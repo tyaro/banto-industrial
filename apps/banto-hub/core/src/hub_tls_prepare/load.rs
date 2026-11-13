@@ -15,35 +15,42 @@
 //!    環境変数には追従しない）。ルート `<ProgramData>\BantoHub` が絶対パスで、既知のフォルダ
 //!    そのものでないこと。
 //! 2. ルートを辿らずに開き、本当のパス・reparse point でないフォルダ・所有者
-//!    （SYSTEM・Administrators・TrustedInstaller）・DACL（[`root_dacl_problems`]。実行した管理者
+//!    （SYSTEM・Administrators・TrustedInstaller）・DACL（[`root_dacl_problems`](super::root_dacl_problems)。実行した管理者
 //!    本人は無いので `None`）を確かめる。
 //! 3. `tls\` をルートのハンドル基準で辿らずに開き、本当のパス・種類・所有者・
-//!    [`exposure_beyond_users_read`] を確かめる。
+//!    [`exposure_beyond_users_read`](banto_safe_root::acl::exposure_beyond_users_read) を確かめる。
 //! 4. 鍵・証明書を `tls\` のハンドル基準で辿らずに読み取りで開く（共有は読み取りだけ。握って
 //!    いる間は誰も書き換えられない）。フォルダ・reparse point・本当の場所の食い違いは断る。
 //!    両方あること（片方だけは断る）。鍵は [`exposure`]（SYSTEM・Administrators だけ）、証明書は
-//!    [`exposure_beyond_users_read`]。
-//! 5. 確かめてから、握ったハンドルから [`MAX_PEM_BYTES`] まで読み、[`inspect_identity`] で中身を
+//!    [`exposure_beyond_users_read`](banto_safe_root::acl::exposure_beyond_users_read)。
+//! 5. 確かめてから、握ったハンドルから [`MAX_PEM_BYTES`](super::MAX_PEM_BYTES) まで読み、[`inspect_identity`] で中身を
 //!    確かめる。
+//!
+//! 手順 1〜3 と、4 のファイルの開き方・証明書の ACL・5 の読み方は、クライアント（ChronoGazer、
+//! #644 PR3b）と同じコードを使うため共有 crate `banto_hub_tls_trust` にある（[`open_place`]・
+//! [`open_checked_file`]・[`check_cert_exposure`]・[`read_checked`]。#644 PR3a）。ここに残るのは、
+//! 鍵の確かめ（両方あること・[`exposure`]）・[`inspect_identity`]・対処の文言（[`Remedy`] から）。
+//! 判定・順序・文言は移す前と同じ。
 //!
 //! 読んだ PEM のバイト列をそのまま TLS に渡す（[`DefaultHubTls`]。確かめた後にパスで開き直さ
 //! ない）。鍵は [`Zeroizing`] で持ち、`Debug`・ログに出さない。
 
 use std::path::{Path, PathBuf};
 
-use banto_safe_root::acl::{exposure, exposure_beyond_users_read, FileSecurity};
-use banto_safe_root::guard::{self, DataAclRefusal, DirState, MachineEnvironment};
+use banto_hub_tls_trust::{
+    check_cert_exposure, open_checked_file, open_place, read_checked, Remedy, Unavailable,
+    TLS_LABEL,
+};
+use banto_safe_root::acl::{exposure, FileSecurity};
 use zeroize::Zeroizing;
 
 use super::{
-    inspect_identity, reasons_text, root_dacl_problems, utc_text, HubTlsOps, IdentityInfo, TlsDir,
-    TlsFile, CERT_FILE, KEY_FILE, MAX_PEM_BYTES, RENEW_FLAG, TLS_DIR,
+    inspect_identity, reasons_text, utc_text, HubTlsOps, IdentityInfo, TlsFile, CERT_FILE,
+    KEY_FILE, RENEW_FLAG,
 };
-use crate::profile_grant::well_known_text;
-use crate::sink_config_prepare::{real_path_text, FileOpenError, PRODUCT_DIR};
 
-/// サービスが既定で TLS を待ち受けるポート（127.0.0.1 だけ）。
-pub const DEFAULT_TLS_PORT: u16 = 8723;
+/// サービスが既定で TLS を待ち受けるポート（127.0.0.1 だけ。#644 PR3a で共有 crate へ）。
+pub use banto_hub_tls_trust::DEFAULT_TLS_PORT;
 
 /// 確かめて読んだ、既定の TLS の鍵と証明書（PEM のバイト列）とポート。
 #[derive(Clone)]
@@ -168,8 +175,6 @@ pub fn bind_failure_lines(port: u16, error: &str) -> Vec<String> {
 }
 
 const ELEV: &str = "banto-hub-elev.exe prepare-hub-tls";
-const ROOT_LABEL: &str = "Hub のルート";
-const TLS_LABEL: &str = "Hub の TLS の置き場";
 
 fn unavailable(reason: String, remedy: String) -> DefaultTlsUnavailable {
     DefaultTlsUnavailable { reason, remedy }
@@ -200,95 +205,21 @@ fn retry_remedy() -> String {
     "原因を取り除いてから Hub のサービスを再起動してください。続くときは、管理者の PowerShell で banto-hub-elev.exe prepare-hub-tls を実行して置き場を確かめてください".to_string()
 }
 
-/// 本当の場所の食い違いの理由（`prepare-*` と同じ文言から、末尾の「止めます」を除く）。
-fn real_path_reason(
-    label: &str,
-    expected: &Path,
-    real: &Path,
-    refusal: guard::RealPathRefusal,
-) -> String {
-    real_path_text(label, expected, real, refusal)
-        .trim_end_matches("。止めます")
-        .to_string()
+/// ルートが保護されていないときの対処。
+fn fix_root_remedy() -> String {
+    "所有者を Administrators にし（takeown /a）、SYSTEM・Administrators 以外への削除・子の削除・ACL と所有者の変更・書き込み・フルの許可を外してから、Hub のサービスを再起動してください".to_string()
 }
 
-fn dir_refusal(label: &str, dir: &Path, refusal: &DataAclRefusal) -> String {
-    let reason = match refusal {
-        DataAclRefusal::ReparsePoint => {
-            "ジャンクションかシンボリックリンク（reparse point）です".to_string()
-        }
-        DataAclRefusal::NotADirectory => "フォルダではありません".to_string(),
-        DataAclRefusal::ForeignOwner(owner) => format!(
-            "所有者（{owner}）が SYSTEM・Administrators ではありません（一般の利用者が先に作った恐れがあります）"
-        ),
+/// 共有 crate の確かめの失敗を、サービスログの理由と対処にする（対処の文言は移す前と同じ）。
+fn from_trust(found: Unavailable) -> DefaultTlsUnavailable {
+    let remedy = match &found.remedy {
+        Remedy::Retry => retry_remedy(),
+        Remedy::Prepare => prepare_remedy(),
+        Remedy::FixRoot => fix_root_remedy(),
+        Remedy::RecreateDir(tls_path) => recreate_dir_remedy(tls_path),
+        Remedy::Renew => renew_remedy(),
     };
-    format!("{label}（{}）は{reason}", dir.display())
-}
-
-/// `tls\` の中のファイル 1 つを開いて種類と場所を確かめる（無ければ `None`。まだ読まない）。
-fn open_child<O: HubTlsOps>(
-    ops: &O,
-    tls: &O::Dir,
-    tls_path: &Path,
-    tls_real: &Path,
-    name: &str,
-    label: &str,
-) -> Result<Option<O::File>, DefaultTlsUnavailable> {
-    let shown = tls_path.join(name);
-    let file = match ops.open_child_file(tls, name) {
-        Ok(Some(file)) => file,
-        Ok(None) => return Ok(None),
-        Err(FileOpenError::InUse) => {
-            return Err(unavailable(
-                format!(
-                    "{label}（{}）は別のプロセスで書き込みに開かれています",
-                    shown.display()
-                ),
-                retry_remedy(),
-            ))
-        }
-        Err(FileOpenError::Other(error)) => {
-            return Err(unavailable(
-                format!("{label}（{}）を開けませんでした: {error}", shown.display()),
-                retry_remedy(),
-            ))
-        }
-    };
-    let security = file.security();
-    let problem = if security.is_dir {
-        Some("フォルダです".to_string())
-    } else if security.is_reparse_point {
-        Some("シンボリックリンクなどの reparse point です".to_string())
-    } else if !guard::paths_match(&file.final_path(), &tls_real.join(name)) {
-        Some(format!(
-            "本当の場所（{}）が期待と違います",
-            file.final_path().display()
-        ))
-    } else {
-        None
-    };
-    match problem {
-        Some(problem) => Err(unavailable(
-            format!("{label}（{}）は{problem}", shown.display()),
-            recreate_dir_remedy(tls_path),
-        )),
-        None => Ok(Some(file)),
-    }
-}
-
-fn read<F: TlsFile>(
-    file: &mut F,
-    label: &str,
-    path: &Path,
-) -> Result<Zeroizing<Vec<u8>>, DefaultTlsUnavailable> {
-    file.read_all(MAX_PEM_BYTES)
-        .map(Zeroizing::new)
-        .map_err(|error| {
-            unavailable(
-                format!("{label}（{}）を読めませんでした: {error}", path.display()),
-                retry_remedy(),
-            )
-        })
+    unavailable(found.reason, remedy)
 }
 
 /// 既定の TLS の鍵と証明書を、置き場ごと確かめてから読む（モジュール doc「確かめの順序」）。
@@ -296,151 +227,15 @@ fn read<F: TlsFile>(
 pub fn load_default_identity<O: HubTlsOps>(
     ops: &O,
 ) -> Result<DefaultHubTls, DefaultTlsUnavailable> {
-    // --- 1. 純粋な確かめ ------------------------------------------------------------
-    let program_data = ops.machine_env().program_data().map_err(|error| {
-        unavailable(
-            format!("ProgramData の場所を取れませんでした: {error}"),
-            retry_remedy(),
-        )
-    })?;
-    let root_path = program_data.join(PRODUCT_DIR);
-    let tls_path = root_path.join(TLS_DIR);
-    if !root_path.is_absolute() {
-        return Err(unavailable(
-            format!(
-                "{ROOT_LABEL}（{}）が絶対パスではありません",
-                root_path.display()
-            ),
-            retry_remedy(),
-        ));
-    }
-    let known = ops.machine_env().known_folders().map_err(|error| {
-        unavailable(
-            format!("既知のフォルダの場所を取れませんでした: {error}"),
-            retry_remedy(),
-        )
-    })?;
-    if let Err(refusal) = guard::reject_well_known_root(&root_path, &known) {
-        return Err(unavailable(
-            well_known_text(&root_path, &refusal),
-            retry_remedy(),
-        ));
-    }
-
-    // --- 2. ルート ------------------------------------------------------------------
-    let root = match ops.pin_dir(&root_path) {
-        Ok(Some(root)) => root,
-        Ok(None) => {
-            return Err(unavailable(
-                format!("{ROOT_LABEL}（{}）がありません", root_path.display()),
-                prepare_remedy(),
-            ))
-        }
-        Err(error) => {
-            return Err(unavailable(
-                format!(
-                    "{ROOT_LABEL}（{}）を開けませんでした: {error}",
-                    root_path.display()
-                ),
-                retry_remedy(),
-            ))
-        }
-    };
-    let root_real = root.final_path();
-    let fix_root = || {
-        "所有者を Administrators にし（takeown /a）、SYSTEM・Administrators 以外への削除・子の削除・ACL と所有者の変更・書き込み・フルの許可を外してから、Hub のサービスを再起動してください".to_string()
-    };
-    if let Err(refusal) = guard::check_real_path(&root_real, &root_path, &known) {
-        return Err(unavailable(
-            real_path_reason(ROOT_LABEL, &root_path, &root_real, refusal),
-            fix_root(),
-        ));
-    }
-    if let Err(refusal) = guard::dir_acl_plan(&DirState::Present(root.info()), None, None) {
-        return Err(unavailable(
-            dir_refusal(ROOT_LABEL, &root_path, &refusal),
-            fix_root(),
-        ));
-    }
-    let root_security = root.security().map_err(|error| {
-        unavailable(
-            format!(
-                "{ROOT_LABEL}（{}）の ACL を読めませんでした: {error}",
-                root_path.display()
-            ),
-            retry_remedy(),
-        )
-    })?;
-    let root_open = root_dacl_problems(&root_security, None);
-    if !root_open.is_empty() {
-        return Err(unavailable(
-            format!(
-                "{ROOT_LABEL}（{}）は保護されていません（{}）。一般の利用者が {TLS_DIR}\\ を消して差し替えられる恐れがあります",
-                root_path.display(),
-                reasons_text(&root_open)
-            ),
-            fix_root(),
-        ));
-    }
-
-    // --- 3. 置き場 ------------------------------------------------------------------
-    let tls = match ops.open_child_dir(&root, TLS_DIR) {
-        Ok(Some(tls)) => tls,
-        Ok(None) => {
-            return Err(unavailable(
-                format!("{TLS_LABEL}（{}）がありません", tls_path.display()),
-                prepare_remedy(),
-            ))
-        }
-        Err(error) => {
-            return Err(unavailable(
-                format!(
-                    "{TLS_LABEL}（{}）を開けませんでした: {error}",
-                    tls_path.display()
-                ),
-                retry_remedy(),
-            ))
-        }
-    };
-    let tls_real = tls.final_path();
-    if let Err(refusal) = guard::check_real_path(&tls_real, &root_real.join(TLS_DIR), &known) {
-        return Err(unavailable(
-            real_path_reason(TLS_LABEL, &tls_path, &tls_real, refusal),
-            recreate_dir_remedy(&tls_path),
-        ));
-    }
-    if let Err(refusal) = guard::dir_acl_plan(&DirState::Present(tls.info()), None, None) {
-        return Err(unavailable(
-            dir_refusal(TLS_LABEL, &tls_path, &refusal),
-            recreate_dir_remedy(&tls_path),
-        ));
-    }
-    let tls_security = tls.security().map_err(|error| {
-        unavailable(
-            format!(
-                "{TLS_LABEL}（{}）の ACL を読めませんでした: {error}",
-                tls_path.display()
-            ),
-            retry_remedy(),
-        )
-    })?;
-    let tls_open = exposure_beyond_users_read(&tls_security);
-    if !tls_open.is_empty() {
-        return Err(unavailable(
-            format!(
-                "{TLS_LABEL}（{}）は保護されていません（{}）。ほかの利用者が鍵・証明書を書き換えた・読んだ恐れがあります",
-                tls_path.display(),
-                reasons_text(&tls_open)
-            ),
-            recreate_dir_remedy(&tls_path),
-        ));
-    }
+    // --- 1〜3. ルートと置き場（共有 crate。モジュール doc「確かめの順序」） ----------
+    let place = open_place(ops).map_err(from_trust)?;
+    let tls_path = place.tls_path().to_path_buf();
 
     // --- 4. 鍵と証明書（開いて握り、ACL を確かめる） ---------------------------------
     let key_path = tls_path.join(KEY_FILE);
     let cert_path = tls_path.join(CERT_FILE);
-    let key = open_child(ops, &tls, &tls_path, &tls_real, KEY_FILE, "秘密鍵")?;
-    let cert = open_child(ops, &tls, &tls_path, &tls_real, CERT_FILE, "証明書")?;
+    let key = open_checked_file(ops, &place, KEY_FILE, "秘密鍵").map_err(from_trust)?;
+    let cert = open_checked_file(ops, &place, CERT_FILE, "証明書").map_err(from_trust)?;
     let (mut key, mut cert) = match (key, cert) {
         (Some(key), Some(cert)) => (key, cert),
         (None, None) => {
@@ -480,25 +275,17 @@ pub fn load_default_identity<O: HubTlsOps>(
             renew_remedy(),
         ));
     }
-    let cert_open = exposure_beyond_users_read(&cert.security());
-    if !cert_open.is_empty() {
-        return Err(unavailable(
-            format!(
-                "証明書（{}）は保護されていません（{}）。ほかの利用者に書き換えられた恐れがあります",
-                cert_path.display(),
-                reasons_text(&cert_open)
-            ),
-            renew_remedy(),
-        ));
-    }
+    check_cert_exposure(&cert, &cert_path).map_err(from_trust)?;
 
     // --- 5. 握ったハンドルから読んで、中身を確かめる --------------------------------
-    let key_pem = read(&mut key, "秘密鍵", &key_path)?;
-    let cert_pem = read(&mut cert, "証明書", &cert_path)?;
+    let key_pem = read_checked(&mut key, "秘密鍵", &key_path)
+        .map(Zeroizing::new)
+        .map_err(from_trust)?;
+    let cert_pem = read_checked(&mut cert, "証明書", &cert_path).map_err(from_trust)?;
     drop((key, cert));
     let now = ops.now_unix();
-    DefaultHubTls::from_checked_pem(DEFAULT_TLS_PORT, cert_pem.to_vec(), key_pem, cert_path, now)
-        .map_err(|error| {
+    DefaultHubTls::from_checked_pem(DEFAULT_TLS_PORT, cert_pem, key_pem, cert_path, now).map_err(
+        |error| {
             unavailable(
                 format!(
                     "{TLS_LABEL}（{}）の鍵と証明書は使えません: {error}",
@@ -506,5 +293,6 @@ pub fn load_default_identity<O: HubTlsOps>(
                 ),
                 renew_remedy(),
             )
-        })
+        },
+    )
 }

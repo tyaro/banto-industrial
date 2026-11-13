@@ -1,0 +1,21 @@
+[package]
+name = "banto-hub-tls-trust"
+description = "Read-only checks of the banto-hub loopback TLS place (ProgramData/BantoHub/tls) shared by the Hub service and its clients (#644 PR3a)"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# 置き場の確かめの部品（辿らずに開く・DACL の読み戻し・既知のフォルダ）。banto-hub-core と
+# 同じ path 依存で、`sqlite` feature は要らない。
+banto-safe-root = { path = "../banto-safe-root" }
+# 証明書の PEM を読む（`PemObject`）。tokio-rustls・reqwest が既に木に持つ 1.x で、Cargo.lock に
+# 新しい package は増えない。
+rustls-pki-types = { version = "1.15.1", default-features = false, features = ["std"] }
+# 証明書（DER）が解析できるかの確かめ。banto-hub-core と同じ版で、新しい package は増えない。
+x509-cert = { version = "0.2.5" }
+
+[dev-dependencies]
+# テストの証明書を作る（banto-hub-core と同じ版・feature。新しい package は増えない）。
+rcgen = { version = "=0.14.7", default-features = false, features = ["crypto", "pem", "ring"] }

@@ -3,81 +3,56 @@
 //! 削除・付け替えは、確かめた `tls\` のハンドルを包んだ `ManagedDir`（`remove`・
 //! `rename_no_replace`）。
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use banto_safe_root::acl::{FileSecurity, PinnedDir, PinnedDirInfo, PinnedFile};
-use banto_safe_root::{InstallUserSid, ManagedDir, SafeRootError};
+use banto_hub_tls_trust::win as trust;
+use banto_safe_root::acl::PinnedFile;
+use banto_safe_root::guard::win::RegistryMachineEnvironment;
+use banto_safe_root::InstallUserSid;
 
-use super::{DirHow, FileAcl, HubTlsOps, TlsDir, TlsFile};
-use crate::profile_grant::win::RegistryMachineEnvironment;
+use super::{DirHow, FileAcl, HubTlsOps, TlsTrustOps};
 use crate::sink_config_prepare::{secret_error_text, FileOpenError};
+
+/// 辿らずに開いたフォルダ（共有 crate の `banto_hub_tls_trust::win::WinTlsDir`。削除・付け替えに
+/// `ManagedDir` の口を使うため、`ManagedDir::from_pinned` で包んで持つ）。
+pub use banto_hub_tls_trust::win::WinTlsDir;
 
 /// 本番の操作。
 pub struct WindowsHubTlsOps;
 
-/// 辿らずに開いたフォルダ。削除・付け替えに `ManagedDir` の口を使うため、
-/// [`ManagedDir::from_pinned`] で包んで持つ（中身は常に辿らずに握ったハンドル）。
-pub struct WinTlsDir(ManagedDir);
-
-impl WinTlsDir {
-    fn new(pinned: PinnedDir) -> Self {
-        Self(ManagedDir::from_pinned(pinned))
-    }
-
-    fn pinned(&self) -> &PinnedDir {
-        // `from_pinned` で作るので、いつも握ったハンドルがある。
-        self.0
-            .pinned()
-            .expect("WinTlsDir は辿らずに開いたフォルダだけを包む")
-    }
-}
-
-impl TlsDir for WinTlsDir {
-    fn info(&self) -> PinnedDirInfo {
-        self.pinned().info().clone()
-    }
-
-    fn final_path(&self) -> PathBuf {
-        self.pinned().final_path().to_path_buf()
-    }
-
-    fn security(&self) -> Result<FileSecurity, String> {
-        self.pinned()
-            .security()
-            .map_err(|err| secret_error_text(&err))
-    }
-}
-
-impl TlsFile for PinnedFile {
-    fn security(&self) -> FileSecurity {
-        PinnedFile::security(self).clone()
-    }
-
-    fn final_path(&self) -> PathBuf {
-        PinnedFile::final_path(self).to_path_buf()
-    }
-
-    fn read_all(&mut self, max_len: usize) -> Result<Vec<u8>, String> {
-        self.read_to_end(max_len)
-            .map_err(|err| secret_error_text(&err))
-    }
-}
-
-/// `ERROR_SHARING_VIOLATION`。
-const ERROR_SHARING_VIOLATION: i32 = 32;
-
-impl HubTlsOps for WindowsHubTlsOps {
+/// 開く・読む操作は共有 crate の実装（#644 PR3a）。フォルダは DACL・所有者を書ける pin
+/// （`*_for_hub`。クライアントの `WindowsTlsTrustOps` は読み取り専用の pin）。
+impl TlsTrustOps for WindowsHubTlsOps {
     type Env = RegistryMachineEnvironment;
     type Dir = WinTlsDir;
     type File = PinnedFile;
+
+    fn machine_env(&self) -> &RegistryMachineEnvironment {
+        &RegistryMachineEnvironment
+    }
+
+    fn pin_dir(&self, dir: &Path) -> Result<Option<WinTlsDir>, String> {
+        trust::pin_dir_for_hub(dir)
+    }
+
+    fn open_child_dir(&self, parent: &WinTlsDir, name: &str) -> Result<Option<WinTlsDir>, String> {
+        trust::open_child_dir_for_hub(parent, name)
+    }
+
+    fn open_child_file(
+        &self,
+        parent: &WinTlsDir,
+        name: &str,
+    ) -> Result<Option<PinnedFile>, FileOpenError> {
+        trust::open_child_file(parent, name)
+    }
+}
+
+impl HubTlsOps for WindowsHubTlsOps {
     type Lock = banto_instance_lock::NamedMutexGuard;
 
     fn hold_lock(&self) -> Result<Option<Self::Lock>, String> {
         banto_instance_lock::try_hold_named_mutex(super::LOCK_NAME).map_err(|err| err.to_string())
-    }
-
-    fn machine_env(&self) -> &RegistryMachineEnvironment {
-        &RegistryMachineEnvironment
     }
 
     fn current_user_sid(&self) -> Result<InstallUserSid, String> {
@@ -89,12 +64,6 @@ impl HubTlsOps for WindowsHubTlsOps {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX))
             .unwrap_or(0)
-    }
-
-    fn pin_dir(&self, dir: &Path) -> Result<Option<WinTlsDir>, String> {
-        banto_safe_root::acl::pin_dir(dir)
-            .map(|found| found.map(WinTlsDir::new))
-            .map_err(|err| err.to_string())
     }
 
     fn create_child_dir(
@@ -109,31 +78,6 @@ impl HubTlsOps for WindowsHubTlsOps {
         };
         made.map(|found| found.map(WinTlsDir::new))
             .map_err(|err| err.to_string())
-    }
-
-    fn open_child_dir(&self, parent: &WinTlsDir, name: &str) -> Result<Option<WinTlsDir>, String> {
-        parent
-            .pinned()
-            .open_child_dir(name)
-            .map(|found| found.map(WinTlsDir::new))
-            .map_err(|err| err.to_string())
-    }
-
-    fn open_child_file(
-        &self,
-        parent: &WinTlsDir,
-        name: &str,
-    ) -> Result<Option<PinnedFile>, FileOpenError> {
-        parent
-            .pinned()
-            .open_child_file(name)
-            .map_err(|err| match err {
-                SafeRootError::Io {
-                    os_error: Some(ERROR_SHARING_VIOLATION),
-                    ..
-                } => FileOpenError::InUse,
-                other => FileOpenError::Other(secret_error_text(&other)),
-            })
     }
 
     fn create_child_file(
@@ -152,12 +96,15 @@ impl HubTlsOps for WindowsHubTlsOps {
     }
 
     fn remove_child(&self, parent: &WinTlsDir, name: &str) -> Result<bool, String> {
-        parent.0.remove(name).map_err(|err| secret_error_text(&err))
+        parent
+            .managed()
+            .remove(name)
+            .map_err(|err| secret_error_text(&err))
     }
 
     fn rename_no_replace(&self, parent: &WinTlsDir, from: &str, to: &str) -> Result<bool, String> {
         parent
-            .0
+            .managed()
             .rename_no_replace(from, to)
             .map_err(|err| secret_error_text(&err))
     }

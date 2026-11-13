@@ -94,7 +94,7 @@ use banto_safe_root::acl::{
 };
 use banto_safe_root::guard::{
     self, AccountKind, CarryOver, DataAclRefusal, DirState, DropReason, KnownFolders,
-    MachineEnvironment, MachineRootError, RealPathRefusal, RootFormProblem, WellKnownRootRefusal,
+    MachineEnvironment, MachineRootError, RealPathRefusal, RootFormProblem,
 };
 use banto_safe_root::mode::{ModeAccess, RelaxReport, RootObservation, TreeProblem};
 use banto_safe_root::{DirAccess, InstallUserSid};
@@ -114,8 +114,8 @@ pub const LABEL: &str = "banto-hub-elev";
 /// マシンの環境変数の名前（サービスと同じ`BANTO_HUB_ROOT`）。
 pub const ROOT_ENV: &str = "BANTO_HUB_ROOT";
 
-/// ProgramData の下の製品のフォルダ。
-pub const PRODUCT_DIR: &str = "BantoHub";
+/// ProgramData の下の製品のフォルダ（#644 PR3a で共有 crate へ）。
+pub use banto_hub_tls_trust::PRODUCT_DIR;
 
 /// ルートの下の profile の置き場。
 pub const PROFILES_DIR: &str = "profiles";
@@ -182,28 +182,9 @@ const PROFILE_ID_RULE: &str =
 
 // --- ルートの文言 ------------------------------------------------------------------
 
-pub(crate) fn well_known_text(root: &Path, refusal: &WellKnownRootRefusal) -> String {
-    match refusal {
-        WellKnownRootRefusal::NetworkOrSpecial => format!(
-            "Hub のルート（{}）はネットワークの場所か特殊なパス（\\\\…）です。ローカルのドライブのフォルダにしてください",
-            root.display()
-        ),
-        WellKnownRootRefusal::DriveRoot => format!(
-            "Hub のルート（{}）はドライブのルートです。専用のフォルダ（例: D:\\BantoHub）にしてください",
-            root.display()
-        ),
-        WellKnownRootRefusal::OverlapsProtected(folder) => format!(
-            "Hub のルート（{}）は OS・プログラムの置き場か共有のフォルダ（{}）に重なります。専用のフォルダにしてください",
-            root.display(),
-            folder.display()
-        ),
-        WellKnownRootRefusal::ContainsProtected(folder) => format!(
-            "Hub のルート（{}）は {} そのものかその上のフォルダです。その下の専用のフォルダにしてください",
-            root.display(),
-            folder.display()
-        ),
-    }
-}
+// 文言は Hub の TLS の置き場の確かめと共有するため `banto_hub_tls_trust::text` へ移した
+// （#644 PR3a）。
+pub(crate) use banto_hub_tls_trust::text::well_known_text;
 
 /// [`MachineRootError`] の文言（純関数）。
 pub fn machine_root_text(error: &MachineRootError) -> String {

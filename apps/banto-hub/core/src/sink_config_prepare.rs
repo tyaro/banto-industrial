@@ -53,9 +53,7 @@
 use std::path::{Path, PathBuf};
 
 use banto_safe_root::acl::{exposure, Exposure, FileSecurity, PinnedDirInfo};
-use banto_safe_root::guard::{
-    self, DataAclRefusal, DirState, KnownFolders, MachineEnvironment, RealPathRefusal,
-};
+use banto_safe_root::guard::{self, DataAclRefusal, DirState, KnownFolders, MachineEnvironment};
 use banto_safe_root::InstallUserSid;
 use banto_service_control::ConsoleLine;
 
@@ -64,8 +62,8 @@ use crate::profile_grant::{root_parent_problem, well_known_text, CreateHow, Out,
 #[cfg(windows)]
 pub mod win;
 
-/// ProgramData の下の製品のフォルダ（Hub のルートと同じ名前）。
-pub const PRODUCT_DIR: &str = "BantoHub";
+/// ProgramData の下の製品のフォルダ（Hub のルートと同じ名前。#644 PR3a で共有 crate へ）。
+pub use banto_hub_tls_trust::PRODUCT_DIR;
 
 /// 置き場のフォルダ名。
 pub const SINK_DIR: &str = "sink";
@@ -87,43 +85,9 @@ fn err_line(text: &str) -> ConsoleLine {
     ConsoleLine::Stderr(format!("{LABEL}: {text}"))
 }
 
-/// [`Exposure`] の文言（純関数。`SafeRootError::Exposed` の Debug の表記を出さないため）。
-/// banto-hub-sink の `config::place::exposure_text` と文言を揃える（片方を直したらもう一方も）。
-pub fn exposure_text(found: &Exposure) -> String {
-    match found {
-        Exposure::ReparsePoint => {
-            "ジャンクション・シンボリックリンクなど（reparse point）です".to_string()
-        }
-        Exposure::HardLinked(links) => {
-            format!("ハードリンクです（名前が {links} 個あります）")
-        }
-        Exposure::ForeignOwner(owner) => {
-            format!("所有者（{owner}）が SYSTEM・Administrators ではありません")
-        }
-        Exposure::NullDacl => "DACL が null です（だれでもフルアクセスできます）".to_string(),
-        Exposure::AllowsOther { sid, mask, .. } => format!(
-            "SYSTEM・Administrators 以外（{sid}）にアクセスを許しています（アクセス {mask:#x}）"
-        ),
-        Exposure::UnknownAce { ace_type, .. } => {
-            format!("種類の分からない ACE（種類 {ace_type}）があります")
-        }
-        Exposure::UnreadableSid { ace_type, .. } => {
-            format!("SID を読めない ACE（種類 {ace_type}）があります")
-        }
-    }
-}
-
-/// `banto_safe_root` の失敗の文言（`Exposed` は理由を 1 つずつ言い換え、それ以外は
-/// `Display`）。
-pub fn secret_error_text(error: &banto_safe_root::SafeRootError) -> String {
-    match error {
-        banto_safe_root::SafeRootError::Exposed(found) => {
-            let reasons: Vec<String> = found.iter().map(exposure_text).collect();
-            format!("書いた後も保護されていません（{}）", reasons.join("・"))
-        }
-        other => other.to_string(),
-    }
-}
+// `exposure_text`・`secret_error_text` は `banto_hub_tls_trust::text` へ移した（#644 PR3a。Hub の
+// TLS の置き場の確かめと同じ文言を使うため）。ここでは同じ名前で見せる。
+pub use banto_hub_tls_trust::text::{exposure_text, secret_error_text};
 
 // --- OS の操作 ---------------------------------------------------------------------
 
@@ -155,14 +119,8 @@ pub trait SinkFile {
     fn delete(self) -> Result<(), String>;
 }
 
-/// [`SinkConfigOps::open_child_file`] の失敗。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FileOpenError {
-    /// 別のプロセスが書き込みに開いている（共有違反）。
-    InUse,
-    /// それ以外（理由）。
-    Other(String),
-}
+/// [`SinkConfigOps::open_child_file`] の失敗（`banto_hub_tls_trust` と同じ型。#644 PR3a で移した）。
+pub use banto_hub_tls_trust::FileOpenError;
 
 /// `prepare-sink-config` が OS に対してする操作（Windows の実装は `win::WindowsSinkConfigOps`。
 /// テストは偽物）。
@@ -364,26 +322,8 @@ pub(crate) fn dir_refusal_text(level: DirLevel, dir: &Path, refusal: &DataAclRef
     format!("{label}（{}）は{reason}", dir.display())
 }
 
-/// 本当のパスの断りの文言。
-pub(crate) fn real_path_text(
-    label: &str,
-    expected: &Path,
-    real: &Path,
-    refusal: RealPathRefusal,
-) -> String {
-    match refusal {
-        RealPathRefusal::Mismatch => format!(
-            "{label}（{}）の本当の場所（{}）が期待と違います。途中のフォルダがジャンクションか短い名前の可能性があります。止めます",
-            expected.display(),
-            real.display()
-        ),
-        RealPathRefusal::WellKnown(refusal) => format!(
-            "{label}（{}）の本当の場所が使えません: {}。止めます",
-            real.display(),
-            well_known_text(real, &refusal)
-        ),
-    }
-}
+// 本当の場所の食い違いの文言は `banto_hub_tls_trust::text` へ移した（#644 PR3a）。
+pub(crate) use banto_hub_tls_trust::text::real_path_text;
 
 /// 置き場の中のファイル 1 つを開いて確かめる（無ければ `None`）。
 fn open_checked_file<O: SinkConfigOps>(

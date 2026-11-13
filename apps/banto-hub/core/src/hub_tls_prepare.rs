@@ -84,10 +84,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
-use banto_safe_root::acl::{
-    exposure, exposure_beyond_users_read, Exposure, FileSecurity, PinnedDirInfo,
-    ACCESS_ALLOWED_ACE_TYPE,
-};
+use banto_safe_root::acl::{exposure, exposure_beyond_users_read, FileSecurity};
 use banto_safe_root::guard::{self, DataAclRefusal, DirState, KnownFolders, MachineEnvironment};
 use banto_safe_root::InstallUserSid;
 use banto_service_control::ConsoleLine;
@@ -95,24 +92,24 @@ use zeroize::Zeroizing;
 
 use crate::profile_grant::{root_parent_problem, well_known_text, Out, Refused, LABEL};
 use crate::sink_config_prepare::{
-    dir_refusal_text, exposure_text, real_path_text, DirLevel, FileOpenError, PRODUCT_DIR,
+    dir_refusal_text, real_path_text, DirLevel, FileOpenError, PRODUCT_DIR,
 };
+
+// 置き場の定数・読み取りの操作・ルートの DACL の確かめは、クライアント（ChronoGazer）と同じ
+// コードを使うため共有 crate に置く（#644 PR3a）。ここでは同じ名前で見せる。
+use banto_hub_tls_trust::text::reasons_text;
+pub use banto_hub_tls_trust::{
+    root_dacl_problems, TlsDir, TlsFile, TlsTrustOps, CERT_FILE, KEY_FILE, MAX_PEM_BYTES,
+    ROOT_TAKEOVER_MASK, TLS_DIR,
+};
+use banto_hub_tls_trust::{ROOT_LABEL, TLS_LABEL};
 
 pub mod load;
 #[cfg(windows)]
 pub mod win;
 
-/// 置き場のフォルダ名。
-pub const TLS_DIR: &str = "tls";
-
 /// 実行全体を直列化する名前付き mutex の名前。
 pub const LOCK_NAME: &str = r"Global\BantoHub.prepare-hub-tls";
-
-/// 証明書（PEM。利用者は読み取りだけ）。
-pub const CERT_FILE: &str = "hub-cert.pem";
-
-/// 秘密鍵（PKCS#8 の PEM。SYSTEM・Administrators だけ）。
-pub const KEY_FILE: &str = "hub-key.pem";
 
 /// 作りかけの証明書（書き終えてから [`CERT_FILE`] へ付け替える）。
 pub const CERT_TEMP: &str = "hub-cert.pem.new";
@@ -122,9 +119,6 @@ pub const KEY_TEMP: &str = "hub-key.pem.new";
 
 /// 作り直しの引数（これだけを受け付ける）。
 pub const RENEW_FLAG: &str = "--renew";
-
-/// 読む PEM の大きさの上限。
-pub const MAX_PEM_BYTES: usize = 64 * 1024;
 
 /// 証明書の CN。
 pub const COMMON_NAME: &str = "BantoHub loopback";
@@ -257,26 +251,14 @@ pub fn inspect_identity(
     now_unix: i64,
 ) -> Result<IdentityInfo, String> {
     use tokio_rustls::rustls::pki_types::pem::PemObject;
-    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use tokio_rustls::rustls::pki_types::PrivateKeyDer;
     use x509_cert::der::{Decode, Encode};
     use x509_cert::ext::pkix::name::GeneralName;
     use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAltName};
 
-    if cert_pem
-        .windows(b"PRIVATE KEY".len())
-        .any(|window| window == b"PRIVATE KEY")
-    {
-        return Err("証明書のファイルに秘密鍵が入っています".to_string());
-    }
-    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
-        .collect::<Result<_, _>>()
-        .map_err(|_| "証明書の PEM を読めません".to_string())?;
-    let [cert_der] = certs.as_slice() else {
-        return Err(format!(
-            "証明書の PEM に証明書がちょうど 1 つではありません（{} 個）",
-            certs.len()
-        ));
-    };
+    // 秘密鍵が入っていない・PEM が読める・証明書がちょうど 1 つ（クライアントの pin と同じ確かめ。
+    // 文言と順序は共有 crate に移す前と同じ）。
+    let cert_der = banto_hub_tls_trust::parse_single_certificate(cert_pem)?;
     let key = PrivateKeyDer::from_pem_slice(key_pem)
         .map_err(|_| "秘密鍵の PEM を読めません".to_string())?;
     let PrivateKeyDer::Pkcs8(pkcs8) = &key else {
@@ -371,29 +353,6 @@ pub fn inspect_identity(
 
 // --- OS の操作 ---------------------------------------------------------------------
 
-/// 辿らずに開いたフォルダ（Windows は `banto_safe_root::acl::PinnedDir` を
-/// `banto_safe_root::ManagedDir` に包んだもの）。
-pub trait TlsDir {
-    /// 開いたハンドルから読んだ属性と所有者。
-    fn info(&self) -> PinnedDirInfo;
-    /// 本当のパス。
-    fn final_path(&self) -> PathBuf;
-    /// 開いたハンドルから読んだ属性・所有者・DACL。
-    fn security(&self) -> Result<FileSecurity, String>;
-}
-
-/// 置き場のハンドル基準に、読み取りの権利で辿らずに開いたファイル（Windows は
-/// `banto_safe_root::acl::PinnedFile`）。持っている間はほかの誰も書き込みに開く・消す・名前を
-/// 変えることができない（共有は読み取りだけ）。
-pub trait TlsFile {
-    /// 開いた時点でハンドルから読んだ属性・リンク数・所有者・DACL。
-    fn security(&self) -> FileSecurity;
-    /// 本当のパス。
-    fn final_path(&self) -> PathBuf;
-    /// 開いたハンドルから、`max_len` バイトまで読む（超えたら断る）。
-    fn read_all(&mut self, max_len: usize) -> Result<Vec<u8>, String>;
-}
-
 /// フォルダの作り方。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirHow {
@@ -413,26 +372,18 @@ pub enum FileAcl {
 }
 
 /// `prepare-hub-tls` が OS に対してする操作（Windows の実装は `win::WindowsHubTlsOps`。テストは
-/// 偽物）。
-pub trait HubTlsOps {
-    /// マシンの環境の読み取り（ProgramData・既知のフォルダ。マシンの環境変数は使わない）。
-    type Env: MachineEnvironment;
-    /// [`HubTlsOps::pin_dir`] などが返すもの。
-    type Dir: TlsDir;
-    /// [`HubTlsOps::open_child_file`] が返すもの。
-    type File: TlsFile;
+/// 偽物）。開く・読む操作は親の [`TlsTrustOps`]（共有 crate。サービスの読み込み [`load`] と
+/// クライアントが使う）、ここには書き込み・作成・直列化を足す。
+pub trait HubTlsOps: TlsTrustOps {
     /// [`HubTlsOps::hold_lock`] が返す、持っている間だけ有効なもの（drop で離す）。
     type Lock;
 
     /// [`LOCK_NAME`] の名前付き mutex を取る（既に誰かが持っていれば `Ok(None)`）。
     fn hold_lock(&self) -> Result<Option<Self::Lock>, String>;
-    fn machine_env(&self) -> &Self::Env;
     /// このプロセスのトークンの利用者の SID（所有者として許す）。
     fn current_user_sid(&self) -> Result<InstallUserSid, String>;
     /// 今の時刻（Unix 秒、UTC）。
     fn now_unix(&self) -> i64;
-    /// フォルダを辿らずに開く（無ければ `Ok(None)`）。
-    fn pin_dir(&self, dir: &Path) -> Result<Option<Self::Dir>, String>;
     /// 確かめ済みの `parent` のハンドル基準に、名前 1 要素のフォルダを作る（既にあれば
     /// `Ok(None)`）。`UsersRead` なら作るのと同時にその DACL を付ける。
     fn create_child_dir(
@@ -441,15 +392,6 @@ pub trait HubTlsOps {
         name: &str,
         how: DirHow,
     ) -> Result<Option<Self::Dir>, String>;
-    /// 確かめ済みの `parent` のハンドル基準に、名前 1 要素の子を辿らずに開く。
-    fn open_child_dir(&self, parent: &Self::Dir, name: &str) -> Result<Option<Self::Dir>, String>;
-    /// 確かめ済みの `parent` のハンドル基準に、名前 1 要素の子を読み取りで辿らずに開く（共有は
-    /// 読み取りだけ）。
-    fn open_child_file(
-        &self,
-        parent: &Self::Dir,
-        name: &str,
-    ) -> Result<Option<Self::File>, FileOpenError>;
     /// 確かめ済みの `parent` のハンドル基準に、`acl` を作るのと同時に付けた新しいファイルを作って
     /// 書き、書き出す。既にあれば `Ok(false)`（何もしない）。
     fn create_child_file(
@@ -536,58 +478,8 @@ fn create_or_open<O: HubTlsOps>(
     }
 }
 
-/// ルートの**オブジェクト自身**に効くと、中の `tls\` を消して差し替えられる・ACL や所有者を
-/// 書き換えられる権利（#644 PR1a のレビュー P1）: `DELETE`・`WRITE_DAC`・`WRITE_OWNER`・
-/// `FILE_DELETE_CHILD`・`GENERIC_ALL`・`GENERIC_WRITE`・`MAXIMUM_ALLOWED`。ファイル・フォルダの
-/// 作成（`FILE_ADD_FILE`・`FILE_ADD_SUBDIRECTORY`）と属性の書き込みは含めない（ProgramData から
-/// 継承する既定の `BUILTIN\Users:(CI)(WD,AD,WEA,WA)` を許すため。作れても既にある `tls\` は
-/// 消せない）。
-pub const ROOT_TAKEOVER_MASK: u32 =
-    0x0001_0000 | 0x0004_0000 | 0x0008_0000 | 0x0000_0040 | 0x1000_0000 | 0x4000_0000 | 0x0200_0000;
-
-/// `INHERIT_ONLY_ACE`（オブジェクト自身には効かず、子へ伝わるだけの ACE）。
-const INHERIT_ONLY_ACE_FLAG: u8 = 0x08;
-
-/// ルート（`%ProgramData%\BantoHub`）の記述子が、一般の利用者に `tls\` を差し替えさせる形の
-/// 理由をすべて返す（純関数、#644 PR1a のレビュー P1。空なら通す）。[`exposure`] から、
-/// 普通の許可（`ACCESS_ALLOWED_ACE_TYPE`）で inherit-only の ACE と、オブジェクト自身に効くが
-/// [`ROOT_TAKEOVER_MASK`] のどれも含まない ACE を除いたもの。残るのは:
-///
-/// - 所有者が SYSTEM・Administrators・TrustedInstaller・`elevated`（実行した管理者本人）以外
-///   （所有者は DACL に関わらず ACL を書き換えられる）。本人は昇格できる管理者なので、sink の
-///   `dir_acl_plan` と同じく信頼する。ルートを継承で作ると、作った本人が所有者になり、親の
-///   `CREATOR OWNER` が本人へのフルの ACE になるため、これを断ると管理者の通常の実行が通らない。
-/// - null DACL・種類の分からない ACE・SID が読めない ACE。
-/// - 信頼する相手（`elevated` を含む）以外への、条件付き・オブジェクトの許可（中身を評価しない
-///   ので、継承のフラグ・マスクを問わず断る側に倒す）。
-/// - 信頼する相手以外への、オブジェクト自身に効く普通の許可で、[`ROOT_TAKEOVER_MASK`] を含む
-///   もの。
-///
-/// 既定の形（ProgramData から継承: SYSTEM・Administrators にフル、`CREATOR OWNER` に
-/// inherit-only のフル、`BUILTIN\Users` に読み取りと `(CI)(WD,AD,WEA,WA)`、所有者
-/// Administrators）は通る。
-pub fn root_dacl_problems(security: &FileSecurity, elevated: Option<&str>) -> Vec<Exposure> {
-    exposure(security)
-        .into_iter()
-        .filter(|found| match found {
-            // 実行した管理者本人（所有者としても、ACE の相手としても）は信頼する。
-            Exposure::ForeignOwner(sid) => Some(sid.as_str()) != elevated,
-            Exposure::AllowsOther { sid, .. } if Some(sid.as_str()) == elevated => false,
-            Exposure::AllowsOther {
-                ace_type,
-                flags,
-                mask,
-                ..
-            } if *ace_type == ACCESS_ALLOWED_ACE_TYPE => {
-                flags & INHERIT_ONLY_ACE_FLAG == 0 && mask & ROOT_TAKEOVER_MASK != 0
-            }
-            _ => true,
-        })
-        .collect()
-}
-
-const ROOT_LABEL: &str = "Hub のルート";
-const TLS_LABEL: &str = "Hub の TLS の置き場";
+// ルートの DACL の確かめ（`root_dacl_problems`・`ROOT_TAKEOVER_MASK`）と文言の呼び名は、
+// クライアントと共有するため `banto_hub_tls_trust` へ移した（#644 PR3a。上の `pub use`）。
 
 /// `tls\` の所有者・種類の断りの文言（純関数）。所有者で断ったときは取り直さず、中身を確かめて
 /// 消してから再実行を案内する（`prepare-sink-config` の `sink\` と同じ理由: 一般の利用者が先に
@@ -664,14 +556,6 @@ fn inspect_child<O: HubTlsOps>(
         None
     };
     Ok(Some(Found { security, contents }))
-}
-
-fn reasons_text(found: &[Exposure]) -> String {
-    found
-        .iter()
-        .map(exposure_text)
-        .collect::<Vec<_>>()
-        .join("・")
 }
 
 /// 作り直しの案内（断りの文言の後ろに付ける）。

@@ -835,6 +835,11 @@ pub struct PinnedDir {
     /// 書き直さずに `ERROR_NO_MORE_FILES` で「成功」を返してしまう。子の再帰は ID で開いた
     /// 新しいハンドルなので、取るのは最上段だけでよい。
     enum_lock: std::sync::Mutex<()>,
+    /// `WRITE_DAC | WRITE_OWNER` を求めて開いたか。偽なら読み取り専用の pin
+    /// （[`pin_dir_read_only`]・[`PinnedDir::open_child_dir_read_only`]、#644 PR3a）で、
+    /// このハンドルで DACL・所有者を書く操作（`reset_acl`・`close_tree`・`relax_tree`）は
+    /// 書かずに断る。
+    writable: bool,
 }
 
 #[cfg(windows)]
@@ -844,6 +849,7 @@ impl std::fmt::Debug for PinnedDir {
             .field("path", &self.path)
             .field("final_path", &self.final_path)
             .field("info", &self.info)
+            .field("writable", &self.writable)
             .finish_non_exhaustive()
     }
 }
@@ -866,6 +872,26 @@ impl PinnedDir {
     /// 開いたハンドルから読んだ属性と所有者。
     pub fn info(&self) -> &PinnedDirInfo {
         &self.info
+    }
+
+    /// このハンドルで DACL・所有者を書けるか（`WRITE_DAC | WRITE_OWNER` を求めて開いたか）。
+    /// 読み取り専用の pin（[`pin_dir_read_only`]）なら偽。
+    pub fn can_write_security(&self) -> bool {
+        self.writable
+    }
+
+    /// 読み取り専用の pin なら、書かずに断る（`AclApi`、`ERROR_ACCESS_DENIED`）。
+    fn require_writable(&self) -> Result<()> {
+        /// `ERROR_ACCESS_DENIED`。
+        const ERROR_ACCESS_DENIED: u32 = 5;
+        if self.writable {
+            Ok(())
+        } else {
+            Err(SafeRootError::AclApi {
+                call: "PinnedDir(read-only)",
+                os_error: ERROR_ACCESS_DENIED,
+            })
+        }
     }
 
     /// 握っている生のハンドル（crate の中の、ハンドル基準の操作だけが使う。閉じない。
@@ -912,6 +938,7 @@ impl PinnedDir {
     /// `recurse` が偽なら、このフォルダそのものだけ書いて中へは下りない（監査 Nit 3:
     /// すでにルートの再帰で書いた `secrets`・`hub-keys` を、その層でもう一度書き直さない）。
     pub fn reset_acl(&self, access: &DirAccess, recurse: Recurse) -> Result<ResetSkips> {
+        self.require_writable()?;
         if self.info.is_reparse_point {
             return Err(SafeRootError::AclMismatch(AclMismatch::ReparsePoint));
         }
@@ -1026,6 +1053,7 @@ impl PinnedDir {
             written: 0,
             reason: AbortReason::Io(error),
         };
+        self.require_writable().map_err(io)?;
         self.as_tree_root().map_err(io)?;
         let operation = mode.operation();
         imp::ensure_user_account(operation).map_err(io)?;
@@ -1086,6 +1114,7 @@ impl PinnedDir {
         progress: &mut dyn FnMut(&crate::mode::Progress),
     ) -> Result<crate::mode::RelaxReport> {
         use crate::mode::{Progress, RelaxReport, StopSignal};
+        self.require_writable()?;
         self.as_tree_root()?;
         let setting = mode.setting();
         imp::ensure_user_account(setting)?;
@@ -1230,6 +1259,15 @@ impl PinnedDir {
     /// 辿らずにそのものを開くので、呼ぶ側が [`PinnedDir::info`] で断る（[`pin_dir`] と同じ）。
     pub fn open_child_dir(&self, name: &str) -> Result<Option<PinnedDir>> {
         imp::open_child_dir(self, name)
+    }
+
+    /// [`PinnedDir::open_child_dir`] の読み取り専用の形（#644 PR3a）。`WRITE_DAC | WRITE_OWNER`
+    /// を求めず `READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY` で開く（共有は同じく
+    /// 削除なし、辿らない・相対で開くのも同じ）。一般利用者が、Administrators の持つフォルダを
+    /// 握って読むため。返すハンドルで DACL・所有者を書く操作は断る
+    /// （[`PinnedDir::can_write_security`]）。親が書ける pin でも読み取り専用で開く。
+    pub fn open_child_dir_read_only(&self, name: &str) -> Result<Option<PinnedDir>> {
+        imp::open_child_dir_read_only(self, name)
     }
 
     /// 開いたままの**ハンドルから**、このフォルダの属性・リンク数・所有者・DACL を読む
@@ -1427,7 +1465,18 @@ pub enum Recurse {
 #[cfg(windows)]
 pub fn pin_dir(dir: &std::path::Path) -> Result<Option<PinnedDir>> {
     reject_dot_segments(dir)?;
-    imp::pin_dir(dir)
+    imp::pin_dir(dir, true)
+}
+
+/// [`pin_dir`] の読み取り専用の形（#644 PR3a）。`WRITE_DAC | WRITE_OWNER` を求めず
+/// `READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY` で開く。共有（削除なし）・
+/// リンクを辿らない・`.`/`..` を断るのは同じなので、持っている間は名前の変更・削除を止める。
+/// 一般利用者（昇格なし）が、Administrators の持つフォルダを握って中を読むためのもの。返す
+/// [`PinnedDir`] で DACL・所有者を書く操作は書かずに断る（[`PinnedDir::can_write_security`]）。
+#[cfg(windows)]
+pub fn pin_dir_read_only(dir: &std::path::Path) -> Result<Option<PinnedDir>> {
+    reject_dot_segments(dir)?;
+    imp::pin_dir(dir, false)
 }
 
 /// 今のプロセスのトークンの利用者の SID（デスクトップ host が自分を
@@ -3074,7 +3123,8 @@ pub(crate) mod imp {
         Ok(std::path::PathBuf::from(stripped))
     }
 
-    pub(super) fn pin_dir(dir: &Path) -> Result<Option<super::PinnedDir>> {
+    /// [`super::pin_dir`]（`writable`）と [`super::pin_dir_read_only`] の本体。
+    pub(super) fn pin_dir(dir: &Path, writable: bool) -> Result<Option<super::PinnedDir>> {
         use windows_sys::Win32::Foundation::{
             ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, INVALID_HANDLE_VALUE,
         };
@@ -3094,10 +3144,15 @@ pub(crate) mod imp {
         // `a_pinned_dir_cannot_be_renamed_away_while_held` で確かめた）。**`WRITE_DAC |
         // WRITE_OWNER`** を求めるのは、このハンドルで `SetKernelObjectSecurity`（DACL と
         // 所有者）を書くため（監査 B2。パスで書くと、確かめた後にその場でリンクにされうる）。
+        // 読み取り専用（`writable` が偽、#644 PR3a）はそれを求めない: 一般利用者は
+        // Administrators の持つフォルダに `WRITE_DAC | WRITE_OWNER` を持たず、求めると開けない。
+        // データのアクセス（`FILE_LIST_DIRECTORY`）と共有は同じなので、名前の変更・削除は
+        // 同じく止める。
+        let security_write = if writable { WRITE_DAC | WRITE_OWNER } else { 0 };
         let handle = unsafe {
             CreateFileW(
                 path.as_ptr(),
-                READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | WRITE_DAC | WRITE_OWNER,
+                READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | security_write,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 std::ptr::null(),
                 OPEN_EXISTING,
@@ -3115,12 +3170,17 @@ pub(crate) mod imp {
                 &std::io::Error::from_raw_os_error(os_error as i32),
             ));
         }
-        pinned_from_handle(OwnedHandle(handle), dir).map(Some)
+        pinned_from_handle(OwnedHandle(handle), dir, writable).map(Some)
     }
 
     /// 開いたハンドルから [`super::PinnedDir`] を組み立てる（属性・所有者・本当のパスを
-    /// ハンドルから読む。[`pin_dir`] と [`create_child_dir`] で共通）。
-    fn pinned_from_handle(handle: OwnedHandle, dir: &Path) -> Result<super::PinnedDir> {
+    /// ハンドルから読む。[`pin_dir`] と [`create_child_dir`] で共通）。`writable` は
+    /// `WRITE_DAC | WRITE_OWNER` を求めて開いたか（[`super::PinnedDir`] の `writable`）。
+    fn pinned_from_handle(
+        handle: OwnedHandle,
+        dir: &Path,
+        writable: bool,
+    ) -> Result<super::PinnedDir> {
         use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
         use windows_sys::Win32::Storage::FileSystem::{
             GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
@@ -3170,6 +3230,7 @@ pub(crate) mod imp {
                 owner,
             },
             enum_lock: std::sync::Mutex::new(()),
+            writable,
         })
     }
 
@@ -3181,7 +3242,7 @@ pub(crate) mod imp {
     ) -> Result<Option<super::PinnedDir>> {
         let descriptor = access.map(descriptor).transpose()?;
         child_relative(parent, name, ChildHow::Create(descriptor.as_ref()))?
-            .map(|handle| pinned_from_handle(handle, &parent.path.join(name)))
+            .map(|handle| pinned_from_handle(handle, &parent.path.join(name), true))
             .transpose()
     }
 
@@ -3191,7 +3252,17 @@ pub(crate) mod imp {
         name: &str,
     ) -> Result<Option<super::PinnedDir>> {
         child_relative(parent, name, ChildHow::Open)?
-            .map(|handle| pinned_from_handle(handle, &parent.path.join(name)))
+            .map(|handle| pinned_from_handle(handle, &parent.path.join(name), true))
+            .transpose()
+    }
+
+    /// [`super::PinnedDir::open_child_dir_read_only`] の本体（#644 PR3a）。
+    pub(super) fn open_child_dir_read_only(
+        parent: &super::PinnedDir,
+        name: &str,
+    ) -> Result<Option<super::PinnedDir>> {
+        child_relative(parent, name, ChildHow::OpenDirReadOnly)?
+            .map(|handle| pinned_from_handle(handle, &parent.path.join(name), false))
             .transpose()
     }
 
@@ -3266,7 +3337,7 @@ pub(crate) mod imp {
     ) -> Result<Option<super::PinnedDir>> {
         let descriptor = users_read_sd(true)?;
         child_relative(parent, name, ChildHow::Create(Some(&descriptor)))?
-            .map(|handle| pinned_from_handle(handle, &parent.path.join(name)))
+            .map(|handle| pinned_from_handle(handle, &parent.path.join(name), true))
             .transpose()
     }
 
@@ -3473,6 +3544,9 @@ pub(crate) mod imp {
         /// `FILE_OPEN`（無ければ `Ok(None)`）。フォルダに限らない（ファイルでも開いて、
         /// 呼ぶ側が `PinnedDirInfo::is_dir` で断る - [`pin_dir`] と同じ）。
         Open,
+        /// `Open` と同じ（共有・作り方・辿らない）で、`WRITE_DAC | WRITE_OWNER` を求めない
+        /// 読み取り専用の pin（#644 PR3a。一般利用者が Administrators の持つフォルダを握る）。
+        OpenDirReadOnly,
         /// `FILE_OPEN`（無ければ `Ok(None)`）で、読み取りだけの権利・読み取りだけの共有（#630・
         /// #648。中身を読む）。種類を問わず開き、呼ぶ側が属性で断る。
         OpenFile,
@@ -3546,12 +3620,15 @@ pub(crate) mod imp {
 
         /// `ERROR_INVALID_NAME`。
         const ERROR_INVALID_NAME: u32 = 123;
-        let is_file = !matches!(how, ChildHow::Create(_) | ChildHow::Open);
+        let is_file = !matches!(
+            how,
+            ChildHow::Create(_) | ChildHow::Open | ChildHow::OpenDirReadOnly
+        );
         // 失敗の文言に出す API の名前。作る経路と開く経路を見分けられるようにする
         // （開く経路の名前の誤りを `CreateChildDir` と読ませない。#628 / #646 Nit 3）。
         let label = match how {
             ChildHow::Create(_) => "CreateChildDir(name)",
-            ChildHow::Open => "OpenChildDir(name)",
+            ChildHow::Open | ChildHow::OpenDirReadOnly => "OpenChildDir(name)",
             ChildHow::OpenFile
             | ChildHow::OpenFileForUpdate
             | ChildHow::OpenAppend { create: false }
@@ -3598,6 +3675,15 @@ pub(crate) mod imp {
                 FILE_OPEN,
                 0,
                 dir_access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ),
+            // データのアクセス（`FILE_LIST_DIRECTORY`）は残す（求めないハンドルは共有の確かめに
+            // 加わらず、名前の変更を止められない - `pin_dir`）。
+            ChildHow::OpenDirReadOnly => (
+                None,
+                FILE_OPEN,
+                0,
+                dir_access & !(WRITE_DAC | WRITE_OWNER),
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
             ),
             // 共有は読み取りだけ（#648 の P1）: 書き込みで開いているハンドルが既にあれば、開く
@@ -3702,6 +3788,7 @@ pub(crate) mod imp {
             // 無ければ作るので「無い」は起きない。
             ChildHow::OpenAppend { create: true } | ChildHow::Pin { create: true } => false,
             ChildHow::Open
+            | ChildHow::OpenDirReadOnly
             | ChildHow::OpenFile
             | ChildHow::OpenFileForUpdate
             | ChildHow::OpenAppend { create: false }
@@ -3735,7 +3822,9 @@ pub(crate) mod imp {
                     IoOp::CreateFile,
                     &std::io::Error::from_raw_os_error(os_error as i32),
                 ),
-                ChildHow::Create(_) | ChildHow::Open => api("NtCreateFile", os_error),
+                ChildHow::Create(_) | ChildHow::Open | ChildHow::OpenDirReadOnly => {
+                    api("NtCreateFile", os_error)
+                }
             });
         }
         Ok(Some(OwnedHandle(handle)))
@@ -5464,6 +5553,135 @@ pub(crate) mod tests {
             assert!(std::fs::remove_dir(&dir).is_err(), "持っている間に消せた");
             drop(pinned);
             std::fs::rename(&dir, &moved).unwrap();
+        }
+
+        /// 読み取り専用の pin が DACL・所有者を書く操作を、書かずに断ったか（OS の失敗ではなく
+        /// 手前の確かめで断ったこと - `call` で見分ける）。
+        fn refused_as_read_only(err: &SafeRootError) -> bool {
+            matches!(
+                err,
+                SafeRootError::AclApi {
+                    call: "PinnedDir(read-only)",
+                    os_error: 5
+                }
+            )
+        }
+
+        /// #644 PR3a: `pin_dir_read_only` も、持っている間は名前の変更・削除を止め（(a)）、
+        /// DACL・所有者を書く操作は書かずに断る（(c)）。`pin_dir` の作りはそのまま。
+        #[test]
+        fn a_read_only_pinned_dir_holds_the_name_and_refuses_to_write_security() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("pinned");
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::create_dir(dir.join("child")).unwrap();
+            let moved = root.path().join("moved");
+            let pinned = pin_dir_read_only(&dir).unwrap().unwrap();
+            assert!(!pinned.can_write_security());
+            assert!(pin_dir(&dir).unwrap().unwrap().can_write_security());
+            assert!(pinned.info().is_dir && !pinned.info().is_reparse_point);
+            assert!(
+                std::fs::rename(&dir, &moved).is_err(),
+                "持っている間に名前を変えられた"
+            );
+            assert!(std::fs::remove_dir(&dir).is_err(), "持っている間に消せた");
+
+            // 子も読み取り専用で開け、同じく握る。書ける pin の親から開いても読み取り専用。
+            let child = pinned.open_child_dir_read_only("child").unwrap().unwrap();
+            assert!(!child.can_write_security());
+            assert!(
+                std::fs::rename(dir.join("child"), dir.join("child2")).is_err(),
+                "子を持っている間に名前を変えられた"
+            );
+            assert!(pinned.open_child_dir_read_only("absent").unwrap().is_none());
+
+            // (c) 書く操作は書かずに断る。
+            let before = read_dir_dacl(&dir).unwrap();
+            let access = DirAccess::with_install_user(me());
+            let err = pinned.reset_acl(&access, Recurse::Tree).unwrap_err();
+            assert!(refused_as_read_only(&err), "{err:?}");
+            let err = child.reset_acl(&access, Recurse::ObjectOnly).unwrap_err();
+            assert!(refused_as_read_only(&err), "{err:?}");
+            let mode = crate::mode::ModeAccess::for_users([me()]).unwrap();
+            let err = pinned.relax_tree(&mode, &mut |_| {}).unwrap_err();
+            assert!(refused_as_read_only(&err), "{err:?}");
+            let abort = pinned
+                .close_tree(&mode, &|| crate::mode::StopSignal::None, &mut |_| {})
+                .unwrap_err();
+            assert_eq!(abort.written, 0);
+            assert!(
+                matches!(&abort.reason, crate::mode::AbortReason::Io(err) if refused_as_read_only(err)),
+                "{:?}",
+                abort.reason
+            );
+            assert_eq!(
+                format!("{:?}", read_dir_dacl(&dir).unwrap()),
+                format!("{before:?}"),
+                "読み取り専用の pin で DACL が変わった"
+            );
+
+            drop(child);
+            drop(pinned);
+            std::fs::rename(&dir, &moved).unwrap();
+        }
+
+        /// #644 PR3a (b): 自分に `WRITE_DAC`・`WRITE_OWNER` が無いフォルダ（Everyone への明示の
+        /// 拒否と OWNER RIGHTS への拒否で、所有者・昇格した管理者からも取り上げる。許すのは
+        /// 読み取りと実行・DELETE だけ）でも、`pin_dir` は開けず `pin_dir_read_only` は開ける。
+        /// 子のフォルダ・その中のファイルも相対で開いて読め、持っている間は（DACL が DELETE を
+        /// 許していても）名前を変えられない。一般利用者が Administrators の持つ `BantoHub\tls\`
+        /// を読む場面の再現。
+        #[test]
+        fn a_read_only_pin_opens_a_dir_without_write_dac() {
+            /// 読み取りと実行（`FILE_GENERIC_READ | FILE_GENERIC_EXECUTE` = 0x1200a9）と
+            /// DELETE（片付けのため）だけ。
+            const READ_ONLY_SDDL: &str = "D:P(D;;WDWO;;;WD)(D;;WDWO;;;OW)(A;;0x1300a9;;;WD)";
+            let root = tempfile::tempdir().unwrap();
+            let place = root.path().join("place");
+            let tls = place.join("tls");
+            std::fs::create_dir_all(&tls).unwrap();
+            std::fs::write(tls.join("cert.pem"), b"pem").unwrap();
+            set_dacl_sddl(&tls, READ_ONLY_SDDL);
+            set_dacl_sddl(&place, READ_ONLY_SDDL);
+            for dir in [&place, &tls] {
+                assert_eq!(
+                    open_for_write_dac_owner(dir),
+                    Err(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED),
+                    "テストの前提: {} は WRITE_DAC | WRITE_OWNER で開けない",
+                    dir.display()
+                );
+            }
+            assert!(pin_dir(&place).is_err(), "書ける pin は開けないはず");
+
+            let pinned = pin_dir_read_only(&place).unwrap().unwrap();
+            assert!(pinned.info().is_dir);
+            assert!(
+                pinned.open_child_dir("tls").is_err(),
+                "書ける pin の子は開けないはず"
+            );
+            let child = pinned.open_child_dir_read_only("tls").unwrap().unwrap();
+            assert!(child.info().is_dir && !child.info().is_reparse_point);
+            child.security().unwrap();
+            let mut file = child.open_child_file("cert.pem").unwrap().unwrap();
+            assert_eq!(file.read_to_end(1024).unwrap(), b"pem");
+            drop(file);
+            assert!(
+                std::fs::rename(&tls, place.join("moved")).is_err(),
+                "子を持っている間に名前を変えられた"
+            );
+            assert!(
+                std::fs::rename(&place, root.path().join("moved")).is_err(),
+                "持っている間に名前を変えられた"
+            );
+            let err = child
+                .reset_acl(&DirAccess::with_install_user(me()), Recurse::ObjectOnly)
+                .unwrap_err();
+            assert!(refused_as_read_only(&err), "{err:?}");
+
+            drop(child);
+            drop(pinned);
+            // 放せば変えられる（DACL は DELETE を許している）。
+            std::fs::rename(&place, root.path().join("moved")).unwrap();
         }
 
         #[test]
