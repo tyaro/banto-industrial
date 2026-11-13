@@ -928,6 +928,7 @@ dependencies = [
  "prost",
  "protoc-bin-vendored",
  "rcgen",
+ "ring",
  "rumqttc",
  "rust-embed",
  "serde",

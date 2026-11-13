@@ -31,8 +31,9 @@
 //!   （`SHGetKnownFolderPath`）から取り、`BANTO_HUB_ROOT`・このプロセスの環境変数には追従しない。
 //! - **確かめ終わるまで副作用なし**（[`prepare_hub_tls`]）: 純粋な確かめ（ProgramData・既知の
 //!   フォルダ）→ ルートを辿らずに開いて確かめる（本当のパス・reparse point でないフォルダ・
-//!   所有者。無ければ親を確かめてから親のハンドル基準で作る）→ `tls\` を確かめ済みのルートの
-//!   ハンドル基準で開く（無ければ上の DACL を作るのと同時に付けて作る）→ 本当のパス・所有者
+//!   所有者。無ければ親を確かめてから親のハンドル基準で作る）→ ルートの DACL を確かめる
+//!   （[`root_dacl_problems`]。一般の利用者が `tls\` を消して差し替えられる形なら**何も変えずに
+//!   断る**）→ `tls\` を確かめ済みのルートのハンドル基準で開く（無ければ上の DACL を作るのと同時に付けて作る）→ 本当のパス・所有者
 //!   （SYSTEM・Administrators・昇格した本人以外なら**何も変えずに断る** - 一般の利用者が先に
 //!   作った `tls\` の乗っ取りを拒む）・ACL（[`banto_safe_root::acl::exposure_beyond_users_read`]。
 //!   Users の読み取りより広い許可・ほかの相手があれば断る。**`--renew` でも断る**）→ 中の鍵・
@@ -43,8 +44,9 @@
 //! - **既存の確かめ**: 鍵は [`banto_safe_root::acl::exposure`]（SYSTEM・Administrators だけ。
 //!   ハードリンク・ほかの所有者も断る）、証明書は `exposure_beyond_users_read`。中身は PEM が
 //!   読める・証明書がちょうど 1 つで秘密鍵を含まない・鍵が PKCS#8 の ECDSA P-256・鍵と証明書の
-//!   公開鍵が一致・期限内・Basic Constraints が CA:FALSE・SAN に IP 127.0.0.1・EKU があれば
-//!   serverAuth を含む。どれかが通らなければ理由を出して断り、`--renew` を案内する。
+//!   公開鍵が一致・署名が ECDSA with SHA-256 で自己署名を証明書の公開鍵で検証できる・期限内・
+//!   Basic Constraints が CA:FALSE・SAN に IP 127.0.0.1・EKU があれば serverAuth を含む・
+//!   Key Usage があれば digitalSignature を含む。どれかが通らなければ理由を出して断り、`--renew` を案内する。
 //! - **`--renew`**: 置き場は上と同じく確かめる（露出していれば断る）。既存の鍵・証明書は中身も
 //!   ACL も確かめない（露出した鍵の作り直しに使えるように。フォルダ・リンクは断る）。
 //! - **書くこと**（この順。作るときと `--renew` で同じ）: 前回の途中で残った一時名
@@ -60,6 +62,8 @@
 //!   「前回の残り」として消し、鍵と証明書が別々の実行のものになり得るため。持たれていれば何も
 //!   変えずに断る。
 //! - ルートの DACL は書かない（`prepare-sink-config` と同じ。`profiles\` を巻き込まない）。
+//!   確かめて、合わなければ断る（[`root_dacl_problems`]。`tls\` の証明書は後でクライアントが
+//!   pin の根に使うので、sink の `dir_acl_plan` より厳しく、昇格した本人が所有者でも断る）。
 //!   既にある `tls\` の DACL も書き直さない（確かめて、合わなければ断る）。
 //!
 //! ## 出力・終了コード
@@ -83,6 +87,7 @@ use std::path::{Path, PathBuf};
 
 use banto_safe_root::acl::{
     exposure, exposure_beyond_users_read, Exposure, FileSecurity, PinnedDirInfo,
+    ACCESS_ALLOWED_ACE_TYPE,
 };
 use banto_safe_root::guard::{self, DataAclRefusal, DirState, KnownFolders, MachineEnvironment};
 use banto_safe_root::InstallUserSid;
@@ -253,9 +258,9 @@ pub fn inspect_identity(
 ) -> Result<IdentityInfo, String> {
     use tokio_rustls::rustls::pki_types::pem::PemObject;
     use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    use x509_cert::der::Decode;
+    use x509_cert::der::{Decode, Encode};
     use x509_cert::ext::pkix::name::GeneralName;
-    use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, SubjectAltName};
+    use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAltName};
 
     if cert_pem
         .windows(b"PRIVATE KEY".len())
@@ -288,6 +293,25 @@ pub fn inspect_identity(
     if tbs.subject_public_key_info.subject_public_key.raw_bytes() != pair.public_key_raw() {
         return Err("秘密鍵と証明書が対になっていません".to_string());
     }
+    // 署名（#644 PR1a のレビュー）: アルゴリズムが ECDSA with SHA-256 で、自己署名を証明書の
+    // 公開鍵（＝秘密鍵の対）で検証できること。中身を書き換えた証明書を pin の根にしない。
+    let ecdsa_sha256 = x509_cert::der::asn1::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+    if cert.signature_algorithm.oid != ecdsa_sha256 || tbs.signature.oid != ecdsa_sha256 {
+        return Err("証明書の署名のアルゴリズムが ECDSA with SHA-256 ではありません".to_string());
+    }
+    let tbs_der = tbs
+        .to_der()
+        .map_err(|_| "証明書（DER）を読めません".to_string())?;
+    let signature = cert
+        .signature
+        .as_bytes()
+        .ok_or_else(|| "証明書の署名を読めません".to_string())?;
+    ring::signature::UnparsedPublicKey::new(
+        &ring::signature::ECDSA_P256_SHA256_ASN1,
+        tbs.subject_public_key_info.subject_public_key.raw_bytes(),
+    )
+    .verify(&tbs_der, signature)
+    .map_err(|_| "証明書の自己署名を証明書の公開鍵で検証できません".to_string())?;
     let secs = |at: x509_cert::time::Time| i64::try_from(at.to_unix_duration().as_secs());
     let (Ok(not_before), Ok(not_after)) =
         (secs(tbs.validity.not_before), secs(tbs.validity.not_after))
@@ -329,6 +353,15 @@ pub fn inspect_identity(
         }
         Ok(_) => {}
         Err(_) => return Err("証明書の用途（EKU）を読めません".to_string()),
+    }
+    // Key Usage（#644 PR1a のレビュー）: あれば digitalSignature を要る（TLS 1.3 の
+    // CertificateVerify の署名）。無ければ用途を絞っていないので通す。
+    match tbs.get::<KeyUsage>() {
+        Ok(Some((_, usage))) if !usage.digital_signature() => {
+            return Err("証明書の Key Usage に digitalSignature がありません".to_string())
+        }
+        Ok(_) => {}
+        Err(_) => return Err("証明書の Key Usage を読めません".to_string()),
     }
     Ok(IdentityInfo {
         fingerprint: fingerprint_text(cert_der.as_ref()),
@@ -501,6 +534,52 @@ fn create_or_open<O: HubTlsOps>(
             None => Err("作ろうとしたら既にあり、開き直すと無くなっていました".to_string()),
         },
     }
+}
+
+/// ルートの**オブジェクト自身**に効くと、中の `tls\` を消して差し替えられる・ACL や所有者を
+/// 書き換えられる権利（#644 PR1a のレビュー P1）: `DELETE`・`WRITE_DAC`・`WRITE_OWNER`・
+/// `FILE_DELETE_CHILD`・`GENERIC_ALL`・`GENERIC_WRITE`・`MAXIMUM_ALLOWED`。ファイル・フォルダの
+/// 作成（`FILE_ADD_FILE`・`FILE_ADD_SUBDIRECTORY`）と属性の書き込みは含めない（ProgramData から
+/// 継承する既定の `BUILTIN\Users:(CI)(WD,AD,WEA,WA)` を許すため。作れても既にある `tls\` は
+/// 消せない）。
+pub const ROOT_TAKEOVER_MASK: u32 =
+    0x0001_0000 | 0x0004_0000 | 0x0008_0000 | 0x0000_0040 | 0x1000_0000 | 0x4000_0000 | 0x0200_0000;
+
+/// `INHERIT_ONLY_ACE`（オブジェクト自身には効かず、子へ伝わるだけの ACE）。
+const INHERIT_ONLY_ACE_FLAG: u8 = 0x08;
+
+/// ルート（`%ProgramData%\BantoHub`）の記述子が、一般の利用者に `tls\` を差し替えさせる形の
+/// 理由をすべて返す（純関数、#644 PR1a のレビュー P1。空なら通す）。[`exposure`] から、
+/// 普通の許可（`ACCESS_ALLOWED_ACE_TYPE`）で inherit-only の ACE と、オブジェクト自身に効くが
+/// [`ROOT_TAKEOVER_MASK`] のどれも含まない ACE を除いたもの。残るのは:
+///
+/// - 所有者が SYSTEM・Administrators・TrustedInstaller 以外（**昇格した本人も**。所有者は DACL に
+///   関わらず ACL を書き換えられる。`tls\` の証明書は後でクライアントが pin の根に使うので、
+///   sink の `dir_acl_plan` より厳しくする）。
+/// - null DACL・種類の分からない ACE・SID が読めない ACE。
+/// - 信頼する相手以外への、条件付き・オブジェクトの許可（中身を評価しないので、継承のフラグ・
+///   マスクを問わず断る側に倒す）。
+/// - 信頼する相手以外への、オブジェクト自身に効く普通の許可で、[`ROOT_TAKEOVER_MASK`] を含む
+///   もの。
+///
+/// 既定の形（ProgramData から継承: SYSTEM・Administrators にフル、`CREATOR OWNER` に
+/// inherit-only のフル、`BUILTIN\Users` に読み取りと `(CI)(WD,AD,WEA,WA)`、所有者
+/// Administrators）は通る。
+pub fn root_dacl_problems(security: &FileSecurity) -> Vec<Exposure> {
+    exposure(security)
+        .into_iter()
+        .filter(|found| match found {
+            Exposure::AllowsOther {
+                ace_type,
+                flags,
+                mask,
+                ..
+            } if *ace_type == ACCESS_ALLOWED_ACE_TYPE => {
+                flags & INHERIT_ONLY_ACE_FLAG == 0 && mask & ROOT_TAKEOVER_MASK != 0
+            }
+            _ => true,
+        })
+        .collect()
 }
 
 const ROOT_LABEL: &str = "Hub のルート";
@@ -701,6 +780,22 @@ fn run<O: HubTlsOps>(
     let elevated = plan.elevated_user.as_ref().map(InstallUserSid::as_str);
     if let Err(refusal) = guard::dir_acl_plan(&DirState::Present(root.info()), None, elevated) {
         return Err(dir_refusal_text(DirLevel::Root, &plan.root, &refusal));
+    }
+    // ルートの DACL（レビュー P1）: 一般の利用者が `tls\` を消して差し替えられるなら、`tls\` を
+    // 開く・作る前に断る。
+    let root_security = root.security().map_err(|error| {
+        format!(
+            "{ROOT_LABEL}（{}）の ACL を読めませんでした: {error}。何も変えずに止めます",
+            plan.root.display()
+        )
+    })?;
+    let root_open = root_dacl_problems(&root_security);
+    if !root_open.is_empty() {
+        return Err(format!(
+            "{ROOT_LABEL}（{}）は保護されていません（{}）。一般の利用者が {TLS_DIR}\\ を消して差し替えられる恐れがあるため、何も変えずに止めます（{RENEW_FLAG} でも）。所有者を Administrators にし（takeown /a）、SYSTEM・Administrators 以外への削除・子の削除・ACL と所有者の変更・書き込み・フルの許可を外してから、もう一度実行してください",
+            plan.root.display(),
+            reasons_text(&root_open)
+        ));
     }
 
     // --- 置き場（確かめ済みのルートのハンドル基準。無ければ DACL を付けて作る） ---------

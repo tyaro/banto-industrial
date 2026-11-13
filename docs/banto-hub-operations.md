@@ -2071,12 +2071,22 @@ cargo run --manifest-path apps/banto-hub/installer/Cargo.toml --release -- targe
 成功すると、証明書の絶対パス・SHA-256 の指紋（証明書 DER 全体）・有効期限
 （notAfter、UTC）を出します。秘密鍵の中身は出しません。証明書は CN
 `BantoHub loopback`、SAN は IP `127.0.0.1` だけ、Basic Constraints は `CA:FALSE`、
-用途（EKU）は serverAuth、notBefore は作った時刻の 1 時間前です。既にある鍵と
-証明書は、PEM が読める・鍵と証明書が対になっている・期限内・`CA:FALSE`・SAN に
-`127.0.0.1` があることを確かめてから保ちます。
+用途（EKU）は serverAuth、Key Usage は digitalSignature、notBefore は作った時刻の
+1 時間前です。既にある鍵と証明書は、PEM が読める・鍵と証明書が対になっている・署名が
+ECDSA with SHA-256 で自己署名を証明書の公開鍵で検証できる・期限内・`CA:FALSE`・SAN に
+`127.0.0.1` がある・EKU があれば serverAuth・Key Usage があれば digitalSignature を
+含むことを確かめてから保ちます。
 
 断るときと対処:
 
+- **ルート `%ProgramData%\BantoHub` が保護されていない**（所有者が SYSTEM・
+  Administrators・TrustedInstaller 以外 - 実行した管理者本人も含む・null DACL・
+  ほかの相手に削除・子の削除・ACL や所有者の変更・汎用の書き込み/全権・
+  MAXIMUM_ALLOWED を許す ACE・条件付きなど読めない許可）: 一般の利用者が `tls\` を
+  消して差し替えられるため、`tls\` を開く前に何も変えずに断ります（`--renew` でも）。
+  ProgramData から継承した既定の形（Users の読み取りと、ファイル・フォルダの作成）は
+  通ります。所有者を Administrators にし（`takeown /a`）、余分な許可を外してから
+  再実行してください。
 - **`tls\` を一般の利用者が先に作っていた**（所有者が SYSTEM・Administrators・
   実行した管理者以外）・**`tls\` が露出している**（利用者の読み取りより広い許可、
   ほかの相手への許可）・ジャンクションなど: 何も変えずに断ります（`--renew` でも）。

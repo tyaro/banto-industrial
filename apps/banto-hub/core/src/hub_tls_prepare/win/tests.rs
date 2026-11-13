@@ -135,6 +135,27 @@ fn fixture() -> Fixture {
     let base = tempfile::tempdir().unwrap();
     let program_data = long(base.path()).join("ProgramData");
     std::fs::create_dir(&program_data).unwrap();
+    // 管理者なら、一時の ProgramData を本物の ProgramData の DACL に似せる（TEMP から継承する
+    // 実行した利用者のフルを外す。ルートは継承で作るので、残すとルートの DACL の確かめで断る）。
+    // 管理者でなければ、外すと後片付けできなくなるので触らない（ルートの所有者が本人になり、
+    // どのみちルートで断る）。
+    if banto_service_elev::is_current_process_admin().unwrap_or(false) {
+        icacls(
+            &program_data,
+            &[
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-32-544:(OI)(CI)F",
+                "*S-1-3-0:(OI)(CI)(IO)F",
+                "*S-1-5-32-545:(OI)(CI)RX",
+            ],
+        );
+        icacls(
+            &program_data,
+            &["/grant", "*S-1-5-32-545:(CI)(WD,AD,WEA,WA)"],
+        );
+    }
     Fixture {
         _base: base,
         program_data: program_data.clone(),
@@ -305,9 +326,16 @@ fn refuses_an_exposed_key_and_renew_replaces_it() {
 }
 
 /// ジャンクションの `tls\`・利用者が自分で作った `tls\`（所有者がその利用者・継承の ACL）は、
-/// 何も書かずに断る（管理者でなくても走る）。
+/// 何も書かずに断る（管理者でなくても走る。管理者でなければ、ルートの所有者が本人になるので
+/// `tls\` を開く前にルートの DACL の確かめで断る）。
 #[test]
 fn refuses_a_junction_or_a_hand_made_tls_dir() {
+    let admin = banto_service_elev::is_current_process_admin().unwrap_or(false);
+    let first_reason = if admin {
+        "reparse point"
+    } else {
+        "Hub のルート"
+    };
     let f = fixture();
     let root = f.program_data.join("BantoHub");
     std::fs::create_dir(&root).unwrap();
@@ -324,10 +352,7 @@ fn refuses_a_junction_or_a_hand_made_tls_dir() {
     for renew in [false, true] {
         let (result, lines) = run(&f.ops, renew);
         assert_eq!(result, Err(Refused), "{lines:#?}");
-        assert!(
-            lines.iter().any(|l| l.contains("reparse point")),
-            "{lines:#?}"
-        );
+        assert!(lines.iter().any(|l| l.contains(first_reason)), "{lines:#?}");
         assert_eq!(
             std::fs::read_dir(&elsewhere).unwrap().count(),
             0,

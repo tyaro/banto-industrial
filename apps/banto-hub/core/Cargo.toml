@@ -178,6 +178,10 @@ time = { version = "0.3", default-features = false }
 # 既にある 0.2.5（async-opcua-crypto が使う）。既定の features（`pem`・`std`）の
 # 依存も木にある。
 x509-cert = { version = "0.2.5" }
+# #644 PR1a（レビュー）: 既にある証明書の自己署名（ECDSA P-256・SHA-256）を、証明書の公開鍵で
+# 検証する（`ring::signature::ECDSA_P256_SHA256_ASN1`）。Cargo.lock に既にある 0.17.14
+# （rcgen・tokio-rustls・sqlx が使う）。
+ring = { version = "0.17.14" }
 
 [build-dependencies]
 # T4（docs/tag-server-design.md §5.4）: build.rs が proto/tagserver/v1/*.proto

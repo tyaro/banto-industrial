@@ -636,6 +636,23 @@ fn inspection_refuses_broken_or_unsafe_identities() {
     let (client, client_key) =
         make(&|p| p.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth]);
     refused(client.as_bytes(), client_key.as_bytes(), NOW, "serverAuth");
+    // Key Usage（レビュー P2）: あって digitalSignature が無ければ断る（無ければ上の ok_cert の
+    // とおり通す）。
+    let (encipher, encipher_key) =
+        make(&|p| p.key_usages = vec![rcgen::KeyUsagePurpose::KeyEncipherment]);
+    refused(
+        encipher.as_bytes(),
+        encipher_key.as_bytes(),
+        NOW,
+        "digitalSignature",
+    );
+    let (signing, signing_key) = make(&|p| {
+        p.key_usages = vec![
+            rcgen::KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::KeyEncipherment,
+        ]
+    });
+    assert!(inspect_identity(signing.as_bytes(), signing_key.as_bytes(), NOW).is_ok());
     // P-384 の鍵は断る。
     let (p384, p384_key) = {
         let pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
@@ -648,6 +665,36 @@ fn inspection_refuses_broken_or_unsafe_identities() {
         )
     };
     refused(p384.as_bytes(), p384_key.as_bytes(), NOW, "P-256");
+}
+
+/// 署名（レビュー P2）: 署名の 1 バイトを変えた証明書は、鍵と対で期限内でも断る。
+#[test]
+fn inspection_refuses_a_certificate_whose_signature_does_not_verify() {
+    use x509_cert::der::{Decode, DecodePem, Encode, EncodePem};
+    let identity = generate_identity(NOW).unwrap();
+    let key = identity.key_pem.as_bytes();
+    let mut der = x509_cert::Certificate::from_pem(identity.cert_pem.as_bytes())
+        .unwrap()
+        .to_der()
+        .unwrap();
+    // DER の最後は署名（BIT STRING の中の ECDSA の s）の最後のバイト。
+    *der.last_mut().unwrap() ^= 0x01;
+    let tampered = x509_cert::Certificate::from_der(&der)
+        .unwrap()
+        .to_pem(x509_cert::der::pem::LineEnding::LF)
+        .unwrap();
+    assert_ne!(tampered, identity.cert_pem);
+    let error = inspect_identity(tampered.as_bytes(), key, NOW).unwrap_err();
+    assert!(error.contains("自己署名"), "{error}");
+
+    // 中身（tbs）の 1 バイトを変えても断る（notAfter などの書き換え）。署名は元のまま。
+    let cert = x509_cert::Certificate::from_pem(identity.cert_pem.as_bytes()).unwrap();
+    let mut changed = cert.clone();
+    changed.tbs_certificate.serial_number =
+        x509_cert::serial_number::SerialNumber::new(&[0x01, 0x02, 0x03]).unwrap();
+    let changed = changed.to_pem(x509_cert::der::pem::LineEnding::LF).unwrap();
+    let error = inspect_identity(changed.as_bytes(), key, NOW).unwrap_err();
+    assert!(error.contains("自己署名"), "{error}");
 }
 
 /// 作った鍵と証明書を `tls_listener` の読み込み（`TlsConfig::explicit`）で読み、Sink と同じ pin
@@ -1064,6 +1111,197 @@ fn refuses_a_root_owned_by_another_user_or_unknown_program_data() {
     let mut ops = FakeOps::new();
     ops.env.program_data = Ok(abs("Windows"));
     assert_refused_without_writes(&ops, false, "何も変えていません");
+}
+
+// --- ルートの DACL（レビュー P1） ----------------------------------------------------
+
+const CREATOR_OWNER: &str = "S-1-3-0";
+
+/// この PC の `%ProgramData%\BantoHub` の実物（ProgramData から継承）: SYSTEM・Administrators
+/// `(I)(OI)(CI)(F)`、`CREATOR OWNER:(I)(OI)(CI)(IO)(F)`、`BUILTIN\Users:(I)(OI)(CI)(RX)`、
+/// `BUILTIN\Users:(I)(CI)(WD,AD,WEA,WA)`。所有者 Administrators。
+fn default_root_aces() -> Vec<ObservedAce> {
+    vec![
+        ace(SYSTEM_SID, 0x1F01FF, 0x13),
+        ace(ADMINISTRATORS_SID, 0x1F01FF, 0x13),
+        ace(CREATOR_OWNER, 0x1000_0000, 0x1B),
+        ace(USERS, READ_EXECUTE_ACCESS_MASK, 0x13),
+        ace(USERS, 0x0000_0116, 0x12),
+    ]
+}
+
+fn root_security(owner: &str, aces: Option<Vec<ObservedAce>>) -> FileSecurity {
+    FileSecurity {
+        is_dir: true,
+        is_reparse_point: false,
+        links: 1,
+        dacl: ObservedDacl {
+            protected: false,
+            owner: owner.to_string(),
+            aces,
+        },
+    }
+}
+
+#[test]
+fn root_dacl_accepts_the_default_program_data_shape() {
+    assert_eq!(
+        root_dacl_problems(&root_security(
+            ADMINISTRATORS_SID,
+            Some(default_root_aces())
+        )),
+        vec![]
+    );
+    // 所有者 SYSTEM・TrustedInstaller も通す。
+    for owner in [SYSTEM_SID, banto_safe_root::acl::TRUSTED_INSTALLER_SID] {
+        assert_eq!(
+            root_dacl_problems(&root_security(owner, Some(default_root_aces()))),
+            vec![]
+        );
+    }
+    // inherit-only の ACE は、どの相手・どの権利でも無視する。
+    let mut aces = default_root_aces();
+    aces.push(ace(USERS, 0x1F01FF, 0x0B));
+    aces.push(ace(EVIL, 0x1000_0000, 0x08));
+    assert_eq!(
+        root_dacl_problems(&root_security(ADMINISTRATORS_SID, Some(aces))),
+        vec![]
+    );
+    // 拒否の ACE も理由にしない。
+    let mut aces = default_root_aces();
+    aces.push(ObservedAce {
+        ace_type: 1,
+        flags: 0,
+        mask: 0x1F01FF,
+        sid: EVIL.to_string(),
+    });
+    assert_eq!(
+        root_dacl_problems(&root_security(ADMINISTRATORS_SID, Some(aces))),
+        vec![]
+    );
+}
+
+#[test]
+fn root_dacl_refuses_takeover_rights_owners_and_unreadable_aces() {
+    // オブジェクト自身に効く危ない権利（1 bit ずつ、継承あり・なし）。
+    for bit in [
+        0x0001_0000u32, // DELETE
+        0x0004_0000,    // WRITE_DAC
+        0x0008_0000,    // WRITE_OWNER
+        0x0000_0040,    // FILE_DELETE_CHILD
+        0x1000_0000,    // GENERIC_ALL
+        0x4000_0000,    // GENERIC_WRITE
+        0x0200_0000,    // MAXIMUM_ALLOWED
+    ] {
+        for (sid, flags) in [
+            (USERS, 0x00),
+            (USERS, 0x13),
+            (EVIL, 0x02),
+            ("S-1-1-0", 0x10),
+        ] {
+            let mut aces = default_root_aces();
+            aces.push(ace(sid, bit, flags));
+            let found = root_dacl_problems(&root_security(ADMINISTRATORS_SID, Some(aces)));
+            assert_eq!(
+                found,
+                vec![Exposure::AllowsOther {
+                    ace_type: 0,
+                    flags,
+                    mask: bit,
+                    sid: sid.to_string(),
+                }],
+                "{bit:#x} {sid} {flags:#x}"
+            );
+        }
+    }
+    // ほかの相手へのフル・変更も断る。
+    let mut aces = default_root_aces();
+    aces.push(ace(USERS, MODIFY_ACCESS_MASK, 0x13));
+    assert_eq!(
+        root_dacl_problems(&root_security(ADMINISTRATORS_SID, Some(aces))).len(),
+        1
+    );
+    // 所有者が昇格した本人・一般の利用者。
+    for owner in [ME, EVIL] {
+        assert_eq!(
+            root_dacl_problems(&root_security(owner, Some(default_root_aces()))),
+            vec![Exposure::ForeignOwner(owner.to_string())]
+        );
+    }
+    // null DACL。
+    assert_eq!(
+        root_dacl_problems(&root_security(ADMINISTRATORS_SID, None)),
+        vec![Exposure::NullDacl]
+    );
+    // 条件付き（9）・オブジェクト（5）の許可は、読み取りだけ・inherit-only でも断る。
+    for (ace_type, flags) in [(9u8, 0x00u8), (5, 0x0B)] {
+        let mut aces = default_root_aces();
+        aces.push(ObservedAce {
+            ace_type,
+            flags,
+            mask: READ_EXECUTE_ACCESS_MASK,
+            sid: USERS.to_string(),
+        });
+        assert_eq!(
+            root_dacl_problems(&root_security(ADMINISTRATORS_SID, Some(aces))).len(),
+            1,
+            "{ace_type}"
+        );
+    }
+    // 種類の分からない ACE・SID が読めない ACE。
+    for (ace_type, sid) in [(0x7Fu8, ""), (0, "")] {
+        let mut aces = default_root_aces();
+        aces.push(ObservedAce {
+            ace_type,
+            flags: 0,
+            mask: READ_EXECUTE_ACCESS_MASK,
+            sid: sid.to_string(),
+        });
+        assert_eq!(
+            root_dacl_problems(&root_security(ADMINISTRATORS_SID, Some(aces))).len(),
+            1,
+            "{ace_type}"
+        );
+    }
+}
+
+/// ルートが露出していれば、`tls\` を開きも作りもせずに断る（`--renew` でも）。既定の形の
+/// ルートは通る。
+#[test]
+fn refuses_an_exposed_root_without_opening_the_tls_dir() {
+    let cases: Vec<DirEdit> = vec![
+        Box::new(|e| e.aces.push(ace(USERS, 0x0000_0040, 0x13))),
+        Box::new(|e| e.aces.push(ace(USERS, 0x0001_0000, 0x00))),
+        Box::new(|e| e.aces.push(ace("S-1-1-0", 0x1000_0000, 0x03))),
+        Box::new(|e| e.owner = ME.to_string()),
+    ];
+    for edit in cases {
+        for (renew, tls_exists) in [(false, true), (true, true), (false, false)] {
+            let (ops, _identity) = FakeOps::with_identity();
+            let mut entry = DirEntry::owned_by(ADMINISTRATORS_SID);
+            entry.aces = default_root_aces();
+            edit(&mut entry);
+            ops.dirs.borrow_mut().insert(root(), entry);
+            if !tls_exists {
+                ops.dirs.borrow_mut().remove(&tls());
+            }
+            let lines = assert_refused_without_writes(&ops, renew, "Hub のルート");
+            assert!(has(&lines, "保護されていません"), "{lines:#?}");
+            assert!(has(&lines, "何も変えずに止めます"), "{lines:#?}");
+            assert!(
+                !ops.calls().iter().any(|c| c.contains("tls")),
+                "{:#?}",
+                ops.calls()
+            );
+        }
+    }
+
+    let (ops, _identity) = FakeOps::with_identity();
+    let mut entry = DirEntry::owned_by(ADMINISTRATORS_SID);
+    entry.aces = default_root_aces();
+    ops.dirs.borrow_mut().insert(root(), entry);
+    let (result, lines) = run(&ops, false);
+    assert_eq!(result, Ok(()), "{lines:#?}");
 }
 
 // --- 手順: 書く途中の失敗 ------------------------------------------------------------
