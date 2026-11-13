@@ -9,7 +9,7 @@
 //!
 //! ## 固定アクション（[`ElevatedAction`]）
 //!
-//! `banto-hub-elev.exe <action> [args...]`が受け付けるのは次の10種類のみ -
+//! `banto-hub-elev.exe <action> [args...]`が受け付けるのは次の11種類のみ -
 //! フリーフォームのコマンド文字列は一切受け付けない（UAC 昇格した管理者
 //! プロセスに任意コマンドを渡させないためのセキュリティ境界、実装指示の
 //! 「固定アクション」要求そのもの）。**2026-08-31 追加の2種類
@@ -29,6 +29,7 @@
 //! | `reset-password`             | `<username> [profile-id]` - 対象 profile の DB を開き、指定ユーザーのパスワードを標準入力から読んだ新パスワードへ再設定する（下記「ロックダウン回復アクション」節） |
 //! | `revert-to-commissioning`    | `[profile-id]` - 対象 profile をロックダウン済み→試運転モードへ戻す（[`crate::commissioning::revert_to_commissioning`]、下記「ロックダウン回復アクション」節） |
 //! | `prepare-sink-config`        | 引数なし - banto-hub-sink の設定ファイルの置き場 `%ProgramData%\BantoHub\sink\` を確かめ終えてから SYSTEM・Administrators だけに整え、中の設定ファイルの所有者・ACL を整え直し、`.example` を差し替える（[`crate::sink_config_prepare`]、#630 PR-2） |
+//! | `prepare-hub-tls`            | `[--renew]` - Hub の loopback TLS の鍵と証明書を `%ProgramData%\BantoHub\tls\` に、作るのと同時に保護された DACL を付けて作る。既にあれば確かめて保つ（壊れている・期限切れ・片方だけ・露出していれば断る）。`--renew` で作り直す（[`crate::hub_tls_prepare`]、#644 PR1a） |
 //!
 //! ## ロックダウン回復アクション（`reset-password`/`revert-to-commissioning`、
 //! 2026-08-31 オーナー決定・docs/tag-server-design.md §5.6 制約3/4）
@@ -235,7 +236,7 @@ use thiserror::Error;
 /// `banto-hub-elev.exe <action>`が受け付ける固定アクション。
 ///
 /// フリーフォームの文字列は受け付けない（[`ElevatedAction::parse`]は既知の
-/// 10種類以外`None`を返す）- モジュール doc の「固定アクション」節参照。
+/// 11種類以外`None`を返す）- モジュール doc の「固定アクション」節参照。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElevatedAction {
     SetupOperators,
@@ -252,6 +253,9 @@ pub enum ElevatedAction {
     /// #630 PR-2（2026-10-17）: banto-hub-sink の設定ファイルの置き場を整える
     /// （[`crate::sink_config_prepare`]）。引数なし。
     PrepareSinkConfig,
+    /// #644 PR1a（2026-11-13）: Hub の loopback TLS の鍵と証明書を作る・確かめる
+    /// （[`crate::hub_tls_prepare`]）。引数は無しか`--renew`だけ。
+    PrepareHubTls,
 }
 
 impl ElevatedAction {
@@ -265,10 +269,11 @@ impl ElevatedAction {
     pub const RESET_PASSWORD: &'static str = "reset-password";
     pub const REVERT_TO_COMMISSIONING: &'static str = "revert-to-commissioning";
     pub const PREPARE_SINK_CONFIG: &'static str = "prepare-sink-config";
+    pub const PREPARE_HUB_TLS: &'static str = "prepare-hub-tls";
 
     /// [`ElevatedAction::as_str`]が返しうる全文字列 - CLI のヘルプ表示・
     /// エラーメッセージ用（`bin/banto-hub-elev.rs`参照）。
-    pub const ALL_NAMES: [&'static str; 10] = [
+    pub const ALL_NAMES: [&'static str; 11] = [
         Self::SETUP_OPERATORS,
         Self::GRANT_SERVICE_ACL,
         Self::GRANT_PROFILE_ACL,
@@ -279,6 +284,7 @@ impl ElevatedAction {
         Self::RESET_PASSWORD,
         Self::REVERT_TO_COMMISSIONING,
         Self::PREPARE_SINK_CONFIG,
+        Self::PREPARE_HUB_TLS,
     ];
 
     /// 大文字小文字を区別する完全一致のみ受け付ける（セキュリティ境界 -
@@ -296,6 +302,7 @@ impl ElevatedAction {
             Self::RESET_PASSWORD => Some(Self::ResetPassword),
             Self::REVERT_TO_COMMISSIONING => Some(Self::RevertToCommissioning),
             Self::PREPARE_SINK_CONFIG => Some(Self::PrepareSinkConfig),
+            Self::PREPARE_HUB_TLS => Some(Self::PrepareHubTls),
             _ => None,
         }
     }
@@ -312,6 +319,7 @@ impl ElevatedAction {
             Self::ResetPassword => Self::RESET_PASSWORD,
             Self::RevertToCommissioning => Self::REVERT_TO_COMMISSIONING,
             Self::PrepareSinkConfig => Self::PREPARE_SINK_CONFIG,
+            Self::PrepareHubTls => Self::PREPARE_HUB_TLS,
         }
     }
 }
@@ -460,6 +468,13 @@ pub enum ElevatedError {
         ElevatedAction::PREPARE_SINK_CONFIG
     )]
     SinkConfigRefused,
+    /// `prepare-hub-tls` が確かめで断った・書けなかった（#644 PR1a。理由の行は
+    /// [`crate::hub_tls_prepare`] が先に出している）。
+    #[error(
+        "banto-hub-elev: '{}' を中止しました（理由は上の行）",
+        ElevatedAction::PREPARE_HUB_TLS
+    )]
+    HubTlsRefused,
     /// `reset-password`・`revert-to-commissioning`の対象の profile を決められない
     /// （profile-id の許可リスト・マシンの環境のルート。#626 の論点 8）。
     #[error(transparent)]
@@ -1020,8 +1035,9 @@ fn revert_to_commissioning_action(profile_id: Option<&str>) -> Result<(), Elevat
 /// できない）、`reset-password`は1〜2個の`<username> [profile-id]`
 /// （`username`は省略不可 - モジュール doc「ロックダウン回復アクション」
 /// 節参照。新パスワードは引数ではなく標準入力から読む）、
-/// `revert-to-commissioning`は0〜1個の`[profile-id]`を受け付け、他の4
-/// アクションは追加引数を受け付けない - モジュール doc の action 表参照）。
+/// `revert-to-commissioning`は0〜1個の`[profile-id]`、`prepare-hub-tls`は無しか
+/// `--renew`だけ（[`crate::hub_tls_prepare::parse_args`]）を受け付け、他のアクションは
+/// 追加引数を受け付けない - モジュール doc の action 表参照）。
 #[cfg(windows)]
 pub fn run(action: ElevatedAction, args: &[String]) -> Result<(), ElevatedError> {
     match action {
@@ -1086,7 +1102,22 @@ pub fn run(action: ElevatedAction, args: &[String]) -> Result<(), ElevatedError>
             reject_extra_args(action, args)?;
             prepare_sink_config()
         }
+        ElevatedAction::PrepareHubTls => {
+            let renew =
+                crate::hub_tls_prepare::parse_args(args).map_err(ElevatedError::InvalidArgs)?;
+            prepare_hub_tls(renew)
+        }
     }
+}
+
+/// [`ElevatedAction::PrepareHubTls`]の本体（#644 PR1a）。確かめ終えてから Hub の loopback TLS の
+/// 鍵と証明書を作る・保つ・（`renew`なら）作り直す（[`crate::hub_tls_prepare::prepare_hub_tls`]）。
+#[cfg(windows)]
+pub fn prepare_hub_tls(renew: bool) -> Result<(), ElevatedError> {
+    use crate::hub_tls_prepare::{self, win::WindowsHubTlsOps};
+    let mut out = print_line;
+    hub_tls_prepare::prepare_hub_tls(&WindowsHubTlsOps, renew, &mut out)
+        .map_err(|_| ElevatedError::HubTlsRefused)
 }
 
 /// [`ElevatedAction::PrepareSinkConfig`]の本体（#630 PR-2）。確かめ終えてから置き場・設定
@@ -1365,6 +1396,10 @@ mod tests {
             ElevatedAction::parse("prepare-sink-config"),
             Some(ElevatedAction::PrepareSinkConfig)
         );
+        assert_eq!(
+            ElevatedAction::parse("prepare-hub-tls"),
+            Some(ElevatedAction::PrepareHubTls)
+        );
     }
 
     #[test]
@@ -1396,7 +1431,7 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), original_len, "ALL_NAMES に重複がある");
-        assert_eq!(original_len, 10, "固定アクションは10種類のはず");
+        assert_eq!(original_len, 11, "固定アクションは11種類のはず");
     }
 
     #[test]
@@ -1614,6 +1649,21 @@ mod tests {
         ] {
             let err = run(action, &extra).expect_err("extra args should be rejected");
             assert!(matches!(err, ElevatedError::InvalidArgs(_)));
+        }
+    }
+
+    /// `prepare-hub-tls`は無しか`--renew`だけ - それ以外は OS に触る前に弾く（#644 PR1a）。
+    #[cfg(windows)]
+    #[test]
+    fn run_rejects_other_args_for_prepare_hub_tls() {
+        for args in [
+            vec!["--force".to_string()],
+            vec!["--renew".to_string(), "--renew".to_string()],
+            vec!["--RENEW".to_string()],
+        ] {
+            let err = run(ElevatedAction::PrepareHubTls, &args)
+                .expect_err("prepare-hub-tls accepts only --renew");
+            assert!(matches!(err, ElevatedError::InvalidArgs(_)), "{args:?}");
         }
     }
 

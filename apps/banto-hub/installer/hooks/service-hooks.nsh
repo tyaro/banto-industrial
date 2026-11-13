@@ -188,6 +188,15 @@
 ;     docs/banto-hub-operations.md §12「サイドカーの初回セットアップ」）。sink の `install`・
 ;     `grant-service-acl` の後、サービスの再開の前に呼ぶ（再開した sink が新しい
 ;     置き場を読むように）。
+; (4b) `banto-hub-elev.exe prepare-hub-tls`（#644 PR1a、2026-11-13 オーナー決定 1〜3）:
+;     Hub の loopback TLS の鍵（ECDSA P-256）と自己署名の証明書（10 年）を
+;     `%ProgramData%\BantoHub\tls\` に、作るのと同時に保護された DACL を付けて作る
+;     （置き場と証明書は Users が読み取りだけ、鍵は SYSTEM・Administrators だけ）。
+;     **引数なし**で呼ぶので、既にあれば確かめて保つ（再インストールで作り直さない
+;     - 作り直しは管理者が `--renew` を明示する）。壊れている・期限切れ・片方だけ・
+;     露出しているなら elev が断る（終了コード 1）が、インストールは止めない
+;     （prepare-sink-config と同じく DetailPrint で手動の実行を案内する）。サービスの
+;     再開の前に呼ぶ（Hub のサービスがこれを読んで待ち受けるのは #644 PR1b から）。
 ; (5) PREINSTALL で止めたものだけ `sc start` で再開する（Hub → Sink の順、
 ;     §4.3「起動していたものだけ再開」）。**新規インストールでは
 ;     $BantoHubWasRunning/$SinkWasRunning が未設定のままなので何も
@@ -702,6 +711,16 @@ Var RestoreSaved3
     DetailPrint "banto-hub: サイドカーの設定ファイルの置き場を整え、雛形 (banto-hub-sink.toml.example) を置きました。管理者のメモ帳で雛形をコピーして banto-hub-sink.toml を作り、編集の後に prepare-sink-config をもう一度実行してください。"
   ${EndIf}
 
+  ; (4b) #644 PR1a: Hub の loopback TLS の鍵と証明書を elev が確かめてから作る・保つ
+  ; （モジュール doc「POSTINSTALL」節参照）。引数なし（--renew は管理者が手で）。
+  DetailPrint "banto-hub: Hub の loopback TLS の鍵と証明書 (%ProgramData%\BantoHub\tls) を確かめています..."
+  ExecWait '"$INSTDIR\banto-hub-elev.exe" prepare-hub-tls' $0
+  ${If} $0 != 0
+    DetailPrint "banto-hub: prepare-hub-tls に失敗しました（終了コード $0）。理由を確かめてから、管理者権限の PowerShell で手動で次を実行してください: $\"$INSTDIR\banto-hub-elev.exe$\" prepare-hub-tls （壊れている・期限切れなら --renew を付けて作り直し、証明書を pin しているクライアントを書き換える。docs/banto-hub-operations.md「Hub–Sink 専用 loopback TLS（#644）」参照）"
+  ${Else}
+    DetailPrint "banto-hub: Hub の loopback TLS の鍵と証明書を確かめました（無ければ作りました。既存は保ちます）。"
+  ${EndIf}
+
   ; #630（#655 のレビュー Should 2）: 旧い置き場（ルート直下・exe の隣）に設定ファイルが
   ; 残っていれば、この版の sink は読まずに起動しない。上書きインストールで (5) が sink を
   ; 再開しても、すぐ止まるので、インストーラの詳細に移し方を残す。パスは (4) の旧い処理と
@@ -875,8 +894,8 @@ Var RestoreSaved3
     StrCpy $BantoHubUnregistered "1"
   ${EndIf}
 
-  ; %ProgramData%\BantoHub\（DB・サイドカー設定・サービスログ）は
-  ; 意図的に削除しない（§4.5・§7 決定7 - 再インストールで設定・データが
+  ; %ProgramData%\BantoHub\（DB・サイドカー設定・サービスログ・Hub の loopback TLS の
+  ; 鍵と証明書 tls\ - #644 PR1a）は意図的に削除しない（§4.5・§7 決定7 - 再インストールで設定・データが
   ; 戻ることを優先する）。完全削除は docs の手順に従い利用者が手動で行う。
 !macroend
 
