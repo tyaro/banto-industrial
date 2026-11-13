@@ -226,7 +226,16 @@ struct FakeOps {
     rename_error: HashMap<String, String>,
     /// 作ろうとすると「既にあった」になる名前（確かめた後に誰かが作った形）。
     create_exists: Vec<String>,
+    /// 直列化の mutex の状態（既定は取れる）。
+    lock: LockState,
     log: Log,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum LockState {
+    Free,
+    Held,
+    Error,
 }
 
 impl FakeOps {
@@ -249,6 +258,7 @@ impl FakeOps {
             remove_error: HashMap::new(),
             rename_error: HashMap::new(),
             create_exists: Vec::new(),
+            lock: LockState::Free,
             log: Rc::new(RefCell::new(Vec::new())),
         }
     }
@@ -302,7 +312,16 @@ impl HubTlsOps for FakeOps {
     type Env = FakeEnv;
     type Dir = FakeDir;
     type File = FakeFile;
+    type Lock = ();
 
+    fn hold_lock(&self) -> Result<Option<()>, String> {
+        self.log.borrow_mut().push("lock".to_string());
+        match self.lock {
+            LockState::Free => Ok(Some(())),
+            LockState::Held => Ok(None),
+            LockState::Error => Err("拒否されました".to_string()),
+        }
+    }
     fn machine_env(&self) -> &FakeEnv {
         &self.env
     }
@@ -1129,5 +1148,26 @@ fn refuses_when_a_temporary_appears_after_the_checks() {
     let (result, _lines) = run(&ops, false);
     assert_eq!(result, Err(Refused));
     assert_eq!(ops.writes().last().unwrap(), "WRITE remove hub-key.pem.new");
+    assert!(ops.file_names().is_empty());
+}
+
+#[test]
+fn refuses_without_touching_anything_when_another_run_holds_the_lock() {
+    let mut ops = FakeOps::new();
+    ops.lock = LockState::Held;
+    let lines = assert_refused_without_writes(&ops, false, "別の prepare-hub-tls が実行中");
+    assert!(has(&lines, "何も変えていません"), "{lines:#?}");
+    // mutex を取りに行っただけで、フォルダは何も開いていない。
+    assert_eq!(ops.calls(), vec!["lock".to_string()]);
+    assert!(ops.file_names().is_empty());
+}
+
+#[test]
+fn refuses_without_touching_anything_when_the_lock_cannot_be_taken() {
+    let mut ops = FakeOps::new();
+    ops.lock = LockState::Error;
+    let lines = assert_refused_without_writes(&ops, true, "を取れませんでした");
+    assert!(has(&lines, "拒否されました"), "{lines:#?}");
+    assert_eq!(ops.calls(), vec!["lock".to_string()]);
     assert!(ops.file_names().is_empty());
 }

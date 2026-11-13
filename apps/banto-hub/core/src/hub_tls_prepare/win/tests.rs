@@ -66,7 +66,12 @@ impl HubTlsOps for TempOps {
     type Env = TempEnv;
     type Dir = WinTlsDir;
     type File = banto_safe_root::acl::PinnedFile;
+    /// 本物の名前付き mutex はテスト同士（並列）で取り合うので、ここでは取らない。
+    type Lock = ();
 
+    fn hold_lock(&self) -> Result<Option<()>, String> {
+        Ok(Some(()))
+    }
     fn machine_env(&self) -> &TempEnv {
         &self.env
     }

@@ -55,6 +55,10 @@
 //!   （`banto_safe_root::ManagedDir::rename_no_replace`）。途中で落ちて一時名が残っても、次の
 //!   実行が確かめの後に消す（鍵が付け替わって証明書が一時名のまま残ったときは「片方だけ」で
 //!   断るので、`--renew` で作り直す）。
+//! - **直列化**（Codex P2）: 実行全体（preflight の後、ルートを開く前から最後まで）をプロセスを
+//!   またぐ名前付き mutex（[`LOCK_NAME`]）で直列化する。重なると、片方が他方の作りかけの一時名を
+//!   「前回の残り」として消し、鍵と証明書が別々の実行のものになり得るため。持たれていれば何も
+//!   変えずに断る。
 //! - ルートの DACL は書かない（`prepare-sink-config` と同じ。`profiles\` を巻き込まない）。
 //!   既にある `tls\` の DACL も書き直さない（確かめて、合わなければ断る）。
 //!
@@ -95,6 +99,9 @@ pub mod win;
 
 /// 置き場のフォルダ名。
 pub const TLS_DIR: &str = "tls";
+
+/// 実行全体を直列化する名前付き mutex の名前。
+pub const LOCK_NAME: &str = r"Global\BantoHub.prepare-hub-tls";
 
 /// 証明書（PEM。利用者は読み取りだけ）。
 pub const CERT_FILE: &str = "hub-cert.pem";
@@ -381,7 +388,11 @@ pub trait HubTlsOps {
     type Dir: TlsDir;
     /// [`HubTlsOps::open_child_file`] が返すもの。
     type File: TlsFile;
+    /// [`HubTlsOps::hold_lock`] が返す、持っている間だけ有効なもの（drop で離す）。
+    type Lock;
 
+    /// [`LOCK_NAME`] の名前付き mutex を取る（既に誰かが持っていれば `Ok(None)`）。
+    fn hold_lock(&self) -> Result<Option<Self::Lock>, String>;
     fn machine_env(&self) -> &Self::Env;
     /// このプロセスのトークンの利用者の SID（所有者として許す）。
     fn current_user_sid(&self) -> Result<InstallUserSid, String>;
@@ -617,6 +628,21 @@ fn run<O: HubTlsOps>(
     created: &mut Created,
 ) -> Result<(), String> {
     let plan = preflight(ops)?;
+    // 実行全体を直列化する。最後まで持つ（ローカルの drop は宣言の逆順なので、下で開く
+    // フォルダのハンドルを閉じた後に離す）。
+    let _lock = match ops.hold_lock() {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            return Err(format!(
+                "別の prepare-hub-tls が実行中です（{LOCK_NAME}）。終わってから、もう一度実行してください。何も変えていません"
+            ))
+        }
+        Err(error) => {
+            return Err(format!(
+                "{LOCK_NAME} を取れませんでした: {error}。何も変えていません"
+            ))
+        }
+    };
     let tls_path = plan.root.join(TLS_DIR);
 
     // --- ルート（辿らずに開く。無ければ親を確かめてから、親のハンドル基準で作る） ------

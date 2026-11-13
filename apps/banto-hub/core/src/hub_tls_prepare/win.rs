@@ -70,6 +70,11 @@ impl HubTlsOps for WindowsHubTlsOps {
     type Env = RegistryMachineEnvironment;
     type Dir = WinTlsDir;
     type File = PinnedFile;
+    type Lock = banto_instance_lock::NamedMutexGuard;
+
+    fn hold_lock(&self) -> Result<Option<Self::Lock>, String> {
+        banto_instance_lock::try_hold_named_mutex(super::LOCK_NAME).map_err(|err| err.to_string())
+    }
 
     fn machine_env(&self) -> &RegistryMachineEnvironment {
         &RegistryMachineEnvironment

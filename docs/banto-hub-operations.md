@@ -2087,6 +2087,9 @@ cargo run --manifest-path apps/banto-hub/installer/Cargo.toml --release -- targe
   `--renew` で作り直してください。
 - 鍵・証明書・一時名（`hub-key.pem.new`・`hub-cert.pem.new`）がフォルダや
   リンクのときも断ります。
+- **別の `prepare-hub-tls` が実行中**（名前付き mutex `Global\BantoHub.prepare-hub-tls`
+  が取れない）: 何も変えずに断ります。重なると互いの作りかけの一時名を消して、鍵と
+  証明書が別々の実行のものになり得るためです。終わってから、もう一度実行してください。
 
 `--renew`（作り直し）:
 
