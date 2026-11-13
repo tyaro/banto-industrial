@@ -35,6 +35,8 @@
 //! クライアントの入口は [`load_pinned_hub_cert`]: 上の後、証明書だけを開いて
 //! `exposure_beyond_users_read` を確かめ、PEM に証明書がちょうど 1 つで DER として解析できる
 //! ことを確かめて、PEM のバイト列と本当のパスを返す（[`HubCertPin`]）。
+//! クライアントの Windows の実装（`win::WindowsTlsTrustOps`）はフォルダを**読み取り専用**の pin
+//! （`WRITE_DAC | WRITE_OWNER` を求めない）で開く。一般利用者（昇格なし）でも動くため。
 //!
 //! ## なぜ鍵を読まないか
 //!

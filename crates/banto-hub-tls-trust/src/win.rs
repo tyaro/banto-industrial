@@ -2,6 +2,12 @@
 //! この crate に複製しない）: 辿らずに開くのは `acl::PinnedDir`。フォルダは、banto-hub-core の
 //! `prepare-hub-tls` が削除・付け替えに `ManagedDir` の口を使うため、[`ManagedDir::from_pinned`]
 //! で包んで持つ（[`WinTlsDir`]。中身は常に辿らずに握ったハンドル）。
+//!
+//! フォルダの開き方は 2 つ。クライアント（[`WindowsTlsTrustOps`]）は**読み取り専用**の pin
+//! （[`pin_dir_read_only`]・[`open_child_dir_read_only`]。`WRITE_DAC | WRITE_OWNER` を求めない）で
+//! 開く: 一般利用者（昇格なし）のデスクトップでも動くため（ルート・`tls\` に `WRITE_DAC` を持た
+//! ない）。Hub（banto-hub-core の `WindowsHubTlsOps`。SYSTEM・昇格した管理者）は今までどおり
+//! DACL を書ける pin（[`pin_dir_for_hub`]・[`open_child_dir_for_hub`]）で開く。
 
 use std::path::{Path, PathBuf};
 
@@ -12,8 +18,9 @@ use banto_safe_root::{ManagedDir, SafeRootError};
 use crate::text::secret_error_text;
 use crate::{FileOpenError, TlsDir, TlsFile, TlsTrustOps};
 
-/// 本番の読み取りの操作（クライアント用。サービスの Hub は banto-hub-core の
-/// `WindowsHubTlsOps` が同じ部品で同じことをする）。
+/// 本番の読み取りの操作（クライアント用。フォルダは読み取り専用の pin で開くので、一般利用者
+/// でも動く）。サービスの Hub は banto-hub-core の `WindowsHubTlsOps` が同じ部品で同じことを
+/// する（フォルダは DACL を書ける pin）。
 pub struct WindowsTlsTrustOps;
 
 /// 辿らずに開いたフォルダ。
@@ -73,18 +80,42 @@ impl TlsFile for PinnedFile {
 /// `ERROR_SHARING_VIOLATION`。
 const ERROR_SHARING_VIOLATION: i32 = 32;
 
-/// 辿らずに開く（無ければ `Ok(None)`）。
-pub fn pin_dir(dir: &Path) -> Result<Option<WinTlsDir>, String> {
+/// Hub 用: DACL・所有者を書ける権利（`banto_safe_root::acl::pin_dir`）で辿らずに開く（無ければ
+/// `Ok(None)`）。一般利用者では開けない（ルートに `WRITE_DAC` を持たない）ので、クライアントは
+/// [`pin_dir_read_only`] を使う。
+pub fn pin_dir_for_hub(dir: &Path) -> Result<Option<WinTlsDir>, String> {
     banto_safe_root::acl::pin_dir(dir)
         .map(|found| found.map(WinTlsDir::new))
         .map_err(|err| err.to_string())
 }
 
-/// `parent` のハンドル基準に、名前 1 要素の子のフォルダを辿らずに開く。
-pub fn open_child_dir(parent: &WinTlsDir, name: &str) -> Result<Option<WinTlsDir>, String> {
+/// Hub 用: `parent` のハンドル基準に、名前 1 要素の子のフォルダを DACL・所有者を書ける権利で
+/// 辿らずに開く。
+pub fn open_child_dir_for_hub(parent: &WinTlsDir, name: &str) -> Result<Option<WinTlsDir>, String> {
     parent
         .pinned()
         .open_child_dir(name)
+        .map(|found| found.map(WinTlsDir::new))
+        .map_err(|err| err.to_string())
+}
+
+/// クライアント用: 読み取り専用の pin（`banto_safe_root::acl::pin_dir_read_only`）で辿らずに
+/// 開く（無ければ `Ok(None)`）。持っている間は名前の変更・削除を止める。
+pub fn pin_dir_read_only(dir: &Path) -> Result<Option<WinTlsDir>, String> {
+    banto_safe_root::acl::pin_dir_read_only(dir)
+        .map(|found| found.map(WinTlsDir::new))
+        .map_err(|err| err.to_string())
+}
+
+/// クライアント用: `parent` のハンドル基準に、名前 1 要素の子のフォルダを読み取り専用の pin で
+/// 辿らずに開く。
+pub fn open_child_dir_read_only(
+    parent: &WinTlsDir,
+    name: &str,
+) -> Result<Option<WinTlsDir>, String> {
+    parent
+        .pinned()
+        .open_child_dir_read_only(name)
         .map(|found| found.map(WinTlsDir::new))
         .map_err(|err| err.to_string())
 }
@@ -116,11 +147,11 @@ impl TlsTrustOps for WindowsTlsTrustOps {
     }
 
     fn pin_dir(&self, dir: &Path) -> Result<Option<WinTlsDir>, String> {
-        pin_dir(dir)
+        pin_dir_read_only(dir)
     }
 
     fn open_child_dir(&self, parent: &WinTlsDir, name: &str) -> Result<Option<WinTlsDir>, String> {
-        open_child_dir(parent, name)
+        open_child_dir_read_only(parent, name)
     }
 
     fn open_child_file(

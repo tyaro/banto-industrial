@@ -20,7 +20,8 @@ pub use banto_hub_tls_trust::win::WinTlsDir;
 /// 本番の操作。
 pub struct WindowsHubTlsOps;
 
-/// 開く・読む操作は共有 crate の実装（クライアントと同じ。#644 PR3a）。
+/// 開く・読む操作は共有 crate の実装（#644 PR3a）。フォルダは DACL・所有者を書ける pin
+/// （`*_for_hub`。クライアントの `WindowsTlsTrustOps` は読み取り専用の pin）。
 impl TlsTrustOps for WindowsHubTlsOps {
     type Env = RegistryMachineEnvironment;
     type Dir = WinTlsDir;
@@ -31,11 +32,11 @@ impl TlsTrustOps for WindowsHubTlsOps {
     }
 
     fn pin_dir(&self, dir: &Path) -> Result<Option<WinTlsDir>, String> {
-        trust::pin_dir(dir)
+        trust::pin_dir_for_hub(dir)
     }
 
     fn open_child_dir(&self, parent: &WinTlsDir, name: &str) -> Result<Option<WinTlsDir>, String> {
-        trust::open_child_dir(parent, name)
+        trust::open_child_dir_for_hub(parent, name)
     }
 
     fn open_child_file(
