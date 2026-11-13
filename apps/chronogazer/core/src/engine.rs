@@ -1232,11 +1232,18 @@ impl OpenedEngine {
             }
         }
         let collect = match service_data_dir {
+            // #623 PR4: tstore の日付ファイルは、設定 DB と同じ記述子の形（`DbPin::InRoot` の
+            // `expected`。サービスの本番は運用モードの形で、`open_relative_operation_dir` が
+            // `data.dir` を確かめた形と同じ）で握る。`DbPin::Off` なら確かめずに握る。
             Some(held) => CollectorService::new_for_service(
                 pool.clone(),
                 collect_data_dir,
                 cfg.drivers.clone(),
                 held,
+                match &cfg.db_pin {
+                    DbPin::InRoot { expected } => expected.clone(),
+                    DbPin::Off => None,
+                },
             ),
             None => CollectorService::new(pool.clone(), collect_data_dir, cfg.drivers.clone()),
         };

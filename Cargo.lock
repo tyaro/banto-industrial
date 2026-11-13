@@ -1197,7 +1197,9 @@ dependencies = [
 name = "banto-tstore"
 version = "0.3.0-alpha.2"
 dependencies = [
+ "banto-safe-root",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.21",
  "time",
  "tokio",

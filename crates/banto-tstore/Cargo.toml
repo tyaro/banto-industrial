@@ -31,6 +31,13 @@ tokio = { workspace = true, features = ["sync"] }
 # UTC-epoch-ms <-> proleptic-Gregorian-date conversion itself is done with
 # plain integer math in `date.rs`, no crate needed for that part).
 time = { version = "0.3", default-features = false, features = ["local-offset"] }
+# #623 PR4: 書き手の置き場を「握ったフォルダ」（`ManagedDir`）でも受け、日付ファイルの
+# 本体・`-wal`・`-shm` を `pin_sqlite(_checked)` で握ったまま開く・列挙と保持期間の削除も
+# 握ったハンドル基準で行う（`place.rs`）。`sqlite` feature は `PinnedSqlite`（握ったまま
+# PERSIST_WAL で開く口）のため。banto-safe-root はこの crate にも banto-collect にも依存
+# しない（循環しない）。sqlx・libsqlite3-sys は既にある版で、新しい package は増えない。
+banto-safe-root = { path = "../banto-safe-root", features = ["sqlite"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile = { workspace = true }

@@ -61,6 +61,10 @@
 //! `prune_files` と同じ削除判定をファイルに触れずに返すプレビュー
 //! （banto-hub T19 S2-d、UX-39）。
 //!
+//! [`place`][]: [`place::DataPlace`] - 書き手の置き場。パスか、握ったフォルダ
+//! （`banto_safe_root::root::ManagedDir`。日付ファイルの本体・`-wal`・`-shm` を握ったまま
+//! 開き、列挙・保持期間の削除も握ったハンドル基準。#623 PR4。ChronoGazer のサービスが使う）。
+//!
 //! [`findable`][]: 記録時刻とファイル日付の契約（#424、2026-09-24 オーナー
 //! 決定）。[`findable::ptime_is_findable_in`] は「その時刻の行をその日付の
 //! ファイルに置けば、その時刻を含むどの検索範囲でも読み出し側
@@ -78,6 +82,7 @@ pub mod error;
 pub mod files;
 pub mod findable;
 pub mod meta;
+pub mod place;
 pub mod reader;
 pub mod schema;
 #[cfg(test)]
@@ -94,5 +99,6 @@ pub use files::{
 };
 pub use findable::{candidate_date_range, ptime_is_findable_in, MAX_OFFSET_PAD_MS};
 pub use meta::{ColumnMeta, GroupMeta};
+pub use place::{prune_managed_files_with, DataPlace};
 pub use reader::{Sample, TsReader};
 pub use writer::{TsWriter, WriterOptions};

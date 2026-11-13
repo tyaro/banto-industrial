@@ -141,7 +141,7 @@
 //! or back-filling historical data are needed).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -152,10 +152,9 @@ use crate::clock::Clock;
 use crate::config::{compute_config_hash, StoreConfig};
 use crate::date::LocalDate;
 use crate::error::TstoreError;
-use crate::files::{
-    latest_file_for_date, plan_prune_excluding, prune_files_excluding, PruneReport,
-};
+use crate::files::PruneReport;
 use crate::findable::ptime_is_findable_in;
+use crate::place::{DataPlace, WritableFile};
 use crate::schema::{self, column_name_for_index, table_name_for_index};
 
 /// Buffering thresholds - "既定: 1秒 or 500行" (design). Not part of
@@ -218,12 +217,17 @@ struct BufferedRow {
 type DateBuffer = HashMap<String, Vec<BufferedRow>>;
 
 struct Inner {
-    data_dir: PathBuf,
+    /// 置き場（#623 PR4。`crate::place` の doc）。
+    place: DataPlace,
     config: StoreConfig,
     config_hash: String,
     clock: Arc<dyn Clock>,
     options: WriterOptions,
     pool: SqlitePool,
+    /// `pool` のファイルの握り（[`DataPlace::Managed`] のときだけ）。`pool` を閉じ終えた後に
+    /// 離す（日付の切り替え・`close`）。`close` せずに drop したときも `pool` の後に落ちるよう、
+    /// `pool` より後に置く（フィールドは宣言の順に drop される）。
+    pin: Option<banto_safe_root::sqlite::PinnedSqlite>,
     /// 今開いている（`pool` が指す）ファイルの日付。
     current_date: LocalDate,
     #[allow(dead_code)] // kept for diagnostics/future use; not read today
@@ -293,29 +297,45 @@ impl TsWriter {
         clock: Arc<dyn Clock>,
         options: WriterOptions,
     ) -> Result<Self, TstoreError> {
+        Self::open_in(
+            DataPlace::Path(data_dir.to_path_buf()),
+            config,
+            clock,
+            options,
+        )
+        .await
+    }
+
+    /// [`Self::open_with_options`] の置き場を [`DataPlace`] で受ける版（#623 PR4）。
+    /// [`DataPlace::Managed`] なら、日付ファイルの列挙・開く・保持期間の削除を握ったフォルダ
+    /// 基準で行い、開いているファイルの本体・`-wal`・`-shm` を握り続ける（`crate::place` の
+    /// doc）。[`DataPlace::Path`] は `open_with_options` と同じ。
+    pub async fn open_in(
+        place: DataPlace,
+        config: StoreConfig,
+        clock: Arc<dyn Clock>,
+        options: WriterOptions,
+    ) -> Result<Self, TstoreError> {
         config.validate()?;
-        // Tiny, one-shot blocking call (directory creation, not the hot
-        // append path) - not worth pulling in tokio's `fs` feature for
-        // (same reasoning as `files.rs`'s module doc for why that module
-        // stays fully synchronous).
-        std::fs::create_dir_all(data_dir)?;
+        place.prepare()?;
 
         let config_hash = compute_config_hash(&config);
         let now_ms = clock.now_ms();
         let today = LocalDate::from_epoch_ms(now_ms, clock.utc_offset_ms());
-        let (pool, seq) = resolve_file(data_dir, &config, &config_hash, today, now_ms).await?;
+        let (file, seq) = resolve_file(&place, &config, &config_hash, today, now_ms).await?;
         let groups = build_group_runtime(&config);
         let dropped_rows = Arc::new(AtomicU64::new(0));
 
         Ok(Self {
             dropped_rows: dropped_rows.clone(),
             inner: Mutex::new(Inner {
-                data_dir: data_dir.to_path_buf(),
+                place,
                 config,
                 config_hash,
                 clock,
                 options,
-                pool,
+                pool: file.pool,
+                pin: file.pin,
                 current_date: today,
                 current_seq: seq,
                 groups,
@@ -440,20 +460,19 @@ impl TsWriter {
     /// 行き先が無くなる。ここでは**ライターのロックを持ったまま**判定と削除を
     /// するので、判定のあとにライターが別の日付へ切り替わる競合も起きない。
     /// 切り替えが成功して古い日付のファイルを閉じ、その日付の行を書き終えた
-    /// あとの掃除では、通常どおり消せる。削除は同期の `std::fs` で、ロックを
-    /// 持つ時間はファイル数に比例する短さ。
+    /// あとの掃除では、通常どおり消せる。削除は同期の `std::fs`（握ったフォルダの
+    /// 置き場では `ManagedDir::remove` で、付随の `-wal`・`-shm` も消す。
+    /// [`DataPlace::prune_files`]、#623 PR4）で、ロックを持つ時間はファイル数に
+    /// 比例する短さ。
     pub async fn prune_files(
         &self,
         retention_days: u32,
         today: LocalDate,
     ) -> Result<PruneReport, TstoreError> {
         let inner = self.inner.lock().await;
-        prune_files_excluding(
-            &inner.data_dir,
-            retention_days,
-            today,
-            &inner.pinned_dates(),
-        )
+        inner
+            .place
+            .prune_files(retention_days, today, &inner.pinned_dates())
     }
 
     /// Run an alternative directory-backed prune while holding the same
@@ -478,12 +497,9 @@ impl TsWriter {
         today: LocalDate,
     ) -> Result<PruneReport, TstoreError> {
         let inner = self.inner.lock().await;
-        plan_prune_excluding(
-            &inner.data_dir,
-            retention_days,
-            today,
-            &inner.pinned_dates(),
-        )
+        inner
+            .place
+            .plan_prune(retention_days, today, &inner.pinned_dates())
     }
 
     /// 失敗中に溜めてよい量の上限（値のセル数）を変える。主にテスト用。
@@ -516,7 +532,13 @@ impl TsWriter {
                 );
             }
         }
-        inner.pool.close().await;
+        // 握りは pool を閉じ終えた後に離す（#623 PR4）。
+        WritableFile {
+            pool: inner.pool,
+            pin: inner.pin,
+        }
+        .close()
+        .await;
         result
     }
 }
@@ -576,16 +598,14 @@ impl Inner {
 
             self.flush_locked().await?;
             let now_ms = self.clock.now_ms();
-            let (pool, seq) = resolve_file(
-                &self.data_dir,
-                &self.config,
-                &self.config_hash,
-                next,
-                now_ms,
-            )
-            .await?;
-            let old_pool = std::mem::replace(&mut self.pool, pool);
-            old_pool.close().await;
+            let (file, seq) =
+                resolve_file(&self.place, &self.config, &self.config_hash, next, now_ms).await?;
+            let old = WritableFile {
+                pool: std::mem::replace(&mut self.pool, file.pool),
+                pin: std::mem::replace(&mut self.pin, file.pin),
+            };
+            // 前の日付の握りは、その pool を閉じ終えた後に離す（#623 PR4）。
+            old.close().await;
             self.current_date = next;
             self.current_seq = seq;
         }
@@ -802,32 +822,52 @@ fn build_group_runtime(config: &StoreConfig) -> HashMap<String, GroupRuntime> {
 /// freshly-generated schema. Shared by [`TsWriter::open_with_options`] (initial
 /// open) and [`Inner::rotate_if_needed`] (midnight rollover) - see this
 /// module's doc comment on why both go through one function.
+///
+/// #623 PR4: ファイルは `place` で開く（[`DataPlace::Managed`] なら握ってから）。設定の
+/// 不一致で付け替えるとき・スキーマを読めない/作れないときは、開いた pool を閉じ終えてから
+/// 握りを離す（[`WritableFile::close`]）。
 async fn resolve_file(
-    data_dir: &Path,
+    place: &DataPlace,
     config: &StoreConfig,
     config_hash: &str,
     date: LocalDate,
     created_at_ms: i64,
-) -> Result<(SqlitePool, u32), TstoreError> {
-    if let Some(existing) = latest_file_for_date(data_dir, date)? {
-        let pool = schema::connect_writable(&existing.path).await?;
-        let file_meta = schema::read_file_meta(&pool).await?;
-        if file_meta.config_hash == config_hash {
-            return Ok((pool, existing.seq));
+) -> Result<(WritableFile, u32), TstoreError> {
+    let seq = match place.latest_file_for_date(date)? {
+        Some(existing) => {
+            let name = existing
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("一覧から選んだ名前は UTF-8")
+                .to_string();
+            let file = place.open_writable(&name).await?;
+            let file_meta = match schema::read_file_meta(&file.pool).await {
+                Ok(meta) => meta,
+                Err(err) => {
+                    file.close().await;
+                    return Err(err);
+                }
+            };
+            if file_meta.config_hash == config_hash {
+                return Ok((file, existing.seq));
+            }
+            file.close().await;
+            existing.seq + 1
         }
-        pool.close().await;
+        None => 1,
+    };
 
-        let next_seq = existing.seq + 1;
-        let path = data_dir.join(schema::data_file_name(date, next_seq));
-        let pool = schema::connect_writable(&path).await?;
-        schema::create_schema(&pool, config, config_hash, date, created_at_ms).await?;
-        return Ok((pool, next_seq));
+    let file = place
+        .open_writable(&schema::data_file_name(date, seq))
+        .await?;
+    if let Err(err) =
+        schema::create_schema(&file.pool, config, config_hash, date, created_at_ms).await
+    {
+        file.close().await;
+        return Err(err);
     }
-
-    let path = data_dir.join(schema::data_file_name(date, 1));
-    let pool = schema::connect_writable(&path).await?;
-    schema::create_schema(&pool, config, config_hash, date, created_at_ms).await?;
-    Ok((pool, 1))
+    Ok((file, seq))
 }
 
 #[cfg(test)]
@@ -837,6 +877,7 @@ mod tests {
     use crate::config::{GroupConfig, TagColumn};
     use crate::files::list_data_files;
     use crate::reader::TsReader;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
