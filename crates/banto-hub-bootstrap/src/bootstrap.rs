@@ -1787,4 +1787,305 @@ mod tests {
             );
         }
     }
+    // ---- #644 受入条件 4: 1 つのポートが Hub の一生を通す場面 ----
+    //
+    // `SwitchPort` は 127.0.0.1 のポートを試験の間ずっと持ち、Hub の停止・先取り・
+    // 復帰・証明書の更新を、同じ URL（= 同じ keyring の口座名）のまま再現する。
+
+    use banto_hub_squat_harness::{Mode, ModeKind, SwitchPort, TestIdentity};
+
+    const SQUAT_KEY: &str = "bh_squatdummy.6f1c2a9e0d4b7381";
+
+    fn squat_routes() -> HashMap<String, Vec<Reply>> {
+        routes(vec![
+            (STATUS_ROUTE, vec![(200, commissioning_body(false))]),
+            (ISSUE_ROUTE, vec![(201, issued_body(42, "n", SQUAT_KEY))]),
+            (TAGS_ROUTE, vec![(200, catalog_body(1))]),
+        ])
+    }
+
+    /// `SwitchPort` の URL を endpoint にしたときの keyring の口座名。
+    fn squat_account(port: &SwitchPort) -> String {
+        keyring_account(&base_url(&port.https_url()).unwrap(), INSTALLATION)
+    }
+
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !done() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "timed out waiting for {what}");
+    }
+
+    fn pinned_to(
+        identity: &TestIdentity,
+        keys: &Arc<MemoryKeyStore>,
+        state: &Arc<MemoryState>,
+    ) -> Bootstrapper {
+        harness(Arc::clone(keys), Arc::clone(state))
+            .with_hub_tls(PinnedHubTls::from_pem(&[identity.pem()]).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_squatted_port_gets_nothing_on_a_fresh_install() {
+        let identity = TestIdentity::generate();
+        let squatter = TestIdentity::generate();
+        let port = SwitchPort::start().await;
+        let keys = Arc::new(MemoryKeyStore::new());
+        let state = Arc::new(MemoryState::new());
+        let bootstrapper = pinned_to(&identity, &keys, &state);
+
+        for mode in [
+            Mode::SquatTls(squatter.server_config()),
+            Mode::SquatPlain,
+            Mode::Down,
+        ] {
+            port.set(mode);
+            // 入れ替わりを何度繰り返しても同じ。
+            for _ in 0..3 {
+                let connection = bootstrapper.connect(&port.https_url()).await.unwrap();
+                assert_eq!(
+                    connection.status,
+                    HubStatus::unreachable(UnreachableCause::Transport)
+                );
+            }
+        }
+
+        // 実際に先取り側へ掛けにいき、先取り側がその接続を読み終えてから記録を調べる。
+        port.settle(ModeKind::SquatTls, 3).await;
+        port.settle(ModeKind::SquatPlain, 3).await;
+        // 何も発行・保存されず、先取りした側には HTTP の要求が 1 バイトも届かない。
+        assert!(state.load().unwrap().is_none());
+        assert!(keys.get(&squat_account(&port)).unwrap().is_none());
+        port.assert_secret_absent(SQUAT_KEY);
+        assert_eq!(port.squat_tls_handshakes(), 0);
+        assert!(port.squat_tls_bytes().is_empty());
+        let plain = String::from_utf8_lossy(&port.squat_bytes()).to_ascii_lowercase();
+        assert!(!plain.contains("http/1.") && !plain.contains("authorization"));
+    }
+
+    #[tokio::test]
+    async fn a_squatted_port_never_receives_a_stored_key() {
+        let identity = TestIdentity::generate();
+        let squatter = TestIdentity::generate();
+        let port = SwitchPort::start().await;
+        let keys = Arc::new(MemoryKeyStore::new());
+        let state = Arc::new(MemoryState::new());
+        keys.set(&squat_account(&port), SQUAT_KEY).unwrap();
+        let bootstrapper = pinned_to(&identity, &keys, &state);
+
+        for mode in [Mode::SquatTls(squatter.server_config()), Mode::SquatPlain] {
+            port.set(mode);
+            for _ in 0..3 {
+                let connection = bootstrapper.connect(&port.https_url()).await.unwrap();
+                assert_eq!(
+                    connection.status,
+                    HubStatus::unreachable(UnreachableCause::Transport)
+                );
+            }
+        }
+
+        // 実際に先取り側へ掛けにいき（掛けにいっていなければ「届いていない」は何も
+        // 示さない）、先取り側がその接続を読み終えてから記録を調べる。
+        port.settle(ModeKind::SquatTls, 3).await;
+        port.settle(ModeKind::SquatPlain, 3).await;
+        // 届かなかっただけで、保存済みのキーは消されも再発行もされない。
+        assert_eq!(
+            keys.get(&squat_account(&port)).unwrap().as_deref(),
+            Some(SQUAT_KEY)
+        );
+        assert!(state.load().unwrap().is_none());
+        assert_squatter_got_nothing(&port);
+        port.assert_secret_absent(SQUAT_KEY);
+    }
+
+    #[tokio::test]
+    async fn a_connected_hub_that_is_swapped_for_a_squatter_then_returns_with_a_renewed_certificate(
+    ) {
+        let identity_a = TestIdentity::generate();
+        let identity_b = TestIdentity::generate();
+        let squatter = TestIdentity::generate();
+        let hub_a = MockHub::start_tls(squat_routes(), identity_a.server_config());
+        let hub_b = MockHub::start_tls(squat_routes(), identity_b.server_config());
+        let port = SwitchPort::start().await;
+        let keys = Arc::new(MemoryKeyStore::new());
+        let state = Arc::new(MemoryState::new());
+        let pinned_a = pinned_to(&identity_a, &keys, &state);
+        let relay = |hub: &MockHub| {
+            let address = hub.endpoint();
+            address
+                .strip_prefix("https://")
+                .unwrap()
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+        };
+
+        // 本物の Hub A につながり、初回は 1 本だけ発行して保存する。
+        port.set(Mode::Relay(relay(&hub_a)));
+        let connection = pinned_a.connect(&port.https_url()).await.unwrap();
+        assert_eq!(connection.status, HubStatus::Connected { tag_count: 1 });
+        assert_eq!(hub_a.hit_count(ISSUE_ROUTE), 1);
+        assert_eq!(
+            keys.get(&squat_account(&port)).unwrap().as_deref(),
+            Some(SQUAT_KEY)
+        );
+
+        // Hub が死んで別プロセスが先取り。つなぎ直しても何も届かない。
+        port.set(Mode::SquatTls(squatter.server_config()));
+        for _ in 0..3 {
+            let connection = pinned_a.connect(&port.https_url()).await.unwrap();
+            assert_eq!(
+                connection.status,
+                HubStatus::unreachable(UnreachableCause::Transport)
+            );
+        }
+        port.settle(ModeKind::SquatTls, 3).await;
+        port.assert_secret_absent(SQUAT_KEY);
+        assert_eq!(port.squat_tls_handshakes(), 0);
+        assert!(port.squat_tls_bytes().is_empty());
+        assert_eq!(
+            keys.get(&squat_account(&port)).unwrap().as_deref(),
+            Some(SQUAT_KEY),
+            "an unreachable Hub must not cost the stored key"
+        );
+
+        // 証明書が更新された Hub B が戻った。古い pin（A）のままでは本物にも送らない。
+        let relayed_before = port.accepts(ModeKind::Relay);
+        port.set(Mode::Relay(relay(&hub_b)));
+        let connection = pinned_a.connect(&port.https_url()).await.unwrap();
+        assert_eq!(
+            connection.status,
+            HubStatus::unreachable(UnreachableCause::Transport)
+        );
+        // 古い pin のまま実際に Hub B へ掛けにいき、その接続が終わってから確かめる。
+        let relayed = port.settle(ModeKind::Relay, relayed_before + 1).await;
+        wait_until("Hub B to finish the refused connection", || {
+            hub_b.connections_served() >= relayed - relayed_before
+        })
+        .await;
+        assert!(hub_b.seen().is_empty(), "{:?}", hub_b.seen());
+
+        // 新しい pin（B）に張り直せば同じキーで戻る。再発行も失効もしない。
+        let pinned_b = pinned_to(&identity_b, &keys, &state);
+        let connection = pinned_b.connect(&port.https_url()).await.unwrap();
+        assert_eq!(connection.status, HubStatus::Connected { tag_count: 1 });
+        assert_eq!(hub_b.hit_count(ISSUE_ROUTE), 0, "the stored key is reused");
+        assert_eq!(hub_b.hit_count(TAGS_ROUTE), 1);
+        assert_eq!(
+            keys.get(&squat_account(&port)).unwrap().as_deref(),
+            Some(SQUAT_KEY)
+        );
+    }
+
+    fn relay_addr(hub: &MockHub) -> std::net::SocketAddr {
+        hub.endpoint()
+            .strip_prefix("http://")
+            .unwrap()
+            .parse::<std::net::SocketAddr>()
+            .unwrap()
+    }
+
+    fn squat_modes(squatter: &TestIdentity) -> [(Mode, ModeKind); 2] {
+        [
+            (Mode::SquatTls(squatter.server_config()), ModeKind::SquatTls),
+            (Mode::SquatPlain, ModeKind::SquatPlain),
+        ]
+    }
+
+    fn assert_squatter_got_nothing(port: &SwitchPort) {
+        port.assert_squat_secret_absent(SQUAT_KEY);
+        assert_eq!(port.squat_tls_handshakes(), 0);
+        assert!(port.squat_tls_bytes().is_empty());
+        let plain = String::from_utf8_lossy(&port.squat_bytes()).to_ascii_lowercase();
+        assert!(
+            !plain.contains("http/1.") && !plain.contains("authorization"),
+            "{plain}"
+        );
+    }
+
+    /// 1 回の `connect()` の途中（鍵なしの確認に本物が答えた直後）でポートが先取りされる。
+    /// 以後の要求（グラントの取得・発行・鍵つきの検証）は 1 つも先取り側へ届かない。
+    #[tokio::test]
+    async fn a_swap_inside_one_connect_after_the_status_check_sends_nothing_to_the_squatter() {
+        let identity = TestIdentity::generate();
+        let squatter = TestIdentity::generate();
+        for (then, then_kind) in squat_modes(&squatter) {
+            let hub = MockHub::start(squat_routes());
+            let port = SwitchPort::start().await;
+            let keys = Arc::new(MemoryKeyStore::new());
+            let state = Arc::new(MemoryState::new());
+            let bootstrapper = pinned_to(&identity, &keys, &state);
+            // 1 本目（確認）だけ本物へ中継し、その返事をクライアントへ流す前に切り替える。
+            port.set(Mode::RelayThen {
+                backend: relay_addr(&hub),
+                tls: Some(identity.server_config()),
+                then: Box::new(then),
+            });
+
+            let connection = bootstrapper.connect(&port.https_url()).await.unwrap();
+            assert_eq!(
+                connection.status,
+                HubStatus::unreachable(UnreachableCause::Transport)
+            );
+            // 本物が見たのは鍵なしの確認 1 本だけ。グラントも発行も届いていない。
+            assert_eq!(hub.routes_seen(), vec![STATUS_ROUTE.to_string()]);
+            assert_eq!(hub.hit_count(STATUS_ROUTE), 1);
+            assert!(hub.seen().iter().all(|req| req.authorization.is_none()));
+            assert_eq!(port.accepts(ModeKind::Relay), 1);
+            // 本物の返事は最後までクライアントへ届いてから切られた（途中で切れたせいで
+            // 失敗したのではない）。
+            assert_eq!(port.handed_over_responses(), 1);
+            // 切り替え後に実際に先取り側へ掛けにいき（途中で終わっただけではない）、
+            // 先取り側がその接続を読み終えてから記録を調べる。
+            port.settle(then_kind, 1).await;
+            assert_squatter_got_nothing(&port);
+            assert!(state.load().unwrap().is_none());
+            assert!(keys.get(&squat_account(&port)).unwrap().is_none());
+        }
+    }
+
+    /// 保存済みの鍵が本物に断られた（401）直後に先取りされる。鍵つきの再確認
+    /// （`probe_tags_status`）と、そのあとの再発行の経路が先取り側へ鍵を運ばない。
+    #[tokio::test]
+    async fn a_swap_right_after_a_rejected_stored_key_does_not_resend_it_to_the_squatter() {
+        let identity = TestIdentity::generate();
+        let squatter = TestIdentity::generate();
+        for (then, then_kind) in squat_modes(&squatter) {
+            let hub = MockHub::start(routes(vec![(TAGS_ROUTE, vec![(401, "{}".to_string())])]));
+            let port = SwitchPort::start().await;
+            let keys = Arc::new(MemoryKeyStore::new());
+            let state = Arc::new(MemoryState::new());
+            keys.set(&squat_account(&port), SQUAT_KEY).unwrap();
+            let bootstrapper = pinned_to(&identity, &keys, &state);
+            port.set(Mode::RelayThen {
+                backend: relay_addr(&hub),
+                tls: Some(identity.server_config()),
+                then: Box::new(then),
+            });
+
+            let connection = bootstrapper.connect(&port.https_url()).await.unwrap();
+            assert_eq!(
+                connection.status,
+                HubStatus::unreachable(UnreachableCause::Transport)
+            );
+            // 本物に着いたのは最初の鍵つきの 1 本だけ（そこで断られた）。
+            assert_eq!(hub.routes_seen(), vec![TAGS_ROUTE.to_string()]);
+            assert_eq!(hub.hit_count(TAGS_ROUTE), 1);
+            assert_eq!(port.accepts(ModeKind::Relay), 1);
+            // 本物の返事は最後までクライアントへ届いてから切られた（途中で切れたせいで
+            // 失敗したのではない）。
+            assert_eq!(port.handed_over_responses(), 1);
+            // 切り替え後に実際に先取り側へ掛けにいき（途中で終わっただけではない）、
+            // 先取り側がその接続を読み終えてから記録を調べる。
+            port.settle(then_kind, 1).await;
+            assert_squatter_got_nothing(&port);
+            assert_eq!(
+                keys.get(&squat_account(&port)).unwrap().as_deref(),
+                Some(SQUAT_KEY),
+                "an unreachable Hub must not cost the stored key"
+            );
+        }
+    }
 }

@@ -82,6 +82,8 @@ mod handle;
 mod pinned_tls;
 pub mod rest;
 pub mod secret;
+#[cfg(test)]
+mod squat_scenarios;
 /// S2a remains crate-internal until the S2b-2 worker slice wires it in.
 mod stream_core;
 #[cfg(test)]

@@ -883,6 +883,7 @@ dependencies = [
 name = "banto-hub-bootstrap"
 version = "0.1.0"
 dependencies = [
+ "banto-hub-squat-harness",
  "banto-tagclient",
  "reqwest",
  "rustls",
@@ -1051,6 +1052,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "banto-hub-squat-harness"
+version = "0.1.0"
+dependencies = [
+ "rcgen",
+ "rustls",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "banto-hub-tls-trust"
 version = "0.1.0"
 dependencies = [
@@ -1213,6 +1224,7 @@ dependencies = [
 name = "banto-tagclient"
 version = "0.3.0-alpha.2"
 dependencies = [
+ "banto-hub-squat-harness",
  "futures-util",
  "reqwest",
  "rustls",

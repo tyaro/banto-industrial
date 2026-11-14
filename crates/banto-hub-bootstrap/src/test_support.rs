@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -45,6 +45,7 @@ pub type Reply = (u16, String);
 pub struct MockHub {
     address: String,
     seen: Arc<Mutex<Vec<SeenRequest>>>,
+    served: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
 }
 
@@ -73,8 +74,10 @@ impl MockHub {
         let address = format!("{scheme}://{}", listener.local_addr().expect("local_addr"));
         let seen: Arc<Mutex<Vec<SeenRequest>>> = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let served = Arc::new(AtomicUsize::new(0));
 
         let thread_seen = Arc::clone(&seen);
+        let thread_served = Arc::clone(&served);
         let thread_stop = Arc::clone(&stop);
         thread::spawn(move || {
             let mut routes = routes;
@@ -98,14 +101,24 @@ impl MockHub {
                         serve(&mut stream, &mut routes, &mut consumed, &thread_seen);
                     }
                 }
+                thread_served.fetch_add(1, Ordering::SeqCst);
             }
         });
 
         Self {
             address,
             seen,
+            served,
             stop,
         }
+    }
+
+    /// How many accepted connections have been handled to the end (answered,
+    /// or given up on because no request could be read, e.g. a failed TLS
+    /// handshake). A test that asserts "nothing was seen" waits for this
+    /// first, so the assertion is not made before the connection was read.
+    pub fn connections_served(&self) -> usize {
+        self.served.load(Ordering::SeqCst)
     }
 
     /// The `http://127.0.0.1:{port}` base URL to hand to the bootstrapper.
