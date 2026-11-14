@@ -264,6 +264,30 @@ fn user_reasons_text(found: &[Exposure]) -> String {
         .join("・")
 }
 
+/// SID の文字列が AppContainer の SID か: パッケージ SID（`S-1-15-2-…`。ALL APPLICATION
+/// PACKAGES `S-1-15-2-1`・ALL RESTRICTED APPLICATION PACKAGES `S-1-15-2-2` を含む）か、
+/// capability SID（`S-1-15-3-…`）。
+///
+/// 利用者の置き場の確かめ（[`user_place_problems`]）は、これらへの普通の許可を問題にしない
+/// （2026-11-14 オーナー決定、docs/hub-desktop-tls-design.md §4.1）。AppContainer のトークンの
+/// アクセスは、「ふつうの確かめ（利用者・グループの SID）」と「パッケージ・capability の SID の
+/// 確かめ」の**両方**を通った分の積になり、通常のトークンはこれらの SID を持たない。そのため、
+/// この種の ACE だけでは別のアカウントに権限は付かず、付くのは同じ利用者（信頼の範囲、§3）の
+/// AppContainer のプロセスだけ。
+///
+/// 判定は文字列の形で厳しく取る: 接頭辞は大文字の `S-1-15-2-`・`S-1-15-3-` ちょうどで、続きは
+/// 1 つ以上の「数字だけの要素」を `-` で繋いだもの。`S-1-15-21-…`（接頭辞の偽の一致）・
+/// `S-1-15-2`・`S-1-15-2-`（続きが無い。実在しない形）・小文字の `s-1-15-2-1`・数字以外の
+/// 混じったものは当てはめない（今までどおり、ほかの相手として確かめる）。
+pub fn is_app_container_sid(sid: &str) -> bool {
+    ["S-1-15-2-", "S-1-15-3-"].iter().any(|prefix| {
+        sid.strip_prefix(prefix).is_some_and(|rest| {
+            rest.split('-')
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        })
+    })
+}
+
 /// 置き場のフォルダ・ファイルの記述子が、信頼する相手（`owners` と SYSTEM・Administrators）
 /// 以外に開いている理由をすべて返す（純関数。空なら通す）。`exposure` から次を除いたもの:
 ///
@@ -273,11 +297,16 @@ fn user_reasons_text(found: &[Exposure]) -> String {
 ///   で、マスクが [`USER_PLACE_OTHERS_READ_MASK`]（読み取りだけ）に収まるもの。継承のフラグは
 ///   問わない（inherit-only でも、書き込みを含めば断る。`%LOCALAPPDATA%` の既定の ACL には
 ///   信頼する相手以外への ACE が無いので、ルートの `root_dacl_problems` のような緩めは要らない）。
+/// - AppContainer の SID（[`is_app_container_sid`]: パッケージ SID `S-1-15-2-…`・capability
+///   SID `S-1-15-3-…`）への普通の許可（`ACCESS_ALLOWED_ACE_TYPE`）。マスクも
+///   `others_may_read` も問わない（鍵でも通す）。2026-11-14 オーナー決定。理由は
+///   [`is_app_container_sid`]。条件付き・オブジェクトの許可は、相手が AppContainer の SID でも
+///   今までどおり残す。
 ///
 /// 残るのは、reparse point・ハードリンク・見知らぬ所有者・null DACL・種類の分からない ACE・
-/// SID の読めない ACE・信頼する相手以外への条件付き／オブジェクトの許可・信頼する相手以外への
-/// 書き込み・削除・`WRITE_DAC`・`WRITE_OWNER` を含む許可（`others_may_read` が偽なら、読み取り
-/// を含むすべての許可）。
+/// SID の読めない ACE・信頼する相手以外への条件付き／オブジェクトの許可・信頼する相手でも
+/// AppContainer の SID でもない相手への書き込み・削除・`WRITE_DAC`・`WRITE_OWNER` を含む許可
+/// （`others_may_read` が偽なら、読み取りを含むすべての許可）。
 ///
 /// フォルダ・証明書・ロックファイル・記録は `others_may_read = true`、鍵は `false`（§4.1
 /// 「鍵のファイルは、その 3 者以外が読めない」）。
@@ -292,6 +321,11 @@ pub fn user_place_problems(
         .filter(|found| match found {
             Exposure::ForeignOwner(sid) => !trusted(sid),
             Exposure::AllowsOther { sid, .. } if trusted(sid) => false,
+            Exposure::AllowsOther { ace_type, sid, .. }
+                if *ace_type == ACCESS_ALLOWED_ACE_TYPE && is_app_container_sid(sid) =>
+            {
+                false
+            }
             Exposure::AllowsOther { ace_type, mask, .. }
                 if others_may_read && *ace_type == ACCESS_ALLOWED_ACE_TYPE =>
             {

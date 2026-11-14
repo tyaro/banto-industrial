@@ -86,6 +86,14 @@
 //!   （[`user_place_problems`]）を見る。起点は、既知のフォルダの値と一致することと、本当の
 //!   パスがローカルの固定ドライブにあること（フォルダの転送を断る）も見る。`%LOCALAPPDATA%` の
 //!   既定の ACL（利用者・SYSTEM・Administrators だけ）なら、何もしなくても通る。
+//! - **AppContainer の SID への許可は問題にしない**（2026-11-14 オーナー決定。
+//!   [`is_app_container_sid`]: パッケージ SID `S-1-15-2-…`・capability SID `S-1-15-3-…` への
+//!   普通の許可。鍵でも同じ）。AppContainer のトークンのアクセスは、利用者・グループの SID の
+//!   確かめとパッケージ・capability の SID の確かめの両方を通った分の積で、通常のトークンは
+//!   これらの SID を持たない。この ACE だけでは別のアカウントに権限は付かず、付くのは同じ
+//!   利用者（信頼する相手）の AppContainer のプロセスだけ。サンドボックスの道具が
+//!   `%LOCALAPPDATA%` に capability SID のフルを足した PC でも、既定の置き場が通る。サービスの
+//!   置き場（`%ProgramData%`）の確かめは変えない。
 //! - **「無い」と「あるが通らない」を分ける**: デスクトップ版を動かしていない利用者では置き場が
 //!   無いのが普通なので、無いのは [`UserPlaceState::Absent`]・[`UserCertPin::Absent`]、通らない
 //!   のは [`UserPlaceProblem`]（理由と対処の種類 [`UserRemedy`]）で返す。
@@ -118,11 +126,12 @@ pub use place::{
     parse_single_certificate, read_checked, CheckedPlace, HubCertPin, Remedy, Unavailable,
 };
 pub use user::{
-    check_place_layout, check_spec, load_pinned_user_cert, open_user_file, open_user_place,
-    user_place_problems, CheckedUserPlace, DefaultUserTlsPlace, MissingUserPlace, UserCertPin,
-    UserFileRole, UserPlaceKind, UserPlacePolicy, UserPlaceProblem, UserPlaceSpec, UserPlaceState,
-    UserRemedy, UserTlsOps, UserTlsPlace, USER_ANCHOR_LABEL, USER_PLACE_OTHERS_READ_MASK,
-    USER_REVOCATIONS_A_DIR, USER_REVOCATIONS_B_DIR, USER_REVOCATIONS_LOCK_FILE,
+    check_place_layout, check_spec, is_app_container_sid, load_pinned_user_cert, open_user_file,
+    open_user_place, user_place_problems, CheckedUserPlace, DefaultUserTlsPlace, MissingUserPlace,
+    UserCertPin, UserFileRole, UserPlaceKind, UserPlacePolicy, UserPlaceProblem, UserPlaceSpec,
+    UserPlaceState, UserRemedy, UserTlsOps, UserTlsPlace, USER_ANCHOR_LABEL,
+    USER_PLACE_OTHERS_READ_MASK, USER_REVOCATIONS_A_DIR, USER_REVOCATIONS_B_DIR,
+    USER_REVOCATIONS_LOCK_FILE,
 };
 
 /// ProgramData の下の製品のフォルダ（Hub のルート）。

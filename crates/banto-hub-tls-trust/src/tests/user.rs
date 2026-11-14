@@ -18,6 +18,13 @@ use crate::*;
 /// 今の利用者。
 const ME: &str = "S-1-5-21-1-2-3-1001";
 
+/// AppContainer の capability SID（サンドボックスの道具が `%LOCALAPPDATA%` に足す形）。
+const CAPABILITY: &str = "S-1-15-3-3557520199-1-2-3";
+/// ALL APPLICATION PACKAGES（パッケージ SID の 1 つ）。
+const ALL_APP_PACKAGES: &str = "S-1-15-2-1";
+/// 接頭辞だけ似ていて、AppContainer の SID ではないもの。
+const LOOKALIKE: &str = "S-1-15-21-9-9-9-1666";
+
 fn local() -> PathBuf {
     abs("Users/me/AppData/Local")
 }
@@ -585,6 +592,67 @@ fn refuses_an_exposed_key_but_allows_a_readable_certificate() {
 }
 
 #[test]
+fn allows_app_container_aces_on_folders_and_the_key() {
+    // 2026-11-14 オーナー決定: AppContainer の SID（パッケージ・capability）への普通の許可は、
+    // 起点・途中・置き場・証明書・鍵のどこにあっても問題にしない（フルでも、継承だけでも）。
+    let mut ops = FakeUserOps::new();
+    for dir in [local(), product(), user_tls()] {
+        let aces = &mut ops.dir(dir).aces;
+        aces.push(ace(CAPABILITY, FULL_ACCESS_MASK, 0x00));
+        aces.push(ace(CAPABILITY, FULL_ACCESS_MASK, 0x0B));
+        aces.push(ace(ALL_APP_PACKAGES, READ_EXECUTE_ACCESS_MASK, 0x03));
+    }
+    for file in [CERT_FILE, KEY_FILE] {
+        let aces = ops.file(user_tls().join(file)).security.dacl.aces.as_mut();
+        let aces = aces.expect("DACL");
+        aces.push(ace(CAPABILITY, FULL_ACCESS_MASK, 0x10));
+        aces.push(ace(ALL_APP_PACKAGES, READ_EXECUTE_ACCESS_MASK, 0x10));
+    }
+    assert!(matches!(ops.load(), UserCertPin::Usable(_)));
+    // 起点そのもの（ロックファイルの置き場）も同じ確かめを通る。
+    assert!(matches!(
+        open_user_place(&ops, &ops.place(), UserPlaceKind::RevocationsLock),
+        Ok(UserPlaceState::Present(_))
+    ));
+
+    // 接頭辞の偽の一致・形の崩れた SID・通常のほかの利用者は、今までどおり断る（フォルダの
+    // 書き込み・鍵の読み取り）。
+    for sid in [LOOKALIKE, EVIL, "S-1-15-2", "S-1-15-2-", "s-1-15-2-1"] {
+        for (dir, remedy) in [
+            (local(), UserRemedy::FixAnchor(local())),
+            (product(), UserRemedy::RecreateDir(product())),
+            (user_tls(), UserRemedy::RecreateDir(user_tls())),
+        ] {
+            let mut ops = FakeUserOps::new();
+            ops.dir(dir).aces.push(ace(sid, FULL_ACCESS_MASK, 0x03));
+            assert_unusable(&ops, "は保護されていません", remedy);
+        }
+        let mut ops = FakeUserOps::new();
+        if let Some(aces) = ops.key().security.dacl.aces.as_mut() {
+            aces.push(ace(sid, READ_EXECUTE_ACCESS_MASK, 0x10));
+        }
+        assert_unusable(&ops, "ほかの利用者に読まれた恐れ", UserRemedy::Renew);
+    }
+
+    // 条件付き（9・11）・オブジェクト（5）の許可は、相手が AppContainer の SID でも断る。
+    for ace_type in [5u8, 9, 11] {
+        for sid in [CAPABILITY, ALL_APP_PACKAGES] {
+            let mut odd = ace(sid, READ_EXECUTE_ACCESS_MASK, 0x03);
+            odd.ace_type = ace_type;
+            let mut ops = FakeUserOps::new();
+            ops.dir(local()).aces.push(odd.clone());
+            assert_unusable(&ops, "は保護されていません", UserRemedy::FixAnchor(local()));
+            let mut ops = FakeUserOps::new();
+            odd.flags = 0x10;
+            if let Some(aces) = ops.key().security.dacl.aces.as_mut() {
+                aces.push(odd);
+            }
+            assert_unusable(&ops, "ほかの利用者に読まれた恐れ", UserRemedy::Renew);
+        }
+    }
+}
+
+#[test]
 fn refuses_reparse_points_and_moved_places() {
     // 起点・途中・置き場が reparse point。
     for (dir, remedy) in [
@@ -886,6 +954,126 @@ fn user_place_problems_table() {
     assert_eq!(count(&with(ace("", READ_EXECUTE_ACCESS_MASK, 0)), true), 1);
 }
 
+#[test]
+fn app_container_sids_are_recognised_strictly() {
+    for sid in [
+        "S-1-15-2-1",
+        "S-1-15-2-2",
+        "S-1-15-2-1-2-3-4-5-6-7",
+        "S-1-15-3-1",
+        "S-1-15-3-1024-1-2-3-4-5-6-7-8",
+        CAPABILITY,
+        ALL_APP_PACKAGES,
+    ] {
+        assert!(is_app_container_sid(sid), "{sid}");
+    }
+    for sid in [
+        "",
+        "S-1-15-2",
+        "S-1-15-3",
+        "S-1-15-2-",
+        "S-1-15-3-",
+        "S-1-15-2--1",
+        "S-1-15-2-1-",
+        "S-1-15-21-1-2-3-1001",
+        "S-1-15-31-1",
+        "S-1-15-20-1",
+        "S-1-15-1-1",
+        "S-1-15-4-1",
+        "S-1-5-2-1",
+        "S-1-5-21-15-2-1",
+        "s-1-15-2-1",
+        "S-1-15-2-x",
+        "S-1-15-2-1 ",
+        " S-1-15-2-1",
+        "S-1-15-2-\u{ff11}",
+        "S-1-15-3-1;S-1-1-0",
+        "S-1-1-0",
+        LOOKALIKE,
+        EVIL,
+        ME,
+        SYSTEM_SID,
+        ADMINISTRATORS_SID,
+    ] {
+        assert!(!is_app_container_sid(sid), "{sid:?}");
+    }
+}
+
+#[test]
+fn user_place_problems_excuses_plain_allows_to_app_container_sids() {
+    let owners = [ME.to_string()];
+    let with = |extra: ObservedAce, is_dir: bool| {
+        let mut aces = user_aces(0x13);
+        aces.push(extra);
+        FileSecurity {
+            is_dir,
+            is_reparse_point: false,
+            links: 1,
+            dacl: ObservedDacl {
+                protected: false,
+                owner: ME.to_string(),
+                aces: Some(aces),
+            },
+        }
+    };
+    let count = |security: &FileSecurity, others_may_read: bool| {
+        user_place_problems(security, &owners, others_may_read).len()
+    };
+
+    // 普通の許可: マスク・継承のフラグ・鍵かどうかを問わず通す。
+    for sid in [CAPABILITY, ALL_APP_PACKAGES, "S-1-15-2-2"] {
+        for mask in [
+            FULL_ACCESS_MASK,
+            MODIFY_ACCESS_MASK,
+            READ_EXECUTE_ACCESS_MASK,
+            0x1000_0000,
+            0x0200_0000,
+        ] {
+            for flags in [0x00u8, 0x03, 0x0B, 0x10, 0x13] {
+                for others_may_read in [true, false] {
+                    for is_dir in [true, false] {
+                        assert_eq!(
+                            count(&with(ace(sid, mask, flags), is_dir), others_may_read),
+                            0,
+                            "{sid} {mask:#x} {flags:#x} {others_may_read} {is_dir}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // 接頭辞の偽の一致・形の崩れた SID は、ほかの相手として今までどおり: 書き込みは断り、
+    // 読み取りは鍵でだけ断る。
+    for sid in [LOOKALIKE, "S-1-15-2", "S-1-15-3", "S-1-15-2-", "s-1-15-3-1"] {
+        assert_eq!(
+            count(&with(ace(sid, FULL_ACCESS_MASK, 0x03), true), true),
+            1
+        );
+        let read = with(ace(sid, READ_EXECUTE_ACCESS_MASK, 0x03), true);
+        assert_eq!(count(&read, true), 0, "{sid}");
+        assert_eq!(count(&read, false), 1, "{sid}");
+    }
+    // 条件付き（9・11）・オブジェクト（5）の許可は、AppContainer の SID でも断る。拒否は理由に
+    // しない（今までどおり）。
+    for sid in [CAPABILITY, ALL_APP_PACKAGES] {
+        for ace_type in [5u8, 9, 11] {
+            let mut odd = ace(sid, READ_EXECUTE_ACCESS_MASK, 0x03);
+            odd.ace_type = ace_type;
+            assert_eq!(count(&with(odd.clone(), true), true), 1, "{sid} {ace_type}");
+            assert_eq!(count(&with(odd, false), false), 1, "{sid} {ace_type}");
+        }
+        for ace_type in [1u8, 6, 10, 12] {
+            let mut deny = ace(sid, FULL_ACCESS_MASK, 0x03);
+            deny.ace_type = ace_type;
+            assert_eq!(count(&with(deny, true), false), 0, "{sid} {ace_type}");
+        }
+    }
+    // 所有者が AppContainer の SID なのは、今までどおり見知らぬ所有者。
+    let mut owned = with(ace(CAPABILITY, FULL_ACCESS_MASK, 0x03), true);
+    owned.dacl.owner = CAPABILITY.to_string();
+    assert_eq!(count(&owned, true), 1);
+}
+
 // --- 実 Windows ---------------------------------------------------------------------
 
 /// 実 Windows の `%LOCALAPPDATA%` で、既知のフォルダ・トークンの SID・辿らない pin・ドライブの
@@ -895,9 +1083,17 @@ fn user_place_problems_table() {
 /// 「無い」（起点の確かめに通ったうえで）、鍵と証明書を置いた後は読める。
 ///
 /// **既定でない ACL の PC**（`%LOCALAPPDATA%` に 3 者以外の ACE が足されている。サンドボックスの
-/// 道具が AppContainer の SID や専用のグループを足した開発機など）では、既定の置き場は
-/// **断られるのが正しい**ので、それを確かめたうえで、足されていた相手を `owners` に加えた
-/// 置き場（差し替えの口で方針を変えた形）で残りを通す。
+/// 道具が AppContainer の capability SID や専用のグループを足した開発機など）:
+///
+/// - AppContainer の SID（`S-1-15-2-…`・`S-1-15-3-…`）への許可は、確かめが問題にしない
+///   （2026-11-14 オーナー決定）。下の「足されていた相手」には**数えない**ので、これだけが
+///   足された PC では、既定の置き場がそのまま通ることを本物の ACL で確かめる形になる。
+/// - それ以外の相手（専用のローカルグループへの継承する読み取りなど）がいると、ここで
+///   `std::fs` が作る鍵はその ACE を継承するので、既定の置き場は鍵の露出として**断られるのが
+///   正しい**。それを確かめたうえで、その相手を `owners` に加えた置き場（差し替えの口で方針を
+///   変えた形）で残りを通す。製品では、Hub が `tls\\` と鍵を継承を切った DACL（本人・SYSTEM・
+///   Administrators だけ）で作るので、この継承は鍵に届かなくなる（同じオーナー決定の (c)。
+///   **PR2 で入る**。この crate は書かないので、この試験では再現しない）。
 #[cfg(windows)]
 #[test]
 fn real_local_app_data_place_is_checked_on_windows() {
@@ -953,6 +1149,8 @@ fn real_local_app_data_place_is_checked_on_windows() {
         .into_iter()
         .map(|ace| ace.sid)
         .filter(|sid| sid != &me && sid != SYSTEM_SID && sid != ADMINISTRATORS_SID)
+        // AppContainer の SID は確かめが問題にしないので、足さなくても通るはず。
+        .filter(|sid| !is_app_container_sid(sid))
         .collect();
     extra_owners.sort();
     extra_owners.dedup();
@@ -975,7 +1173,8 @@ fn real_local_app_data_place_is_checked_on_windows() {
 
     if !extra_owners.is_empty() {
         // 既定の置き場: 起点（書き込みを持つ相手がいる）か、継承した ACE の付いた鍵（読み取り
-        // だけの相手がいる）で断られる。継承しない読み取りだけの ACE なら通る。
+        // だけの相手がいる）で断られる。継承しない読み取りだけの ACE なら通る。鍵への継承は、
+        // PR2 で Hub が継承を切った DACL で作るようになると届かなくなる。
         write_pair();
         let strict = load_pinned_user_cert(&ops, &place);
         std::fs::remove_dir_all(local.join(&scratch)).expect("一時の置き場を消す");
