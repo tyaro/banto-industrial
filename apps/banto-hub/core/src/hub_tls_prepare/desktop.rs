@@ -36,7 +36,7 @@ fn unavailable(reason: impl Into<String>) -> DefaultTlsUnavailable {
     }
 }
 
-/// 文字列の内容から対処を推測しない。証明書が確実に無い場合だけ、作り直しを案内しない。
+/// 文字列の内容から対処を推測しない。本体・補助ファイル・証明書欠損を区別して案内する。
 #[derive(Debug)]
 struct DesktopFailure {
     reason: String,
@@ -48,6 +48,8 @@ enum DesktopRemedy {
     InspectAndRecreate,
     RepairPlaceOnly,
     InspectRemainingKey,
+    InspectAuxiliaryFile(std::path::PathBuf),
+    CleanupAuxiliaryFile(std::path::PathBuf),
 }
 
 impl From<String> for DesktopFailure {
@@ -72,15 +74,24 @@ impl std::fmt::Display for DesktopFailure {
 }
 
 impl DesktopFailure {
+    fn auxiliary(dir: &CheckedUserPlace<WinTlsDir>, name: &str, reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            remedy: DesktopRemedy::InspectAuxiliaryFile(dir.dir_path().join(name)),
+        }
+    }
+
     fn into_unavailable(self) -> DefaultTlsUnavailable {
         let remedy = match self.remedy {
             DesktopRemedy::InspectAndRecreate => return unavailable(self.reason),
-            DesktopRemedy::RepairPlaceOnly => "証明書も鍵もありません。Hub を閉じ、置き場と親の置き場の所有者・アクセス許可を修復してから、Hub のデスクトップ版を再起動してください",
-            DesktopRemedy::InspectRemainingKey => "証明書はありません。Hub を閉じ、利用者の TLS フォルダの中身を確認してください。鍵が残る場合はフォルダごと削除して作り直してください。鍵も無い場合は、置き場と親の置き場の所有者・アクセス許可を修復してから再起動してください。失効の記録は消さないでください",
+            DesktopRemedy::RepairPlaceOnly => "証明書も鍵もありません。Hub を閉じ、置き場と親の置き場の所有者・アクセス許可を修復してから、Hub のデスクトップ版を再起動してください".into(),
+            DesktopRemedy::InspectRemainingKey => "証明書はありません。Hub を閉じ、利用者の TLS フォルダの中身を確認してください。鍵が残る場合はフォルダごと削除して作り直してください。鍵も無い場合は、置き場と親の置き場の所有者・アクセス許可を修復してから再起動してください。失効の記録は消さないでください".into(),
+            DesktopRemedy::InspectAuxiliaryFile(path) => format!("本体の hub-cert.pem・hub-key.pem は削除せず、Hub を閉じ、補助ファイル（{}）の中身・所有者・アクセス許可を確認してください。補助ファイルだけを安全に削除するか、その所有者・アクセス許可を修復してから再起動してください", path.display()),
+            DesktopRemedy::CleanupAuxiliaryFile(path) => format!("本体の鍵・証明書の検査と失効照合は済んでいます。本体の hub-cert.pem・hub-key.pem は削除せず、Hub を閉じ、補助ファイル（{}）の中身・アクセス許可と他のプロセスによる使用を確認し、安全に片付けてから再起動してください", path.display()),
         };
         DefaultTlsUnavailable {
             reason: self.reason,
-            remedy: remedy.into(),
+            remedy,
         }
     }
 }
@@ -294,7 +305,8 @@ fn checked_auxiliary_file(
     } else {
         UserFileRole::Secret
     };
-    open_user_file(ops, dir, name, name, role).map_err(|found| found.reason.into())
+    open_user_file(ops, dir, name, name, role)
+        .map_err(|found| DesktopFailure::auxiliary(dir, name, found.reason))
 }
 
 fn create(dir: &WinTlsDir, name: &str, bytes: &[u8]) -> Result<(), String> {
@@ -441,6 +453,23 @@ fn cleanup(dir: &WinTlsDir, names: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+/// 本体の検査・失効照合を終えてから呼ぶ。失敗しても本体を削除・再作成する理由にはしない。
+fn cleanup_auxiliary_files(dir: &CheckedUserPlace<WinTlsDir>) -> Result<(), DesktopFailure> {
+    for name in [KEY_TEMP, CERT_TEMP, CREATING] {
+        dir.dir().managed().remove(name).map_err(|error| {
+            let path = dir.dir_path().join(name);
+            DesktopFailure {
+                reason: format!(
+                    "補助ファイル（{}）の片付けに失敗しました: {error}",
+                    path.display()
+                ),
+                remedy: DesktopRemedy::CleanupAuxiliaryFile(path),
+            }
+        })?;
+    }
+    Ok(())
+}
+
 fn load_in<P: UserTlsPlace + ?Sized>(
     ops: &WindowsTlsTrustOps,
     place: &P,
@@ -456,10 +485,19 @@ fn load_in<P: UserTlsPlace + ?Sized>(
     let complete = matches!((&cert, &key), (Some(cert), Some(key)) if pair_matches(cert, key));
     let marker = checked_auxiliary_file(ops, &dir, CREATING)?;
     let creating = if let Some(mut marker) = marker {
-        if TlsFile::read_all(&mut marker, 128).map_err(|error| error.to_string())?
-            != CREATING_CONTENTS
+        if TlsFile::read_all(&mut marker, 128).map_err(|error| {
+            DesktopFailure::auxiliary(
+                &dir,
+                CREATING,
+                format!("TLS の作成中の印を読めませんでした: {error}"),
+            )
+        })? != CREATING_CONTENTS
         {
-            return Err("TLS の作成中の印の形が壊れています".into());
+            return Err(DesktopFailure::auxiliary(
+                &dir,
+                CREATING,
+                "TLS の作成中の印の形が壊れています",
+            ));
         }
         true
     } else {
@@ -469,7 +507,11 @@ fn load_in<P: UserTlsPlace + ?Sized>(
     // 印を片付ける前に一時ファイルの種類・所有者・ACL を確かめる。
     for name in [KEY_TEMP, CERT_TEMP] {
         if checked_auxiliary_file(ops, &dir, name)?.is_some() && !creating {
-            return Err("TLS の一時ファイルが残っていますが、作成中の印がありません".into());
+            return Err(DesktopFailure::auxiliary(
+                &dir,
+                name,
+                "TLS の一時ファイルが残っていますが、作成中の印がありません",
+            ));
         }
     }
     if !complete {
@@ -511,7 +553,7 @@ fn load_in<P: UserTlsPlace + ?Sized>(
     if !records.is_settled() || records.is_revoked(&thumbprint) {
         return Err("利用者の失効の記録が揃っていないか、この証明書は失効しています".into());
     }
-    cleanup(dir.dir(), &[KEY_TEMP, CERT_TEMP, CREATING])?;
+    cleanup_auxiliary_files(&dir)?;
     Ok(identity)
 }
 

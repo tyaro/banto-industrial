@@ -366,7 +366,16 @@ fn without_marker_partial_malformed_or_temporary_files_are_untouched() {
         let place = &fixture.0;
         place.initialize_records();
         place.put(name, b"broken");
-        assert!(place.load().is_err());
+        let error = load_in(
+            &WindowsTlsTrustOps,
+            place,
+            &ReconcileOptions::default(),
+            NOW,
+        )
+        .unwrap_err();
+        if matches!(name, KEY_TEMP | CERT_TEMP) {
+            assert_auxiliary_repair(&error.into_unavailable().log_lines().join("\n"), name);
+        }
         assert_eq!(std::fs::read(place.tls().join(name)).unwrap(), b"broken");
         assert!(!place.tls().join(CREATING).exists());
         assert!(!place
@@ -574,7 +583,14 @@ fn untrusted_auxiliary_files_do_not_revoke_the_valid_identity() {
         );
         let auxiliary = place.tls().join(name);
         acl(&auxiliary, &["/grant", "*S-1-1-0:(M)"]);
-        assert!(place.load().is_err());
+        let error = load_in(
+            &WindowsTlsTrustOps,
+            place,
+            &ReconcileOptions::default(),
+            NOW,
+        )
+        .unwrap_err();
+        assert_auxiliary_repair(&error.into_unavailable().log_lines().join("\n"), name);
         assert!(
             !read_user_revocations(&WindowsTlsTrustOps, place).is_revoked(&thumb(&cert)),
             "{name} の問題で本体を失効させない"
@@ -614,6 +630,55 @@ fn auxiliary_failure_does_not_hide_exposure_of_the_identity() {
             std::fs::read(place.tls().join(CERT_FILE)).unwrap(),
             cert.cert_pem()
         );
+    }
+}
+
+fn assert_auxiliary_repair(lines: &str, name: &str) {
+    assert!(lines.contains(name), "{lines}");
+    assert!(
+        lines.contains("本体の hub-cert.pem・hub-key.pem は削除せず"),
+        "{lines}"
+    );
+    assert!(!lines.contains("漏れた鍵"), "{lines}");
+    assert!(!lines.contains("フォルダごと削除"), "{lines}");
+    assert!(!lines.contains("作り直"), "{lines}");
+}
+
+#[test]
+fn final_auxiliary_cleanup_failure_preserves_the_valid_pair_and_only_repairs_the_auxiliary() {
+    for name in [CREATING, KEY_TEMP, CERT_TEMP] {
+        let fixture = Fixture::new();
+        let place = &fixture.0;
+        let cert = place.load().unwrap();
+        place.put(CREATING, CREATING_CONTENTS);
+        if name != CREATING {
+            place.put(name, b"auxiliary");
+        }
+        let dir = place.dir();
+        // 読み取りは許すが削除の共有は許さない。検査は通り、最後の片付けだけが失敗する。
+        let held = WindowsTlsTrustOps
+            .open_child_file(dir.dir(), name)
+            .unwrap()
+            .unwrap();
+        let error = load_in(
+            &WindowsTlsTrustOps,
+            place,
+            &ReconcileOptions::default(),
+            NOW,
+        )
+        .unwrap_err();
+        let lines = error.into_unavailable().log_lines().join("\n");
+        assert_auxiliary_repair(&lines, name);
+        assert!(lines.contains("片付け"), "{lines}");
+        assert!(place.tls().join(name).exists());
+        assert_eq!(
+            std::fs::read(place.tls().join(CERT_FILE)).unwrap(),
+            cert.cert_pem()
+        );
+        assert!(!read_user_revocations(&WindowsTlsTrustOps, place).is_revoked(&thumb(&cert)));
+        drop(held);
+        drop(dir);
+        assert_eq!(thumb(&place.load().unwrap()), thumb(&cert));
     }
 }
 
@@ -737,7 +802,15 @@ fn malformed_creation_marker_preserves_the_pair_and_marker() {
     let place = &fixture.0;
     let cert = place.load().unwrap();
     place.put(CREATING, b"broken");
-    assert!(place.load().unwrap_err().contains("印の形"));
+    let error = load_in(
+        &WindowsTlsTrustOps,
+        place,
+        &ReconcileOptions::default(),
+        NOW,
+    )
+    .unwrap_err();
+    assert!(error.reason.contains("印の形"));
+    assert_auxiliary_repair(&error.into_unavailable().log_lines().join("\n"), CREATING);
     assert_eq!(
         std::fs::read(place.tls().join(CREATING)).unwrap(),
         b"broken"
