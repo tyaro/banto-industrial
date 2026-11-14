@@ -1306,7 +1306,7 @@ fn column_map() -> ColumnMap {
     // `ListParams::default()`).
     ColumnMap::new()
         .column("id", "id")
-        .column("name", "name")
+        .text_column("name", "name")
         .column("protocol", "protocol")
         .column("enabled", "enabled")
         .column("simulation", "simulation")
@@ -4892,6 +4892,17 @@ mod tests {
         assert_eq!(result.total_count, 2);
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].name, "C");
+
+        let searched = svc
+            .list(ListParams {
+                search: Some("B".to_string()),
+                ..ListParams::default()
+            })
+            .await
+            .expect("name search should succeed");
+        assert_eq!(searched.total_count, 1);
+        assert_eq!(searched.rows.len(), 1);
+        assert_eq!(searched.rows[0].name, "B");
     }
 
     // --- #383 段階3 P2: "hub" (this module's doc comment, "`\"hub\"`" section).
