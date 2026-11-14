@@ -15,7 +15,7 @@
 //! listener を受け取る口が要る（別 Issue）。
 //!
 //! 閉じた後に接続が残っても再 bind できる（この PC の Windows 11 で、サーバー側 TIME_WAIT・
-//! FIN_WAIT_2・接続が開いたまま listener だけ閉じた場合を確かめた。試験
+//! FIN_WAIT_2・未送信のデータが残った FIN_WAIT_1・接続が開いたまま listener だけ閉じた場合を確かめた。試験
 //! `rebind_after_*` / `rebind_while_*`）。証明書の差し替えは待ち受けを閉じずに TLS の設定だけを
 //! 替える設計（docs/hub-desktop-tls-design.md §4.2・§4.5）。再 bind に失敗したときは、今までどおり
 //! 8723 の TLS 無しで起動して理由をログに出す（#644 のオーナー決定 B）。
@@ -218,6 +218,31 @@ mod tests {
         rebind_after_close(
             |server, client| vec![Box::new(server), Box::new(client)],
             true,
+        )
+        .await;
+    }
+
+    /// クライアントが読まないまま、サーバーが送信バッファを詰まらせて閉じる
+    /// （未送信のデータが残ったサーバー側 FIN_WAIT_1）。
+    #[tokio::test]
+    async fn rebind_while_unsent_data_is_stuck_after_server_closes() {
+        rebind_after_close(
+            |server, client| {
+                const LIMIT: usize = 64 * 1024 * 1024;
+                let chunk = [0u8; 64 * 1024];
+                let mut total = 0usize;
+                while total < LIMIT {
+                    match server.try_write(&chunk) {
+                        Ok(n) => total += n,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => panic!("write failed: {e}"),
+                    }
+                }
+                assert!(total > 0, "no bytes could be sent");
+                drop(server);
+                vec![Box::new(client)]
+            },
+            false,
         )
         .await;
     }
