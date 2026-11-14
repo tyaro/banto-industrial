@@ -47,6 +47,12 @@ fn pd() -> PathBuf {
 fn root() -> PathBuf {
     pd().join(PRODUCT_DIR)
 }
+fn records() -> PathBuf {
+    root().join(SERVICE_REVOCATIONS_DIR)
+}
+fn record_file() -> PathBuf {
+    records().join(banto_hub_tls_trust::REVOCATIONS_FILE)
+}
 fn tls() -> PathBuf {
     root().join(TLS_DIR)
 }
@@ -239,12 +245,19 @@ enum LockState {
 }
 
 impl FakeOps {
-    /// 既定: ProgramData・ルート・`tls\` があり、中は空。
+    /// 既定: ProgramData・ルート・`tls\` があり、中は空。サービスの失効の記録（#1121 PR2b）は
+    /// 空で健全。
     fn new() -> Self {
         let mut dirs = HashMap::new();
         dirs.insert(pd(), DirEntry::owned_by(SYSTEM_SID));
         dirs.insert(root(), DirEntry::owned_by(ADMINISTRATORS_SID));
         dirs.insert(tls(), DirEntry::users_read());
+        dirs.insert(records(), DirEntry::users_read());
+        let mut files = HashMap::new();
+        files.insert(
+            record_file(),
+            FileEntry::with(FileAcl::UsersRead, &empty_record()),
+        );
         Self {
             env: FakeEnv {
                 program_data: Ok(pd()),
@@ -252,7 +265,7 @@ impl FakeOps {
             now: NOW,
             dirs: RefCell::new(dirs),
             on_create: HashMap::new(),
-            files: RefCell::new(HashMap::new()),
+            files: RefCell::new(files),
             open_error: HashMap::new(),
             create_error: HashMap::new(),
             remove_error: HashMap::new(),
@@ -302,10 +315,63 @@ impl FakeOps {
     }
 
     fn file_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.files.borrow().keys().map(|p| short(p)).collect();
+        let mut names: Vec<String> = self
+            .files
+            .borrow()
+            .keys()
+            .filter(|p| p.parent() == Some(tls().as_path()))
+            .map(|p| short(p))
+            .collect();
         names.sort();
         names
     }
+
+    /// サービスの失効の記録の中身を差し替える（`None` で消す）。
+    fn put_record(&self, contents: Option<&[u8]>) {
+        let mut files = self.files.borrow_mut();
+        match contents {
+            Some(contents) => {
+                files.insert(record_file(), FileEntry::with(FileAcl::UsersRead, contents));
+            }
+            None => {
+                files.remove(&record_file());
+            }
+        }
+    }
+
+    /// サービスの失効の記録の置き場を消す（中の記録も）。
+    fn remove_records(&self) {
+        self.dirs.borrow_mut().remove(&records());
+        self.files
+            .borrow_mut()
+            .retain(|path, _| path.parent() != Some(records().as_path()));
+    }
+
+    /// 今のサービスの失効の記録（無ければ `None`）。
+    fn record(&self) -> Option<RevocationRecord> {
+        self.files
+            .borrow()
+            .get(&record_file())
+            .map(|entry| RevocationRecord::parse(&entry.contents).unwrap())
+    }
+}
+
+/// 空の健全なサービスの失効の記録。
+fn empty_record() -> Vec<u8> {
+    RevocationRecord::new(banto_hub_tls_trust::RecordState::Committed, []).encode()
+}
+
+/// 拇印 `thumbprints` を持つサービスの失効の記録。
+fn record_with(thumbprints: &[CertThumbprint]) -> Vec<u8> {
+    RevocationRecord::new(
+        banto_hub_tls_trust::RecordState::Committed,
+        thumbprints.iter().map(|thumbprint| RevokedCert {
+            thumbprint: *thumbprint,
+            place: RevokedCertPlace::Service,
+            recorded_at: 1,
+        }),
+    )
+    .encode()
 }
 
 impl TlsTrustOps for FakeOps {
@@ -345,6 +411,65 @@ impl TlsTrustOps for FakeOps {
             path: path.clone(),
             entry: entry.clone(),
         }))
+    }
+}
+
+impl ServiceRevocationOps for FakeOps {
+    fn create_protected_child_dir(
+        &self,
+        parent: &FakeDir,
+        name: &str,
+    ) -> Result<Option<FakeDir>, String> {
+        self.create_child_dir(parent, name, DirHow::UsersRead)
+    }
+    fn create_file_no_replace(
+        &self,
+        dir: &FakeDir,
+        name: &str,
+        contents: &[u8],
+    ) -> Result<bool, String> {
+        self.log
+            .borrow_mut()
+            .push(format!("CREATE record {name} no-replace"));
+        if let Some(error) = self.create_error.get(name) {
+            return Err(error.clone());
+        }
+        let path = dir.path.join(name);
+        if self.files.borrow().contains_key(&path) {
+            return Ok(false);
+        }
+        self.files
+            .borrow_mut()
+            .insert(path, FileEntry::with(FileAcl::UsersRead, contents));
+        Ok(true)
+    }
+    fn write_file_atomic(&self, dir: &FakeDir, name: &str, contents: &[u8]) -> Result<(), String> {
+        self.log.borrow_mut().push(format!("WRITE replace {name}"));
+        if let Some(error) = self.create_error.get(name) {
+            return Err(error.clone());
+        }
+        self.files.borrow_mut().insert(
+            dir.path.join(name),
+            FileEntry::with(FileAcl::UsersRead, contents),
+        );
+        Ok(())
+    }
+    fn remove_stale_file_temps(&self, dir: &FakeDir, name: &str) -> Result<(), String> {
+        let prefix = format!(".{name}.tmp-");
+        let stale: Vec<PathBuf> = self
+            .files
+            .borrow()
+            .keys()
+            .filter(|p| p.parent() == Some(dir.path.as_path()) && short(p).starts_with(&prefix))
+            .cloned()
+            .collect();
+        for path in stale {
+            self.log
+                .borrow_mut()
+                .push(format!("WRITE tidy {}", short(&path)));
+            self.files.borrow_mut().remove(&path);
+        }
+        Ok(())
     }
 }
 
@@ -758,6 +883,7 @@ async fn generated_identity_serves_tls_to_a_pinned_client() {
 #[test]
 fn creates_root_tls_dir_and_identity_from_nothing() {
     let ops = FakeOps::new();
+    ops.remove_records();
     ops.dirs.borrow_mut().remove(&root());
     ops.dirs.borrow_mut().remove(&tls());
     let (result, lines) = run(&ops, false);
@@ -767,6 +893,8 @@ fn creates_root_tls_dir_and_identity_from_nothing() {
         vec![
             "CREATE dir BantoHub Inherit",
             "CREATE dir tls UsersRead",
+            "CREATE dir tls-revocations UsersRead",
+            "CREATE record revocations.txt no-replace",
             "CREATE file hub-key.pem.new ServiceOnly",
             "CREATE file hub-cert.pem.new UsersRead",
             "WRITE rename hub-key.pem.new hub-key.pem",
@@ -797,6 +925,10 @@ fn creates_root_tls_dir_and_identity_from_nothing() {
     assert!(has(&lines, &info.fingerprint), "{lines:#?}");
     assert!(has(&lines, "2036-11-13 00:00:00 UTC"), "{lines:#?}");
     assert!(has(&lines, "を作りました"), "{lines:#?}");
+    // サービスの失効の記録（#1121 PR2b）は、鍵と証明書より先に空で作る（場面 11）。
+    assert_eq!(ops.record().unwrap().entries(), &[]);
+    assert!(has(&lines, "サービスの失効の記録の置き場（"), "{lines:#?}");
+    assert!(has(&lines, "を空で作りました"), "{lines:#?}");
     assert!(!has(&lines, "残っています"), "{lines:#?}");
     assert_no_key_material(&lines, Some(std::str::from_utf8(&key.contents).unwrap()));
 }
@@ -1326,6 +1458,253 @@ fn refuses_an_exposed_root_without_opening_the_tls_dir() {
     ops.dirs.borrow_mut().insert(root(), entry);
     let (result, lines) = run(&ops, false);
     assert_eq!(result, Ok(()), "{lines:#?}");
+}
+
+// --- 手順: サービスの失効の記録（#1121 PR2b。docs/hub-desktop-tls-design.md 場面 11・25・26） ---
+
+/// 拇印 `n` を並べた、ただの拇印（記録の中身用）。
+fn thumb(n: u8) -> CertThumbprint {
+    CertThumbprint::from_hex(&format!("{n:02x}").repeat(32)).unwrap()
+}
+
+/// 書き込みのうち、鍵と証明書のもの（記録・置き場を除く）が最初に出た位置。
+fn first_identity_write(ops: &FakeOps) -> usize {
+    ops.writes()
+        .iter()
+        .position(|w| w.contains("hub-key") || w.contains("hub-cert"))
+        .unwrap()
+}
+
+/// 場面 11・25: 置き場はあるが記録が無い。鍵と証明書を作る前に、置き換えずに空で作る。
+#[test]
+fn scene_11_25_creates_an_absent_record_before_the_identity() {
+    let ops = FakeOps::new();
+    ops.put_record(None);
+    let (result, lines) = run(&ops, false);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    let writes = ops.writes();
+    assert_eq!(
+        writes[0], "CREATE record revocations.txt no-replace",
+        "{writes:#?}"
+    );
+    assert!(first_identity_write(&ops) > 0, "{writes:#?}");
+    assert_eq!(ops.record().unwrap().entries(), &[]);
+    assert!(has(&lines, "を空で作りました"), "{lines:#?}");
+
+    // 置き場のフォルダごと無い: `tls\` と同じ DACL で作ってから、記録を作る。
+    let ops = FakeOps::new();
+    ops.remove_records();
+    let (result, lines) = run(&ops, true);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    assert_eq!(
+        &ops.writes()[..2],
+        &[
+            "CREATE dir tls-revocations UsersRead",
+            "CREATE record revocations.txt no-replace"
+        ]
+    );
+    assert_eq!(ops.record().unwrap().entries(), &[]);
+
+    // 保つとき（再インストール）も、無ければ作る（鍵と証明書は書かない）。
+    let (ops, _identity) = FakeOps::with_identity();
+    ops.put_record(None);
+    let (result, lines) = run(&ops, false);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    assert_eq!(
+        ops.writes(),
+        vec!["CREATE record revocations.txt no-replace"]
+    );
+    assert!(has(&lines, "確かめて保ちました"), "{lines:#?}");
+}
+
+/// 場面 11（設計の場面 20 と揃える）: 健全な記録は、`--renew` でも書き換えない。
+#[test]
+fn scene_11_renew_leaves_a_healthy_record_untouched() {
+    let (ops, identity) = FakeOps::with_identity();
+    let old = CertThumbprint::of_pem(identity.cert_pem.as_bytes()).unwrap();
+    let before = record_with(&[thumb(7)]);
+    ops.put_record(Some(&before));
+    let (result, lines) = run(&ops, true);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    assert!(
+        !ops.writes().iter().any(|w| w.contains("revocations")),
+        "{:#?}",
+        ops.writes()
+    );
+    assert_ne!(
+        ops.file(CERT_FILE).unwrap().contents,
+        identity.cert_pem.as_bytes()
+    );
+    let after = ops.files.borrow()[&record_file()].contents.clone();
+    assert_eq!(after, before);
+    assert!(!ops.record().unwrap().contains(&old));
+}
+
+/// 場面 11・26: 形が壊れた記録は、`--renew` が行ごとに読めた拇印と古い証明書の拇印を引き継いで、
+/// 鍵と証明書を作る前に置き換えで作り直す。
+#[test]
+fn scene_11_26_renew_rebuilds_a_broken_record_with_salvaged_and_old_thumbprints() {
+    let (ops, identity) = FakeOps::with_identity();
+    let old = CertThumbprint::of_pem(identity.cert_pem.as_bytes()).unwrap();
+    let broken = format!(
+        "banto-hub-revocations 1\nstate committed\nrevoked {} service 5\ngarbage\n",
+        thumb(3)
+    );
+    ops.put_record(Some(broken.as_bytes()));
+    let (result, lines) = run(&ops, true);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    let writes = ops.writes();
+    let rebuilt = writes
+        .iter()
+        .position(|w| w == "WRITE replace revocations.txt")
+        .unwrap();
+    assert!(rebuilt < first_identity_write(&ops), "{writes:#?}");
+    let record = ops.record().unwrap();
+    let thumbs: Vec<CertThumbprint> = record.entries().iter().map(|e| e.thumbprint).collect();
+    let mut expected = vec![thumb(3), old];
+    expected.sort();
+    assert_eq!(thumbs, expected);
+    assert!(record
+        .entries()
+        .iter()
+        .all(|e| e.place == RevokedCertPlace::Service));
+    assert!(has(&lines, "作り直しました（2 件）"), "{lines:#?}");
+    assert!(has(&lines, "古い証明書の拇印"), "{lines:#?}");
+    // 新しい証明書は失効していない。
+    let new = CertThumbprint::of_pem(&ops.file(CERT_FILE).unwrap().contents).unwrap();
+    assert!(!record.contains(&new));
+
+    // 何も読めない記録（大きすぎる）でも、古い証明書の拇印だけで作り直す。
+    let (ops, identity) = FakeOps::with_identity();
+    let old = CertThumbprint::of_pem(identity.cert_pem.as_bytes()).unwrap();
+    ops.put_record(Some(&vec![
+        b'x';
+        banto_hub_tls_trust::MAX_REVOCATIONS_BYTES + 1
+    ]));
+    let (result, lines) = run(&ops, true);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    let record = ops.record().unwrap();
+    assert_eq!(record.entries().len(), 1);
+    assert!(record.contains(&old));
+}
+
+/// 場面 11: 証明書がまだ無いときは、読めた拇印だけを引き継いで作り直してから作る。
+#[test]
+fn scene_11_rebuilds_a_broken_record_before_creating_the_first_identity() {
+    let ops = FakeOps::new();
+    let broken = format!("revoked {} service 5\n", thumb(9));
+    ops.put_record(Some(broken.as_bytes()));
+    let (result, lines) = run(&ops, false);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    let record = ops.record().unwrap();
+    assert_eq!(
+        record
+            .entries()
+            .iter()
+            .map(|e| e.thumbprint)
+            .collect::<Vec<_>>(),
+        vec![thumb(9)]
+    );
+    assert!(!has(&lines, "古い証明書の拇印"), "{lines:#?}");
+    assert_eq!(ops.file_names(), vec![CERT_FILE, KEY_FILE]);
+}
+
+/// 場面 26: 記録が壊れていて、`--renew` が無く今の証明書を保つときは、作り直すと保つ証明書も
+/// 失効に入るので、何も変えずに断って `--renew` を案内する。
+#[test]
+fn scene_26_a_broken_record_without_renew_refuses_to_keep_the_identity() {
+    let (ops, _identity) = FakeOps::with_identity();
+    ops.put_record(Some(b"not a record"));
+    let lines = assert_refused_without_writes(&ops, false, "形が壊れています");
+    assert!(has(&lines, "--renew"), "{lines:#?}");
+    assert_eq!(
+        ops.files.borrow()[&record_file()].contents,
+        b"not a record".to_vec()
+    );
+    // 「準備中」もサービスの記録では壊れている扱い。
+    let (ops, _identity) = FakeOps::with_identity();
+    ops.put_record(Some(
+        &RevocationRecord::new(banto_hub_tls_trust::RecordState::Pending, []).encode(),
+    ));
+    assert_refused_without_writes(&ops, false, "準備中");
+}
+
+/// 保つ証明書の拇印が記録にある（サービスの Hub はその証明書で待ち受けない）: 何も変えずに断り、
+/// `--renew` を案内する。`--renew` は記録を変えずに作り直す。
+#[test]
+fn refuses_to_keep_a_revoked_identity_and_renew_replaces_it() {
+    let (ops, identity) = FakeOps::with_identity();
+    let old = CertThumbprint::of_pem(identity.cert_pem.as_bytes()).unwrap();
+    let before = record_with(&[old]);
+    ops.put_record(Some(&before));
+    let lines = assert_refused_without_writes(&ops, false, "失効の記録にあります");
+    assert!(has(&lines, "--renew"), "{lines:#?}");
+    let (result, lines) = run(&ops, true);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    assert_eq!(ops.files.borrow()[&record_file()].contents, before);
+    let new = CertThumbprint::of_pem(&ops.file(CERT_FILE).unwrap().contents).unwrap();
+    assert_ne!(new, old);
+}
+
+/// 場面 26: 記録の置き場が確かめに通らない（露出・所有者違い・リンク・場所の食い違い）ときは、
+/// `--renew` でも何も変えずに断る（管理者が置き場を直してから `--renew`）。
+#[test]
+fn scene_26_refuses_an_untrusted_record_place_even_with_renew() {
+    let cases: Vec<DirEdit> = vec![
+        Box::new(|e| e.aces.push(ace(USERS, MODIFY_ACCESS_MASK, 0x03))),
+        Box::new(|e| e.aces.push(ace(EVIL, 0x1F01FF, 0x03))),
+        Box::new(|e| e.owner = EVIL.to_string()),
+        Box::new(|e| e.owner = ME.to_string()),
+        Box::new(|e| e.is_reparse_point = true),
+        Box::new(|e| e.real = Some(abs("Elsewhere/tls-revocations"))),
+    ];
+    for edit in cases {
+        for renew in [false, true] {
+            let (ops, _identity) = FakeOps::with_identity();
+            let mut entry = DirEntry::users_read();
+            edit(&mut entry);
+            ops.dirs.borrow_mut().insert(records(), entry);
+            let lines = assert_refused_without_writes(&ops, renew, "サービスの失効の記録の置き場");
+            assert!(has(&lines, "何も変えずに止めます"), "{lines:#?}");
+            assert!(
+                has(&lines, "--renew で記録と証明書を作り直して"),
+                "{lines:#?}"
+            );
+        }
+    }
+}
+
+/// 記録が健全なときは、記録の一時ファイルを片付けない（起動中のサービスの Hub が作っている
+/// 最中かもしれない。片付けるのは壊れた記録を作り直すときだけ。#1132 の Codex CLI の指摘）。
+#[test]
+fn keeps_record_temporaries_when_the_record_is_healthy() {
+    let (ops, _identity) = FakeOps::with_identity();
+    let temp = records().join(".revocations.txt.tmp-0000abcd");
+    ops.files
+        .borrow_mut()
+        .insert(temp.clone(), FileEntry::with(FileAcl::UsersRead, b"half"));
+    let (result, lines) = run(&ops, false);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    assert_eq!(ops.writes(), Vec::<String>::new());
+    assert!(ops.files.borrow().contains_key(&temp));
+}
+
+/// 記録を作れない（I/O）ときは、鍵と証明書を作らずに止める。
+#[test]
+fn failing_to_create_the_record_stops_before_the_identity() {
+    let mut ops = FakeOps::new();
+    ops.put_record(None);
+    ops.create_error
+        .insert("revocations.txt".to_string(), "ディスクが一杯".to_string());
+    let (result, lines) = run(&ops, false);
+    assert_eq!(result, Err(Refused));
+    assert_eq!(
+        ops.writes(),
+        vec!["CREATE record revocations.txt no-replace"]
+    );
+    assert!(has(&lines, "ディスクが一杯"), "{lines:#?}");
+    assert!(has(&lines, "まだ作っていません"), "{lines:#?}");
+    assert!(ops.file_names().is_empty());
 }
 
 // --- 手順: 書く途中の失敗 ------------------------------------------------------------

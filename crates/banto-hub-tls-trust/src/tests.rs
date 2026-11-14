@@ -458,4 +458,5 @@ fn root_dacl_problems_do_not_trust_anyone_without_elevated() {
 }
 
 mod revocation;
+mod service_revocation;
 mod user;
