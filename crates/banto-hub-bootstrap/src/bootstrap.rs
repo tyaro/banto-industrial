@@ -1787,4 +1787,172 @@ mod tests {
             );
         }
     }
+    // ---- #644 受入条件 4: 1 つのポートが Hub の一生を通す場面 ----
+    //
+    // `SwitchPort` は 127.0.0.1 のポートを試験の間ずっと持ち、Hub の停止・先取り・
+    // 復帰・証明書の更新を、同じ URL（= 同じ keyring の口座名）のまま再現する。
+
+    use banto_hub_squat_harness::{Mode, ModeKind, SwitchPort, TestIdentity};
+
+    const SQUAT_KEY: &str = "bh_squatdummy.6f1c2a9e0d4b7381";
+
+    fn squat_routes() -> HashMap<String, Vec<Reply>> {
+        routes(vec![
+            (STATUS_ROUTE, vec![(200, commissioning_body(false))]),
+            (ISSUE_ROUTE, vec![(201, issued_body(42, "n", SQUAT_KEY))]),
+            (TAGS_ROUTE, vec![(200, catalog_body(1))]),
+        ])
+    }
+
+    /// `SwitchPort` の URL を endpoint にしたときの keyring の口座名。
+    fn squat_account(port: &SwitchPort) -> String {
+        keyring_account(&base_url(&port.https_url()).unwrap(), INSTALLATION)
+    }
+
+    fn pinned_to(
+        identity: &TestIdentity,
+        keys: &Arc<MemoryKeyStore>,
+        state: &Arc<MemoryState>,
+    ) -> Bootstrapper {
+        harness(Arc::clone(keys), Arc::clone(state))
+            .with_hub_tls(PinnedHubTls::from_pem(&[identity.pem()]).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_squatted_port_gets_nothing_on_a_fresh_install() {
+        let identity = TestIdentity::generate();
+        let squatter = TestIdentity::generate();
+        let port = SwitchPort::start().await;
+        let keys = Arc::new(MemoryKeyStore::new());
+        let state = Arc::new(MemoryState::new());
+        let bootstrapper = pinned_to(&identity, &keys, &state);
+
+        for mode in [
+            Mode::SquatTls(squatter.server_config()),
+            Mode::SquatPlain,
+            Mode::Down,
+        ] {
+            port.set(mode);
+            // 入れ替わりを何度繰り返しても同じ。
+            for _ in 0..3 {
+                let connection = bootstrapper.connect(&port.https_url()).await.unwrap();
+                assert_eq!(
+                    connection.status,
+                    HubStatus::unreachable(UnreachableCause::Transport)
+                );
+            }
+        }
+
+        // 何も発行・保存されず、先取りした側には HTTP の要求が 1 バイトも届かない。
+        assert!(state.load().unwrap().is_none());
+        assert!(keys.get(&squat_account(&port)).unwrap().is_none());
+        port.assert_secret_absent(SQUAT_KEY);
+        assert_eq!(port.squat_tls_handshakes(), 0);
+        assert!(port.squat_tls_bytes().is_empty());
+        let plain = String::from_utf8_lossy(&port.squat_bytes()).to_ascii_lowercase();
+        assert!(!plain.contains("http/1.") && !plain.contains("authorization"));
+        assert!(port.accepts(ModeKind::SquatTls) >= 3);
+        assert!(port.accepts(ModeKind::SquatPlain) >= 3);
+    }
+
+    #[tokio::test]
+    async fn a_squatted_port_never_receives_a_stored_key() {
+        let identity = TestIdentity::generate();
+        let squatter = TestIdentity::generate();
+        let port = SwitchPort::start().await;
+        let keys = Arc::new(MemoryKeyStore::new());
+        let state = Arc::new(MemoryState::new());
+        keys.set(&squat_account(&port), SQUAT_KEY).unwrap();
+        let bootstrapper = pinned_to(&identity, &keys, &state);
+
+        for mode in [Mode::SquatTls(squatter.server_config()), Mode::SquatPlain] {
+            port.set(mode);
+            for _ in 0..3 {
+                let connection = bootstrapper.connect(&port.https_url()).await.unwrap();
+                assert_eq!(
+                    connection.status,
+                    HubStatus::unreachable(UnreachableCause::Transport)
+                );
+            }
+        }
+
+        // 届かなかっただけで、保存済みのキーは消されも再発行もされない。
+        assert_eq!(
+            keys.get(&squat_account(&port)).unwrap().as_deref(),
+            Some(SQUAT_KEY)
+        );
+        assert!(state.load().unwrap().is_none());
+        port.assert_secret_absent(SQUAT_KEY);
+        assert_eq!(port.squat_tls_handshakes(), 0);
+        assert!(port.squat_tls_bytes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_connected_hub_that_is_swapped_for_a_squatter_then_returns_with_a_renewed_certificate(
+    ) {
+        let identity_a = TestIdentity::generate();
+        let identity_b = TestIdentity::generate();
+        let squatter = TestIdentity::generate();
+        let hub_a = MockHub::start_tls(squat_routes(), identity_a.server_config());
+        let hub_b = MockHub::start_tls(squat_routes(), identity_b.server_config());
+        let port = SwitchPort::start().await;
+        let keys = Arc::new(MemoryKeyStore::new());
+        let state = Arc::new(MemoryState::new());
+        let pinned_a = pinned_to(&identity_a, &keys, &state);
+        let relay = |hub: &MockHub| {
+            let address = hub.endpoint();
+            address
+                .strip_prefix("https://")
+                .unwrap()
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+        };
+
+        // 本物の Hub A につながり、初回は 1 本だけ発行して保存する。
+        port.set(Mode::Relay(relay(&hub_a)));
+        let connection = pinned_a.connect(&port.https_url()).await.unwrap();
+        assert_eq!(connection.status, HubStatus::Connected { tag_count: 1 });
+        assert_eq!(hub_a.hit_count(ISSUE_ROUTE), 1);
+        assert_eq!(
+            keys.get(&squat_account(&port)).unwrap().as_deref(),
+            Some(SQUAT_KEY)
+        );
+
+        // Hub が死んで別プロセスが先取り。つなぎ直しても何も届かない。
+        port.set(Mode::SquatTls(squatter.server_config()));
+        for _ in 0..3 {
+            let connection = pinned_a.connect(&port.https_url()).await.unwrap();
+            assert_eq!(
+                connection.status,
+                HubStatus::unreachable(UnreachableCause::Transport)
+            );
+        }
+        port.assert_secret_absent(SQUAT_KEY);
+        assert!(port.squat_tls_bytes().is_empty());
+        assert_eq!(
+            keys.get(&squat_account(&port)).unwrap().as_deref(),
+            Some(SQUAT_KEY),
+            "an unreachable Hub must not cost the stored key"
+        );
+
+        // 証明書が更新された Hub B が戻った。古い pin（A）のままでは本物にも送らない。
+        port.set(Mode::Relay(relay(&hub_b)));
+        let connection = pinned_a.connect(&port.https_url()).await.unwrap();
+        assert_eq!(
+            connection.status,
+            HubStatus::unreachable(UnreachableCause::Transport)
+        );
+        assert!(hub_b.seen().is_empty(), "{:?}", hub_b.seen());
+
+        // 新しい pin（B）に張り直せば同じキーで戻る。再発行も失効もしない。
+        let pinned_b = pinned_to(&identity_b, &keys, &state);
+        let connection = pinned_b.connect(&port.https_url()).await.unwrap();
+        assert_eq!(connection.status, HubStatus::Connected { tag_count: 1 });
+        assert_eq!(hub_b.hit_count(ISSUE_ROUTE), 0, "the stored key is reused");
+        assert_eq!(hub_b.hit_count(TAGS_ROUTE), 1);
+        assert_eq!(
+            keys.get(&squat_account(&port)).unwrap().as_deref(),
+            Some(SQUAT_KEY)
+        );
+    }
 }

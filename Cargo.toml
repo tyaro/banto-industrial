@@ -84,6 +84,7 @@ members = [
     "crates/banto-tagclient",
     "crates/banto-hub-bootstrap",
     "crates/banto-hub-tls-trust",
+    "crates/banto-hub-squat-harness",
     "crates/banto-instance-lock",
     "crates/banto-desktop-tray",
     "crates/banto-exit-once",
