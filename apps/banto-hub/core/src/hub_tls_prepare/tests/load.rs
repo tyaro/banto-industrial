@@ -42,7 +42,7 @@ fn default_tls_loads_a_prepared_identity_in_order_without_writing() {
     )
     .unwrap();
     assert_eq!(loaded.info(), &info);
-    // 書き込み・作成・mutex なし。ルート → tls\ → 鍵 → 証明書の順に、辿らずに開く。
+    // 書き込み・作成・mutex なし。ルート → tls\ → 鍵 → 証明書 → 記録の順に、辿らずに開く。
     assert_eq!(
         ops.calls(),
         vec![
@@ -50,6 +50,9 @@ fn default_tls_loads_a_prepared_identity_in_order_without_writing() {
             "open_dir tls",
             "open_file hub-key.pem",
             "open_file hub-cert.pem",
+            // サービスの失効の記録（#1121 PR2b）: ルートのハンドル基準で置き場 → 記録。
+            "open_dir tls-revocations",
+            "open_file revocations.txt",
         ]
     );
     // Debug にもログの行にも鍵を出さない。
@@ -300,4 +303,131 @@ fn default_tls_bind_failure_lines_name_the_port_and_the_remedy() {
     assert!(lines[0].contains("127.0.0.1:8723"), "{lines:#?}");
     assert!(lines[0].contains("使用中です"), "{lines:#?}");
     assert!(lines[1].contains("netstat"), "{lines:#?}");
+}
+
+// --- サービスの失効の記録（#1121 PR2b。docs/hub-desktop-tls-design.md 場面 8・25・26） ---------
+
+/// 場面 25: 記録が無い（#1116 の証明書だけがある PC）。起動のときに空で作って、TLS を使う。
+/// 置き場のフォルダごと無ければ、`tls\` と同じ DACL で作る。`tls\` には書かない。
+#[test]
+fn scene_25_default_tls_creates_an_absent_service_record() {
+    let (ops, _identity) = FakeOps::with_identity();
+    ops.put_record(None);
+    assert!(load_default_identity(&ops).is_ok());
+    assert_eq!(
+        ops.writes(),
+        vec!["CREATE record revocations.txt no-replace"]
+    );
+    assert_eq!(ops.record().unwrap().entries(), &[]);
+    assert!(
+        !ops.calls().iter().any(|c| c == "lock"),
+        "{:#?}",
+        ops.calls()
+    );
+
+    let (ops, _identity) = FakeOps::with_identity();
+    ops.remove_records();
+    assert!(load_default_identity(&ops).is_ok());
+    assert_eq!(
+        ops.writes(),
+        vec![
+            "CREATE dir tls-revocations UsersRead",
+            "CREATE record revocations.txt no-replace"
+        ]
+    );
+    // 2 回目の起動は読むだけ。
+    ops.log.borrow_mut().clear();
+    assert!(load_default_identity(&ops).is_ok());
+    assert_eq!(ops.writes(), Vec::<String>::new());
+}
+
+/// 場面 8: 証明書の拇印が記録にある（露出を見た証明書）。TLS を使わず、`--renew` を案内する。
+/// ほかの拇印だけなら使う。
+#[test]
+fn scene_8_default_tls_refuses_a_revoked_certificate() {
+    let (ops, identity) = FakeOps::with_identity();
+    let revoked = CertThumbprint::of_pem(identity.cert_pem.as_bytes()).unwrap();
+    ops.put_record(Some(&record_with(&[thumb(1), revoked])));
+    let found = assert_unavailable(&ops, "失効の記録にあります");
+    assert!(found.reason.contains(&revoked.to_string()), "{found:#?}");
+    assert!(found.remedy.contains(RENEW_FLAG), "{found:#?}");
+
+    let (ops, _identity) = FakeOps::with_identity();
+    ops.put_record(Some(&record_with(&[thumb(1)])));
+    assert!(load_default_identity(&ops).is_ok());
+}
+
+/// 場面 26: 記録の形が壊れている（`準備中`・大きすぎる・ファイルが露出も含む）。TLS を使わず、
+/// 記録は書き換えない（作り直すのは elev の `--renew`）。
+#[test]
+fn scene_26_default_tls_refuses_a_broken_service_record() {
+    let mut users_writable = FileEntry::with(FileAcl::UsersRead, &empty_record());
+    if let Some(aces) = users_writable.security.dacl.aces.as_mut() {
+        aces.push(ace(USERS, MODIFY_ACCESS_MASK, 0));
+    }
+    let mut linked = FileEntry::with(FileAcl::UsersRead, &empty_record());
+    linked.security.links = 2;
+    let cases: Vec<(FileEntry, &str)> = vec![
+        (
+            FileEntry::with(FileAcl::UsersRead, b"garbage"),
+            "形が壊れています",
+        ),
+        (
+            FileEntry::with(
+                FileAcl::UsersRead,
+                &RevocationRecord::new(banto_hub_tls_trust::RecordState::Pending, []).encode(),
+            ),
+            "準備中",
+        ),
+        (
+            FileEntry::with(
+                FileAcl::UsersRead,
+                &vec![b'x'; banto_hub_tls_trust::MAX_REVOCATIONS_BYTES + 1],
+            ),
+            "大きすぎます",
+        ),
+        (users_writable, "保護されていません"),
+        (linked, "保護されていません"),
+    ];
+    for (entry, needle) in cases {
+        let (ops, _identity) = FakeOps::with_identity();
+        ops.files.borrow_mut().insert(record_file(), entry);
+        let found = assert_unavailable(&ops, needle);
+        assert!(found.reason.contains("サービスの失効の記録"), "{found:#?}");
+        assert!(found.remedy.contains(RENEW_FLAG), "{found:#?}");
+    }
+}
+
+/// 場面 26: 記録の置き場が確かめに通らない（露出・所有者違い・リンク・場所の食い違い）。TLS を
+/// 使わず、何も書かず、置き場を直してから `--renew` を案内する。
+#[test]
+fn scene_26_default_tls_refuses_an_untrusted_record_place() {
+    let cases: Vec<DirEdit> = vec![
+        Box::new(|e| e.aces.push(ace(USERS, MODIFY_ACCESS_MASK, 0x03))),
+        Box::new(|e| e.owner = EVIL.to_string()),
+        Box::new(|e| e.is_reparse_point = true),
+        Box::new(|e| e.real = Some(abs("Elsewhere/tls-revocations"))),
+    ];
+    for edit in cases {
+        let (ops, _identity) = FakeOps::with_identity();
+        let mut entry = DirEntry::users_read();
+        edit(&mut entry);
+        ops.dirs.borrow_mut().insert(records(), entry);
+        let found = assert_unavailable(&ops, "サービスの失効の記録の置き場");
+        assert!(found.remedy.contains("tls-revocations"), "{found:#?}");
+        assert!(found.remedy.contains(RENEW_FLAG), "{found:#?}");
+    }
+}
+
+/// 記録を作れない（I/O）ときも、閉じる側（TLS 無し）に倒す。
+#[test]
+fn default_tls_refuses_when_the_service_record_cannot_be_created() {
+    let (mut ops, _identity) = FakeOps::with_identity();
+    ops.put_record(None);
+    ops.create_error
+        .insert("revocations.txt".to_string(), "ディスクが一杯".to_string());
+    let found = load_default_identity(&ops).expect_err("作れなければ使わない");
+    assert!(found.reason.contains("ディスクが一杯"), "{found:#?}");
+    assert!(found.remedy.contains("再起動"), "{found:#?}");
+    assert!(ops.record().is_none());
 }

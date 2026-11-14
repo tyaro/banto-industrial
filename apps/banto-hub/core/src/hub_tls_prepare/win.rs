@@ -10,7 +10,7 @@ use banto_safe_root::acl::PinnedFile;
 use banto_safe_root::guard::win::RegistryMachineEnvironment;
 use banto_safe_root::InstallUserSid;
 
-use super::{DirHow, FileAcl, HubTlsOps, TlsTrustOps};
+use super::{DirHow, FileAcl, HubTlsOps, ServiceRevocationOps, TlsTrustOps};
 use crate::sink_config_prepare::{secret_error_text, FileOpenError};
 
 /// 辿らずに開いたフォルダ（共有 crate の `banto_hub_tls_trust::win::WinTlsDir`。削除・付け替えに
@@ -45,6 +45,41 @@ impl TlsTrustOps for WindowsHubTlsOps {
         name: &str,
     ) -> Result<Option<PinnedFile>, FileOpenError> {
         trust::open_child_file(parent, name)
+    }
+}
+
+/// サービスの失効の記録を書く操作（#1121 PR2b）。部品は共有 crate の `win` の関数（中身は
+/// `banto_safe_root`）: フォルダは `tls\` と同じ記述子で作り、記録のファイルは証明書と同じ記述子
+/// （所有者 Administrators を明示）で作る・置き換える。
+impl ServiceRevocationOps for WindowsHubTlsOps {
+    fn create_protected_child_dir(
+        &self,
+        parent: &WinTlsDir,
+        name: &str,
+    ) -> Result<Option<WinTlsDir>, String> {
+        trust::create_child_dir_users_read(parent, name)
+    }
+
+    fn create_file_no_replace(
+        &self,
+        dir: &WinTlsDir,
+        name: &str,
+        contents: &[u8],
+    ) -> Result<bool, String> {
+        trust::create_file_no_replace_users_read(dir, name, contents)
+    }
+
+    fn write_file_atomic(
+        &self,
+        dir: &WinTlsDir,
+        name: &str,
+        contents: &[u8],
+    ) -> Result<(), String> {
+        trust::write_file_atomic_users_read(dir, name, contents)
+    }
+
+    fn remove_stale_file_temps(&self, dir: &WinTlsDir, name: &str) -> Result<(), String> {
+        trust::remove_stale_temps(dir, name)
     }
 }
 

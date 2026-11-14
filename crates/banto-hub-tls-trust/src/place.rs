@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use banto_safe_root::acl::exposure_beyond_users_read;
-use banto_safe_root::guard::{self, DataAclRefusal, DirState, MachineEnvironment};
+use banto_safe_root::guard::{self, DataAclRefusal, DirState, KnownFolders, MachineEnvironment};
 
 use crate::text::{real_path_reason, reasons_text, well_known_text};
 use crate::{
@@ -42,13 +42,37 @@ fn unavailable(reason: String, remedy: Remedy) -> Unavailable {
 
 /// 確かめ終えた置き場（ルートと `tls\` を辿らずに握ったまま持つ）。
 pub struct CheckedPlace<D> {
-    _root: D,
+    root: D,
+    root_path: PathBuf,
+    root_real: PathBuf,
+    known: KnownFolders,
     tls: D,
     tls_path: PathBuf,
     tls_real: PathBuf,
 }
 
 impl<D> CheckedPlace<D> {
+    /// 確かめたルートのハンドル（サービスの失効の記録の置き場を、このハンドル基準で開くため。
+    /// #1121 PR2b）。
+    pub fn root(&self) -> &D {
+        &self.root
+    }
+
+    /// ルートの期待のパス（`<ProgramData>\BantoHub`。文言用）。
+    pub fn root_path(&self) -> &Path {
+        &self.root_path
+    }
+
+    /// ルートの本当のパス。
+    pub fn root_real(&self) -> &Path {
+        &self.root_real
+    }
+
+    /// 確かめに使った既知のフォルダ。
+    pub fn known(&self) -> &KnownFolders {
+        &self.known
+    }
+
     /// 確かめた `tls\` のハンドル。
     pub fn tls(&self) -> &D {
         &self.tls
@@ -65,7 +89,7 @@ impl<D> CheckedPlace<D> {
     }
 }
 
-fn dir_refusal(label: &str, dir: &Path, refusal: &DataAclRefusal) -> String {
+pub(crate) fn dir_refusal(label: &str, dir: &Path, refusal: &DataAclRefusal) -> String {
     let reason = match refusal {
         DataAclRefusal::ReparsePoint => {
             "ジャンクションかシンボリックリンク（reparse point）です".to_string()
@@ -78,8 +102,31 @@ fn dir_refusal(label: &str, dir: &Path, refusal: &DataAclRefusal) -> String {
     format!("{label}（{}）は{reason}", dir.display())
 }
 
+/// 確かめたルート（[`open_root`] が返す）。
+pub(crate) struct CheckedRoot<D> {
+    pub(crate) root: D,
+    pub(crate) root_path: PathBuf,
+    pub(crate) root_real: PathBuf,
+    pub(crate) known: KnownFolders,
+}
+
 /// ルートと `tls\` を確かめて開く（crate doc の手順 1〜3）。書き込み・作成はしない。
 pub fn open_place<O: TlsTrustOps>(ops: &O) -> Result<CheckedPlace<O::Dir>, Unavailable> {
+    let CheckedRoot {
+        root,
+        root_path,
+        root_real,
+        known,
+    } = open_root(ops)?;
+    let tls_path = root_path.join(TLS_DIR);
+
+    // --- 3. 置き場 ------------------------------------------------------------------
+    open_tls(ops, root, root_path, root_real, known, tls_path)
+}
+
+/// crate doc の手順 1・2: ProgramData とルートを確かめて開く（無ければ [`Remedy::Prepare`]）。
+/// サービスの失効の記録の読み口（`crate::service_revocation`）と共有する。
+pub(crate) fn open_root<O: TlsTrustOps>(ops: &O) -> Result<CheckedRoot<O::Dir>, Unavailable> {
     // --- 1. 純粋な確かめ ------------------------------------------------------------
     let program_data = ops.machine_env().program_data().map_err(|error| {
         unavailable(
@@ -88,7 +135,6 @@ pub fn open_place<O: TlsTrustOps>(ops: &O) -> Result<CheckedPlace<O::Dir>, Unava
         )
     })?;
     let root_path = program_data.join(PRODUCT_DIR);
-    let tls_path = root_path.join(TLS_DIR);
     if !root_path.is_absolute() {
         return Err(unavailable(
             format!(
@@ -165,7 +211,23 @@ pub fn open_place<O: TlsTrustOps>(ops: &O) -> Result<CheckedPlace<O::Dir>, Unava
         ));
     }
 
-    // --- 3. 置き場 ------------------------------------------------------------------
+    Ok(CheckedRoot {
+        root,
+        root_path,
+        root_real,
+        known,
+    })
+}
+
+/// crate doc の手順 3: 確かめたルートのハンドル基準で `tls\` を開いて確かめる。
+fn open_tls<O: TlsTrustOps>(
+    ops: &O,
+    root: O::Dir,
+    root_path: PathBuf,
+    root_real: PathBuf,
+    known: KnownFolders,
+    tls_path: PathBuf,
+) -> Result<CheckedPlace<O::Dir>, Unavailable> {
     let recreate = || Remedy::RecreateDir(tls_path.clone());
     let tls = match ops.open_child_dir(&root, TLS_DIR) {
         Ok(Some(tls)) => tls,
@@ -220,7 +282,10 @@ pub fn open_place<O: TlsTrustOps>(ops: &O) -> Result<CheckedPlace<O::Dir>, Unava
     }
 
     Ok(CheckedPlace {
-        _root: root,
+        root,
+        root_path,
+        root_real,
+        known,
         tls,
         tls_path,
         tls_real,

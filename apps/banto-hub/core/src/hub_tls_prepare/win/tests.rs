@@ -18,8 +18,8 @@ use banto_safe_root::InstallUserSid;
 use banto_service_control::ConsoleLine;
 
 use super::super::{
-    inspect_identity, prepare_hub_tls, DirHow, FileAcl, HubTlsOps, Refused, TlsTrustOps, CERT_FILE,
-    CERT_TEMP, KEY_FILE, KEY_TEMP, TLS_DIR,
+    inspect_identity, prepare_hub_tls, DirHow, FileAcl, HubTlsOps, Refused, ServiceRevocationOps,
+    TlsTrustOps, CERT_FILE, CERT_TEMP, KEY_FILE, KEY_TEMP, SERVICE_REVOCATIONS_DIR, TLS_DIR,
 };
 use super::{RegistryMachineEnvironment, WinTlsDir, WindowsHubTlsOps};
 use crate::sink_config_prepare::FileOpenError;
@@ -82,6 +82,35 @@ impl TlsTrustOps for TempOps {
         name: &str,
     ) -> Result<Option<Self::File>, FileOpenError> {
         WindowsHubTlsOps.open_child_file(parent, name)
+    }
+}
+
+impl ServiceRevocationOps for TempOps {
+    fn create_protected_child_dir(
+        &self,
+        parent: &WinTlsDir,
+        name: &str,
+    ) -> Result<Option<WinTlsDir>, String> {
+        WindowsHubTlsOps.create_protected_child_dir(parent, name)
+    }
+    fn create_file_no_replace(
+        &self,
+        dir: &WinTlsDir,
+        name: &str,
+        contents: &[u8],
+    ) -> Result<bool, String> {
+        WindowsHubTlsOps.create_file_no_replace(dir, name, contents)
+    }
+    fn write_file_atomic(
+        &self,
+        dir: &WinTlsDir,
+        name: &str,
+        contents: &[u8],
+    ) -> Result<(), String> {
+        WindowsHubTlsOps.write_file_atomic(dir, name, contents)
+    }
+    fn remove_stale_file_temps(&self, dir: &WinTlsDir, name: &str) -> Result<(), String> {
+        WindowsHubTlsOps.remove_stale_file_temps(dir, name)
     }
 }
 
@@ -393,4 +422,85 @@ fn a_non_admin_cannot_create_the_place() {
     let (result, lines) = run(&f.ops, false);
     assert_eq!(result, Err(Refused), "{lines:#?}");
     assert!(!f.tls().exists(), "{lines:#?}");
+}
+
+/// サービスの失効の記録（#1121 PR2b）: elev が `tls\` と同じ形の置き場と空の記録（所有者
+/// Administrators を明示）を作り、サービスの Hub の読み込みが照合する。記録が消えれば Hub が
+/// 作り直し、壊れれば Hub は使わず、`--renew` が古い証明書の拇印を引き継いで作り直す。
+#[test]
+fn creates_and_rebuilds_the_service_record_and_the_hub_checks_it() {
+    use banto_hub_tls_trust::{CertThumbprint, RevocationRecord, REVOCATIONS_FILE};
+
+    use crate::hub_tls_prepare::load::load_default_identity;
+
+    if !elevated_admin("creates_and_rebuilds_the_service_record_and_the_hub_checks_it") {
+        return;
+    }
+    let f = fixture();
+    let records = f
+        .program_data
+        .join("BantoHub")
+        .join(SERVICE_REVOCATIONS_DIR);
+    let record = records.join(REVOCATIONS_FILE);
+    let (result, lines) = run(&f.ops, false);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    let check_record = || {
+        let dir = inspect_file(&records).unwrap().expect("置き場がある");
+        assert!(dir.is_dir && dir.dacl.protected, "{dir:?}");
+        assert_eq!(dir.dacl.owner, ADMINISTRATORS_SID);
+        assert_eq!(exposure_beyond_users_read(&dir), vec![], "{dir:?}");
+        let file = inspect_file(&record).unwrap().expect("記録がある");
+        assert_eq!(file.dacl.owner, ADMINISTRATORS_SID, "{file:?}");
+        assert_eq!(exposure_beyond_users_read(&file), vec![], "{file:?}");
+        RevocationRecord::parse(&std::fs::read(&record).unwrap()).unwrap()
+    };
+    assert_eq!(check_record().entries(), &[]);
+    // 一時の ProgramData では、elev が継承で作ったルートに、CREATOR OWNER から実行した管理者
+    // 本人（CI の runneradmin）のフルが付き、所有者も本人になる。elev は本人を信頼するが、サービス
+    // の読み込みは本人を知らないので断る（#1116・#1117 からの決まり）。本物の ProgramData で
+    // 昇格した管理者の既定の所有者（Administrators）が作った形に揃えてから読ませる。
+    let root = f.program_data.join("BantoHub");
+    let me = std::process::Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .expect("whoami を起動できない");
+    let me = String::from_utf8_lossy(&me.stdout);
+    let sid = me
+        .trim()
+        .rsplit(',')
+        .next()
+        .expect("whoami の出力")
+        .trim_matches('"')
+        .to_string();
+    icacls(&root, &["/setowner", "*S-1-5-32-544"]);
+    icacls(&root, &["/remove:g", &format!("*{sid}")]);
+    if let Err(found) = load_default_identity(&f.ops) {
+        panic!("サービスの読み込みが断った: {found:#?}");
+    }
+
+    // 消えた記録は、サービスの Hub の起動が空で作り直す（場面 25）。
+    std::fs::remove_file(&record).unwrap();
+    if let Err(found) = load_default_identity(&f.ops) {
+        panic!("サービスの読み込みが断った: {found:#?}");
+    }
+    assert_eq!(check_record().entries(), &[]);
+
+    // 壊れた記録: Hub は使わず、elev は `--renew` が無ければ断り、`--renew` で作り直す（場面 26）。
+    std::fs::write(&record, b"broken").unwrap();
+    let found = load_default_identity(&f.ops).expect_err("壊れた記録では使わない");
+    assert!(found.reason.contains("形が壊れています"), "{found:#?}");
+    let (result, lines) = run(&f.ops, false);
+    assert_eq!(result, Err(Refused), "{lines:#?}");
+    let old = CertThumbprint::of_pem(&std::fs::read(f.tls().join(CERT_FILE)).unwrap()).unwrap();
+    let (result, lines) = run(&f.ops, true);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    assert!(check_record().contains(&old));
+    let loaded = load_default_identity(&f.ops).unwrap();
+    assert!(!check_record().contains(&CertThumbprint::of_pem(loaded.cert_pem()).unwrap()));
+    // 記録が健全なら、一時ファイルは片付けない（サービスの Hub が作っている最中かもしれない）。
+    let temp = records.join(format!(".{REVOCATIONS_FILE}.tmp-0000abcd"));
+    std::fs::write(&temp, b"half").unwrap();
+    let (result, lines) = run(&f.ops, false);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    assert!(temp.exists(), "{lines:#?}");
 }

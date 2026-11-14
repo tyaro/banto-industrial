@@ -143,11 +143,28 @@
 //!   ロックファイルも、置き場のフォルダと、開いた後のハンドルで確かめる。取れない・通らない
 //!   ときは何も書かない。握ったプロセスが落ちれば OS がハンドルを閉じるので、残らない。
 //!
+//! ## サービスの失効の記録（#1121 PR2b、2026-11-14 オーナー決定）
+//!
+//! サービスの `tls\` の証明書の失効は `<ProgramData>\BantoHub\tls-revocations\`（[`SERVICE_REVOCATIONS_DIR`]）
+//! （`tls\` の外）の 1 つの記録に残す（`service_revocation` モジュール）。書けるのは SYSTEM と
+//! 管理者だけなので、対の記録も `準備中` も持たず、「無い」は空。置き場はサービスの `tls\` と同じ
+//! 確かめ（[`open_service_revocations_dir`]）に通したときだけ読む。
+//!
+//! - **読み口**（[`read_service_revocations`]）はサービスの Hub・ChronoGazer・chronogazer-server
+//!   が共有する。使えないときは [`ServiceRevocationFault`]（置き場が通らない・形が壊れている・
+//!   一時的）で分け、壊れていても行ごとに読める拇印は拾う。
+//! - **書き口**（[`ServiceRevocationOps`]。サービスの Hub と elev だけ）: 無ければ**置き換えずに**
+//!   作る（[`create_service_revocations_if_absent`]・[`ensure_service_revocations`]）、壊れた記録は
+//!   置き換えで作り直す（[`rewrite_service_revocations`]）。ファイルは証明書と同じ記述子（所有者
+//!   Administrators を明示）で作る。記録用のロックは持たない（理由はモジュールの doc「書き方と
+//!   ロック」）。
+//!
 //! ## テスト
 //!
 //! OS を触る操作はすべて [`TlsTrustOps`]・[`UserTlsOps`]・[`RevocationOps`]（Windows の実装は
 //! `win::WindowsTlsTrustOps`）を通すので、確かめの順序と断る分岐は偽物で全 OS で確かめる
-//! （`tests.rs`、利用者ごとの置き場は `tests/user.rs`、失効の記録は `tests/revocation.rs` で、
+//! （`tests.rs`、利用者ごとの置き場は `tests/user.rs`、失効の記録は `tests/revocation.rs`、
+//! サービスの失効の記録は `tests/service_revocation.rs` で、
 //! 設計 §4.4.2 の場面の番号を試験の名前に入れてある）。Hub 側の同じ手順の表は banto-hub-core の
 //! `hub_tls_prepare/tests/load.rs` にある。
 
@@ -155,6 +172,7 @@ mod dacl;
 mod ops;
 mod place;
 mod revocation;
+mod service_revocation;
 pub mod text;
 mod user;
 #[cfg(windows)]
@@ -172,6 +190,14 @@ pub use revocation::{
     RevocationRecord, RevocationSide, RevocationWarning, RevokedCert, RevokedCertPlace,
     SideContent, UserRevocations, DEFAULT_LOCK_POLL, DEFAULT_LOCK_WAIT, MAX_REVOCATIONS_BYTES,
     REVOCATIONS_FILE, REVOCATIONS_HEADER,
+};
+pub use service_revocation::{
+    create_service_revocations_if_absent, ensure_service_revocations,
+    open_or_create_service_revocations_dir, open_service_revocations_dir, read_service_revocations,
+    read_service_revocations_in, remove_stale_service_revocation_temps,
+    rewrite_service_revocations, salvage_revocations, ServiceRevocationFault, ServiceRevocationOps,
+    ServiceRevocationProblem, ServiceRevocations, ServiceRevocationsDir, ServiceRoot,
+    SERVICE_REVOCATIONS_DIR, SERVICE_REVOCATIONS_LABEL,
 };
 pub use user::{
     check_place_layout, check_spec, is_app_container_sid, load_pinned_user_cert, open_user_file,

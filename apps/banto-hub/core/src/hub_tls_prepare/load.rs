@@ -2,7 +2,8 @@
 //! 2026-11-13 オーナー決定 A・B）。
 //!
 //! `banto-hub-elev prepare-hub-tls`（[`super`]）が `<ProgramData>\BantoHub\tls\` に作った
-//! [`KEY_FILE`]・[`CERT_FILE`] を、**書き込み・作成を一切せずに**、置き場ごと確かめてから読む。
+//! [`KEY_FILE`]・[`CERT_FILE`] を、**`tls\` には書き込み・作成を一切せずに**、置き場ごと確かめて
+//! から読む。書くのはサービスの失効の記録だけ（下の手順 6）。
 //! サービス（`HubHostKind::Service`）は、Hub の TLS の環境変数（`BANTO_HUB_TLS_PORT/CERT/KEY`）
 //! がどれも無いときにここを呼び、読めたら 127.0.0.1:[`DEFAULT_TLS_PORT`] で TLS を待ち受ける
 //! （`crate::runtime::HubConfig::default_tls`）。読めなければ（無い・片方だけ・壊れている・
@@ -25,6 +26,13 @@
 //!    [`exposure_beyond_users_read`](banto_safe_root::acl::exposure_beyond_users_read)。
 //! 5. 確かめてから、握ったハンドルから [`MAX_PEM_BYTES`](super::MAX_PEM_BYTES) まで読み、[`inspect_identity`] で中身を
 //!    確かめる。
+//! 6. **サービスの失効の記録**（#1121 PR2b。docs/hub-desktop-tls-design.md §4.4.1「サービスの
+//!    記録」、場面 25・26）: 確かめたルートのハンドル基準で `tls-revocations\` を確かめ（無ければ
+//!    `tls\` と同じ保護された DACL を付けて作る）、記録を読む（無ければ空で作る。#1116 で作った
+//!    証明書だけがある PC のため。置き換えずに作るので、同時に elev が作った記録を上書きしない）。
+//!    証明書の拇印が記録にあれば使わない。置き場が確かめに通らない・形が壊れている・作れない
+//!    （I/O）も使わない。どれも TLS 無しで起動し、理由と対処をログに出す（閉じる側）。読み書きは
+//!    共有 crate の `banto_hub_tls_trust::ensure_service_revocations`。
 //!
 //! 手順 1〜3 と、4 のファイルの開き方・証明書の ACL・5 の読み方は、クライアント（ChronoGazer、
 //! #644 PR3b）と同じコードを使うため共有 crate `banto_hub_tls_trust` にある（[`open_place`]・
@@ -38,8 +46,9 @@
 use std::path::{Path, PathBuf};
 
 use banto_hub_tls_trust::{
-    check_cert_exposure, open_checked_file, open_place, read_checked, Remedy, Unavailable,
-    TLS_LABEL,
+    check_cert_exposure, ensure_service_revocations, open_checked_file, open_place, read_checked,
+    CertThumbprint, Remedy, ServiceRevocationFault, ServiceRevocationProblem, Unavailable,
+    SERVICE_REVOCATIONS_DIR, SERVICE_REVOCATIONS_LABEL, TLS_LABEL,
 };
 use banto_safe_root::acl::{exposure, FileSecurity};
 use zeroize::Zeroizing;
@@ -210,6 +219,32 @@ fn fix_root_remedy() -> String {
     "所有者を Administrators にし（takeown /a）、SYSTEM・Administrators 以外への削除・子の削除・ACL と所有者の変更・書き込み・フルの許可を外してから、Hub のサービスを再起動してください".to_string()
 }
 
+/// サービスの失効の記録の置き場が確かめに通らないときの対処（場面 26）。
+fn fix_record_place_remedy(dir: &Path) -> String {
+    format!(
+        "{} の中身を確かめ、所有者を Administrators にし、SYSTEM・Administrators 以外への書き込みの許可を外して（または、このフォルダを消して）から、管理者の PowerShell で {ELEV} {RENEW_FLAG} を実行して記録と証明書を作り直し、この証明書を pin しているクライアント（banto-hub-sink の hub_tls_pinned_certs など）を新しい証明書に書き換えてから、Hub と Sink のサービスを再起動してください",
+        dir.display()
+    )
+}
+
+/// サービスの失効の記録を使えないときの、理由と対処（#1121 PR2b）。
+fn from_record(found: ServiceRevocationProblem, root_path: &Path) -> DefaultTlsUnavailable {
+    let remedy = match found.fault {
+        ServiceRevocationFault::Untrusted => {
+            fix_record_place_remedy(&root_path.join(SERVICE_REVOCATIONS_DIR))
+        }
+        ServiceRevocationFault::Broken => renew_remedy(),
+        ServiceRevocationFault::Transient => retry_remedy(),
+    };
+    unavailable(
+        format!(
+            "{SERVICE_REVOCATIONS_LABEL}を使えないので、サービスの証明書を使いません: {}",
+            found.reason
+        ),
+        remedy,
+    )
+}
+
 /// 共有 crate の確かめの失敗を、サービスログの理由と対処にする（対処の文言は移す前と同じ）。
 fn from_trust(found: Unavailable) -> DefaultTlsUnavailable {
     let remedy = match &found.remedy {
@@ -222,8 +257,8 @@ fn from_trust(found: Unavailable) -> DefaultTlsUnavailable {
     unavailable(found.reason, remedy)
 }
 
-/// 既定の TLS の鍵と証明書を、置き場ごと確かめてから読む（モジュール doc「確かめの順序」）。
-/// 書き込み・作成はしない。
+/// 既定の TLS の鍵と証明書を、置き場ごと確かめてから読み、サービスの失効の記録と照合する
+/// （モジュール doc「確かめの順序」）。`tls\` には書き込み・作成をしない。記録が無ければ空で作る。
 pub fn load_default_identity<O: HubTlsOps>(
     ops: &O,
 ) -> Result<DefaultHubTls, DefaultTlsUnavailable> {
@@ -284,15 +319,45 @@ pub fn load_default_identity<O: HubTlsOps>(
     let cert_pem = read_checked(&mut cert, "証明書", &cert_path).map_err(from_trust)?;
     drop((key, cert));
     let now = ops.now_unix();
-    DefaultHubTls::from_checked_pem(DEFAULT_TLS_PORT, cert_pem, key_pem, cert_path, now).map_err(
-        |error| {
-            unavailable(
-                format!(
-                    "{TLS_LABEL}（{}）の鍵と証明書は使えません: {error}",
-                    tls_path.display()
-                ),
-                renew_remedy(),
-            )
-        },
+    let loaded = DefaultHubTls::from_checked_pem(
+        DEFAULT_TLS_PORT,
+        cert_pem,
+        key_pem,
+        cert_path.clone(),
+        now,
     )
+    .map_err(|error| {
+        unavailable(
+            format!(
+                "{TLS_LABEL}（{}）の鍵と証明書は使えません: {error}",
+                tls_path.display()
+            ),
+            renew_remedy(),
+        )
+    })?;
+
+    // --- 6. サービスの失効の記録（#1121 PR2b。場面 25・26） ------------------------------
+    // `inspect_identity` を通った PEM なので、拇印は取れる（取れなければ使わない側に倒す）。
+    let thumbprint = CertThumbprint::of_pem(loaded.cert_pem()).map_err(|error| {
+        unavailable(
+            format!(
+                "証明書（{}）の拇印を取れませんでした: {error}",
+                cert_path.display()
+            ),
+            renew_remedy(),
+        )
+    })?;
+    let (record, _created) = ensure_service_revocations(ops, &place)
+        .map_err(|found| from_record(found, place.root_path()))?;
+    if record.contains(&thumbprint) {
+        return Err(unavailable(
+            format!(
+                "証明書（{}、拇印 {thumbprint}）は{SERVICE_REVOCATIONS_LABEL}（{}）の失効の記録にあります（露出を見た証明書は二度と使いません）",
+                cert_path.display(),
+                place.root_path().join(SERVICE_REVOCATIONS_DIR).display()
+            ),
+            renew_remedy(),
+        ));
+    }
+    Ok(loaded)
 }

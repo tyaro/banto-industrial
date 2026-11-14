@@ -180,6 +180,18 @@ pub(super) fn write_atomic(
     name: &str,
     contents: &[u8],
 ) -> Result<()> {
+    write_atomic_with(dir, display, name, contents, None)
+}
+
+/// [`write_atomic`] の、一時ファイルを `descriptor`（`Some` なら作るのと同時に付ける記述子）で
+/// 作る版（#1121 PR2b。[`super::ManagedDir::write_atomic_users_read`]）。
+pub(super) fn write_atomic_with(
+    dir: &PinnedDir,
+    display: &Path,
+    name: &str,
+    contents: &[u8],
+    descriptor: Option<&crate::acl::imp::LocalBox>,
+) -> Result<()> {
     // 宛先がフォルダ（ジャンクション・ディレクトリのシンボリックリンクを含む）なら、何も作らずに
     // 断る。【実測】`FileRenameInformationEx`（`REPLACE_IF_EXISTS | POSIX_SEMANTICS`）は、普通の
     // 空のフォルダは置き換えない（`ERROR_ACCESS_DENIED`）が、**ジャンクションは置き換えてしまう**
@@ -206,7 +218,7 @@ pub(super) fn write_atomic(
     let mut created = None;
     for step in 0..TEMP_TRIES {
         let temp = temp_name(name, seed.wrapping_add(step)).ok_or_else(super::invalid_name)?;
-        if let Some(handle) = child_relative(dir, &temp, ChildHow::CreateFile(None))? {
+        if let Some(handle) = child_relative(dir, &temp, ChildHow::CreateFile(descriptor))? {
             created = Some(handle);
             break;
         }
