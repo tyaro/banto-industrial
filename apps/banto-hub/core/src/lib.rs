@@ -159,6 +159,10 @@
 //!   （[`http_hub_health::HttpHubHealthProbe`]）- `GET /api/v1/openapi.json`
 //!   への素朴な TCP/HTTP 往復（新規クレート依存なし）＋期待 profile の
 //!   `profile.lock`診断で health/所有権を判定する
+//! - [`pinned_hub_health`]: #644 PR4（2026-11-14）。デスクトップシェルの Service モードが使う
+//!   [`hub_health::HubHealthProbe`]（[`pinned_hub_health::PinnedHubHealthProbe`]）- Hub の TLS の口
+//!   （127.0.0.1:8723）の相手が `%ProgramData%\BantoHub\tls\` の証明書と完全に一致するときだけ
+//!   `Healthy`。「消えた」（`Unreachable`）は従来どおり平文の口で決める
 //! - [`host_switch`]: T17-3（同§3）。Desktop↔Service 切替トランザクションの
 //!   状態機械（[`host_switch::HostSwitchEngine`]）- 切替の各段階
 //!   （[`host_switch::SwitchPhase`]）と失敗到達（[`host_switch::FaultStage`]）
@@ -251,6 +255,7 @@ pub mod mqtt;
 pub mod opcua;
 pub mod opcua_pki;
 pub mod pending_changes;
+pub mod pinned_hub_health;
 pub mod profile_grant;
 pub mod profile_lock;
 pub mod profile_mode;

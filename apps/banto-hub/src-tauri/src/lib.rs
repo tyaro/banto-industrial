@@ -23,9 +23,9 @@
 //! ```text
 //! setup:
 //!   #[cfg(windows)] WindowsServiceManager::query_status()
-//!     Running かつ HttpHubHealthProbe が Healthy
+//!     Running かつ pin した TLS の probe（#644 PR4、service_tls::service_probe）が Healthy
 //!       -> HubRuntime::start をスキップし、メインウィンドウを
-//!          サービスの localhost URL へ navigate（ShellView::Service）
+//!          https://127.0.0.1:8723/ へ navigate（ShellView::Service）
 //!          トレイ: 「サービス: Running」・画面を開く・
 //!          (Operators のみ)サービスを停止・管理画面を終了
 //!     Running だが Healthy でない（Unreachable/PortConflict/
@@ -109,7 +109,9 @@
 //!   [`banto_hub_core::service_manager::WindowsServiceManager`]で問い合わせ、
 //!   `Running`なら[`banto_hub_core::http_hub_health::HttpHubHealthProbe`]
 //!   （実装指示 3.「T17-3 で deferred だった実 HTTP probe」）で health を
-//!   確認する。Healthy ならデスクトップ Hub を起動せずサービスへ接続する
+//!   確認する（#644 PR4 から pin した TLS の
+//!   [`banto_hub_core::pinned_hub_health::PinnedHubHealthProbe`] - 下の「Service モードは
+//!   pin した https だけ」節）。Healthy ならデスクトップ Hub を起動せずサービスへ接続する
 //!   （実装指示 1.「service Running なら Desktop Collector を起動しない」）。
 //! - [`ShellView`]/[`FallbackInfo`]: 現在シェルが表示している見え方
 //!   （デスクトップホスト／サービス接続／fallback）とその診断情報。
@@ -171,7 +173,10 @@
 //!   このプロセス自身が接続する用途では意味を持たないため、loopback
 //!   （`127.0.0.1`）へ読み替える。[`ProbeTarget`]がこの解決結果を保持し、
 //!   [`decide_startup`]・[`attempt_desktop_start`]・[`run_host_switch`]が
-//!   共通で使う。
+//!   共通で使う。#644 PR4（2026-11-14）から、この値は**平文の口**（`PORT`、既定 8722）の
+//!   probe（Desktop の失敗の診断・Service→Desktop の「旧サービスが消えた」）にだけ使う。
+//!   Service の navigate 先と pin した TLS の probe は`BANTO_BIND`・`PORT`に追従せず、常に
+//!   `https://127.0.0.1:8723/`（Hub は TLS を 127.0.0.1 だけで待ち受ける - [`service_tls`]）。
 //! - Operators に加え Windows ローカル Administrators グループのメンバーも
 //!   サービス操作系トレイ項目を表示できるようにした
 //!   （[`banto_hub_core::service_operators::is_current_process_admin`]、
@@ -194,14 +199,17 @@
 //! いたこと。[`host_switch_ipc`]の4コマンドが呼べず、`/status`の
 //! 「Windows サービス」カードが「シェル状態を読み込み中…」のまま
 //! 進まなくなっていた。`capabilities/default.json`に
-//! `remote.urls: ["http://127.0.0.1:*/*"]`を追加して解消した - この
-//! crate は`resolve_navigate_host`/`navigate_to_hub`の実装どおり自プロセス
-//! 内`HubRuntime`（既定`127.0.0.1`、`BANTO_BIND`が空/`0.0.0.0`/`::`なら
-//! 同じくloopbackへ読み替える）以外へ navigate する経路を持たないため、
-//! 許可 origin をこの loopback に限定できる（詳細な安全性の論拠は
-//! `capabilities/default.json`の`description`に記載）。ポートは`PORT`
+//! `remote.urls: ["http://127.0.0.1:*/*"]`を追加して解消した。ポートは`PORT`
 //! env で可変なためワイルドカードにしたが、ホストは`127.0.0.1`固定のまま
 //! 広げていない。
+//!
+//! ただし当時の論拠「自プロセス内`HubRuntime`以外へ navigate する経路を持たない」は
+//! 事実と違っていた - Service モードはサービスの平文の`http://127.0.0.1:8722/`へ移っており、
+//! Hub の停止中に 8722 を先取りした偽の画面からもシェルの invoke を呼べた（#644）。
+//! #644 PR4（2026-11-14）で Service は pin した`https://127.0.0.1:8723/*`だけになり
+//! （下の「Service モードは pin した https だけ」節）、`http://127.0.0.1:*/*`は Desktop モードの
+//! 自プロセスの Hub のために残している（#1121 で Desktop も TLS 化する予定。論拠は
+//! `capabilities/default.json`の`description`）。
 //!
 //! ## OS の終了で収集を止める（#586、2026-10-12）
 //!
@@ -230,6 +238,37 @@
 //! - デスクトップのログ（`logs\banto-hub-desktop-YYYY-MM-DD.log`）: 設定モードへの切り替えの
 //!   開始・完了と 5 の案内を、起きた時刻で（[`AppState::pending_log`] に覚えて、Hub が動き
 //!   始めてから書く）。
+//!
+//! ## Service モードは pin した https だけ（#644 PR4、2026-11-14 オーナー決定）
+//!
+//! 以前の Service モードは`http://127.0.0.1:8722`の openapi の profile-id（偽装できる）だけで
+//! 本物の Hub と見なして移っていた。Hub の停止中に 8722 を先取りしたプロセスの偽の画面へ
+//! パスワード・セッショントークンが渡り、`remote.urls`によって偽の画面からシェルの invoke
+//! （`switch_to_service`等）も呼べた（#644）。
+//!
+//! - **navigate 先**: Service は常に`https://127.0.0.1:8723/`（[`service_tls::service_url`]）。Hub の
+//!   サービスは`%ProgramData%\BantoHub\tls\`の鍵で、8722 と同じ router（UI を含む）を 8723 の
+//!   TLS でも配る（#1117）。
+//! - **Service と見なす判定**（[`service_tls::service_probe`]、
+//!   [`banto_hub_core::pinned_hub_health::PinnedHubHealthProbe`]）: 8723 の相手が`tls\`の証明書と
+//!   完全一致する証明書で TLS を話し、openapi の profile-id が合うときだけ`Healthy`。この probe を
+//!   使う経路（= Service へ進む経路のすべて）: [`decide_startup`]→[`probe_service_or_fallback`]
+//!   （起動・再試行・切り替えの後の判定・「設定モードに戻す」の後）、[`spawn_service_watch`]の
+//!   再接続（同じ関数）、[`run_host_switch`]の engine（Desktop→Service の`Healthy`待ち・
+//!   Service→Desktop の`Unreachable`待ち）。[`attempt_desktop_start`]の失敗時の probe は診断だけ
+//!   （Service へは進まない）なので平文のまま。
+//! - **Service→Desktop の「消えた」**: Desktop が取りに行く平文の期待ポート（既定 8722）が応答
+//!   しなくなったことで決める（Desktop は 8723 を使わない。根拠は
+//!   `banto_hub_core::pinned_hub_health`の doc「消えた」）。
+//! - **webview の pin**（[`service_tls::install_certificate_pin`]）: WebView2 の
+//!   `ServerCertificateErrorDetected`で、`https://127.0.0.1:8723`の相手の証明書がその場で読んだ
+//!   pin と DER で完全一致するときだけ許し、それ以外はすべて断る。probe の後に相手が入れ替わって
+//!   も webview で断る。
+//! - **TLS なしの Hub には繋がない**: Hub のサービスが TLS なしで起動している（`tls\`が無い・
+//!   壊れ・露出・8723 が埋まっている）・8723 を別のプロセスが取っている・pin が読めないときは、
+//!   平文の 8722 へは移らず、Fallback の窓に理由と対処（`prepare-hub-tls`とサービスの再起動）を
+//!   出す（`HealthOutcome::Tls*`、[`tray_status::describe_health_outcome`]）。
+//! - `capabilities/default.json`の`remote.urls`に`https://127.0.0.1:8723/*`を足した。
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -275,6 +314,7 @@ mod hub_slot;
 // 見張り・切り替え・「設定モードに戻す」 の部品は Windows だけで使う（テストはどの OS でも走る）。
 #[cfg_attr(not(windows), allow(dead_code))]
 mod launch_gate;
+mod service_tls;
 mod sink_service_ipc;
 mod tray_status;
 
@@ -329,14 +369,11 @@ struct FallbackInfo {
 
 /// [`decide_startup`]の判定結果。
 enum StartupOutcome {
-    /// サービスへ接続する - `host`/`port`が navigate 先（実装指示 3.、
-    /// [`resolve_navigate_host`]参照 - 第一スライスは`127.0.0.1`固定
-    /// だった）。
-    Service {
-        host: String,
-        port: u16,
-        scm_state: ScmState,
-    },
+    /// サービスへ接続する。navigate 先は #644 PR4（2026-11-14）から常に
+    /// [`service_tls::service_url`]（`https://127.0.0.1:8723/`）で、pin した TLS の probe
+    /// （[`service_tls::service_probe`]）が `Healthy` のときだけ作る（以前は`BANTO_BIND`・`PORT`から
+    /// 組み立てた平文の`host`/`port`を持っていた）。
+    Service { scm_state: ScmState },
     /// デスクトップホストとして起動できた。
     Desktop(Box<StartedHub>),
     /// fallback 画面を表示する。
@@ -360,7 +397,8 @@ struct ProbeTarget {
     root: PathBuf,
     profile_id: String,
     port: u16,
-    /// navigate/probe 先ホスト（[`resolve_navigate_host`]が解決）。
+    /// 平文の口（`port`）の probe 先ホスト（[`resolve_navigate_host`]が解決）。#644 PR4 から
+    /// Service の navigate 先・TLS の probe 先には使わない（常に 127.0.0.1:8723 - [`service_tls`]）。
     host: String,
     /// #661 661-5: profile のフォルダ（Desktop へ進む前に形を見る - [`launch_gate`]）。
     profile_dir: PathBuf,
@@ -636,19 +674,18 @@ fn fallback_actions(info: &FallbackInfo, can_operate: bool) -> Vec<launch_gate::
 /// `frontendDist`（`ui/index.html`）の出番はここまで - 二重配布は行わない。
 /// T16-2: サービス接続時（[`StartupOutcome::Service`]）の navigate にも
 /// 共用する - 接続先が自プロセスの`RunningHub`かサービスかは呼び出し元が
-/// 区別するだけで、navigate 自体の処理は同じ。`host_port`は呼び出し元が
-/// 組み立てた`host:port`文字列（Desktop は`RunningHub::local_addr()`の
-/// `Display`、Service は[`format_host_port`] - 実装指示 3.「navigate 先を
-/// 127.0.0.1 固定にしない」）。
-fn navigate_to_hub(window: &WebviewWindow, host_port: &str) {
-    let url = match tauri::Url::parse(&format!("http://{host_port}/")) {
+/// 区別するだけで、navigate 自体の処理は同じ。`url`は呼び出し元が組み立てる:
+/// Desktop は`http://{RunningHub::local_addr()}/`（自プロセスの Hub。TLS 化は #1121）、
+/// Service は #644 PR4（2026-11-14）から常に[`service_tls::service_url`]
+/// （`https://127.0.0.1:8723/`、webview は[`service_tls::install_certificate_pin`]で pin する）。
+/// 以前の Service は`BANTO_BIND`から組み立てた平文の`http://{host}:{port}/`だった。
+fn navigate_to_hub(window: &WebviewWindow, url: &str) {
+    let url = match tauri::Url::parse(url) {
         Ok(url) => url,
         Err(err) => {
-            // `host_port` は `RunningHub::local_addr()` またはサービスの
-            // 期待ポート・[`resolve_navigate_host`]から組み立てた文字列
-            // なので、パース失敗は事実上起こり得ない（`BANTO_BIND`に URL
-            // として不正な値を設定した場合を除く）- 起きてもプロセスを
-            // 落とさず診断だけ表示する。
+            // `url` は `RunningHub::local_addr()` または固定の Service の URL から
+            // 組み立てた文字列なので、パース失敗は事実上起こり得ない - 起きても
+            // プロセスを落とさず診断だけ表示する。
             show_startup_error(
                 window,
                 &format!("Hub の URL の組み立てに失敗しました: {err}"),
@@ -1065,8 +1102,10 @@ fn stop_collection(app: &AppHandle) {
 /// 全体ではなく[`ProbeTarget`]が必要とする値だけを返す薄いラッパ。
 ///
 /// #479: ここで返す `port` は「**サービス版の Hub が待ち受ける期待ポート**」
-/// （`PORT` 環境変数、無ければ既定 8722）で、サービスへの接続・health probe・
-/// host_switch の判定に使う。デスクトップシェルの Hub は、`PORT` 指定が無く既定の
+/// （`PORT` 環境変数、無ければ既定 8722）で、平文の口の health probe・
+/// host_switch の判定に使う（#644 PR4 から、サービスへの接続と Service と見なす判定は
+/// 平文の口ではなく 127.0.0.1:8723 の TLS - [`service_tls`]。この値は「旧サービスが平文の口から
+/// 消えたか」と Desktop の失敗の診断にだけ効く）。デスクトップシェルの Hub は、`PORT` 指定が無く既定の
 /// ポートが埋まっているときだけ OS 割り当てのポートへ退避する
 /// （`banto_hub_core::runtime::port_fallback_applies`）ので、デスクトップが実際に
 /// 待ち受けているポートとは限らない。デスクトップ側の実ポートは常に
@@ -1109,18 +1148,6 @@ fn resolve_navigate_host() -> String {
     match std::env::var("BANTO_BIND") {
         Ok(value) if !value.is_empty() && value != "0.0.0.0" && value != "::" => value,
         _ => "127.0.0.1".to_string(),
-    }
-}
-
-/// URL の authority 部分へ埋め込める`host:port`文字列を組み立てる。IPv6
-/// リテラルは`[host]:port`と角括弧が必要（`std::net::SocketAddr`の
-/// `Display`実装と同じ判定 - `BANTO_BIND`にIPv6アドレスを設定した場合の
-/// 保険、banto-hub の現行既定は IPv4 のみだが将来の変更に備える）。
-fn format_host_port(host: &str, port: u16) -> String {
-    if host.contains(':') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
     }
 }
 
@@ -1212,12 +1239,24 @@ fn decide_startup(target: &ProbeTarget, slot: &Arc<HubSlot<RunningHub>>) -> Star
 /// サービスが `Running` のとき: health が `Healthy` ならサービスへ接続し、それ以外は
 /// fallback（デスクトップを起動しない - サービスが port/profile lock を握っている
 /// 可能性が高いため）。
+///
+/// #644 PR4（2026-11-14）: health は pin した TLS の probe（[`service_tls::service_probe`]）。
+/// Hub のサービスが TLS なしで起動している・8723 を別のプロセスが取っている・pin が読めない
+/// ときは `Healthy` にならず、ここで Fallback の窓に理由（`HealthOutcome::Tls*`）を出す -
+/// 平文の 8722 へは移らない。起動・再試行・切り替えの後の判定（[`decide_startup`]）と
+/// サービスの見張りの再接続（[`spawn_service_watch`]）がここを通る。
 fn probe_service_or_fallback(target: &ProbeTarget) -> StartupOutcome {
-    let probe = HttpHubHealthProbe::with_host(target.root.clone(), target.host.clone());
-    match probe.probe(&target.profile_id, target.port) {
+    let probe = service_tls::service_probe(target.root.clone(), target.host.clone());
+    service_outcome(probe.probe(&target.profile_id, target.port))
+}
+
+/// [`probe_service_or_fallback`] の写し（純関数）: `Healthy` だけが Service（navigate する）、
+/// それ以外（#644 PR4 の `Tls*` を含む）はすべて Fallback。
+fn service_outcome(
+    probed: Result<HealthOutcome, banto_hub_core::hub_health::ProbeError>,
+) -> StartupOutcome {
+    match probed {
         Ok(HealthOutcome::Healthy { .. }) => StartupOutcome::Service {
-            host: target.host.clone(),
-            port: target.port,
             scm_state: ScmState::Running,
         },
         Ok(other) => StartupOutcome::Fallback(FallbackInfo {
@@ -1279,6 +1318,10 @@ fn attempt_desktop_start(
         Err(err) => {
             // 起動できなかった - 札を返す（終了が待っていればここで起きる）。
             drop(ticket);
+            // ここは「このアプリの Hub が平文の期待ポートを取れなかった」相手の診断だけで、
+            // 結果で Service へ進むことは無い（Fallback にしかならない）ので、平文の probe の
+            // まま（#644 PR4。Service へ進む判定は pin した TLS の [`probe_service_or_fallback`]・
+            // [`run_host_switch`] だけ）。
             let health = HttpHubHealthProbe::with_host(target.root.clone(), target.host.clone())
                 .probe(&target.profile_id, target.port)
                 .ok();
@@ -1337,13 +1380,11 @@ fn apply_startup_outcome(
     }
 
     match outcome {
-        StartupOutcome::Service {
-            host,
-            port,
-            scm_state,
-        } => {
-            navigate_to_hub(window, &format_host_port(&host, port));
+        StartupOutcome::Service { scm_state } => {
+            // #644 PR4: probe が pin した TLS で `Healthy` と確かめた後だけここへ来る。平文の
+            // 8722 へは移らない。
             set_view(&state, ShellView::Service { scm_state });
+            navigate_to_service(app, window, state.view_generation.current());
             None
         }
         StartupOutcome::Desktop(started) => {
@@ -1360,7 +1401,7 @@ fn apply_startup_outcome(
             let status = controller.status();
             *state.controller.lock().expect("controller mutex poisoned") = Some(controller.clone());
             set_view(&state, ShellView::Desktop);
-            navigate_to_hub(window, &addr.to_string());
+            navigate_to_hub(window, &format!("http://{addr}/"));
             Some((status, controller))
         }
         StartupOutcome::Fallback(info) => {
@@ -1379,6 +1420,71 @@ fn apply_startup_outcome(
             None
         }
     }
+}
+
+/// Service の画面（[`service_tls::service_url`]）へ移る（#644 PR4 レビュー・2026-11-14）。
+/// WebView2 が覚えている証明書の許可を先に消し（[`service_tls::clear_certificate_allowances`]、
+/// `service_tls` のモジュール doc「許可の記憶を消す」の (b)）、消し終えた完了ハンドラ（UI
+/// スレッド）で navigate する。最初の読み込みで必ず `ServerCertificateErrorDetected` が来て、その
+/// 時点の pin で許し直す。
+///
+/// `generation` は Service の画面にした（[`set_view`]）直後の世代。完了までに画面が変わっていたら
+/// （見張り・切り替え・再試行が先に進めた）何もしない。比べるのと navigate を同じ `view` のロックの
+/// 中で行う（`set_view` は同じロックで世代を進める）。
+///
+/// 消せなかったときは Service へは navigate せず、Fallback の窓へ倒す。UI スレッドで画面を
+/// 組み替えないよう別のスレッドで、切り替えの進行中フラグを取り、世代を確かめてから適用する。
+fn navigate_to_service(app: &AppHandle, window: &WebviewWindow, generation: u64) {
+    let app = app.clone();
+    let target = window.clone();
+    service_tls::clear_certificate_allowances(window, move |cleared| {
+        let state = app.state::<AppState>();
+        let why = match cleared {
+            Ok(()) => {
+                let view = state.view.lock().expect("view mutex poisoned");
+                if state.view_generation.current() == generation
+                    && matches!(*view, ShellView::Service { .. })
+                {
+                    navigate_to_hub(&target, &service_tls::service_url());
+                }
+                return;
+            }
+            Err(why) => why,
+        };
+        push_desktop_log(
+            &app,
+            format!("Service の画面を開きません（Fallback の窓に移ります）: {why}"),
+        );
+        std::thread::spawn(move || {
+            // 適用した側（切り替え・再試行）がまだ進行中フラグを持っていることがあるので、
+            // 少し待って取り直す。その間に画面が変わったら任せる。
+            for _ in 0..100 {
+                let state = app.state::<AppState>();
+                if state.hub.is_closed() || state.view_generation.current() != generation {
+                    return;
+                }
+                if host_switch_ipc::try_begin_switch() {
+                    if state.view_generation.current() == generation {
+                        apply_outcome_and_sync(
+                            &app,
+                            &target,
+                            StartupOutcome::Fallback(FallbackInfo {
+                                scm_state: Some(ScmState::Running),
+                                health: None,
+                                desktop_error: Some(format!(
+                                    "Service の画面を開きませんでした: {why}"
+                                )),
+                                cause: FallbackCause::General,
+                            }),
+                        );
+                    }
+                    host_switch_ipc::end_switch();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+    });
 }
 
 /// 画面を書き換え、同じロックの中で世代を進める（#706 レビュー。画面を変える経路はすべてここを
@@ -1861,11 +1967,9 @@ fn apply_host_switch_outcome(app: &AppHandle, target: &ProbeTarget, result: Host
         return;
     };
     let outcome = match result {
-        HostSwitchResult::Service { scm_state } => StartupOutcome::Service {
-            host: target.host.clone(),
-            port: target.port,
-            scm_state,
-        },
+        // engine の probe は pin した TLS（[`run_host_switch`]）なので、ここへ来るのは
+        // `https://127.0.0.1:8723` の相手を pin で確かめた後だけ（#644 PR4）。
+        HostSwitchResult::Service { scm_state } => StartupOutcome::Service { scm_state },
         HostSwitchResult::Desktop => {
             // #661 661-5: engine の「Desktop へ進んでよい」（SCM Stopped・旧 health 消失）の
             // 後でも、起動の判定（[`decide_startup`]）をもう一度通す - profile が締まった
@@ -1939,7 +2043,11 @@ pub(crate) fn run_host_switch(app: &AppHandle, command: SwitchCommand) {
     let can_operate = state.can_operate_service;
     let target = expected_probe_target();
     let manager = build_service_manager();
-    let probe = HttpHubHealthProbe::with_host(target.root.clone(), target.host.clone());
+    // #644 PR4: Desktop→Service の `Healthy` は pin した TLS（8723）で確かめる。Service→Desktop の
+    // 「旧サービスが消えた」（`Unreachable`）は、Desktop が取りに行く平文の期待ポート（`target.port`、
+    // 既定 8722）が応答しなくなったことで決める（Desktop は 8723 を使わない - #1121 まで。根拠は
+    // `banto_hub_core::pinned_hub_health` の doc「消えた」）。
+    let probe = service_tls::service_probe(target.root.clone(), target.host.clone());
     let mut engine = HostSwitchEngine::new(
         manager,
         probe,
@@ -2316,11 +2424,33 @@ fn watch_fallback(scm_state: Option<ScmState>, cause: FallbackCause) -> StartupO
     })
 }
 
+/// 見張りのスレッドから webview の証明書の許可を消し、消し終えるまで待つ（#644 PR4 レビュー・
+/// `service_tls` のモジュール doc「許可の記憶を消す」の (c)）。消すのは UI スレッドの完了ハンドラ
+/// なので、見張り（UI スレッドではない）が待っても詰まらない。窓が無い・待ちの上限を越えたときも
+/// `Err`（呼ぶ側は Service へ移らない）。
+#[cfg(windows)]
+fn clear_allowances_and_wait(app: &AppHandle) -> Result<(), String> {
+    const CLEAR_TIMEOUT: Duration = Duration::from_secs(10);
+    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+        return Err("メインの窓がありません".to_string());
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    service_tls::clear_certificate_allowances(&window, move |cleared| {
+        let _ = tx.send(cleared);
+    });
+    rx.recv_timeout(CLEAR_TIMEOUT).unwrap_or_else(|_| {
+        Err("webview の証明書の許可を消し終えるのを待てませんでした".to_string())
+    })
+}
+
 /// サービスの見張り（#661 661-5）: サービスに接続している間にサービスが止まったら（終了コード
 /// 4・5 を含む）、合う Fallback の窓へ移る。止まる途中（StopPending）で一般の窓に移った後も、
 /// 停止に達したら終了コードと profile の形で理由を選び直す（#690）。**Hub は決して起動しない**
 /// （[`launch_gate::on_watch_tick`]）。切り替え・「設定モードに戻す」 の間と、終了が始まった後は
 /// 何もしない。
+///
+/// #644 PR4 レビュー（2026-11-14）: Service の画面の間は、webview が許した証明書と今の pin も
+/// 比べ、違う・読めないなら許可を消してから probe の結果を適用する（[`clear_allowances_and_wait`]）。
 #[cfg(windows)]
 fn spawn_service_watch(app: AppHandle) {
     std::thread::spawn(move || loop {
@@ -2361,7 +2491,24 @@ fn spawn_service_watch(app: AppHandle) {
         // 理由が同じでも SCM の状態が変わったら窓とトレイを直す（#706 レビュー）。
         let step =
             launch_gate::refresh_on_scm_change(step, watched, shown_scm.as_ref(), scm.as_ref());
+        // #644 PR4 レビュー（2026-11-14）: Service の画面の間、webview が許した証明書が今の pin と
+        // 違う・pin が読めないなら（`--renew` の後など）、許可を消してから probe の結果を適用する
+        // （`service_tls` のモジュール doc「許可の記憶を消す」の (c)）。まだ一度も許していなければ
+        // 比べない。
+        let pin_changed = step == launch_gate::WatchStep::Stay
+            && watched == launch_gate::WatchedView::Service
+            && service_tls::allowance_is_stale(
+                service_tls::allowed_certificate().as_deref(),
+                service_tls::read_hub_cert_pem,
+            );
         let outcome = match step {
+            launch_gate::WatchStep::Stay if pin_changed => {
+                push_desktop_log(
+                    &app,
+                    "サービスの見張り: Hub の証明書（pin）が webview の許した証明書と違うか読めないので、許可を消して確かめ直します",
+                );
+                probe_service_or_fallback(&expected_probe_target())
+            }
             launch_gate::WatchStep::Stay => continue,
             launch_gate::WatchStep::ToFallback(cause) | launch_gate::WatchStep::Refresh(cause) => {
                 watch_fallback(scm.clone(), cause)
@@ -2376,10 +2523,6 @@ fn spawn_service_watch(app: AppHandle) {
                 }
             }
         };
-        let cause = match &outcome {
-            StartupOutcome::Fallback(info) => Some(info.cause),
-            _ => None,
-        };
         // 照会の間に切り替えが始まっていたら任せる（進行中フラグを取ってから適用する）。
         if !host_switch_ipc::try_begin_switch() {
             continue;
@@ -2391,6 +2534,26 @@ fn spawn_service_watch(app: AppHandle) {
             host_switch_ipc::end_switch();
             continue;
         }
+        // #644 PR4 レビュー: pin が変わったら、進行中フラグを持ち世代を確かめた後で許可を消し、
+        // 消し終えるのを待ってから適用する（Service なら `apply_startup_outcome` がもう一度消して
+        // から読み込み直す）。消せなければ Service へは移らない。
+        let outcome = if pin_changed {
+            match clear_allowances_and_wait(&app) {
+                Ok(()) => outcome,
+                Err(why) => StartupOutcome::Fallback(FallbackInfo {
+                    scm_state: scm.clone(),
+                    health: None,
+                    desktop_error: Some(format!("Service の画面を開きませんでした: {why}")),
+                    cause: FallbackCause::General,
+                }),
+            }
+        } else {
+            outcome
+        };
+        let cause = match &outcome {
+            StartupOutcome::Fallback(info) => Some(info.cause),
+            _ => None,
+        };
         // #706 実機確認: GUI では標準出力が見えないので、デスクトップのログにも残す。
         push_desktop_log(
             &app,
@@ -2617,6 +2780,11 @@ pub fn run() {
             // T16-1 で初回だけの継続通知を追加（UX-7）。#392 A2 で
             // ChronoGazer と共有の `banto-desktop-tray` へ移した。
             banto_desktop_tray::hide_to_tray_on_close(&window, TRAY_HINT);
+
+            // #644 PR4: Service の画面（https://127.0.0.1:8723）の証明書を pin する WebView2 の
+            // ハンドラを、最初の navigate より前に 1 回だけ付ける（[`service_tls`]）。
+            #[cfg(windows)]
+            service_tls::install_certificate_pin(&window);
 
             // T16-2: サービス検出 → 接続 / デスクトップ起動 / fallback の
             // 判定（このモジュール doc「起動シーケンス」節参照）。
@@ -3234,10 +3402,42 @@ mod tests {
         }
     }
 
+    /// #644 PR4: pin した TLS の probe が `Healthy` でなければ Service にしない（navigate しない）。
+    /// TLS なし・先取り・pin が読めないは、それぞれ理由を Fallback の窓に出す。
     #[test]
-    fn format_host_port_wraps_ipv6_literals_in_brackets() {
-        assert_eq!(format_host_port("127.0.0.1", 8722), "127.0.0.1:8722");
-        assert_eq!(format_host_port("::1", 8722), "[::1]:8722");
+    fn only_a_pinned_healthy_probe_navigates_to_the_service() {
+        assert!(matches!(
+            service_outcome(Ok(HealthOutcome::Healthy {
+                version: "v1".to_string()
+            })),
+            StartupOutcome::Service {
+                scm_state: ScmState::Running
+            }
+        ));
+        for (health, expected) in [
+            (HealthOutcome::TlsNotListening, "prepare-hub-tls"),
+            (HealthOutcome::TlsUntrusted, "一致しませんでした"),
+            (
+                HealthOutcome::TlsPinUnavailable {
+                    reason: "証明書がありません".to_string(),
+                },
+                "証明書がありません",
+            ),
+            (HealthOutcome::Unreachable, "応答がありません"),
+        ] {
+            let StartupOutcome::Fallback(info) = service_outcome(Ok(health.clone())) else {
+                panic!("{health:?} で Service へ進んではいけない");
+            };
+            assert_eq!(info.health.as_ref(), Some(&health));
+            let message = fallback_message(&info, true);
+            assert!(message.contains(expected), "{message}");
+        }
+        assert!(matches!(
+            service_outcome(Err(banto_hub_core::hub_health::ProbeError::Other(
+                "x".to_string()
+            ))),
+            StartupOutcome::Fallback(_)
+        ));
     }
 
     /// T16-2 fallback 画面本文（実装指示 2.）の組み立てを確認する - SCM 状態・

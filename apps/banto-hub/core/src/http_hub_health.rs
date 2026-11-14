@@ -142,30 +142,38 @@ impl HubHealthProbe for HttpHubHealthProbe {
             FetchOutcome::PortConflict => return Ok(HealthOutcome::PortConflict),
             FetchOutcome::Healthy(value) => value,
         };
-        let version = extract_version(&openapi);
-
-        if validate_profile_id(expected_profile).is_err() {
-            // 呼び出し元が渡した expected_profile 自体が profile-id として
-            // 不正 - 比較しようがないので安全側で「別 profile」扱いにする。
-            return Ok(HealthOutcome::WrongProfileOrVersion);
-        }
-        // T16-2 第三スライス: ワイヤ上の profile-id を確認する（このモジュール
-        // doc「判定ロジック」4.参照）- 欠落・型不一致・不一致のいずれも
-        // 「別 profile」扱いにする（区別しても呼び出し元の対処は変わらない）。
-        if extract_wire_profile_id(&openapi).as_deref() != Some(expected_profile) {
-            return Ok(HealthOutcome::WrongProfileOrVersion);
-        }
-        let paths = match resolve_profile_paths(&self.root, expected_profile) {
-            Ok(paths) => paths,
-            Err(_) => return Ok(HealthOutcome::WrongProfileOrVersion),
-        };
-        // 取得側と同じパス（ルートだけを解く。`profile_lock::lock_file_path`）。
-        let lock_path = lock_file_path(&paths);
-        Ok(classify_lock_read(
-            read_owner_info_detailed(&lock_path),
-            version,
-        ))
+        Ok(classify_openapi(&self.root, &openapi, expected_profile))
     }
+}
+
+/// openapi 応答（[`FetchOutcome::Healthy`] の中身）から、profile の確かめ（このモジュール doc
+/// 「判定ロジック」3.〜5.）までを行う。平文の [`HttpHubHealthProbe`] と、#644 PR4 の pin した
+/// TLS の probe（`crate::pinned_hub_health`）で共有する。
+pub(crate) fn classify_openapi(
+    root: &std::path::Path,
+    openapi: &serde_json::Value,
+    expected_profile: &str,
+) -> HealthOutcome {
+    let version = extract_version(openapi);
+
+    if validate_profile_id(expected_profile).is_err() {
+        // 呼び出し元が渡した expected_profile 自体が profile-id として
+        // 不正 - 比較しようがないので安全側で「別 profile」扱いにする。
+        return HealthOutcome::WrongProfileOrVersion;
+    }
+    // T16-2 第三スライス: ワイヤ上の profile-id を確認する（このモジュール
+    // doc「判定ロジック」4.参照）- 欠落・型不一致・不一致のいずれも
+    // 「別 profile」扱いにする（区別しても呼び出し元の対処は変わらない）。
+    if extract_wire_profile_id(openapi).as_deref() != Some(expected_profile) {
+        return HealthOutcome::WrongProfileOrVersion;
+    }
+    let paths = match resolve_profile_paths(root, expected_profile) {
+        Ok(paths) => paths,
+        Err(_) => return HealthOutcome::WrongProfileOrVersion,
+    };
+    // 取得側と同じパス（ルートだけを解く。`profile_lock::lock_file_path`）。
+    let lock_path = lock_file_path(&paths);
+    classify_lock_read(read_owner_info_detailed(&lock_path), version)
 }
 
 /// `profile.lock` の読み取り結果を [`HealthOutcome`] に写す純関数（#626 PR-C）。
@@ -205,7 +213,7 @@ fn classify_lock_read(
 
 /// [`fetch_openapi`]の内部分類 - [`HealthOutcome`]そのものではなく、
 /// profile 確認より前（ネットワーク層だけ）で決まる3値に絞る。
-enum FetchOutcome {
+pub(crate) enum FetchOutcome {
     Unreachable,
     PortConflict,
     Healthy(serde_json::Value),
@@ -248,7 +256,17 @@ fn fetch_openapi(host: &str, port: u16, timeout: Duration) -> FetchOutcome {
     {
         return FetchOutcome::PortConflict;
     }
+    exchange_openapi(&mut stream, host, port)
+}
 
+/// 接続済みの `stream`（平文の TCP、または #644 PR4 の pin した TLS）で
+/// `GET /api/v1/openapi.json` を送り、応答を分類する（接続後の失敗はすべて
+/// [`FetchOutcome::PortConflict`]）。
+pub(crate) fn exchange_openapi<S: Read + Write>(
+    stream: &mut S,
+    host: &str,
+    port: u16,
+) -> FetchOutcome {
     let request = format!(
         "GET {HEALTH_PATH} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: banto-hub-shell-health-probe\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
     );

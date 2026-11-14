@@ -63,6 +63,19 @@ banto-service-elev = { path = "../../../crates/banto-service-elev" }
 # 判定はサービス本体と同じ `banto_hub_core::profile_mode::profile_shape`）。core が既に使う
 # workspace の crate で、パッケージは増えない。
 banto-safe-root = { path = "../../../crates/banto-safe-root" }
+# #644 PR4（2026-11-14）: Service モードは `https://127.0.0.1:8723/` へ移り、webview と health probe の
+# 両方で `%ProgramData%\BantoHub\tls\` の証明書を pin する。置き場の確かめと証明書の読み取り
+# （`load_pinned_hub_cert`、読み取り専用で一般利用者でも動く）は Hub・ChronoGazer と同じ共有 crate。
+# core が既に使う crate で、パッケージは増えない。
+banto-hub-tls-trust = { path = "../../../crates/banto-hub-tls-trust" }
+
+# #644 PR4: webview の pin（`src/service_tls.rs`）。WebView2 の `ServerCertificateErrorDetected`
+# （`ICoreWebView2_14`）に、`%ProgramData%\BantoHub\tls\` の証明書と DER で完全一致するときだけ
+# 許すハンドラを付ける。どちらも tauri（wry）が Windows で既に使う版で、Cargo.lock に新しい
+# package は増えない（この crate の依存の行が増えるだけ）。
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.39"
+windows-core = "0.62"
 
 # #505 のテスト専用: 窓の CSP（`tauri.conf.json`）が Hub の応答の CSP（banto の
 # `CONTENT_SECURITY_POLICY`）に Tauri の IPC を足しただけか、banto の

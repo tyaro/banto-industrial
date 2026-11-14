@@ -65,6 +65,18 @@ pub enum HealthOutcome {
     PortConflict,
     /// health が応答しない（`Running`なのに応答なし、接続タイムアウト等）。
     Unreachable,
+    /// #644 PR4（2026-11-14）: Hub の TLS の口（127.0.0.1:8723）に誰も応答しないが、平文の口
+    /// （期待ポート）には応答がある - Hub のサービスが TLS なしで起動している（`tls\` が無い・
+    /// 壊れ・露出・8723 が埋まっている。PR1b の決定 A・B）か、起動の途中。平文の口へは繋がない
+    /// （[`crate::pinned_hub_health::PinnedHubHealthProbe`]）。
+    TlsNotListening,
+    /// #644 PR4: Hub の TLS の口の相手が、`%ProgramData%\BantoHub\tls\` の証明書（pin）と完全に
+    /// 一致する証明書で TLS を話さなかった（別の証明書・TLS 以外）。別のプロセスがポートを先に
+    /// 取っている恐れがある。
+    TlsUntrusted,
+    /// #644 PR4: pin にする証明書を確かめて読めなかった（`tls\` が無い・保護されていない・
+    /// 壊れている等）。`reason` は表示用の日本語の理由と対処（鍵の中身は含めない）。
+    TlsPinUnavailable { reason: String },
 }
 
 /// [`HubHealthProbe::probe`]自体の実行に失敗したことを表すエラー - 上記

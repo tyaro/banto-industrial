@@ -105,6 +105,22 @@ pub fn describe_health_outcome(outcome: &HealthOutcome) -> String {
         HealthOutcome::MutexOwnerUnknown => {
             "応答はありますが、profile の所有情報を確認できませんでした".to_string()
         }
+        // #644 PR4: Service は pin した TLS（https://127.0.0.1:8723）でだけ繋ぐ。どれも http へは
+        // 繋がない（`crate::service_tls` の doc「TLS なしの Hub には繋がない」）。
+        HealthOutcome::TlsNotListening => format!(
+            "Hub の TLS（https://{}:{}）が応答しません（http の口には応答があります）。Hub のサービスが TLS なしで起動しているか、起動の途中です。{}（8723 を別のプログラムが使っていないかも確かめてください）",
+            crate::service_tls::SERVICE_TLS_HOST,
+            crate::service_tls::SERVICE_TLS_PORT,
+            crate::service_tls::TLS_REMEDY
+        ),
+        HealthOutcome::TlsUntrusted => format!(
+            "https://{}:{} の相手が Hub の証明書（pin）と一致しませんでした。別のプログラムがポートを先に取っている恐れがあるので接続しません。そのプログラムを止めてから、Hub のサービスを再起動してください",
+            crate::service_tls::SERVICE_TLS_HOST,
+            crate::service_tls::SERVICE_TLS_PORT
+        ),
+        HealthOutcome::TlsPinUnavailable { reason } => {
+            format!("Hub の TLS の証明書を確かめられないので接続しません: {reason}")
+        }
     }
 }
 
@@ -252,6 +268,22 @@ mod tests {
         assert!(!describe_health_outcome(&HealthOutcome::PortConflict).is_empty());
         assert!(!describe_health_outcome(&HealthOutcome::WrongProfileOrVersion).is_empty());
         assert!(!describe_health_outcome(&HealthOutcome::MutexOwnerUnknown).is_empty());
+        // #644 PR4: TLS が使えないときは http へは繋がず、prepare-hub-tls と再起動を案内する。
+        let not_listening = describe_health_outcome(&HealthOutcome::TlsNotListening);
+        assert!(
+            not_listening.contains("https://127.0.0.1:8723"),
+            "{not_listening}"
+        );
+        assert!(not_listening.contains("接続しません"), "{not_listening}");
+        assert!(not_listening.contains("prepare-hub-tls"), "{not_listening}");
+        assert!(
+            describe_health_outcome(&HealthOutcome::TlsUntrusted).contains("一致しませんでした")
+        );
+        let unavailable = describe_health_outcome(&HealthOutcome::TlsPinUnavailable {
+            reason: "証明書がありません".to_string(),
+        });
+        assert!(unavailable.contains("証明書がありません"), "{unavailable}");
+        assert!(unavailable.contains("接続しません"), "{unavailable}");
     }
 
     #[test]
