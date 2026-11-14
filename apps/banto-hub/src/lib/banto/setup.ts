@@ -32,6 +32,7 @@ import {
 } from '@banto/admin-core';
 import type { Notifier, UiSettingsProvider } from '@banto/admin-core';
 import { toastStore } from '#lib/toast.svelte.js';
+import { purgeLoopbackRememberedToken } from './loopbackTokenPurge';
 
 /** usersAdmin.ts 等の CSRF ヘッダー（管理系 REST 全体で共通）。 */
 export const CSRF_HEADER = { 'X-Banto-Client': 'banto' } as const;
@@ -59,8 +60,13 @@ const notifier: Notifier = { notify: (kind, message) => toastStore.push(kind, me
  * `initBanto()` 完了 + EventProvider 接続完了を待てる Promise。
  * `routes/+layout.svelte` はこれを `{#await}` してから子を描画し、
  * `(app)/+layout.ts` のガードもこれを待ってから `getAuthProvider()` を呼ぶ。
+ *
+ * #644 PR5: loopback の origin に残った Remember me のトークンは、provider が読む**前**に
+ * サーバーで失効させて `localStorage` から消す（ガードが古いトークンを読まないよう、
+ * この Promise が掃除の完了を待つ）。
  */
 export const bantoReady: Promise<void> = (async () => {
+	await purgeLoopbackRememberedToken();
 	const authProvider = createHttpAuthProvider();
 	const dataProvider = createHttpDataProvider({ getToken: authProvider.getToken });
 	initBanto({ dataProvider, authProvider, notifier, resources: [] });

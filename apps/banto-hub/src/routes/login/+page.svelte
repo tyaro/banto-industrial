@@ -8,6 +8,7 @@
 	import { goto } from '$app/navigation';
 	import { getAuthProvider, notify } from '@banto/admin-core';
 	import { bantoReady } from '#lib/banto/setup.js';
+	import { isLoopbackOrigin } from '#lib/banto/loopbackOrigin.js';
 	import { APP_NAME } from '#lib/appName.js';
 	import { resolveAppPath } from '#lib/navigation.js';
 
@@ -22,6 +23,9 @@
 	let error: string | null = $state(null);
 	let submitting = $state(false);
 	let remember = $state(false);
+	// #644 PR5: 同じ PC（loopback）の origin では Remember me を使わない（先取りした別プロセスが
+	// localStorage を読めるため）。
+	const loopback = isLoopbackOrigin();
 
 	// banto v2.0.0（#260、design §6.1）: ログイン・初回セットアップが
 	// `superseded`（別のログイン・ログアウトが先に確定し、このログインは何も
@@ -46,7 +50,7 @@
 		submitting = true;
 		try {
 			const params: Record<string, unknown> = { username, password };
-			if (remember) params.remember = true;
+			if (remember && !loopback) params.remember = true;
 			const result = await getAuthProvider().login(params);
 			if (result.success) {
 				goto(resolveAppPath('/status'));
@@ -142,10 +146,17 @@
 				<input type="password" bind:value={password} autocomplete="current-password" />
 			</label>
 
-			<label class="remember">
-				<input type="checkbox" bind:checked={remember} />
-				ログイン状態を保持する（30日間）
-			</label>
+			{#if loopback}
+				<p class="remember-note">
+					同じ PC
+					からの接続では、ログイン状態を保持しません（#644）。タブを閉じると再ログインが必要です。
+				</p>
+			{:else}
+				<label class="remember">
+					<input type="checkbox" bind:checked={remember} />
+					ログイン状態を保持する（30日間）
+				</label>
+			{/if}
 
 			{#if error}
 				<p class="error">{error}</p>
@@ -208,6 +219,12 @@
 	input:focus-visible {
 		outline: none;
 		box-shadow: var(--banto-focus-ring);
+	}
+
+	.remember-note {
+		margin: 0;
+		font-size: 0.85rem;
+		opacity: 0.75;
 	}
 
 	.remember {
