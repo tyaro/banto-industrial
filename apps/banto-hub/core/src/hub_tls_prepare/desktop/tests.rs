@@ -69,7 +69,12 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.0 .0).expect("専用の TLS 一時フォルダを片付ける");
+        if let Err(error) = std::fs::remove_dir_all(&self.0 .0) {
+            eprintln!(
+                "専用の TLS 一時フォルダを片付けられませんでした（{}）: {error}",
+                self.0 .0.display()
+            );
+        }
     }
 }
 fn acl(path: &Path, args: &[&str]) {
