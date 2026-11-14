@@ -28,8 +28,29 @@
 //! Windows が信頼する証明書（Windows の root に入った CA が出したもの）にはイベントが来ないので、
 //! webview の pin はそれを縛れない。LocalMachine の root に足せるのは管理者、CurrentUser の root に
 //! 足せるのはその利用者本人だけで、どちらも #644 の相手（ポートを先取りする別のプロセス）の外。
-//! probe（rustls）は Windows の root を使わないので、その場合も pin と一致しなければ Service へ
-//! 進まない。
+//! 既に信頼された CA（社内 CA の設定ミスや鍵の漏れた root など）が 127.0.0.1 の葉を出せる環境では
+//! webview の pin は効かない。その時点でこの PC の全 HTTPS が偽装できるので、#644 の脅威モデルの
+//! 外（P3）として受容する（#644 PR4 レビュー・2026-11-14）。Service へ進む判定（rustls の probe）は
+//! OS の root を使わないので、その場合も pin と一致しなければ Service へ進まない。
+//!
+//! # 許可の記憶を消す（#644 PR4 レビュー・2026-11-14）
+//!
+//! WebView2 は `ALWAYS_ALLOW` をセッションの間覚え、その組ではイベントがもう来ない。そのままだと
+//! `prepare-hub-tls --renew` で pin が変わっても旧証明書は許されたままで、旧鍵の持ち主が（Hub が
+//! 止まった隙に）8723 を取ると画面の fetch・WebSocket が通ってしまう。そこで許した証明書（DER）を
+//! 覚え（[`allowed_certificate`]）、`ClearServerCertificateErrorActions`
+//! （[`clear_certificate_allowances`]）で WebView2 の記憶を消す時機を 3 つ設ける:
+//!
+//! - (a) ハンドラを付けた直後（[`install_certificate_pin`]）。Chromium がプロファイルに例外を
+//!   残していた場合の保険。最初の navigate より前に UI スレッドの列に積む。
+//! - (b) Service の画面へ移る直前（`lib.rs` の `apply_startup_outcome`）。消し終えてから navigate
+//!   するので、最初の読み込みで必ずイベントが来て、その時点の pin で許し直す。
+//! - (c) サービスの見張り（`lib.rs` の `spawn_service_watch`）。Service の画面の間、覚えた DER と
+//!   その時点の pin を比べ（[`allowance_is_stale`]）、違う・読めないなら消してから probe の結果を
+//!   適用する（pin が合わなければ Fallback、合えば Service の画面を読み込み直す）。
+//!
+//! 消せなかった（COM の失敗）ときは Service の画面へ移らず Fallback に倒す。古い文書の接続
+//! （WebSocket を含む）は Fallback・Service への navigate で文書ごと切れる。
 //!
 //! # TLS なしの Hub には繋がない
 //!
@@ -40,6 +61,7 @@
 //! Desktop モード（このプロセスが握る自分の Hub）は今の main では平文のまま（#1121 で TLS 化）。
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use banto_hub_core::pinned_hub_health::{HubCertPemSource, PinnedHubHealthProbe};
 
@@ -103,8 +125,44 @@ fn remedy_text(remedy: &banto_hub_tls_trust::Remedy) -> String {
     }
 }
 
-/// `ServerCertificateErrorDetected` の判断（純関数。モジュール doc「二重の pin」）。`Ok(())` なら
-/// 許す（`ALWAYS_ALLOW`）、`Err(理由)` なら断る（`CANCEL`、理由はログにだけ出す）。
+/// webview が `ALWAYS_ALLOW` にした証明書（DER）。WebView2 の記憶を消したら `None` に戻す
+/// （モジュール doc「許可の記憶を消す」）。
+static ALLOWED_CERTIFICATE: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+
+/// webview が今許している証明書（DER）。まだ一度も許していない・消した後は `None`。
+pub(crate) fn allowed_certificate() -> Option<Vec<u8>> {
+    ALLOWED_CERTIFICATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn set_allowed_certificate(der: Option<Vec<u8>>) {
+    *ALLOWED_CERTIFICATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = der;
+}
+
+/// webview が覚えている許可が古いか（純関数。モジュール doc「許可の記憶を消す」の (c)）。
+/// `allowed` が `None`（まだ一度も許していない）なら比べず `false`（pin も読まない）。pin が
+/// 読めない・解釈できない・DER が違うときは `true`。
+pub(crate) fn allowance_is_stale(
+    allowed: Option<&[u8]>,
+    read_pin: impl FnOnce() -> Result<Vec<u8>, String>,
+) -> bool {
+    let Some(allowed) = allowed else {
+        return false;
+    };
+    match read_pin().and_then(|pem| banto_hub_tls_trust::parse_single_certificate(&pem)) {
+        Ok(pin_der) => pin_der != allowed,
+        Err(_) => true,
+    }
+}
+
+/// `ServerCertificateErrorDetected` の判断（純関数。モジュール doc「二重の pin」）。`Ok(DER)` なら
+/// 許す（`ALWAYS_ALLOW`。DER は許した証明書で、[`allowed_certificate`] に覚える）、`Err(理由)` なら
+/// 断る（`CANCEL`、理由はログにだけ出す）。
 ///
 /// 確かめる順: URI → エラーの種類 → 相手の証明書 → pin（pin はここまで通ったときだけ読む）。
 /// - `request_uri`: `https`（WebSocket は `wss`）・ホスト `127.0.0.1`・ポート [`SERVICE_TLS_PORT`] だけ。
@@ -118,7 +176,7 @@ pub(crate) fn certificate_error_action(
     untrusted_authority: bool,
     server_pem: Result<String, String>,
     read_pin: impl FnOnce() -> Result<Vec<u8>, String>,
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
     let uri =
         tauri::Url::parse(request_uri).map_err(|_| "要求の URI を解釈できません".to_string())?;
     // WebSocket（`wss`）も同じ口・同じ pin（イベントは WebSocket を含むすべての資源で来る）。
@@ -147,7 +205,7 @@ pub(crate) fn certificate_error_action(
     if server_der != pin_der {
         return Err("相手の証明書が Hub の証明書（pin）と一致しません（別のプロセスがポートを先に取っている恐れがあります）".to_string());
     }
-    Ok(())
+    Ok(server_der)
 }
 
 /// メインの窓の WebView2 に `ServerCertificateErrorDetected` のハンドラを 1 回だけ付ける（窓を
@@ -170,6 +228,107 @@ pub(crate) fn install_certificate_pin(window: &tauri::WebviewWindow) {
             "banto-hub-shell: Hub の証明書の pin を webview に付けられませんでした（Service の画面は開けません）: {err}"
         ));
     }
+    // (a) Chromium がプロファイルに許可を残していた場合の保険（モジュール doc「許可の記憶を
+    // 消す」）。`with_webview` は UI スレッドの列に順に積むので、ハンドラの登録の後・`setup` の後の
+    // 最初の navigate より前に消し始める。Service へ移るときは (b) でもう一度消し終えてから移る。
+    clear_certificate_allowances(window, |cleared| {
+        if let Err(why) = cleared {
+            log_err_line(&format!(
+                "banto-hub-shell: 起動時に webview の証明書の許可を消せませんでした（Service へ移るときにもう一度消します）: {why}"
+            ));
+        }
+    });
+}
+
+/// 続きの型（[`clear_certificate_allowances`]）。
+type AfterClear = Box<dyn FnOnce(Result<(), String>) + Send + 'static>;
+
+/// WebView2 が覚えている証明書の許可（`ALWAYS_ALLOW`）を消し、終わったら `then` を 1 回だけ呼ぶ
+/// （モジュール doc「許可の記憶を消す」）。消せたら [`allowed_certificate`] も `None` に戻す。
+///
+/// `ClearServerCertificateErrorActions` は非同期なので、`then` は消し終えた完了ハンドラの中
+/// （窓の UI スレッド）で呼ぶ。COM の失敗・cast の失敗・`with_webview` の失敗は `Err(理由)`
+/// （呼ぶ側は Service の画面へ移らない）。`with_webview` が失敗したときは呼んだスレッドで呼ぶ。
+/// 窓が閉じて完了ハンドラが来なければ `then` は呼ばれない（呼ぶ側は待ちの上限を持つか、移らない
+/// 側に倒す）。
+#[cfg(windows)]
+pub(crate) fn clear_certificate_allowances(
+    window: &tauri::WebviewWindow,
+    then: impl FnOnce(Result<(), String>) + Send + 'static,
+) {
+    use std::sync::Arc;
+    // 同期の失敗（`with_webview`・COM の呼び出し）と完了ハンドラのどちらからでも 1 回だけ呼ぶ。
+    let slot: Arc<Mutex<Option<AfterClear>>> = Arc::new(Mutex::new(Some(Box::new(then))));
+    let fire = |slot: &Arc<Mutex<Option<AfterClear>>>, result: Result<(), String>| {
+        let then = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(then) = then {
+            then(result);
+        }
+    };
+    let in_ui = Arc::clone(&slot);
+    let result = window.with_webview(move |webview| {
+        let on_done = Arc::clone(&in_ui);
+        // SAFETY: WebView2 の COM の呼び出し。`with_webview` は窓の UI スレッドで呼ぶ。
+        let started = unsafe {
+            start_clear(
+                &webview,
+                Box::new(move |cleared| {
+                    if cleared.is_ok() {
+                        set_allowed_certificate(None);
+                    }
+                    fire(&on_done, cleared);
+                }),
+            )
+        };
+        if let Err(err) = started {
+            fire(
+                &in_ui,
+                Err(format!("webview の証明書の許可を消せませんでした: {err}")),
+            );
+        }
+    });
+    if let Err(err) = result {
+        fire(
+            &slot,
+            Err(format!(
+                "webview の証明書の許可を消せませんでした（UI スレッドに渡せません）: {err}"
+            )),
+        );
+    }
+}
+
+/// 非 Windows には WebView2 の証明書の許可が無い（Service の画面も無い）。すぐ `then(Ok)`。
+#[cfg(not(windows))]
+pub(crate) fn clear_certificate_allowances(
+    _window: &tauri::WebviewWindow,
+    then: impl FnOnce(Result<(), String>) + Send + 'static,
+) {
+    then(Ok(()));
+}
+
+/// `ClearServerCertificateErrorActions` を始める（COM）。完了ハンドラは `on_done` を呼ぶ。
+#[cfg(windows)]
+unsafe fn start_clear(
+    webview: &tauri::webview::PlatformWebview,
+    on_done: Box<dyn FnOnce(Result<(), String>)>,
+) -> windows_core::Result<()> {
+    use webview2_com::ClearServerCertificateErrorActionsCompletedHandler;
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_14;
+    use windows_core::Interface;
+
+    let core = unsafe { webview.controller().CoreWebView2() }?;
+    let core: ICoreWebView2_14 = core.cast()?;
+    let handler =
+        ClearServerCertificateErrorActionsCompletedHandler::create(Box::new(move |hresult| {
+            on_done(
+                hresult.map_err(|err| format!("webview の証明書の許可を消せませんでした: {err}")),
+            );
+            Ok(())
+        }));
+    unsafe { core.ClearServerCertificateErrorActions(&handler) }
 }
 
 /// ハンドラの登録（COM）。トークンは捨てる（窓と同じ寿命で、外さない）。
@@ -234,10 +393,13 @@ unsafe fn decide_and_set(
         read_hub_cert_pem,
     );
     let action = match decision {
-        Ok(()) => {
+        Ok(der) => {
             log_line(&format!(
                 "banto-hub-shell: Hub の証明書（pin と一致）を許しました: {request_uri}"
             ));
+            // 見張りが pin の入れ替わりを知るために覚える（モジュール doc「許可の記憶を消す」）。
+            // `SetAction` が失敗しても覚えておく（比べて消す側に倒れるだけ）。
+            set_allowed_certificate(Some(der));
             COREWEBVIEW2_SERVER_CERTIFICATE_ERROR_ACTION_ALWAYS_ALLOW
         }
         Err(reason) => {
@@ -279,9 +441,11 @@ mod tests {
     #[test]
     fn allows_only_the_pinned_certificate_on_the_hub_tls_port() {
         let (hub, _) = two_certs();
+        let hub_der = banto_hub_tls_trust::parse_single_certificate(hub.as_bytes()).unwrap();
+        // 許した証明書の DER を返す（見張りが覚えた DER と pin を比べる - `allowance_is_stale`）。
         assert_eq!(
             certificate_error_action(HUB_URI, true, Ok(hub.clone()), pin(&hub)),
-            Ok(())
+            Ok(hub_der.clone())
         );
         // WebSocket も同じ口・同じ pin なら許す。
         assert_eq!(
@@ -291,8 +455,31 @@ mod tests {
                 Ok(hub.clone()),
                 pin(&hub)
             ),
-            Ok(())
+            Ok(hub_der)
         );
+    }
+
+    #[test]
+    fn an_allowance_is_stale_once_the_pin_changes_or_cannot_be_read() {
+        let (old, renewed) = two_certs();
+        let old_der = banto_hub_tls_trust::parse_single_certificate(old.as_bytes()).unwrap();
+        // 今の pin と同じ証明書を許しているなら古くない。
+        assert!(!allowance_is_stale(Some(&old_der), pin(&old)));
+        // `--renew` で pin が変わった。
+        assert!(allowance_is_stale(Some(&old_der), pin(&renewed)));
+        // pin が読めない・解釈できない（置き場の作り直しの途中など）も古いと見なす（消す側）。
+        assert!(allowance_is_stale(Some(&old_der), || Err(
+            "置き場がありません".to_string()
+        )));
+        assert!(allowance_is_stale(Some(&old_der), || Ok(
+            b"not pem".to_vec()
+        )));
+    }
+
+    #[test]
+    fn nothing_allowed_yet_is_never_stale_and_the_pin_is_not_read() {
+        let never = || -> Result<Vec<u8>, String> { panic!("pin を読んではいけない") };
+        assert!(!allowance_is_stale(None, never));
     }
 
     #[test]

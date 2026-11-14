@@ -1383,8 +1383,8 @@ fn apply_startup_outcome(
         StartupOutcome::Service { scm_state } => {
             // #644 PR4: probe が pin した TLS で `Healthy` と確かめた後だけここへ来る。平文の
             // 8722 へは移らない。
-            navigate_to_hub(window, &service_tls::service_url());
             set_view(&state, ShellView::Service { scm_state });
+            navigate_to_service(app, window, state.view_generation.current());
             None
         }
         StartupOutcome::Desktop(started) => {
@@ -1420,6 +1420,71 @@ fn apply_startup_outcome(
             None
         }
     }
+}
+
+/// Service の画面（[`service_tls::service_url`]）へ移る（#644 PR4 レビュー・2026-11-14）。
+/// WebView2 が覚えている証明書の許可を先に消し（[`service_tls::clear_certificate_allowances`]、
+/// `service_tls` のモジュール doc「許可の記憶を消す」の (b)）、消し終えた完了ハンドラ（UI
+/// スレッド）で navigate する。最初の読み込みで必ず `ServerCertificateErrorDetected` が来て、その
+/// 時点の pin で許し直す。
+///
+/// `generation` は Service の画面にした（[`set_view`]）直後の世代。完了までに画面が変わっていたら
+/// （見張り・切り替え・再試行が先に進めた）何もしない。比べるのと navigate を同じ `view` のロックの
+/// 中で行う（`set_view` は同じロックで世代を進める）。
+///
+/// 消せなかったときは Service へは navigate せず、Fallback の窓へ倒す。UI スレッドで画面を
+/// 組み替えないよう別のスレッドで、切り替えの進行中フラグを取り、世代を確かめてから適用する。
+fn navigate_to_service(app: &AppHandle, window: &WebviewWindow, generation: u64) {
+    let app = app.clone();
+    let target = window.clone();
+    service_tls::clear_certificate_allowances(window, move |cleared| {
+        let state = app.state::<AppState>();
+        let why = match cleared {
+            Ok(()) => {
+                let view = state.view.lock().expect("view mutex poisoned");
+                if state.view_generation.current() == generation
+                    && matches!(*view, ShellView::Service { .. })
+                {
+                    navigate_to_hub(&target, &service_tls::service_url());
+                }
+                return;
+            }
+            Err(why) => why,
+        };
+        push_desktop_log(
+            &app,
+            format!("Service の画面を開きません（Fallback の窓に移ります）: {why}"),
+        );
+        std::thread::spawn(move || {
+            // 適用した側（切り替え・再試行）がまだ進行中フラグを持っていることがあるので、
+            // 少し待って取り直す。その間に画面が変わったら任せる。
+            for _ in 0..100 {
+                let state = app.state::<AppState>();
+                if state.hub.is_closed() || state.view_generation.current() != generation {
+                    return;
+                }
+                if host_switch_ipc::try_begin_switch() {
+                    if state.view_generation.current() == generation {
+                        apply_outcome_and_sync(
+                            &app,
+                            &target,
+                            StartupOutcome::Fallback(FallbackInfo {
+                                scm_state: Some(ScmState::Running),
+                                health: None,
+                                desktop_error: Some(format!(
+                                    "Service の画面を開きませんでした: {why}"
+                                )),
+                                cause: FallbackCause::General,
+                            }),
+                        );
+                    }
+                    host_switch_ipc::end_switch();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+    });
 }
 
 /// 画面を書き換え、同じロックの中で世代を進める（#706 レビュー。画面を変える経路はすべてここを
@@ -2359,11 +2424,33 @@ fn watch_fallback(scm_state: Option<ScmState>, cause: FallbackCause) -> StartupO
     })
 }
 
+/// 見張りのスレッドから webview の証明書の許可を消し、消し終えるまで待つ（#644 PR4 レビュー・
+/// `service_tls` のモジュール doc「許可の記憶を消す」の (c)）。消すのは UI スレッドの完了ハンドラ
+/// なので、見張り（UI スレッドではない）が待っても詰まらない。窓が無い・待ちの上限を越えたときも
+/// `Err`（呼ぶ側は Service へ移らない）。
+#[cfg(windows)]
+fn clear_allowances_and_wait(app: &AppHandle) -> Result<(), String> {
+    const CLEAR_TIMEOUT: Duration = Duration::from_secs(10);
+    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+        return Err("メインの窓がありません".to_string());
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    service_tls::clear_certificate_allowances(&window, move |cleared| {
+        let _ = tx.send(cleared);
+    });
+    rx.recv_timeout(CLEAR_TIMEOUT).unwrap_or_else(|_| {
+        Err("webview の証明書の許可を消し終えるのを待てませんでした".to_string())
+    })
+}
+
 /// サービスの見張り（#661 661-5）: サービスに接続している間にサービスが止まったら（終了コード
 /// 4・5 を含む）、合う Fallback の窓へ移る。止まる途中（StopPending）で一般の窓に移った後も、
 /// 停止に達したら終了コードと profile の形で理由を選び直す（#690）。**Hub は決して起動しない**
 /// （[`launch_gate::on_watch_tick`]）。切り替え・「設定モードに戻す」 の間と、終了が始まった後は
 /// 何もしない。
+///
+/// #644 PR4 レビュー（2026-11-14）: Service の画面の間は、webview が許した証明書と今の pin も
+/// 比べ、違う・読めないなら許可を消してから probe の結果を適用する（[`clear_allowances_and_wait`]）。
 #[cfg(windows)]
 fn spawn_service_watch(app: AppHandle) {
     std::thread::spawn(move || loop {
@@ -2404,7 +2491,24 @@ fn spawn_service_watch(app: AppHandle) {
         // 理由が同じでも SCM の状態が変わったら窓とトレイを直す（#706 レビュー）。
         let step =
             launch_gate::refresh_on_scm_change(step, watched, shown_scm.as_ref(), scm.as_ref());
+        // #644 PR4 レビュー（2026-11-14）: Service の画面の間、webview が許した証明書が今の pin と
+        // 違う・pin が読めないなら（`--renew` の後など）、許可を消してから probe の結果を適用する
+        // （`service_tls` のモジュール doc「許可の記憶を消す」の (c)）。まだ一度も許していなければ
+        // 比べない。
+        let pin_changed = step == launch_gate::WatchStep::Stay
+            && watched == launch_gate::WatchedView::Service
+            && service_tls::allowance_is_stale(
+                service_tls::allowed_certificate().as_deref(),
+                service_tls::read_hub_cert_pem,
+            );
         let outcome = match step {
+            launch_gate::WatchStep::Stay if pin_changed => {
+                push_desktop_log(
+                    &app,
+                    "サービスの見張り: Hub の証明書（pin）が webview の許した証明書と違うか読めないので、許可を消して確かめ直します",
+                );
+                probe_service_or_fallback(&expected_probe_target())
+            }
             launch_gate::WatchStep::Stay => continue,
             launch_gate::WatchStep::ToFallback(cause) | launch_gate::WatchStep::Refresh(cause) => {
                 watch_fallback(scm.clone(), cause)
@@ -2419,10 +2523,6 @@ fn spawn_service_watch(app: AppHandle) {
                 }
             }
         };
-        let cause = match &outcome {
-            StartupOutcome::Fallback(info) => Some(info.cause),
-            _ => None,
-        };
         // 照会の間に切り替えが始まっていたら任せる（進行中フラグを取ってから適用する）。
         if !host_switch_ipc::try_begin_switch() {
             continue;
@@ -2434,6 +2534,26 @@ fn spawn_service_watch(app: AppHandle) {
             host_switch_ipc::end_switch();
             continue;
         }
+        // #644 PR4 レビュー: pin が変わったら、進行中フラグを持ち世代を確かめた後で許可を消し、
+        // 消し終えるのを待ってから適用する（Service なら `apply_startup_outcome` がもう一度消して
+        // から読み込み直す）。消せなければ Service へは移らない。
+        let outcome = if pin_changed {
+            match clear_allowances_and_wait(&app) {
+                Ok(()) => outcome,
+                Err(why) => StartupOutcome::Fallback(FallbackInfo {
+                    scm_state: scm.clone(),
+                    health: None,
+                    desktop_error: Some(format!("Service の画面を開きませんでした: {why}")),
+                    cause: FallbackCause::General,
+                }),
+            }
+        } else {
+            outcome
+        };
+        let cause = match &outcome {
+            StartupOutcome::Fallback(info) => Some(info.cause),
+            _ => None,
+        };
         // #706 実機確認: GUI では標準出力が見えないので、デスクトップのログにも残す。
         push_desktop_log(
             &app,
