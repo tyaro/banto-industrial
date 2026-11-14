@@ -321,7 +321,13 @@ fn scene_26_a_broken_record_is_broken_and_salvages_readable_lines() {
         .security
         .is_reparse_point = true;
     let found = unusable(&ops);
-    assert_eq!(found.fault, ServiceRevocationFault::Broken);
+    // 置き換えでは直せない（write_atomic がフォルダ・ジャンクションの宛先を断る）ので置き場の
+    // 問題として扱い、管理者に消してもらう（#1132 の Codex の指摘）。
+    assert_eq!(found.fault, ServiceRevocationFault::Untrusted);
+    assert!(
+        found.reason.contains("置き換えでは直せません"),
+        "{found:#?}"
+    );
     assert!(found.salvaged.is_empty(), "リンクの中身は読まない");
 }
 

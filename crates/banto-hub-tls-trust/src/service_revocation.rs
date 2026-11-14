@@ -16,7 +16,8 @@
 //!   `exposure_beyond_users_read`（Users の読み取りより広い許可が無い）。ファイルも種類・場所と
 //!   `exposure_beyond_users_read`（ハードリンク・ほかの所有者を含む）を確かめる。
 //! - **使えないときの 3 つ**（[`ServiceRevocationFault`]）: 置き場が確かめに通らない
-//!   （`Untrusted`。管理者が置き場を直してから `prepare-hub-tls --renew`）・形が壊れている
+//!   （`Untrusted`。記録のファイルがフォルダ・リンクになっている場合も含む。管理者が置き場を
+//!   直してから `prepare-hub-tls --renew`）・形が壊れている
 //!   （`Broken`。フォルダは通っているので、elev が置き換えで作り直せる）・一時的な I/O
 //!   （`Transient`）。どれも、サービスの証明書を使わない側に倒す（場面 26）。
 //! - 壊れているときも、行ごとに読める拇印は拾う（[`ServiceRevocationProblem::salvaged`]。
@@ -101,11 +102,12 @@ impl ServiceRevocations {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceRevocationFault {
     /// 置き場（ルート・記録のフォルダ）が確かめに通らない（露出・所有者違い・リンク・場所の
-    /// 食い違い）。書いても別のアカウントに書き換えられうるので、直るまで書かない。管理者が
+    /// 食い違い）か、記録のファイルがフォルダ・reparse point・場所の食い違い（置き換えでは
+    /// 直せないので、管理者に消してもらう。#1132 の Codex の指摘）。書いても別のアカウントに書き換えられうるので、直るまで書かない。管理者が
     /// 置き場を直してから `prepare-hub-tls --renew`。
     Untrusted,
-    /// 置き場は通るが、記録の形が壊れている（読めない形・大きすぎる・`準備中`・ファイルが
-    /// 露出・リンク・フォルダ）。elev が拇印を引き継いで置き換えで作り直せる。
+    /// 置き場は通るが、記録の形が壊れている（読めない形・大きすぎる・`準備中`・ファイルの
+    /// ACL の露出・ハードリンク・所有者違い）。elev が拇印を引き継いで置き換えで作り直せる。
     Broken,
     /// 一時的かもしれない（開けない・読めない・書けない）。状態を見たのではない。
     Transient,
@@ -303,8 +305,19 @@ pub fn read_service_revocations_in<O: TlsTrustOps>(
         Err(refusal) if refusal.transient => {
             return Err(problem(refusal.reason, ServiceRevocationFault::Transient))
         }
-        // フォルダ・reparse point・場所の食い違い: 中身は読まない（置き換えで作り直す）。
-        Err(refusal) => return Err(broken(refusal.reason, Vec::new())),
+        // フォルダ・reparse point・場所の食い違い: 中身は読まない。原子的な置き換え
+        // （`write_atomic`）はフォルダ・ジャンクションの宛先を断るので、`--renew` の作り直しでは
+        // 直らない。置き場の問題（Untrusted）として扱い、管理者に記録の置き場を消してから
+        // `--renew` するよう案内する（#1132 の Codex の指摘）。
+        Err(refusal) => {
+            return Err(problem(
+                format!(
+                    "{}。記録のファイルがフォルダ・リンクになっているため、置き換えでは直せません",
+                    refusal.reason
+                ),
+                ServiceRevocationFault::Untrusted,
+            ))
+        }
     };
     let open = exposure_beyond_users_read(&file.security());
     let bytes = match file.read_all(MAX_REVOCATIONS_BYTES) {

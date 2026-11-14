@@ -605,7 +605,10 @@ impl ManagedDir {
                     Some(&descriptor),
                 )
             }
-            Inner::Plain => Err(SafeRootError::UnsupportedPlatform),
+            Inner::Plain => {
+                let _ = contents;
+                Err(SafeRootError::UnsupportedPlatform)
+            }
         }
     }
 
