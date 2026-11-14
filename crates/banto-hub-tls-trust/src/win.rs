@@ -16,7 +16,7 @@ use banto_safe_root::guard::win::RegistryMachineEnvironment;
 use banto_safe_root::{ManagedDir, SafeRootError};
 
 use crate::text::secret_error_text;
-use crate::{FileOpenError, TlsDir, TlsFile, TlsTrustOps};
+use crate::{FileOpenError, ReadError, TlsDir, TlsFile, TlsTrustOps};
 
 /// 本番の読み取りの操作（クライアント用。フォルダは読み取り専用の pin で開くので、一般利用者
 /// でも動く）。サービスの Hub は banto-hub-core の `WindowsHubTlsOps` が同じ部品で同じことを
@@ -71,9 +71,14 @@ impl TlsFile for PinnedFile {
         PinnedFile::final_path(self).to_path_buf()
     }
 
-    fn read_all(&mut self, max_len: usize) -> Result<Vec<u8>, String> {
-        self.read_to_end(max_len)
-            .map_err(|err| secret_error_text(&err))
+    fn read_all(&mut self, max_len: usize) -> Result<Vec<u8>, ReadError> {
+        self.read_to_end(max_len).map_err(|err| match err {
+            banto_safe_root::SafeRootError::Io {
+                kind: std::io::ErrorKind::FileTooLarge,
+                ..
+            } => ReadError::TooLarge,
+            other => ReadError::Other(secret_error_text(&other)),
+        })
     }
 }
 

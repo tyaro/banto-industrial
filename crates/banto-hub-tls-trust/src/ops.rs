@@ -18,6 +18,25 @@ pub trait TlsDir {
     fn security(&self) -> Result<FileSecurity, String>;
 }
 
+/// [`TlsFile::read_all`] の失敗。上限超えは中身そのものの恒久的な異常、それ以外は一時的な
+/// I/O 失敗かもしれない（呼ぶ側が扱いを分ける）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadError {
+    /// `max_len` を超えていた。
+    TooLarge,
+    /// それ以外（理由の文言）。
+    Other(String),
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge => f.write_str("大きすぎます"),
+            Self::Other(text) => f.write_str(text),
+        }
+    }
+}
+
 /// 置き場のハンドル基準に、読み取りの権利で辿らずに開いたファイル（Windows は
 /// `banto_safe_root::acl::PinnedFile`）。持っている間はほかの誰も書き込みに開く・消す・名前を
 /// 変えることができない（共有は読み取りだけ）。
@@ -27,7 +46,7 @@ pub trait TlsFile {
     /// 本当のパス。
     fn final_path(&self) -> PathBuf;
     /// 開いたハンドルから、`max_len` バイトまで読む（超えたら断る）。
-    fn read_all(&mut self, max_len: usize) -> Result<Vec<u8>, String>;
+    fn read_all(&mut self, max_len: usize) -> Result<Vec<u8>, ReadError>;
 }
 
 /// [`TlsTrustOps::open_child_file`] の失敗。

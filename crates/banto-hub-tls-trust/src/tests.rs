@@ -171,9 +171,9 @@ impl TlsFile for FakeFile {
     fn final_path(&self) -> PathBuf {
         self.entry.real.clone().unwrap_or_else(|| self.path.clone())
     }
-    fn read_all(&mut self, max_len: usize) -> Result<Vec<u8>, String> {
+    fn read_all(&mut self, max_len: usize) -> Result<Vec<u8>, crate::ReadError> {
         if self.entry.contents.len() > max_len {
-            return Err("大きすぎます".to_string());
+            return Err(crate::ReadError::TooLarge);
         }
         Ok(self.entry.contents.clone())
     }

@@ -913,6 +913,19 @@ fn scene_14_a_lost_record_without_a_certificate_is_repaired_from_the_other() {
     assert_eq!(ops.reconcile().outcome, ReconcileOutcome::Consistent);
 }
 
+/// 上限（256 KiB）を超えた記録は、形が壊れているのと同じ恒久的な破損。一時的な読み取り失敗
+/// （`Incomplete`）にせず、消失として B から直す。次の回は整う。
+#[test]
+fn an_oversized_record_is_loss_and_is_rebuilt_not_incomplete() {
+    let ops = FakeRevOps::settled(&[1, 2]);
+    ops.put_file(A, &vec![b'x'; MAX_REVOCATIONS_BYTES + 1]);
+    let report = ops.reconcile();
+    assert_eq!(report.outcome, ReconcileOutcome::Refused, "{report:#?}");
+    assert_eq!(lost_sides(&report), vec![A]);
+    ops.assert_committed(&[thumb(1), thumb(2)]);
+    assert_eq!(ops.reconcile().outcome, ReconcileOutcome::Consistent);
+}
+
 /// 場面 22: 利用者が案内どおりに `BantoHub\` ごと消した。A も消えるので場面 14 になり、B の
 /// 拇印を引き継いで A を直す（フォルダも作り直す）。`tls\` だけ消したのなら、記録はそのまま。
 #[test]

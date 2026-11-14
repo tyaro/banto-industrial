@@ -161,7 +161,7 @@ mod user;
 pub mod win;
 
 pub use dacl::{root_dacl_problems, ROOT_TAKEOVER_MASK};
-pub use ops::{FileOpenError, TlsDir, TlsFile, TlsTrustOps};
+pub use ops::{FileOpenError, ReadError, TlsDir, TlsFile, TlsTrustOps};
 pub use place::{
     check_cert_exposure, load_pinned_hub_cert, open_checked_file, open_place,
     parse_single_certificate, read_checked, CheckedPlace, HubCertPin, Remedy, Unavailable,

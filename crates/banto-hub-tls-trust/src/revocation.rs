@@ -36,9 +36,9 @@ use banto_safe_root::guard;
 use crate::user::{fault_of, read_unchecked, user_reasons_text, UncheckedRead};
 use crate::{
     check_place_layout, load_pinned_user_cert, open_user_file, open_user_place,
-    parse_single_certificate, user_place_problems, CheckedUserPlace, FileOpenError, TlsFile,
-    UncheckedUserCert, UserCertPin, UserFault, UserFileRole, UserPlaceKind, UserPlaceProblem,
-    UserPlaceState, UserRemedy, UserTlsOps, UserTlsPlace,
+    parse_single_certificate, user_place_problems, CheckedUserPlace, FileOpenError, ReadError,
+    TlsFile, UncheckedUserCert, UserCertPin, UserFault, UserFileRole, UserPlaceKind,
+    UserPlaceProblem, UserPlaceState, UserRemedy, UserTlsOps, UserTlsPlace,
 };
 
 /// 失効の記録のファイル名（A・B のフォルダの中で同じ名前）。
@@ -526,6 +526,18 @@ fn read_side<O: UserTlsOps, P: UserTlsPlace + ?Sized>(
     let shown = checked.dir_path().join(REVOCATIONS_FILE);
     let bytes = match file.read_all(MAX_REVOCATIONS_BYTES) {
         Ok(bytes) => bytes,
+        // 上限超えは形が壊れているのと同じ恒久的な破損（消失として直す）。
+        Err(ReadError::TooLarge) => {
+            return SideContent::Lost {
+                reason: format!(
+                    "{label}（{}）が大きすぎます（上限 {} KiB）",
+                    shown.display(),
+                    MAX_REVOCATIONS_BYTES / 1024
+                ),
+                salvaged: Vec::new(),
+                place_trusted: true,
+            }
+        }
         Err(error) => {
             return SideContent::Unread {
                 reason: format!("{label}（{}）を読めませんでした: {error}", shown.display()),
