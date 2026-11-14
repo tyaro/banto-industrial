@@ -366,7 +366,7 @@ fn push_group_move_error(
 fn column_map() -> ColumnMap {
     ColumnMap::new()
         .column("id", "id")
-        .column("name", "name")
+        .text_column("name", "name")
         .column("plcConnectionId", "plc_connection_id")
         .column("periodMs", "period_ms")
         .column("enabled", "enabled")
@@ -1396,6 +1396,26 @@ mod tests {
         assert_eq!(result.total_count, 2);
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].name, "C");
+    }
+
+    #[tokio::test]
+    async fn list_search_matches_name_and_counts_only_matching_rows() {
+        let (_plc_svc, svc, conn_id) = setup().await;
+        for name in ["Alpha East", "Alpha West", "Beta"] {
+            svc.create(sample_input(name, conn_id)).await.unwrap();
+        }
+
+        let result = svc
+            .list(ListParams {
+                search: Some("lph".to_string()),
+                ..ListParams::default()
+            })
+            .await
+            .expect("search should succeed");
+
+        assert_eq!(result.total_count, 2);
+        assert_eq!(result.rows.len(), 2);
+        assert!(result.rows.iter().all(|row| row.name.starts_with("Alpha")));
     }
 
     // --- S2 (docs/banto-hub-external-db-design.md §4.2): `query_sql` の
