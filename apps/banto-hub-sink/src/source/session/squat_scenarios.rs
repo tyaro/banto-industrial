@@ -680,11 +680,20 @@ async fn run_keeps_retrying_a_squatter_without_leaking_the_key() {
     // 本物の Hub へは、設定の取得と状態の push がキー付きで届く。
     wait_until("config GET and status PUT on the real hub", 15, || {
         let heads = hub.heads.lock().unwrap();
-        heads.iter().any(|h| h.starts_with("GET /api/sink/config "))
-            && heads.iter().any(|h| h.starts_with("PUT /api/sink/status "))
+        let with_key = |prefix: &str| {
+            heads.iter().any(|h| {
+                h.starts_with(prefix)
+                    && h.to_ascii_lowercase().contains(&format!(
+                        "authorization: bearer {}",
+                        DUMMY_KEY.to_ascii_lowercase()
+                    ))
+            })
+        };
+        with_key("GET /api/sink/config ") && with_key("PUT /api/sink/status ")
     })
     .await;
     let delivered = hub.bearer_requests();
+    assert!(delivered >= 2, "the real hub gets the key, got {delivered}");
 
     // Hub が止まって、別プロセスが先取りした。再試行（状態の push は 1 秒ごと、設定の取得は
     // バックオフ）が先取りへ何度も向かっても、pin で断られてキーは届かない。
