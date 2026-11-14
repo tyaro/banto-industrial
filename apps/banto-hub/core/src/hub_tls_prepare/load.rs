@@ -58,7 +58,7 @@ use banto_hub_tls_trust::{
     Remedy, RevokedCert, RevokedCertPlace, ServiceRevocationFault, ServiceRevocationProblem,
     Unavailable, SERVICE_REVOCATIONS_DIR, SERVICE_REVOCATIONS_LABEL, TLS_LABEL,
 };
-use banto_safe_root::acl::{exposure, Exposure, FileSecurity};
+use banto_safe_root::acl::{exposure, Exposure};
 use zeroize::Zeroizing;
 
 use super::{
@@ -319,6 +319,90 @@ fn record_exposed_at_start<O: HubTlsOps>(
     found
 }
 
+/// 鍵・証明書それぞれの確かめの結果（[`load_default_identity`] の手順 4）。
+enum Verdict {
+    Fine,
+    Missing,
+    /// 開けなかった（理由, 失効に入れる種類か）。
+    OpenFailed(DefaultTlsUnavailable, bool),
+    /// 露出・所有者の違い（理由, 失効に入れる種類か）。
+    Exposed(DefaultTlsUnavailable, bool),
+}
+
+impl Verdict {
+    fn open_failed(found: Unavailable) -> Self {
+        let revokes = found.fault.revokes();
+        Verdict::OpenFailed(from_trust(found), revokes)
+    }
+
+    fn revokes(&self) -> bool {
+        matches!(
+            self,
+            Verdict::OpenFailed(_, true) | Verdict::Exposed(_, true)
+        )
+    }
+}
+
+/// 鍵と証明書のどちらかに問題があったときの断り方。失効に入れる種類がどちらかにあれば、それを
+/// 優先して記録に書いてから断る。無ければ、理由の優先は 開けない → 無い（片方だけ）→ 露出（鍵、
+/// 証明書）。
+fn refuse_pair<O: HubTlsOps>(
+    ops: &O,
+    verdicts: [Verdict; 2],
+    key_path: &Path,
+    cert_path: &Path,
+    tls_path: &Path,
+) -> DefaultTlsUnavailable {
+    let [key_verdict, cert_verdict] = verdicts;
+    let key_missing = matches!(key_verdict, Verdict::Missing);
+    let cert_missing = matches!(cert_verdict, Verdict::Missing);
+    let mut verdicts = [key_verdict, cert_verdict];
+    if let Some(i) = verdicts.iter().position(Verdict::revokes) {
+        if let Verdict::OpenFailed(found, _) | Verdict::Exposed(found, _) =
+            std::mem::replace(&mut verdicts[i], Verdict::Fine)
+        {
+            return record_exposed_at_start(ops, found);
+        }
+    }
+    let [key_verdict, cert_verdict] = verdicts;
+    let (mut opens, mut exposed) = (Vec::new(), Vec::new());
+    for verdict in [key_verdict, cert_verdict] {
+        match verdict {
+            Verdict::OpenFailed(found, _) => opens.push(found),
+            Verdict::Exposed(found, _) => exposed.push(found),
+            Verdict::Fine | Verdict::Missing => {}
+        }
+    }
+    if !opens.is_empty() {
+        return opens.remove(0);
+    }
+    if key_missing && cert_missing {
+        return unavailable(
+            format!(
+                "{TLS_LABEL}（{}）に鍵（{KEY_FILE}）と証明書（{CERT_FILE}）がありません",
+                tls_path.display()
+            ),
+            prepare_remedy(),
+        );
+    }
+    if key_missing || cert_missing {
+        let (have, missing) = if cert_missing {
+            (key_path, cert_path)
+        } else {
+            (cert_path, key_path)
+        };
+        return unavailable(
+            format!(
+                "{} はありますが {} がありません（片方だけ）",
+                have.display(),
+                missing.display()
+            ),
+            renew_remedy(),
+        );
+    }
+    exposed.remove(0)
+}
+
 /// 既定の TLS の鍵と証明書を、置き場ごと確かめてから読み、サービスの失効の記録と照合する
 /// （モジュール doc「確かめの順序」）。`tls\` には書き込み・作成をしない。記録が無ければ空で作る。
 /// 露出・所有者の違いを見たら、ディスク上の証明書の拇印を記録に書いてから断る（#1121 PR2c）。
@@ -342,51 +426,46 @@ pub fn load_default_identity<O: HubTlsOps>(
     // --- 4. 鍵と証明書（開いて握り、ACL を確かめる） ---------------------------------
     let key_path = tls_path.join(KEY_FILE);
     let cert_path = tls_path.join(CERT_FILE);
-    let key = open_checked_file(ops, &place, KEY_FILE, "秘密鍵").map_err(from_trust)?;
-    let cert = open_checked_file(ops, &place, CERT_FILE, "証明書").map_err(from_trust)?;
+    // 鍵と証明書は独立に確かめる（片方の失効に入れない問題・無い・開けない、が、もう片方の
+    // 失効に入れる露出を隠さない）。握るのは、問題が無かったときだけ。
+    let (key, key_verdict) = match open_checked_file(ops, &place, KEY_FILE, "秘密鍵") {
+        Ok(Some(key)) => {
+            let key_open = exposure(&key.security());
+            if key_open.is_empty() {
+                (Some(key), Verdict::Fine)
+            } else {
+                let (found, fault) = key_exposure(&key_path, &key_open);
+                (None, Verdict::Exposed(found, fault.revokes()))
+            }
+        }
+        Ok(None) => (None, Verdict::Missing),
+        Err(found) => (None, Verdict::open_failed(found)),
+    };
+    let (cert, cert_verdict) = match open_checked_file(ops, &place, CERT_FILE, "証明書") {
+        Ok(Some(cert)) => match check_cert_exposure(&cert, &cert_path) {
+            Ok(()) => (Some(cert), Verdict::Fine),
+            Err(found) => {
+                let revokes = found.fault.revokes();
+                (None, Verdict::Exposed(from_trust(found), revokes))
+            }
+        },
+        Ok(None) => (None, Verdict::Missing),
+        Err(found) => (None, Verdict::open_failed(found)),
+    };
     let (mut key, mut cert) = match (key, cert) {
         (Some(key), Some(cert)) => (key, cert),
-        (None, None) => {
-            return Err(unavailable(
-                format!(
-                    "{TLS_LABEL}（{}）に鍵（{KEY_FILE}）と証明書（{CERT_FILE}）がありません",
-                    tls_path.display()
-                ),
-                prepare_remedy(),
-            ))
-        }
-        (key, _) => {
-            let (have, missing) = if key.is_some() {
-                (&key_path, &cert_path)
-            } else {
-                (&cert_path, &key_path)
-            };
-            return Err(unavailable(
-                format!(
-                    "{} はありますが {} がありません（片方だけ）",
-                    have.display(),
-                    missing.display()
-                ),
-                renew_remedy(),
+        (key, cert) => {
+            // 握ったハンドルを放してから、証明書を形だけ読み直して記録に書く。
+            drop((key, cert, place));
+            return Err(refuse_pair(
+                ops,
+                [key_verdict, cert_verdict],
+                &key_path,
+                &cert_path,
+                &tls_path,
             ));
         }
     };
-    let key_security: FileSecurity = key.security();
-    let key_open = exposure(&key_security);
-    if !key_open.is_empty() {
-        let (found, fault) = key_exposure(&key_path, &key_open);
-        // 握ったハンドルを放してから、証明書を形だけ読み直して記録に書く。
-        drop((key, cert, place));
-        return Err(if fault.revokes() {
-            record_exposed_at_start(ops, found)
-        } else {
-            found
-        });
-    }
-    if let Err(found) = check_cert_exposure(&cert, &cert_path) {
-        drop((key, cert, place));
-        return Err(refuse(found));
-    }
 
     // --- 5. 握ったハンドルから読んで、中身を確かめる --------------------------------
     let key_pem = read_checked(&mut key, "秘密鍵", &key_path)

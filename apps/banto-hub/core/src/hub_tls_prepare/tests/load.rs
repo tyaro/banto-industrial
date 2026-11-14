@@ -318,6 +318,42 @@ fn default_tls_refuses_a_foreign_exposed_or_linked_tls_dir() {
     }
 }
 
+/// 片方の失効に入れない問題（ハードリンク・開けない）・無いことが、もう片方の失効に入れる露出を
+/// 隠さない（#1121 PR2c、起動時）。
+#[test]
+fn default_tls_records_an_exposed_cert_despite_a_non_revoking_key_problem() {
+    let expose_cert = |ops: &FakeOps| {
+        ops.edit_file(CERT_FILE, |f| {
+            f.security
+                .dacl
+                .aces
+                .as_mut()
+                .unwrap()
+                .push(ace(USERS, MODIFY_ACCESS_MASK, 0))
+        });
+    };
+
+    // (1) 鍵がハードリンク（失効に入れない）で、証明書が露出。
+    let (ops, identity) = FakeOps::with_identity();
+    ops.edit_file(KEY_FILE, |f| f.security.links = 2);
+    expose_cert(&ops);
+    assert_recorded(&ops, "証明書（", &identity.cert_pem);
+
+    // (2) 鍵の open が失敗（失効に入れない種類）で、証明書が露出。
+    let (mut ops, identity) = FakeOps::with_identity();
+    ops.open_error
+        .insert(KEY_FILE.to_string(), FileOpenError::InUse);
+    expose_cert(&ops);
+    assert_recorded(&ops, "証明書（", &identity.cert_pem);
+
+    // (3) 証明書が無く、鍵が露出: 鍵の露出として断る。拇印は読めないので書かれない。
+    let (ops, _identity) = FakeOps::with_identity();
+    ops.edit_file(KEY_FILE, |f| f.security.dacl.aces = None);
+    ops.files.borrow_mut().remove(&tls().join(CERT_FILE));
+    let found = assert_unavailable(&ops, "秘密鍵");
+    assert!(found.reason.contains("保護されていません"), "{found:#?}");
+}
+
 /// 露出を見たのに記録に書けない（#1121 PR2c）: 書けなかったことを理由に足して、TLS 無しで起動する。
 #[test]
 fn default_tls_reports_an_exposure_it_could_not_record() {
