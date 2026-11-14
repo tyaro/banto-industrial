@@ -135,6 +135,7 @@ pub use banto_hub_tls_trust::{
 };
 
 pub mod load;
+pub mod watch;
 #[cfg(windows)]
 pub mod win;
 

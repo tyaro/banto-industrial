@@ -455,28 +455,7 @@ fn creates_and_rebuilds_the_service_record_and_the_hub_checks_it() {
         RevocationRecord::parse(&std::fs::read(&record).unwrap()).unwrap()
     };
     assert_eq!(check_record().entries(), &[]);
-    // 一時の ProgramData では、elev が継承で作ったルートに、CREATOR OWNER から実行した管理者
-    // 本人（CI の runneradmin）のフルが付き、所有者も本人になる。elev は本人を信頼するが、サービス
-    // の読み込みは本人を知らないので断る（#1116・#1117 からの決まり）。本物の ProgramData で
-    // 昇格した管理者の既定の所有者（Administrators）が作った形に揃えてから読ませる。
-    let root = f.program_data.join("BantoHub");
-    let me = std::process::Command::new("whoami")
-        .args(["/user", "/fo", "csv", "/nh"])
-        .output()
-        .expect("whoami を起動できない");
-    let me = String::from_utf8_lossy(&me.stdout);
-    let sid = me
-        .trim()
-        .rsplit(',')
-        .next()
-        .expect("whoami の出力")
-        .trim_matches('"')
-        .to_string();
-    icacls(&root, &["/setowner", "*S-1-5-32-544"]);
-    // 本人のフルは CREATOR OWNER から継承した ACE なので、`/remove:g` は継承を切ってから
-    // （継承していた ACE を明示の ACE に写してから）でないと外れない。
-    icacls(&root, &["/inheritance:d"]);
-    icacls(&root, &["/remove:g", &format!("*{sid}")]);
+    own_root_as_admins(&f);
     if let Err(found) = load_default_identity(&f.ops) {
         panic!("サービスの読み込みが断った: {found:#?}");
     }
@@ -506,4 +485,85 @@ fn creates_and_rebuilds_the_service_record_and_the_hub_checks_it() {
     let (result, lines) = run(&f.ops, false);
     assert_eq!(result, Ok(()), "{lines:#?}");
     assert!(temp.exists(), "{lines:#?}");
+}
+
+/// 一時の ProgramData のルートを、本物の ProgramData で昇格した管理者が作った形（所有者
+/// Administrators・実行した本人の ACE なし）に揃える（サービスの読み込みは本人を知らないため）。
+fn own_root_as_admins(f: &Fixture) {
+    // 一時の ProgramData では、elev が継承で作ったルートに、CREATOR OWNER から実行した管理者
+    // 本人（CI の runneradmin）のフルが付き、所有者も本人になる。elev は本人を信頼するが、サービス
+    // の読み込みは本人を知らないので断る（#1116・#1117 からの決まり）。本物の ProgramData で
+    // 昇格した管理者の既定の所有者（Administrators）が作った形に揃えてから読ませる。
+    let root = f.program_data.join("BantoHub");
+    let me = std::process::Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .expect("whoami を起動できない");
+    let me = String::from_utf8_lossy(&me.stdout);
+    let sid = me
+        .trim()
+        .rsplit(',')
+        .next()
+        .expect("whoami の出力")
+        .trim_matches('"')
+        .to_string();
+    icacls(&root, &["/setowner", "*S-1-5-32-544"]);
+    // 本人のフルは CREATOR OWNER から継承した ACE なので、`/remove:g` は継承を切ってから
+    // （継承していた ACE を明示の ACE に写してから）でないと外れない。
+    icacls(&root, &["/inheritance:d"]);
+    icacls(&root, &["/remove:g", &format!("*{sid}")]);
+}
+
+/// #1121 PR2c・場面 8（本物の ACL）: サービスの Hub が待ち受けている間に鍵の ACL を緩められたら、
+/// 周期の確かめが露出を見て、その証明書の拇印をサービスの記録に書き、止めると決める。以後の
+/// 起動は記録にあるので使わない。
+#[test]
+fn the_service_watch_records_an_exposed_key() {
+    use banto_hub_tls_trust::{CertThumbprint, RevocationRecord, REVOCATIONS_FILE};
+
+    use crate::hub_tls_prepare::load::load_default_identity;
+    use crate::hub_tls_prepare::watch::{ServiceTlsWatch, WatchRound};
+
+    if !elevated_admin("the_service_watch_records_an_exposed_key") {
+        return;
+    }
+    let f = fixture();
+    let (result, lines) = run(&f.ops, false);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    own_root_as_admins(&f);
+    let loaded = load_default_identity(&f.ops).unwrap_or_else(|found| panic!("{found:#?}"));
+    let serving = CertThumbprint::of_pem(loaded.cert_pem()).unwrap();
+    let mut watch = ServiceTlsWatch::new(serving);
+    assert_eq!(watch.check(&f.ops), WatchRound::default());
+
+    icacls(
+        &f.tls().join(KEY_FILE),
+        &["/grant", &format!("*{BUILTIN_USERS_SID}:R")],
+    );
+    let round = watch.check(&f.ops);
+    assert!(round.stop && round.finished, "{round:#?}");
+    let record = f
+        .program_data
+        .join("BantoHub")
+        .join(SERVICE_REVOCATIONS_DIR)
+        .join(REVOCATIONS_FILE);
+    let record = RevocationRecord::parse(&std::fs::read(&record).unwrap()).unwrap();
+    assert!(record.contains(&serving), "{record:#?}");
+    let file = inspect_file(
+        &f.program_data
+            .join("BantoHub")
+            .join(SERVICE_REVOCATIONS_DIR)
+            .join(REVOCATIONS_FILE),
+    )
+    .unwrap()
+    .expect("記録がある");
+    assert_eq!(exposure_beyond_users_read(&file), vec![], "{file:?}");
+
+    // 鍵の ACL を直しても、記録にあるので使わない。
+    icacls(
+        &f.tls().join(KEY_FILE),
+        &["/remove:g", &format!("*{BUILTIN_USERS_SID}")],
+    );
+    let found = load_default_identity(&f.ops).expect_err("失効した証明書は使わない");
+    assert!(found.reason.contains("失効の記録にあります"), "{found:#?}");
 }

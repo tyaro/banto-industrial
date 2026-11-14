@@ -99,7 +99,15 @@
 //!     環境変数（`BANTO_HUB_TLS_*`）がどれも無ければ、`<ProgramData>\BantoHub\tls\` の鍵と
 //!     証明書を確かめて読み（`banto_hub_core::hub_tls_prepare::load`、#644 PR1b）、
 //!     127.0.0.1:8723 で TLS を待ち受ける。読めなければ理由と対処をログに出して TLS 無しで
-//!     起動する（オーナー決定 A。8723 を取れないときも同じ、決定 B）。
+//!     起動する（オーナー決定 A。8723 を取れないときも同じ、決定 B）。露出・所有者の違いを
+//!     見たときは、その証明書の拇印をサービスの失効の記録に書いてから断る（#1121 PR2c）。
+//!     8723 で待ち受けたら、その証明書の周期の確かめ（`banto_hub_core::hub_tls_prepare::watch`、
+//!     30 秒ごと。#1121 PR2c）を見張りと同じ [`Watchers`] に立てる: 置き場の露出・所有者の
+//!     違いを見たら拇印を記録に書き、記録にある・記録が壊れた・置き場が通らないなら、8723 の
+//!     TLS を止めてその証明書で張られた接続も切り（`RunningHub::tls_revoker`）、理由と対処を
+//!     ログに出す（そのプロセスでは再開しない）。記録に書けなければ拇印を覚えて使わず、毎周期
+//!     書き直す。見張りと同じく、Hub を止める前・緩める前に必ず止める。環境変数で TLS を
+//!     設定したとき・TLS 無しで起動したときは立てない。
 //!
 //! STOP（設定モードへ）: Hub を止めて設定 DB を閉じる（`shutdown_and_report`。閉じ切れなければ
 //! 緩めずに 5）→ tokio ランタイムを Stopped の報告の前に終える（上限 [`RUNTIME_SHUTDOWN_WAIT`]。
@@ -122,6 +130,9 @@ use banto_hub_core::hub_log;
 use banto_hub_core::hub_tls_prepare::load::{
     load_default_identity, DefaultHubTls, DefaultTlsUnavailable,
 };
+use banto_hub_core::hub_tls_prepare::watch::{
+    ServiceTlsWatch, ServingThumbprint, WatchLine, WatchRound, SERVICE_TLS_RECHECK_INTERVAL,
+};
 use banto_hub_core::profile_lock::{
     open_profile_dirs_checked, try_acquire_profile_exclusive, HubHostKind, ProfileLockError,
     DIR_AUDIT_SPOOL, DIR_CONFIG, DIR_DATA, DIR_LOGS,
@@ -143,7 +154,7 @@ use banto_hub_core::profile_paths::{
     resolve_profile_paths_from_env, ExternalPath, ProfilePaths,
 };
 use banto_hub_core::runtime::{
-    hub_tls_env_present, HubConfig, HubRuntime, HubStartError, RunningHub,
+    hub_tls_env_present, HubConfig, HubRuntime, HubStartError, RunningHub, TlsRevoker,
 };
 use banto_hub_core::service_manager::{
     dispatch_failure_lines, run_service, OverrunWatch, ServiceContext, ServiceExit, ServiceProgram,
@@ -233,6 +244,13 @@ fn hub_stop_overrun_line() -> &'static str {
     "banto-hub: warn: OS シャットダウンの予算内に最終 flush が終わりませんでした（SCM がプロセスを終了させる可能性があります）"
 }
 
+/// 既定の TLS を失効で止めた後の行（#1121 PR2c）。
+fn tls_revoked_line(addr: std::net::SocketAddr) -> String {
+    format!(
+        "[WARN] {LABEL}: 既定の TLS（https://{addr}）を止め、張られていた接続を切りました。Hub は TLS 無し（平文の待ち受けだけ）で動き続けます"
+    )
+}
+
 /// 設定 DB を閉じ終えたときの行（STOP で緩める前の順序の目印）。
 const DB_CLOSED_LINE: &str = "banto-hub: 設定 DB を閉じました";
 /// Hub の tokio ランタイムを終えたときの行（同上）。
@@ -320,6 +338,10 @@ type RedirectionGuardSource = Box<dyn Fn() -> RedirectionGuard + Send + Sync>;
 /// `load_default_identity(&WindowsHubTlsOps)`、あれば `None`（環境変数を優先）。テストは差し替える。
 type DefaultTlsSource =
     Box<dyn Fn() -> Option<Result<DefaultHubTls, DefaultTlsUnavailable>> + Send + Sync>;
+
+/// 既定の TLS の周期の確かめの 1 周期（#1121 PR2c）。本番は
+/// `ServiceTlsWatch::check(&WindowsHubTlsOps)`。テストは差し替える。
+type TlsWatchCheck = Arc<dyn Fn(&mut ServiceTlsWatch) -> WatchRound + Send + Sync>;
 
 /// サービスログ（本番は `hub_log` のサービスログ。テストは行を集める偽物）。
 pub(crate) trait ServiceLog: Send + Sync {
@@ -504,10 +526,12 @@ impl Tamper {
     }
 }
 
-/// 運用中の見張りと定期の確かめ直し。drop で止める（緩める前に必ず止める）。
+/// 運用中の見張りと定期の確かめ直し（と、既定の TLS の周期の確かめ。#1121 PR2c）。drop で止める
+/// （Hub を止める前・緩める前に必ず止める）。
 struct Watchers {
     stop_watch: Option<Box<dyn Fn() + Send + Sync>>,
     stop_recheck: Option<std::sync::mpsc::Sender<()>>,
+    stop_tls: Option<std::sync::mpsc::Sender<()>>,
     threads: Vec<std::thread::JoinHandle<()>>,
 }
 
@@ -517,6 +541,7 @@ impl Watchers {
             stop();
         }
         self.stop_recheck.take();
+        self.stop_tls.take();
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
@@ -600,6 +625,11 @@ pub(crate) struct HubProgram {
     runtime_shutdown_wait: Duration,
     /// 運用中の定期の確かめ直しの間隔（本番は [`RECHECK_INTERVAL`]。テストは短くする）。
     recheck_interval: Duration,
+    /// 既定の TLS の周期の確かめの 1 周期（#1121 PR2c。本番は `WindowsHubTlsOps`。テストは
+    /// 差し替える）。
+    tls_watch: TlsWatchCheck,
+    /// 既定の TLS の周期の確かめの間隔（本番は [`SERVICE_TLS_RECHECK_INTERVAL`]。テストは短くする）。
+    tls_recheck_interval: Duration,
     /// テスト専用: `shutdown_and_report` の `db_closed` を `false` に偽る（Hub の起動の
     /// 失敗では、設定 DB も閉じ終えられなかった `HubStartError::DbLeftOpen` として扱う）。
     #[cfg(test)]
@@ -674,6 +704,10 @@ impl HubProgram {
             log: parts.log,
             runtime_shutdown_wait: RUNTIME_SHUTDOWN_WAIT,
             recheck_interval: RECHECK_INTERVAL,
+            tls_watch: Arc::new(|watch: &mut ServiceTlsWatch| {
+                watch.check(&banto_hub_core::hub_tls_prepare::win::WindowsHubTlsOps)
+            }),
+            tls_recheck_interval: SERVICE_TLS_RECHECK_INTERVAL,
             #[cfg(test)]
             fake_db_not_closed: std::sync::atomic::AtomicBool::new(false),
         }
@@ -1145,8 +1179,13 @@ impl HubProgram {
         };
 
         // #644 PR1b: 既定の TLS（環境変数が無いときだけ）。読めなければ TLS 無しで起動する。
+        // 待ち受ける証明書の拇印（#1121 PR2c の周期の確かめが使う）。
+        let mut serving: Option<ServingThumbprint> = None;
         config.default_tls = match (self.default_tls)() {
-            Some(Ok(identity)) => Some(identity),
+            Some(Ok(identity)) => {
+                serving = ServingThumbprint::of_pem(identity.cert_pem()).ok();
+                Some(identity)
+            }
             Some(Err(unavailable)) => {
                 for line in unavailable.log_lines() {
                     self.log.error(&line);
@@ -1176,6 +1215,20 @@ impl HubProgram {
             }
         };
         let controller = hub.controller();
+        // #1121 PR2c: 既定の TLS で待ち受けたら、その証明書の周期の確かめを立てる（環境変数の
+        // TLS・TLS 無し・8723 を取れなかったときは立てない）。
+        if let (Some(serving), Some(revoker), Some(addr)) =
+            (serving, hub.tls_revoker(), hub.tls_local_addr())
+        {
+            if let Err(reason) = self.start_tls_watch(&mut watchers, serving, revoker.clone(), addr)
+            {
+                // 確かめられないまま使い続けない（閉じる側）。
+                self.log.error(&format!(
+                    "[WARN] {LABEL}: 既定の TLS の周期の確かめを始められないので、既定の TLS（https://{addr}）を止めます: {reason}"
+                ));
+                revoker.revoke();
+            }
+        }
         engine.hub = Some(hub);
         // 終了の受付（#392 A2 レビュー）の印を立てるのは `shutdown_and_report` だけで、それは
         // この開始より後に呼ばれるため、ここで `Err` になる経路は今は無い。
@@ -1272,6 +1325,52 @@ impl HubProgram {
         exit_after_relax_back(relaxed, 0)
     }
 
+    /// 既定の TLS の周期の確かめ（#1121 PR2c、モジュール doc の手順 11）を `watchers` に立てる。
+    /// [`Self::tls_recheck_interval`] ごとに [`Self::tls_watch`] を呼び、行をサービスログへ出し、
+    /// 止めると決めたら `revoker` で 8723 を止めて接続を切る。止めた後も、記録に書けていない拇印が
+    /// あれば書き直しを続け、書き終えたら終わる。`watchers.stop()` で止まる。
+    fn start_tls_watch(
+        &self,
+        watchers: &mut Watchers,
+        serving: ServingThumbprint,
+        revoker: TlsRevoker,
+        addr: std::net::SocketAddr,
+    ) -> Result<(), String> {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let interval = self.tls_recheck_interval;
+        let check = self.tls_watch.clone();
+        let log = self.log.clone();
+        let thread = std::thread::Builder::new()
+            .name("banto-hub-tls-watch".to_string())
+            .spawn(move || {
+                let mut watch = ServiceTlsWatch::new(serving);
+                loop {
+                    match stop_rx.recv_timeout(interval) {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        _ => return,
+                    }
+                    let round = check(&mut watch);
+                    for line in &round.lines {
+                        match line {
+                            WatchLine::Info(line) => log.line(line),
+                            WatchLine::Warn(line) => log.error(line),
+                        }
+                    }
+                    if round.stop {
+                        revoker.revoke();
+                        log.error(&tls_revoked_line(addr));
+                    }
+                    if round.finished {
+                        return;
+                    }
+                }
+            })
+            .map_err(|err| err.to_string())?;
+        watchers.stop_tls = Some(stop_tx);
+        watchers.threads.push(thread);
+        Ok(())
+    }
+
     /// 見張り（`SecurityWatch`）と定期の確かめ直しを始める（ChronoGazer の
     /// `start_watchers` と同じ形）。変化・確かめ直しの失敗は `tamper` に最初の 1 件を残す。
     fn start_watchers(
@@ -1283,6 +1382,7 @@ impl HubProgram {
         let mut watchers = Watchers {
             stop_watch: None,
             stop_recheck: None,
+            stop_tls: None,
             threads: Vec::new(),
         };
         if let Some(mut watch) = self.acl.watch(&watched.root)? {

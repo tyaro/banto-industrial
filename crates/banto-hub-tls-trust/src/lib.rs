@@ -158,6 +158,11 @@
 //!   置き換えで作り直す（[`rewrite_service_revocations`]）。ファイルは証明書と同じ記述子（所有者
 //!   Administrators を明示）で作る。記録用のロックは持たない（理由はモジュールの doc「書き方と
 //!   ロック」）。
+//! - **露出の書き足し**（#1121 PR2c。サービスの Hub だけ）: 置き場の確かめが返す [`Unavailable`]
+//!   は、失効に入れる種類（露出・所有者の違い）を [`PlaceFault`] で持つ。サービスの Hub はそれを
+//!   見たら、ディスク上の証明書を形だけ読み（[`peek_service_cert`]）、拇印を
+//!   [`record_service_revocations`] で書き足す（健全なら和で置き換え、無ければ置き換えずに作る。
+//!   壊れた記録・通らない置き場には書かない）。クライアントは [`PlaceFault`] を見ない。
 //!
 //! ## テスト
 //!
@@ -181,8 +186,9 @@ pub mod win;
 pub use dacl::{root_dacl_problems, ROOT_TAKEOVER_MASK};
 pub use ops::{FileOpenError, ReadError, TlsDir, TlsFile, TlsTrustOps};
 pub use place::{
-    check_cert_exposure, load_pinned_hub_cert, open_checked_file, open_place,
-    parse_single_certificate, read_checked, CheckedPlace, HubCertPin, Remedy, Unavailable,
+    check_cert_exposure, exposure_fault, load_pinned_hub_cert, open_checked_file, open_place,
+    parse_single_certificate, read_checked, CheckedPlace, HubCertPin, PlaceFault, Remedy,
+    Unavailable,
 };
 pub use revocation::{
     read_user_revocations, reconcile_user_revocations, record_user_revocation, CertThumbprint,
@@ -193,11 +199,11 @@ pub use revocation::{
 };
 pub use service_revocation::{
     create_service_revocations_if_absent, ensure_service_revocations,
-    open_or_create_service_revocations_dir, open_service_revocations_dir, read_service_revocations,
-    read_service_revocations_in, remove_stale_service_revocation_temps,
-    rewrite_service_revocations, salvage_revocations, ServiceRevocationFault, ServiceRevocationOps,
-    ServiceRevocationProblem, ServiceRevocations, ServiceRevocationsDir, ServiceRoot,
-    SERVICE_REVOCATIONS_DIR, SERVICE_REVOCATIONS_LABEL,
+    open_or_create_service_revocations_dir, open_service_revocations_dir, peek_service_cert,
+    read_service_revocations, read_service_revocations_in, record_service_revocations,
+    remove_stale_service_revocation_temps, rewrite_service_revocations, salvage_revocations,
+    ServiceRevocationFault, ServiceRevocationOps, ServiceRevocationProblem, ServiceRevocations,
+    ServiceRevocationsDir, ServiceRoot, SERVICE_REVOCATIONS_DIR, SERVICE_REVOCATIONS_LABEL,
 };
 pub use user::{
     check_place_layout, check_spec, is_app_container_sid, load_pinned_user_cert, open_user_file,

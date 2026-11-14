@@ -218,6 +218,7 @@ use crate::rest::{api_router_with_controller, opcua_settings_router, user_auth_s
 use crate::settings::{HubSettingsExt, SettingsService, DEFAULT_PORT};
 use crate::subscribe_core::EVAL_TICK_MS;
 pub use crate::tls_listener::RunningTlsListener as RunningTlsServer;
+pub use crate::tls_listener::TlsRevoker;
 use crate::tls_listener::{self, TlsConfig};
 use crate::users::UsersService;
 use crate::write_audit::{RejectionWriter, WriteAuditService};
@@ -1483,6 +1484,14 @@ impl RunningHub {
     /// The dedicated loopback TLS address, when configured.
     pub fn tls_local_addr(&self) -> Option<std::net::SocketAddr> {
         self.tls_server.as_ref().map(RunningTlsServer::local_addr)
+    }
+
+    /// 8723 の TLS を失効で止める口（#1121 PR2c。サービスの Hub の周期の確かめが使う）。TLS を
+    /// 待ち受けていなければ `None`。止めると、その証明書で張られた接続もすぐ切り、そのプロセスでは
+    /// 再開しない（`crate::tls_listener` のモジュール doc「失効による停止」）。通常の停止
+    /// （[`Self::shutdown_and_report`]）の挙動は変えない。
+    pub fn tls_revoker(&self) -> Option<TlsRevoker> {
+        self.tls_server.as_ref().map(RunningTlsServer::revoker)
     }
 
     /// #479: 既定ポートが埋まっていて OS 割り当てのポートへ退避して起動したとき、
