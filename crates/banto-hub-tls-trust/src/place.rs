@@ -237,24 +237,55 @@ pub fn open_checked_file<O: TlsTrustOps>(
     label: &str,
 ) -> Result<Option<O::File>, Unavailable> {
     let tls_path = place.tls_path();
-    let shown = tls_path.join(name);
-    let file = match ops.open_child_file(place.tls(), name) {
+    open_file_in(ops, place.tls(), tls_path, place.tls_real(), name, label).map_err(|refusal| {
+        let remedy = if refusal.transient {
+            Remedy::Retry
+        } else {
+            Remedy::RecreateDir(tls_path.to_path_buf())
+        };
+        unavailable(refusal.reason, remedy)
+    })
+}
+
+/// [`open_file_in`] が断った理由。
+pub(crate) struct FileRefusal {
+    /// 何が合わなかったか（表示用）。
+    pub(crate) reason: String,
+    /// 一時的かもしれない（開けない・別のプロセスが書き込みに開いている）。偽なら、種類か場所が
+    /// 違う（フォルダ・reparse point・本当の場所の食い違い）。
+    pub(crate) transient: bool,
+}
+
+/// [`open_checked_file`] と利用者ごとの置き場（`crate::user`）が共有する中身: 確かめ済みの
+/// フォルダ `dir`（期待のパス `dir_path`・本当のパス `dir_real`）のハンドル基準で、名前 1 要素の
+/// ファイルを辿らずに読み取りで開き、種類と場所を確かめる（無ければ `None`。ACL は見ない）。
+pub(crate) fn open_file_in<O: TlsTrustOps>(
+    ops: &O,
+    dir: &O::Dir,
+    dir_path: &Path,
+    dir_real: &Path,
+    name: &str,
+    label: &str,
+) -> Result<Option<O::File>, FileRefusal> {
+    let shown = dir_path.join(name);
+    let transient = |reason: String| FileRefusal {
+        reason,
+        transient: true,
+    };
+    let file = match ops.open_child_file(dir, name) {
         Ok(Some(file)) => file,
         Ok(None) => return Ok(None),
         Err(FileOpenError::InUse) => {
-            return Err(unavailable(
-                format!(
-                    "{label}（{}）は別のプロセスで書き込みに開かれています",
-                    shown.display()
-                ),
-                Remedy::Retry,
-            ))
+            return Err(transient(format!(
+                "{label}（{}）は別のプロセスで書き込みに開かれています",
+                shown.display()
+            )))
         }
         Err(FileOpenError::Other(error)) => {
-            return Err(unavailable(
-                format!("{label}（{}）を開けませんでした: {error}", shown.display()),
-                Remedy::Retry,
-            ))
+            return Err(transient(format!(
+                "{label}（{}）を開けませんでした: {error}",
+                shown.display()
+            )))
         }
     };
     let security = file.security();
@@ -262,7 +293,7 @@ pub fn open_checked_file<O: TlsTrustOps>(
         Some("フォルダです".to_string())
     } else if security.is_reparse_point {
         Some("シンボリックリンクなどの reparse point です".to_string())
-    } else if !guard::paths_match(&file.final_path(), &place.tls_real().join(name)) {
+    } else if !guard::paths_match(&file.final_path(), &dir_real.join(name)) {
         Some(format!(
             "本当の場所（{}）が期待と違います",
             file.final_path().display()
@@ -271,10 +302,10 @@ pub fn open_checked_file<O: TlsTrustOps>(
         None
     };
     match problem {
-        Some(problem) => Err(unavailable(
-            format!("{label}（{}）は{problem}", shown.display()),
-            Remedy::RecreateDir(tls_path.to_path_buf()),
-        )),
+        Some(problem) => Err(FileRefusal {
+            reason: format!("{label}（{}）は{problem}", shown.display()),
+            transient: false,
+        }),
         None => Ok(Some(file)),
     }
 }

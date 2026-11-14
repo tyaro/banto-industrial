@@ -4,17 +4,19 @@
 use std::path::PathBuf;
 
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS};
+use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::Registry::{
     RegGetValueW, HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
 };
 use windows_sys::Win32::UI::Shell::{
-    FOLDERID_ProgramData, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesCommon,
-    FOLDERID_ProgramFilesCommonX86, FOLDERID_ProgramFilesX86, FOLDERID_Public, FOLDERID_System,
-    FOLDERID_SystemX86, FOLDERID_UserProfiles, FOLDERID_Windows, SHGetKnownFolderPath,
+    FOLDERID_LocalAppData, FOLDERID_ProgramData, FOLDERID_ProgramFiles,
+    FOLDERID_ProgramFilesCommon, FOLDERID_ProgramFilesCommonX86, FOLDERID_ProgramFilesX86,
+    FOLDERID_Public, FOLDERID_System, FOLDERID_SystemX86, FOLDERID_UserProfiles, FOLDERID_Windows,
+    SHGetKnownFolderPath,
 };
 
-use super::{KnownFolders, MachineEnvironment, MACHINE_ENVIRONMENT_KEY};
+use super::{DriveKind, KnownFolders, MachineEnvironment, MACHINE_ENVIRONMENT_KEY};
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
@@ -61,6 +63,87 @@ pub fn program_files_dirs() -> Vec<PathBuf> {
         .into_iter()
         .filter_map(|id| known_folder(id).ok())
         .collect()
+}
+
+/// 今の利用者の `%LOCALAPPDATA%`（`FOLDERID_LocalAppData`。このプロセスの環境変数は読まない。
+/// #1121 PR1a）。プロセスのトークンの利用者のもの（偽装していないスレッドから呼ぶ）。
+pub fn local_app_data() -> Result<PathBuf, String> {
+    known_folder(&FOLDERID_LocalAppData)
+}
+
+/// `GetDriveTypeW` の値（`Win32_System_WindowsProgramming` の定数。feature を足さずに済むよう
+/// ここに置く）。
+const DRIVE_REMOVABLE: u32 = 2;
+const DRIVE_FIXED: u32 = 3;
+const DRIVE_REMOTE: u32 = 4;
+
+/// パスの先頭の解釈（[`classify_path_prefix`] の結果）。
+#[derive(Debug, PartialEq, Eq)]
+enum PathPrefix {
+    /// UNC（OS に尋ねずネットワーク）。
+    Network,
+    /// ドライブ文字（`X:`）で始まる。
+    Drive(char),
+}
+
+/// `text` の先頭を解釈する純粋な関数（OS に尋ねない。`/` は `\` と同じに扱い、接頭辞の
+/// 大文字小文字は区別しない）。`\\?\UNC\` は UNC、`\\?\X:` は接頭辞を外してドライブ文字、
+/// `\\?\` の後がドライブ文字でないもの（`\\?\Volume{..}\` など）と `\\.\` は推測せず
+/// `Err`、ほかの `\\` は UNC、`X:` はそのままドライブ文字。
+fn classify_path_prefix(text: &str) -> Result<PathPrefix, String> {
+    let norm: String = text.replace('/', "\\");
+    let drive_of = |rest: &str| -> Option<char> {
+        let mut chars = rest.chars();
+        match (chars.next(), chars.next()) {
+            (Some(letter), Some(':')) if letter.is_ascii_alphabetic() => Some(letter),
+            _ => None,
+        }
+    };
+    let starts = |prefix: &str| {
+        norm.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    };
+    if starts("\\\\?\\UNC\\") {
+        return Ok(PathPrefix::Network);
+    }
+    if starts("\\\\?\\") {
+        return drive_of(&norm[4..]).map(PathPrefix::Drive).ok_or_else(|| {
+            format!("パス（{text}）の \\\\?\\ の後がドライブ文字でないため種類を判定できません")
+        });
+    }
+    if starts("\\\\.\\") {
+        return Err(format!(
+            "パス（{text}）はデバイス名前空間（\\\\.\\）で始まるため種類を判定できません"
+        ));
+    }
+    if starts("\\\\") {
+        return Ok(PathPrefix::Network);
+    }
+    drive_of(&norm)
+        .map(PathPrefix::Drive)
+        .ok_or_else(|| format!("パス（{text}）がドライブ文字で始まりません"))
+}
+
+/// `path`（本当のパス。`PinnedDir::final_path` の形）が載っているドライブの種類（#1121 PR1a。
+/// 読むだけ）。先頭は [`classify_path_prefix`] で解釈する: UNC（`\\server\..`・
+/// `\\?\UNC\..`）は OS に尋ねずに [`DriveKind::Network`]、`X:\..` と `\\?\X:\..`（verbatim の
+/// DOS 形式）はドライブ文字の `GetDriveTypeW`。`\\?\Volume{..}` や `\\.\` など判定できない形と、
+/// ドライブ文字で始まらないパスは理由を返す。
+pub fn drive_kind(path: &std::path::Path) -> Result<DriveKind, String> {
+    let text = path.to_string_lossy();
+    let letter = match classify_path_prefix(&text)? {
+        PathPrefix::Network => return Ok(DriveKind::Network),
+        PathPrefix::Drive(letter) => letter,
+    };
+    let root = wide(&format!("{letter}:\\"));
+    // SAFETY: `root` は NUL 終端の `X:\`。
+    let kind = unsafe { GetDriveTypeW(root.as_ptr()) };
+    Ok(match kind {
+        DRIVE_FIXED => DriveKind::Fixed,
+        DRIVE_REMOTE => DriveKind::Network,
+        DRIVE_REMOVABLE => DriveKind::Removable,
+        other => DriveKind::Other(other),
+    })
 }
 
 /// `HKLM\<key>` の `name`（REG_SZ か REG_EXPAND_SZ。**展開しない**生の値）。無ければ
@@ -143,6 +226,74 @@ mod tests {
         assert_eq!(known.forbidden_itself.len(), 2);
         super::super::reject_well_known_root(&program_data.join("BantoHub"), &known).unwrap();
         assert!(super::super::reject_well_known_root(&program_data, &known).is_err());
+    }
+
+    /// 読むだけ: 今の利用者の `%LOCALAPPDATA%` は既知のフォルダから絶対パスで取れ、その
+    /// ドライブの種類が読める。UNC は OS に尋ねずにネットワーク、ドライブ文字で始まらない
+    /// パスは理由を返す。
+    #[test]
+    fn local_app_data_and_drive_kind_resolve() {
+        let local = local_app_data().unwrap();
+        assert!(local.is_absolute(), "{local:?}");
+        drive_kind(&local).unwrap();
+        assert_eq!(
+            drive_kind(std::path::Path::new(r"\\server\share\dir")),
+            Ok(DriveKind::Network)
+        );
+        assert!(drive_kind(std::path::Path::new(r"relative\dir")).is_err());
+        // verbatim: DOS 形式は同じドライブと同じ種類、UNC 形式はネットワーク。
+        assert_eq!(
+            drive_kind(std::path::Path::new(r"\\?\C:\Windows")),
+            drive_kind(std::path::Path::new(r"C:\Windows"))
+        );
+        for unc in [
+            r"\\?\UNC\server\share\x",
+            r"\\?\unc\server\share\x",
+            "//?/UNC/server/share/x",
+            r"\\server\share\x",
+        ] {
+            assert_eq!(
+                drive_kind(std::path::Path::new(unc)),
+                Ok(DriveKind::Network),
+                "{unc}"
+            );
+        }
+        for bad in [
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\",
+            r"\\.\C:",
+            "//./C:",
+        ] {
+            assert!(drive_kind(std::path::Path::new(bad)).is_err(), "{bad}");
+        }
+    }
+
+    /// 純粋: 接頭辞の解釈の表。
+    #[test]
+    fn classify_path_prefix_table() {
+        use PathPrefix::{Drive, Network};
+        let ok = [
+            (r"C:\x", Drive('C')),
+            (r"\\?\C:\x", Drive('C')),
+            ("//?/d:/x", Drive('d')),
+            (r"\\?\UNC\s\h", Network),
+            ("//?/unc/s/h", Network),
+            (r"\\s\h", Network),
+            ("//s/h", Network),
+            (r"\\?\Z:", Drive('Z')),
+        ];
+        for (text, want) in ok {
+            assert_eq!(classify_path_prefix(text), Ok(want), "{text}");
+        }
+        for bad in [
+            r"\\?\Volume{1}\",
+            r"\\?\",
+            r"\\.\C:",
+            r"\\.\UNC\s\h",
+            "rel",
+            "",
+        ] {
+            assert!(classify_path_prefix(bad).is_err(), "{bad}");
+        }
     }
 
     /// 読むだけ: 無い値は `None`、ある値（`Path` は必ずある）は読める（`RRF_NOEXPAND` で

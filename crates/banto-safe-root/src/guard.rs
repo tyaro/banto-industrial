@@ -36,6 +36,9 @@
 //! - [`data_acl_plan`] は、開いたフォルダの属性と所有者から、作る・書き直す・断るを決める
 //!   （reparse point・フォルダでない・見知らぬ所有者を断る）。対象の利用者を持たない置き場
 //!   （banto-hub-sink の `sink\`、#630）は [`dir_acl_plan`] に `None` を渡す。
+//! - [`DriveKind`]（Windows の読み取りは `win::drive_kind`）と `win::local_app_data` は、
+//!   利用者ごとの置き場（banto-hub-tls-trust の `user`、#1121 PR1a）の確かめ用: 今の利用者の
+//!   `%LOCALAPPDATA%` を既知のフォルダから取る・本当のパスがローカルの固定ドライブかを見る。
 //! - [`plan_carry_over`] は、書き直す前の DACL（`PinnedDir::read_dacl`）から、**引き継ぐ
 //!   利用者**（明示の許可で「変更」相当、`SidTypeUser`、拒否の ACE を持たない）と
 //!   **落とすもの**（グループ・well-known・継承・拒否・拒否を持つ利用者など）を分ける。banto-hub の `grant-profile-acl` が、今の
@@ -50,6 +53,20 @@ use crate::acl::{
 
 #[cfg(windows)]
 pub mod win;
+
+/// ドライブの種類（#1121 PR1a。利用者ごとの置き場が、ローカルの固定ドライブにあることを
+/// 確かめるため。Windows の読み取りは [`win::drive_kind`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveKind {
+    /// ローカルの固定ドライブ（`DRIVE_FIXED`）。
+    Fixed,
+    /// ネットワークの場所（UNC のパス、または `DRIVE_REMOTE`）。
+    Network,
+    /// 取り外せるドライブ（`DRIVE_REMOVABLE`）。
+    Removable,
+    /// それ以外（光学ドライブ・RAM ディスク・種類が分からないなど。中身は `GetDriveTypeW` の値）。
+    Other(u32),
+}
 
 /// マシンの環境変数のレジストリキー（`HKLM` の下）。
 pub const MACHINE_ENVIRONMENT_KEY: &str =

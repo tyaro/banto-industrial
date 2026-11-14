@@ -162,3 +162,23 @@ impl TlsTrustOps for WindowsTlsTrustOps {
         open_child_file(parent, name)
     }
 }
+
+/// 利用者ごとの置き場（#1121 PR1a）の読み取り。部品は `banto_safe_root` のもの:
+/// `%LOCALAPPDATA%` は既知のフォルダ（`guard::win::local_app_data`）、SID はプロセスのトークン
+/// （`acl::current_user_sid`）、ドライブの種類は `guard::win::drive_kind`。フォルダは読み取り
+/// 専用の pin で開く（[`WindowsTlsTrustOps`] のまま）。
+impl crate::UserTlsOps for WindowsTlsTrustOps {
+    fn local_app_data(&self) -> Result<PathBuf, String> {
+        banto_safe_root::guard::win::local_app_data()
+    }
+
+    fn current_user_sid(&self) -> Result<String, String> {
+        banto_safe_root::acl::current_user_sid()
+            .map(|sid| sid.as_str().to_string())
+            .map_err(|err| err.to_string())
+    }
+
+    fn drive_kind(&self, real: &Path) -> Result<banto_safe_root::guard::DriveKind, String> {
+        banto_safe_root::guard::win::drive_kind(real)
+    }
+}
