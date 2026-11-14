@@ -110,3 +110,6 @@ tokio = { workspace = true, features = [
     "test-util",
 ] }
 tempfile = { workspace = true }
+# #644 受入条件 4 の場面試験（Hub 停止中の先取り・入れ替え・証明書更新で API キーが本物の Hub 以外へ
+# 届かないこと）。先取り役・中継・記録の部品で、公開しない dev 専用の crate。
+banto-hub-squat-harness = { path = "../../crates/banto-hub-squat-harness" }

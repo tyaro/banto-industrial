@@ -1029,6 +1029,7 @@ dependencies = [
  "banto-db-source",
  "banto-drivers",
  "banto-hub-core",
+ "banto-hub-squat-harness",
  "banto-safe-root",
  "banto-server",
  "banto-service-control",
