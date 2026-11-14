@@ -285,6 +285,9 @@ windows-sys = { version = "0.61", features = [
 # フォーム（CI）でも通す必要があるため、以下の Windows 限定の依存を使う
 # コード側は必ず `#[cfg(windows)]` で追加ガードすること。
 [target.'cfg(windows)'.dependencies]
+# #1121 PR2a: `bind_exclusive.rs` が bind の前に `SO_EXCLUSIVEADDRUSE` を付ける
+# （socket2 0.6 に専用の関数は無いので windows-sys の `setsockopt`、feature `Win32_Networking_WinSock`）。socket2 0.6 は tokio が既に Cargo.lock に持つ（新しい crate は増えない）。
+socket2 = "0.6"
 # T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P2）: `profile_lock.rs`が
 # `Global\BantoHub.<profile-id>`named mutex（`CreateMutexW`/`CloseHandle`/
 # `GetLastError`/`ERROR_ALREADY_EXISTS`）で Desktop/Service 間の排他を取る。
@@ -336,6 +339,7 @@ windows-sys = { version = "0.61", features = [
 # ドメインの SID（`LsaOpenPolicy`・`LsaQueryInformationPolicy`・`ConvertSidToStringSidW`）と比べる。
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authentication_Identity",
     "Win32_Security_Authorization",

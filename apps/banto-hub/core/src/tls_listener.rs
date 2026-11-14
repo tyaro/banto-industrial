@@ -265,7 +265,9 @@ pub(crate) async fn start(
 ) -> Result<RunningTlsListener, TlsError> {
     let acceptor = config.acceptor()?;
     let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, config.port);
-    let tcp = TcpListener::bind(address).await.map_err(TlsError::Bind)?;
+    let tcp = crate::bind_exclusive::bind_exclusive(address)
+        .await
+        .map_err(TlsError::Bind)?;
     let local_addr = tcp.local_addr().map_err(TlsError::Bind)?;
     let listener = TlsListener {
         tcp,
@@ -524,5 +526,32 @@ mod tests {
             .starts_with("HTTP/1.1 200"));
         server.stop().await;
         plain.stop().await;
+    }
+
+    /// #1121 PR2a: TLS の経路でも、握ったポートを `SO_REUSEADDR` の別ソケットが奪えない。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn tls_listener_port_cannot_be_taken_with_reuseaddr() {
+        use socket2::{Domain, Socket, Type};
+
+        let key_pair = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let cert = temp.path().join("server.pem");
+        let key = temp.path().join("server.key");
+        std::fs::write(&cert, key_pair.cert.pem()).unwrap();
+        std::fs::write(&key, key_pair.signing_key.serialize_pem()).unwrap();
+        let config = TlsConfig {
+            port: 0,
+            identity: TlsIdentity::Files { cert, key },
+        };
+        let server = start(&config, Router::new()).await.unwrap();
+        let addr = SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            server.local_addr().port(),
+        ));
+        let socket = Socket::new(Domain::for_address(addr), Type::STREAM, None).unwrap();
+        socket.set_reuse_address(true).unwrap();
+        assert!(socket.bind(&addr.into()).is_err(), "{addr} was taken over");
+        server.stop().await;
     }
 }

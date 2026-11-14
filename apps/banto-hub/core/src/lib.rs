@@ -229,6 +229,7 @@
 pub mod api_keys;
 pub mod assets;
 pub mod audit_spool;
+mod bind_exclusive;
 pub mod broker_glue;
 pub mod clock_read;
 pub mod clock_sync;
