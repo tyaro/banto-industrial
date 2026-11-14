@@ -23,7 +23,7 @@
 //! 平文の待受。
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -77,6 +77,18 @@ impl TestIdentity {
 pub enum Mode {
     Down,
     Relay(SocketAddr),
+    /// 最初に受けた接続だけを中継し、裏の最初の返事をクライアントへ流す**前**に
+    /// 第 2 引数のモードへ切り替える（確認と送信の間の入れ替え）。中継した接続は
+    /// その返事を流し終えたら切り、キープアライブで次の要求を本物へ運ばせない。
+    ///
+    /// `tls` を渡すと、この待受が本物の Hub と同じ証明書で TLS を終わらせ、**平文の**
+    /// 裏（`MockHub::start`）へ中継する。TLS の暗号文の上では「最初の返事」を
+    /// 見分けられないので、アプリケーションの返事で切り替えたいときはこちらを使う。
+    RelayThen {
+        backend: SocketAddr,
+        tls: Option<Arc<rustls::ServerConfig>>,
+        then: Box<Mode>,
+    },
     SquatTls(Arc<rustls::ServerConfig>),
     SquatPlain,
 }
@@ -94,7 +106,7 @@ impl Mode {
     fn kind(&self) -> ModeKind {
         match self {
             Mode::Down => ModeKind::Down,
-            Mode::Relay(_) => ModeKind::Relay,
+            Mode::Relay(_) | Mode::RelayThen { .. } => ModeKind::Relay,
             Mode::SquatTls(_) => ModeKind::SquatTls,
             Mode::SquatPlain => ModeKind::SquatPlain,
         }
@@ -132,7 +144,7 @@ struct Recorded {
 
 struct State {
     mode: Mode,
-    connections: Vec<AbortHandle>,
+    connections: Vec<(tokio::task::Id, AbortHandle)>,
 }
 
 struct Shared {
@@ -184,7 +196,7 @@ impl SwitchPort {
                     .of(mode.kind())
                     .fetch_add(1, Ordering::SeqCst);
                 let task = tokio::spawn(handle(stream, mode, Arc::clone(&accept_shared)));
-                state.connections.push(task.abort_handle());
+                state.connections.push((task.id(), task.abort_handle()));
             }
         })
         .abort_handle();
@@ -210,7 +222,7 @@ impl SwitchPort {
     /// 新しい接続の扱いを切り替え、前のモードで受けた接続を全部切る。
     pub fn set(&self, mode: Mode) {
         let mut state = lock(&self.shared.state);
-        for connection in state.connections.drain(..) {
+        for (_, connection) in state.connections.drain(..) {
             connection.abort();
         }
         state.mode = mode;
@@ -246,6 +258,17 @@ impl SwitchPort {
         lock(&self.shared.recorded.relay).clone()
     }
 
+    /// 先取り側が受けたバイトだけを調べる。中継で本物の Hub へ正当に送った分（本物へ
+    /// 鍵を 1 度送ったあとの入れ替えの試験）は対象にしない。
+    pub fn assert_squat_secret_absent(&self, secret: &str) {
+        assert_absent("squat TLS plaintext", &self.squat_tls_bytes(), secret);
+        assert_absent(
+            "squat plain bytes",
+            &lock(&self.shared.recorded.squat_plain),
+            secret,
+        );
+    }
+
     /// 記録したどのバイトにも、キー全体と `.` より後ろの秘密部分が無いことを確かめる。
     pub fn assert_secret_absent(&self, secret: &str) {
         assert_absent("squat TLS plaintext", &self.squat_tls_bytes(), secret);
@@ -261,7 +284,7 @@ impl SwitchPort {
 impl Drop for SwitchPort {
     fn drop(&mut self) {
         self.accept_task.abort();
-        for connection in lock(&self.shared.state).connections.drain(..) {
+        for (_, connection) in lock(&self.shared.state).connections.drain(..) {
             connection.abort();
         }
     }
@@ -291,7 +314,16 @@ fn assert_absent(label: &str, bytes: &[u8], secret: &str) {
 async fn handle(stream: TcpStream, mode: Mode, shared: Arc<Shared>) {
     match mode {
         Mode::Down => drop(stream),
-        Mode::Relay(backend) => relay(stream, backend, &shared).await,
+        Mode::Relay(backend) => relay(stream, backend, &shared, None).await,
+        Mode::RelayThen { backend, tls, then } => match tls {
+            None => relay(stream, backend, &shared, Some(*then)).await,
+            Some(config) => {
+                let Ok(stream) = TlsAcceptor::from(config).accept(stream).await else {
+                    return;
+                };
+                relay(stream, backend, &shared, Some(*then)).await;
+            }
+        },
         Mode::SquatPlain => {
             let mut stream = stream;
             sink(&mut stream, &shared.recorded.squat_plain).await;
@@ -329,16 +361,37 @@ async fn sink<S: AsyncReadExt + AsyncWriteExt + Unpin>(stream: &mut S, record: &
     }
 }
 
-async fn relay(client: TcpStream, backend: SocketAddr, shared: &Shared) {
+/// 自分（中継中の接続）だけを残して、ほかの接続を全部切ってモードを切り替える。
+fn switch_keeping(shared: &Shared, keep: Option<tokio::task::Id>, mode: Mode) {
+    let mut state = lock(&shared.state);
+    let mut kept = Vec::new();
+    for (id, connection) in state.connections.drain(..) {
+        if Some(id) == keep {
+            kept.push((id, connection));
+        } else {
+            connection.abort();
+        }
+    }
+    state.connections = kept;
+    state.mode = mode;
+}
+
+async fn relay<S>(client: S, backend: SocketAddr, shared: &Shared, then: Option<Mode>)
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
     let Ok(backend) = TcpStream::connect(backend).await else {
         return;
     };
-    let (mut client_read, mut client_write) = client.into_split();
+    let (mut client_read, mut client_write) = tokio::io::split(client);
     let (mut backend_read, mut backend_write) = backend.into_split();
+    // `then` があるとき、裏の最初の返事を見たら立てる。以後クライアントからの
+    // 要求は裏へ運ばない（キープアライブで次の要求が本物へ届くのを防ぐ）。
+    let sealed = AtomicBool::new(false);
     let upstream = async {
         let mut buffer = [0u8; 4096];
         while let Ok(count) = client_read.read(&mut buffer).await {
-            if count == 0 {
+            if count == 0 || sealed.load(Ordering::SeqCst) {
                 break;
             }
             lock(&shared.recorded.relay).extend_from_slice(&buffer[..count]);
@@ -347,10 +400,35 @@ async fn relay(client: TcpStream, backend: SocketAddr, shared: &Shared) {
             }
         }
     };
+    let mut then = then;
     let downstream = async {
         let mut buffer = [0u8; 4096];
-        while let Ok(count) = backend_read.read(&mut buffer).await {
-            if count == 0 || client_write.write_all(&buffer[..count]).await.is_err() {
+        loop {
+            // 切り替え後は、返事の残りを少しだけ待って流し、あとは切る。
+            let read = if then.is_none() && sealed.load(Ordering::SeqCst) {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    backend_read.read(&mut buffer),
+                )
+                .await
+                {
+                    Ok(read) => read,
+                    Err(_) => break,
+                }
+            } else {
+                backend_read.read(&mut buffer).await
+            };
+            let Ok(count) = read else { break };
+            if count == 0 {
+                break;
+            }
+            if let Some(next) = then.take() {
+                // 返事をクライアントへ流す前に切り替える。流したあとでは、クライアントが
+                // すぐ開く新しい接続が本物へ着いてしまう。
+                sealed.store(true, Ordering::SeqCst);
+                switch_keeping(shared, tokio::task::try_id(), next);
+            }
+            if client_write.write_all(&buffer[..count]).await.is_err() {
                 break;
             }
         }
@@ -497,6 +575,56 @@ mod tests {
         assert_eq!(&echoed, b"ping-bytes");
         assert_eq!(port.relay_bytes(), b"ping-bytes");
         assert_eq!(port.accepts(ModeKind::Relay), 1);
+    }
+
+    #[tokio::test]
+    async fn relay_then_switches_before_the_first_response_reaches_the_client() {
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let backend_seen = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&backend_seen);
+        tokio::spawn(async move {
+            let (mut stream, _) = backend.accept().await.unwrap();
+            let mut buffer = [0u8; 64];
+            while let Ok(count) = stream.read(&mut buffer).await {
+                if count == 0 {
+                    break;
+                }
+                lock(&seen).extend_from_slice(&buffer[..count]);
+                if stream.write_all(b"first-response").await.is_err() {
+                    break;
+                }
+            }
+        });
+        let port = SwitchPort::start().await;
+        port.set(Mode::RelayThen {
+            backend: backend_addr,
+            tls: None,
+            then: Box::new(Mode::SquatPlain),
+        });
+        let mut client = TcpStream::connect(port.addr()).await.unwrap();
+        client.write_all(b"status").await.unwrap();
+        let mut response = [0u8; 14];
+        timeout(Duration::from_secs(3), client.read_exact(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&response, b"first-response");
+        // 返事を受けた時点で、新しい接続はもう先取り側に着く。
+        let mut fresh = TcpStream::connect(port.addr()).await.unwrap();
+        fresh.write_all(b"key-bytes").await.unwrap();
+        let mut buffer = [0u8; 256];
+        assert!(fresh.read(&mut buffer).await.unwrap() > 0);
+        // 中継した接続は返事のあとで切られ、続きの要求は裏へ届かない。
+        let _ = client.write_all(b"second").await;
+        assert!(is_closed(&mut client).await);
+        assert_eq!(*lock(&backend_seen), b"status");
+        assert_eq!(port.accepts(ModeKind::Relay), 1);
+        assert_eq!(port.accepts(ModeKind::SquatPlain), 1);
+        assert_eq!(
+            lock(&port.shared.recorded.squat_plain).as_slice(),
+            b"key-bytes"
+        );
     }
 
     #[tokio::test]
