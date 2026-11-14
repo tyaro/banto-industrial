@@ -4,17 +4,19 @@
 use std::path::PathBuf;
 
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS};
+use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::Registry::{
     RegGetValueW, HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
 };
 use windows_sys::Win32::UI::Shell::{
-    FOLDERID_ProgramData, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesCommon,
-    FOLDERID_ProgramFilesCommonX86, FOLDERID_ProgramFilesX86, FOLDERID_Public, FOLDERID_System,
-    FOLDERID_SystemX86, FOLDERID_UserProfiles, FOLDERID_Windows, SHGetKnownFolderPath,
+    FOLDERID_LocalAppData, FOLDERID_ProgramData, FOLDERID_ProgramFiles,
+    FOLDERID_ProgramFilesCommon, FOLDERID_ProgramFilesCommonX86, FOLDERID_ProgramFilesX86,
+    FOLDERID_Public, FOLDERID_System, FOLDERID_SystemX86, FOLDERID_UserProfiles, FOLDERID_Windows,
+    SHGetKnownFolderPath,
 };
 
-use super::{KnownFolders, MachineEnvironment, MACHINE_ENVIRONMENT_KEY};
+use super::{DriveKind, KnownFolders, MachineEnvironment, MACHINE_ENVIRONMENT_KEY};
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
@@ -61,6 +63,47 @@ pub fn program_files_dirs() -> Vec<PathBuf> {
         .into_iter()
         .filter_map(|id| known_folder(id).ok())
         .collect()
+}
+
+/// 今の利用者の `%LOCALAPPDATA%`（`FOLDERID_LocalAppData`。このプロセスの環境変数は読まない。
+/// #1121 PR1a）。プロセスのトークンの利用者のもの（偽装していないスレッドから呼ぶ）。
+pub fn local_app_data() -> Result<PathBuf, String> {
+    known_folder(&FOLDERID_LocalAppData)
+}
+
+/// `GetDriveTypeW` の値（`Win32_System_WindowsProgramming` の定数。feature を足さずに済むよう
+/// ここに置く）。
+const DRIVE_REMOVABLE: u32 = 2;
+const DRIVE_FIXED: u32 = 3;
+const DRIVE_REMOTE: u32 = 4;
+
+/// `path`（本当のパス。`PinnedDir::final_path` の形）が載っているドライブの種類（#1121 PR1a。
+/// 読むだけ）。`\\` で始まるパス（UNC）は OS に尋ねずに [`DriveKind::Network`]。それ以外は
+/// 先頭のドライブ文字（`X:`）の `GetDriveTypeW`。ドライブ文字で始まらないパスは理由を返す。
+pub fn drive_kind(path: &std::path::Path) -> Result<DriveKind, String> {
+    let text = path.to_string_lossy();
+    if text.starts_with("\\\\") || text.starts_with("//") {
+        return Ok(DriveKind::Network);
+    }
+    let mut chars = text.chars();
+    let letter = match (chars.next(), chars.next()) {
+        (Some(letter), Some(':')) if letter.is_ascii_alphabetic() => letter,
+        _ => {
+            return Err(format!(
+                "パス（{}）がドライブ文字で始まりません",
+                path.display()
+            ))
+        }
+    };
+    let root = wide(&format!("{letter}:\\"));
+    // SAFETY: `root` は NUL 終端の `X:\`。
+    let kind = unsafe { GetDriveTypeW(root.as_ptr()) };
+    Ok(match kind {
+        DRIVE_FIXED => DriveKind::Fixed,
+        DRIVE_REMOTE => DriveKind::Network,
+        DRIVE_REMOVABLE => DriveKind::Removable,
+        other => DriveKind::Other(other),
+    })
 }
 
 /// `HKLM\<key>` の `name`（REG_SZ か REG_EXPAND_SZ。**展開しない**生の値）。無ければ
@@ -143,6 +186,21 @@ mod tests {
         assert_eq!(known.forbidden_itself.len(), 2);
         super::super::reject_well_known_root(&program_data.join("BantoHub"), &known).unwrap();
         assert!(super::super::reject_well_known_root(&program_data, &known).is_err());
+    }
+
+    /// 読むだけ: 今の利用者の `%LOCALAPPDATA%` は既知のフォルダから絶対パスで取れ、その
+    /// ドライブの種類が読める。UNC は OS に尋ねずにネットワーク、ドライブ文字で始まらない
+    /// パスは理由を返す。
+    #[test]
+    fn local_app_data_and_drive_kind_resolve() {
+        let local = local_app_data().unwrap();
+        assert!(local.is_absolute(), "{local:?}");
+        drive_kind(&local).unwrap();
+        assert_eq!(
+            drive_kind(std::path::Path::new(r"\\server\share\dir")),
+            Ok(DriveKind::Network)
+        );
+        assert!(drive_kind(std::path::Path::new(r"relative\dir")).is_err());
     }
 
     /// 読むだけ: 無い値は `None`、ある値（`Path` は必ずある）は読める（`RRF_NOEXPAND` で

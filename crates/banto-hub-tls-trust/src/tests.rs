@@ -456,3 +456,5 @@ fn root_dacl_problems_do_not_trust_anyone_without_elevated() {
     assert!(!root_dacl_problems(&security, None).is_empty());
     assert!(root_dacl_problems(&security, Some(EVIL)).is_empty());
 }
+
+mod user;

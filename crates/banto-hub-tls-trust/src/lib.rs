@@ -59,16 +59,55 @@
 //! 対処の文言は呼ぶ側が決める（Hub は「Hub のサービスを再起動」、クライアントは自分の言い方）。
 //! 理由の文言は Hub のサービスログの文言そのもの（移す前と同じ）。
 //!
+//! ## 利用者ごとの置き場（#1121 PR1a、2026-11-14 オーナー決定）
+//!
+//! Hub のデスクトップ版は LocalSystem でも管理者でもないので、`%ProgramData%\BantoHub\tls\` を
+//! 作れない。デスクトップ版は**利用者ごとの置き場**の鍵と証明書で 8723 を待ち受け、ChronoGazer
+//! はサービスの置き場と利用者の置き場の両方を pin として読む（docs/hub-desktop-tls-design.md
+//! §4.1・§4.4）。その置き場と確かめが `user` モジュール:
+//!
+//! - **差し替えの口は 1 つ**（[`UserTlsPlace`]）。4 つの置き場（[`UserPlaceKind`]: `tls\`・
+//!   失効の記録 A・B・記録のロックファイル）それぞれについて、パス・期待する所有者・確かめの
+//!   方針（[`UserPlaceSpec`]）を返す。パスを決め打ちするのは既定の実装
+//!   [`DefaultUserTlsPlace`]（`%LOCALAPPDATA%\BantoHub\tls\`・`…\BantoHub\revocations\`・
+//!   `%LOCALAPPDATA%\BantoHubRevocations\`・`%LOCALAPPDATA%\BantoHubRevocations.lock`）だけ。
+//!   Store 版のフォーク（MSIX では `%LOCALAPPDATA%` がパッケージごとの場所へ振り向けられ、
+//!   publisher cache folder は所有者・ACL が違いうる）はこの trait を差し替える。
+//! - **`%LOCALAPPDATA%` は環境変数ではなく既知のフォルダ**（`FOLDERID_LocalAppData`）から取る
+//!   （[`UserTlsOps::local_app_data`]）。理由は ProgramData と同じで、環境変数で別の場所へ
+//!   向けられないようにするため。
+//! - **信頼する相手は 3 者**: 今のプロセスのトークンの利用者（[`UserPlaceSpec::owners`]）・
+//!   SYSTEM・Administrators。サービスの置き場と違い、利用者本人を信頼する（置き場は本人の
+//!   もの。守る相手は**別のアカウント**）。
+//! - **確かめ**（[`open_user_place`]）: 起点（`%LOCALAPPDATA%`）を辿らずに開き、その下は親の
+//!   ハンドル基準で 1 要素ずつ開いて、起点から置き場までの**すべてのフォルダ**で、reparse
+//!   point でないこと・本当のパスが期待と同じ場所であること・所有者が 3 者のどれかであること・
+//!   3 者以外に書き込み・削除・`WRITE_DAC`・`WRITE_OWNER` の許可が無いこと
+//!   （[`user_place_problems`]）を見る。起点は、既知のフォルダの値と一致することと、本当の
+//!   パスがローカルの固定ドライブにあること（フォルダの転送を断る）も見る。`%LOCALAPPDATA%` の
+//!   既定の ACL（利用者・SYSTEM・Administrators だけ）なら、何もしなくても通る。
+//! - **「無い」と「あるが通らない」を分ける**: デスクトップ版を動かしていない利用者では置き場が
+//!   無いのが普通なので、無いのは [`UserPlaceState::Absent`]・[`UserCertPin::Absent`]、通らない
+//!   のは [`UserPlaceProblem`]（理由と対処の種類 [`UserRemedy`]）で返す。
+//! - **読む入口**は [`load_pinned_user_cert`]（ChronoGazer 用）。サービスの置き場と違って
+//!   **鍵の露出も確かめる**（鍵は同じ利用者のものなので開ける。3 者以外が読めれば通さない。
+//!   中身は読まない）。
+//! - **この crate は書かない**。作る・作り直すのは Hub の core（PR2）で、[`open_user_place`] が
+//!   返す確かめ済みのハンドル（[`CheckedUserPlace`]・[`MissingUserPlace`]）を基準に書く。失効の
+//!   記録の読み書きと整える手順（§4.4.1）は PR1b で足す（ここにあるのは置き場と確かめだけ）。
+//!
 //! ## テスト
 //!
-//! OS を触る操作はすべて [`TlsTrustOps`]（Windows の実装は `win::WindowsTlsTrustOps`）を通す
-//! ので、確かめの順序と断る分岐は偽物で全 OS で確かめる（`tests.rs`）。Hub 側の同じ手順の
-//! 表は banto-hub-core の `hub_tls_prepare/tests/load.rs` にある。
+//! OS を触る操作はすべて [`TlsTrustOps`]・[`UserTlsOps`]（Windows の実装は
+//! `win::WindowsTlsTrustOps`）を通すので、確かめの順序と断る分岐は偽物で全 OS で確かめる
+//! （`tests.rs`、利用者ごとの置き場は `tests/user.rs`）。Hub 側の同じ手順の表は banto-hub-core の
+//! `hub_tls_prepare/tests/load.rs` にある。
 
 mod dacl;
 mod ops;
 mod place;
 pub mod text;
+mod user;
 #[cfg(windows)]
 pub mod win;
 
@@ -77,6 +116,13 @@ pub use ops::{FileOpenError, TlsDir, TlsFile, TlsTrustOps};
 pub use place::{
     check_cert_exposure, load_pinned_hub_cert, open_checked_file, open_place,
     parse_single_certificate, read_checked, CheckedPlace, HubCertPin, Remedy, Unavailable,
+};
+pub use user::{
+    check_place_layout, check_spec, load_pinned_user_cert, open_user_file, open_user_place,
+    user_place_problems, CheckedUserPlace, DefaultUserTlsPlace, MissingUserPlace, UserCertPin,
+    UserFileRole, UserPlaceKind, UserPlacePolicy, UserPlaceProblem, UserPlaceSpec, UserPlaceState,
+    UserRemedy, UserTlsOps, UserTlsPlace, USER_ANCHOR_LABEL, USER_PLACE_OTHERS_READ_MASK,
+    USER_REVOCATIONS_A_DIR, USER_REVOCATIONS_B_DIR, USER_REVOCATIONS_LOCK_FILE,
 };
 
 /// ProgramData の下の製品のフォルダ（Hub のルート）。
