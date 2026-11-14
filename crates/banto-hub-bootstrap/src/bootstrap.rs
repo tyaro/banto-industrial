@@ -1955,4 +1955,97 @@ mod tests {
             Some(SQUAT_KEY)
         );
     }
+
+    fn relay_addr(hub: &MockHub) -> std::net::SocketAddr {
+        hub.endpoint()
+            .strip_prefix("http://")
+            .unwrap()
+            .parse::<std::net::SocketAddr>()
+            .unwrap()
+    }
+
+    fn squat_modes(squatter: &TestIdentity) -> [Mode; 2] {
+        [Mode::SquatTls(squatter.server_config()), Mode::SquatPlain]
+    }
+
+    fn assert_squatter_got_nothing(port: &SwitchPort) {
+        port.assert_squat_secret_absent(SQUAT_KEY);
+        assert_eq!(port.squat_tls_handshakes(), 0);
+        assert!(port.squat_tls_bytes().is_empty());
+        let plain = String::from_utf8_lossy(&port.squat_bytes()).to_ascii_lowercase();
+        assert!(
+            !plain.contains("http/1.") && !plain.contains("authorization"),
+            "{plain}"
+        );
+    }
+
+    /// 1 回の `connect()` の途中（鍵なしの確認に本物が答えた直後）でポートが先取りされる。
+    /// 以後の要求（グラントの取得・発行・鍵つきの検証）は 1 つも先取り側へ届かない。
+    #[tokio::test]
+    async fn a_swap_inside_one_connect_after_the_status_check_sends_nothing_to_the_squatter() {
+        let identity = TestIdentity::generate();
+        let squatter = TestIdentity::generate();
+        for then in squat_modes(&squatter) {
+            let hub = MockHub::start(squat_routes());
+            let port = SwitchPort::start().await;
+            let keys = Arc::new(MemoryKeyStore::new());
+            let state = Arc::new(MemoryState::new());
+            let bootstrapper = pinned_to(&identity, &keys, &state);
+            // 1 本目（確認）だけ本物へ中継し、その返事をクライアントへ流す前に切り替える。
+            port.set(Mode::RelayThen {
+                backend: relay_addr(&hub),
+                tls: Some(identity.server_config()),
+                then: Box::new(then),
+            });
+
+            let connection = bootstrapper.connect(&port.https_url()).await.unwrap();
+            assert_eq!(
+                connection.status,
+                HubStatus::unreachable(UnreachableCause::Transport)
+            );
+            // 本物が見たのは鍵なしの確認 1 本だけ。グラントも発行も届いていない。
+            assert_eq!(hub.routes_seen(), vec![STATUS_ROUTE.to_string()]);
+            assert!(hub.seen().iter().all(|req| req.authorization.is_none()));
+            assert_eq!(port.accepts(ModeKind::Relay), 1);
+            assert_squatter_got_nothing(&port);
+            assert!(state.load().unwrap().is_none());
+            assert!(keys.get(&squat_account(&port)).unwrap().is_none());
+        }
+    }
+
+    /// 保存済みの鍵が本物に断られた（401）直後に先取りされる。鍵つきの再確認
+    /// （`probe_tags_status`）と、そのあとの再発行の経路が先取り側へ鍵を運ばない。
+    #[tokio::test]
+    async fn a_swap_right_after_a_rejected_stored_key_does_not_resend_it_to_the_squatter() {
+        let identity = TestIdentity::generate();
+        let squatter = TestIdentity::generate();
+        for then in squat_modes(&squatter) {
+            let hub = MockHub::start(routes(vec![(TAGS_ROUTE, vec![(401, "{}".to_string())])]));
+            let port = SwitchPort::start().await;
+            let keys = Arc::new(MemoryKeyStore::new());
+            let state = Arc::new(MemoryState::new());
+            keys.set(&squat_account(&port), SQUAT_KEY).unwrap();
+            let bootstrapper = pinned_to(&identity, &keys, &state);
+            port.set(Mode::RelayThen {
+                backend: relay_addr(&hub),
+                tls: Some(identity.server_config()),
+                then: Box::new(then),
+            });
+
+            let connection = bootstrapper.connect(&port.https_url()).await.unwrap();
+            assert_eq!(
+                connection.status,
+                HubStatus::unreachable(UnreachableCause::Transport)
+            );
+            // 本物に着いたのは最初の鍵つきの 1 本だけ（そこで断られた）。
+            assert_eq!(hub.routes_seen(), vec![TAGS_ROUTE.to_string()]);
+            assert_eq!(port.accepts(ModeKind::Relay), 1);
+            assert_squatter_got_nothing(&port);
+            assert_eq!(
+                keys.get(&squat_account(&port)).unwrap().as_deref(),
+                Some(SQUAT_KEY),
+                "an unreachable Hub must not cost the stored key"
+            );
+        }
+    }
 }

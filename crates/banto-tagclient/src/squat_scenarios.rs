@@ -20,7 +20,7 @@ use tokio::task::AbortHandle;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 
-use crate::{Endpoint, PinnedHubTls, RestClient, SecretApiKey};
+use crate::{BindingRequest, Endpoint, PinnedHubTls, RestClient, SecretApiKey};
 
 const DUMMY_KEY: &str = "bh_squatdummy.6f1c2a9e0d4b7381";
 const CATALOG: &str = r#"{"revision":1,"run_id":2,"collection_mode":"configured","tags":[]}"#;
@@ -68,6 +68,20 @@ impl BackendHub {
 
     fn set_redirect(&self, status: u16, location: &str) {
         *self.redirect.lock().unwrap() = Some((status, location.to_owned()));
+    }
+
+    /// ダミーのキーを Bearer に載せた WebSocket の握手を受けた回数。
+    fn websocket_upgrades(&self) -> usize {
+        let needle = format!("Bearer {DUMMY_KEY}").to_ascii_lowercase();
+        self.heads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|head| {
+                let lower = head.to_ascii_lowercase();
+                lower.contains("upgrade: websocket") && lower.contains(&needle)
+            })
+            .count()
     }
 
     fn requests(&self) -> usize {
@@ -121,6 +135,21 @@ async fn serve(
         heads.lock().unwrap().push(head.clone());
         let lower = head.to_ascii_lowercase();
         if lower.contains("upgrade: websocket") {
+            // リダイレクトを設定してある間は、WebSocket の握手にも同じ向き先を返す。
+            let configured = redirect.lock().unwrap().clone();
+            if let Some((status, location)) = configured {
+                let response = format!(
+                    "HTTP/1.1 {status} Redirect
+Location: {location}
+Content-Length: 0
+
+"
+                );
+                if stream.write_all(response.as_bytes()).await.is_err() {
+                    return;
+                }
+                continue;
+            }
             let key = head
                 .lines()
                 .find_map(|line| {
@@ -387,6 +416,10 @@ async fn a_redirect_from_the_hub_is_never_followed_to_another_listener() {
                 !catalog_ok(&client).await,
                 "{status} to {location} must be an error"
             );
+            assert!(
+                !stream_ok(&client).await,
+                "WebSocket {status} to {location} must be an error"
+            );
         }
     }
 
@@ -396,4 +429,70 @@ async fn a_redirect_from_the_hub_is_never_followed_to_another_listener() {
     plain_target.assert_secret_absent(DUMMY_KEY);
     tls_target.assert_secret_absent(DUMMY_KEY);
     plain_target_2.assert_secret_absent(DUMMY_KEY);
+}
+
+/// 監視役（ワーカー）が自分で張り直す経路。つないでいた WebSocket が先取りで切れても、
+/// 自動の再接続は先取り側へキーを運ばず、本物が戻れば手を加えずに回復する。
+#[tokio::test]
+async fn the_worker_reconnects_by_itself_never_to_a_squatter_and_recovers_on_the_real_hub() {
+    let identity_a = TestIdentity::generate();
+    let squatter = TestIdentity::generate();
+    let hub = BackendHub::start(&identity_a).await;
+    let port = SwitchPort::start().await;
+    // `start` はクライアントを消費する。台帳が空でもワーカーは WebSocket を開く。
+    let handle = client(&port.https_url(), &[&identity_a])
+        .start(vec![BindingRequest {
+            binding_key: "a".to_owned(),
+            external_name: "line1.tag".to_owned(),
+        }])
+        .unwrap();
+    port.set(Mode::Relay(hub.addr));
+
+    async fn wait_for(what: &str, limit: Duration, mut done: impl FnMut() -> bool) {
+        let waited = tokio::time::timeout(limit, async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "timed out waiting for {what}");
+    }
+
+    wait_for(
+        "the first WebSocket upgrade",
+        Duration::from_secs(10),
+        || hub.websocket_upgrades() >= 1,
+    )
+    .await;
+    let delivered = hub.websocket_upgrades();
+
+    // つながっている WebSocket ごと、別の証明書の TLS に入れ替わる。
+    port.set(Mode::SquatTls(squatter.server_config()));
+    wait_for(
+        "the worker's own reconnects to the squatter",
+        Duration::from_secs(12),
+        || port.accepts(ModeKind::SquatTls) >= 2,
+    )
+    .await;
+    assert_eq!(port.squat_tls_handshakes(), 0, "pin must stop the TLS");
+    port.assert_secret_absent(DUMMY_KEY);
+    assert_no_http_reached(&port);
+    assert_eq!(
+        hub.websocket_upgrades(),
+        delivered,
+        "the real Hub got no new upgrade while squatted"
+    );
+
+    // 本物が戻る。ワーカーが自分で張り直して、新しい握手が本物に届く。
+    port.set(Mode::Relay(hub.addr));
+    wait_for(
+        "the worker to recover by itself",
+        Duration::from_secs(15),
+        || hub.websocket_upgrades() > delivered,
+    )
+    .await;
+    let _ = handle.shutdown().await;
+
+    assert_eq!(port.squat_tls_handshakes(), 0);
+    assert_no_http_reached(&port);
 }
