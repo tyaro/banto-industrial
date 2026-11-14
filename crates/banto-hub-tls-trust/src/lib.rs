@@ -131,8 +131,8 @@
 //!   見た」と「操作が終わらなかった」を分ける。警告の理由（[`RevocationWarning`]）も返す。
 //!   「この回はできなかった」が何周期続いたら止めるかは、呼ぶ側が数える。
 //! - **失効を書き足す口**（[`record_user_revocation`]）は同じ手順で、和に拇印を足して両方に
-//!   書く。露出を見た証明書の拇印は [`load_pinned_user_cert`] の「あるが通らない」
-//!   （[`UnusableUserCert::exposed_thumbprint`]）から取る。
+//!   書く。露出・所有者の違いを見た証明書の拇印は [`load_pinned_user_cert`] の「あるが通らない」
+//!   （[`UnusableUserCert::revocation_thumbprint`]）から取る。
 //! - **書き方**（[`RevocationOps`]。Windows の実装は `win::WindowsTlsTrustOps`、部品は
 //!   `banto_safe_root`）: 置き場を [`open_user_place`] の確かめに通した直後に、**握ったフォルダの
 //!   ハンドル基準**でだけ書く（パスで開き直さない）。記録は「同じフォルダの一時ファイル →

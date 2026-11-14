@@ -501,19 +501,31 @@ impl HubRuntime {
         // #1121 PR2d: env の検証と profile 排他が済んでから、Windows Shell だけは
         // 利用者の TLS を用意する。明示 env（不完全なら既に失敗）・注入済みの組が優先。
         #[cfg(windows)]
-        let tls_config = match crate::hub_tls_prepare::desktop::load_for_shell(
-            host_kind,
-            skip_profile_lock,
-            tls_config.is_some(),
-        ) {
-            Some(Ok(identity)) => Some(TlsPlan::Default(identity)),
-            Some(Err(found)) => {
-                for line in found.log_lines() {
-                    log_err_line(&line);
+        let (tls_config, profile_lock) = {
+            // start の future が drop されても、blocking pool のファイル操作が終わるまでは
+            // closure が排他を保つ。JoinError のときもこちらの握りは残るので TLS 無しで続けられる。
+            let profile_lock = Arc::new(profile_lock);
+            let loaded = crate::hub_tls_prepare::desktop::load_for_shell(
+                host_kind,
+                skip_profile_lock,
+                tls_config.is_some(),
+                profile_lock.clone(),
+            )
+            .await;
+            let profile_lock = Arc::try_unwrap(profile_lock).map_err(|_| {
+                HubStartError::Tls("TLS の準備後に profile の排他を回収できませんでした".into())
+            })?;
+            let tls_config = match loaded {
+                Some(Ok(identity)) => Some(TlsPlan::Default(identity)),
+                Some(Err(found)) => {
+                    for line in found.log_lines() {
+                        log_err_line(&line);
+                    }
+                    None
                 }
-                None
-            }
-            None => tls_config,
+                None => tls_config,
+            };
+            (tls_config, profile_lock)
         };
 
         // #661 661-1・#623 PR2a: 握った組を渡されたときだけ、profile の中の設定 DB は本体・

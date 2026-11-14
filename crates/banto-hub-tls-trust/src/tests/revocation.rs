@@ -723,9 +723,9 @@ fn scene_9_an_exposed_service_certificate_is_recorded_in_the_user_records() {
 }
 
 /// 場面 6・7 の入口: 露出（別のアカウントが鍵を読める・フォルダを書き換えられる）を見た
-/// 読み手は、形だけ読めた証明書の拇印を返す。所有者の違い・壊れは露出ではないので返さない。
+/// 読み手は、形だけ読めた証明書の拇印を返す。所有者の違いも失効に入れ、リンク・壊れ等は入れない。
 #[test]
-fn an_exposed_certificate_yields_its_thumbprint_and_other_faults_do_not() {
+fn exposed_or_foreign_owned_certificates_yield_the_thumbprint_to_revoke() {
     let load = |ops: &FakeRevOps| match load_pinned_user_cert(ops, &ops.place()) {
         UserCertPin::Unusable(found) => found,
         other => panic!("通らないはず: {other:#?}"),
@@ -736,7 +736,7 @@ fn an_exposed_certificate_yields_its_thumbprint_and_other_faults_do_not() {
     ops.loosen_file(&user_tls().join(KEY_FILE));
     let found = load(&ops);
     assert_eq!(found.problem.fault, UserFault::Exposed);
-    assert_eq!(found.exposed_thumbprint(), Some(cert));
+    assert_eq!(found.revocation_thumbprint(), Some(cert));
     assert!(matches!(found.seen, UncheckedUserCert::Seen(_)));
 
     // `tls\` を別のアカウントが書き換えられる（鍵と証明書を差し替えられた恐れ）。
@@ -745,7 +745,7 @@ fn an_exposed_certificate_yields_its_thumbprint_and_other_faults_do_not() {
     ops.loosen_dir(&user_tls());
     let found = load(&ops);
     assert_eq!(found.problem.fault, UserFault::Exposed);
-    assert_eq!(found.exposed_thumbprint(), Some(cert));
+    assert_eq!(found.revocation_thumbprint(), Some(cert));
 
     // null DACL の鍵も露出。
     let ops = FakeRevOps::fresh();
@@ -757,15 +757,16 @@ fn an_exposed_certificate_yields_its_thumbprint_and_other_faults_do_not() {
         .security
         .dacl
         .aces = None;
-    assert_eq!(load(&ops).exposed_thumbprint(), Some(cert));
+    assert_eq!(load(&ops).revocation_thumbprint(), Some(cert));
 
-    // 所有者が違う: 信じないが、露出としては扱わない（形は読める）。
+    // 所有者が違う: 読み取りを足せるので、形が読めれば失効に入れる（PR2 の決定）。
     let ops = FakeRevOps::fresh();
-    ops.put_cert();
+    let cert = ops.put_cert();
     ops.dirs.borrow_mut().get_mut(&user_tls()).unwrap().owner = EVIL.to_string();
     let found = load(&ops);
     assert_eq!(found.problem.fault, UserFault::ForeignOwner);
-    assert_eq!(found.exposed_thumbprint(), None);
+    assert_eq!(found.revocation_thumbprint(), Some(cert));
+    assert_eq!(found.exposed_thumbprint(), Some(cert)); // 既存の API も決定済みの失効方針に揃える。
     assert!(matches!(found.seen, UncheckedUserCert::Seen(_)));
 
     // ハードリンクの鍵: 露出ではない。
@@ -777,7 +778,9 @@ fn an_exposed_certificate_yields_its_thumbprint_and_other_faults_do_not() {
         .unwrap()
         .security
         .links = 2;
-    assert_eq!(load(&ops).problem.fault, UserFault::Untrusted);
+    let found = load(&ops);
+    assert_eq!(found.problem.fault, UserFault::Untrusted);
+    assert_eq!(found.revocation_thumbprint(), None);
 
     // 鍵が無い・証明書が読める形でない: 壊れ。
     let ops = FakeRevOps::fresh();
@@ -785,7 +788,7 @@ fn an_exposed_certificate_yields_its_thumbprint_and_other_faults_do_not() {
     ops.files.borrow_mut().remove(&user_tls().join(KEY_FILE));
     let found = load(&ops);
     assert_eq!(found.problem.fault, UserFault::Broken);
-    assert_eq!(found.exposed_thumbprint(), None);
+    assert_eq!(found.revocation_thumbprint(), None);
     let ops = FakeRevOps::fresh();
     ops.put_cert();
     ops.files
@@ -796,6 +799,7 @@ fn an_exposed_certificate_yields_its_thumbprint_and_other_faults_do_not() {
     let found = load(&ops);
     assert_eq!(found.problem.fault, UserFault::Broken);
     assert_eq!(found.seen, UncheckedUserCert::Malformed);
+    assert_eq!(found.revocation_thumbprint(), None);
 
     // 開けない: 一時的。形も読めない。
     let ops = FakeRevOps::fresh();
@@ -807,6 +811,7 @@ fn an_exposed_certificate_yields_its_thumbprint_and_other_faults_do_not() {
     let found = load(&ops);
     assert_eq!(found.problem.fault, UserFault::Transient);
     assert_eq!(found.seen, UncheckedUserCert::Unreadable);
+    assert_eq!(found.revocation_thumbprint(), None);
 
     // リンクの先は読まない。
     let ops = FakeRevOps::fresh();
@@ -819,6 +824,7 @@ fn an_exposed_certificate_yields_its_thumbprint_and_other_faults_do_not() {
     let found = load(&ops);
     assert_eq!(found.problem.fault, UserFault::Untrusted);
     assert_eq!(found.seen, UncheckedUserCert::Unreadable);
+    assert_eq!(found.revocation_thumbprint(), None);
 }
 
 // --- 整える手順: 和と書き戻し -------------------------------------------------------------

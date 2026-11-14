@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use banto_hub_tls_trust::{
-    RevocationSide, TlsTrustOps, UserPlaceSpec, UserTlsOps, REVOCATIONS_FILE,
+    RevocationSide, TlsTrustOps, UserFault, UserPlaceSpec, UserTlsOps, REVOCATIONS_FILE,
 };
 use banto_safe_root::acl::{inspect_file, ADMINISTRATORS_SID, SYSTEM_SID};
 
@@ -36,7 +36,7 @@ impl Place {
         load_in(&WindowsTlsTrustOps, self, &ReconcileOptions::default(), NOW)
     }
     fn dir(&self) -> CheckedUserPlace<WinTlsDir> {
-        tls_place(&WindowsTlsTrustOps, self).unwrap()
+        tls_place(&WindowsTlsTrustOps, self, &ReconcileOptions::default()).unwrap()
     }
     fn initialize_records(&self) {
         settled(&WindowsTlsTrustOps, self, &ReconcileOptions::default()).unwrap();
@@ -103,6 +103,183 @@ fn configured_tls_test_mode_and_other_hosts_never_load_user_place() {
         assert!(result.is_none());
     }
     assert_eq!(select_default(Shell, false, false, || 8723), Some(8723));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn synchronous_tls_load_runs_off_the_async_worker() {
+    use crate::profile_lock::HubHostKind::Shell;
+    let worker = std::thread::current().id();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let release_task = tokio::spawn(async move {
+        ready.await.unwrap();
+        tokio::task::yield_now().await;
+        release.send(()).unwrap();
+    });
+    let found = load_for_shell_with(Shell, false, false, (), move || {
+        assert_ne!(worker, std::thread::current().id());
+        started.send(()).unwrap();
+        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        Err(unavailable("injected TLS failure"))
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+    release_task.await.unwrap();
+    assert_eq!(found.reason, "injected TLS failure");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocking_loader_panic_becomes_tls_unavailable_without_releasing_profile_guard() {
+    use crate::profile_lock::HubHostKind::{Console, Service, Shell};
+    let keep_alive = std::sync::Arc::new(None::<crate::profile_lock::ProfileLockGuard>);
+    for (host, skip, configured) in [
+        (Shell, true, false),
+        (Shell, false, true),
+        (Console, false, false),
+        (Service, false, false),
+    ] {
+        assert!(
+            load_for_shell_with(host, skip, configured, keep_alive.clone(), || panic!(
+                "must not load"
+            ))
+            .await
+            .is_none()
+        );
+        assert_eq!(std::sync::Arc::strong_count(&keep_alive), 1);
+    }
+    let found = load_for_shell_with(Shell, false, false, keep_alive.clone(), || {
+        panic!("private panic payload")
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(std::sync::Arc::strong_count(&keep_alive), 1);
+    assert!(found.reason.contains("準備タスクが異常終了"));
+    let lines = found.log_lines().join("\n");
+    assert!(lines.contains("TLS 無しで起動"));
+    assert!(!lines.contains("private panic payload"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelling_the_start_wait_keeps_the_real_profile_locked_until_load_finishes() {
+    use crate::profile_lock::{try_acquire_profile_lock, HubHostKind::Shell};
+    let fixture = Fixture::new();
+    let profile = format!(
+        "tls-cancel-{}-{}",
+        std::process::id(),
+        NONCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let paths = crate::profile_paths::resolve_profile_paths(&fixture.0 .0, &profile).unwrap();
+    let guard = std::sync::Arc::new(Some(try_acquire_profile_lock(&paths, Shell).unwrap()));
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let pending = tokio::spawn(load_for_shell_with(
+        Shell,
+        false,
+        false,
+        guard.clone(),
+        move || {
+            started.send(()).unwrap();
+            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            Err(unavailable("test finished"))
+        },
+    ));
+    drop(guard);
+    ready.await.unwrap();
+    pending.abort();
+    assert!(pending.await.unwrap_err().is_cancelled());
+    assert!(
+        try_acquire_profile_lock(&paths, Shell).is_err(),
+        "blocking load が終わる前に排他を離さない"
+    );
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(again) = try_acquire_profile_lock(&paths, Shell) {
+            drop(again);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "blocking load 終了後は排他が返る"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[test]
+fn unavailable_remedy_explains_safe_recreation_without_deleting_revocations() {
+    let found = unavailable("broken pair");
+    let close = found.remedy.find("Hub を閉じ").unwrap();
+    let inspect = found.remedy.find("中身を確認").unwrap();
+    let delete = found.remedy.find("フォルダごと削除").unwrap();
+    let restart = found.remedy.find("再起動").unwrap();
+    assert!(close < inspect && inspect < delete && delete < restart);
+    assert!(found.remedy.contains(r"%LOCALAPPDATA%\BantoHub\tls"));
+    assert!(found.remedy.contains("親の置き場"));
+    assert!(found.remedy.contains("失効の記録は消さない"));
+}
+
+#[test]
+fn file_and_place_faults_use_the_callers_revocation_lock_options() {
+    for place_fault in [false, true] {
+        let fixture = Fixture::new();
+        let place = &fixture.0;
+        place.load().unwrap();
+        let spec = place.spec(UserPlaceKind::RevocationsLock);
+        let parent = WindowsTlsTrustOps
+            .pin_dir(&spec.dir_path())
+            .unwrap()
+            .unwrap();
+        let held = WindowsTlsTrustOps
+            .open_child_file_exclusive(&parent, spec.file.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+        let options = ReconcileOptions {
+            lock_wait: Duration::from_millis(70),
+            lock_poll: Duration::from_millis(5),
+        };
+        let reason = if place_fault {
+            acl(&place.tls(), &["/grant", "*S-1-1-0:(OI)(CI)(M)"]);
+            let started = Instant::now();
+            let reason = match tls_place(&WindowsTlsTrustOps, place, &options) {
+                Ok(_) => panic!("通らない置き場"),
+                Err(reason) => reason,
+            };
+            assert!(
+                started.elapsed() >= options.lock_wait
+                    && started.elapsed() < Duration::from_secs(2)
+            );
+            reason
+        } else {
+            acl(
+                &place.tls().join(KEY_FILE),
+                &["/grant", "*S-1-5-32-545:(R)"],
+            );
+            let dir = place.dir();
+            let started = Instant::now();
+            let reason = match checked_file(
+                &WindowsTlsTrustOps,
+                place,
+                &options,
+                &dir,
+                KEY_FILE,
+                UserFileRole::Secret,
+            ) {
+                Ok(_) => panic!("通らない鍵"),
+                Err(reason) => reason,
+            };
+            assert!(
+                started.elapsed() >= options.lock_wait
+                    && started.elapsed() < Duration::from_secs(2)
+            );
+            reason
+        };
+        assert!(reason.contains("失効の記録に残せませんでした"), "{reason}");
+        drop(held);
+        drop(parent);
+    }
 }
 
 #[test]
@@ -365,6 +542,7 @@ fn owner_fault_revokes_but_other_untrusted_faults_do_not() {
         problem(
             &WindowsTlsTrustOps,
             place,
+            &ReconcileOptions::default(),
             UserPlaceProblem {
                 reason: "test fault".into(),
                 remedy: banto_hub_tls_trust::UserRemedy::Renew,

@@ -13,8 +13,8 @@ use banto_hub_tls_trust::{
     check_place_layout, open_user_file, open_user_place, peek_user_cert, read_user_revocations,
     reconcile_user_revocations, record_user_revocation, user_place_problems, CertThumbprint,
     CheckedUserPlace, DefaultUserTlsPlace, FileOpenError, ReconcileOptions, ReconcileOutcome,
-    RevocationOps, RevokedCertPlace, TlsFile, UncheckedUserCert, UserFault, UserFileRole,
-    UserPlaceKind, UserPlaceProblem, UserPlaceState, UserTlsPlace, DEFAULT_LOCK_POLL,
+    RevocationOps, RevokedCertPlace, TlsFile, UncheckedUserCert, UserFileRole, UserPlaceKind,
+    UserPlaceProblem, UserPlaceState, UserTlsPlace, DEFAULT_LOCK_POLL,
 };
 use banto_safe_root::acl::PinnedFile;
 use banto_safe_root::guard::paths_match;
@@ -32,23 +32,59 @@ const CREATING_CONTENTS: &[u8] = b"banto-hub-tls-creating 1\n";
 fn unavailable(reason: impl Into<String>) -> DefaultTlsUnavailable {
     DefaultTlsUnavailable {
         reason: reason.into(),
-        remedy: "利用者の TLS の置き場・失効の記録の所有者とアクセス許可、ログの理由を確かめてから Hub のデスクトップ版を再起動してください。壊れた組や失効した証明書は自動では作り直しません".into(),
+        remedy: "Hub を閉じ、ログの理由と TLS・失効の記録の置き場の所有者・アクセス許可を確かめてください。TLS の組が壊れた・失効した場合は、利用者の TLS フォルダ（既定は %LOCALAPPDATA%\\BantoHub\\tls）だけを、中身を確認してフォルダごと削除し、Hub のデスクトップ版を再起動してください。親の置き場の所有者・アクセス許可が異常なら先に直してください。失効の記録は消さないでください".into(),
     }
 }
 
 /// env の検証・profile 排他の取得後に runtime が呼ぶ。既存の TLS 設定があるとき、
 /// Shell 以外、テスト専用の profile 排他を省くときは、利用者の置き場を一切触らない。
-pub fn load_for_shell(
+/// 同期 I/O・ロック待ち・鍵の作成は blocking pool で行い、終了まで `keep_alive` を持つ。
+pub async fn load_for_shell(
     host: crate::profile_lock::HubHostKind,
     skip_profile_lock: bool,
     tls_configured: bool,
+    keep_alive: std::sync::Arc<Option<crate::profile_lock::ProfileLockGuard>>,
 ) -> Option<Result<DefaultHubTls, DefaultTlsUnavailable>> {
-    select_default(
+    load_for_shell_with(
         host,
         skip_profile_lock,
         tls_configured,
+        keep_alive,
         load_desktop_identity,
     )
+    .await
+}
+
+async fn load_for_shell_with<G, F>(
+    host: crate::profile_lock::HubHostKind,
+    skip_profile_lock: bool,
+    tls_configured: bool,
+    keep_alive: G,
+    load: F,
+) -> Option<Result<DefaultHubTls, DefaultTlsUnavailable>>
+where
+    G: Send + 'static,
+    F: FnOnce() -> Result<DefaultHubTls, DefaultTlsUnavailable> + Send + 'static,
+{
+    let task = select_default(host, skip_profile_lock, tls_configured, || {
+        tokio::task::spawn_blocking(move || {
+            // await 側がキャンセルされても、ファイル操作の終了まで profile の排他を保つ。
+            let result = load();
+            drop(keep_alive);
+            result
+        })
+    })?;
+    Some(task.await.unwrap_or_else(|error| {
+        // panic の payload は鍵などを含む可能性があるのでログへ展開しない。
+        let reason = if error.is_panic() {
+            "パニック"
+        } else {
+            "キャンセル"
+        };
+        Err(unavailable(format!(
+            "デスクトップ版の TLS の準備タスクが異常終了しました（{reason}）"
+        )))
+    }))
 }
 
 fn select_default<T>(
@@ -83,15 +119,16 @@ fn now_unix() -> i64 {
 fn problem<P: UserTlsPlace + ?Sized>(
     ops: &WindowsTlsTrustOps,
     place: &P,
+    options: &ReconcileOptions,
     found: UserPlaceProblem,
 ) -> String {
     let mut reason = found.reason;
-    if matches!(found.fault, UserFault::Exposed | UserFault::ForeignOwner) {
+    if found.fault.revokes() {
         if let UncheckedUserCert::Seen(seen) = peek_user_cert(ops, place) {
             let report = record_user_revocation(
                 ops,
                 place,
-                &ReconcileOptions::default(),
+                options,
                 seen.thumbprint,
                 RevokedCertPlace::User,
             );
@@ -108,11 +145,12 @@ fn problem<P: UserTlsPlace + ?Sized>(
 fn tls_place<P: UserTlsPlace + ?Sized>(
     ops: &WindowsTlsTrustOps,
     place: &P,
+    options: &ReconcileOptions,
 ) -> Result<CheckedUserPlace<WinTlsDir>, String> {
     // 作った直後も起点から読み直す。既存のフォルダの DACL は書き換えない。
     for _ in 0..16 {
         match open_user_place(ops, place, UserPlaceKind::Tls)
-            .map_err(|found| problem(ops, place, found))?
+            .map_err(|found| problem(ops, place, options, found))?
         {
             UserPlaceState::Present(dir) => return Ok(dir),
             UserPlaceState::Absent(missing) => {
@@ -134,11 +172,12 @@ fn tls_place<P: UserTlsPlace + ?Sized>(
 fn checked_file<P: UserTlsPlace + ?Sized>(
     ops: &WindowsTlsTrustOps,
     place: &P,
+    options: &ReconcileOptions,
     dir: &CheckedUserPlace<WinTlsDir>,
     name: &str,
     role: UserFileRole,
 ) -> Result<Option<PinnedFile>, String> {
-    open_user_file(ops, dir, name, name, role).map_err(|found| problem(ops, place, found))
+    open_user_file(ops, dir, name, name, role).map_err(|found| problem(ops, place, options, found))
 }
 
 fn create(dir: &WinTlsDir, name: &str, bytes: &[u8]) -> Result<(), String> {
@@ -225,11 +264,12 @@ type PairBytes = (Option<Vec<u8>>, Option<Zeroizing<Vec<u8>>>);
 fn read_pair<P: UserTlsPlace + ?Sized>(
     ops: &WindowsTlsTrustOps,
     place: &P,
+    options: &ReconcileOptions,
     dir: &CheckedUserPlace<WinTlsDir>,
 ) -> Result<PairBytes, String> {
     // 両方のハンドルを握ってから読む。ACL やリンクの問題は作成中でも復旧しない。
-    let mut cert = checked_file(ops, place, dir, CERT_FILE, UserFileRole::Public)?;
-    let mut key = checked_file(ops, place, dir, KEY_FILE, UserFileRole::Secret)?;
+    let mut cert = checked_file(ops, place, options, dir, CERT_FILE, UserFileRole::Public)?;
+    let mut key = checked_file(ops, place, options, dir, KEY_FILE, UserFileRole::Secret)?;
     let cert = cert
         .as_mut()
         .map(|file| TlsFile::read_all(file, MAX_PEM_BYTES))
@@ -276,10 +316,10 @@ fn load_in<P: UserTlsPlace + ?Sized>(
     now: i64,
 ) -> Result<DefaultHubTls, String> {
     check_place_layout(place)?;
-    let dir = tls_place(ops, place)?;
+    let dir = tls_place(ops, place, options)?;
     let _lock = lock(ops, &dir, options.lock_wait)?;
     settled(ops, place, options)?;
-    let marker = checked_file(ops, place, &dir, CREATING, UserFileRole::Public)?;
+    let marker = checked_file(ops, place, options, &dir, CREATING, UserFileRole::Public)?;
     let creating = if let Some(mut marker) = marker {
         if TlsFile::read_all(&mut marker, 128).map_err(|error| error.to_string())?
             != CREATING_CONTENTS
@@ -290,12 +330,14 @@ fn load_in<P: UserTlsPlace + ?Sized>(
     } else {
         false
     };
-    let (cert, key) = read_pair(ops, place, &dir)?;
+    let (cert, key) = read_pair(ops, place, options, &dir)?;
     let complete = matches!((&cert, &key), (Some(cert), Some(key)) if pair_matches(cert, key));
     // 印が無い一時ファイルを「前の作りかけ」と決めつけない。完全な組を使う場合も、
     // 印を片付ける前に一時ファイルの種類・所有者・ACL を確かめる。
     for name in [KEY_TEMP, CERT_TEMP] {
-        if checked_file(ops, place, &dir, name, UserFileRole::Secret)?.is_some() && !creating {
+        if checked_file(ops, place, options, &dir, name, UserFileRole::Secret)?.is_some()
+            && !creating
+        {
             return Err("TLS の一時ファイルが残っていますが、作成中の印がありません".into());
         }
     }
@@ -323,7 +365,7 @@ fn load_in<P: UserTlsPlace + ?Sized>(
             }
         }
     }
-    let (cert, key) = read_pair(ops, place, &dir)?;
+    let (cert, key) = read_pair(ops, place, options, &dir)?;
     let cert = cert.ok_or("TLS の証明書がありません")?;
     let key = key.ok_or("TLS の鍵がありません")?;
     let identity = DefaultHubTls::from_checked_pem(
