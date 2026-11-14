@@ -139,15 +139,7 @@ async fn serve(
             let configured = redirect.lock().unwrap().clone();
             if let Some((status, location)) = configured {
                 let response = format!(
-                    "HTTP/1.1 {status} Redirect
-
-Location: {location}
-
-Content-Length: 0
-
-
-
-"
+                    "HTTP/1.1 {status} Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
                 );
                 if stream.write_all(response.as_bytes()).await.is_err() {
                     return;
