@@ -1674,9 +1674,10 @@ fn scene_26_refuses_an_untrusted_record_place_even_with_renew() {
     }
 }
 
-/// 前回の途中で残った記録の一時ファイルは、名前付き mutex を持っている間に片付ける（読まない）。
+/// 記録が健全なときは、記録の一時ファイルを片付けない（起動中のサービスの Hub が作っている
+/// 最中かもしれない。片付けるのは壊れた記録を作り直すときだけ。#1132 の Codex CLI の指摘）。
 #[test]
-fn removes_leftover_record_temporaries_while_holding_the_lock() {
+fn keeps_record_temporaries_when_the_record_is_healthy() {
     let (ops, _identity) = FakeOps::with_identity();
     let temp = records().join(".revocations.txt.tmp-0000abcd");
     ops.files
@@ -1684,15 +1685,8 @@ fn removes_leftover_record_temporaries_while_holding_the_lock() {
         .insert(temp.clone(), FileEntry::with(FileAcl::UsersRead, b"half"));
     let (result, lines) = run(&ops, false);
     assert_eq!(result, Ok(()), "{lines:#?}");
-    assert_eq!(
-        ops.writes(),
-        vec!["WRITE tidy .revocations.txt.tmp-0000abcd"]
-    );
-    assert!(!ops.files.borrow().contains_key(&temp));
-    let calls = ops.calls();
-    let tidy = calls.iter().position(|c| c.contains("tidy")).unwrap();
-    let lock = calls.iter().position(|c| c == "lock").unwrap();
-    assert!(lock < tidy, "{calls:#?}");
+    assert_eq!(ops.writes(), Vec::<String>::new());
+    assert!(ops.files.borrow().contains_key(&temp));
 }
 
 /// 記録を作れない（I/O）ときは、鍵と証明書を作らずに止める。

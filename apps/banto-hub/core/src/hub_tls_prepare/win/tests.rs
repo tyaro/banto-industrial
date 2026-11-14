@@ -497,10 +497,10 @@ fn creates_and_rebuilds_the_service_record_and_the_hub_checks_it() {
     assert!(check_record().contains(&old));
     let loaded = load_default_identity(&f.ops).unwrap();
     assert!(!check_record().contains(&CertThumbprint::of_pem(loaded.cert_pem()).unwrap()));
-    // 残った一時ファイルは、次の elev が片付ける。
+    // 記録が健全なら、一時ファイルは片付けない（サービスの Hub が作っている最中かもしれない）。
     let temp = records.join(format!(".{REVOCATIONS_FILE}.tmp-0000abcd"));
     std::fs::write(&temp, b"half").unwrap();
     let (result, lines) = run(&f.ops, false);
     assert_eq!(result, Ok(()), "{lines:#?}");
-    assert!(!temp.exists(), "{lines:#?}");
+    assert!(temp.exists(), "{lines:#?}");
 }

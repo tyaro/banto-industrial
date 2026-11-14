@@ -544,7 +544,8 @@ pub fn rewrite_service_revocations<O: ServiceRevocationOps>(
     Ok(record)
 }
 
-/// 残った一時ファイルを片付ける（elev が名前付き mutex を持っている間だけ呼ぶ。失敗は無視する）。
+/// 残った一時ファイルを片付ける（失敗は無視する）。ほかの書き手が作っている最中の一時ファイルも
+/// 消しうるので、記録を置き換えで作り直す直前にだけ呼ぶ（[`rewrite_service_revocations`] が呼ぶ）。
 pub fn remove_stale_service_revocation_temps<O: ServiceRevocationOps>(
     ops: &O,
     dir: &ServiceRevocationsDir<O::Dir>,

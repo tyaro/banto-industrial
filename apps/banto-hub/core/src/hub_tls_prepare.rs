@@ -86,8 +86,9 @@
 //! - 記録のためのロックは足さない。この実行全体は名前付き mutex（[`LOCK_NAME`]）で直列なので
 //!   「`tls\` → 記録」の順は満たされ、サービスの Hub が起動のときに記録を作るのは「置き換えずに
 //!   作る」だけなので、ここで作り直した記録を上書きしない（共有 crate の
-//!   `service_revocation` の module doc「書き方とロック」）。残った一時ファイルは、mutex を
-//!   持っている間にここで片付ける。
+//!   `service_revocation` の module doc「書き方とロック」）。残った一時ファイルは、壊れた
+//!   記録を作り直すときだけ片付ける（記録が無い・健全なときは、起動中のサービスの Hub が作って
+//!   いる一時ファイルを消しうるので触らない。#1132 の Codex CLI の指摘）。
 //!
 //! ## 出力・終了コード
 //!
@@ -124,10 +125,9 @@ use crate::sink_config_prepare::{
 use banto_hub_tls_trust::text::reasons_text;
 use banto_hub_tls_trust::{
     create_service_revocations_if_absent, open_or_create_service_revocations_dir,
-    read_service_revocations_in, remove_stale_service_revocation_temps,
-    rewrite_service_revocations, CertThumbprint, RevocationRecord, RevokedCert, RevokedCertPlace,
-    ServiceRevocationFault, ServiceRevocationProblem, ServiceRevocations, ServiceRoot, ROOT_LABEL,
-    SERVICE_REVOCATIONS_LABEL, TLS_LABEL,
+    read_service_revocations_in, rewrite_service_revocations, CertThumbprint, RevocationRecord,
+    RevokedCert, RevokedCertPlace, ServiceRevocationFault, ServiceRevocationProblem,
+    ServiceRevocations, ServiceRoot, ROOT_LABEL, SERVICE_REVOCATIONS_LABEL, TLS_LABEL,
 };
 pub use banto_hub_tls_trust::{
     root_dacl_problems, ServiceRevocationOps, TlsDir, TlsFile, TlsTrustOps, CERT_FILE, KEY_FILE,
@@ -971,9 +971,10 @@ fn run<O: HubTlsOps>(
             record_dir_path.display()
         )));
     }
-    // サービスの失効の記録は、鍵と証明書を作る・作り直す**前に**整える（場面 11）。前回の途中で
-    // 残った一時ファイルは、名前付き mutex を持っている間に片付ける。
-    remove_stale_service_revocation_temps(ops, &record_dir);
+    // サービスの失効の記録は、鍵と証明書を作る・作り直す**前に**整える（場面 11）。残った一時
+    // ファイルは、壊れた記録を置き換えで作り直すとき（`rewrite_service_revocations`）だけ片付ける。
+    // 名前付き mutex は elev どうししか直列化しないので、記録が無い・健全なときに片付けると、
+    // 起動中のサービスの Hub が作っている一時ファイルを消しうる（#1132 の Codex CLI の指摘）。
     let record_path = record_dir.record_path();
     match record_plan {
         RecordPlan::Keep(_) => {}
