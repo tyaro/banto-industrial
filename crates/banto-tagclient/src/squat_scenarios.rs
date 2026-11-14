@@ -20,7 +20,7 @@ use tokio::task::AbortHandle;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 
-use crate::{BindingRequest, Endpoint, PinnedHubTls, RestClient, SecretApiKey};
+use crate::{BindingRequest, Endpoint, ErrorKind, PinnedHubTls, RestClient, SecretApiKey};
 
 const DUMMY_KEY: &str = "bh_squatdummy.6f1c2a9e0d4b7381";
 const CATALOG: &str = r#"{"revision":1,"run_id":2,"collection_mode":"configured","tags":[]}"#;
@@ -140,8 +140,12 @@ async fn serve(
             if let Some((status, location)) = configured {
                 let response = format!(
                     "HTTP/1.1 {status} Redirect
+
 Location: {location}
+
 Content-Length: 0
+
+
 
 "
                 );
@@ -416,9 +420,17 @@ async fn a_redirect_from_the_hub_is_never_followed_to_another_listener() {
                 !catalog_ok(&client).await,
                 "{status} to {location} must be an error"
             );
-            assert!(
-                !stream_ok(&client).await,
-                "WebSocket {status} to {location} must be an error"
+            // 握手の 3xx はリダイレクトとして分類され（追わずに InvalidEndpoint）、
+            // 形の崩れた返事による失敗ではないことを種類で確かめる。
+            let error = tokio::time::timeout(Duration::from_secs(6), client.connect_stream())
+                .await
+                .expect("WebSocket handshake must finish")
+                .err()
+                .expect("WebSocket redirect must be an error");
+            assert_eq!(
+                error.kind(),
+                ErrorKind::InvalidEndpoint,
+                "WebSocket {status} to {location} must be refused as a redirect"
             );
         }
     }
