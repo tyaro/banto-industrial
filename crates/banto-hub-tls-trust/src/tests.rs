@@ -171,9 +171,9 @@ impl TlsFile for FakeFile {
     fn final_path(&self) -> PathBuf {
         self.entry.real.clone().unwrap_or_else(|| self.path.clone())
     }
-    fn read_all(&mut self, max_len: usize) -> Result<Vec<u8>, String> {
+    fn read_all(&mut self, max_len: usize) -> Result<Vec<u8>, crate::ReadError> {
         if self.entry.contents.len() > max_len {
-            return Err("大きすぎます".to_string());
+            return Err(crate::ReadError::TooLarge);
         }
         Ok(self.entry.contents.clone())
     }
@@ -457,4 +457,5 @@ fn root_dacl_problems_do_not_trust_anyone_without_elevated() {
     assert!(root_dacl_problems(&security, Some(EVIL)).is_empty());
 }
 
+mod revocation;
 mod user;

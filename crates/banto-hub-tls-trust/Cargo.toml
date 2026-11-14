@@ -1,6 +1,6 @@
 [package]
 name = "banto-hub-tls-trust"
-description = "Read-only checks of the banto-hub loopback TLS place (ProgramData/BantoHub/tls) shared by the Hub service and its clients (#644 PR3a)"
+description = "Checks of the banto-hub loopback TLS places (service and per-user) and the per-user revocation records, shared by the Hub and its clients (#644 PR3a, #1121)"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -15,6 +15,9 @@ banto-safe-root = { path = "../banto-safe-root" }
 rustls-pki-types = { version = "1.15.1", default-features = false, features = ["std"] }
 # 証明書（DER）が解析できるかの確かめ。banto-hub-core と同じ版で、新しい package は増えない。
 x509-cert = { version = "0.2.5" }
+# 証明書の拇印（DER の SHA-256。失効の記録、#1121 PR1b）。banto-hub-core と同じ workspace の版で、
+# Cargo.lock に新しい package は増えない。
+sha2 = { workspace = true }
 
 [dev-dependencies]
 # テストの証明書を作る（banto-hub-core と同じ版・feature。新しい package は増えない）。
