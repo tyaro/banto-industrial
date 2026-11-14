@@ -289,11 +289,24 @@ fn assert_no_http_reached(port: &SwitchPort) {
     }
 }
 
-/// 張れた世代が、Hub プロセスの死・先取りで通信の失敗の再接続に入っていること。
+/// 張れた世代が、Hub プロセスの死・先取りで通信の失敗の再接続に入っていること。accept は
+/// TLS の失敗より先に数えられ、worker は試行の前に error なしの `Connecting` を出すので、
+/// 満たされるまで `WAIT` の範囲で待つ。
 async fn assert_reconnecting_on_transport(hub: &HubService) {
-    let view = hub.subscription().await;
-    assert_ne!(view.state, "live", "{view:?}");
-    assert_eq!(view.last_error.as_deref(), Some("transport"), "{view:?}");
+    let mut last = hub.subscription().await;
+    let ok = tokio::time::timeout(WAIT, async {
+        loop {
+            if last.state != "live" && last.last_error.as_deref() == Some("transport") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            last = hub.subscription().await;
+        }
+    })
+    .await;
+    if ok.is_err() {
+        panic!("never reached a non-live state with last_error=transport: {last:?}");
+    }
 }
 
 /// 購読が成立していないこと（再接続中、または状態の確認が断られて世代ごと止まった）。
