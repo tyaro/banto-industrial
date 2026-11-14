@@ -132,7 +132,7 @@ sqlx = { version = "0.9", default-features = false }
 # （`banto-safe-root` の `sqlite` feature）ための型付きの FFI。sqlx-sqlite が既に
 # 0.30 系を木に持っている（同梱の SQLite もそちらの feature で決まる）ので、
 # Cargo.lock に新しい package は増えない。
-libsqlite3-sys = { version = "0.30", default-features = false }
+libsqlite3-sys = { version = "0.37", default-features = false }
 tokio = { version = "1" }
 # I2a (docs/plan.md「条件付き自動書き込みアプリ」I2a): MELSEC MC protocol
 # (SLMP) framing, wrapped by `banto-plc`'s `slmp` module. MIT, tokio-async,
