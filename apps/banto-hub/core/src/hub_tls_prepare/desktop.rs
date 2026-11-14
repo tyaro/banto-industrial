@@ -32,7 +32,7 @@ const CREATING_CONTENTS: &[u8] = b"banto-hub-tls-creating 1\n";
 fn unavailable(reason: impl Into<String>) -> DefaultTlsUnavailable {
     DefaultTlsUnavailable {
         reason: reason.into(),
-        remedy: "Hub を閉じ、ログの理由と TLS・失効の記録の置き場の所有者・アクセス許可を確かめてください。TLS の組が壊れた・失効した場合は、利用者の TLS フォルダ（既定は %LOCALAPPDATA%\\BantoHub\\tls）だけを、中身を確認してフォルダごと削除し、Hub のデスクトップ版を再起動してください。親の置き場の所有者・アクセス許可が異常なら先に直してください。失効の記録は消さないでください".into(),
+        remedy: "Hub を閉じ、ログの理由と TLS・失効の記録の置き場の所有者・アクセス許可を確かめてください。本体の TLS の組が壊れた・失効した場合や、本体の鍵・証明書・置き場に露出や所有者の異常を見た場合は、ACL を直すだけでは漏れた鍵は無効になりません。利用者の TLS フォルダ（既定は %LOCALAPPDATA%\\BantoHub\\tls）だけを、中身を確認してフォルダごと削除し、Hub のデスクトップ版を再起動してください。親の置き場の所有者・アクセス許可が異常なら先に直してください。失効の記録は消さないでください".into(),
     }
 }
 
@@ -124,7 +124,7 @@ fn problem<P: UserTlsPlace + ?Sized>(
 ) -> String {
     let mut reason = found.reason;
     if found.fault.revokes() {
-        if let UncheckedUserCert::Seen(seen) = peek_user_cert(ops, place) {
+        let recorded = if let UncheckedUserCert::Seen(seen) = peek_user_cert(ops, place) {
             let report = record_user_revocation(
                 ops,
                 place,
@@ -132,11 +132,20 @@ fn problem<P: UserTlsPlace + ?Sized>(
                 seen.thumbprint,
                 RevokedCertPlace::User,
             );
-            reason.push_str(if report.revocations.is_revoked(&seen.thumbprint) {
-                "。証明書の拇印を失効の記録に残しました"
+            if report.revocations.is_revoked(&seen.thumbprint) {
+                reason.push_str("。証明書の拇印を失効の記録に残しました");
+                true
             } else {
-                "。証明書の拇印を失効の記録に残せませんでした（この証明書は使いません）"
-            });
+                reason.push_str("。証明書の拇印を失効の記録に残せませんでした");
+                false
+            }
+        } else {
+            reason.push_str("。証明書の拇印を読めず、失効を記録できませんでした");
+            false
+        };
+        if !recorded {
+            // §7 の受容済みの限界: 永続の記録が無ければ再起動後の失効は保証できない。
+            reason.push_str("。今回の起動ではこの証明書を使いません。失効の記録が無いまま再起動すると同じ証明書が使われることがあります。ACL を直すだけでは漏れた鍵は無効になりません。Hub を閉じ、利用者の TLS フォルダの中身を確認しフォルダごと削除してから再起動してください（失効の記録は消さないでください）");
         }
     }
     reason
@@ -169,7 +178,8 @@ fn tls_place<P: UserTlsPlace + ?Sized>(
     Err("TLS の置き場を作成・再確認できませんでした（試行回数の上限）".into())
 }
 
-fn checked_file<P: UserTlsPlace + ?Sized>(
+/// 本体の証明書・鍵の問題だけを、失効の判定に渡す。
+fn checked_identity_file<P: UserTlsPlace + ?Sized>(
     ops: &WindowsTlsTrustOps,
     place: &P,
     options: &ReconcileOptions,
@@ -178,6 +188,21 @@ fn checked_file<P: UserTlsPlace + ?Sized>(
     role: UserFileRole,
 ) -> Result<Option<PinnedFile>, String> {
     open_user_file(ops, dir, name, name, role).map_err(|found| problem(ops, place, options, found))
+}
+
+/// 初回作成の印・一時ファイルは安全性を確かめ、問題があれば TLS を使わず残す。
+/// 本体とは別の未使用の補助ファイルなので、所有者や ACL の問題でも本体の失効には渡さない。
+fn checked_auxiliary_file(
+    ops: &WindowsTlsTrustOps,
+    dir: &CheckedUserPlace<WinTlsDir>,
+    name: &str,
+) -> Result<Option<PinnedFile>, String> {
+    let role = if name == CREATING {
+        UserFileRole::Public
+    } else {
+        UserFileRole::Secret
+    };
+    open_user_file(ops, dir, name, name, role).map_err(|found| found.reason)
 }
 
 fn create(dir: &WinTlsDir, name: &str, bytes: &[u8]) -> Result<(), String> {
@@ -268,8 +293,9 @@ fn read_pair<P: UserTlsPlace + ?Sized>(
     dir: &CheckedUserPlace<WinTlsDir>,
 ) -> Result<PairBytes, String> {
     // 両方のハンドルを握ってから読む。ACL やリンクの問題は作成中でも復旧しない。
-    let mut cert = checked_file(ops, place, options, dir, CERT_FILE, UserFileRole::Public)?;
-    let mut key = checked_file(ops, place, options, dir, KEY_FILE, UserFileRole::Secret)?;
+    let mut cert =
+        checked_identity_file(ops, place, options, dir, CERT_FILE, UserFileRole::Public)?;
+    let mut key = checked_identity_file(ops, place, options, dir, KEY_FILE, UserFileRole::Secret)?;
     let cert = cert
         .as_mut()
         .map(|file| TlsFile::read_all(file, MAX_PEM_BYTES))
@@ -319,7 +345,7 @@ fn load_in<P: UserTlsPlace + ?Sized>(
     let dir = tls_place(ops, place, options)?;
     let _lock = lock(ops, &dir, options.lock_wait)?;
     settled(ops, place, options)?;
-    let marker = checked_file(ops, place, options, &dir, CREATING, UserFileRole::Public)?;
+    let marker = checked_auxiliary_file(ops, &dir, CREATING)?;
     let creating = if let Some(mut marker) = marker {
         if TlsFile::read_all(&mut marker, 128).map_err(|error| error.to_string())?
             != CREATING_CONTENTS
@@ -335,9 +361,7 @@ fn load_in<P: UserTlsPlace + ?Sized>(
     // 印が無い一時ファイルを「前の作りかけ」と決めつけない。完全な組を使う場合も、
     // 印を片付ける前に一時ファイルの種類・所有者・ACL を確かめる。
     for name in [KEY_TEMP, CERT_TEMP] {
-        if checked_file(ops, place, options, &dir, name, UserFileRole::Secret)?.is_some()
-            && !creating
-        {
+        if checked_auxiliary_file(ops, &dir, name)?.is_some() && !creating {
             return Err("TLS の一時ファイルが残っていますが、作成中の印がありません".into());
         }
     }

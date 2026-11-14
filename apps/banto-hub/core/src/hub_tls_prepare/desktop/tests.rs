@@ -219,6 +219,9 @@ fn unavailable_remedy_explains_safe_recreation_without_deleting_revocations() {
     assert!(found.remedy.contains(r"%LOCALAPPDATA%\BantoHub\tls"));
     assert!(found.remedy.contains("親の置き場"));
     assert!(found.remedy.contains("失効の記録は消さない"));
+    assert!(found
+        .remedy
+        .contains("ACL を直すだけでは漏れた鍵は無効になりません"));
 }
 
 #[test]
@@ -259,7 +262,7 @@ fn file_and_place_faults_use_the_callers_revocation_lock_options() {
             );
             let dir = place.dir();
             let started = Instant::now();
-            let reason = match checked_file(
+            let reason = match checked_identity_file(
                 &WindowsTlsTrustOps,
                 place,
                 &options,
@@ -424,6 +427,80 @@ fn exposure_is_recorded_and_acl_repair_does_not_restore_identity() {
     assert!(read_user_revocations(&WindowsTlsTrustOps, place).is_revoked(&thumb(&cert)));
     acl(&path, &["/remove:g", "*S-1-5-32-545"]);
     assert!(place.load().unwrap_err().contains("失効"));
+}
+
+#[test]
+fn unrecordable_exposure_warns_about_restart_and_requires_recreating_tls() {
+    let fixture = Fixture::new();
+    let place = &fixture.0;
+    let cert = place.load().unwrap();
+    let spec = place.spec(UserPlaceKind::RevocationsLock);
+    let parent = WindowsTlsTrustOps
+        .pin_dir(&spec.dir_path())
+        .unwrap()
+        .unwrap();
+    let held = WindowsTlsTrustOps
+        .open_child_file_exclusive(&parent, spec.file.as_deref().unwrap())
+        .unwrap()
+        .unwrap();
+    acl(&place.tls(), &["/grant", "*S-1-1-0:(OI)(CI)(M)"]);
+    let options = ReconcileOptions {
+        lock_wait: Duration::from_millis(70),
+        lock_poll: Duration::from_millis(5),
+    };
+    let reason = load_in(&WindowsTlsTrustOps, place, &options, NOW).unwrap_err();
+    assert!(reason.contains("失効の記録に残せませんでした"), "{reason}");
+    assert!(
+        reason.contains("今回の起動ではこの証明書を使いません"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("再起動すると同じ証明書が使われることがあります"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("ACL を直すだけでは漏れた鍵は無効になりません"),
+        "{reason}"
+    );
+    assert!(reason.contains("フォルダごと削除"), "{reason}");
+    assert!(!read_user_revocations(&WindowsTlsTrustOps, place).is_revoked(&thumb(&cert)));
+    drop(held);
+    drop(parent);
+    acl(&place.tls(), &["/remove:g", "*S-1-1-0"]);
+    // §7 の受容済みの限界を隠さない。永続の記録が無ければ、ACL を直すだけでは同じ組を
+    // 再び使いうる。そのためログは、その操作だけを復旧として案内してはいけない。
+    assert_eq!(thumb(&place.load().unwrap()), thumb(&cert));
+    std::fs::remove_dir_all(place.tls()).unwrap();
+    let renewed = place.load().unwrap();
+    assert_ne!(thumb(&renewed), thumb(&cert));
+    assert!(read_user_revocations(&WindowsTlsTrustOps, place).is_settled());
+}
+
+#[test]
+fn untrusted_auxiliary_files_do_not_revoke_the_valid_identity() {
+    for name in [CREATING, KEY_TEMP, CERT_TEMP] {
+        let fixture = Fixture::new();
+        let place = &fixture.0;
+        let cert = place.load().unwrap();
+        place.put(
+            name,
+            if name == CREATING {
+                CREATING_CONTENTS
+            } else {
+                b"auxiliary"
+            },
+        );
+        let auxiliary = place.tls().join(name);
+        acl(&auxiliary, &["/grant", "*S-1-1-0:(M)"]);
+        assert!(place.load().is_err());
+        assert!(
+            !read_user_revocations(&WindowsTlsTrustOps, place).is_revoked(&thumb(&cert)),
+            "{name} の問題で本体を失効させない"
+        );
+        assert!(auxiliary.exists(), "問題の補助ファイルを自動では消さない");
+        std::fs::remove_file(&auxiliary).unwrap();
+        assert_eq!(thumb(&place.load().unwrap()), thumb(&cert));
+    }
 }
 
 #[test]
