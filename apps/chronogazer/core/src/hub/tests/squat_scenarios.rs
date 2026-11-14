@@ -409,8 +409,10 @@ async fn a_squatter_on_the_hub_port_never_receives_the_key_from_the_supervisor()
     // 見張りの 1 周期を**手で**回す（ここだけ）。確かめたいのは「見張りが動いても先取り役へ
     // 何も出さない」で、自動で動くことではないので、30 秒の周期を待たずに 1 回分を起こす。
     // 周期が掛けにいった接続があれば、先取り役が読み終えてから記録を調べる。
+    let before_tick = port.accepts(ModeKind::SquatTls);
     hub.supervise_once().await;
-    port.settle(ModeKind::SquatTls, 4).await;
+    // 周期が実際に掛けにいった（新しい接続が増えた）ことを要求してから、読み終えを待つ。
+    port.settle(ModeKind::SquatTls, before_tick + 1).await;
     assert_eq!(port.squat_tls_handshakes(), 0);
     assert_no_http_reached(&port);
     assert_not_live(&hub).await;
