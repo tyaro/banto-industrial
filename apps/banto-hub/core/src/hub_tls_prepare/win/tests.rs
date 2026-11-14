@@ -455,6 +455,25 @@ fn creates_and_rebuilds_the_service_record_and_the_hub_checks_it() {
         RevocationRecord::parse(&std::fs::read(&record).unwrap()).unwrap()
     };
     assert_eq!(check_record().entries(), &[]);
+    // 一時の ProgramData では、elev が継承で作ったルートに、CREATOR OWNER から実行した管理者
+    // 本人（CI の runneradmin）のフルが付き、所有者も本人になる。elev は本人を信頼するが、サービス
+    // の読み込みは本人を知らないので断る（#1116・#1117 からの決まり）。本物の ProgramData で
+    // 昇格した管理者の既定の所有者（Administrators）が作った形に揃えてから読ませる。
+    let root = f.program_data.join("BantoHub");
+    let me = std::process::Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .expect("whoami を起動できない");
+    let me = String::from_utf8_lossy(&me.stdout);
+    let sid = me
+        .trim()
+        .rsplit(',')
+        .next()
+        .expect("whoami の出力")
+        .trim_matches('"')
+        .to_string();
+    icacls(&root, &["/setowner", "*S-1-5-32-544"]);
+    icacls(&root, &["/remove:g", &format!("*{sid}")]);
     if let Err(found) = load_default_identity(&f.ops) {
         panic!("サービスの読み込みが断った: {found:#?}");
     }
