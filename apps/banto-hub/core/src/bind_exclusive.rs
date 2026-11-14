@@ -14,6 +14,12 @@
 //! ワイルドカード（LAN）で bind すると上の先取りを受けうる。上流 banto に bind 済みの
 //! listener を受け取る口が要る（別 Issue）。
 //!
+//! 閉じた後に接続が残っても再 bind できる（この PC の Windows 11 で、サーバー側 TIME_WAIT・
+//! FIN_WAIT_2・接続が開いたまま listener だけ閉じた場合を確かめた。試験
+//! `rebind_after_*` / `rebind_while_*`）。証明書の差し替えは待ち受けを閉じずに TLS の設定だけを
+//! 替える設計（docs/hub-desktop-tls-design.md §4.2・§4.5）。再 bind に失敗したときは、今までどおり
+//! 8723 の TLS 無しで起動して理由をログに出す（#644 のオーナー決定 B）。
+//!
 //! 文字列（`host:port`）の解決は `TcpListener::bind` と同じく `lookup_host` の結果を順に
 //! 試し、最初に bind できたものを使う。失敗は最後のエラーをそのまま返すので、
 //! `io::ErrorKind`（`AddrInUse` / `PermissionDenied` など）を見る
@@ -137,6 +143,83 @@ mod tests {
         let socket = Socket::new(Domain::for_address(addr), Type::STREAM, None).unwrap();
         socket.set_reuse_address(true).unwrap();
         assert!(socket.bind(&addr.into()).is_err(), "{addr} was taken over");
+    }
+
+    /// 閉じた後に接続が残っていても、同じアドレスへ排他的に再 bind できる。
+    /// `close_order` が場面ごとの閉じ方を決める（引数は accept した側・connect した側）。
+    async fn rebind_after_close(
+        close_order: impl FnOnce(tokio::net::TcpStream, std::net::TcpStream) -> Vec<Box<dyn Send>>,
+        listener_dropped_before_streams: bool,
+    ) {
+        let listener = bind_exclusive("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let mut keep: Vec<Box<dyn Send>> = Vec::new();
+        if listener_dropped_before_streams {
+            drop(listener);
+            keep.extend(close_order(server, client));
+        } else {
+            keep.extend(close_order(server, client));
+            drop(listener);
+        }
+        // `keep` に残した側は再 bind を試す間は開いたまま。
+        let again = bind_exclusive(addr)
+            .await
+            .unwrap_or_else(|e| panic!("could not rebind {addr}: {e}"));
+        assert_eq!(again.local_addr().unwrap(), addr);
+        drop(keep);
+    }
+
+    /// サーバーが先に閉じ、クライアントも閉じる（サーバー側 TIME_WAIT）。
+    #[tokio::test]
+    async fn rebind_after_server_closes_first_then_client() {
+        rebind_after_close(
+            |server, client| {
+                drop(server);
+                drop(client);
+                Vec::new()
+            },
+            false,
+        )
+        .await;
+    }
+
+    /// クライアントが先に閉じる。
+    #[tokio::test]
+    async fn rebind_after_client_closes_first() {
+        rebind_after_close(
+            |server, client| {
+                drop(client);
+                drop(server);
+                Vec::new()
+            },
+            false,
+        )
+        .await;
+    }
+
+    /// サーバーが閉じ、クライアントは開いたまま（サーバー側 FIN_WAIT_2）。
+    #[tokio::test]
+    async fn rebind_while_client_stays_open_after_server_closes() {
+        rebind_after_close(
+            |server, client| {
+                drop(server);
+                vec![Box::new(client)]
+            },
+            false,
+        )
+        .await;
+    }
+
+    /// 受け付けた接続を開いたまま listener だけ閉じる。
+    #[tokio::test]
+    async fn rebind_after_listener_closes_with_accepted_connection_open() {
+        rebind_after_close(
+            |server, client| vec![Box::new(server), Box::new(client)],
+            true,
+        )
+        .await;
     }
 
     #[tokio::test]
