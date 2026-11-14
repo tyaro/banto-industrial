@@ -10,6 +10,7 @@
 //! `tests/proxy_env.rs` に分けた。
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,6 +34,8 @@ struct BackendHub {
     addr: SocketAddr,
     heads: Arc<Mutex<Vec<String>>>,
     redirect: Arc<Mutex<Option<(u16, String)>>>,
+    /// 受けた接続のうち、扱いが終わった（握手の失敗・相手が閉じた）数。
+    finished: Arc<AtomicUsize>,
     task: AbortHandle,
 }
 
@@ -43,18 +46,25 @@ impl BackendHub {
         let heads = Arc::new(Mutex::new(Vec::new()));
         let redirect = Arc::new(Mutex::new(None));
         let acceptor = TlsAcceptor::from(identity.server_config());
+        let finished = Arc::new(AtomicUsize::new(0));
         let (task_heads, task_redirect) = (Arc::clone(&heads), Arc::clone(&redirect));
+        let task_finished = Arc::clone(&finished);
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     continue;
                 };
-                tokio::spawn(serve(
+                let serving = serve(
                     stream,
                     acceptor.clone(),
                     Arc::clone(&task_heads),
                     Arc::clone(&task_redirect),
-                ));
+                );
+                let finished = Arc::clone(&task_finished);
+                tokio::spawn(async move {
+                    serving.await;
+                    finished.fetch_add(1, Ordering::SeqCst);
+                });
             }
         })
         .abort_handle();
@@ -62,8 +72,21 @@ impl BackendHub {
             addr,
             heads,
             redirect,
+            finished,
             task,
         }
+    }
+
+    /// 受けた接続が `at_least` 本、最後まで扱われるのを待つ。中継が「終わった」あとも
+    /// この Hub は届いたバイトをまだ読んでいることがあるので、「要求が 1 つも
+    /// 届いていない」を確かめる前に、Hub 自身が接続を読み終えたことを待つ。
+    async fn wait_finished(&self, at_least: usize) {
+        wait_for(
+            "the real Hub to finish its connections",
+            Duration::from_secs(10),
+            || self.finished.load(Ordering::SeqCst) >= at_least,
+        )
+        .await;
     }
 
     fn set_redirect(&self, status: u16, location: &str) {
@@ -204,6 +227,16 @@ async fn stream_ok(client: &RestClient) -> bool {
         .is_ok_and(|result| result.is_ok())
 }
 
+async fn wait_for(what: &str, limit: Duration, mut done: impl FnMut() -> bool) {
+    let waited = tokio::time::timeout(limit, async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(waited.is_ok(), "timed out waiting for {what}");
+}
+
 /// 先取りされている間は、何度やっても REST も WebSocket も失敗する。
 async fn assert_always_refused(client: &RestClient) {
     for attempt in 0..ATTEMPTS {
@@ -250,14 +283,16 @@ async fn a_hub_that_goes_down_and_is_squatted_never_receives_the_key() {
     let delivered = hub.bearer_requests();
 
     // 止まって、別の証明書の TLS が同じポートを先取りした。
+    // 記録を調べる前に、先取り側が受けた接続をすべて読み終えるのを待つ（受けた数は
+    // TCP を受けた時点で増えるので、それだけでは握手や受信が済んだことにならない）。
     port.set(Mode::SquatTls(squatter.server_config()));
     assert_always_refused(&client).await;
-    assert!(port.accepts(ModeKind::SquatTls) >= ATTEMPTS);
+    port.settle(ModeKind::SquatTls, ATTEMPTS).await;
 
     // 証明書もない平文が先取りした。
     port.set(Mode::SquatPlain);
     assert_always_refused(&client).await;
-    assert!(port.accepts(ModeKind::SquatPlain) >= ATTEMPTS);
+    port.settle(ModeKind::SquatPlain, ATTEMPTS).await;
 
     port.assert_secret_absent(DUMMY_KEY);
     assert_eq!(port.squat_tls_handshakes(), 0, "pin must stop the TLS");
@@ -289,17 +324,17 @@ async fn a_swap_between_the_check_and_the_send_does_not_leak_on_the_same_client(
     // 使い回していた接続が切れた最初の失敗のあと、つなぎ直す要求も断られる
     // （つなぎ直しのたびに pin を確かめ直す）。
     assert!(!catalog_ok(&client).await, "REST redial on the same client");
-    assert!(
-        port.accepts(ModeKind::SquatTls) >= 2,
-        "the client really dialed the squatter and refused it"
-    );
+    // 実際に先取り側へ掛けにいって断り、先取り側はその接続を読み終えている。
+    port.settle(ModeKind::SquatTls, 2).await;
 
     // 平文への入れ替わりも同じ。
     port.set(Mode::SquatPlain);
     assert!(!catalog_ok(&client).await);
     assert!(!stream_ok(&client).await);
+    port.settle(ModeKind::SquatPlain, 2).await;
 
     port.assert_secret_absent(DUMMY_KEY);
+    assert_eq!(port.squat_tls_handshakes(), 0, "pin must stop the TLS");
     assert_no_http_reached(&port);
 }
 
@@ -317,6 +352,9 @@ async fn a_swap_between_the_check_and_the_send_does_not_leak_on_a_fresh_client()
     let fresh = client(&port.https_url(), &[&identity_a]);
     assert!(!catalog_ok(&fresh).await);
     assert!(!stream_ok(&fresh).await);
+    // 新しいクライアントが実際に先取り側へ掛けにいき、先取り側が読み終えてから調べる
+    // （掛けにいっていなければ「何も届いていない」は何も示さない）。
+    port.settle(ModeKind::SquatTls, 2).await;
 
     port.assert_secret_absent(DUMMY_KEY);
     assert!(port.squat_bytes().is_empty());
@@ -342,12 +380,15 @@ async fn a_websocket_that_drops_does_not_reconnect_to_a_squatter_with_the_key() 
     for attempt in 0..ATTEMPTS {
         assert!(!stream_ok(&client).await, "reconnect {attempt}");
     }
+    port.settle(ModeKind::SquatTls, ATTEMPTS).await;
     port.set(Mode::SquatPlain);
     for attempt in 0..ATTEMPTS {
         assert!(!stream_ok(&client).await, "plain reconnect {attempt}");
     }
+    port.settle(ModeKind::SquatPlain, ATTEMPTS).await;
 
     port.assert_secret_absent(DUMMY_KEY);
+    assert_eq!(port.squat_tls_handshakes(), 0, "pin must stop the TLS");
     assert_no_http_reached(&port);
     drop(live);
 }
@@ -365,6 +406,10 @@ async fn recovery_and_a_renewed_certificate_need_the_new_pin_and_never_leak_to_t
     let stale = client(&port.https_url(), &[&identity_a]);
     assert!(!catalog_ok(&stale).await);
     assert!(!stream_ok(&stale).await);
+    // 古い pin のクライアントが実際に掛けにいき、中継も Hub B もその接続を最後まで
+    // 扱い終えてから「要求は 1 つも届いていない」を確かめる。
+    let dialed = port.settle(ModeKind::Relay, 2).await;
+    hub_b.wait_finished(dialed).await;
     assert_eq!(hub_b.requests(), 0, "no request may reach the renewed Hub");
     port.assert_secret_absent(DUMMY_KEY);
 
@@ -427,6 +472,12 @@ async fn a_redirect_from_the_hub_is_never_followed_to_another_listener() {
         }
     }
 
+    // どの試みも本物の Hub に届き、Hub がリダイレクトを返した（別の理由で失敗した
+    // だけなら、向き先に誰も来ないのは当たり前になる）。
+    assert!(
+        hub.bearer_requests() >= 2 * 2 * locations.len(),
+        "every REST and WebSocket attempt must reach the Hub and get its redirect"
+    );
     assert_eq!(plain_target.accepts(), 0);
     assert_eq!(tls_target.accepts(ModeKind::SquatTls), 0);
     assert_eq!(plain_target_2.accepts(ModeKind::SquatPlain), 0);
@@ -452,16 +503,6 @@ async fn the_worker_reconnects_by_itself_never_to_a_squatter_and_recovers_on_the
         .unwrap();
     port.set(Mode::Relay(hub.addr));
 
-    async fn wait_for(what: &str, limit: Duration, mut done: impl FnMut() -> bool) {
-        let waited = tokio::time::timeout(limit, async {
-            while !done() {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await;
-        assert!(waited.is_ok(), "timed out waiting for {what}");
-    }
-
     wait_for(
         "the first WebSocket upgrade",
         Duration::from_secs(10),
@@ -472,12 +513,10 @@ async fn the_worker_reconnects_by_itself_never_to_a_squatter_and_recovers_on_the
 
     // つながっている WebSocket ごと、別の証明書の TLS に入れ替わる。
     port.set(Mode::SquatTls(squatter.server_config()));
-    wait_for(
-        "the worker's own reconnects to the squatter",
-        Duration::from_secs(12),
-        || port.accepts(ModeKind::SquatTls) >= 2,
-    )
-    .await;
+    // ワーカー自身の再接続が 2 本、先取り側で最後まで扱われる（握手が断られて閉じる）
+    // のを待つ。TCP を受けた数だけでは、握手や送信が済む前に記録を調べてしまう。
+    port.wait_finished(ModeKind::SquatTls, 2, Duration::from_secs(12))
+        .await;
     assert_eq!(port.squat_tls_handshakes(), 0, "pin must stop the TLS");
     port.assert_secret_absent(DUMMY_KEY);
     assert_no_http_reached(&port);
@@ -497,6 +536,9 @@ async fn the_worker_reconnects_by_itself_never_to_a_squatter_and_recovers_on_the
     .await;
     let _ = handle.shutdown().await;
 
+    // ワーカーが止まったあと、先取り側が受けた接続をすべて読み終えてから調べ直す。
+    port.settle(ModeKind::SquatTls, 2).await;
     assert_eq!(port.squat_tls_handshakes(), 0);
+    port.assert_squat_secret_absent(DUMMY_KEY);
     assert_no_http_reached(&port);
 }

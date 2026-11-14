@@ -184,22 +184,17 @@ fn proxy_environment_variables_are_ignored_and_the_key_never_goes_to_the_proxy()
 
         // 先取りされたら、プロキシ経由で回り込まず、断る。
         port.set(Mode::SquatTls(squatter.server_config()));
-        let baseline = port.accepts(ModeKind::SquatTls);
+        let baseline = port.finished(ModeKind::SquatTls);
         for _ in 0..5 {
             assert!(client.fetch_catalog().await.is_err());
         }
-        // 監視役の再接続（台帳の取得）も、プロキシを使わず先取りを断る。
-        let waited = tokio::time::timeout(Duration::from_secs(10), async {
-            while port.accepts(ModeKind::SquatTls) < baseline + 7 {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await;
-        assert!(
-            waited.is_ok(),
-            "the worker should keep retrying the squatter"
-        );
+        // 監視役の再接続（台帳の取得）も、プロキシを使わず先取りを断る。受けた数では
+        // なく、先取り側で最後まで扱われた（握手が断られて閉じた）接続の数で待つ。
+        port.wait_finished(ModeKind::SquatTls, baseline + 7, Duration::from_secs(10))
+            .await;
         let _ = handle.shutdown().await;
+        // 監視役が止まったあと、受けた接続をすべて読み終えてから記録を調べる。
+        port.settle(ModeKind::SquatTls, baseline + 7).await;
 
         assert_eq!(proxy.accepts(), 0, "the proxy must still not be dialed");
         proxy.assert_secret_absent(DUMMY_KEY);
