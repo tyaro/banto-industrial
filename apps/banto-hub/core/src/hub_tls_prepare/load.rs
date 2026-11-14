@@ -467,7 +467,9 @@ pub fn load_default_identity<O: HubTlsOps>(
             Ok(()) => (Some(cert), Verdict::Fine),
             Err(found) => {
                 let revokes = found.fault.revokes();
-                if revokes {
+                // 鍵のほうが失効に入れる種類でも、開けた証明書のハンドルから拇印を取る
+                // （後で開き直すと、間に差し替わった別の証明書を見てしまう）。
+                if revokes || key_verdict.revokes() {
                     held = Some(held_thumbprint(&mut cert, &cert_path));
                 }
                 (None, Verdict::Exposed(from_trust(found), revokes))

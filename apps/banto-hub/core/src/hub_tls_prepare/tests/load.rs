@@ -384,6 +384,17 @@ fn default_tls_records_the_checked_certificate_even_if_it_is_swapped_after() {
         .insert(CERT_FILE.to_string(), other.cert_pem.as_bytes().to_vec());
     assert_recorded(&ops, "秘密鍵", &identity.cert_pem);
     assert!(!ops.record().unwrap().contains(&swapped));
+
+    // (3) 鍵が露出、証明書はハードリンクだけ（失効に入れない）。握っていた証明書のハンドルから
+    // 拇印を取るので、開いた後の差し替えを見ない。
+    let (ops, identity) = FakeOps::with_identity();
+    ops.edit_file(KEY_FILE, |f| f.security.dacl.aces = None);
+    ops.edit_file(CERT_FILE, |f| f.security.links = 2);
+    ops.swap_after_open
+        .borrow_mut()
+        .insert(CERT_FILE.to_string(), other.cert_pem.as_bytes().to_vec());
+    assert_recorded(&ops, "秘密鍵", &identity.cert_pem);
+    assert!(!ops.record().unwrap().contains(&swapped));
 }
 
 /// 露出を見たのに記録に書けない（#1121 PR2c）: 書けなかったことを理由に足して、TLS 無しで起動する。
