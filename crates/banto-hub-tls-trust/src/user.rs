@@ -242,7 +242,9 @@ pub enum UserFault {
     /// 数える。鍵なら読まれた恐れ、フォルダ・証明書なら差し替えられた恐れがあり、ACL が直っても
     /// その証明書は二度と使わない（設計 §4.4「露出を見た証明書は二度と使わない」）。
     Exposed,
-    /// 露出ではないが信じられない（所有者が違う・リンク・ハードリンク・種類や場所の食い違い・
+    /// 所有者が違う。所有者は読み取りを足せるので、Hub は失効に入れる（PR2）。
+    ForeignOwner,
+    /// 露出ではないが信じられない（リンク・ハードリンク・種類や場所の食い違い・
     /// ドライブの種類・置き場の指定）。
     Untrusted,
     /// 壊れている（証明書はあるが鍵が無い・証明書が読める形でない）。
@@ -280,7 +282,7 @@ fn problem_with(reason: String, remedy: UserRemedy, fault: UserFault) -> UserPla
 }
 
 /// [`user_place_problems`] の結果の種類: 許可（ACL）に由来する理由が 1 つでもあれば露出、
-/// 無ければ「信じられない」（所有者・リンク・ハードリンクだけ）。
+/// 無ければ所有者の違い、残りは「信じられない」（リンク・ハードリンクだけ）。
 pub(crate) fn fault_of(found: &[Exposure]) -> UserFault {
     let open_to_others = found.iter().any(|found| {
         matches!(
@@ -293,6 +295,11 @@ pub(crate) fn fault_of(found: &[Exposure]) -> UserFault {
     });
     if open_to_others {
         UserFault::Exposed
+    } else if found
+        .iter()
+        .any(|item| matches!(item, Exposure::ForeignOwner(_)))
+    {
+        UserFault::ForeignOwner
     } else {
         UserFault::Untrusted
     }

@@ -764,7 +764,7 @@ fn an_exposed_certificate_yields_its_thumbprint_and_other_faults_do_not() {
     ops.put_cert();
     ops.dirs.borrow_mut().get_mut(&user_tls()).unwrap().owner = EVIL.to_string();
     let found = load(&ops);
-    assert_eq!(found.problem.fault, UserFault::Untrusted);
+    assert_eq!(found.problem.fault, UserFault::ForeignOwner);
     assert_eq!(found.exposed_thumbprint(), None);
     assert!(matches!(found.seen, UncheckedUserCert::Seen(_)));
 
@@ -1389,7 +1389,7 @@ fn scene_27_untrusted_places_or_lock_refuse_and_write_nothing() {
         ),
         (
             |lock| lock.security.dacl.owner = EVIL.to_string(),
-            UserFault::Untrusted,
+            UserFault::ForeignOwner,
         ),
     ];
     for (spoil, fault) in spoils {
