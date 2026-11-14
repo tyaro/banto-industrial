@@ -8,23 +8,47 @@
 //! certificates nor changes their permissions, and never logs the key.
 //! The listener binds IPv4 127.0.0.1 only; callers should use that literal
 //! address rather than localhost or ::1.
+//!
+//! ## 失効による停止（#1121 PR2c）
+//!
+//! 通常の停止（[`RunningTlsListener::stop`]）は graceful shutdown を送り、上限を過ぎたら serve の
+//! タスクを abort する。axum の serve は接続ごとにタスクを spawn するので、abort しても upgrade
+//! 済みの WebSocket などの接続は残りうる（通常の終了ではこれでよい。ランタイムごと終わる）。
+//!
+//! 証明書の失効（露出を見た）で止めるときは、その証明書で張られた接続を**すぐ確実に**切る
+//! （[`TlsRevoker::revoke`]）。そのため、受け付けた TCP の接続はすべて [`SeverableTcp`] で包んで
+//! から TLS の handshake に渡す。包むときに、下の TCP のソケットの複製（`try_clone`。同じ接続を
+//! 指す別のハンドル）を共有の [`Severance`] に登録しておき、失効のときは印を立ててから複製の
+//! すべてに `shutdown(Both)` をかける。OS の上で接続が閉じるので、どのタスクがその接続を
+//! 持っていても、次の読み書きは EOF かエラーになり（待っている読み書きも起こされる）、相手にも
+//! FIN が届く。印が立った後の [`SeverableTcp`] の読み書きはエラーを返し、印が立った後に
+//! 登録しようとした接続（失効と受け付けが競った）もすぐ閉じる。複製は包んだ側の drop で
+//! 登録から外して閉じる。最後に serve のタスクを abort するので、待ち受けのポートも閉じ、
+//! handshake の途中のものも捨てる。
 
 use std::{
+    collections::HashMap,
     env,
     ffi::OsString,
     io,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4},
     path::PathBuf,
-    sync::Arc,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    task::{Context, Poll},
     time::Duration,
 };
 
 use axum::serve::{Listener, ListenerExt};
 use thiserror::Error;
 use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
     sync::oneshot,
-    task::{JoinHandle, JoinSet},
+    task::{AbortHandle, JoinHandle, JoinSet},
 };
 use tokio_rustls::{
     rustls::{
@@ -195,14 +219,135 @@ impl TlsConfig {
     }
 }
 
+/// 受け付けた接続の、下の TCP のソケットの複製（失効のときに `shutdown(Both)` をかける）。
+/// モジュール doc「失効による停止」。
+#[derive(Default)]
+pub(crate) struct Severance {
+    severed: AtomicBool,
+    next_id: AtomicU64,
+    sockets: Mutex<HashMap<u64, std::net::TcpStream>>,
+}
+
+impl Severance {
+    fn sockets(&self) -> std::sync::MutexGuard<'_, HashMap<u64, std::net::TcpStream>> {
+        self.sockets.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// 印を立て、登録したすべての接続を OS の上で閉じる（`shutdown(Both)`）。何度呼んでもよい。
+    fn sever(&self) {
+        let mut sockets = self.sockets();
+        self.severed.store(true, Ordering::SeqCst);
+        for (_, socket) in sockets.drain() {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+    }
+
+    fn is_severed(&self) -> bool {
+        self.severed.load(Ordering::SeqCst)
+    }
+
+    /// `stream` を包む。複製を作れなければ接続を閉じて `None`（切れない接続は受け付けない）。
+    fn wrap(self: &Arc<Self>, stream: TcpStream) -> Option<SeverableTcp> {
+        let std_stream = stream.into_std().ok()?;
+        let clone = match std_stream.try_clone() {
+            Ok(clone) => clone,
+            Err(_) => {
+                let _ = std_stream.shutdown(Shutdown::Both);
+                return None;
+            }
+        };
+        let inner = TcpStream::from_std(std_stream).ok()?;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        {
+            // 印と登録は同じロックの下で見る（失効と受け付けが競っても、閉じ損ねない）。
+            let mut sockets = self.sockets();
+            if self.is_severed() {
+                let _ = clone.shutdown(Shutdown::Both);
+                return None;
+            }
+            sockets.insert(id, clone);
+        }
+        Some(SeverableTcp {
+            inner,
+            id,
+            severance: self.clone(),
+        })
+    }
+}
+
+/// 失効で切れる TCP の接続（モジュール doc「失効による停止」）。印が立った後の読み書きは
+/// `ConnectionAborted` を返す。
+pub(crate) struct SeverableTcp {
+    inner: TcpStream,
+    id: u64,
+    severance: Arc<Severance>,
+}
+
+impl SeverableTcp {
+    fn severed_error() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "Hub の TLS の証明書が失効したので接続を切りました",
+        )
+    }
+}
+
+impl Drop for SeverableTcp {
+    fn drop(&mut self) {
+        // 複製を登録から外して閉じる（接続そのものは `inner` の drop で閉じる）。
+        self.severance.sockets().remove(&self.id);
+    }
+}
+
+impl AsyncRead for SeverableTcp {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.severance.is_severed() {
+            return Poll::Ready(Err(Self::severed_error()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for SeverableTcp {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.severance.is_severed() {
+            return Poll::Ready(Err(Self::severed_error()));
+        }
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.severance.is_severed() {
+            return Poll::Ready(Err(Self::severed_error()));
+        }
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.severance.is_severed() {
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 struct TlsListener {
     tcp: TcpListener,
     acceptor: TlsAcceptor,
-    handshakes: JoinSet<Option<(TlsStream<TcpStream>, SocketAddr)>>,
+    severance: Arc<Severance>,
+    handshakes: JoinSet<Option<(TlsStream<SeverableTcp>, SocketAddr)>>,
 }
 
 impl Listener for TlsListener {
-    type Io = TlsStream<TcpStream>;
+    type Io = TlsStream<SeverableTcp>;
     type Addr = SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
@@ -216,6 +361,9 @@ impl Listener for TlsListener {
                 accepted = self.tcp.accept(), if self.handshakes.len() < MAX_PENDING_HANDSHAKES => {
                     match accepted {
                         Ok((stream, peer)) => {
+                            let Some(stream) = self.severance.wrap(stream) else {
+                                continue;
+                            };
                             let acceptor = self.acceptor.clone();
                             self.handshakes.spawn(async move {
                                 // Idle local peers cannot hold the listener indefinitely.
@@ -239,11 +387,42 @@ pub struct RunningTlsListener {
     local_addr: SocketAddr,
     shutdown: oneshot::Sender<()>,
     task: JoinHandle<()>,
+    severance: Arc<Severance>,
+}
+
+/// 失効で 8723 の待ち受けを止め、その証明書で張られた接続をすぐ切る口（#1121 PR2c。
+/// [`RunningTlsListener::revoker`]。複製して別のスレッド・タスクから呼べる）。
+#[derive(Clone)]
+pub struct TlsRevoker {
+    severance: Arc<Severance>,
+    abort: Arc<AbortHandle>,
+}
+
+impl TlsRevoker {
+    /// 張られた接続をすべて OS の上で閉じ、serve のタスクを abort する（待ち受けのポートも閉じる）。
+    /// 待たない（同期）。何度呼んでもよい。止めた後は再開しない。
+    pub fn revoke(&self) {
+        self.severance.sever();
+        self.abort.abort();
+    }
+
+    /// 失効で止めたか。
+    pub fn is_revoked(&self) -> bool {
+        self.severance.is_severed()
+    }
 }
 
 impl RunningTlsListener {
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// 失効で止める口（モジュール doc「失効による停止」）。
+    pub fn revoker(&self) -> TlsRevoker {
+        TlsRevoker {
+            severance: self.severance.clone(),
+            abort: Arc::new(self.task.abort_handle()),
+        }
     }
 
     pub async fn stop(mut self) {
@@ -269,9 +448,11 @@ pub(crate) async fn start(
         .await
         .map_err(TlsError::Bind)?;
     let local_addr = tcp.local_addr().map_err(TlsError::Bind)?;
+    let severance = Arc::new(Severance::default());
     let listener = TlsListener {
         tcp,
         acceptor,
+        severance: severance.clone(),
         handshakes: JoinSet::new(),
     };
     let (shutdown, receiver) = oneshot::channel();
@@ -291,6 +472,7 @@ pub(crate) async fn start(
         local_addr,
         shutdown,
         task,
+        severance,
     })
 }
 
@@ -362,6 +544,7 @@ mod tests {
             local_addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
             shutdown,
             task,
+            severance: Arc::default(),
         };
         server.stop().await;
         assert!(held_receiver.await.is_err());
@@ -557,5 +740,140 @@ mod tests {
         socket.set_reuse_address(true).unwrap();
         assert!(socket.bind(&addr.into()).is_err(), "{addr} was taken over");
         server.stop().await;
+    }
+
+    /// 失効の試験用: rcgen で作った一時の証明書で待ち受け、応答を流し続ける `/stream` を持つ。
+    async fn streaming_server() -> (RunningTlsListener, Arc<tokio_rustls::rustls::ClientConfig>) {
+        let key_pair = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_pem = key_pair.cert.pem().into_bytes();
+        let key_pem = Zeroizing::new(key_pair.signing_key.serialize_pem().into_bytes());
+        let config = TlsConfig::in_memory(0, cert_pem, key_pem);
+        let app = Router::new()
+            .route(
+                "/stream",
+                get(|| async {
+                    let ticks = futures_util::stream::unfold((), |()| async {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        Some((Ok::<_, io::Error>(b"tick\n".to_vec()), ()))
+                    });
+                    axum::body::Body::from_stream(ticks)
+                }),
+            )
+            .route(
+                "/hold",
+                get(|| async {
+                    // 1 回だけ流して、あとは書きも読みもしない（失効の印だけでは起きない接続）。
+                    let once = futures_util::stream::unfold(true, |first| async move {
+                        if first {
+                            Some((Ok::<_, io::Error>(b"tick\n".to_vec()), false))
+                        } else {
+                            std::future::pending::<()>().await;
+                            None
+                        }
+                    });
+                    axum::body::Body::from_stream(once)
+                }),
+            );
+        let server = start(&config, app).await.unwrap();
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots.add(key_pair.cert.der().clone()).unwrap();
+        let client = Arc::new(
+            tokio_rustls::rustls::ClientConfig::builder_with_provider(Arc::new(
+                tokio_rustls::rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+        );
+        (server, client)
+    }
+
+    /// `path` に TLS で繋いで、流れ始めるまで読む。
+    async fn open_stream(
+        addr: SocketAddr,
+        client: Arc<tokio_rustls::rustls::ClientConfig>,
+        path: &str,
+    ) -> tokio_rustls::client::TlsStream<TcpStream> {
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut tls = tokio_rustls::TlsConnector::from(client)
+            .connect("localhost".try_into().unwrap(), stream)
+            .await
+            .unwrap();
+        tls.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !String::from_utf8_lossy(&seen).contains("tick") {
+            let n = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut buf))
+                .await
+                .expect("流れ始めない")
+                .unwrap();
+            assert!(n > 0, "流れる前に閉じた");
+            seen.extend_from_slice(&buf[..n]);
+        }
+        tls
+    }
+
+    /// 流れ続けている接続が、`within` のうちに閉じる（EOF かエラー）か。
+    async fn closes_within(
+        tls: &mut tokio_rustls::client::TlsStream<TcpStream>,
+        within: Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        let mut buf = [0u8; 1024];
+        loop {
+            match tokio::time::timeout_at(deadline, tls.read(&mut buf)).await {
+                Err(_) => return false,
+                Ok(Ok(0)) | Ok(Err(_)) => return true,
+                Ok(Ok(_)) => continue,
+            }
+        }
+    }
+
+    /// #1121 PR2c: 失効の停止は、張られた長く続く接続（応答を流し続ける）をすぐ切り、待ち受けの
+    /// ポートも閉じる。比べとして、通常の停止（graceful → 上限で abort）では、その接続は残る
+    /// （axum の serve は接続ごとにタスクを spawn するため。モジュール doc「失効による停止」）。
+    #[tokio::test]
+    async fn revoke_cuts_a_long_lived_connection_that_graceful_stop_leaves() {
+        // 失効の停止: すぐ閉じる。
+        let (server, client) = streaming_server().await;
+        let addr = server.local_addr();
+        let mut tls = open_stream(addr, client.clone(), "/stream").await;
+        // 書きも読みもしていない接続も、OS の上で閉じるので切れる（印だけでは起きない）。
+        let mut idle = open_stream(addr, client.clone(), "/hold").await;
+        let revoker = server.revoker();
+        assert!(!revoker.is_revoked());
+        revoker.revoke();
+        assert!(revoker.is_revoked());
+        assert!(
+            closes_within(&mut tls, Duration::from_secs(2)).await,
+            "失効の停止の後も接続が流れ続けた"
+        );
+        assert!(
+            closes_within(&mut idle, Duration::from_secs(2)).await,
+            "失効の停止の後も止まっている接続が残った"
+        );
+        // 待ち受けも閉じる（abort は非同期なので少し待つ）。
+        let mut refused = false;
+        for _ in 0..50 {
+            if TcpStream::connect(addr).await.is_err() {
+                refused = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(refused, "失効の停止の後も {addr} が受け付けた");
+        server.stop().await;
+
+        // 通常の停止: 上限（STOP_TIMEOUT）で serve を abort しても、接続は流れ続ける。
+        let (server, client) = streaming_server().await;
+        let mut tls = open_stream(server.local_addr(), client, "/stream").await;
+        server.stop().await;
+        assert!(
+            !closes_within(&mut tls, Duration::from_millis(500)).await,
+            "通常の停止で接続が切れた（比べの前提が変わった）"
+        );
     }
 }

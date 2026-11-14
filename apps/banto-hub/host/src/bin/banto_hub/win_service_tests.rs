@@ -1055,3 +1055,149 @@ fn a_loaded_default_tls_is_handed_to_the_hub() {
         assert!(!has(&lines, "既定の TLS"), "{lines:#?}");
     }
 }
+
+// --- 既定の TLS の周期の確かめ（#1121 PR2c） ---------------------------------------------
+
+/// ポートは OS に任せた、確かめ済みの既定の TLS。
+fn loaded_default_tls() -> DefaultHubTls {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let identity = banto_hub_core::hub_tls_prepare::generate_identity(now).unwrap();
+    DefaultHubTls::from_checked_pem(
+        0,
+        identity.cert_pem.as_bytes().to_vec(),
+        identity.key_pem.as_bytes().to_vec(),
+        PathBuf::from("hub-cert.pem"),
+        now,
+    )
+    .unwrap()
+}
+
+/// `needle` を含む行が出るまで待つ（上限 10 秒）。
+fn wait_for_line(fx: &Fixture, needle: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(line) = fx.lines().into_iter().find(|line| line.contains(needle)) {
+            return line;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{needle} が出ない: {:#?}",
+            fx.lines()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// 周期の確かめが止めると決めたら、行をサービスログへ出し、8723（テストでは OS が選んだ
+/// ポート）を止め、その後は確かめを終える（`finished`）。Hub は TLS 無しで動き続け、STOP で
+/// ふつうに終わる。
+#[test]
+fn a_revoked_default_tls_is_stopped_logged_and_not_resumed() {
+    use std::sync::atomic::AtomicUsize;
+    let fx = Fixture::new("tls-revoked", loose(), None);
+    let mut program = fx.program();
+    let loaded = loaded_default_tls();
+    let expected = ServingThumbprint::of_pem(loaded.cert_pem()).unwrap();
+    program.default_tls = Box::new(move || Some(Ok(loaded.clone())));
+    program.tls_recheck_interval = Duration::from_millis(30);
+    let rounds = Arc::new(AtomicUsize::new(0));
+    let seen = rounds.clone();
+    program.tls_watch = Arc::new(move |watch: &mut ServiceTlsWatch| {
+        assert_eq!(watch.serving(), expected);
+        let round = seen.fetch_add(1, Ordering::SeqCst);
+        if round < 2 {
+            return WatchRound::default();
+        }
+        WatchRound {
+            stop: true,
+            finished: true,
+            lines: vec![
+                WatchLine::Info("banto-hub: 試験の記録に書きました".to_string()),
+                WatchLine::Warn("[WARN] banto-hub: 試験の露出".to_string()),
+            ],
+        }
+    });
+    let running = spawn(program);
+    running.wait_running();
+    let line = wait_for_line(&fx, "張られていた接続を切りました");
+    let addr: std::net::SocketAddr = line
+        .split("https://")
+        .nth(1)
+        .and_then(|rest| rest.split('）').next())
+        .unwrap()
+        .parse()
+        .unwrap();
+    // 待ち受けが閉じる（abort は非同期なので少し待つ）。
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+        assert!(Instant::now() < deadline, "{addr} がまだ受け付ける");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // 終えた後は、もう確かめない（再開しない）。
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(rounds.load(Ordering::SeqCst), 3);
+    running.send(ScmControlKind::Stop);
+    assert_eq!(running.join(), Some(ServiceExit::Success));
+    let lines = fx.lines();
+    assert_in_order(
+        &lines,
+        &[
+            "Windows サービスとして起動しました",
+            "banto-hub: 試験の記録に書きました",
+            "err: [WARN] banto-hub: 試験の露出",
+            "err: [WARN] banto-hub: 既定の TLS（https://127.0.0.1:",
+            "log-closed",
+        ],
+    );
+    assert_silent_after_log_closed(&lines);
+}
+
+/// 止めると決めない間は周期ごとに確かめ、STOP で（Hub を止める前に）止まる。ログを閉じた後に
+/// 何も書かない。既定の TLS が無いとき（環境変数・読めない）は立てない。
+#[test]
+fn the_tls_watch_runs_each_round_and_stops_before_the_hub() {
+    use std::sync::atomic::AtomicUsize;
+    for with_tls in [true, false] {
+        let fx = Fixture::new("tls-watch", loose(), None);
+        let mut program = fx.program();
+        let loaded = loaded_default_tls();
+        if with_tls {
+            program.default_tls = Box::new(move || Some(Ok(loaded.clone())));
+        }
+        program.tls_recheck_interval = Duration::from_millis(20);
+        let rounds = Arc::new(AtomicUsize::new(0));
+        let seen = rounds.clone();
+        let trace = fx.trace.clone();
+        program.tls_watch = Arc::new(move |_watch: &mut ServiceTlsWatch| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            push(&trace, "tls:check");
+            WatchRound::default()
+        });
+        let running = spawn(program);
+        running.wait_running();
+        std::thread::sleep(Duration::from_millis(300));
+        running.send(ScmControlKind::Stop);
+        assert_eq!(running.join(), Some(ServiceExit::Success));
+        let after = rounds.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(rounds.load(Ordering::SeqCst), after, "STOP の後も確かめた");
+        let lines = fx.lines();
+        if with_tls {
+            assert!(after >= 2, "{after}");
+            // 最後の確かめは、Hub の停止の行より前。
+            let last_check = lines.iter().rposition(|line| line == "tls:check").unwrap();
+            let db_closed = lines
+                .iter()
+                .position(|line| line.contains(DB_CLOSED_LINE))
+                .unwrap();
+            assert!(last_check < db_closed, "{lines:#?}");
+        } else {
+            assert_eq!(after, 0, "{lines:#?}");
+        }
+        assert!(!has(&lines, "張られていた接続を切りました"), "{lines:#?}");
+        assert_silent_after_log_closed(&lines);
+    }
+}

@@ -31,9 +31,13 @@
 //!   同じフォルダの一時ファイルに書き切ってから、**置き換えずに**付け替える
 //!   （[`ServiceRevocationOps::create_file_no_replace`]）。先に誰かが作っていれば何も変えず、
 //!   読み直したものを使う。
-//! - **作り直す**（[`rewrite_service_revocations`]。elev が、形が壊れた記録を引き継ぐときだけ。
-//!   PR2c でサービスの Hub が露出を書き足すときも使う）: 残った一時ファイルを片付けてから、
+//! - **作り直す**（[`rewrite_service_revocations`]。elev が、形が壊れた記録を引き継ぐときと、
+//!   サービスの Hub が健全な記録に露出を書き足すとき）: 残った一時ファイルを片付けてから、
 //!   一時ファイル → 書き切る → 置き換え（[`ServiceRevocationOps::write_file_atomic`]）。
+//! - **書き足す**（[`record_service_revocations`]。サービスの Hub が露出を見たとき。#1121
+//!   PR2c）: 記録が健全なら和で作り直す（足すものが無ければ書かない）。無ければ、拇印入りで
+//!   **置き換えずに**作る（先に誰かが作っていたら読み直して書き足す）。壊れている・置き場が
+//!   通らない・一時的に読めないなら書かない（作り直すのは elev の `--renew` だけ）。
 //!
 //! 記録用のロックは足さない。書き手どうしの組み合わせはどれも失効を消さない:
 //!
@@ -59,7 +63,8 @@ use crate::place::{dir_refusal, open_file_in, open_root, CheckedRoot};
 use crate::text::{real_path_reason, reasons_text};
 use crate::{
     CertThumbprint, CheckedPlace, ReadError, RecordState, Remedy, RevocationRecord, RevokedCert,
-    RevokedCertPlace, TlsDir, TlsFile, TlsTrustOps, MAX_REVOCATIONS_BYTES, REVOCATIONS_FILE,
+    RevokedCertPlace, TlsDir, TlsFile, TlsTrustOps, CERT_FILE, MAX_PEM_BYTES,
+    MAX_REVOCATIONS_BYTES, REVOCATIONS_FILE, TLS_DIR,
 };
 
 /// ルートの下の、サービスの失効の記録の置き場のフォルダ名（`tls\` の外）。
@@ -577,4 +582,110 @@ pub fn ensure_service_revocations<O: ServiceRevocationOps>(
         ));
     };
     Ok((record, created))
+}
+
+/// 露出を見た拇印をサービスの記録に書き足す（#1121 PR2c、場面 8。サービスの Hub だけ）: ルートを
+/// [`crate::open_place`] と同じ手順で確かめ（`tls\` は見ない。`tls\` が露出していても記録の置き場は
+/// 別）、記録のフォルダを確かめて（無ければ作る）記録を読む。
+///
+/// - 健全な記録: 足りない拇印があれば和で置き換え（[`rewrite_service_revocations`]）。全部あれば
+///   書かない。
+/// - 無い: 拇印入りで置き換えずに作る。先に誰かが作っていたら（`Ok(false)`）読み直して、健全なら
+///   和で置き換える。
+/// - 壊れている・置き場が通らない・読めない: 書かずに理由を返す（呼ぶ側はその拇印をプロセスの
+///   中に覚えて使わず、次の周期に書き直しを試みる。2026-11-14 オーナー決定 3）。
+///
+/// 返すのは書いた後（書かなかったときは読んだ）記録。
+pub fn record_service_revocations<O: ServiceRevocationOps>(
+    ops: &O,
+    entries: &[RevokedCert],
+) -> Result<RevocationRecord, ServiceRevocationProblem> {
+    let CheckedRoot {
+        root,
+        root_path,
+        root_real,
+        known,
+    } = open_root(ops).map_err(|found| {
+        let fault = match found.remedy {
+            Remedy::Retry | Remedy::Prepare => ServiceRevocationFault::Transient,
+            _ => ServiceRevocationFault::Untrusted,
+        };
+        problem(found.reason, fault)
+    })?;
+    let service_root = ServiceRoot {
+        root: &root,
+        root_path: &root_path,
+        root_real: &root_real,
+        known: &known,
+        elevated: None,
+    };
+    let (dir, _) = open_or_create_service_revocations_dir(ops, &service_root)?;
+    let write_failed = |error: String| problem(error, ServiceRevocationFault::Transient);
+    // 作ったら読み直す。先に誰かが作っていたら、その記録に書き足す（最大 2 回まわる）。
+    for _ in 0..2 {
+        match read_service_revocations_in(ops, &dir)? {
+            ServiceRevocations::Record(record) => {
+                if entries
+                    .iter()
+                    .all(|entry| record.contains(&entry.thumbprint))
+                {
+                    return Ok(record);
+                }
+                let merged = record
+                    .entries()
+                    .iter()
+                    .cloned()
+                    .chain(entries.iter().cloned());
+                return rewrite_service_revocations(ops, &dir, merged).map_err(write_failed);
+            }
+            ServiceRevocations::Absent => {
+                let record = RevocationRecord::new(RecordState::Committed, entries.iter().cloned());
+                let created = ops
+                    .create_file_no_replace(&dir.dir, REVOCATIONS_FILE, &record.encode())
+                    .map_err(|error| {
+                        write_failed(format!(
+                            "{RECORD_LABEL}（{}）を作れませんでした: {error}",
+                            dir.record_path().display()
+                        ))
+                    })?;
+                if created {
+                    return Ok(record);
+                }
+            }
+        }
+    }
+    Err(problem(
+        format!(
+            "{RECORD_LABEL}（{}）を作ろうとしたら既にあり、読み直すと無くなっていました",
+            dir.record_path().display()
+        ),
+        ServiceRevocationFault::Transient,
+    ))
+}
+
+/// サービスの `tls\` の証明書の拇印を、**露出・所有者の確かめをせずに**形だけ読む（#1121 PR2c）。
+/// 露出を見たときに、ディスク上の証明書も失効に入れるためだけに使う（拇印が増えるだけなので、
+/// 安全側にしか動かない。待ち受け・pin には使わない）。ルートは確かめる（通らなければ記録も
+/// 書けない）。`tls\` と証明書は辿らずに開き、種類と本当の場所だけを確かめる。無い・開けない・
+/// 読めない・証明書の形でないときは `None`。
+pub fn peek_service_cert<O: TlsTrustOps>(ops: &O) -> Option<CertThumbprint> {
+    let CheckedRoot {
+        root,
+        root_path,
+        root_real,
+        known,
+    } = open_root(ops).ok()?;
+    let tls = ops.open_child_dir(&root, TLS_DIR).ok()??;
+    let tls_path = root_path.join(TLS_DIR);
+    let tls_real = tls.final_path();
+    guard::check_real_path(&tls_real, &root_real.join(TLS_DIR), &known).ok()?;
+    let info = tls.info();
+    if !info.is_dir || info.is_reparse_point {
+        return None;
+    }
+    let mut cert = open_file_in(ops, &tls, &tls_path, &tls_real, CERT_FILE, "証明書")
+        .ok()
+        .flatten()?;
+    let pem = cert.read_all(MAX_PEM_BYTES).ok()?;
+    CertThumbprint::of_pem(&pem).ok()
 }

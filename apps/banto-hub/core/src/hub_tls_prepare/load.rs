@@ -3,7 +3,7 @@
 //!
 //! `banto-hub-elev prepare-hub-tls`（[`super`]）が `<ProgramData>\BantoHub\tls\` に作った
 //! [`KEY_FILE`]・[`CERT_FILE`] を、**`tls\` には書き込み・作成を一切せずに**、置き場ごと確かめて
-//! から読む。書くのはサービスの失効の記録だけ（下の手順 6）。
+//! から読む。書くのはサービスの失効の記録だけ（下の手順 6 と「露出を見たとき」）。
 //! サービス（`HubHostKind::Service`）は、Hub の TLS の環境変数（`BANTO_HUB_TLS_PORT/CERT/KEY`）
 //! がどれも無いときにここを呼び、読めたら 127.0.0.1:[`DEFAULT_TLS_PORT`] で TLS を待ち受ける
 //! （`crate::runtime::HubConfig::default_tls`）。読めなければ（無い・片方だけ・壊れている・
@@ -34,6 +34,13 @@
 //!    （I/O）も使わない。どれも TLS 無しで起動し、理由と対処をログに出す（閉じる側）。読み書きは
 //!    共有 crate の `banto_hub_tls_trust::ensure_service_revocations`。
 //!
+//! **露出を見たとき**（#1121 PR2c、場面 8。2026-11-14 オーナー決定 1）: 手順 2〜4 で露出（信頼する
+//! 相手以外への許可）か所有者の違い（共有 crate の `PlaceFault::revokes`）を見たら、ディスク上の
+//! 証明書を形だけ読み（`banto_hub_tls_trust::peek_service_cert`。ルートが通るときだけ）、その拇印を
+//! サービスの記録に書いてから断る（`record_service_revocations`。証明書が読めなければ書けるものが
+//! 無いので書かない）。書けた・書けなかったは理由の文に足す。リンク・ハードリンク・壊れ・無い・
+//! 一時的な失敗は書かない。動いている間の確かめは [`super::watch`]。
+//!
 //! 手順 1〜3 と、4 のファイルの開き方・証明書の ACL・5 の読み方は、クライアント（ChronoGazer、
 //! #644 PR3b）と同じコードを使うため共有 crate `banto_hub_tls_trust` にある（[`open_place`]・
 //! [`open_checked_file`]・[`check_cert_exposure`]・[`read_checked`]。#644 PR3a）。ここに残るのは、
@@ -46,11 +53,12 @@
 use std::path::{Path, PathBuf};
 
 use banto_hub_tls_trust::{
-    check_cert_exposure, ensure_service_revocations, open_checked_file, open_place, read_checked,
-    CertThumbprint, Remedy, ServiceRevocationFault, ServiceRevocationProblem, Unavailable,
-    SERVICE_REVOCATIONS_DIR, SERVICE_REVOCATIONS_LABEL, TLS_LABEL,
+    check_cert_exposure, ensure_service_revocations, exposure_fault, open_checked_file, open_place,
+    peek_service_cert, read_checked, record_service_revocations, CertThumbprint, PlaceFault,
+    Remedy, RevokedCert, RevokedCertPlace, ServiceRevocationFault, ServiceRevocationProblem,
+    Unavailable, SERVICE_REVOCATIONS_DIR, SERVICE_REVOCATIONS_LABEL, TLS_LABEL,
 };
-use banto_safe_root::acl::{exposure, FileSecurity};
+use banto_safe_root::acl::{exposure, Exposure, FileSecurity};
 use zeroize::Zeroizing;
 
 use super::{
@@ -195,7 +203,7 @@ fn prepare_remedy() -> String {
 }
 
 /// 壊れている・期限切れ・鍵や証明書の露出のときの対処。
-fn renew_remedy() -> String {
+pub(super) fn renew_remedy() -> String {
     format!(
         "管理者の PowerShell で {ELEV} {RENEW_FLAG} を実行して作り直し、この証明書を pin しているクライアント（banto-hub-sink の hub_tls_pinned_certs など）を新しい証明書に書き換えてから、Hub と Sink のサービスを再起動してください"
     )
@@ -228,7 +236,10 @@ fn fix_record_place_remedy(dir: &Path) -> String {
 }
 
 /// サービスの失効の記録を使えないときの、理由と対処（#1121 PR2b）。
-fn from_record(found: ServiceRevocationProblem, root_path: &Path) -> DefaultTlsUnavailable {
+pub(super) fn from_record(
+    found: ServiceRevocationProblem,
+    root_path: &Path,
+) -> DefaultTlsUnavailable {
     let remedy = match found.fault {
         ServiceRevocationFault::Untrusted => {
             fix_record_place_remedy(&root_path.join(SERVICE_REVOCATIONS_DIR))
@@ -246,7 +257,7 @@ fn from_record(found: ServiceRevocationProblem, root_path: &Path) -> DefaultTlsU
 }
 
 /// 共有 crate の確かめの失敗を、サービスログの理由と対処にする（対処の文言は移す前と同じ）。
-fn from_trust(found: Unavailable) -> DefaultTlsUnavailable {
+pub(super) fn from_trust(found: Unavailable) -> DefaultTlsUnavailable {
     let remedy = match &found.remedy {
         Remedy::Retry => retry_remedy(),
         Remedy::Prepare => prepare_remedy(),
@@ -257,13 +268,75 @@ fn from_trust(found: Unavailable) -> DefaultTlsUnavailable {
     unavailable(found.reason, remedy)
 }
 
+/// 秘密鍵の露出（[`exposure`] が空でない）の理由と対処。種類は [`exposure_fault`]（ハードリンク
+/// だけなら失効に入れない）。
+pub(super) fn key_exposure(
+    key_path: &Path,
+    key_open: &[Exposure],
+) -> (DefaultTlsUnavailable, PlaceFault) {
+    (
+        unavailable(
+            format!(
+                "秘密鍵（{}）は保護されていません（{}）。ほかの利用者に読まれた・すり替えられた恐れがあります",
+                key_path.display(),
+                reasons_text(key_open)
+            ),
+            renew_remedy(),
+        ),
+        exposure_fault(key_open),
+    )
+}
+
+/// 失効の記録に入れる、サービスの証明書の 1 件（種類は service、時刻は今）。
+pub(super) fn service_revoked<O: HubTlsOps>(ops: &O, thumbprint: CertThumbprint) -> RevokedCert {
+    RevokedCert {
+        thumbprint,
+        place: RevokedCertPlace::Service,
+        recorded_at: u64::try_from(ops.now_unix()).unwrap_or(0),
+    }
+}
+
+/// 起動のときに露出・所有者の違い（[`PlaceFault::revokes`]）を見た（#1121 PR2c、場面 8）: ディスク
+/// 上の証明書の拇印を形だけ読めたら（[`peek_service_cert`]）、サービスの記録に書いてから断る。読め
+/// なければ（ルートが通らない・証明書が無い・形が壊れている）書けるものが無いので何もしない。
+/// 書けたか・書けなかったかは理由の文に足す（書けなくても TLS 無しで起動するのは同じ）。
+fn record_exposed_at_start<O: HubTlsOps>(
+    ops: &O,
+    mut found: DefaultTlsUnavailable,
+) -> DefaultTlsUnavailable {
+    let Some(thumbprint) = peek_service_cert(ops) else {
+        return found;
+    };
+    match record_service_revocations(ops, &[service_revoked(ops, thumbprint)]) {
+        Ok(_) => found.reason.push_str(&format!(
+            "。この証明書（拇印 {thumbprint}）はサービスの失効の記録に書きました（二度と使いません）"
+        )),
+        Err(problem) => found.reason.push_str(&format!(
+            "。この証明書（拇印 {thumbprint}）をサービスの失効の記録に書けませんでした: {}",
+            problem.reason
+        )),
+    }
+    found
+}
+
 /// 既定の TLS の鍵と証明書を、置き場ごと確かめてから読み、サービスの失効の記録と照合する
 /// （モジュール doc「確かめの順序」）。`tls\` には書き込み・作成をしない。記録が無ければ空で作る。
+/// 露出・所有者の違いを見たら、ディスク上の証明書の拇印を記録に書いてから断る（#1121 PR2c）。
 pub fn load_default_identity<O: HubTlsOps>(
     ops: &O,
 ) -> Result<DefaultHubTls, DefaultTlsUnavailable> {
     // --- 1〜3. ルートと置き場（共有 crate。モジュール doc「確かめの順序」） ----------
-    let place = open_place(ops).map_err(from_trust)?;
+    // 露出・所有者の違いなら、記録に書いてから断る（#1121 PR2c）。
+    let refuse = |found: Unavailable| {
+        let revokes = found.fault.revokes();
+        let found = from_trust(found);
+        if revokes {
+            record_exposed_at_start(ops, found)
+        } else {
+            found
+        }
+    };
+    let place = open_place(ops).map_err(refuse)?;
     let tls_path = place.tls_path().to_path_buf();
 
     // --- 4. 鍵と証明書（開いて握り、ACL を確かめる） ---------------------------------
@@ -301,16 +374,19 @@ pub fn load_default_identity<O: HubTlsOps>(
     let key_security: FileSecurity = key.security();
     let key_open = exposure(&key_security);
     if !key_open.is_empty() {
-        return Err(unavailable(
-            format!(
-                "秘密鍵（{}）は保護されていません（{}）。ほかの利用者に読まれた・すり替えられた恐れがあります",
-                key_path.display(),
-                reasons_text(&key_open)
-            ),
-            renew_remedy(),
-        ));
+        let (found, fault) = key_exposure(&key_path, &key_open);
+        // 握ったハンドルを放してから、証明書を形だけ読み直して記録に書く。
+        drop((key, cert, place));
+        return Err(if fault.revokes() {
+            record_exposed_at_start(ops, found)
+        } else {
+            found
+        });
     }
-    check_cert_exposure(&cert, &cert_path).map_err(from_trust)?;
+    if let Err(found) = check_cert_exposure(&cert, &cert_path) {
+        drop((key, cert, place));
+        return Err(refuse(found));
+    }
 
     // --- 5. 握ったハンドルから読んで、中身を確かめる --------------------------------
     let key_pem = read_checked(&mut key, "秘密鍵", &key_path)

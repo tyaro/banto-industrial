@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use banto_safe_root::acl::exposure_beyond_users_read;
+use banto_safe_root::acl::{exposure_beyond_users_read, Exposure};
 use banto_safe_root::guard::{self, DataAclRefusal, DirState, KnownFolders, MachineEnvironment};
 
 use crate::text::{real_path_reason, reasons_text, well_known_text};
@@ -27,6 +27,53 @@ pub enum Remedy {
     Renew,
 }
 
+/// 置き場を信じられない理由の種類のうち、サービスの証明書を失効に入れるかどうかを分けるもの
+/// （#1121 PR2c。docs/hub-desktop-tls-design.md §7「PR2 で決めたこと」1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceFault {
+    /// 露出: 信頼する相手以外への許可（null DACL・種類の分からない ACE・SID の読めない ACE を
+    /// 含む）が、ルート・`tls\`・鍵・証明書のどれかにある。失効に入れる。
+    Exposed,
+    /// 所有者の違い（ルート・`tls\`・鍵・証明書）。所有者は自分に読み取りの許可を足せるので、
+    /// 失効に入れる（2026-11-14 オーナー決定 1）。
+    ForeignOwner,
+    /// それ以外（無い・リンク・ハードリンク・場所の食い違い・壊れ・一時的な失敗）。失効には
+    /// 入れず、使わないだけ。
+    Other,
+}
+
+impl PlaceFault {
+    /// 失効に入れる種類か（露出・所有者の違い）。
+    pub fn revokes(self) -> bool {
+        matches!(self, Self::Exposed | Self::ForeignOwner)
+    }
+}
+
+/// [`Exposure`] の並びを [`PlaceFault`] に分ける（純関数）: 信頼する相手以外への許可が 1 つでも
+/// あれば露出、無くて所有者が違えば所有者の違い、どちらも無ければ（ハードリンク・reparse point
+/// だけ）それ以外。空なら [`PlaceFault::Other`]。
+pub fn exposure_fault(found: &[Exposure]) -> PlaceFault {
+    let open_to_others = found.iter().any(|found| {
+        matches!(
+            found,
+            Exposure::NullDacl
+                | Exposure::AllowsOther { .. }
+                | Exposure::UnknownAce { .. }
+                | Exposure::UnreadableSid { .. }
+        )
+    });
+    if open_to_others {
+        PlaceFault::Exposed
+    } else if found
+        .iter()
+        .any(|found| matches!(found, Exposure::ForeignOwner(_)))
+    {
+        PlaceFault::ForeignOwner
+    } else {
+        PlaceFault::Other
+    }
+}
+
 /// 置き場を信じられない理由（表示用の日本語の文。鍵の中身は含めない）と対処の種類。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unavailable {
@@ -34,10 +81,32 @@ pub struct Unavailable {
     pub reason: String,
     /// 対処の種類。
     pub remedy: Remedy,
+    /// 失効に入れる種類か（#1121 PR2c。サービスの Hub が使う。クライアントは見ない）。
+    pub fault: PlaceFault,
 }
 
 fn unavailable(reason: String, remedy: Remedy) -> Unavailable {
-    Unavailable { reason, remedy }
+    Unavailable {
+        reason,
+        remedy,
+        fault: PlaceFault::Other,
+    }
+}
+
+fn unavailable_with(reason: String, remedy: Remedy, fault: PlaceFault) -> Unavailable {
+    Unavailable {
+        reason,
+        remedy,
+        fault,
+    }
+}
+
+/// [`DataAclRefusal`] の種類（所有者の違いだけが失効に入る）。
+fn refusal_fault(refusal: &DataAclRefusal) -> PlaceFault {
+    match refusal {
+        DataAclRefusal::ForeignOwner(_) => PlaceFault::ForeignOwner,
+        DataAclRefusal::ReparsePoint | DataAclRefusal::NotADirectory => PlaceFault::Other,
+    }
 }
 
 /// 確かめ終えた置き場（ルートと `tls\` を辿らずに握ったまま持つ）。
@@ -184,9 +253,10 @@ pub(crate) fn open_root<O: TlsTrustOps>(ops: &O) -> Result<CheckedRoot<O::Dir>, 
         ));
     }
     if let Err(refusal) = guard::dir_acl_plan(&DirState::Present(root.info()), None, None) {
-        return Err(unavailable(
+        return Err(unavailable_with(
             dir_refusal(ROOT_LABEL, &root_path, &refusal),
             Remedy::FixRoot,
+            refusal_fault(&refusal),
         ));
     }
     let root_security = root.security().map_err(|error| {
@@ -201,13 +271,14 @@ pub(crate) fn open_root<O: TlsTrustOps>(ops: &O) -> Result<CheckedRoot<O::Dir>, 
     // 読む側は実行した本人を信頼しない（crate doc「所有者に『実行した本人』を含めない」）。
     let root_open = root_dacl_problems(&root_security, None);
     if !root_open.is_empty() {
-        return Err(unavailable(
+        return Err(unavailable_with(
             format!(
                 "{ROOT_LABEL}（{}）は保護されていません（{}）。一般の利用者が {TLS_DIR}\\ を消して差し替えられる恐れがあります",
                 root_path.display(),
                 reasons_text(&root_open)
             ),
             Remedy::FixRoot,
+            exposure_fault(&root_open),
         ));
     }
 
@@ -255,9 +326,10 @@ fn open_tls<O: TlsTrustOps>(
         ));
     }
     if let Err(refusal) = guard::dir_acl_plan(&DirState::Present(tls.info()), None, None) {
-        return Err(unavailable(
+        return Err(unavailable_with(
             dir_refusal(TLS_LABEL, &tls_path, &refusal),
             recreate(),
+            refusal_fault(&refusal),
         ));
     }
     let tls_security = tls.security().map_err(|error| {
@@ -271,13 +343,14 @@ fn open_tls<O: TlsTrustOps>(
     })?;
     let tls_open = exposure_beyond_users_read(&tls_security);
     if !tls_open.is_empty() {
-        return Err(unavailable(
+        return Err(unavailable_with(
             format!(
                 "{TLS_LABEL}（{}）は保護されていません（{}）。ほかの利用者が鍵・証明書を書き換えた・読んだ恐れがあります",
                 tls_path.display(),
                 reasons_text(&tls_open)
             ),
             recreate(),
+            exposure_fault(&tls_open),
         ));
     }
 
@@ -382,13 +455,14 @@ pub fn check_cert_exposure<F: TlsFile>(cert: &F, cert_path: &Path) -> Result<(),
     if cert_open.is_empty() {
         return Ok(());
     }
-    Err(unavailable(
+    Err(unavailable_with(
         format!(
             "証明書（{}）は保護されていません（{}）。ほかの利用者に書き換えられた恐れがあります",
             cert_path.display(),
             reasons_text(&cert_open)
         ),
         Remedy::Renew,
+        exposure_fault(&cert_open),
     ))
 }
 

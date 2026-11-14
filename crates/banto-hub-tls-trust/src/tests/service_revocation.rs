@@ -506,3 +506,156 @@ fn salvage_takes_only_well_formed_revoked_lines() {
     );
     assert!(salvage_revocations(&[0xff, 0xfe]).is_empty());
 }
+
+// --- 書き足す（#1121 PR2c、場面 8） ------------------------------------------------------
+
+/// 健全な記録には和で置き換える。全部あれば書かない。
+#[test]
+fn scene_8_record_adds_to_a_healthy_record_by_replacing() {
+    let ops = FakeServiceOps::with_record(&[1]);
+    let record = record_service_revocations(&ops, &[revoked(2), revoked(3)]).unwrap();
+    assert!(record.contains(&thumb(1)) && record.contains(&thumb(2)) && record.contains(&thumb(3)));
+    assert_eq!(ops.writes(), vec!["WRITE replace revocations.txt"]);
+    assert_eq!(ops.stored().unwrap(), record);
+
+    ops.log.borrow_mut().clear();
+    let again = record_service_revocations(&ops, &[revoked(2)]).unwrap();
+    assert_eq!(again, record);
+    assert_eq!(ops.writes(), Vec::<String>::new());
+}
+
+/// 記録が無ければ、拇印入りで置き換えずに作る（置き場ごと無ければ作る）。先に誰かが作って
+/// いたら、読み直してその記録に書き足す（相手の拇印を消さない）。
+#[test]
+fn scene_8_record_creates_an_absent_record_without_replacing() {
+    let ops = FakeServiceOps::without_records();
+    let record = record_service_revocations(&ops, &[revoked(4)]).unwrap();
+    assert!(record.contains(&thumb(4)));
+    assert_eq!(
+        ops.writes(),
+        vec!["CREATE dir tls-revocations", "CREATE file revocations.txt"]
+    );
+    assert_eq!(ops.stored().unwrap(), record);
+
+    let ops = FakeServiceOps::with_record(&[]);
+    ops.files.borrow_mut().clear();
+    *ops.raced.borrow_mut() = Some(encoded(&[8]));
+    let record = record_service_revocations(&ops, &[revoked(4)]).unwrap();
+    assert!(record.contains(&thumb(4)) && record.contains(&thumb(8)));
+    assert_eq!(
+        ops.writes(),
+        vec![
+            "CREATE file revocations.txt",
+            "WRITE replace revocations.txt"
+        ]
+    );
+    assert_eq!(ops.stored().unwrap(), record);
+}
+
+/// 壊れた記録・通らない置き場には書かない（作り直すのは elev の `--renew`）。作れないのは
+/// `Transient`。
+#[test]
+fn scene_8_record_refuses_broken_untrusted_or_unwritable_records() {
+    let ops = FakeServiceOps::with_record(&[]);
+    ops.put(b"garbage");
+    let found = record_service_revocations(&ops, &[revoked(1)]).expect_err("壊れている");
+    assert_eq!(found.fault, ServiceRevocationFault::Broken);
+    assert_eq!(ops.writes(), Vec::<String>::new());
+
+    let ops = FakeServiceOps::with_record(&[]);
+    ops.dirs.borrow_mut().get_mut(&records()).unwrap().owner = EVIL.to_string();
+    let found = record_service_revocations(&ops, &[revoked(1)]).expect_err("通らない");
+    assert_eq!(found.fault, ServiceRevocationFault::Untrusted);
+    assert_eq!(ops.writes(), Vec::<String>::new());
+
+    let mut ops = FakeServiceOps::without_records();
+    ops.dirs
+        .borrow_mut()
+        .insert(records(), DirEntry::users_read());
+    ops.create_error = Some("ディスクが一杯".to_string());
+    let found = record_service_revocations(&ops, &[revoked(1)]).expect_err("作れない");
+    assert_eq!(found.fault, ServiceRevocationFault::Transient);
+    assert!(found.reason.contains("ディスクが一杯"), "{found:#?}");
+}
+
+/// 露出の種類分け: 許可は露出、所有者だけなら所有者の違い、ハードリンク・reparse point だけなら
+/// それ以外（失効に入れない）。
+#[test]
+fn exposure_fault_separates_exposure_owner_and_links() {
+    use banto_safe_root::acl::Exposure;
+    let allows = Exposure::AllowsOther {
+        ace_type: 0,
+        flags: 0,
+        mask: MODIFY_ACCESS_MASK,
+        sid: USERS.to_string(),
+    };
+    let owner = Exposure::ForeignOwner(EVIL.to_string());
+    assert_eq!(
+        exposure_fault(&[owner.clone(), allows.clone()]),
+        PlaceFault::Exposed
+    );
+    assert_eq!(exposure_fault(&[Exposure::NullDacl]), PlaceFault::Exposed);
+    assert_eq!(
+        exposure_fault(&[Exposure::HardLinked(2), owner]),
+        PlaceFault::ForeignOwner
+    );
+    assert_eq!(
+        exposure_fault(&[Exposure::HardLinked(2), Exposure::ReparsePoint]),
+        PlaceFault::Other
+    );
+    assert!(PlaceFault::Exposed.revokes() && PlaceFault::ForeignOwner.revokes());
+    assert!(!PlaceFault::Other.revokes());
+}
+
+/// 置き場の確かめが返す種類: `tls\` の露出・所有者の違いは失効に入る種類、リンク・無いは入らない。
+#[test]
+fn open_place_marks_exposure_and_foreign_owner() {
+    let ops = FakeServiceOps::without_records();
+    ops.dirs
+        .borrow_mut()
+        .get_mut(&super::tls())
+        .unwrap()
+        .aces
+        .push(ace(USERS, MODIFY_ACCESS_MASK, 0x03));
+    assert_eq!(open_place(&ops).err().unwrap().fault, PlaceFault::Exposed);
+
+    let ops = FakeServiceOps::without_records();
+    ops.dirs.borrow_mut().get_mut(&super::tls()).unwrap().owner = EVIL.to_string();
+    assert_eq!(
+        open_place(&ops).err().unwrap().fault,
+        PlaceFault::ForeignOwner
+    );
+
+    let ops = FakeServiceOps::without_records();
+    ops.dirs
+        .borrow_mut()
+        .get_mut(&super::tls())
+        .unwrap()
+        .is_reparse_point = true;
+    assert_eq!(open_place(&ops).err().unwrap().fault, PlaceFault::Other);
+
+    let ops = FakeServiceOps::without_records();
+    ops.dirs.borrow_mut().remove(&super::tls());
+    assert_eq!(open_place(&ops).err().unwrap().fault, PlaceFault::Other);
+}
+
+/// 形だけ読む: 露出した `tls\` の中の証明書の拇印も読む（失効に入れるため）。無ければ `None`。
+#[test]
+fn peek_reads_the_certificate_thumbprint_without_checking_exposure() {
+    let ops = FakeServiceOps::without_records();
+    assert_eq!(peek_service_cert(&ops), None);
+    let cert = super::cert_pem().into_bytes();
+    ops.files
+        .borrow_mut()
+        .insert(super::tls().join(CERT_FILE), FileEntry::users_read(&cert));
+    ops.dirs
+        .borrow_mut()
+        .get_mut(&super::tls())
+        .unwrap()
+        .aces
+        .push(ace(USERS, MODIFY_ACCESS_MASK, 0x03));
+    assert_eq!(
+        peek_service_cert(&ops),
+        Some(CertThumbprint::of_pem(&cert).unwrap())
+    );
+}

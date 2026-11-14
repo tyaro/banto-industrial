@@ -13,9 +13,35 @@ type FileEdit = Box<dyn Fn(&mut FileEntry)>;
 
 /// 読めなかった: 理由・対処を返し、書き込み・作成・直列化の mutex を一切触っていない。
 fn assert_unavailable(ops: &FakeOps, needle: &str) -> DefaultTlsUnavailable {
+    let found = assert_refused(ops, needle);
+    assert_eq!(ops.writes(), Vec::<String>::new(), "{found:#?}");
+    found
+}
+
+/// 露出・所有者の違い（#1121 PR2c、場面 8）: 断る前に、ディスク上の証明書の拇印をサービスの
+/// 記録に書く（`tls\` には書かない）。
+fn assert_recorded(ops: &FakeOps, needle: &str, cert_pem: &str) -> DefaultTlsUnavailable {
+    let found = assert_refused(ops, needle);
+    let thumbprint = CertThumbprint::of_pem(cert_pem.as_bytes()).unwrap();
+    assert!(
+        found.reason.contains("失効の記録に書きました"),
+        "{found:#?}"
+    );
+    assert!(found.reason.contains(&thumbprint.to_string()), "{found:#?}");
+    assert_eq!(ops.writes(), vec!["WRITE replace revocations.txt"]);
+    let record = ops.record().unwrap();
+    assert!(record.contains(&thumbprint), "{record:#?}");
+    assert!(record
+        .entries()
+        .iter()
+        .all(|entry| entry.place == RevokedCertPlace::Service && entry.recorded_at == NOW as u64));
+    found
+}
+
+/// 断った: 理由・対処を返し、直列化の mutex を触っていない。ログの行に鍵を出さない。
+fn assert_refused(ops: &FakeOps, needle: &str) -> DefaultTlsUnavailable {
     let found = load_default_identity(ops).expect_err("読めないはず");
     assert!(found.reason.contains(needle), "{needle} が無い: {found:#?}");
-    assert_eq!(ops.writes(), Vec::<String>::new(), "{found:#?}");
     assert!(
         !ops.calls().iter().any(|c| c == "lock"),
         "{:#?}",
@@ -145,30 +171,38 @@ fn default_tls_refuses_only_one_of_the_pair() {
 
 #[test]
 fn default_tls_refuses_an_exposed_key_or_certificate() {
-    let key_cases: Vec<FileEdit> = vec![
-        Box::new(|f| {
-            f.security
-                .dacl
-                .aces
-                .as_mut()
-                .unwrap()
-                .push(ace(USERS, READ_EXECUTE_ACCESS_MASK, 0))
-        }),
-        Box::new(|f| f.security.dacl.owner = EVIL.to_string()),
-        Box::new(|f| f.security.links = 2),
-        Box::new(|f| f.security.dacl.aces = None),
+    // (形を変える手, 失効に入れるか)。ハードリンクだけは入れない（#1121 PR2c）。
+    let key_cases: Vec<(FileEdit, bool)> = vec![
+        (
+            Box::new(|f| {
+                f.security
+                    .dacl
+                    .aces
+                    .as_mut()
+                    .unwrap()
+                    .push(ace(USERS, READ_EXECUTE_ACCESS_MASK, 0))
+            }),
+            true,
+        ),
+        (Box::new(|f| f.security.dacl.owner = EVIL.to_string()), true),
+        (Box::new(|f| f.security.links = 2), false),
+        (Box::new(|f| f.security.dacl.aces = None), true),
     ];
-    for edit in key_cases {
+    for (edit, revokes) in key_cases {
         let (ops, identity) = FakeOps::with_identity();
         ops.edit_file(KEY_FILE, |f| edit(f));
-        let found = assert_unavailable(&ops, "秘密鍵");
+        let found = if revokes {
+            assert_recorded(&ops, "秘密鍵", &identity.cert_pem)
+        } else {
+            assert_unavailable(&ops, "秘密鍵")
+        };
         assert!(found.reason.contains("保護されていません"), "{found:#?}");
         assert!(found.remedy.contains("--renew"), "{found:#?}");
         assert!(found.remedy.contains("hub_tls_pinned_certs"), "{found:#?}");
         assert_no_key_material(&found.log_lines(), Some(&identity.key_pem));
     }
 
-    let (ops, _identity) = FakeOps::with_identity();
+    let (ops, identity) = FakeOps::with_identity();
     ops.edit_file(CERT_FILE, |f| {
         f.security
             .dacl
@@ -177,7 +211,7 @@ fn default_tls_refuses_an_exposed_key_or_certificate() {
             .unwrap()
             .push(ace(USERS, MODIFY_ACCESS_MASK, 0))
     });
-    let found = assert_unavailable(&ops, "証明書（");
+    let found = assert_recorded(&ops, "証明書（", &identity.cert_pem);
     assert!(found.remedy.contains("--renew"), "{found:#?}");
 }
 
@@ -227,39 +261,75 @@ fn default_tls_refuses_directories_links_misplaced_or_busy_files() {
 }
 
 /// 一般の利用者が作った・書ける `tls\`（実行した管理者が所有者のものも、サービスは本人を
-/// 知らないので断る）・リンク・別の場所: 中のファイルは開かず、消して作り直す案内。
+/// 知らないので断る）・リンク・別の場所: 鍵は開かず、消して作り直す案内。露出・所有者の違い
+/// なら、証明書だけを形だけ読んで、その拇印をサービスの記録に書く（#1121 PR2c）。リンク・別の
+/// 場所は中のファイルを開かない。
 #[test]
 fn default_tls_refuses_a_foreign_exposed_or_linked_tls_dir() {
-    let cases: Vec<(DirEdit, &str)> = vec![
-        (Box::new(|e| e.owner = EVIL.to_string()), "所有者"),
-        (Box::new(|e| e.owner = ME.to_string()), "所有者"),
+    let cases: Vec<(DirEdit, &str, bool)> = vec![
+        (Box::new(|e| e.owner = EVIL.to_string()), "所有者", true),
+        (Box::new(|e| e.owner = ME.to_string()), "所有者", true),
         (
             Box::new(|e| e.aces.push(ace(USERS, MODIFY_ACCESS_MASK, 0x03))),
             "保護されていません",
+            true,
         ),
         (
             Box::new(|e| e.aces.push(ace("S-1-1-0", READ_EXECUTE_ACCESS_MASK, 0x03))),
             "保護されていません",
+            true,
         ),
-        (Box::new(|e| e.is_reparse_point = true), "reparse point"),
+        (
+            Box::new(|e| e.is_reparse_point = true),
+            "reparse point",
+            false,
+        ),
         (
             Box::new(|e| e.real = Some(abs("Elsewhere/tls"))),
             "期待と違います",
+            false,
         ),
     ];
-    for (edit, needle) in cases {
-        let (ops, _identity) = FakeOps::with_identity();
+    for (edit, needle, revokes) in cases {
+        let (ops, identity) = FakeOps::with_identity();
         let mut entry = DirEntry::users_read();
         edit(&mut entry);
         ops.dirs.borrow_mut().insert(tls(), entry);
-        let found = assert_unavailable(&ops, needle);
+        let found = if revokes {
+            assert_recorded(&ops, needle, &identity.cert_pem)
+        } else {
+            assert_unavailable(&ops, needle)
+        };
         assert!(found.remedy.contains("消して"), "{found:#?}");
-        assert!(
-            !ops.calls().iter().any(|c| c.starts_with("open_file")),
-            "{:#?}",
-            ops.calls()
-        );
+        let opened: Vec<String> = ops
+            .calls()
+            .into_iter()
+            .filter(|c| c.starts_with("open_file"))
+            .collect();
+        let expected: Vec<String> = if revokes {
+            vec![
+                format!("open_file {CERT_FILE}"),
+                "open_file revocations.txt".to_string(),
+            ]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(opened, expected);
     }
+}
+
+/// 露出を見たのに記録に書けない（#1121 PR2c）: 書けなかったことを理由に足して、TLS 無しで起動する。
+#[test]
+fn default_tls_reports_an_exposure_it_could_not_record() {
+    let (mut ops, identity) = FakeOps::with_identity();
+    ops.create_error
+        .insert("revocations.txt".to_string(), "ディスクが一杯".to_string());
+    ops.edit_file(KEY_FILE, |f| f.security.dacl.aces = None);
+    let found = assert_refused(&ops, "秘密鍵");
+    assert!(found.reason.contains("書けませんでした"), "{found:#?}");
+    assert!(found.reason.contains("ディスクが一杯"), "{found:#?}");
+    let thumbprint = CertThumbprint::of_pem(identity.cert_pem.as_bytes()).unwrap();
+    assert!(!ops.record().unwrap().contains(&thumbprint));
 }
 
 /// 保護されていないルート（一般の利用者・実行した管理者が所有者、乗っ取りの権利）: `tls\` を
