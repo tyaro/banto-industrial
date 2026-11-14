@@ -447,10 +447,10 @@ impl CollectionGroupService {
 
         let mut count_builder: QueryBuilder<Sqlite> =
             QueryBuilder::new("SELECT COUNT(*) FROM collection_groups");
-        banto_storage::list_query::sqlite::append_where(
+        banto_storage::list_query::sqlite::append_list_where(
             &mut count_builder,
             &columns,
-            &params.filters,
+            &params,
         )?;
         let total_count: i64 = count_builder
             .build_query_scalar()
@@ -1375,6 +1375,7 @@ mod tests {
 
         let result = svc
             .list(ListParams {
+                search: None,
                 sort: vec![SortState {
                     field: "periodMs".to_string(),
                     direction: SortDirection::Desc,

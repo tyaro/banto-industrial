@@ -1351,10 +1351,10 @@ impl WriteAuditService {
 
         let mut count_builder: QueryBuilder<Sqlite> =
             QueryBuilder::new("SELECT COUNT(*) FROM hub_write_audit");
-        banto_storage::list_query::sqlite::append_where(
+        banto_storage::list_query::sqlite::append_list_where(
             &mut count_builder,
             &columns,
-            &params.filters,
+            &params,
         )?;
         let total_count: i64 = count_builder
             .build_query_scalar()

@@ -1528,10 +1528,10 @@ impl PlcConnectionService {
 
         let mut count_builder: QueryBuilder<Sqlite> =
             QueryBuilder::new("SELECT COUNT(*) FROM plc_connections");
-        banto_storage::list_query::sqlite::append_where(
+        banto_storage::list_query::sqlite::append_list_where(
             &mut count_builder,
             &columns,
-            &params.filters,
+            &params,
         )?;
         let total_count: i64 = count_builder
             .build_query_scalar()
@@ -4871,6 +4871,7 @@ mod tests {
         // (design §7) - sort/filter by `name` instead.
         let result = svc
             .list(ListParams {
+                search: None,
                 sort: vec![SortState {
                     field: "name".to_string(),
                     direction: SortDirection::Desc,
