@@ -473,6 +473,9 @@ fn creates_and_rebuilds_the_service_record_and_the_hub_checks_it() {
         .trim_matches('"')
         .to_string();
     icacls(&root, &["/setowner", "*S-1-5-32-544"]);
+    // 本人のフルは CREATOR OWNER から継承した ACE なので、`/remove:g` は継承を切ってから
+    // （継承していた ACE を明示の ACE に写してから）でないと外れない。
+    icacls(&root, &["/inheritance:d"]);
     icacls(&root, &["/remove:g", &format!("*{sid}")]);
     if let Err(found) = load_default_identity(&f.ops) {
         panic!("サービスの読み込みが断った: {found:#?}");
