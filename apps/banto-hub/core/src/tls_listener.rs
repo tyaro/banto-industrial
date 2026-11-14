@@ -528,10 +528,14 @@ mod tests {
         plain.stop().await;
     }
 
-    /// #1121 PR2a: TLS の経路でも、握ったポートを `SO_REUSEADDR` の別ソケットが奪えない。
+    /// #1121 PR2a: TLS の経路で、握った 127.0.0.1 のポートを同じ利用者の `SO_REUSEADDR` の
+    /// 別ソケットが奪えない（回帰の確認）。127.0.0.1 では `SO_EXCLUSIVEADDRUSE` が無くても
+    /// 断られるので、付与そのものの確認は `bind_exclusive` の
+    /// `bound_listener_has_exclusive_addr_use` が行う（`start` が持つ listener は task に
+    /// 渡るので、ここからは getsockopt できない）。
     #[cfg(windows)]
     #[tokio::test]
-    async fn tls_listener_port_cannot_be_taken_with_reuseaddr() {
+    async fn tls_listener_loopback_port_rejects_reuseaddr_bind() {
         use socket2::{Domain, Socket, Type};
 
         let key_pair = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();

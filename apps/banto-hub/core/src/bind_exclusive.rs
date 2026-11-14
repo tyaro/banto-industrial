@@ -1,20 +1,24 @@
 //! 待ち受けソケットの bind（#1121 PR2a、docs/hub-desktop-tls-design.md §4.5 の 2.）。
 //!
-//! Windows では、`SO_EXCLUSIVEADDRUSE` を付けずに bind したポートへ、ほかのプロセスが
-//! `SO_REUSEADDR` を付けて同じアドレスで bind でき、接続の振り分けを奪える場合がある
-//! （ポートの先取り）。Hub は loopback で API キーや ログイン情報を受けるので、bind の
-//! 前に必ず `SO_EXCLUSIVEADDRUSE` を付けて、握った後は同じアドレスに誰も bind できない
-//! ようにする。Windows 以外は今までどおり `TcpListener::bind`（`SO_REUSEADDR` の扱いを
-//! 勝手に変えない）。
+//! Windows では bind の前に `SO_EXCLUSIVEADDRUSE` を付ける。効き方はアドレスで違う
+//! （この PC の Windows 11 で同じ利用者のソケットを使って確かめた結果）:
+//!
+//! - 127.0.0.1 に bind するとき（8723 のシェル専用の待ち受け）: 同じ利用者が
+//!   `SO_REUSEADDR` 付きで同じアドレスへ bind しても、`SO_EXCLUSIVEADDRUSE` の有無に
+//!   かかわらず断られる。ここでは別の利用者の bind への守り・二重の守りとして付ける。
+//! - ワイルドカード（0.0.0.0）に bind するとき: 付けないと、別のソケットがより具体的な
+//!   127.0.0.1 を後から取れて先取りされる。付ければ断られる。効くのは主にこちら。
+//!
+//! 平文の 8722 は `banto_server::start`（上流 crate）の中で bind されるので、ここからは
+//! 差し替えられない。設計（§4.5 の 2.）が求めるのはシェル専用の待ち受けと 8723 で、8722 は
+//! ワイルドカード（LAN）で bind すると上の先取りを受けうる。上流 banto に bind 済みの
+//! listener を受け取る口が要る（別 Issue）。
 //!
 //! 文字列（`host:port`）の解決は `TcpListener::bind` と同じく `lookup_host` の結果を順に
 //! 試し、最初に bind できたものを使う。失敗は最後のエラーをそのまま返すので、
 //! `io::ErrorKind`（`AddrInUse` / `PermissionDenied` など）を見る
-//! `runtime::bind_error_allows_port_fallback` の判定はそのまま効く。
-//!
-//! 平文の 8722 は `banto_server::start`（上流 crate）の中で bind されるので、ここからは
-//! 差し替えられない。上流が bind 済みの listener を受け取る API を持った時点で
-//! この関数へ寄せる（#1121 PR2a の持ち越し）。
+//! `runtime::bind_error_allows_port_fallback` の判定はそのまま効く。Windows 以外は
+//! `TcpListener::bind` をそのまま使う。
 
 use std::io;
 use std::net::SocketAddr;
@@ -25,7 +29,7 @@ use tokio::net::{lookup_host, TcpListener, ToSocketAddrs};
 pub(crate) async fn bind_exclusive(addr: impl ToSocketAddrs) -> io::Result<TcpListener> {
     let mut last_err = None;
     for candidate in lookup_host(addr).await? {
-        match bind_one(candidate) {
+        match bind_one(candidate).await {
             Ok(listener) => return Ok(listener),
             Err(err) => last_err = Some(err),
         }
@@ -39,7 +43,7 @@ pub(crate) async fn bind_exclusive(addr: impl ToSocketAddrs) -> io::Result<TcpLi
 }
 
 #[cfg(windows)]
-fn bind_one(addr: SocketAddr) -> io::Result<TcpListener> {
+async fn bind_one(addr: SocketAddr) -> io::Result<TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
 
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
@@ -78,11 +82,8 @@ fn set_exclusive_addr_use(socket: &socket2::Socket) -> io::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn bind_one(addr: SocketAddr) -> io::Result<TcpListener> {
-    // 同期の bind は tokio の `TcpListener::bind` と同じ（std で bind → nonblocking）。
-    let std_listener = std::net::TcpListener::bind(addr)?;
-    std_listener.set_nonblocking(true)?;
-    TcpListener::from_std(std_listener)
+async fn bind_one(addr: SocketAddr) -> io::Result<TcpListener> {
+    TcpListener::bind(addr).await
 }
 
 #[cfg(all(test, windows))]
@@ -90,18 +91,52 @@ mod tests {
     use super::*;
     use socket2::{Domain, Socket, Type};
 
-    /// 別ソケットが `SO_REUSEADDR` 付きで同じアドレスへ bind を試みる。
-    pub(crate) fn reuse_bind_fails(addr: SocketAddr) -> bool {
-        let socket = Socket::new(Domain::for_address(addr), Type::STREAM, None).unwrap();
-        socket.set_reuse_address(true).unwrap();
-        socket.bind(&addr.into()).is_err()
+    /// `getsockopt(SOL_SOCKET, SO_EXCLUSIVEADDRUSE)` の値。
+    pub(crate) fn exclusive_addr_use(listener: &TcpListener) -> u32 {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{
+            getsockopt, SOCKET, SOCKET_ERROR, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+        };
+
+        let mut value: u32 = 0;
+        let mut len = size_of::<u32>() as i32;
+        // SAFETY: ソケットは生きており、値は 4 バイトの u32 を指して長さも 4。
+        let rc = unsafe {
+            getsockopt(
+                listener.as_raw_socket() as SOCKET,
+                SOL_SOCKET,
+                SO_EXCLUSIVEADDRUSE,
+                (&raw mut value).cast::<u8>(),
+                &mut len,
+            )
+        };
+        assert_ne!(rc, SOCKET_ERROR, "{}", io::Error::last_os_error());
+        value
     }
 
+    /// 修正の有無で結果が変わる試験: `SO_EXCLUSIVEADDRUSE` が実際に付いている。
     #[tokio::test]
-    async fn reuseaddr_socket_cannot_take_an_exclusively_bound_port() {
+    async fn bound_listener_has_exclusive_addr_use() {
+        let listener = bind_exclusive("127.0.0.1:0").await.unwrap();
+        assert_eq!(exclusive_addr_use(&listener), 1);
+    }
+
+    /// 比較の対照: 素の `TcpListener::bind` では付かない（上の試験が意味を持つ確認）。
+    #[tokio::test]
+    async fn plain_bind_has_no_exclusive_addr_use() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        assert_eq!(exclusive_addr_use(&listener), 0);
+    }
+
+    /// 127.0.0.1 では同じ利用者の `SO_REUSEADDR` の bind は元から断られる（付与の有無に
+    /// よらない）ので、これは回帰の確認で、修正の有無は上の試験が確かめる。
+    #[tokio::test]
+    async fn reuseaddr_socket_cannot_take_a_loopback_port() {
         let listener = bind_exclusive("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        assert!(reuse_bind_fails(addr), "{addr} was taken over");
+        let socket = Socket::new(Domain::for_address(addr), Type::STREAM, None).unwrap();
+        socket.set_reuse_address(true).unwrap();
+        assert!(socket.bind(&addr.into()).is_err(), "{addr} was taken over");
     }
 
     #[tokio::test]
