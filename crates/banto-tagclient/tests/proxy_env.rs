@@ -21,7 +21,7 @@ use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 const DUMMY_KEY: &str = "bh_squatdummy.6f1c2a9e0d4b7381";
 const CATALOG: &str = r#"{"revision":1,"run_id":2,"collection_mode":"configured","tags":[]}"#;
 
-/// 本物の Hub の代わり。台帳（keep-alive で何度でも）と WebSocket の握手に答え、
+/// 本物の Hub の代わり。台帳（接続ごとに 1 要求）と WebSocket の握手に答え、
 /// 受けた要求の先頭部分をすべて `heads` に記録する。
 async fn real_hub(identity: &TestIdentity) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -40,7 +40,7 @@ async fn real_hub(identity: &TestIdentity) -> (SocketAddr, Arc<Mutex<Vec<String>
                 let Ok(mut stream) = acceptor.accept(stream).await else {
                     return;
                 };
-                while let Some(head) = read_head(&mut stream).await {
+                if let Some(head) = read_head(&mut stream).await {
                     heads.lock().unwrap().push(head.clone());
                     if head.to_ascii_lowercase().contains("upgrade: websocket") {
                         let key = head
@@ -68,7 +68,6 @@ async fn real_hub(identity: &TestIdentity) -> (SocketAddr, Arc<Mutex<Vec<String>
                     );
                     let _ = stream.write_all(response.as_bytes()).await;
                     let _ = stream.shutdown().await;
-                    return;
                 }
             });
         }
