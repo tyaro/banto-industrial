@@ -1975,7 +1975,7 @@ fn unsupported_kind_error(
 fn column_map() -> ColumnMap {
     ColumnMap::new()
         .column("id", "id")
-        .column("name", "name")
+        .text_column("name", "name")
         .column("collectionGroupId", "collection_group_id")
         .column("address", "address")
         .column("dataType", "data_type")
@@ -2443,10 +2443,10 @@ impl TagService {
 
         let mut count_builder: QueryBuilder<Sqlite> =
             QueryBuilder::new("SELECT COUNT(*) FROM tags");
-        banto_storage::list_query::sqlite::append_where(
+        banto_storage::list_query::sqlite::append_list_where(
             &mut count_builder,
             &columns,
-            &params.filters,
+            &params,
         )?;
         let total_count: i64 = count_builder
             .build_query_scalar()
@@ -7146,6 +7146,7 @@ mod tests {
 
         let result = svc
             .list(ListParams {
+                search: None,
                 sort: vec![SortState {
                     field: "decimals".to_string(),
                     direction: SortDirection::Desc,
@@ -7166,6 +7167,17 @@ mod tests {
         assert_eq!(result.total_count, 2);
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].name, "C");
+
+        let searched = svc
+            .list(ListParams {
+                search: Some("B".to_string()),
+                ..ListParams::default()
+            })
+            .await
+            .expect("name search should succeed");
+        assert_eq!(searched.total_count, 1);
+        assert_eq!(searched.rows.len(), 1);
+        assert_eq!(searched.rows[0].name, "B");
     }
 
     // --- count_by_group (T18-5a 第2段, docs/banto-hub-t18-design.md §4 決定6) --

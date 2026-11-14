@@ -304,7 +304,7 @@ fn column_map() -> ColumnMap {
         .column("apiKeyNameSnapshot", "api_key_name_snapshot")
         .column("apiKeyPrefixSnapshot", "api_key_prefix_snapshot")
         .column("tagId", "tag_id")
-        .column("externalNameSnapshot", "external_name_snapshot")
+        .text_column("externalNameSnapshot", "external_name_snapshot")
         .column("valueRequested", "value_requested")
         .column("valueRequestedText", "value_requested_text")
         .column("action", "action")
@@ -1351,10 +1351,10 @@ impl WriteAuditService {
 
         let mut count_builder: QueryBuilder<Sqlite> =
             QueryBuilder::new("SELECT COUNT(*) FROM hub_write_audit");
-        banto_storage::list_query::sqlite::append_where(
+        banto_storage::list_query::sqlite::append_list_where(
             &mut count_builder,
             &columns,
-            &params.filters,
+            &params,
         )?;
         let total_count: i64 = count_builder
             .build_query_scalar()
@@ -1407,6 +1407,27 @@ mod tests {
         assert_eq!(row.value_requested, Some(42.5));
         assert_eq!(row.action, "write");
         assert_eq!(row.result, "ok");
+    }
+
+    #[tokio::test]
+    async fn list_search_matches_external_name_snapshot_and_counts_matches() {
+        let svc = service().await;
+        svc.insert_row(&sample_row()).await.unwrap();
+        let mut other = sample_row();
+        other.external_name_snapshot = "line1.fast.pressure".to_string();
+        svc.insert_row(&other).await.unwrap();
+
+        let result = svc
+            .list(ListParams {
+                search: Some("temp01".to_string()),
+                ..ListParams::default()
+            })
+            .await
+            .expect("external name search should succeed");
+
+        assert_eq!(result.total_count, 1);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].external_name_snapshot, "line1.fast.temp01");
     }
 
     /// #713: キーを削除した後も、監査行から名前とプレフィックスが読める。

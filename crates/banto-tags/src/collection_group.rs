@@ -366,7 +366,7 @@ fn push_group_move_error(
 fn column_map() -> ColumnMap {
     ColumnMap::new()
         .column("id", "id")
-        .column("name", "name")
+        .text_column("name", "name")
         .column("plcConnectionId", "plc_connection_id")
         .column("periodMs", "period_ms")
         .column("enabled", "enabled")
@@ -447,10 +447,10 @@ impl CollectionGroupService {
 
         let mut count_builder: QueryBuilder<Sqlite> =
             QueryBuilder::new("SELECT COUNT(*) FROM collection_groups");
-        banto_storage::list_query::sqlite::append_where(
+        banto_storage::list_query::sqlite::append_list_where(
             &mut count_builder,
             &columns,
-            &params.filters,
+            &params,
         )?;
         let total_count: i64 = count_builder
             .build_query_scalar()
@@ -1375,6 +1375,7 @@ mod tests {
 
         let result = svc
             .list(ListParams {
+                search: None,
                 sort: vec![SortState {
                     field: "periodMs".to_string(),
                     direction: SortDirection::Desc,
@@ -1395,6 +1396,53 @@ mod tests {
         assert_eq!(result.total_count, 2);
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].name, "C");
+    }
+
+    #[tokio::test]
+    async fn list_search_matches_name_and_counts_only_matching_rows() {
+        let (_plc_svc, svc, conn_id) = setup().await;
+        for (name, period_ms) in [("Alpha East", 100), ("Alpha West", 1_000), ("Beta", 5_000)] {
+            let mut input = sample_input(name, conn_id);
+            input.period_ms = period_ms;
+            svc.create(input).await.unwrap();
+        }
+
+        let result = svc
+            .list(ListParams {
+                search: Some("lph".to_string()),
+                filters: vec![FilterState {
+                    field: "periodMs".to_string(),
+                    op: FilterOp::Gte,
+                    value: json!(1_000),
+                }],
+                ..ListParams::default()
+            })
+            .await
+            .expect("search should succeed");
+
+        assert_eq!(result.total_count, 1);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].name, "Alpha West");
+    }
+
+    #[tokio::test]
+    async fn list_search_treats_wildcards_as_literal_characters() {
+        let (_plc_svc, svc, conn_id) = setup().await;
+        for name in ["Alpha_East", "AlphaXEast"] {
+            svc.create(sample_input(name, conn_id)).await.unwrap();
+        }
+
+        let result = svc
+            .list(ListParams {
+                search: Some("a_E".to_string()),
+                ..ListParams::default()
+            })
+            .await
+            .expect("literal wildcard search should succeed");
+
+        assert_eq!(result.total_count, 1);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].name, "Alpha_East");
     }
 
     // --- S2 (docs/banto-hub-external-db-design.md §4.2): `query_sql` の

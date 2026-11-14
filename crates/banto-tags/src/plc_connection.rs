@@ -1306,7 +1306,7 @@ fn column_map() -> ColumnMap {
     // `ListParams::default()`).
     ColumnMap::new()
         .column("id", "id")
-        .column("name", "name")
+        .text_column("name", "name")
         .column("protocol", "protocol")
         .column("enabled", "enabled")
         .column("simulation", "simulation")
@@ -1528,10 +1528,10 @@ impl PlcConnectionService {
 
         let mut count_builder: QueryBuilder<Sqlite> =
             QueryBuilder::new("SELECT COUNT(*) FROM plc_connections");
-        banto_storage::list_query::sqlite::append_where(
+        banto_storage::list_query::sqlite::append_list_where(
             &mut count_builder,
             &columns,
-            &params.filters,
+            &params,
         )?;
         let total_count: i64 = count_builder
             .build_query_scalar()
@@ -4871,6 +4871,7 @@ mod tests {
         // (design §7) - sort/filter by `name` instead.
         let result = svc
             .list(ListParams {
+                search: None,
                 sort: vec![SortState {
                     field: "name".to_string(),
                     direction: SortDirection::Desc,
@@ -4891,6 +4892,17 @@ mod tests {
         assert_eq!(result.total_count, 2);
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].name, "C");
+
+        let searched = svc
+            .list(ListParams {
+                search: Some("B".to_string()),
+                ..ListParams::default()
+            })
+            .await
+            .expect("name search should succeed");
+        assert_eq!(searched.total_count, 1);
+        assert_eq!(searched.rows.len(), 1);
+        assert_eq!(searched.rows[0].name, "B");
     }
 
     // --- #383 段階3 P2: "hub" (this module's doc comment, "`\"hub\"`" section).
