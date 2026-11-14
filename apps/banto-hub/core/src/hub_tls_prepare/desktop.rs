@@ -10,11 +10,11 @@ use std::time::{Duration, Instant};
 
 use banto_hub_tls_trust::win::{WinTlsDir, WindowsTlsTrustOps};
 use banto_hub_tls_trust::{
-    check_place_layout, open_user_file, open_user_place, peek_user_cert, read_user_revocations,
-    reconcile_user_revocations, record_user_revocation, user_place_problems, CertThumbprint,
-    CheckedUserPlace, DefaultUserTlsPlace, FileOpenError, ReconcileOptions, ReconcileOutcome,
-    RevocationOps, RevokedCertPlace, TlsFile, UncheckedUserCert, UserFileRole, UserPlaceKind,
-    UserPlaceProblem, UserPlaceState, UserTlsPlace, DEFAULT_LOCK_POLL,
+    check_place_layout, check_spec, open_user_file, open_user_place, peek_user_cert,
+    read_user_revocations, reconcile_user_revocations, record_user_revocation, user_place_problems,
+    CertThumbprint, CheckedUserPlace, DefaultUserTlsPlace, FileOpenError, ReconcileOptions,
+    ReconcileOutcome, RevocationOps, RevokedCertPlace, TlsFile, TlsTrustOps, UncheckedUserCert,
+    UserFileRole, UserPlaceKind, UserPlaceProblem, UserPlaceState, UserTlsPlace,
 };
 use banto_safe_root::acl::PinnedFile;
 use banto_safe_root::guard::paths_match;
@@ -33,6 +33,55 @@ fn unavailable(reason: impl Into<String>) -> DefaultTlsUnavailable {
     DefaultTlsUnavailable {
         reason: reason.into(),
         remedy: "Hub を閉じ、ログの理由と TLS・失効の記録の置き場の所有者・アクセス許可を確かめてください。本体の TLS の組が壊れた・失効した場合や、本体の鍵・証明書・置き場に露出や所有者の異常を見た場合は、ACL を直すだけでは漏れた鍵は無効になりません。利用者の TLS フォルダ（既定は %LOCALAPPDATA%\\BantoHub\\tls）だけを、中身を確認してフォルダごと削除し、Hub のデスクトップ版を再起動してください。親の置き場の所有者・アクセス許可が異常なら先に直してください。失効の記録は消さないでください".into(),
+    }
+}
+
+/// 文字列の内容から対処を推測しない。証明書が確実に無い場合だけ、作り直しを案内しない。
+#[derive(Debug)]
+struct DesktopFailure {
+    reason: String,
+    remedy: DesktopRemedy,
+}
+
+#[derive(Debug)]
+enum DesktopRemedy {
+    InspectAndRecreate,
+    RepairPlaceOnly,
+    InspectRemainingKey,
+}
+
+impl From<String> for DesktopFailure {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            remedy: DesktopRemedy::InspectAndRecreate,
+        }
+    }
+}
+
+impl From<&str> for DesktopFailure {
+    fn from(reason: &str) -> Self {
+        reason.to_string().into()
+    }
+}
+
+impl std::fmt::Display for DesktopFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl DesktopFailure {
+    fn into_unavailable(self) -> DefaultTlsUnavailable {
+        let remedy = match self.remedy {
+            DesktopRemedy::InspectAndRecreate => return unavailable(self.reason),
+            DesktopRemedy::RepairPlaceOnly => "証明書も鍵もありません。Hub を閉じ、置き場と親の置き場の所有者・アクセス許可を修復してから、Hub のデスクトップ版を再起動してください",
+            DesktopRemedy::InspectRemainingKey => "証明書はありません。Hub を閉じ、利用者の TLS フォルダの中身を確認してください。鍵が残る場合はフォルダごと削除して作り直してください。鍵も無い場合は、置き場と親の置き場の所有者・アクセス許可を修復してから再起動してください。失効の記録は消さないでください",
+        };
+        DefaultTlsUnavailable {
+            reason: self.reason,
+            remedy: remedy.into(),
+        }
     }
 }
 
@@ -101,7 +150,8 @@ fn select_default<T>(
 pub fn load_desktop_identity() -> Result<DefaultHubTls, DefaultTlsUnavailable> {
     let ops = WindowsTlsTrustOps;
     let place = DefaultUserTlsPlace::resolve(&ops).map_err(|error| unavailable(error.reason))?;
-    load_in(&ops, &place, &ReconcileOptions::default(), now_unix()).map_err(unavailable)
+    load_in(&ops, &place, &ReconcileOptions::default(), now_unix())
+        .map_err(DesktopFailure::into_unavailable)
 }
 
 /// 利用者向けの 8723 の競合の案内（サービス・別のプロファイルが待ち受けている場合も含む）。
@@ -116,15 +166,57 @@ fn now_unix() -> i64 {
     i64::try_from(WindowsTlsTrustOps.now_unix_seconds()).unwrap_or(i64::MAX)
 }
 
+/// 対処のための存在確認だけ（信頼や読み込みの入口ではない）。所有者・ACL が通らない場所でも
+/// 起点から親のハンドル基準で辿らずに開き、祖先を保持する。鍵の内容は一切読まない。
+/// 途中がリンク・種類違い・I/O 失敗なら「無い」と断定しない。
+fn key_is_absent<P: UserTlsPlace + ?Sized>(ops: &WindowsTlsTrustOps, place: &P) -> bool {
+    let spec = place.spec(UserPlaceKind::Tls);
+    if check_spec(&spec).is_err() || spec.file.is_some() {
+        return false;
+    }
+    let plain = |dir: &WinTlsDir| {
+        let info = dir.pinned().info();
+        info.is_dir && !info.is_reparse_point
+    };
+    let anchor = match ops.pin_dir(&spec.anchor) {
+        Ok(None) => return true,
+        Ok(Some(dir)) if plain(&dir) => dir,
+        _ => return false,
+    };
+    let mut held = vec![anchor];
+    for name in &spec.dirs {
+        match ops.open_child_dir(held.last().expect("起点を保持している"), name) {
+            Ok(None) => return true,
+            Ok(Some(dir)) if plain(&dir) => held.push(dir),
+            _ => return false,
+        }
+    }
+    matches!(
+        ops.open_child_file(held.last().expect("起点を保持している"), KEY_FILE),
+        Ok(None)
+    )
+}
+
 fn problem<P: UserTlsPlace + ?Sized>(
     ops: &WindowsTlsTrustOps,
     place: &P,
     options: &ReconcileOptions,
     found: UserPlaceProblem,
-) -> String {
+) -> DesktopFailure {
     let mut reason = found.reason;
     if found.fault.revokes() {
-        let recorded = if let UncheckedUserCert::Seen(seen) = peek_user_cert(ops, place) {
+        let seen = peek_user_cert(ops, place);
+        if seen == UncheckedUserCert::Absent {
+            let remedy = if key_is_absent(ops, place) {
+                reason.push_str("。証明書も鍵もありません。置き場の所有者・アクセス許可を修復してから再起動してください");
+                DesktopRemedy::RepairPlaceOnly
+            } else {
+                reason.push_str("。証明書はありません。残っている鍵の確認が必要です");
+                DesktopRemedy::InspectRemainingKey
+            };
+            return DesktopFailure { reason, remedy };
+        }
+        let recorded = if let UncheckedUserCert::Seen(seen) = seen {
             let report = record_user_revocation(
                 ops,
                 place,
@@ -148,14 +240,14 @@ fn problem<P: UserTlsPlace + ?Sized>(
             reason.push_str("。今回の起動ではこの証明書を使いません。失効の記録が無いまま再起動すると同じ証明書が使われることがあります。ACL を直すだけでは漏れた鍵は無効になりません。Hub を閉じ、利用者の TLS フォルダの中身を確認しフォルダごと削除してから再起動してください（失効の記録は消さないでください）");
         }
     }
-    reason
+    reason.into()
 }
 
 fn tls_place<P: UserTlsPlace + ?Sized>(
     ops: &WindowsTlsTrustOps,
     place: &P,
     options: &ReconcileOptions,
-) -> Result<CheckedUserPlace<WinTlsDir>, String> {
+) -> Result<CheckedUserPlace<WinTlsDir>, DesktopFailure> {
     // 作った直後も起点から読み直す。既存のフォルダの DACL は書き換えない。
     for _ in 0..16 {
         match open_user_place(ops, place, UserPlaceKind::Tls)
@@ -186,7 +278,7 @@ fn checked_identity_file<P: UserTlsPlace + ?Sized>(
     dir: &CheckedUserPlace<WinTlsDir>,
     name: &str,
     role: UserFileRole,
-) -> Result<Option<PinnedFile>, String> {
+) -> Result<Option<PinnedFile>, DesktopFailure> {
     open_user_file(ops, dir, name, name, role).map_err(|found| problem(ops, place, options, found))
 }
 
@@ -196,13 +288,13 @@ fn checked_auxiliary_file(
     ops: &WindowsTlsTrustOps,
     dir: &CheckedUserPlace<WinTlsDir>,
     name: &str,
-) -> Result<Option<PinnedFile>, String> {
+) -> Result<Option<PinnedFile>, DesktopFailure> {
     let role = if name == CREATING {
         UserFileRole::Public
     } else {
         UserFileRole::Secret
     };
-    open_user_file(ops, dir, name, name, role).map_err(|found| found.reason)
+    open_user_file(ops, dir, name, name, role).map_err(|found| found.reason.into())
 }
 
 fn create(dir: &WinTlsDir, name: &str, bytes: &[u8]) -> Result<(), String> {
@@ -219,9 +311,18 @@ fn create(dir: &WinTlsDir, name: &str, bytes: &[u8]) -> Result<(), String> {
 fn lock(
     ops: &WindowsTlsTrustOps,
     dir: &CheckedUserPlace<WinTlsDir>,
-    wait: Duration,
+    options: &ReconcileOptions,
 ) -> Result<PinnedFile, String> {
-    let until = Instant::now() + wait;
+    lock_with_sleep(ops, dir, options, |duration| ops.sleep(duration))
+}
+
+fn lock_with_sleep(
+    ops: &WindowsTlsTrustOps,
+    dir: &CheckedUserPlace<WinTlsDir>,
+    options: &ReconcileOptions,
+    mut sleep: impl FnMut(Duration),
+) -> Result<PinnedFile, String> {
+    let until = Instant::now() + options.lock_wait;
     loop {
         match ops.open_child_file_exclusive(dir.dir(), LOCK_FILE) {
             Ok(Some(file)) => {
@@ -258,7 +359,12 @@ fn lock(
         if Instant::now() >= until {
             return Err("TLS のロックを上限までに取れませんでした".into());
         }
-        ops.sleep(DEFAULT_LOCK_POLL.min(until.saturating_duration_since(Instant::now())));
+        sleep(
+            options
+                .lock_poll
+                .max(Duration::from_millis(1))
+                .min(until.saturating_duration_since(Instant::now())),
+        );
     }
 }
 
@@ -291,7 +397,7 @@ fn read_pair<P: UserTlsPlace + ?Sized>(
     place: &P,
     options: &ReconcileOptions,
     dir: &CheckedUserPlace<WinTlsDir>,
-) -> Result<PairBytes, String> {
+) -> Result<PairBytes, DesktopFailure> {
     // 両方のハンドルを握ってから読む。ACL やリンクの問題は作成中でも復旧しない。
     let mut cert =
         checked_identity_file(ops, place, options, dir, CERT_FILE, UserFileRole::Public)?;
@@ -340,10 +446,10 @@ fn load_in<P: UserTlsPlace + ?Sized>(
     place: &P,
     options: &ReconcileOptions,
     now: i64,
-) -> Result<DefaultHubTls, String> {
+) -> Result<DefaultHubTls, DesktopFailure> {
     check_place_layout(place)?;
     let dir = tls_place(ops, place, options)?;
-    let _lock = lock(ops, &dir, options.lock_wait)?;
+    let _lock = lock(ops, &dir, options)?;
     settled(ops, place, options)?;
     // 本体の露出を補助ファイルの異常で隠さない。失効の記録への書き足しまで先に行う。
     let (cert, key) = read_pair(ops, place, options, &dir)?;
@@ -386,7 +492,7 @@ fn load_in<P: UserTlsPlace + ?Sized>(
                 .rename_no_replace(from, to)
                 .map_err(|err| err.to_string())?
             {
-                return Err(format!("TLS の {from} を {to} に付け替えられませんでした"));
+                return Err(format!("TLS の {from} を {to} に付け替えられませんでした").into());
             }
         }
     }

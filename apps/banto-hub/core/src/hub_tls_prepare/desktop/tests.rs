@@ -34,6 +34,7 @@ impl Place {
     }
     fn load(&self) -> Result<DefaultHubTls, String> {
         load_in(&WindowsTlsTrustOps, self, &ReconcileOptions::default(), NOW)
+            .map_err(|error| error.reason)
     }
     fn dir(&self) -> CheckedUserPlace<WinTlsDir> {
         tls_place(&WindowsTlsTrustOps, self, &ReconcileOptions::default()).unwrap()
@@ -284,7 +285,10 @@ fn file_and_place_faults_use_the_callers_revocation_lock_options() {
             );
             reason
         };
-        assert!(reason.contains("失効の記録に残せませんでした"), "{reason}");
+        assert!(
+            reason.reason.contains("失効の記録に残せませんでした"),
+            "{reason}"
+        );
         drop(held);
         drop(parent);
     }
@@ -435,6 +439,70 @@ fn exposure_is_recorded_and_acl_repair_does_not_restore_identity() {
 }
 
 #[test]
+fn absence_only_repairs_the_place_but_existing_or_uncertain_certificates_require_recreation() {
+    for state in 0..6 {
+        let fixture = Fixture::new();
+        let place = &fixture.0;
+        place.initialize_records();
+        if state == 1 {
+            place.put(CERT_FILE, b"not a certificate");
+        }
+        let cert = if matches!(state, 2 | 3) {
+            Some(place.load().unwrap())
+        } else {
+            None
+        };
+        if state >= 4 {
+            place.put(KEY_FILE, b"remaining key");
+        }
+        let dir = place.dir();
+        let held = match state {
+            2 => WindowsTlsTrustOps
+                .open_child_file_exclusive(dir.dir(), CERT_FILE)
+                .unwrap(),
+            5 => WindowsTlsTrustOps
+                .open_child_file_exclusive(dir.dir(), KEY_FILE)
+                .unwrap(),
+            _ => None,
+        };
+        acl(&place.tls(), &["/grant", "*S-1-1-0:(OI)(CI)(M)"]);
+        let error = load_in(
+            &WindowsTlsTrustOps,
+            place,
+            &ReconcileOptions::default(),
+            NOW,
+        )
+        .unwrap_err();
+        let lines = error.into_unavailable().log_lines().join("\n");
+        if state == 0 {
+            assert!(lines.contains("再起動"), "{lines}");
+            assert!(
+                !lines.contains("フォルダごと削除"),
+                "証明書が無いのに削除を案内しない: {lines}"
+            );
+            assert!(
+                !lines.contains("使われることがあります"),
+                "証明書が無いのに再利用を警告しない: {lines}"
+            );
+            assert!(!lines.contains("漏れた鍵"), "{lines}");
+        } else if state >= 4 {
+            assert!(lines.contains("鍵が残る場合はフォルダごと削除"), "{lines}");
+            assert!(lines.contains("鍵も無い場合は"), "{lines}");
+            assert!(!lines.contains("使われることがあります"), "{lines}");
+        } else {
+            assert!(lines.contains("フォルダごと削除"), "{lines}");
+            assert!(lines.contains("漏れた鍵"), "{lines}");
+        }
+        if state == 3 {
+            assert!(read_user_revocations(&WindowsTlsTrustOps, place)
+                .is_revoked(&thumb(cert.as_ref().unwrap())));
+        }
+        drop(held);
+        drop(dir);
+    }
+}
+
+#[test]
 fn unrecordable_exposure_warns_about_restart_and_requires_recreating_tls() {
     let fixture = Fixture::new();
     let place = &fixture.0;
@@ -454,20 +522,29 @@ fn unrecordable_exposure_warns_about_restart_and_requires_recreating_tls() {
         lock_poll: Duration::from_millis(5),
     };
     let reason = load_in(&WindowsTlsTrustOps, place, &options, NOW).unwrap_err();
-    assert!(reason.contains("失効の記録に残せませんでした"), "{reason}");
     assert!(
-        reason.contains("今回の起動ではこの証明書を使いません"),
+        reason.reason.contains("失効の記録に残せませんでした"),
         "{reason}"
     );
     assert!(
-        reason.contains("再起動すると同じ証明書が使われることがあります"),
+        reason
+            .reason
+            .contains("今回の起動ではこの証明書を使いません"),
         "{reason}"
     );
     assert!(
-        reason.contains("ACL を直すだけでは漏れた鍵は無効になりません"),
+        reason
+            .reason
+            .contains("再起動すると同じ証明書が使われることがあります"),
         "{reason}"
     );
-    assert!(reason.contains("フォルダごと削除"), "{reason}");
+    assert!(
+        reason
+            .reason
+            .contains("ACL を直すだけでは漏れた鍵は無効になりません"),
+        "{reason}"
+    );
+    assert!(reason.reason.contains("フォルダごと削除"), "{reason}");
     assert!(!read_user_revocations(&WindowsTlsTrustOps, place).is_revoked(&thumb(&cert)));
     drop(held);
     drop(parent);
@@ -560,7 +637,7 @@ fn marked_complete_pair_does_not_delete_untrusted_temp_and_expiry_does_not_renew
         cert.info().not_after_unix + 1,
     )
     .unwrap_err();
-    assert!(error.contains("期限"), "{error}");
+    assert!(error.reason.contains("期限"), "{error}");
     assert_eq!(
         std::fs::read(place.tls().join(CERT_FILE)).unwrap(),
         cert.cert_pem()
@@ -568,11 +645,40 @@ fn marked_complete_pair_does_not_delete_untrusted_temp_and_expiry_does_not_renew
 }
 
 #[test]
+fn identity_lock_uses_the_callers_poll_without_timing_assumptions() {
+    let fixture = Fixture::new();
+    let dir = fixture.0.dir();
+    for poll in [Duration::ZERO, Duration::from_millis(7)] {
+        let options = ReconcileOptions {
+            lock_wait: Duration::from_secs(1),
+            lock_poll: poll,
+        };
+        let mut held = Some(lock(&WindowsTlsTrustOps, &dir, &options).unwrap());
+        let mut waits = Vec::new();
+        let acquired = lock_with_sleep(&WindowsTlsTrustOps, &dir, &options, |duration| {
+            waits.push(duration);
+            drop(held.take());
+        })
+        .unwrap();
+        assert_eq!(waits, vec![poll.max(Duration::from_millis(1))]);
+        drop(acquired);
+    }
+}
+
+#[test]
 fn identity_and_record_locks_wait_then_fail_without_creating_key() {
     let fixture = Fixture::new();
     let place = &fixture.0;
     let dir = place.dir();
-    let held = lock(&WindowsTlsTrustOps, &dir, Duration::from_secs(1)).unwrap();
+    let held = lock(
+        &WindowsTlsTrustOps,
+        &dir,
+        &ReconcileOptions {
+            lock_wait: Duration::from_secs(1),
+            ..ReconcileOptions::default()
+        },
+    )
+    .unwrap();
     let options = ReconcileOptions {
         lock_wait: Duration::from_millis(70),
         lock_poll: Duration::from_millis(10),
@@ -580,6 +686,7 @@ fn identity_and_record_locks_wait_then_fail_without_creating_key() {
     let started = Instant::now();
     assert!(load_in(&WindowsTlsTrustOps, place, &options, NOW)
         .unwrap_err()
+        .reason
         .contains("ロック"));
     assert!(started.elapsed() >= options.lock_wait);
     assert!(!place.tls().join(KEY_FILE).exists());
@@ -597,6 +704,7 @@ fn identity_and_record_locks_wait_then_fail_without_creating_key() {
         .unwrap();
     assert!(load_in(&WindowsTlsTrustOps, place, &options, NOW)
         .unwrap_err()
+        .reason
         .contains("確定できません"));
     assert!(!place.tls().join(KEY_FILE).exists());
     drop(held);
@@ -775,7 +883,15 @@ fn creation_child() {
     ));
     if std::env::var("BANTO_TEST_TLS_MODE").unwrap() == "lock" {
         let dir = place.dir();
-        let _held = lock(&WindowsTlsTrustOps, &dir, Duration::from_secs(1)).unwrap();
+        let _held = lock(
+            &WindowsTlsTrustOps,
+            &dir,
+            &ReconcileOptions {
+                lock_wait: Duration::from_secs(1),
+                ..ReconcileOptions::default()
+            },
+        )
+        .unwrap();
         place.initialize_records();
         create(dir.dir(), CREATING, CREATING_CONTENTS).unwrap();
         create(dir.dir(), KEY_FILE, b"interrupted").unwrap();
