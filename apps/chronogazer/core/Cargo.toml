@@ -140,6 +140,11 @@ reqwest = { workspace = true }
 # `banto-tagclient` が通常依存として使っている workspace 版と同じもの。
 # 依存ツリーには既に入っているので Cargo.lock にノードは増えない。
 tokio-tungstenite = { workspace = true }
+# #644 受入条件 4 の場面試験（`src/hub/tests/squat_scenarios.rs`）: 1 つのポートが Hub 停止中の
+# 先取り・入れ替え・証明書の作り直しを通す。先取り役・中継・記録の部品で、公開しない dev 専用の crate。
+banto-hub-squat-harness = { path = "../../../crates/banto-hub-squat-harness" }
+# 同じ試験の模擬 Hub が TLS で待ち受けるため（`banto-tagclient`・harness と同じ版・feature）。
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
 # R1-D の D-4（2026-10-09）: tests/mini_soak.rs の working set の記録
 # （`GetProcessMemoryInfo`）専用。`apps/banto-hub/core` の tests/soak.rs と
