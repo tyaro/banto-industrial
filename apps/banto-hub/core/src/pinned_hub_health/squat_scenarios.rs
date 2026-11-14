@@ -8,6 +8,7 @@
 //! ここでは 1 つのポート（`SwitchPort`）が Hub の一生を通るあいだ、同じ probe で繰り返し確かめる。
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -37,6 +38,8 @@ fn ok_response(body: &str) -> String {
 struct TlsHub {
     addr: SocketAddr,
     heads: Arc<Mutex<Vec<String>>>,
+    /// 受けた接続のうち、扱いが終わった（握手の失敗・返事を返した・相手が閉じた）数。
+    finished: Arc<AtomicUsize>,
     task: AbortHandle,
 }
 
@@ -46,7 +49,9 @@ impl TlsHub {
         let addr = listener.local_addr().unwrap();
         let heads = Arc::new(Mutex::new(Vec::new()));
         let acceptor = TlsAcceptor::from(identity.server_config());
+        let finished = Arc::new(AtomicUsize::new(0));
         let task_heads = Arc::clone(&heads);
+        let task_finished = Arc::clone(&finished);
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -54,7 +59,7 @@ impl TlsHub {
                 };
                 let acceptor = acceptor.clone();
                 let heads = Arc::clone(&task_heads);
-                tokio::spawn(async move {
+                let serving = async move {
                     let Ok(mut stream) = acceptor.accept(stream).await else {
                         return;
                     };
@@ -72,11 +77,35 @@ impl TlsHub {
                         .push(String::from_utf8_lossy(&raw).into_owned());
                     let _ = stream.write_all(ok_response(OPENAPI).as_bytes()).await;
                     let _ = stream.shutdown().await;
+                };
+                let finished = Arc::clone(&task_finished);
+                tokio::spawn(async move {
+                    serving.await;
+                    finished.fetch_add(1, Ordering::SeqCst);
                 });
             }
         })
         .abort_handle();
-        Self { addr, heads, task }
+        Self {
+            addr,
+            heads,
+            finished,
+            task,
+        }
+    }
+
+    /// 受けた接続が `at_least` 本、最後まで扱われるのを待つ。中継が「終わった」あとも
+    /// この Hub は届いたバイトをまだ読んでいることがあるので、「要求が届いていない」を
+    /// 確かめる前に、Hub 自身が接続を読み終えたことを待つ。
+    async fn wait_finished(&self, at_least: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while self.finished.load(Ordering::SeqCst) < at_least {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the real hub must finish {at_least} connections"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     fn requests(&self) -> usize {
@@ -221,7 +250,9 @@ async fn the_gate_opens_only_for_the_real_hub_through_its_whole_lifecycle() {
     for _ in 0..ATTEMPTS {
         assert_eq!(run(&probe, plain.port).await, HealthOutcome::TlsUntrusted);
     }
-    assert!(port.accepts(ModeKind::SquatTls) >= ATTEMPTS);
+    // 実際に掛けにいった本数を確かめ、先取り役がその接続を読み終えるのを待つ（受けた数は
+    // TCP を受けた時点で増えるので、それだけでは握手や受信が済んだことにならない）。
+    port.settle(ModeKind::SquatTls, ATTEMPTS).await;
     assert_eq!(
         port.squat_tls_handshakes(),
         0,
@@ -234,7 +265,7 @@ async fn the_gate_opens_only_for_the_real_hub_through_its_whole_lifecycle() {
     for _ in 0..ATTEMPTS {
         assert_eq!(run(&probe, plain.port).await, HealthOutcome::TlsUntrusted);
     }
-    assert!(port.accepts(ModeKind::SquatPlain) >= ATTEMPTS);
+    port.settle(ModeKind::SquatPlain, ATTEMPTS).await;
     assert_no_http_reached(&port);
 
     // 受けてすぐ閉じる（Hub の口が壊れている・何もいない）。平文の口には誰かいるので、
@@ -243,7 +274,7 @@ async fn the_gate_opens_only_for_the_real_hub_through_its_whole_lifecycle() {
     for _ in 0..ATTEMPTS {
         assert_eq!(run(&probe, plain.port).await, HealthOutcome::TlsUntrusted);
     }
-    assert!(port.accepts(ModeKind::Down) >= ATTEMPTS);
+    port.settle(ModeKind::Down, ATTEMPTS).await;
 
     // 平文の口まで空けば、Service→Desktop の待ちが見る「消えた」になる。
     let plain_port = plain.port;
@@ -254,6 +285,9 @@ async fn the_gate_opens_only_for_the_real_hub_through_its_whole_lifecycle() {
     // 同じポートで本物が戻れば、また通る（回復）。
     port.set(Mode::Relay(hub_a.addr));
     assert_eq!(run(&probe, plain_port).await, healthy());
+    // 中継と Hub A が受けた接続をすべて扱い終えてから数える（遅れて記録される要求が無い）。
+    let relayed = port.settle(ModeKind::Relay, 2).await;
+    hub_a.wait_finished(relayed).await;
     assert_eq!(
         hub_a.requests(),
         2,
@@ -283,10 +317,16 @@ async fn a_renewed_certificate_opens_the_gate_only_after_the_pin_is_reread() {
     assert_eq!(run(&probe, plain.port).await, healthy());
 
     // 再起動した Hub は新しい証明書（B）だが、pin はまだ A: 何度確かめても通らず、要求は届かない。
+    // 中継の本数の基準は、切り替える前（probe が動いていない間）に取る。
+    let to_a = port.settle(ModeKind::Relay, 1).await;
     port.set(Mode::Relay(hub_b.addr));
     for _ in 0..ATTEMPTS {
         assert_eq!(run(&probe, plain.port).await, HealthOutcome::TlsUntrusted);
     }
+    // 古い pin のまま実際に Hub B へ掛けにいき、中継も Hub B もその接続を最後まで扱い
+    // 終えてから「要求は 1 つも届いていない」を確かめる。
+    let to_b = port.settle(ModeKind::Relay, to_a + ATTEMPTS).await - to_a;
+    hub_b.wait_finished(to_b).await;
     assert_eq!(
         hub_b.requests(),
         0,
@@ -299,8 +339,12 @@ async fn a_renewed_certificate_opens_the_gate_only_after_the_pin_is_reread() {
     assert_eq!(hub_b.requests(), 1);
 
     // 古い証明書の Hub（A）がまた同じポートに現れても、もう通らない。
+    let before_a_again = port.settle(ModeKind::Relay, to_a + to_b + 1).await;
     port.set(Mode::Relay(hub_a.addr));
     let seen_by_a = hub_a.requests();
     assert_eq!(run(&probe, plain.port).await, HealthOutcome::TlsUntrusted);
+    // 実際に Hub A へ掛けにいき、中継も Hub A もその接続を扱い終えてから比べる。
+    let to_a_again = port.settle(ModeKind::Relay, before_a_again + 1).await - before_a_again;
+    hub_a.wait_finished(to_a + to_a_again).await;
     assert_eq!(hub_a.requests(), seen_by_a);
 }
