@@ -1131,7 +1131,13 @@ fn run_locked<O: RevocationOps, P: UserTlsPlace + ?Sized>(
             (steps, false)
         }
         // 初期化の最後で止まった: 和を両方に書き、A を確定にする。
+        // 正しい順序では証明書はまだ無いので、あれば A を巻き戻されたとみなして失効に入れる
+        // （有無が分からなければ確定しない）。
         [Shape::Pending, Shape::Committed] => {
+            if let Err(reason) = add_current_cert(&mut union, warnings) {
+                warnings.push(RevocationWarning::Io(reason));
+                return Incomplete;
+            }
             let mut steps = Vec::new();
             if !up_to_date(&sides[1], &union) {
                 steps.push((b, RecordState::Committed));

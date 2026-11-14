@@ -631,6 +631,40 @@ fn scene_4_continuing_with_an_existing_certificate_revokes_it() {
     assert!(report.revocations.is_revoked(&cert));
 }
 
+/// 初期化の最後で止まった（A 準備中・B 確定）ときも、利用者の証明書があれば失効に入れる。
+/// 有無が分からなければ確定しない。
+#[test]
+fn scene_4_pending_committed_revokes_an_existing_certificate() {
+    let ops = FakeRevOps::fresh();
+    ops.put_record(A, Pending, &[1]);
+    ops.put_record(B, Committed, &[2]);
+    let cert = ops.put_cert();
+    let report = ops.reconcile();
+    assert_eq!(report.outcome, ReconcileOutcome::Consistent, "{report:#?}");
+    assert_eq!(
+        report.warnings,
+        vec![RevocationWarning::ExistingCertRevoked(cert)]
+    );
+    ops.assert_committed(&[thumb(1), thumb(2), cert]);
+    assert!(report.revocations.is_revoked(&cert));
+    assert!(read_user_revocations(&ops, &ops.place()).is_revoked(&cert));
+
+    // 有無が分からない: 何も書かない。
+    let ops = FakeRevOps::fresh();
+    ops.put_record(A, Pending, &[1]);
+    ops.put_record(B, Committed, &[2]);
+    ops.put_cert();
+    ops.open_error.borrow_mut().insert(
+        user_tls().join(CERT_FILE),
+        FileOpenError::Other("拒否".to_string()),
+    );
+    let report = ops.reconcile();
+    assert_eq!(report.outcome, ReconcileOutcome::Incomplete, "{report:#?}");
+    assert!(has_io_warning(&report));
+    assert!(ops.writes().is_empty());
+    assert_eq!(ops.stored(A), Some((Pending, vec![thumb(1)])));
+}
+
 // --- 失効を書き足す ---------------------------------------------------------------------
 
 /// 場面 7（記録の部分）・6: 利用者の証明書の露出を見た側が、A・B に拇印を書き足す。もう片方の
