@@ -1232,6 +1232,10 @@ pub fn truncate_bytes(text: &str, max: usize) -> String {
     text[..end].to_string()
 }
 
+// #644 受入条件 4 の場面試験。crate 内だけの口 `connect_ws` を直接呼ぶので、子モジュールとして置く。
+#[cfg(test)]
+mod squat_scenarios;
+
 #[cfg(test)]
 mod tests {
     use super::*;
