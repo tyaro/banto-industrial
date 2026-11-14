@@ -182,3 +182,106 @@ impl crate::UserTlsOps for WindowsTlsTrustOps {
         banto_safe_root::guard::win::drive_kind(real)
     }
 }
+
+/// 置き換えを、宛先が読み取りで開かれている間の失敗（共有違反・アクセス拒否）でやり直す回数と
+/// 間隔。ロック無しの照合（[`crate::read_user_revocations`]）は記録を一瞬だけ読み取りで握り、
+/// その間の置き換えは OS が断る。握る時間は短いので、少し待てば通る。
+const REPLACE_TRIES: u32 = 5;
+const REPLACE_RETRY_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
+/// `ERROR_ACCESS_DENIED`。
+const ERROR_ACCESS_DENIED: i32 = 5;
+
+/// 一時ファイルの名前か（`banto_safe_root::root::temp_name` の形: `.{name}.tmp-{16 進 8 桁}`）。
+fn is_temp_name_of(candidate: &str, name: &str) -> bool {
+    candidate
+        .strip_prefix('.')
+        .and_then(|rest| rest.strip_prefix(name))
+        .and_then(|rest| rest.strip_prefix(".tmp-"))
+        .is_some_and(|nonce| nonce.len() == 8 && nonce.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// 失効の記録の書き込み（#1121 PR1b）。部品はすべて `banto_safe_root` で、どれも握った
+/// フォルダのハンドル基準に、名前 1 要素で辿らずに行う:
+///
+/// - フォルダを作る: `PinnedDir::create_child_dir`（`NtCreateFile` の相対の `FILE_CREATE`。
+///   記述子は親から継承）。
+/// - 置き換え: `ManagedDir::write_atomic`（同じフォルダの一時ファイル `FILE_CREATE` → 書く →
+///   `FlushFileBuffers` → 一時ファイルのハンドルで `FileRenameInformationEx`）。
+/// - 残った一時ファイル: `ManagedDir::remove_where`（開いた後のハンドルで種類を確かめて消す）。
+/// - ロックファイルを作る: `ManagedDir::create_new`（`FILE_CREATE`）。
+/// - 排他の open: `PinnedDir::open_child_file_exclusive`（読み取りだけの権利・**共有なし**）。
+///   同じ口の 2 つ目の open は共有違反（`ERROR_SHARING_VIOLATION`）で失敗する。中身は読まない・
+///   書かない・消さない（握るだけ）。プロセスが落ちれば OS がハンドルを閉じるので、ロックは
+///   残らない。
+///
+/// フォルダの pin は読み取り専用（[`WindowsTlsTrustOps`]）のまま: 子を作る・置き換える権利は、
+/// 握ったハンドルの権利ではなく、フォルダの DACL と今のトークンで OS が確かめる。
+impl crate::RevocationOps for WindowsTlsTrustOps {
+    fn create_child_dir(&self, parent: &WinTlsDir, name: &str) -> Result<(), String> {
+        parent
+            .pinned()
+            .create_child_dir(name, None)
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+
+    fn write_atomic(&self, dir: &WinTlsDir, name: &str, contents: &[u8]) -> Result<(), String> {
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            match dir.managed().write_atomic(name, contents) {
+                Ok(()) => return Ok(()),
+                Err(SafeRootError::Io {
+                    os_error: Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION),
+                    ..
+                }) if tries < REPLACE_TRIES => std::thread::sleep(REPLACE_RETRY_WAIT),
+                Err(err) => return Err(err.to_string()),
+            }
+        }
+    }
+
+    fn remove_stale_temps(&self, dir: &WinTlsDir, name: &str) -> Result<(), String> {
+        let report = dir
+            .managed()
+            .remove_where(&|candidate| is_temp_name_of(candidate, name))
+            .map_err(|err| err.to_string())?;
+        match report.failed.first() {
+            Some((left, err)) => Err(format!("{left}: {err}")),
+            None => Ok(()),
+        }
+    }
+
+    fn create_file_if_absent(&self, dir: &WinTlsDir, name: &str) -> Result<(), String> {
+        dir.managed()
+            .create_new(name)
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+
+    fn open_child_file_exclusive(
+        &self,
+        dir: &WinTlsDir,
+        name: &str,
+    ) -> Result<Option<PinnedFile>, FileOpenError> {
+        dir.pinned()
+            .open_child_file_exclusive(name)
+            .map_err(|err| match err {
+                SafeRootError::Io {
+                    os_error: Some(ERROR_SHARING_VIOLATION),
+                    ..
+                } => FileOpenError::InUse,
+                other => FileOpenError::Other(secret_error_text(&other)),
+            })
+    }
+
+    fn sleep(&self, duration: std::time::Duration) {
+        std::thread::sleep(duration);
+    }
+
+    fn now_unix_seconds(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0)
+    }
+}

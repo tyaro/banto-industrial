@@ -100,20 +100,61 @@
 //! - **読む入口**は [`load_pinned_user_cert`]（ChronoGazer 用）。サービスの置き場と違って
 //!   **鍵の露出も確かめる**（鍵は同じ利用者のものなので開ける。3 者以外が読めれば通さない。
 //!   中身は読まない）。
-//! - **この crate は書かない**。作る・作り直すのは Hub の core（PR2）で、[`open_user_place`] が
-//!   返す確かめ済みのハンドル（[`CheckedUserPlace`]・[`MissingUserPlace`]）を基準に書く。失効の
-//!   記録の読み書きと整える手順（§4.4.1）は PR1b で足す（ここにあるのは置き場と確かめだけ）。
+//! - **鍵と証明書は書かない**。作る・作り直すのは Hub の core（PR2）で、[`open_user_place`] が
+//!   返す確かめ済みのハンドル（[`CheckedUserPlace`]・[`MissingUserPlace`]）を基準に書く。この
+//!   crate が書くのは、下の失効の記録とそのロックファイルだけ。
+//!
+//! ## 利用者の失効の記録（#1121 PR1b、2026-11-14 オーナー決定）
+//!
+//! 鍵がほかのアカウントに読める状態だった証明書は、ACL が直っても二度と使わない（その間に
+//! 鍵をコピーされたかもしれない）。露出を見た側（デスクトップ版の Hub・ChronoGazer
+//! デスクトップ）が証明書の拇印（[`CertThumbprint`]。DER の SHA-256）を**失効の記録**に書き
+//! 足し、拇印が記録にある証明書を pin にも待ち受けにも使わない（設計 §4.4.1・§4.4.2）。Hub と
+//! ChronoGazer が同じ決まりで読み書きする必要があるので、`revocation` モジュールに置く:
+//!
+//! - **記録は 2 つ（A・B）で、和で照合する**。別のフォルダに置き（[`UserPlaceKind`]）、片方の
+//!   置き場だけに書ける相手が、片方を消す・壊す・古い内容に戻しても、もう片方が残る。拇印は
+//!   増えるだけで、減らさない。
+//! - **形**（[`RevocationRecord`]）: フォルダの中の [`REVOCATIONS_FILE`] に、ASCII の行で
+//!   「形の名前と版・状態（`準備中`／`確定`）・拇印の並び（拇印・どの置き場の証明書か・書いた
+//!   時刻）・件数」。読むときは形を厳しく取り、少しでも違えば「壊れている」。依存を増やさない
+//!   ため、JSON にはしない。
+//! - **照合の読み口**（[`read_user_revocations`]）はロック無しで、書き込みをしない。確かめに
+//!   通らない置き場の記録も、形が読めれば和に入れる（和は安全側にしか動かない）。
+//! - **整える手順は 1 つ**（[`reconcile_user_revocations`]）。同じ利用者のどのプロセスが何度
+//!   走らせても同じ結果になる。A・B の状態の表（未初期化・初期化の途中・整っている）に無い形は
+//!   **消失**で、その場で「今ある利用者の証明書を失効に入れて、記録を直す」。記録のファイルを
+//!   新しく作るときも、利用者の証明書がすでにあれば失効に入れる（正しい順序では、記録が 2 つ
+//!   とも `確定` になる前に証明書は無いので、あれば記録を消されたとみなす）。
+//! - **結果は 3 つ**（[`ReconcileOutcome`]）: 整っている・通らない（消失を見た、置き場かロックが
+//!   通らない）・この回はできなかった（ロックが上限までに取れない、I/O の誤り）。「状態を確かに
+//!   見た」と「操作が終わらなかった」を分ける。警告の理由（[`RevocationWarning`]）も返す。
+//!   「この回はできなかった」が何周期続いたら止めるかは、呼ぶ側が数える。
+//! - **失効を書き足す口**（[`record_user_revocation`]）は同じ手順で、和に拇印を足して両方に
+//!   書く。露出を見た証明書の拇印は [`load_pinned_user_cert`] の「あるが通らない」
+//!   （[`UnusableUserCert::exposed_thumbprint`]）から取る。
+//! - **書き方**（[`RevocationOps`]。Windows の実装は `win::WindowsTlsTrustOps`、部品は
+//!   `banto_safe_root`）: 置き場を [`open_user_place`] の確かめに通した直後に、**握ったフォルダの
+//!   ハンドル基準**でだけ書く（パスで開き直さない）。記録は「同じフォルダの一時ファイル →
+//!   書き切る → 置き換え」で、途中で止まっても前か新しい中身のどちらかが残る。フォルダが
+//!   無ければ作り、作ったら起点から確かめ直す。確かめに通らない置き場には書かない。
+//! - **直列化**は、A・B の外のロックファイルの排他の open（共有なしで開く。上限付きで待つ。既定
+//!   [`DEFAULT_LOCK_WAIT`]）。名前付き mutex は使わない（別のアカウントが先に作って握れる）。
+//!   ロックファイルも、置き場のフォルダと、開いた後のハンドルで確かめる。取れない・通らない
+//!   ときは何も書かない。握ったプロセスが落ちれば OS がハンドルを閉じるので、残らない。
 //!
 //! ## テスト
 //!
-//! OS を触る操作はすべて [`TlsTrustOps`]・[`UserTlsOps`]（Windows の実装は
+//! OS を触る操作はすべて [`TlsTrustOps`]・[`UserTlsOps`]・[`RevocationOps`]（Windows の実装は
 //! `win::WindowsTlsTrustOps`）を通すので、確かめの順序と断る分岐は偽物で全 OS で確かめる
-//! （`tests.rs`、利用者ごとの置き場は `tests/user.rs`）。Hub 側の同じ手順の表は banto-hub-core の
+//! （`tests.rs`、利用者ごとの置き場は `tests/user.rs`、失効の記録は `tests/revocation.rs` で、
+//! 設計 §4.4.2 の場面の番号を試験の名前に入れてある）。Hub 側の同じ手順の表は banto-hub-core の
 //! `hub_tls_prepare/tests/load.rs` にある。
 
 mod dacl;
 mod ops;
 mod place;
+mod revocation;
 pub mod text;
 mod user;
 #[cfg(windows)]
@@ -125,13 +166,20 @@ pub use place::{
     check_cert_exposure, load_pinned_hub_cert, open_checked_file, open_place,
     parse_single_certificate, read_checked, CheckedPlace, HubCertPin, Remedy, Unavailable,
 };
+pub use revocation::{
+    read_user_revocations, reconcile_user_revocations, record_user_revocation, CertThumbprint,
+    ReconcileOptions, ReconcileOutcome, ReconcileReport, RecordState, RevocationOps,
+    RevocationRecord, RevocationSide, RevocationWarning, RevokedCert, RevokedCertPlace,
+    SideContent, UserRevocations, DEFAULT_LOCK_POLL, DEFAULT_LOCK_WAIT, MAX_REVOCATIONS_BYTES,
+    REVOCATIONS_FILE, REVOCATIONS_HEADER,
+};
 pub use user::{
     check_place_layout, check_spec, is_app_container_sid, load_pinned_user_cert, open_user_file,
-    open_user_place, user_place_problems, CheckedUserPlace, DefaultUserTlsPlace, MissingUserPlace,
-    UserCertPin, UserFileRole, UserPlaceKind, UserPlacePolicy, UserPlaceProblem, UserPlaceSpec,
-    UserPlaceState, UserRemedy, UserTlsOps, UserTlsPlace, USER_ANCHOR_LABEL,
-    USER_PLACE_OTHERS_READ_MASK, USER_REVOCATIONS_A_DIR, USER_REVOCATIONS_B_DIR,
-    USER_REVOCATIONS_LOCK_FILE,
+    open_user_place, peek_user_cert, user_place_problems, CheckedUserPlace, DefaultUserTlsPlace,
+    MissingUserPlace, SeenUserCert, UncheckedUserCert, UnusableUserCert, UserCertPin, UserFault,
+    UserFileRole, UserPlaceKind, UserPlacePolicy, UserPlaceProblem, UserPlaceSpec, UserPlaceState,
+    UserRemedy, UserTlsOps, UserTlsPlace, USER_ANCHOR_LABEL, USER_PLACE_OTHERS_READ_MASK,
+    USER_REVOCATIONS_A_DIR, USER_REVOCATIONS_B_DIR, USER_REVOCATIONS_LOCK_FILE,
 };
 
 /// ProgramData の下の製品のフォルダ（Hub のルート）。

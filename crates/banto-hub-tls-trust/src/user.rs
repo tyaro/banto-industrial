@@ -1,7 +1,7 @@
 //! 利用者ごとの置き場（#1121 PR1a。docs/hub-desktop-tls-design.md §4.1・§4.4.1）: 差し替えの口
 //! [`UserTlsPlace`]、既定の実装 [`DefaultUserTlsPlace`]、置き場の確かめ [`open_user_place`]、
 //! ChronoGazer 向けの読み取りの入口 [`load_pinned_user_cert`]。書き込み・作成はしない
-//! （crate doc「利用者ごとの置き場」）。
+//! （crate doc「利用者ごとの置き場」。失効の記録の読み書きは `crate::revocation`）。
 
 use std::path::{Path, PathBuf};
 
@@ -11,6 +11,7 @@ use banto_safe_root::acl::{
 use banto_safe_root::guard::{self, DriveKind, RealPathRefusal};
 
 use crate::place::open_file_in;
+use crate::revocation::CertThumbprint;
 use crate::text::{exposure_text, real_path_reason};
 use crate::{
     parse_single_certificate, HubCertPin, TlsDir, TlsFile, TlsTrustOps, CERT_FILE, KEY_FILE,
@@ -229,6 +230,25 @@ pub enum UserRemedy {
     Renew,
 }
 
+/// 「あるが通らない」の種類（#1121 PR1b）。失効の記録に拇印を入れるか（露出）、その回は
+/// 操作が終わらなかっただけか（一時的）を、呼ぶ側が文言に頼らずに分けるためのもの。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserFault {
+    /// 一時的かもしれない（開けない・読めない・場所を取れない）。状態を見たのではなく、操作が
+    /// 終わらなかっただけ。
+    Transient,
+    /// **露出**: 信頼する相手以外への許可（ACL）がある。普通・条件付き・オブジェクトの許可の
+    /// ほか、null DACL・種類の分からない ACE・SID の読めない ACE も、相手を絞れないので露出に
+    /// 数える。鍵なら読まれた恐れ、フォルダ・証明書なら差し替えられた恐れがあり、ACL が直っても
+    /// その証明書は二度と使わない（設計 §4.4「露出を見た証明書は二度と使わない」）。
+    Exposed,
+    /// 露出ではないが信じられない（所有者が違う・リンク・ハードリンク・種類や場所の食い違い・
+    /// ドライブの種類・置き場の指定）。
+    Untrusted,
+    /// 壊れている（証明書はあるが鍵が無い・証明書が読める形でない）。
+    Broken,
+}
+
 /// 「あるが通らない」の理由（表示用の日本語の文。鍵の中身は含めない）と対処の種類。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserPlaceProblem {
@@ -236,10 +256,46 @@ pub struct UserPlaceProblem {
     pub reason: String,
     /// 対処の種類。
     pub remedy: UserRemedy,
+    /// 種類（露出か、それ以外か、一時的か）。
+    pub fault: UserFault,
 }
 
+/// 対処が「やり直す」なら一時的、それ以外は「信じられない」。露出・壊れは
+/// [`problem_with`] で明示する。
 fn problem(reason: String, remedy: UserRemedy) -> UserPlaceProblem {
-    UserPlaceProblem { reason, remedy }
+    let fault = if remedy == UserRemedy::Retry {
+        UserFault::Transient
+    } else {
+        UserFault::Untrusted
+    };
+    problem_with(reason, remedy, fault)
+}
+
+fn problem_with(reason: String, remedy: UserRemedy, fault: UserFault) -> UserPlaceProblem {
+    UserPlaceProblem {
+        reason,
+        remedy,
+        fault,
+    }
+}
+
+/// [`user_place_problems`] の結果の種類: 許可（ACL）に由来する理由が 1 つでもあれば露出、
+/// 無ければ「信じられない」（所有者・リンク・ハードリンクだけ）。
+pub(crate) fn fault_of(found: &[Exposure]) -> UserFault {
+    let open_to_others = found.iter().any(|found| {
+        matches!(
+            found,
+            Exposure::NullDacl
+                | Exposure::AllowsOther { .. }
+                | Exposure::UnknownAce { .. }
+                | Exposure::UnreadableSid { .. }
+        )
+    });
+    if open_to_others {
+        UserFault::Exposed
+    } else {
+        UserFault::Untrusted
+    }
 }
 
 /// [`Exposure`] の文言（利用者の置き場用。信頼する相手に利用者本人が入るので、所有者と許可の
@@ -256,7 +312,7 @@ fn user_exposure_text(found: &Exposure) -> String {
     }
 }
 
-fn user_reasons_text(found: &[Exposure]) -> String {
+pub(crate) fn user_reasons_text(found: &[Exposure]) -> String {
     found
         .iter()
         .map(user_exposure_text)
@@ -419,7 +475,7 @@ pub fn check_place_layout<P: UserTlsPlace + ?Sized>(place: &P) -> Result<(), Str
 
 /// 確かめ終えた置き場（起点から置き場のフォルダまでを、辿らずに握ったまま持つ）。置き場が
 /// ロックファイルのときは、握っているのはファイルを入れるフォルダで、ファイルそのものは
-/// [`open_user_file`]（読み取り）か、呼ぶ側の排他の open（PR1b）で開いて
+/// [`open_user_file`]（読み取り）か、排他の open（`crate::revocation` のロック）で開いて
 /// [`user_place_problems`] で確かめる。
 pub struct CheckedUserPlace<D> {
     /// 起点から、置き場のフォルダの親まで（握っている間は名前の変更・削除を止める）。
@@ -546,13 +602,14 @@ fn check_dir<D: TlsDir>(
     }
     let open = user_place_problems(&security, owners, true);
     if !open.is_empty() {
-        return Err(problem(
+        return Err(problem_with(
             format!(
                 "{label}（{}）は保護されていません（{}）。ほかの利用者が中身を書き換えられる恐れがあります",
                 shown.display(),
                 user_reasons_text(&open)
             ),
             remedy.clone(),
+            fault_of(&open),
         ));
     }
     Ok(real)
@@ -765,13 +822,14 @@ pub fn open_user_file<O: UserTlsOps>(
             UserFileRole::Secret => "ほかの利用者に読まれた恐れがあります",
             UserFileRole::Public => "ほかの利用者に書き換えられた恐れがあります",
         };
-        return Err(problem(
+        return Err(problem_with(
             format!(
                 "{label}（{}）は保護されていません（{}）。{risk}",
                 dir_path.join(name).display(),
                 user_reasons_text(&open)
             ),
             UserRemedy::Renew,
+            fault_of(&open),
         ));
     }
     Ok(Some(file))
@@ -786,8 +844,138 @@ pub enum UserCertPin {
     Absent,
     /// 確かめに通った証明書。
     Usable(HubCertPin),
-    /// あるが通らない（理由と対処の種類）。
-    Unusable(UserPlaceProblem),
+    /// あるが通らない（理由と、形だけ読めた証明書）。
+    Unusable(UnusableUserCert),
+}
+
+/// 「あるが通らない」利用者の証明書（#1121 PR1b）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnusableUserCert {
+    /// 理由・対処の種類・種類（[`UserFault`]。露出なら [`UserFault::Exposed`]）。
+    pub problem: UserPlaceProblem,
+    /// 確かめを通さずに、形だけ読んだ証明書（[`peek_user_cert`]）。失効の記録に入れる拇印を
+    /// 取るためのもので、**pin には使わない**。
+    pub seen: UncheckedUserCert,
+}
+
+impl UnusableUserCert {
+    /// 露出を見た証明書の拇印（失効の記録に書き足すもの。§4.4.2 の場面 6・7）。露出
+    /// （[`UserFault::Exposed`]）で、証明書の形が読めたときだけ `Some`。所有者の違い・リンク・
+    /// 壊れ・一時的な失敗は `None`（pin に入れないのは同じだが、失効には入れない）。
+    pub fn exposed_thumbprint(&self) -> Option<CertThumbprint> {
+        match (&self.problem.fault, &self.seen) {
+            (UserFault::Exposed, UncheckedUserCert::Seen(seen)) => Some(seen.thumbprint),
+            _ => None,
+        }
+    }
+}
+
+/// 確かめを通さずに形だけ読んだ利用者の証明書（[`peek_user_cert`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UncheckedUserCert {
+    /// 無い（途中のフォルダか証明書のファイルが無い）。
+    Absent,
+    /// 証明書がちょうど 1 つ読めた。
+    Seen(SeenUserCert),
+    /// ファイルはあるが、証明書として読める形でない（失効に入れる拇印が無い。この形のままでは
+    /// pin にも待ち受けにも使えない）。
+    Malformed,
+    /// あるかどうか・中身が分からない（開けない・読めない・途中がリンクで辿らなかった）。
+    Unreadable,
+}
+
+/// 形だけ読めた証明書（確かめには通っていない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeenUserCert {
+    /// PEM のバイト列。
+    pub cert_pem: Vec<u8>,
+    /// 証明書（DER）の SHA-256。
+    pub thumbprint: CertThumbprint,
+}
+
+/// [`read_unchecked`] の結果。
+pub(crate) enum UncheckedRead {
+    /// 途中のフォルダかファイルが無い。
+    Absent,
+    /// 読めた中身。
+    Bytes(Vec<u8>),
+    /// 分からない（開けない・読めない・リンクやフォルダで辿らなかった・大きすぎる）。
+    Unreadable,
+}
+
+/// 置き場の指定 `spec` のフォルダの中の `name` を、**所有者・ACL・場所の確かめを通さずに**
+/// 読む。確かめに通らない置き場からも「形が読めた」中身を取るためのもので、結果は**安全側に
+/// しか使わない**（失効に入れる拇印を増やすだけ。§4.4.1「置き場が確かめに通らないほうも、形が
+/// 読めれば和に入れる」）。
+///
+/// 辿らないことは保つ: 起点を辿らずに開き、その下は親のハンドル基準で 1 要素ずつ開く。途中が
+/// reparse point・フォルダでないもの、ファイルがフォルダ・reparse point なら読まずに
+/// `Unreadable`（リンクの先の、関係の無いファイルを読まない）。書き込み・作成はしない。
+pub(crate) fn read_unchecked<O: UserTlsOps>(
+    ops: &O,
+    spec: &UserPlaceSpec,
+    name: &str,
+    max_len: usize,
+) -> UncheckedRead {
+    if check_spec(spec).is_err() || !guard::is_plain_child_name(name) {
+        return UncheckedRead::Unreadable;
+    }
+    let plain_dir = |dir: &O::Dir| {
+        let info = dir.info();
+        info.is_dir && !info.is_reparse_point
+    };
+    let mut current = match ops.pin_dir(&spec.anchor) {
+        Ok(Some(anchor)) => anchor,
+        Ok(None) => return UncheckedRead::Absent,
+        Err(_) => return UncheckedRead::Unreadable,
+    };
+    if !plain_dir(&current) {
+        return UncheckedRead::Unreadable;
+    }
+    for dir in &spec.dirs {
+        current = match ops.open_child_dir(&current, dir) {
+            Ok(Some(child)) => child,
+            Ok(None) => return UncheckedRead::Absent,
+            Err(_) => return UncheckedRead::Unreadable,
+        };
+        if !plain_dir(&current) {
+            return UncheckedRead::Unreadable;
+        }
+    }
+    let mut file = match ops.open_child_file(&current, name) {
+        Ok(Some(file)) => file,
+        Ok(None) => return UncheckedRead::Absent,
+        Err(_) => return UncheckedRead::Unreadable,
+    };
+    let security = file.security();
+    if security.is_dir || security.is_reparse_point {
+        return UncheckedRead::Unreadable;
+    }
+    match file.read_all(max_len) {
+        Ok(bytes) => UncheckedRead::Bytes(bytes),
+        Err(_) => UncheckedRead::Unreadable,
+    }
+}
+
+/// 利用者の `tls\` の証明書を、確かめを通さずに形だけ読む（辿らないことは保つ）。失効の記録に
+/// 入れる拇印を取るためのもので、返した証明書を pin や待ち受けに使ってはならない（使うのは
+/// [`load_pinned_user_cert`] が通したものだけ）。
+pub fn peek_user_cert<O: UserTlsOps, P: UserTlsPlace + ?Sized>(
+    ops: &O,
+    place: &P,
+) -> UncheckedUserCert {
+    let spec = place.spec(UserPlaceKind::Tls);
+    match read_unchecked(ops, &spec, CERT_FILE, MAX_PEM_BYTES) {
+        UncheckedRead::Absent => UncheckedUserCert::Absent,
+        UncheckedRead::Unreadable => UncheckedUserCert::Unreadable,
+        UncheckedRead::Bytes(cert_pem) => match CertThumbprint::of_pem(&cert_pem) {
+            Ok(thumbprint) => UncheckedUserCert::Seen(SeenUserCert {
+                cert_pem,
+                thumbprint,
+            }),
+            Err(_) => UncheckedUserCert::Malformed,
+        },
+    }
 }
 
 /// ChronoGazer 向けの入口: 利用者の `tls\` を確かめ（[`open_user_place`]）、証明書を辿らずに
@@ -799,67 +987,76 @@ pub enum UserCertPin {
 /// 利用者のものなので開けることと、鍵の露出を見つけるのがこの読み手の役目だから（§4.4
 /// 「毎周期、確かめ直す」「露出を見た証明書は二度と使わない」）。証明書があるのに鍵が無いのは
 /// 「あるが通らない」（鍵の無い証明書を pin にしない）。
+///
+/// 「あるが通らない」ときは、理由の種類（[`UserFault`]）と、形だけ読めた証明書
+/// （[`UnusableUserCert::seen`]）を付けて返す。露出なら、呼ぶ側がその拇印
+/// （[`UnusableUserCert::exposed_thumbprint`]）を失効の記録に書き足す
+/// （[`crate::record_user_revocation`]）。
 pub fn load_pinned_user_cert<O: UserTlsOps, P: UserTlsPlace + ?Sized>(
     ops: &O,
     place: &P,
 ) -> UserCertPin {
+    match load_checked_user_cert(ops, place) {
+        Ok(Some(pin)) => UserCertPin::Usable(pin),
+        Ok(None) => UserCertPin::Absent,
+        Err(problem) => UserCertPin::Unusable(UnusableUserCert {
+            problem,
+            seen: peek_user_cert(ops, place),
+        }),
+    }
+}
+
+/// [`load_pinned_user_cert`] の確かめの本体（無ければ `Ok(None)`）。
+fn load_checked_user_cert<O: UserTlsOps, P: UserTlsPlace + ?Sized>(
+    ops: &O,
+    place: &P,
+) -> Result<Option<HubCertPin>, UserPlaceProblem> {
     use x509_cert::der::Decode;
 
-    let checked = match open_user_place(ops, place, UserPlaceKind::Tls) {
-        Ok(UserPlaceState::Present(checked)) => checked,
-        Ok(UserPlaceState::Absent(_)) => return UserCertPin::Absent,
-        Err(found) => return UserCertPin::Unusable(found),
+    let checked = match open_user_place(ops, place, UserPlaceKind::Tls)? {
+        UserPlaceState::Present(checked) => checked,
+        UserPlaceState::Absent(_) => return Ok(None),
     };
     let cert_path = checked.dir_path().join(CERT_FILE);
-    let mut cert = match open_user_file(ops, &checked, CERT_FILE, "証明書", UserFileRole::Public)
-    {
-        Ok(Some(cert)) => cert,
-        Ok(None) => return UserCertPin::Absent,
-        Err(found) => return UserCertPin::Unusable(found),
+    let Some(mut cert) = open_user_file(ops, &checked, CERT_FILE, "証明書", UserFileRole::Public)?
+    else {
+        return Ok(None);
     };
-    match open_user_file(ops, &checked, KEY_FILE, "鍵", UserFileRole::Secret) {
-        Ok(Some(_key)) => {}
-        Ok(None) => {
-            return UserCertPin::Unusable(problem(
-                format!(
-                    "{}（{}）に証明書はありますが、鍵（{KEY_FILE}）がありません",
-                    UserPlaceKind::Tls.label(),
-                    checked.dir_path().display()
-                ),
-                UserRemedy::Renew,
-            ))
-        }
-        Err(found) => return UserCertPin::Unusable(found),
+    if open_user_file(ops, &checked, KEY_FILE, "鍵", UserFileRole::Secret)?.is_none() {
+        return Err(problem_with(
+            format!(
+                "{}（{}）に証明書はありますが、鍵（{KEY_FILE}）がありません",
+                UserPlaceKind::Tls.label(),
+                checked.dir_path().display()
+            ),
+            UserRemedy::Renew,
+            UserFault::Broken,
+        ));
     }
     let real = cert.final_path();
-    let cert_pem = match cert.read_all(MAX_PEM_BYTES) {
-        Ok(cert_pem) => cert_pem,
-        Err(error) => {
-            return UserCertPin::Unusable(problem(
-                format!(
-                    "証明書（{}）を読めませんでした: {error}",
-                    cert_path.display()
-                ),
-                UserRemedy::Retry,
-            ))
-        }
-    };
+    let cert_pem = cert.read_all(MAX_PEM_BYTES).map_err(|error| {
+        problem(
+            format!(
+                "証明書（{}）を読めませんでした: {error}",
+                cert_path.display()
+            ),
+            UserRemedy::Retry,
+        )
+    })?;
     drop(cert);
     let broken = |error: String| {
-        UserCertPin::Unusable(problem(
+        problem_with(
             format!("証明書（{}）は使えません: {error}", cert_path.display()),
             UserRemedy::Renew,
-        ))
+            UserFault::Broken,
+        )
     };
-    let der = match parse_single_certificate(&cert_pem) {
-        Ok(der) => der,
-        Err(error) => return broken(error),
-    };
+    let der = parse_single_certificate(&cert_pem).map_err(broken)?;
     if x509_cert::Certificate::from_der(&der).is_err() {
-        return broken("証明書（DER）を読めません".to_string());
+        return Err(broken("証明書（DER）を読めません".to_string()));
     }
-    UserCertPin::Usable(HubCertPin {
+    Ok(Some(HubCertPin {
         cert_pem,
         cert_path: real,
-    })
+    }))
 }

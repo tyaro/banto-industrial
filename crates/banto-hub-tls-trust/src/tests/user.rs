@@ -16,7 +16,7 @@ use super::{abs, ace, cert_pem, short, DirEntry, FakeDir, FakeEnv, FakeFile, Fil
 use crate::*;
 
 /// 今の利用者。
-const ME: &str = "S-1-5-21-1-2-3-1001";
+pub(super) const ME: &str = "S-1-5-21-1-2-3-1001";
 
 /// AppContainer の capability SID（サンドボックスの道具が `%LOCALAPPDATA%` に足す形）。
 const CAPABILITY: &str = "S-1-15-3-3557520199-1-2-3";
@@ -25,24 +25,24 @@ const ALL_APP_PACKAGES: &str = "S-1-15-2-1";
 /// 接頭辞だけ似ていて、AppContainer の SID ではないもの。
 const LOOKALIKE: &str = "S-1-15-21-9-9-9-1666";
 
-fn local() -> PathBuf {
+pub(super) fn local() -> PathBuf {
     abs("Users/me/AppData/Local")
 }
-fn product() -> PathBuf {
+pub(super) fn product() -> PathBuf {
     local().join(PRODUCT_DIR)
 }
-fn user_tls() -> PathBuf {
+pub(super) fn user_tls() -> PathBuf {
     product().join(TLS_DIR)
 }
-fn rev_a() -> PathBuf {
+pub(super) fn rev_a() -> PathBuf {
     product().join(USER_REVOCATIONS_A_DIR)
 }
-fn rev_b() -> PathBuf {
+pub(super) fn rev_b() -> PathBuf {
     local().join(USER_REVOCATIONS_B_DIR)
 }
 
 /// `%LOCALAPPDATA%` の既定の形（SYSTEM・Administrators・本人にフル）。
-fn user_aces(flags: u8) -> Vec<ObservedAce> {
+pub(super) fn user_aces(flags: u8) -> Vec<ObservedAce> {
     vec![
         ace(SYSTEM_SID, FULL_ACCESS_MASK, flags),
         ace(ADMINISTRATORS_SID, FULL_ACCESS_MASK, flags),
@@ -50,7 +50,7 @@ fn user_aces(flags: u8) -> Vec<ObservedAce> {
     ]
 }
 
-fn user_dir() -> DirEntry {
+pub(super) fn user_dir() -> DirEntry {
     DirEntry {
         owner: ME.to_string(),
         is_reparse_point: false,
@@ -59,7 +59,7 @@ fn user_dir() -> DirEntry {
     }
 }
 
-fn user_file(contents: &[u8]) -> FileEntry {
+pub(super) fn user_file(contents: &[u8]) -> FileEntry {
     FileEntry {
         security: FileSecurity {
             is_dir: false,
@@ -86,6 +86,8 @@ struct FakeUserOps {
     files: HashMap<PathBuf, FileEntry>,
     open_error: HashMap<String, FileOpenError>,
     log: RefCell<Vec<String>>,
+    /// 直前の [`FakeUserOps::load`] が「あるが通らない」だったか。
+    last_unusable: std::cell::Cell<bool>,
 }
 
 impl FakeUserOps {
@@ -102,6 +104,7 @@ impl FakeUserOps {
             files: HashMap::new(),
             open_error: HashMap::new(),
             log: RefCell::new(Vec::new()),
+            last_unusable: std::cell::Cell::new(false),
         }
     }
 
@@ -143,12 +146,25 @@ impl FakeUserOps {
         self.file(user_tls().join(KEY_FILE))
     }
 
+    /// 確かめ（[`load_pinned_user_cert`] の本体・[`open_user_place`]）が開いた順。「あるが
+    /// 通らない」のときに続けて走る、確かめを通さない読み取り（[`peek_user_cert`]。失効に入れる
+    /// 拇印を取る）の分は除く: 同じ読み取りをもう一度走らせて、その長さだけ末尾を落とす。
     fn calls(&self) -> Vec<String> {
-        self.log.borrow().clone()
+        let all = self.log.borrow().clone();
+        if !self.last_unusable.get() {
+            return all;
+        }
+        peek_user_cert(self, &self.place());
+        let peeked = self.log.borrow().len() - all.len();
+        *self.log.borrow_mut() = all.clone();
+        all[..all.len() - peeked].to_vec()
     }
 
     fn load(&self) -> UserCertPin {
-        load_pinned_user_cert(self, &self.place())
+        let found = load_pinned_user_cert(self, &self.place());
+        self.last_unusable
+            .set(matches!(found, UserCertPin::Unusable(_)));
+        found
     }
 }
 
@@ -210,6 +226,7 @@ fn assert_unusable(ops: &FakeUserOps, needle: &str, remedy: UserRemedy) -> UserP
     let UserCertPin::Unusable(found) = ops.load() else {
         panic!("断るはず（{needle}）: {:#?}", ops.load());
     };
+    let found = found.problem;
     assert!(found.reason.contains(needle), "{needle} が無い: {found:#?}");
     assert_eq!(found.remedy, remedy, "{found:#?}");
     found
@@ -1185,7 +1202,7 @@ fn real_local_app_data_place_is_checked_on_windows() {
                     "この PC の %LOCALAPPDATA% の ACL は既定ではありません（3 者以外: \
                      {extra_owners:?}）。既定の置き場は断られました（{}）。足されていた相手を \
                      owners に加えて続けます",
-                    found.reason
+                    found.problem.reason
                 );
                 place.extra_owners = extra_owners;
             }
@@ -1220,8 +1237,8 @@ fn real_local_app_data_place_is_checked_on_windows() {
         );
         match found {
             UserCertPin::Unusable(found) => {
-                assert!(found.reason.contains("本当の場所"), "{found:#?}");
-                assert_eq!(found.remedy, UserRemedy::RecreateDir(scratch_path));
+                assert!(found.problem.reason.contains("本当の場所"), "{found:#?}");
+                assert_eq!(found.problem.remedy, UserRemedy::RecreateDir(scratch_path));
             }
             other => panic!("振り向けられた置き場は通らないはず: {other:#?}"),
         }

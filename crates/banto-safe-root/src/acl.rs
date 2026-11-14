@@ -1357,6 +1357,22 @@ impl PinnedDir {
     pub fn open_child_file_for_update(&self, name: &str) -> Result<Option<PinnedFile>> {
         imp::open_child_file_for_update(self, name)
     }
+
+    /// このフォルダ（確かめ済みの開いたハンドル）を基準に、名前 1 要素の子を**相対で辿らずに、
+    /// 排他に**開く（#1121 PR1b。プロセスをまたぐ直列化のためのロックファイル）。無ければ
+    /// `Ok(None)`。
+    ///
+    /// 作り・名前の確かめ・求める権利は [`PinnedDir::open_child_file`] と同じ（`FILE_OPEN |
+    /// FILE_OPEN_REPARSE_POINT`、読み取りだけ、パスを解決し直さない）。違うのは共有で、
+    /// **1 つも許さない**: 持っている間は、ほかの誰も中身の読み取り・書き込み・追記・削除の
+    /// 権利で開けず、同じ口の 2 つ目の open は共有違反（[`SafeRootError::Io`] の `os_error` が
+    /// `ERROR_SHARING_VIOLATION`(32)）で失敗する。既に誰かがそれらの権利で開いていれば、開く
+    /// こと自体が同じ共有違反で失敗する。握ったプロセスが落ちれば OS がハンドルを閉じるので、
+    /// 残らない。子がフォルダ・リンクでも辿らずにそのものを開くので、呼ぶ側が
+    /// [`PinnedFile::security`] で確かめる。
+    pub fn open_child_file_exclusive(&self, name: &str) -> Result<Option<PinnedFile>> {
+        imp::open_child_file_exclusive(self, name)
+    }
 }
 
 /// [`PinnedDir::open_child_file`]・[`PinnedDir::create_child_file`] で、確かめ済みのフォルダの
@@ -3286,6 +3302,16 @@ pub(crate) mod imp {
             .transpose()
     }
 
+    /// [`super::PinnedDir::open_child_file_exclusive`] の本体（#1121 PR1b）。
+    pub(super) fn open_child_file_exclusive(
+        parent: &super::PinnedDir,
+        name: &str,
+    ) -> Result<Option<super::PinnedFile>> {
+        child_relative(parent, name, ChildHow::OpenFileExclusive)?
+            .map(|handle| pinned_file_from_handle(handle, &parent.path.join(name)))
+            .transpose()
+    }
+
     /// [`super::PinnedFile::reset_acl`] の本体（#630 PR-2）: 属性を読み直してから、ファイル用の
     /// 保護された記述子（所有者 Administrators）をハンドルに書き、読み戻して確かめる。
     pub(super) fn reset_file_acl(handle: HANDLE) -> Result<super::FileSecurity> {
@@ -3553,6 +3579,10 @@ pub(crate) mod imp {
         /// `FILE_OPEN`（無ければ `Ok(None)`）で、記述子を書く・消すための権利（#630 PR-2）。
         /// 中身は求めない。種類を問わず開き、呼ぶ側が属性で断る。
         OpenFileForUpdate,
+        /// `FILE_OPEN`（無ければ `Ok(None)`）で、読み取りだけの権利・**共有なし**（#1121 PR1b。
+        /// ロックファイルの排他の open）。持っている間は、ほかの誰も中身・追記・削除の権利で
+        /// 開けない。種類を問わず開き、呼ぶ側が属性で断る。
+        OpenFileExclusive,
         /// ファイルを `FILE_CREATE | FILE_NON_DIRECTORY_FILE` で、この記述子を付けて作る
         /// （既にあれば `Ok(None)`。#630）。書き込みと、失敗したときに消すための `DELETE` を
         /// 求め、共有は読み取りだけ。`None` なら記述子を渡さず、親のフォルダから継承する
@@ -3631,6 +3661,7 @@ pub(crate) mod imp {
             ChildHow::Open | ChildHow::OpenDirReadOnly => "OpenChildDir(name)",
             ChildHow::OpenFile
             | ChildHow::OpenFileForUpdate
+            | ChildHow::OpenFileExclusive
             | ChildHow::OpenAppend { create: false }
             | ChildHow::OpenForDelete
             | ChildHow::OpenAttributes
@@ -3704,6 +3735,10 @@ pub(crate) mod imp {
                     | SYNCHRONIZE,
                 FILE_SHARE_READ,
             ),
+            // #1121 PR1b: 権利は `OpenFile` と同じ読み取りだけ（所有者の変更・削除などの強い
+            // 権利を求めない。読めれば握れる）で、共有を 1 つも許さない。同じ口の 2 つ目の
+            // open は、1 つ目が読み取りの共有を許していないので共有違反で失敗する。
+            ChildHow::OpenFileExclusive => (None, FILE_OPEN, 0, read_access, 0),
             ChildHow::CreateFile(descriptor) => (
                 descriptor,
                 FILE_CREATE,
@@ -3791,6 +3826,7 @@ pub(crate) mod imp {
             | ChildHow::OpenDirReadOnly
             | ChildHow::OpenFile
             | ChildHow::OpenFileForUpdate
+            | ChildHow::OpenFileExclusive
             | ChildHow::OpenAppend { create: false }
             | ChildHow::OpenForDelete
             | ChildHow::OpenAttributes
@@ -3809,6 +3845,7 @@ pub(crate) mod imp {
             return Err(match how {
                 ChildHow::OpenFile
                 | ChildHow::OpenFileForUpdate
+                | ChildHow::OpenFileExclusive
                 | ChildHow::OpenAppend { create: false }
                 | ChildHow::OpenForDelete
                 | ChildHow::OpenAttributes
@@ -6539,6 +6576,57 @@ pub(crate) mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(exposure(key.security()), vec![]);
+        }
+
+        /// 排他に開く（#1121 PR1b）。持っている間は、同じ口の 2 つ目も、読み取り・書き込みの
+        /// open も共有違反で失敗し、消す・名前を変えることもできない。放せばまた開ける。既に
+        /// 読み取りで開かれていれば、開くこと自体が共有違反で失敗する。
+        #[test]
+        fn open_child_file_exclusive_admits_one_holder_at_a_time() {
+            let root = tempfile::tempdir().unwrap();
+            let lock = root.path().join("a.lock");
+            std::fs::write(&lock, b"").unwrap();
+            let parent = pin_dir_read_only(root.path()).unwrap().unwrap();
+            let busy = |found: Result<Option<PinnedFile>>| {
+                assert!(
+                    matches!(
+                        found,
+                        Err(SafeRootError::Io {
+                            op: crate::error::IoOp::OpenFile,
+                            os_error: Some(32),
+                            ..
+                        })
+                    ),
+                    "{found:?}"
+                );
+            };
+
+            assert!(parent
+                .open_child_file_exclusive("missing")
+                .unwrap()
+                .is_none());
+            let held = parent.open_child_file_exclusive("a.lock").unwrap().unwrap();
+            assert_eq!(held.final_path(), parent.final_path().join("a.lock"));
+            assert!(!held.security().is_dir && !held.security().is_reparse_point);
+            busy(parent.open_child_file_exclusive("a.lock"));
+            busy(parent.open_child_file("a.lock"));
+            assert!(std::fs::File::open(&lock).is_err());
+            assert!(std::fs::OpenOptions::new().write(true).open(&lock).is_err());
+            assert!(std::fs::remove_file(&lock).is_err());
+            drop(held);
+            let again = parent.open_child_file_exclusive("a.lock").unwrap().unwrap();
+            drop(again);
+
+            // 既に読み取りで開かれている（共有は読み書き削除すべて）間は、握れない。
+            let reader = std::fs::File::open(&lock).unwrap();
+            busy(parent.open_child_file_exclusive("a.lock"));
+            drop(reader);
+            assert!(parent
+                .open_child_file_exclusive("a.lock")
+                .unwrap()
+                .is_some());
+            // 握っても、消えない・中身も変わらない。
+            assert_eq!(std::fs::read(&lock).unwrap(), b"");
         }
 
         /// 記述子を書く・消す権利で開く（#630 PR-2）。中身は読めない。持っている間はほかの
