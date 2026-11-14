@@ -46,7 +46,10 @@ use banto_safe_root::guard::MachineEnvironment;
 /// 周期の確かめが持つ拇印の型（host が共有 crate に直接依存しないための再公開）。
 pub use banto_hub_tls_trust::CertThumbprint as ServingThumbprint;
 
-use super::load::{from_record, from_trust, key_exposure, service_revoked, DefaultTlsUnavailable};
+use super::load::{
+    from_record, from_trust, held_thumbprint, key_exposure, service_revoked, DefaultTlsUnavailable,
+    HeldThumbprint,
+};
 use super::{HubTlsOps, TlsFile, CERT_FILE, KEY_FILE, RENEW_FLAG};
 
 /// 周期の確かめの間隔（ChronoGazer の見張りと同じ 30 秒。テストでは呼ぶ側が短くする）。
@@ -85,8 +88,9 @@ pub struct WatchRound {
 enum PlaceSeen {
     /// 通った。
     Fine,
-    /// 露出・所有者の違い（失効に入れる）。
-    Revokes(DefaultTlsUnavailable),
+    /// 露出・所有者の違い（失効に入れる）。2 つ目は確かめに使った証明書のハンドルから取った拇印
+    /// （開けていたら `Some`。読めなければ `Some(None)`。開き直さない）。
+    Revokes(DefaultTlsUnavailable, HeldThumbprint),
     /// それ以外で通らない（失効に入れず、保つ）。
     Keeps(String),
 }
@@ -95,7 +99,7 @@ fn seen_of(found: Unavailable) -> PlaceSeen {
     let revokes = found.fault.revokes();
     let found = from_trust(found);
     if revokes {
-        PlaceSeen::Revokes(found)
+        PlaceSeen::Revokes(found, None)
     } else {
         PlaceSeen::Keeps(found.reason)
     }
@@ -118,7 +122,7 @@ fn check_place<O: HubTlsOps>(ops: &O) -> PlaceSeen {
             } else {
                 let (found, fault) = key_exposure(&tls_path.join(KEY_FILE), &key_open);
                 if fault.revokes() {
-                    PlaceSeen::Revokes(found)
+                    PlaceSeen::Revokes(found, None)
                 } else {
                     PlaceSeen::Keeps(found.reason)
                 }
@@ -127,19 +131,45 @@ fn check_place<O: HubTlsOps>(ops: &O) -> PlaceSeen {
         Ok(None) => PlaceSeen::Keeps(missing_reason(&tls_path)),
         Err(found) => seen_of(found),
     };
+    let key_revokes = matches!(key_seen, PlaceSeen::Revokes(..));
     let cert_seen = match open_checked_file(ops, &place, CERT_FILE, "証明書") {
-        Ok(Some(cert)) => match check_cert_exposure(&cert, &tls_path.join(CERT_FILE)) {
-            Ok(()) => PlaceSeen::Fine,
-            Err(found) => seen_of(found),
-        },
+        Ok(Some(mut cert)) => {
+            let cert_path = tls_path.join(CERT_FILE);
+            let checked = check_cert_exposure(&cert, &cert_path);
+            let cert_revokes = checked.as_ref().is_err_and(|found| found.fault.revokes());
+            let seen = match checked {
+                Ok(()) => PlaceSeen::Fine,
+                Err(found) => seen_of(found),
+            };
+            // 失効に入れるなら、握ったハンドルから拇印を取る（放す前）。
+            if key_revokes || cert_revokes {
+                let held = Some(held_thumbprint(&mut cert, &cert_path));
+                match seen {
+                    PlaceSeen::Revokes(found, _) => PlaceSeen::Revokes(found, held),
+                    // 証明書は通ったが、鍵が露出: 鍵のほうの結果に拇印を付けて返す。
+                    other => {
+                        return finish(key_seen, other, held);
+                    }
+                }
+            } else {
+                seen
+            }
+        }
         Ok(None) => PlaceSeen::Keeps(missing_reason(&tls_path)),
         Err(found) => seen_of(found),
     };
-    // 失効に入れる種類がどちらかにあれば優先する。
+    finish(key_seen, cert_seen, None)
+}
+
+/// 鍵・証明書の結果をまとめる。失効に入れる種類がどちらかにあれば優先する（`held` は、証明書の
+/// ハンドルから取った拇印で、証明書側が `Revokes` で持っていなければここで足す）。
+fn finish(key_seen: PlaceSeen, cert_seen: PlaceSeen, held: HeldThumbprint) -> PlaceSeen {
     match (key_seen, cert_seen) {
-        (PlaceSeen::Revokes(found), _) | (_, PlaceSeen::Revokes(found)) => {
-            PlaceSeen::Revokes(found)
+        (PlaceSeen::Revokes(found, key_held), PlaceSeen::Revokes(_, cert_held)) => {
+            PlaceSeen::Revokes(found, cert_held.or(key_held).or(held))
         }
+        (PlaceSeen::Revokes(found, key_held), _) => PlaceSeen::Revokes(found, held.or(key_held)),
+        (_, PlaceSeen::Revokes(found, cert_held)) => PlaceSeen::Revokes(found, cert_held.or(held)),
         (PlaceSeen::Keeps(reason), _) | (_, PlaceSeen::Keeps(reason)) => PlaceSeen::Keeps(reason),
         (PlaceSeen::Fine, PlaceSeen::Fine) => PlaceSeen::Fine,
     }
@@ -220,10 +250,10 @@ impl ServiceTlsWatch {
                 }
                 self.last_keep = Some(reason);
             }
-            PlaceSeen::Revokes(found) => {
+            PlaceSeen::Revokes(found, held) => {
                 self.last_keep = None;
                 self.unwritten.insert(self.serving);
-                if let Some(disk) = peek_service_cert(ops) {
+                if let Some(disk) = held.unwrap_or_else(|| peek_service_cert(ops)) {
                     self.unwritten.insert(disk);
                 }
                 stop = Some((

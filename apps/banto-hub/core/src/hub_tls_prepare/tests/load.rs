@@ -354,6 +354,38 @@ fn default_tls_records_an_exposed_cert_despite_a_non_revoking_key_problem() {
     assert!(found.reason.contains("保護されていません"), "{found:#?}");
 }
 
+/// 確かめたハンドルを放した後に証明書の中身を差し替えられても、記録に入るのは確かめた元の
+/// 証明書の拇印（#1121 PR2c、Codex CLI P1）。
+#[test]
+fn default_tls_records_the_checked_certificate_even_if_it_is_swapped_after() {
+    let other = generate_identity(NOW).unwrap();
+    // (1) 証明書が露出。
+    let (ops, identity) = FakeOps::with_identity();
+    ops.edit_file(CERT_FILE, |f| {
+        f.security
+            .dacl
+            .aces
+            .as_mut()
+            .unwrap()
+            .push(ace(USERS, MODIFY_ACCESS_MASK, 0))
+    });
+    ops.swap_after_open
+        .borrow_mut()
+        .insert(CERT_FILE.to_string(), other.cert_pem.as_bytes().to_vec());
+    assert_recorded(&ops, "証明書（", &identity.cert_pem);
+    let swapped = CertThumbprint::of_pem(other.cert_pem.as_bytes()).unwrap();
+    assert!(!ops.record().unwrap().contains(&swapped));
+
+    // (2) 鍵が露出（証明書は握れている）。
+    let (ops, identity) = FakeOps::with_identity();
+    ops.edit_file(KEY_FILE, |f| f.security.dacl.aces = None);
+    ops.swap_after_open
+        .borrow_mut()
+        .insert(CERT_FILE.to_string(), other.cert_pem.as_bytes().to_vec());
+    assert_recorded(&ops, "秘密鍵", &identity.cert_pem);
+    assert!(!ops.record().unwrap().contains(&swapped));
+}
+
 /// 露出を見たのに記録に書けない（#1121 PR2c）: 書けなかったことを理由に足して、TLS 無しで起動する。
 #[test]
 fn default_tls_reports_an_exposure_it_could_not_record() {

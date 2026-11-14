@@ -234,6 +234,9 @@ struct FakeOps {
     create_exists: Vec<String>,
     /// 直列化の mutex の状態（既定は取れる）。
     lock: LockState,
+    /// 開いた後に、ディスク上の中身が差し替わる名前（開いたハンドルは元の中身のまま。次に開くと
+    /// 差し替え後。確かめの後に書き換えられる相手の形）。
+    swap_after_open: RefCell<HashMap<String, Vec<u8>>>,
     log: Log,
 }
 
@@ -272,6 +275,7 @@ impl FakeOps {
             rename_error: HashMap::new(),
             create_exists: Vec::new(),
             lock: LockState::Free,
+            swap_after_open: RefCell::new(HashMap::new()),
             log: Rc::new(RefCell::new(Vec::new())),
         }
     }
@@ -407,10 +411,18 @@ impl TlsTrustOps for FakeOps {
         if let Some(error) = self.open_error.get(name) {
             return Err(error.clone());
         }
-        Ok(self.files.borrow().get(&path).map(|entry| FakeFile {
+        let opened = self.files.borrow().get(&path).map(|entry| FakeFile {
             path: path.clone(),
             entry: entry.clone(),
-        }))
+        });
+        if opened.is_some() {
+            if let Some(swapped) = self.swap_after_open.borrow_mut().remove(name) {
+                if let Some(entry) = self.files.borrow_mut().get_mut(&path) {
+                    entry.contents = swapped;
+                }
+            }
+        }
+        Ok(opened)
     }
 }
 

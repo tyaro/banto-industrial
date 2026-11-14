@@ -150,6 +150,45 @@ fn scene_8_a_different_certificate_on_disk_is_recorded_too() {
         .all(|entry| entry.place == RevokedCertPlace::Service));
 }
 
+/// 確かめたハンドルを放した後に証明書の中身を差し替えられても、記録に入るのは確かめた元の
+/// 証明書の拇印（Codex CLI P1）。
+#[test]
+fn scene_8_the_checked_certificate_is_recorded_even_if_swapped_after() {
+    let other = generate_identity(NOW).unwrap();
+    let swapped = CertThumbprint::of_pem(other.cert_pem.as_bytes()).unwrap();
+    // (1) 証明書が露出。
+    let (ops, mut watch, serving) = watching();
+    let original = serving;
+    ops.edit_file(CERT_FILE, |f| {
+        f.security
+            .dacl
+            .aces
+            .as_mut()
+            .unwrap()
+            .push(ace(USERS, MODIFY_ACCESS_MASK, 0))
+    });
+    ops.swap_after_open
+        .borrow_mut()
+        .insert(CERT_FILE.to_string(), other.cert_pem.as_bytes().to_vec());
+    let round = watch.check(&ops);
+    assert!(round.stop, "{round:#?}");
+    let record = ops.record().unwrap();
+    assert!(record.contains(&original) && !record.contains(&swapped));
+
+    // (2) 待ち受けは別の証明書で、ディスクの鍵が露出（ディスクの証明書の拇印が要る）。
+    let (ops, identity) = FakeOps::with_identity();
+    let on_disk = CertThumbprint::of_pem(identity.cert_pem.as_bytes()).unwrap();
+    let mut watch = ServiceTlsWatch::new(thumb(9));
+    ops.edit_file(KEY_FILE, |f| f.security.dacl.aces = None);
+    ops.swap_after_open
+        .borrow_mut()
+        .insert(CERT_FILE.to_string(), other.cert_pem.as_bytes().to_vec());
+    let round = watch.check(&ops);
+    assert!(round.stop, "{round:#?}");
+    let record = ops.record().unwrap();
+    assert!(record.contains(&on_disk) && !record.contains(&swapped));
+}
+
 /// 失効に入れない種類（ハードリンク・リンク・場所の食い違い・無い・一時的な失敗）は、記録に
 /// 書かず、止めず、警告を出す（同じ理由は繰り返さない）。
 #[test]

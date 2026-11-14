@@ -300,11 +300,17 @@ pub(super) fn service_revoked<O: HubTlsOps>(ops: &O, thumbprint: CertThumbprint)
 /// 上の証明書の拇印を形だけ読めたら（[`peek_service_cert`]）、サービスの記録に書いてから断る。読め
 /// なければ（ルートが通らない・証明書が無い・形が壊れている）書けるものが無いので何もしない。
 /// 書けたか・書けなかったかは理由の文に足す（書けなくても TLS 無しで起動するのは同じ）。
+///
+/// `held` は、確かめに使った証明書のハンドルから取った拇印（ハンドルを開けていたら `Some`。読めな
+/// ければ `Some(None)`）。開けていたなら必ずそれを使い、開き直さない（開き直す間に差し替えられた
+/// 中身を記録に入れて、確かめた元の証明書を残さないため。Codex CLI P1）。開けなかった・無い・
+/// ファイルを開く前の段階の露出（`None`）だけ、ディスクを形だけ読む（元を見ていないので取れる分）。
 fn record_exposed_at_start<O: HubTlsOps>(
     ops: &O,
     mut found: DefaultTlsUnavailable,
+    held: HeldThumbprint,
 ) -> DefaultTlsUnavailable {
-    let Some(thumbprint) = peek_service_cert(ops) else {
+    let Some(thumbprint) = held.unwrap_or_else(|| peek_service_cert(ops)) else {
         return found;
     };
     match record_service_revocations(ops, &[service_revoked(ops, thumbprint)]) {
@@ -317,6 +323,18 @@ fn record_exposed_at_start<O: HubTlsOps>(
         )),
     }
     found
+}
+
+/// 確かめに使った証明書のハンドルから取った拇印（[`record_exposed_at_start`] の `held`）。
+pub(super) type HeldThumbprint = Option<Option<CertThumbprint>>;
+
+/// 握った証明書のハンドルから読んで拇印を取る（読めない・形が壊れていれば `None`）。
+pub(super) fn held_thumbprint<F: TlsFile>(
+    cert: &mut F,
+    cert_path: &Path,
+) -> Option<CertThumbprint> {
+    let pem = read_checked(cert, "証明書", cert_path).ok()?;
+    CertThumbprint::of_pem(&pem).ok()
 }
 
 /// 鍵・証明書それぞれの確かめの結果（[`load_default_identity`] の手順 4）。
@@ -352,6 +370,7 @@ fn refuse_pair<O: HubTlsOps>(
     key_path: &Path,
     cert_path: &Path,
     tls_path: &Path,
+    held: HeldThumbprint,
 ) -> DefaultTlsUnavailable {
     let [key_verdict, cert_verdict] = verdicts;
     let key_missing = matches!(key_verdict, Verdict::Missing);
@@ -361,7 +380,7 @@ fn refuse_pair<O: HubTlsOps>(
         if let Verdict::OpenFailed(found, _) | Verdict::Exposed(found, _) =
             std::mem::replace(&mut verdicts[i], Verdict::Fine)
         {
-            return record_exposed_at_start(ops, found);
+            return record_exposed_at_start(ops, found, held);
         }
     }
     let [key_verdict, cert_verdict] = verdicts;
@@ -415,7 +434,7 @@ pub fn load_default_identity<O: HubTlsOps>(
         let revokes = found.fault.revokes();
         let found = from_trust(found);
         if revokes {
-            record_exposed_at_start(ops, found)
+            record_exposed_at_start(ops, found, None)
         } else {
             found
         }
@@ -441,11 +460,16 @@ pub fn load_default_identity<O: HubTlsOps>(
         Ok(None) => (None, Verdict::Missing),
         Err(found) => (None, Verdict::open_failed(found)),
     };
+    // 開けた証明書のハンドルから取った拇印（露出していたとき。鍵のほうが露出のときは下で取る）。
+    let mut held: HeldThumbprint = None;
     let (cert, cert_verdict) = match open_checked_file(ops, &place, CERT_FILE, "証明書") {
-        Ok(Some(cert)) => match check_cert_exposure(&cert, &cert_path) {
+        Ok(Some(mut cert)) => match check_cert_exposure(&cert, &cert_path) {
             Ok(()) => (Some(cert), Verdict::Fine),
             Err(found) => {
                 let revokes = found.fault.revokes();
+                if revokes {
+                    held = Some(held_thumbprint(&mut cert, &cert_path));
+                }
                 (None, Verdict::Exposed(from_trust(found), revokes))
             }
         },
@@ -454,8 +478,13 @@ pub fn load_default_identity<O: HubTlsOps>(
     };
     let (mut key, mut cert) = match (key, cert) {
         (Some(key), Some(cert)) => (key, cert),
-        (key, cert) => {
-            // 握ったハンドルを放してから、証明書を形だけ読み直して記録に書く。
+        (key, mut cert) => {
+            // 握った証明書のハンドルから拇印を取ってから放し、記録に書く。
+            if held.is_none() {
+                if let Some(cert) = cert.as_mut() {
+                    held = Some(held_thumbprint(cert, &cert_path));
+                }
+            }
             drop((key, cert, place));
             return Err(refuse_pair(
                 ops,
@@ -463,6 +492,7 @@ pub fn load_default_identity<O: HubTlsOps>(
                 &key_path,
                 &cert_path,
                 &tls_path,
+                held,
             ));
         }
     };
