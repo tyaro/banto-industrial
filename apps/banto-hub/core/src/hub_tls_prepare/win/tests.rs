@@ -455,11 +455,15 @@ fn creates_and_rebuilds_the_service_record_and_the_hub_checks_it() {
         RevocationRecord::parse(&std::fs::read(&record).unwrap()).unwrap()
     };
     assert_eq!(check_record().entries(), &[]);
-    assert!(load_default_identity(&f.ops).is_ok());
+    if let Err(found) = load_default_identity(&f.ops) {
+        panic!("サービスの読み込みが断った: {found:#?}");
+    }
 
     // 消えた記録は、サービスの Hub の起動が空で作り直す（場面 25）。
     std::fs::remove_file(&record).unwrap();
-    assert!(load_default_identity(&f.ops).is_ok());
+    if let Err(found) = load_default_identity(&f.ops) {
+        panic!("サービスの読み込みが断った: {found:#?}");
+    }
     assert_eq!(check_record().entries(), &[]);
 
     // 壊れた記録: Hub は使わず、elev は `--renew` が無ければ断り、`--renew` で作り直す（場面 26）。
