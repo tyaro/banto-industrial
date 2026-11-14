@@ -192,6 +192,40 @@ fn links_missing_and_transient_failures_keep_serving_with_a_warning() {
     }
 }
 
+/// 片方のファイルが無い・一時的に開けなくても、もう片方（鍵）の露出は見て、失効に入れて止める。
+#[test]
+fn scene_8_exposed_key_is_recorded_even_when_the_certificate_is_missing_or_unopenable() {
+    let expose = |ops: &FakeOps| {
+        ops.edit_file(KEY_FILE, |f| {
+            f.security
+                .dacl
+                .aces
+                .as_mut()
+                .unwrap()
+                .push(ace(USERS, READ_EXECUTE_ACCESS_MASK, 0))
+        })
+    };
+
+    // (1) 証明書が無い。
+    let (ops, mut watch, serving) = watching();
+    expose(&ops);
+    ops.files.borrow_mut().remove(&tls().join(CERT_FILE));
+    let round = watch.check(&ops);
+    assert!(round.stop, "{round:#?}");
+    assert!(ops.record().unwrap().contains(&serving));
+    assert!(watch.is_stopped());
+
+    // (2) 証明書の open が一時的に失敗する。
+    let (mut ops, mut watch, serving) = watching();
+    expose(&ops);
+    ops.open_error
+        .insert(CERT_FILE.to_string(), FileOpenError::InUse);
+    let round = watch.check(&ops);
+    assert!(round.stop, "{round:#?}");
+    assert!(ops.record().unwrap().contains(&serving));
+    assert!(watch.is_stopped());
+}
+
 /// 場面 8（別のプロセスが書いた）: 記録に既にある拇印なら止める（何も書かない）。
 #[test]
 fn scene_8_an_already_recorded_certificate_stops() {

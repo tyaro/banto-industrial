@@ -109,34 +109,48 @@ fn check_place<O: HubTlsOps>(ops: &O) -> PlaceSeen {
         Err(found) => return seen_of(found),
     };
     let tls_path = place.tls_path().to_path_buf();
-    let key = match open_checked_file(ops, &place, KEY_FILE, "秘密鍵") {
-        Ok(key) => key,
-        Err(found) => return seen_of(found),
-    };
-    let cert = match open_checked_file(ops, &place, CERT_FILE, "証明書") {
-        Ok(cert) => cert,
-        Err(found) => return seen_of(found),
-    };
-    let (Some(key), Some(cert)) = (key, cert) else {
-        return PlaceSeen::Keeps(format!(
-            "{}（{}）に鍵（{KEY_FILE}）か証明書（{CERT_FILE}）がありません",
-            banto_hub_tls_trust::TLS_LABEL,
-            tls_path.display()
-        ));
-    };
-    let key_open = exposure(&key.security());
-    if !key_open.is_empty() {
-        let (found, fault) = key_exposure(&tls_path.join(KEY_FILE), &key_open);
-        return if fault.revokes() {
-            PlaceSeen::Revokes(found)
-        } else {
-            PlaceSeen::Keeps(found.reason)
-        };
-    }
-    match check_cert_exposure(&cert, &tls_path.join(CERT_FILE)) {
-        Ok(()) => PlaceSeen::Fine,
+    // 鍵と証明書は独立に確かめる（片方が無い・開けなくても、もう片方の露出は見る）。
+    let key_seen = match open_checked_file(ops, &place, KEY_FILE, "秘密鍵") {
+        Ok(Some(key)) => {
+            let key_open = exposure(&key.security());
+            if key_open.is_empty() {
+                PlaceSeen::Fine
+            } else {
+                let (found, fault) = key_exposure(&tls_path.join(KEY_FILE), &key_open);
+                if fault.revokes() {
+                    PlaceSeen::Revokes(found)
+                } else {
+                    PlaceSeen::Keeps(found.reason)
+                }
+            }
+        }
+        Ok(None) => PlaceSeen::Keeps(missing_reason(&tls_path)),
         Err(found) => seen_of(found),
+    };
+    let cert_seen = match open_checked_file(ops, &place, CERT_FILE, "証明書") {
+        Ok(Some(cert)) => match check_cert_exposure(&cert, &tls_path.join(CERT_FILE)) {
+            Ok(()) => PlaceSeen::Fine,
+            Err(found) => seen_of(found),
+        },
+        Ok(None) => PlaceSeen::Keeps(missing_reason(&tls_path)),
+        Err(found) => seen_of(found),
+    };
+    // 失効に入れる種類がどちらかにあれば優先する。
+    match (key_seen, cert_seen) {
+        (PlaceSeen::Revokes(found), _) | (_, PlaceSeen::Revokes(found)) => {
+            PlaceSeen::Revokes(found)
+        }
+        (PlaceSeen::Keeps(reason), _) | (_, PlaceSeen::Keeps(reason)) => PlaceSeen::Keeps(reason),
+        (PlaceSeen::Fine, PlaceSeen::Fine) => PlaceSeen::Fine,
     }
+}
+
+fn missing_reason(tls_path: &std::path::Path) -> String {
+    format!(
+        "{}（{}）に鍵（{KEY_FILE}）か証明書（{CERT_FILE}）がありません",
+        banto_hub_tls_trust::TLS_LABEL,
+        tls_path.display()
+    )
 }
 
 /// 止めるときのログの行（理由と対処）。
