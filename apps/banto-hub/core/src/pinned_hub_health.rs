@@ -192,4 +192,6 @@ fn fetch_openapi_pinned(config: Arc<ClientConfig>, port: u16, timeout: Duration)
 }
 
 #[cfg(test)]
+mod squat_scenarios;
+#[cfg(test)]
 mod tests;

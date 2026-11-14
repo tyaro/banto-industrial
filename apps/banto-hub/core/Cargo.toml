@@ -219,7 +219,10 @@ async-opcua = { git = "https://github.com/tyaro/async-opcua", rev = "9daa957a0cc
 # `crate::db_source::supervisor` のバックオフ（1s → 30s）と「60 秒以上
 # 動いたら連続回数を戻す」を実時間ゼロで検証する。**dev 限定**なので
 # 配布バイナリの依存には入らない。
-tokio = { workspace = true, features = ["rt", "macros", "time", "net", "test-util"] }
+tokio = { workspace = true, features = ["rt", "macros", "time", "net", "io-util", "test-util"] }
+# #644 受入条件 4 の場面試験（`src/pinned_hub_health/squat_scenarios.rs`）: 1 つのポートが Hub 停止中の
+# 先取り・入れ替え・証明書の作り直しを通す。先取り役・中継・記録の部品で、公開しない dev 専用の crate。
+banto-hub-squat-harness = { path = "../../../crates/banto-hub-squat-harness" }
 tower = { workspace = true, features = ["util"] }
 tempfile = { workspace = true }
 # #344（2026-09-15）: `broker_glue::BrokerReadClient::connect` は broker の

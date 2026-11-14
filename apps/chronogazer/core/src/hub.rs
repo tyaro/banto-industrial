@@ -6933,4 +6933,6 @@ mod tests {
         );
         store.delete("hub:x:1:y").unwrap();
     }
+
+    mod squat_scenarios;
 }
