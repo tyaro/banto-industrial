@@ -25,10 +25,12 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 use tokio::task::AbortHandle;
 use tokio_rustls::TlsAcceptor;
 
@@ -79,7 +81,10 @@ pub enum Mode {
     Relay(SocketAddr),
     /// 最初に受けた接続だけを中継し、裏の最初の返事をクライアントへ流す**前**に
     /// 第 2 引数のモードへ切り替える（確認と送信の間の入れ替え）。中継した接続は
-    /// その返事を流し終えたら切り、キープアライブで次の要求を本物へ運ばせない。
+    /// その返事（HTTP/1.1 の返事 1 つ）を**最後まで**流し終えたら切り、キープアライブで
+    /// 次の要求を本物へ運ばせない。返事の終わりは `Content-Length`・chunked・接続の
+    /// 終わりで見分け、時間では区切らない（返事が分かれて遅れて届いても途中で切らない）。
+    /// 流し終えた回数は [`SwitchPort::handed_over_responses`] で確かめられる。
     ///
     /// `tls` を渡すと、この待受が本物の Hub と同じ証明書で TLS を終わらせ、**平文の**
     /// 裏（`MockHub::start`）へ中継する。TLS の暗号文の上では「最初の返事」を
@@ -122,6 +127,7 @@ struct Counters {
     squat_tls: AtomicUsize,
     squat_plain: AtomicUsize,
     squat_tls_handshakes: AtomicUsize,
+    handed_over_responses: AtomicUsize,
 }
 
 impl Counters {
@@ -150,7 +156,26 @@ struct State {
 struct Shared {
     state: Mutex<State>,
     counters: Counters,
+    /// 受けた接続のうち、扱いが終わった（相手が閉じた・切った・握手が失敗した）数。
+    finished: Counters,
+    finished_notify: Notify,
     recorded: Recorded,
+}
+
+/// 接続の扱いが終わったら（中断で落とされたときも）数える。
+struct FinishedGuard {
+    shared: Arc<Shared>,
+    kind: ModeKind,
+}
+
+impl Drop for FinishedGuard {
+    fn drop(&mut self) {
+        self.shared
+            .finished
+            .of(self.kind)
+            .fetch_add(1, Ordering::SeqCst);
+        self.shared.finished_notify.notify_waiters();
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -179,6 +204,8 @@ impl SwitchPort {
                 connections: Vec::new(),
             }),
             counters: Counters::default(),
+            finished: Counters::default(),
+            finished_notify: Notify::new(),
             recorded: Recorded::default(),
         });
         let accept_shared = Arc::clone(&shared);
@@ -195,7 +222,15 @@ impl SwitchPort {
                     .counters
                     .of(mode.kind())
                     .fetch_add(1, Ordering::SeqCst);
-                let task = tokio::spawn(handle(stream, mode, Arc::clone(&accept_shared)));
+                let guard = FinishedGuard {
+                    shared: Arc::clone(&accept_shared),
+                    kind: mode.kind(),
+                };
+                let handler_shared = Arc::clone(&accept_shared);
+                let task = tokio::spawn(async move {
+                    let _finished = guard;
+                    handle(stream, mode, handler_shared).await;
+                });
                 state.connections.push((task.id(), task.abort_handle()));
             }
         })
@@ -231,6 +266,63 @@ impl SwitchPort {
     /// そのモードで受けた TCP 接続の数（切り替えをまたいだ合計）。
     pub fn accepts(&self, kind: ModeKind) -> usize {
         self.shared.counters.of(kind).load(Ordering::SeqCst)
+    }
+
+    /// そのモードで受けた接続のうち、扱いが終わった数（切り替えをまたいだ合計）。
+    ///
+    /// [`Self::accepts`] は TCP を受けた時点で増えるので、TLS の握手や要求の処理が
+    /// 済んだことは示さない。先取り側では、相手（クライアント）が接続を閉じるか
+    /// 握手が失敗するまで読み続けるので、「終わった」はその接続で相手が送ったものを
+    /// すべて記録し終えたことを意味する。記録したバイトを調べる前にこちらを待つ。
+    pub fn finished(&self, kind: ModeKind) -> usize {
+        self.shared.finished.of(kind).load(Ordering::SeqCst)
+    }
+
+    /// そのモードで扱いが終わった接続が `at_least` 本になるまで待つ。`limit` を
+    /// 過ぎたら、受けた数と終わった数を添えて panic する。
+    pub async fn wait_finished(&self, kind: ModeKind, at_least: usize, limit: Duration) {
+        let waited = tokio::time::timeout(limit, async {
+            loop {
+                let notified = self.shared.finished_notify.notified();
+                tokio::pin!(notified);
+                // 数を読む前に待ちを登録する（読んだ直後の通知を取りこぼさない）。
+                notified.as_mut().enable();
+                if self.finished(kind) >= at_least {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await;
+        assert!(
+            waited.is_ok(),
+            "timed out waiting for {at_least} finished {kind:?} connections (accepted {}, finished {})",
+            self.accepts(kind),
+            self.finished(kind)
+        );
+    }
+
+    /// そのモードで**いままでに受けた**接続がすべて終わるまで待ち、その数を返す。
+    /// 呼び出し側の要求がすべて返ったあと（新しい接続がもう来ないとき）に、記録を
+    /// 調べる前の区切りとして使う。`at_least` 本に満たなければ panic する（一度も
+    /// 掛けにいっていないのに「何も届いていない」が通るのを防ぐ）。
+    pub async fn settle(&self, kind: ModeKind, at_least: usize) -> usize {
+        let accepted = self.accepts(kind);
+        assert!(
+            accepted >= at_least,
+            "only {accepted} {kind:?} connections were accepted, expected at least {at_least}"
+        );
+        self.wait_finished(kind, accepted, Duration::from_secs(10))
+            .await;
+        accepted
+    }
+
+    /// [`Mode::RelayThen`] が、裏の最初の返事を最後までクライアントへ流し終えた回数。
+    pub fn handed_over_responses(&self) -> usize {
+        self.shared
+            .counters
+            .handed_over_responses
+            .load(Ordering::SeqCst)
     }
 
     /// 先取り側の TLS がクライアントの確認を通って最後まで済んだ回数。
@@ -391,8 +483,12 @@ where
     let upstream = async {
         let mut buffer = [0u8; 4096];
         while let Ok(count) = client_read.read(&mut buffer).await {
-            if count == 0 || sealed.load(Ordering::SeqCst) {
+            if count == 0 {
                 break;
+            }
+            if sealed.load(Ordering::SeqCst) {
+                // 返事を流している途中で接続を畳まないよう、読み捨てるだけにする。
+                continue;
             }
             lock(&shared.recorded.relay).extend_from_slice(&buffer[..count]);
             if backend_write.write_all(&buffer[..count]).await.is_err() {
@@ -400,26 +496,23 @@ where
             }
         }
     };
+    let mut first_response = then.is_some().then(ResponseEnd::default);
     let mut then = then;
     let downstream = async {
         let mut buffer = [0u8; 4096];
-        loop {
-            // 切り替え後は、返事の残りを少しだけ待って流し、あとは切る。
-            let read = if then.is_none() && sealed.load(Ordering::SeqCst) {
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(200),
-                    backend_read.read(&mut buffer),
-                )
-                .await
-                {
-                    Ok(read) => read,
-                    Err(_) => break,
-                }
-            } else {
-                backend_read.read(&mut buffer).await
-            };
-            let Ok(count) = read else { break };
+        while let Ok(count) = backend_read.read(&mut buffer).await {
             if count == 0 {
+                // 長さの手がかりが無い返事は、裏が閉じたところが終わり。
+                if first_response
+                    .as_ref()
+                    .is_some_and(ResponseEnd::ends_at_close)
+                {
+                    let _ = client_write.shutdown().await;
+                    shared
+                        .counters
+                        .handed_over_responses
+                        .fetch_add(1, Ordering::SeqCst);
+                }
                 break;
             }
             if let Some(next) = then.take() {
@@ -431,6 +524,19 @@ where
             if client_write.write_all(&buffer[..count]).await.is_err() {
                 break;
             }
+            if let Some(response) = first_response.as_mut() {
+                // 最初の返事を最後まで流し終えたら切る。断片が分かれて遅れて届いても、
+                // 終わりが見えるまでは流し続ける（時間で区切らない）。
+                if response.feed(&buffer[..count]) {
+                    let _ = client_write.flush().await;
+                    let _ = client_write.shutdown().await;
+                    shared
+                        .counters
+                        .handed_over_responses
+                        .fetch_add(1, Ordering::SeqCst);
+                    break;
+                }
+            }
         }
     };
     // どちらかが終わったら両方畳む（片側だけ開いたままにしない）。
@@ -438,6 +544,89 @@ where
         () = upstream => {},
         () = downstream => {},
     }
+}
+
+/// HTTP/1.1 の返事 1 つがどこで終わるかを、流れてくる断片から追う。
+///
+/// 試験の裏（`MockHub` など）が返す形だけを扱う: `Content-Length`、chunked（終わりの
+/// 長さ 0 のチャンクを探すだけで、トレーラーは扱わない）、どちらも無ければ接続の
+/// 終わりまで。本文を持たない状態（1xx・204・304）はヘッダーの終わりが返事の終わり。
+#[derive(Default)]
+struct ResponseEnd {
+    head: Vec<u8>,
+    body: Option<Body>,
+}
+
+enum Body {
+    Remaining(usize),
+    Chunked(Vec<u8>),
+    UntilClose,
+}
+
+impl ResponseEnd {
+    /// 断片を足す。ここまでで返事が完結したら `true`。
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        let rest = match self.body {
+            Some(_) => bytes.to_vec(),
+            None => {
+                self.head.extend_from_slice(bytes);
+                let Some(end) = self
+                    .head
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                else {
+                    return false;
+                };
+                let rest = self.head.split_off(end + 4);
+                self.body = Some(body_of(&String::from_utf8_lossy(&self.head)));
+                rest
+            }
+        };
+        match self.body.as_mut() {
+            Some(Body::Remaining(left)) => {
+                *left = left.saturating_sub(rest.len());
+                *left == 0
+            }
+            Some(Body::Chunked(seen)) => {
+                seen.extend_from_slice(&rest);
+                seen.as_slice() == b"0\r\n\r\n" || seen.ends_with(b"\r\n0\r\n\r\n")
+            }
+            Some(Body::UntilClose) | None => false,
+        }
+    }
+
+    /// ヘッダーは届いていて、返事の終わりが「接続の終わり」で決まる形か。
+    fn ends_at_close(&self) -> bool {
+        matches!(self.body, Some(Body::UntilClose))
+    }
+}
+
+fn body_of(head: &str) -> Body {
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|line| line.split(' ').nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    if (100..200).contains(&status) || status == 204 || status == 304 {
+        return Body::Remaining(0);
+    }
+    let mut length = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("transfer-encoding")
+            && value.to_ascii_lowercase().contains("chunked")
+        {
+            return Body::Chunked(Vec::new());
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            length = value.parse::<usize>().ok();
+        }
+    }
+    length.map_or(Body::UntilClose, Body::Remaining)
 }
 
 /// 偽のプロキシ・リダイレクト先。平文で受けるだけで、返事はしない。
@@ -520,7 +709,7 @@ impl Drop for RecordingListener {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::timeout;
 
     async fn is_closed(stream: &mut TcpStream) -> bool {
         let mut out = Vec::new();
@@ -583,16 +772,33 @@ mod tests {
         let backend_addr = backend.local_addr().unwrap();
         let backend_seen = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&backend_seen);
+        // 返事を 3 つの断片に分け、間を空けて返す（ヘッダーの途中・本文の途中で切れる）。
+        // 断片の間は、以前の「残りを 200ms だけ待つ」より長い。
+        const FRAGMENTS: [&[u8]; 3] = [
+            b"HTTP/1.1 200 OK\r\nContent-Len",
+            b"gth: 10\r\n\r\nhello",
+            b"world",
+        ];
         tokio::spawn(async move {
             let (mut stream, _) = backend.accept().await.unwrap();
             let mut buffer = [0u8; 64];
+            let mut answered = false;
             while let Ok(count) = stream.read(&mut buffer).await {
                 if count == 0 {
                     break;
                 }
                 lock(&seen).extend_from_slice(&buffer[..count]);
-                if stream.write_all(b"first-response").await.is_err() {
-                    break;
+                if answered {
+                    continue;
+                }
+                answered = true;
+                for (index, fragment) in FRAGMENTS.iter().enumerate() {
+                    if index > 0 {
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                    }
+                    if stream.write_all(fragment).await.is_err() {
+                        return;
+                    }
                 }
             }
         });
@@ -604,20 +810,29 @@ mod tests {
         });
         let mut client = TcpStream::connect(port.addr()).await.unwrap();
         client.write_all(b"status").await.unwrap();
-        let mut response = [0u8; 14];
-        timeout(Duration::from_secs(3), client.read_exact(&mut response))
+        // 最初の断片が届いた時点で、新しい接続はもう先取り側に着く。
+        let mut first = [0u8; 28];
+        timeout(Duration::from_secs(3), client.read_exact(&mut first))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(&response, b"first-response");
-        // 返事を受けた時点で、新しい接続はもう先取り側に着く。
+        assert_eq!(&first, FRAGMENTS[0]);
         let mut fresh = TcpStream::connect(port.addr()).await.unwrap();
         fresh.write_all(b"key-bytes").await.unwrap();
         let mut buffer = [0u8; 256];
         assert!(fresh.read(&mut buffer).await.unwrap() > 0);
-        // 中継した接続は返事のあとで切られ、続きの要求は裏へ届かない。
-        let _ = client.write_all(b"second").await;
-        assert!(is_closed(&mut client).await);
+        // 返事の途中でクライアントが次の要求を送っても、裏へは運ばれず、返事も途中で
+        // 切られない。返事は最後まで届き、そのあとで接続が切られる。
+        client.write_all(b"second").await.unwrap();
+        let mut rest = Vec::new();
+        timeout(Duration::from_secs(5), client.read_to_end(&mut rest))
+            .await
+            .expect("the relayed connection must be cut after the response")
+            .unwrap();
+        assert_eq!(rest, [FRAGMENTS[1], FRAGMENTS[2]].concat());
+        assert_eq!(port.handed_over_responses(), 1);
+        port.wait_finished(ModeKind::Relay, 1, Duration::from_secs(3))
+            .await;
         assert_eq!(*lock(&backend_seen), b"status");
         assert_eq!(port.accepts(ModeKind::Relay), 1);
         assert_eq!(port.accepts(ModeKind::SquatPlain), 1);
@@ -625,6 +840,48 @@ mod tests {
             lock(&port.shared.recorded.squat_plain).as_slice(),
             b"key-bytes"
         );
+    }
+
+    #[test]
+    fn response_end_follows_content_length_chunked_and_close() {
+        let mut sized = ResponseEnd::default();
+        assert!(!sized.feed(b"HTTP/1.1 401 Test\r\ncontent-length: 2\r\n"));
+        assert!(!sized.feed(b"\r\n{"));
+        assert!(sized.feed(b"}"));
+
+        let mut empty = ResponseEnd::default();
+        assert!(empty.feed(b"HTTP/1.1 307 Redirect\r\nContent-Length: 0\r\n\r\n"));
+
+        let mut switching = ResponseEnd::default();
+        assert!(switching.feed(b"HTTP/1.1 101 Switching Protocols\r\n\r\n"));
+
+        let mut chunked = ResponseEnd::default();
+        assert!(!chunked.feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}"));
+        assert!(!chunked.feed(b"\r\n0\r\n"));
+        assert!(chunked.feed(b"\r\n"));
+
+        let mut until_close = ResponseEnd::default();
+        assert!(!until_close.ends_at_close());
+        assert!(!until_close.feed(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{}"));
+        assert!(until_close.ends_at_close());
+    }
+
+    #[tokio::test]
+    async fn finished_counts_a_connection_only_after_the_peer_closed_it() {
+        let port = SwitchPort::start().await;
+        port.set(Mode::SquatPlain);
+        let mut client = TcpStream::connect(port.addr()).await.unwrap();
+        client.write_all(b"first").await.unwrap();
+        let mut buffer = [0u8; 256];
+        assert!(client.read(&mut buffer).await.unwrap() > 0);
+        // 受けて返事もしたが、相手がまだ閉じていないので「終わった」には数えない。
+        assert_eq!(port.accepts(ModeKind::SquatPlain), 1);
+        assert_eq!(port.finished(ModeKind::SquatPlain), 0);
+        client.write_all(b"-late").await.unwrap();
+        drop(client);
+        assert_eq!(port.settle(ModeKind::SquatPlain, 1).await, 1);
+        // 終わったあとなら、閉じる直前に送った分も記録に入っている。
+        assert_eq!(port.squat_bytes(), b"first-late");
     }
 
     #[tokio::test]

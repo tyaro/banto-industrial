@@ -1809,6 +1809,16 @@ mod tests {
         keyring_account(&base_url(&port.https_url()).unwrap(), INSTALLATION)
     }
 
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !done() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "timed out waiting for {what}");
+    }
+
     fn pinned_to(
         identity: &TestIdentity,
         keys: &Arc<MemoryKeyStore>,
@@ -1843,6 +1853,9 @@ mod tests {
             }
         }
 
+        // 実際に先取り側へ掛けにいき、先取り側がその接続を読み終えてから記録を調べる。
+        port.settle(ModeKind::SquatTls, 3).await;
+        port.settle(ModeKind::SquatPlain, 3).await;
         // 何も発行・保存されず、先取りした側には HTTP の要求が 1 バイトも届かない。
         assert!(state.load().unwrap().is_none());
         assert!(keys.get(&squat_account(&port)).unwrap().is_none());
@@ -1851,8 +1864,6 @@ mod tests {
         assert!(port.squat_tls_bytes().is_empty());
         let plain = String::from_utf8_lossy(&port.squat_bytes()).to_ascii_lowercase();
         assert!(!plain.contains("http/1.") && !plain.contains("authorization"));
-        assert!(port.accepts(ModeKind::SquatTls) >= 3);
-        assert!(port.accepts(ModeKind::SquatPlain) >= 3);
     }
 
     #[tokio::test]
@@ -1876,15 +1887,18 @@ mod tests {
             }
         }
 
+        // 実際に先取り側へ掛けにいき（掛けにいっていなければ「届いていない」は何も
+        // 示さない）、先取り側がその接続を読み終えてから記録を調べる。
+        port.settle(ModeKind::SquatTls, 3).await;
+        port.settle(ModeKind::SquatPlain, 3).await;
         // 届かなかっただけで、保存済みのキーは消されも再発行もされない。
         assert_eq!(
             keys.get(&squat_account(&port)).unwrap().as_deref(),
             Some(SQUAT_KEY)
         );
         assert!(state.load().unwrap().is_none());
+        assert_squatter_got_nothing(&port);
         port.assert_secret_absent(SQUAT_KEY);
-        assert_eq!(port.squat_tls_handshakes(), 0);
-        assert!(port.squat_tls_bytes().is_empty());
     }
 
     #[tokio::test]
@@ -1927,7 +1941,9 @@ mod tests {
                 HubStatus::unreachable(UnreachableCause::Transport)
             );
         }
+        port.settle(ModeKind::SquatTls, 3).await;
         port.assert_secret_absent(SQUAT_KEY);
+        assert_eq!(port.squat_tls_handshakes(), 0);
         assert!(port.squat_tls_bytes().is_empty());
         assert_eq!(
             keys.get(&squat_account(&port)).unwrap().as_deref(),
@@ -1936,12 +1952,19 @@ mod tests {
         );
 
         // 証明書が更新された Hub B が戻った。古い pin（A）のままでは本物にも送らない。
+        let relayed_before = port.accepts(ModeKind::Relay);
         port.set(Mode::Relay(relay(&hub_b)));
         let connection = pinned_a.connect(&port.https_url()).await.unwrap();
         assert_eq!(
             connection.status,
             HubStatus::unreachable(UnreachableCause::Transport)
         );
+        // 古い pin のまま実際に Hub B へ掛けにいき、その接続が終わってから確かめる。
+        let relayed = port.settle(ModeKind::Relay, relayed_before + 1).await;
+        wait_until("Hub B to finish the refused connection", || {
+            hub_b.connections_served() >= relayed - relayed_before
+        })
+        .await;
         assert!(hub_b.seen().is_empty(), "{:?}", hub_b.seen());
 
         // 新しい pin（B）に張り直せば同じキーで戻る。再発行も失効もしない。
@@ -2011,11 +2034,12 @@ mod tests {
             assert_eq!(hub.hit_count(STATUS_ROUTE), 1);
             assert!(hub.seen().iter().all(|req| req.authorization.is_none()));
             assert_eq!(port.accepts(ModeKind::Relay), 1);
-            // 切り替え後に実際に先取り側へ掛けにいった（途中で終わっただけではない）。
-            assert!(
-                port.accepts(then_kind) >= 1,
-                "the client never dialed the squatter after the swap"
-            );
+            // 本物の返事は最後までクライアントへ届いてから切られた（途中で切れたせいで
+            // 失敗したのではない）。
+            assert_eq!(port.handed_over_responses(), 1);
+            // 切り替え後に実際に先取り側へ掛けにいき（途中で終わっただけではない）、
+            // 先取り側がその接続を読み終えてから記録を調べる。
+            port.settle(then_kind, 1).await;
             assert_squatter_got_nothing(&port);
             assert!(state.load().unwrap().is_none());
             assert!(keys.get(&squat_account(&port)).unwrap().is_none());
@@ -2050,11 +2074,12 @@ mod tests {
             assert_eq!(hub.routes_seen(), vec![TAGS_ROUTE.to_string()]);
             assert_eq!(hub.hit_count(TAGS_ROUTE), 1);
             assert_eq!(port.accepts(ModeKind::Relay), 1);
-            // 切り替え後に実際に先取り側へ掛けにいった（途中で終わっただけではない）。
-            assert!(
-                port.accepts(then_kind) >= 1,
-                "the client never dialed the squatter after the swap"
-            );
+            // 本物の返事は最後までクライアントへ届いてから切られた（途中で切れたせいで
+            // 失敗したのではない）。
+            assert_eq!(port.handed_over_responses(), 1);
+            // 切り替え後に実際に先取り側へ掛けにいき（途中で終わっただけではない）、
+            // 先取り側がその接続を読み終えてから記録を調べる。
+            port.settle(then_kind, 1).await;
             assert_squatter_got_nothing(&port);
             assert_eq!(
                 keys.get(&squat_account(&port)).unwrap().as_deref(),
