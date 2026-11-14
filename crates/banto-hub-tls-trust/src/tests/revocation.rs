@@ -766,7 +766,10 @@ fn exposed_or_foreign_owned_certificates_yield_the_thumbprint_to_revoke() {
     let found = load(&ops);
     assert_eq!(found.problem.fault, UserFault::ForeignOwner);
     assert_eq!(found.revocation_thumbprint(), Some(cert));
-    assert_eq!(found.exposed_thumbprint(), Some(cert)); // 既存の API も決定済みの失効方針に揃える。
+    // 非推奨の旧名の互換性だけをここで確かめる。本番の呼び出しは新しい名前を使う。
+    #[allow(deprecated)]
+    let legacy = found.exposed_thumbprint();
+    assert_eq!(legacy, Some(cert));
     assert!(matches!(found.seen, UncheckedUserCert::Seen(_)));
 
     // ハードリンクの鍵: 露出ではない。

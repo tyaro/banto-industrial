@@ -345,6 +345,9 @@ fn load_in<P: UserTlsPlace + ?Sized>(
     let dir = tls_place(ops, place, options)?;
     let _lock = lock(ops, &dir, options.lock_wait)?;
     settled(ops, place, options)?;
+    // 本体の露出を補助ファイルの異常で隠さない。失効の記録への書き足しまで先に行う。
+    let (cert, key) = read_pair(ops, place, options, &dir)?;
+    let complete = matches!((&cert, &key), (Some(cert), Some(key)) if pair_matches(cert, key));
     let marker = checked_auxiliary_file(ops, &dir, CREATING)?;
     let creating = if let Some(mut marker) = marker {
         if TlsFile::read_all(&mut marker, 128).map_err(|error| error.to_string())?
@@ -356,8 +359,6 @@ fn load_in<P: UserTlsPlace + ?Sized>(
     } else {
         false
     };
-    let (cert, key) = read_pair(ops, place, options, &dir)?;
-    let complete = matches!((&cert, &key), (Some(cert), Some(key)) if pair_matches(cert, key));
     // 印が無い一時ファイルを「前の作りかけ」と決めつけない。完全な組を使う場合も、
     // 印を片付ける前に一時ファイルの種類・所有者・ACL を確かめる。
     for name in [KEY_TEMP, CERT_TEMP] {

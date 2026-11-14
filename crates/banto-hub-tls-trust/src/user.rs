@@ -885,6 +885,7 @@ impl UnusableUserCert {
 
     /// [`Self::revocation_thumbprint`] の互換の別名。名前は露出だが、PR2 以降は所有者の違いも
     /// 失効に入れる。新しい呼び出し側は意味を表す `revocation_thumbprint` を使う。
+    #[deprecated(note = "use revocation_thumbprint")]
     pub fn exposed_thumbprint(&self) -> Option<CertThumbprint> {
         self.revocation_thumbprint()
     }

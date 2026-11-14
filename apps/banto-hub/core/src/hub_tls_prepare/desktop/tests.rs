@@ -504,6 +504,38 @@ fn untrusted_auxiliary_files_do_not_revoke_the_valid_identity() {
 }
 
 #[test]
+fn auxiliary_failure_does_not_hide_exposure_of_the_identity() {
+    for name in [CREATING, KEY_TEMP, CERT_TEMP] {
+        let fixture = Fixture::new();
+        let place = &fixture.0;
+        let cert = place.load().unwrap();
+        place.put(
+            name,
+            if name == CREATING {
+                CREATING_CONTENTS
+            } else {
+                b"auxiliary"
+            },
+        );
+        acl(&place.tls().join(name), &["/grant", "*S-1-1-0:(M)"]);
+        acl(
+            &place.tls().join(KEY_FILE),
+            &["/grant", "*S-1-5-32-545:(R)"],
+        );
+        assert!(place.load().is_err());
+        assert!(
+            read_user_revocations(&WindowsTlsTrustOps, place).is_revoked(&thumb(&cert)),
+            "{name} の問題で本体の露出を隠さない"
+        );
+        assert!(place.tls().join(name).exists(), "問題の補助ファイルは残す");
+        assert_eq!(
+            std::fs::read(place.tls().join(CERT_FILE)).unwrap(),
+            cert.cert_pem()
+        );
+    }
+}
+
+#[test]
 fn marked_complete_pair_does_not_delete_untrusted_temp_and_expiry_does_not_renew() {
     let fixture = Fixture::new();
     let place = &fixture.0;
