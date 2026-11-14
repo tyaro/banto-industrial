@@ -9,6 +9,7 @@
 //! 子プロセスとして起こす（`proxy_child` は `--ignored` でだけ走る）。
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -38,6 +39,9 @@ struct BackendHub {
     addr: SocketAddr,
     heads: Arc<Mutex<Vec<String>>>,
     redirect: Arc<Mutex<Option<(u16, String)>>>,
+    /// 受けた接続の数と、そのうち扱いが終わった（握手の失敗・相手が閉じた・切られた）数。
+    accepted: Arc<AtomicUsize>,
+    finished: Arc<AtomicUsize>,
     task: AbortHandle,
 }
 
@@ -48,18 +52,27 @@ impl BackendHub {
         let heads = Arc::new(Mutex::new(Vec::new()));
         let redirect = Arc::new(Mutex::new(None));
         let acceptor = TlsAcceptor::from(identity.server_config());
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicUsize::new(0));
         let (task_heads, task_redirect) = (Arc::clone(&heads), Arc::clone(&redirect));
+        let (task_accepted, task_finished) = (Arc::clone(&accepted), Arc::clone(&finished));
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     continue;
                 };
-                tokio::spawn(serve(
+                task_accepted.fetch_add(1, Ordering::SeqCst);
+                let serving = serve(
                     stream,
                     acceptor.clone(),
                     Arc::clone(&task_heads),
                     Arc::clone(&task_redirect),
-                ));
+                );
+                let finished = Arc::clone(&task_finished);
+                tokio::spawn(async move {
+                    serving.await;
+                    finished.fetch_add(1, Ordering::SeqCst);
+                });
             }
         })
         .abort_handle();
@@ -67,8 +80,29 @@ impl BackendHub {
             addr,
             heads,
             redirect,
+            accepted,
+            finished,
             task,
         }
+    }
+
+    /// 受けた接続が `at_least` 本、最後まで扱われるのを待つ。中継が「終わった」あとも
+    /// この Hub は届いたバイトをまだ読んでいることがあるので、「要求が 1 つも
+    /// 届いていない」を確かめる前に、Hub 自身が接続を読み終えたことを待つ。
+    async fn wait_finished(&self, at_least: usize) {
+        wait_until("the real hub to finish its connections", 10, || {
+            self.finished.load(Ordering::SeqCst) >= at_least
+        })
+        .await;
+    }
+
+    /// 受けた接続がすべて終わるまで待つ（中継が切られたあと、途中だった要求の記録が
+    /// 出そろう）。件数の基準を取る前に使う。
+    async fn wait_idle(&self) {
+        wait_until("the real hub to have no open connection", 10, || {
+            self.finished.load(Ordering::SeqCst) == self.accepted.load(Ordering::SeqCst)
+        })
+        .await;
     }
 
     fn set_redirect(&self, status: u16, location: &str) {
@@ -334,12 +368,14 @@ async fn rest_calls_never_deliver_the_key_to_a_squatter_or_a_stopped_hub() {
             );
         }
     }
-    assert!(port.accepts(ModeKind::SquatTls) >= ATTEMPTS);
+    // 実際に掛けにいった本数を確かめ、先取り側がその接続を読み終えるのを待つ（受けた数は
+    // TCP を受けた時点で増えるので、それだけでは握手や受信が済んだことにならない）。
+    port.settle(ModeKind::SquatTls, ATTEMPTS).await;
 
     // 証明書もない平文が先取りした。
     port.set(Mode::SquatPlain);
     assert_rest_refused(&api, "plain squat").await;
-    assert!(port.accepts(ModeKind::SquatPlain) >= ATTEMPTS);
+    port.settle(ModeKind::SquatPlain, ATTEMPTS).await;
 
     // Hub が止まっていて何も待っていない。
     port.set(Mode::Down);
@@ -380,14 +416,13 @@ async fn a_swap_between_the_check_and_the_send_does_not_leak_on_the_same_client(
         Err(HubApiError::Tls)
     ));
     assert!(matches!(api.fetch_config().await, Err(HubApiError::Tls)));
-    assert!(
-        port.accepts(ModeKind::SquatTls) >= 2,
-        "the client really dialed the squatter and refused it"
-    );
+    // 実際に先取り側へ掛けにいって断り、先取り側はその接続を読み終えている。
+    port.settle(ModeKind::SquatTls, 2).await;
 
     // 平文への入れ替わりも同じ。
     port.set(Mode::SquatPlain);
     assert_rest_refused(&api, "plain swap").await;
+    port.settle(ModeKind::SquatPlain, ATTEMPTS).await;
 
     port.assert_secret_absent(DUMMY_KEY);
     assert_eq!(port.squat_tls_handshakes(), 0);
@@ -409,11 +444,11 @@ async fn ingest_websocket_never_delivers_the_key_to_a_squatter_or_a_stopped_hub(
 
     port.set(Mode::SquatTls(squatter.server_config()));
     assert_ws_refused(&url, &pins_a, "tls squat").await;
-    assert!(port.accepts(ModeKind::SquatTls) >= ATTEMPTS);
+    port.settle(ModeKind::SquatTls, ATTEMPTS).await;
 
     port.set(Mode::SquatPlain);
     assert_ws_refused(&url, &pins_a, "plain squat").await;
-    assert!(port.accepts(ModeKind::SquatPlain) >= ATTEMPTS);
+    port.settle(ModeKind::SquatPlain, ATTEMPTS).await;
 
     port.set(Mode::Down);
     assert_ws_refused(&url, &pins_a, "down").await;
@@ -482,19 +517,35 @@ async fn the_ingest_retry_loop_keeps_redialing_a_squatter_without_leaking_the_ke
     // Hub が死に（つながっていた WS が切れ）、別プロセスが先取りした。再試行は先取りへ向かい、
     // そのたびに pin で断られる（バックオフの 1 秒・2 秒を挟んで 3 回）。
     port.set(Mode::SquatTls(squatter.server_config()));
-    wait_until("repeated redials of the squatter", 15, || {
-        port.accepts(ModeKind::SquatTls) >= 3
-    })
+    // 受けた数ではなく、先取り側で最後まで扱われた（握手が断られて閉じた）接続の数で待つ。
+    port.wait_finished(ModeKind::SquatTls, 3, Duration::from_secs(15))
+        .await;
+    assert_eq!(port.squat_tls_handshakes(), 0);
+    assert!(port.squat_tls_bytes().is_empty());
+    assert_eq!(
+        hub.bearer_upgrades(),
+        delivered,
+        "the real hub got no new upgrade while squatted"
+    );
+
+    // 本物が戻る。手を加えなくても、再試行が自分で本物へ張り直す。
+    port.set(Mode::Relay(hub.addr));
+    wait_until(
+        "the source to reconnect to the real hub by itself",
+        30,
+        || hub.bearer_upgrades() > delivered,
+    )
     .await;
 
     assert!(
         source.stop(Duration::from_secs(10)).await.is_ok(),
         "the source stops"
     );
-    port.assert_secret_absent(DUMMY_KEY);
+    // 止めたあと、先取り側が受けた接続をすべて読み終えてから記録を調べる。
+    port.settle(ModeKind::SquatTls, 3).await;
+    port.assert_squat_secret_absent(DUMMY_KEY);
     assert_eq!(port.squat_tls_handshakes(), 0);
     assert!(port.squat_tls_bytes().is_empty());
-    assert_eq!(hub.bearer_upgrades(), delivered);
 }
 
 #[tokio::test]
@@ -509,6 +560,10 @@ async fn a_renewed_certificate_needs_the_pin_rotated_and_never_leaks_before_that
     let stale = HubApi::new(&config_for(&port.https_url(), &[&identity_a])).unwrap();
     assert_rest_refused(&stale, "stale pin").await;
     assert_ws_refused(&ws_url(&port), &pins(&[&identity_a]), "stale pin ws").await;
+    // 古い pin のまま実際に掛けにいき、中継も Hub B もその接続を最後まで扱い終えてから
+    // 「要求は 1 つも届いていない」を確かめる。
+    let dialed = port.settle(ModeKind::Relay, 2 * ATTEMPTS).await;
+    hub_b.wait_finished(dialed).await;
     assert_eq!(hub_b.requests(), 0, "no request may reach the renewed Hub");
     assert_eq!(hub_b.bearer_requests(), 0);
 
@@ -608,6 +663,7 @@ async fn proxy_child() {
     port.set(Mode::SquatTls(squatter.server_config()));
     assert_rest_refused(&api, "tls squat").await;
     assert_ws_refused(&ws_url(&port), &pins_a, "tls squat ws").await;
+    port.settle(ModeKind::SquatTls, 2 * ATTEMPTS).await;
     port.assert_secret_absent(DUMMY_KEY);
     assert_eq!(port.squat_tls_handshakes(), 0);
     assert_no_http_reached(&port);
@@ -698,8 +754,20 @@ async fn run_keeps_retrying_a_squatter_without_leaking_the_key() {
     // Hub が止まって、別プロセスが先取りした。再試行（状態の push は 1 秒ごと、設定の取得は
     // バックオフ）が先取りへ何度も向かっても、pin で断られてキーは届かない。
     port.set(Mode::SquatTls(squatter.server_config()));
-    wait_until("repeated retries against the squatter", 20, || {
-        port.accepts(ModeKind::SquatTls) >= 5
+    // 受けた数ではなく、先取り側で最後まで扱われた（握手が断られて閉じた）接続の数で待つ。
+    port.wait_finished(ModeKind::SquatTls, 5, Duration::from_secs(20))
+        .await;
+    assert_eq!(port.squat_tls_handshakes(), 0);
+    assert!(port.squat_tls_bytes().is_empty());
+
+    // 本物が戻る。手を加えなくても、再試行が自分で本物へ届く。切り替えの時に本物へ
+    // 向かっていた要求の記録が出そろう（本物の側の接続がすべて終わる）のを待ってから
+    // 基準を取るので、増えた分は戻ったあとに届いた要求になる。
+    hub.wait_idle().await;
+    let before_recovery = hub.bearer_requests();
+    port.set(Mode::Relay(hub.addr));
+    wait_until("run to reach the real hub again by itself", 30, || {
+        hub.bearer_requests() > before_recovery
     })
     .await;
 
@@ -710,10 +778,12 @@ async fn run_keeps_retrying_a_squatter_without_leaking_the_key() {
         .unwrap();
     assert!(result.is_ok());
 
-    port.assert_secret_absent(DUMMY_KEY);
+    // 止めたあと、先取り側が受けた接続をすべて読み終えてから記録を調べる。
+    port.settle(ModeKind::SquatTls, 5).await;
+    port.assert_squat_secret_absent(DUMMY_KEY);
     assert_eq!(port.squat_tls_handshakes(), 0);
     assert!(port.squat_tls_bytes().is_empty());
     assert_no_http_reached(&port);
     // 切り替え時に本物へ向かっていた要求が後から記録されうる（設定の取得と状態の push は並行）
-    // ので、本物側の件数の厳密な比較はしない。漏れの判定は先取り側の観測で行う。
+    // ので、先取り中の本物側の件数の厳密な比較はしない。漏れの判定は先取り側の観測で行う。
 }
