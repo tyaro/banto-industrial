@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use banto_hub_squat_harness::{Mode, ModeKind, SwitchPort, TestIdentity};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task::AbortHandle;
 use tokio_rustls::TlsAcceptor;
 
@@ -120,6 +120,19 @@ impl PlainPort {
 impl Drop for PlainPort {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+/// 平文の口の待ち受けが本当に止まる（接続が断られる）まで待つ。abort は非同期なので、
+/// 止まる前に確かめると「まだ誰かいる」状態を見てしまう。
+async fn wait_until_refused(port: u16) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "plain port {port} must stop listening"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -233,16 +246,14 @@ async fn the_gate_opens_only_for_the_real_hub_through_its_whole_lifecycle() {
     assert!(port.accepts(ModeKind::Down) >= ATTEMPTS);
 
     // 平文の口まで空けば、Service→Desktop の待ちが見る「消えた」になる。
+    let plain_port = plain.port;
     drop(plain);
-    let unused = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
-    };
-    assert_eq!(run(&probe, unused).await, HealthOutcome::Unreachable);
+    wait_until_refused(plain_port).await;
+    assert_eq!(run(&probe, plain_port).await, HealthOutcome::Unreachable);
 
     // 同じポートで本物が戻れば、また通る（回復）。
     port.set(Mode::Relay(hub_a.addr));
-    assert_eq!(run(&probe, unused).await, healthy());
+    assert_eq!(run(&probe, plain_port).await, healthy());
     assert_eq!(
         hub_a.requests(),
         2,
