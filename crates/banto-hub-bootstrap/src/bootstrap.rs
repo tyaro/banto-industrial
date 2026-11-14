@@ -1964,8 +1964,11 @@ mod tests {
             .unwrap()
     }
 
-    fn squat_modes(squatter: &TestIdentity) -> [Mode; 2] {
-        [Mode::SquatTls(squatter.server_config()), Mode::SquatPlain]
+    fn squat_modes(squatter: &TestIdentity) -> [(Mode, ModeKind); 2] {
+        [
+            (Mode::SquatTls(squatter.server_config()), ModeKind::SquatTls),
+            (Mode::SquatPlain, ModeKind::SquatPlain),
+        ]
     }
 
     fn assert_squatter_got_nothing(port: &SwitchPort) {
@@ -1985,7 +1988,7 @@ mod tests {
     async fn a_swap_inside_one_connect_after_the_status_check_sends_nothing_to_the_squatter() {
         let identity = TestIdentity::generate();
         let squatter = TestIdentity::generate();
-        for then in squat_modes(&squatter) {
+        for (then, then_kind) in squat_modes(&squatter) {
             let hub = MockHub::start(squat_routes());
             let port = SwitchPort::start().await;
             let keys = Arc::new(MemoryKeyStore::new());
@@ -2005,8 +2008,14 @@ mod tests {
             );
             // 本物が見たのは鍵なしの確認 1 本だけ。グラントも発行も届いていない。
             assert_eq!(hub.routes_seen(), vec![STATUS_ROUTE.to_string()]);
+            assert_eq!(hub.hit_count(STATUS_ROUTE), 1);
             assert!(hub.seen().iter().all(|req| req.authorization.is_none()));
             assert_eq!(port.accepts(ModeKind::Relay), 1);
+            // 切り替え後に実際に先取り側へ掛けにいった（途中で終わっただけではない）。
+            assert!(
+                port.accepts(then_kind) >= 1,
+                "the client never dialed the squatter after the swap"
+            );
             assert_squatter_got_nothing(&port);
             assert!(state.load().unwrap().is_none());
             assert!(keys.get(&squat_account(&port)).unwrap().is_none());
@@ -2019,7 +2028,7 @@ mod tests {
     async fn a_swap_right_after_a_rejected_stored_key_does_not_resend_it_to_the_squatter() {
         let identity = TestIdentity::generate();
         let squatter = TestIdentity::generate();
-        for then in squat_modes(&squatter) {
+        for (then, then_kind) in squat_modes(&squatter) {
             let hub = MockHub::start(routes(vec![(TAGS_ROUTE, vec![(401, "{}".to_string())])]));
             let port = SwitchPort::start().await;
             let keys = Arc::new(MemoryKeyStore::new());
@@ -2039,7 +2048,13 @@ mod tests {
             );
             // 本物に着いたのは最初の鍵つきの 1 本だけ（そこで断られた）。
             assert_eq!(hub.routes_seen(), vec![TAGS_ROUTE.to_string()]);
+            assert_eq!(hub.hit_count(TAGS_ROUTE), 1);
             assert_eq!(port.accepts(ModeKind::Relay), 1);
+            // 切り替え後に実際に先取り側へ掛けにいった（途中で終わっただけではない）。
+            assert!(
+                port.accepts(then_kind) >= 1,
+                "the client never dialed the squatter after the swap"
+            );
             assert_squatter_got_nothing(&port);
             assert_eq!(
                 keys.get(&squat_account(&port)).unwrap().as_deref(),
