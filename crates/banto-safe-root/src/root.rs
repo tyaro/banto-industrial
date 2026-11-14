@@ -582,6 +582,33 @@ impl ManagedDir {
         }
     }
 
+    /// [`ManagedDir::write_atomic`] の、一時ファイル（つまり置き換えた後のファイル）を「SYSTEM・
+    /// Administrators にフル、`BUILTIN\Users` に読み取りと実行、所有者 `BUILTIN\Administrators`、
+    /// 保護された DACL（継承のフラグ無し）」の記述子で**作るのと同時に**付けて作る版（#1121
+    /// PR2b。Hub のサービスの失効の記録）。所有者を明示するのは、「作成者を所有者に」の PC で
+    /// 昇格した利用者が所有者にならないため（[`crate::acl::PinnedDir::create_child_file_users_read`]
+    /// と同じ）。所有者を Administrators にできるのは昇格した管理者・SYSTEM だけ（それ以外は
+    /// 何も置き換えずに失敗する）。Guarded だけ（Plain は [`SafeRootError::UnsupportedPlatform`]）。
+    pub fn write_atomic_users_read(&self, name: &str, contents: &[u8]) -> Result<()> {
+        if temp_name(name, 0).is_none() {
+            return Err(invalid_name());
+        }
+        match &self.inner {
+            #[cfg(windows)]
+            Inner::Guarded(pinned) => {
+                let descriptor = crate::acl::imp::users_read_sd(false)?;
+                win::write_atomic_with(
+                    pinned,
+                    &self.display_of(name),
+                    name,
+                    contents,
+                    Some(&descriptor),
+                )
+            }
+            Inner::Plain => Err(SafeRootError::UnsupportedPlatform),
+        }
+    }
+
     /// 名前 1 要素のファイルを消す（無ければ `Ok(false)`）。Guarded は名前で相対に開いた**後に
     /// ハンドルで**属性を読み直し、reparse point・フォルダなら消さずに
     /// [`SafeRootError::Refused`]（一覧の属性は信じない。Fable B-5）。消すのは開いたハンドルで

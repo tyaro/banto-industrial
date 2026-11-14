@@ -205,6 +205,131 @@ fn is_temp_name_of(candidate: &str, name: &str) -> bool {
         .is_some_and(|nonce| nonce.len() == 8 && nonce.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
+/// `dir` の中の `name` を原子的に置き換える（`ManagedDir::write_atomic`。宛先が読み取りで開かれて
+/// いる間の失敗は `REPLACE_TRIES` 回までやり直す）。利用者の記録（[`crate::RevocationOps`]）と
+/// サービスの記録（banto-hub-core の [`crate::ServiceRevocationOps`] の実装）が共有する。
+pub fn write_file_atomic(dir: &WinTlsDir, name: &str, contents: &[u8]) -> Result<(), String> {
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        match dir.managed().write_atomic(name, contents) {
+            Ok(()) => return Ok(()),
+            Err(SafeRootError::Io {
+                os_error: Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION),
+                ..
+            }) if tries < REPLACE_TRIES => std::thread::sleep(REPLACE_RETRY_WAIT),
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+}
+
+/// `dir` の中に残った、`name` の一時ファイル（`.{name}.tmp-{16 進 8 桁}`）を読まずに消す。
+pub fn remove_stale_temps(dir: &WinTlsDir, name: &str) -> Result<(), String> {
+    let report = dir
+        .managed()
+        .remove_where(&|candidate| is_temp_name_of(candidate, name))
+        .map_err(|err| err.to_string())?;
+    match report.failed.first() {
+        Some((left, err)) => Err(format!("{left}: {err}")),
+        None => Ok(()),
+    }
+}
+
+/// 一時ファイルの nonce の最初の値（プロセスと時刻から。衝突したら進める）。
+fn temp_nonce_seed() -> u32 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos())
+        .unwrap_or(0);
+    nanos ^ std::process::id().rotate_left(16)
+}
+
+/// サービスの失効の記録（#1121 PR2b）: `dir` の中に `name` が無ければ作る。同じフォルダの一時
+/// ファイル（`.{name}.tmp-{16 進 8 桁}`）を `PinnedDir::create_child_file_users_read`（SYSTEM・
+/// Administrators にフル、Users に読み取りと実行、所有者 Administrators を作るのと同時に付け、
+/// 書いて書き出し、読み戻して確かめる）で作り、`ManagedDir::rename_no_replace` で**置き換えず
+/// に**付け替える。宛先が既にあれば（`AlreadyExists`）一時ファイルを消して `Ok(false)`。
+pub fn create_file_no_replace_users_read(
+    dir: &WinTlsDir,
+    name: &str,
+    contents: &[u8],
+) -> Result<bool, String> {
+    let managed = dir.managed();
+    let seed = temp_nonce_seed();
+    let mut made = None;
+    for step in 0..16u32 {
+        let temp = banto_safe_root::root::temp_name(name, seed.wrapping_add(step))
+            .ok_or_else(|| format!("{name} の一時ファイルの名前を作れません"))?;
+        match dir.pinned().create_child_file_users_read(&temp, contents) {
+            Ok(Some(file)) => {
+                // 付け替えは名前で開き直して行う（作ったハンドルは先に閉じる）。
+                drop(file);
+                made = Some(temp);
+                break;
+            }
+            Ok(None) => continue,
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+    let Some(temp) = made else {
+        return Err(format!(
+            "{name} の一時ファイルを作れませんでした（名前が衝突し続けます）"
+        ));
+    };
+    match managed.rename_no_replace(&temp, name) {
+        Ok(true) => Ok(true),
+        Ok(false) => Err(format!("{temp} を付け替えようとしたら無くなっていました")),
+        Err(err) => {
+            let _ = managed.remove(&temp);
+            match err {
+                SafeRootError::Io {
+                    kind: std::io::ErrorKind::AlreadyExists,
+                    ..
+                } => Ok(false),
+                other => Err(other.to_string()),
+            }
+        }
+    }
+}
+
+/// サービスの失効の記録（#1121 PR2b）: `dir` の中の `name` を原子的に置き換える
+/// （`ManagedDir::write_atomic_users_read`。置き換えた後のファイルは、SYSTEM・Administrators に
+/// フル、Users に読み取りと実行、所有者 Administrators）。宛先が読み取りで開かれている間の失敗は
+/// `REPLACE_TRIES` 回までやり直す（[`write_file_atomic`] と同じ）。
+pub fn write_file_atomic_users_read(
+    dir: &WinTlsDir,
+    name: &str,
+    contents: &[u8],
+) -> Result<(), String> {
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        match dir.managed().write_atomic_users_read(name, contents) {
+            Ok(()) => return Ok(()),
+            Err(SafeRootError::Io {
+                os_error: Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION),
+                ..
+            }) if tries < REPLACE_TRIES => std::thread::sleep(REPLACE_RETRY_WAIT),
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+}
+
+/// Hub 用: `parent` の直下に、SYSTEM・Administrators にフル、`BUILTIN\Users` に読み取りと実行、
+/// 所有者 Administrators、保護された DACL（`OICI`）のフォルダを作るのと同時に付けて作る
+/// （`PinnedDir::create_child_dir_users_read`。`tls\` とサービスの失効の記録の置き場。既にあれば
+/// `Ok(None)`）。
+pub fn create_child_dir_users_read(
+    parent: &WinTlsDir,
+    name: &str,
+) -> Result<Option<WinTlsDir>, String> {
+    parent
+        .pinned()
+        .create_child_dir_users_read(name)
+        .map(|found| found.map(WinTlsDir::new))
+        .map_err(|err| err.to_string())
+}
+
 /// 失効の記録の書き込み（#1121 PR1b）。部品はすべて `banto_safe_root` で、どれも握った
 /// フォルダのハンドル基準に、名前 1 要素で辿らずに行う:
 ///
@@ -231,29 +356,11 @@ impl crate::RevocationOps for WindowsTlsTrustOps {
     }
 
     fn write_atomic(&self, dir: &WinTlsDir, name: &str, contents: &[u8]) -> Result<(), String> {
-        let mut tries = 0;
-        loop {
-            tries += 1;
-            match dir.managed().write_atomic(name, contents) {
-                Ok(()) => return Ok(()),
-                Err(SafeRootError::Io {
-                    os_error: Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION),
-                    ..
-                }) if tries < REPLACE_TRIES => std::thread::sleep(REPLACE_RETRY_WAIT),
-                Err(err) => return Err(err.to_string()),
-            }
-        }
+        write_file_atomic(dir, name, contents)
     }
 
     fn remove_stale_temps(&self, dir: &WinTlsDir, name: &str) -> Result<(), String> {
-        let report = dir
-            .managed()
-            .remove_where(&|candidate| is_temp_name_of(candidate, name))
-            .map_err(|err| err.to_string())?;
-        match report.failed.first() {
-            Some((left, err)) => Err(format!("{left}: {err}")),
-            None => Ok(()),
-        }
+        remove_stale_temps(dir, name)
     }
 
     fn create_file_if_absent(&self, dir: &WinTlsDir, name: &str) -> Result<(), String> {

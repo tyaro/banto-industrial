@@ -65,6 +65,30 @@
 //!   pin の根に使うので、SYSTEM・Administrators・昇格した本人以外の所有者や広い許可は断る）。
 //!   既にある `tls\` の DACL も書き直さない（確かめて、合わなければ断る）。
 //!
+//! ## サービスの失効の記録（#1121 PR2b。docs/hub-desktop-tls-design.md §4.4.1・場面 11・26）
+//!
+//! 露出を見たサービスの証明書の拇印は、`<ProgramData>\BantoHub\tls-revocations\`（`tls\` の外。
+//! 共有 crate の `banto_hub_tls_trust::ServiceRevocations`）に残り、サービスの Hub と
+//! クライアントはその証明書を使わない。ここでは、鍵と証明書を作る・作り直す**前に**記録を整える:
+//!
+//! - 置き場（`tls-revocations\`）は `tls\` の後に、確かめ済みのルートのハンドル基準で開いて
+//!   確かめる（無ければ `tls\` と同じ保護された DACL を付けて作る）。確かめに通らない（露出・
+//!   所有者違い・リンク）なら、**何も変えずに断る**（場面 26。`--renew` でも。管理者が置き場を
+//!   直してから `--renew`）。
+//! - 記録が無ければ空で作る（置き換えずに作る。サービスの Hub の起動と同時でも、先に作った方が
+//!   残る）。
+//! - 形が壊れていれば、行ごとに読めた拇印と、古い証明書の拇印（読めれば）を引き継いで、
+//!   置き換えで作り直す。`--renew` が無く今の証明書を保つときは、保つ証明書が失効になるので、
+//!   **何も変えずに断り** `--renew` を案内する。
+//! - 健全な記録は書き換えない（`--renew` でも。設計の場面 20 の利用者側と揃える）。保つ証明書の
+//!   拇印が記録にあれば、サービスの Hub はそれを使わないので、何も変えずに断り `--renew` を
+//!   案内する。
+//! - 記録のためのロックは足さない。この実行全体は名前付き mutex（[`LOCK_NAME`]）で直列なので
+//!   「`tls\` → 記録」の順は満たされ、サービスの Hub が起動のときに記録を作るのは「置き換えずに
+//!   作る」だけなので、ここで作り直した記録を上書きしない（共有 crate の
+//!   `service_revocation` の module doc「書き方とロック」）。残った一時ファイルは、mutex を
+//!   持っている間にここで片付ける。
+//!
 //! ## 出力・終了コード
 //!
 //! 行は `banto-hub-elev: ` で始まる。成功したときは証明書の絶対パス・SHA-256 の指紋（DER
@@ -98,11 +122,17 @@ use crate::sink_config_prepare::{
 // 置き場の定数・読み取りの操作・ルートの DACL の確かめは、クライアント（ChronoGazer）と同じ
 // コードを使うため共有 crate に置く（#644 PR3a）。ここでは同じ名前で見せる。
 use banto_hub_tls_trust::text::reasons_text;
-pub use banto_hub_tls_trust::{
-    root_dacl_problems, TlsDir, TlsFile, TlsTrustOps, CERT_FILE, KEY_FILE, MAX_PEM_BYTES,
-    ROOT_TAKEOVER_MASK, TLS_DIR,
+use banto_hub_tls_trust::{
+    create_service_revocations_if_absent, open_or_create_service_revocations_dir,
+    read_service_revocations_in, remove_stale_service_revocation_temps,
+    rewrite_service_revocations, CertThumbprint, RevocationRecord, RevokedCert, RevokedCertPlace,
+    ServiceRevocationFault, ServiceRevocationProblem, ServiceRevocations, ServiceRoot, ROOT_LABEL,
+    SERVICE_REVOCATIONS_LABEL, TLS_LABEL,
 };
-use banto_hub_tls_trust::{ROOT_LABEL, TLS_LABEL};
+pub use banto_hub_tls_trust::{
+    root_dacl_problems, ServiceRevocationOps, TlsDir, TlsFile, TlsTrustOps, CERT_FILE, KEY_FILE,
+    MAX_PEM_BYTES, ROOT_TAKEOVER_MASK, SERVICE_REVOCATIONS_DIR, TLS_DIR,
+};
 
 pub mod load;
 #[cfg(windows)]
@@ -372,9 +402,10 @@ pub enum FileAcl {
 }
 
 /// `prepare-hub-tls` が OS に対してする操作（Windows の実装は `win::WindowsHubTlsOps`。テストは
-/// 偽物）。開く・読む操作は親の [`TlsTrustOps`]（共有 crate。サービスの読み込み [`load`] と
-/// クライアントが使う）、ここには書き込み・作成・直列化を足す。
-pub trait HubTlsOps: TlsTrustOps {
+/// 偽物）。開く・読む操作は [`TlsTrustOps`]（共有 crate。サービスの読み込み [`load`] と
+/// クライアントが使う）、サービスの失効の記録を書く操作は親の [`ServiceRevocationOps`]（共有
+/// crate、#1121 PR2b）、ここには鍵と証明書の書き込み・作成・直列化を足す。
+pub trait HubTlsOps: ServiceRevocationOps {
     /// [`HubTlsOps::hold_lock`] が返す、持っている間だけ有効なもの（drop で離す）。
     type Lock;
 
@@ -575,6 +606,40 @@ enum Action {
     Renew(Identity, IdentityInfo),
 }
 
+/// サービスの失効の記録をどうするか（モジュール doc「サービスの失効の記録」）。
+enum RecordPlan {
+    /// 無いので空で作る。
+    Create,
+    /// 健全なので書き換えない。
+    Keep(RevocationRecord),
+    /// 形が壊れているので、拇印を引き継いで作り直す。
+    Rebuild {
+        /// 何が壊れていたか。
+        reason: String,
+        /// 行ごとに読めた拇印。
+        salvaged: Vec<RevokedCert>,
+    },
+}
+
+/// サービスの失効の記録を使えないときの、断りの文言（純関数）。
+fn record_refusal_text(found: &ServiceRevocationProblem) -> String {
+    match found.fault {
+        ServiceRevocationFault::Untrusted => format!(
+            "{}。別の利用者が失効の記録を書き換えられる恐れがあるため、何も変えずに止めます（{RENEW_FLAG} でも）。中身を確かめ、{SERVICE_REVOCATIONS_LABEL}の所有者を Administrators にし、SYSTEM・Administrators 以外への書き込みの許可を外して（または、このフォルダを消して）から、{RENEW_FLAG} で記録と証明書を作り直してください",
+            found.reason
+        ),
+        ServiceRevocationFault::Broken => format!(
+            "{}。何も変えずに止めます。{}",
+            found.reason,
+            renew_hint()
+        ),
+        ServiceRevocationFault::Transient => format!(
+            "{}。何も変えずに止めます。原因を取り除いてから、もう一度実行してください",
+            found.reason
+        ),
+    }
+}
+
 /// `prepare-hub-tls` の本体（モジュール doc「設計意図」）。
 pub fn prepare_hub_tls<O: HubTlsOps>(ops: &O, renew: bool, out: Out<'_>) -> Result<(), Refused> {
     let mut created = Created::default();
@@ -719,6 +784,34 @@ fn run<O: HubTlsOps>(
         ));
     }
 
+    // --- サービスの失効の記録の置き場（#1121 PR2b。確かめ済みのルートのハンドル基準。無ければ
+    // `tls\` と同じ DACL を付けて作る。通らなければ何も変えずに断る - 場面 26） -------------
+    let record_root = ServiceRoot {
+        root: &root,
+        root_path: &plan.root,
+        root_real: &root_real,
+        known: &plan.known,
+        elevated,
+    };
+    let (record_dir, record_dir_created) =
+        open_or_create_service_revocations_dir(ops, &record_root)
+            .map_err(|found| record_refusal_text(&found))?;
+    let record_dir_path = record_dir.path().to_path_buf();
+    if record_dir_created {
+        created
+            .0
+            .push((SERVICE_REVOCATIONS_LABEL, record_dir_path.clone()));
+    }
+    let record_plan = match read_service_revocations_in(ops, &record_dir) {
+        Ok(ServiceRevocations::Absent) => RecordPlan::Create,
+        Ok(ServiceRevocations::Record(record)) => RecordPlan::Keep(record),
+        Err(found) if found.fault == ServiceRevocationFault::Broken => RecordPlan::Rebuild {
+            reason: found.reason,
+            salvaged: found.salvaged,
+        },
+        Err(found) => return Err(record_refusal_text(&found)),
+    };
+
     // --- 中のファイル（置き場のハンドル基準。辿らない） --------------------------------
     let read = !renew;
     let key = inspect_child(ops, &tls, &tls_path, &tls_real, KEY_FILE, "秘密鍵", read)?;
@@ -811,6 +904,54 @@ fn run<O: HubTlsOps>(
             }
         }
     };
+    // --- 失効の記録との照合（#1121 PR2b。書く前に決める） -------------------------------
+    // 保つ証明書の拇印。`--renew` で記録が壊れているときは、引き継ぐために古い証明書を読む
+    // （読めなければ無し。中身・ACL は確かめない）。
+    let kept_thumbprint = match &action {
+        Action::Keep(_) => cert
+            .as_ref()
+            .and_then(|found| found.contents.as_deref())
+            .and_then(|pem| CertThumbprint::of_pem(pem).ok()),
+        Action::Create(..) | Action::Renew(..) => None,
+    };
+    let old_thumbprint = match (&action, &record_plan) {
+        (Action::Renew(..), RecordPlan::Rebuild { .. }) if cert.is_some() => inspect_child(
+            ops,
+            &tls,
+            &tls_path,
+            &tls_real,
+            CERT_FILE,
+            "古い証明書",
+            true,
+        )
+        .ok()
+        .flatten()
+        .and_then(|found| found.contents)
+        .and_then(|pem| CertThumbprint::of_pem(&pem).ok()),
+        _ => kept_thumbprint,
+    };
+    if let Action::Keep(_) = &action {
+        match &record_plan {
+            RecordPlan::Rebuild { reason, .. } => {
+                return Err(format!(
+                    "{reason}。作り直すと今の証明書（{}）も失効に入るので、何も変えずに止めます。{}",
+                    cert_path.display(),
+                    renew_hint()
+                ))
+            }
+            RecordPlan::Keep(record)
+                if kept_thumbprint.is_some_and(|thumbprint| record.contains(&thumbprint)) =>
+            {
+                return Err(format!(
+                    "証明書（{}）は{SERVICE_REVOCATIONS_LABEL}（{}）の失効の記録にあります（露出を見た証明書は二度と使いません）。Hub はこの証明書で待ち受けないので、何も変えずに止めます。{}",
+                    cert_path.display(),
+                    record_dir_path.display(),
+                    renew_hint()
+                ))
+            }
+            RecordPlan::Keep(_) | RecordPlan::Create => {}
+        }
+    }
     let had_key = key.is_some();
     let had_cert = cert.is_some();
     drop((key, cert));
@@ -824,6 +965,60 @@ fn run<O: HubTlsOps>(
             tls_path.display()
         )));
     }
+    if record_dir_created {
+        out(out_line(&format!(
+            "{SERVICE_REVOCATIONS_LABEL}（{}）を作りました（SYSTEM・Administrators にフル、利用者は読み取りだけ、所有者は Administrators、親から継承しない）",
+            record_dir_path.display()
+        )));
+    }
+    // サービスの失効の記録は、鍵と証明書を作る・作り直す**前に**整える（場面 11）。前回の途中で
+    // 残った一時ファイルは、名前付き mutex を持っている間に片付ける。
+    remove_stale_service_revocation_temps(ops, &record_dir);
+    let record_path = record_dir.record_path();
+    match record_plan {
+        RecordPlan::Keep(_) => {}
+        RecordPlan::Create => match create_service_revocations_if_absent(ops, &record_dir) {
+            Ok((_, true)) => out(out_line(&format!(
+                "サービスの失効の記録（{}）を空で作りました",
+                record_path.display()
+            ))),
+            // 確かめと作るの間にサービスの Hub が作った（読み直して健全なら、そのまま使う）。
+            Ok((_, false)) => {}
+            Err(found) => {
+                return Err(format!(
+                    "サービスの失効の記録（{}）を作れませんでした: {}。鍵と証明書はまだ作っていません。もう一度実行してください",
+                    record_path.display(),
+                    found.reason
+                ))
+            }
+        },
+        RecordPlan::Rebuild { reason, salvaged } => {
+            let recorded_at = u64::try_from(now).unwrap_or(0);
+            let carried = salvaged.len();
+            let entries = salvaged.into_iter().chain(old_thumbprint.map(|thumbprint| {
+                RevokedCert {
+                    thumbprint,
+                    place: RevokedCertPlace::Service,
+                    recorded_at,
+                }
+            }));
+            let record = rewrite_service_revocations(ops, &record_dir, entries).map_err(|error| {
+                format!("{error}。鍵と証明書はまだ作っていません。もう一度実行してください")
+            })?;
+            out(err_line(&format!(
+                "警告: {reason}。読めた拇印 {carried} 件{}を引き継いで、サービスの失効の記録（{}）を作り直しました（{} 件）",
+                if old_thumbprint.is_some() {
+                    "と古い証明書の拇印"
+                } else {
+                    ""
+                },
+                record_path.display(),
+                record.entries().len()
+            )));
+        }
+    }
+    drop(record_dir);
+
     for (name, found) in [(KEY_TEMP, &key_temp), (CERT_TEMP, &cert_temp)] {
         if found.is_none() {
             continue;
