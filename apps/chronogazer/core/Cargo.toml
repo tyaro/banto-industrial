@@ -115,7 +115,7 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 # #644 PR3b: `crate::hub_tls` のテストの証明書を作る（banto-hub-tls-trust・banto-hub-core と
 # 同じ版・feature。新しい package は増えない）。
-rcgen = { version = "=0.14.7", default-features = false, features = ["crypto", "pem", "ring"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
 # R2b-5c: ランプ波つきのワイヤのシミュレータ（`banto_plc::ramp`。`dev_plc` とテストの「対照の実機」）。
 banto-plc = { path = "../../../crates/banto-plc", features = ["simulator"] }
 # `test-util` (#394 レビュー P1-1): `HUB_OPERATION_TIMEOUT` のテストを

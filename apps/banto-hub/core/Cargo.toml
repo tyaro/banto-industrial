@@ -181,7 +181,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 # （PEM の書き出し・鍵の読み込み）だけを足す。Cargo.lock に増えるのは rcgen・pem・
 # yasna の 3 つ（MIT/Apache-2.0。deny.toml の許可に入る）。0.14.8 以降は
 # rust-version 1.88 なので、1.85.1 に合う 0.14.7 に留める。
-rcgen = { version = "=0.14.7", default-features = false, features = ["crypto", "pem", "ring"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
 # rcgen の有効期限の型（`OffsetDateTime`）。Cargo.lock に既にある 0.3 系を使う。
 time = { version = "0.3", default-features = false }
 # #644 PR1a: 既にある証明書の確かめ（期限・CA:FALSE・SAN・公開鍵）。Cargo.lock に
