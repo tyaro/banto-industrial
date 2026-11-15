@@ -49,6 +49,11 @@ pub struct ShellTransport {
 
 impl ShellTransport {
     pub async fn start() -> Result<Arc<Self>, String> {
+        Self::start_avoiding(&[crate::settings::DEFAULT_PORT]).await
+    }
+
+    /// Exclude the Hub's resolved/configured plain listener ports as well as 8723.
+    pub async fn start_avoiding(excluded_ports: &[u16]) -> Result<Arc<Self>, String> {
         #[cfg(windows)]
         let (certificate, config) = {
             let now = SystemTime::now()
@@ -72,11 +77,11 @@ impl ShellTransport {
         }));
         let router = Router::new().fallback(forward).with_state(dispatch.clone());
         #[cfg(windows)]
-        let listener = tls_listener::start_reserved(&config, router)
+        let listener = tls_listener::start_reserved(&config, router, excluded_ports)
             .await
             .map_err(|e| e.to_string())?;
         #[cfg(not(windows))]
-        let listener = tls_listener::start_plain_reserved(router)
+        let listener = tls_listener::start_plain_reserved(router, excluded_ports)
             .await
             .map_err(|e| e.to_string())?;
         Ok(Arc::new(Self {

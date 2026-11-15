@@ -26,7 +26,7 @@ pub(crate) fn present(
     let (label, remedy) = if status.address.is_some() {
         ("ChronoGazer 接続用 TLS: 待ち受け中", "")
     } else if status.requires_recreation {
-        ("ChronoGazer 接続用 TLS: 作り直しが必要", "理由を確認して、トレイから TLS の証明書を作り直してください。置き場が安全でない場合は Hub を閉じて所有者・アクセス許可を修復してください。失効の記録は消さないでください")
+        ("ChronoGazer 接続用 TLS: 作り直しが必要", "先に TLS フォルダと鍵・証明書の所有者・アクセス許可を確認し、異常があれば直してから、トレイで TLS の証明書を作り直してください。失効の記録は消さないでください")
     } else if status.can_resume {
         (
             "ChronoGazer 接続用 TLS: 一時停止中",
@@ -40,7 +40,11 @@ pub(crate) fn present(
         can_resume: status.can_resume,
         label: label.into(),
         reason: status.reason.clone(),
-        remedy: status.remedy.as_deref().unwrap_or(remedy).into(),
+        remedy: match (status.requires_recreation, status.remedy.as_deref()) {
+            (true, Some(detail)) => format!("先に TLS フォルダと鍵・証明書の所有者・アクセス許可を確認し、異常があれば直してください。{detail}"),
+            (_, Some(detail)) => detail.into(),
+            (_, None) => remedy.into(),
+        },
     }
 }
 
@@ -72,6 +76,23 @@ pub(crate) fn current(state: &crate::AppState) -> Option<Presentation> {
 mod tests {
     use super::*;
     use banto_hub_core::hub_tls_prepare::desktop::watch::DesktopTlsStatus;
+    #[test]
+    fn exposure_guidance_repairs_permissions_before_recreation_and_preserves_typed_detail() {
+        let mut status = DesktopTlsStatus {
+            remedy: None,
+            address: None,
+            reason: Some("鍵 ACL の露出".into()),
+            requires_recreation: true,
+            can_resume: false,
+        };
+        let remedy = present(&status).remedy;
+        assert!(remedy.find("所有者・アクセス許可").unwrap() < remedy.find("トレイ").unwrap());
+        assert!(remedy.contains("直してから"));
+        status.remedy = Some("C:\\TLS\\hub-key.pem の詳細を確認してください".into());
+        let remedy = present(&status).remedy;
+        assert!(remedy.starts_with("先に TLS フォルダ"));
+        assert!(remedy.contains("C:\\TLS\\hub-key.pem"));
+    }
     #[test]
     fn recreation_is_offered_only_for_an_active_or_recreation_required_identity() {
         let mut status = DesktopTlsStatus {

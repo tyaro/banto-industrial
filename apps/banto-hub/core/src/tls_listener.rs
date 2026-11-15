@@ -604,11 +604,11 @@ pub(crate) async fn start(
 ) -> Result<RunningTlsListener, TlsError> {
     #[cfg(windows)]
     {
-        start_inner(config, app, false, None).await
+        start_inner(config, app, None, None).await
     }
     #[cfg(not(windows))]
     {
-        start_inner(config, app, false).await
+        start_inner(config, app, None).await
     }
 }
 
@@ -619,18 +619,19 @@ pub(crate) async fn start_following(
     app: axum::Router,
     follows: &TlsRevoker,
 ) -> Result<RunningTlsListener, TlsError> {
-    start_inner(config, app, false, Some((follows, false))).await
+    start_inner(config, app, None, Some((follows, false))).await
 }
 
 #[cfg(windows)]
 pub(crate) async fn start_reserved(
     config: &TlsConfig,
     app: axum::Router,
+    excluded_ports: &[u16],
 ) -> Result<RunningTlsListener, TlsError> {
     start_inner(
         config,
         app,
-        true,
+        Some(excluded_ports),
         #[cfg(windows)]
         None,
     )
@@ -643,19 +644,33 @@ pub(crate) async fn start_renewed(
     app: axum::Router,
     follows: &TlsRevoker,
 ) -> Result<RunningTlsListener, TlsError> {
-    start_inner(config, app, false, Some((follows, true))).await
+    start_inner(config, app, None, Some((follows, true))).await
 }
 
 /// Bound OS-selected shell port; never consume the disk identity's 8723 port.
 /// Keep rejected sockets bound until another choice succeeds, so the OS cannot
 /// immediately hand the same excluded port back. Four attempts bound recovery.
-async fn reserved_shell_socket() -> io::Result<(TcpListener, std::net::TcpListener)> {
+async fn reserved_shell_socket(
+    excluded_ports: &[u16],
+) -> io::Result<(TcpListener, std::net::TcpListener)> {
+    reserve_shell_socket_with(excluded_ports, || {
+        crate::bind_exclusive::bind_exclusive(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+    })
+    .await
+}
+
+async fn reserve_shell_socket_with<F, Fut>(
+    excluded_ports: &[u16],
+    mut bind: F,
+) -> io::Result<(TcpListener, std::net::TcpListener)>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = io::Result<TcpListener>>,
+{
     let mut rejected = Vec::new();
     for _ in 0..4 {
-        let socket =
-            crate::bind_exclusive::bind_exclusive(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-                .await?;
-        if !shell_port_allowed(socket.local_addr()?.port()) {
+        let socket = bind().await?;
+        if !shell_port_allowed(socket.local_addr()?.port(), excluded_ports) {
             rejected.push(socket);
             continue;
         }
@@ -665,12 +680,12 @@ async fn reserved_shell_socket() -> io::Result<(TcpListener, std::net::TcpListen
     }
     Err(io::Error::new(
         io::ErrorKind::AddrInUse,
-        "OS did not provide a shell port outside reserved 8723",
+        "OS did not provide a shell port outside the reserved Hub ports",
     ))
 }
 
-fn shell_port_allowed(port: u16) -> bool {
-    port != 0 && port != banto_hub_tls_trust::DEFAULT_TLS_PORT
+fn shell_port_allowed(port: u16, excluded_ports: &[u16]) -> bool {
+    port != 0 && port != banto_hub_tls_trust::DEFAULT_TLS_PORT && !excluded_ports.contains(&port)
 }
 
 // WebKit hosts retain their HTTP UI compatibility path with an exact runtime
@@ -678,6 +693,7 @@ fn shell_port_allowed(port: u16) -> bool {
 #[cfg(not(windows))]
 pub(crate) async fn start_plain_reserved(
     app: axum::Router,
+    excluded_ports: &[u16],
 ) -> Result<RunningTlsListener, TlsError> {
     struct Plain {
         tcp: TcpListener,
@@ -702,7 +718,9 @@ pub(crate) async fn start_plain_reserved(
             self.tcp.local_addr()
         }
     }
-    let (tcp, reservation) = reserved_shell_socket().await.map_err(TlsError::Bind)?;
+    let (tcp, reservation) = reserved_shell_socket(excluded_ports)
+        .await
+        .map_err(TlsError::Bind)?;
     let local_addr = tcp.local_addr().map_err(TlsError::Bind)?;
     let severance = Arc::new(Severance::default());
     let listener = Plain {
@@ -732,13 +750,15 @@ pub(crate) async fn start_plain_reserved(
 async fn start_inner(
     config: &TlsConfig,
     app: axum::Router,
-    reserve: bool,
+    reserve: Option<&[u16]>,
     #[cfg(windows)] follows: Option<(&TlsRevoker, bool)>,
 ) -> Result<RunningTlsListener, TlsError> {
     let acceptor = Arc::new(RwLock::new(config.acceptor()?));
     let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, config.port);
-    let (tcp, reservation) = if reserve {
-        let (tcp, reservation) = reserved_shell_socket().await.map_err(TlsError::Bind)?;
+    let (tcp, reservation) = if let Some(excluded_ports) = reserve {
+        let (tcp, reservation) = reserved_shell_socket(excluded_ports)
+            .await
+            .map_err(TlsError::Bind)?;
         (tcp, Some(reservation))
     } else {
         (
@@ -856,9 +876,46 @@ mod tests {
 
     #[test]
     fn shell_port_selection_excludes_disk_tls_and_unassigned_ports() {
-        assert!(!shell_port_allowed(0));
-        assert!(!shell_port_allowed(banto_hub_tls_trust::DEFAULT_TLS_PORT));
-        assert!(shell_port_allowed(49152));
+        assert!(!shell_port_allowed(0, &[49152]));
+        assert!(!shell_port_allowed(
+            banto_hub_tls_trust::DEFAULT_TLS_PORT,
+            &[49152]
+        ));
+        assert!(!shell_port_allowed(49152, &[49152]));
+        assert!(shell_port_allowed(49153, &[49152]));
+    }
+
+    #[tokio::test]
+    async fn shell_reservation_retries_a_configured_plain_port_before_authorizing_origin() {
+        let first =
+            crate::bind_exclusive::bind_exclusive(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+        let excluded = first.local_addr().unwrap();
+        let next = crate::bind_exclusive::bind_exclusive(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let expected = next.local_addr().unwrap();
+        let mut candidates = std::collections::VecDeque::from([first, next]);
+        let mut calls = 0;
+        let (socket, reservation) = reserve_shell_socket_with(&[excluded.port()], || {
+            calls += 1;
+            if calls == 2 {
+                assert!(
+                    std::net::TcpListener::bind(excluded).is_err(),
+                    "rejected port remains held during retry"
+                );
+            }
+            std::future::ready(Ok(candidates.pop_front().unwrap()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(socket.local_addr().unwrap(), expected);
+        assert!(shell_port_allowed(expected.port(), &[excluded.port()]));
+        let _plain =
+            std::net::TcpListener::bind(excluded).expect("configured plain port released for Hub");
+        drop((socket, reservation));
     }
 
     #[test]

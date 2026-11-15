@@ -44,13 +44,19 @@ pub(crate) fn transport() -> Result<&'static Arc<ShellTransport>, String> {
         .usable()
 }
 
-pub(crate) fn initialize(app: &tauri::AppHandle) -> Result<(), String> {
+pub(crate) fn initialize(
+    app: &tauri::AppHandle,
+    plain_port: u16,
+    probe_port: u16,
+) -> Result<(), String> {
     // Registration and retention happen once together. Repeated setup must not
     // authorize another origin and then release that origin's reserved socket.
     TRANSPORT
         .get_or_init(|| {
             Initialization::new(
-                tauri::async_runtime::block_on(ShellTransport::start()),
+                tauri::async_runtime::block_on(ShellTransport::start_avoiding(&[
+                    plain_port, probe_port,
+                ])),
                 |transport| {
                     app.add_capability(capability(&transport.url()))
                         .map_err(|e| format!("シェルの origin の権限を登録できません: {e}"))

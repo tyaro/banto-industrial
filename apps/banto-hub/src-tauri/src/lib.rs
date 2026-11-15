@@ -1190,7 +1190,11 @@ fn build_service_manager() -> WindowsServiceManager {
 /// Desktop に進まず、Fallback の窓「運用モード（停止中）」「運用モードのまま残っています」
 /// （終了コード 5）を出す（判定は [`launch_gate::plan_startup`]、純関数）。切り替え・
 /// 「設定モードに戻す」の後に Desktop へ進むかも、この同じ関数で決める。
-fn decide_startup(target: &ProbeTarget, slot: &Arc<HubSlot<RunningHub>>) -> StartupOutcome {
+fn decide_startup(
+    app: &AppHandle,
+    target: &ProbeTarget,
+    slot: &Arc<HubSlot<RunningHub>>,
+) -> StartupOutcome {
     #[cfg(windows)]
     let (scm, fault) = match build_service_manager().query_status() {
         Ok(status) => {
@@ -1217,7 +1221,7 @@ fn decide_startup(target: &ProbeTarget, slot: &Arc<HubSlot<RunningHub>>) -> Star
     };
     match launch_gate::plan_startup(scm.as_ref(), &mode, fault) {
         StartupPlan::ProbeService => probe_service_or_fallback(target),
-        StartupPlan::TryDesktop => attempt_desktop_start(target, slot, scm),
+        StartupPlan::TryDesktop => attempt_desktop_start(app, target, slot, scm),
         StartupPlan::Fallback(cause) => {
             if let Some(why) = mode.blocks_desktop() {
                 log_line(&format!(
@@ -1276,6 +1280,21 @@ fn service_outcome(
     }
 }
 
+/// Bind/register only after Hub resolves its settings; failure must stop it.
+#[allow(unused_variables)]
+fn prepare_desktop_transport<H>(
+    hub: H,
+    initialize: impl FnOnce(&H) -> Result<(), String>,
+    shutdown: impl FnOnce(H),
+) -> Result<H, String> {
+    if let Err(reason) = initialize(&hub) {
+        shutdown(hub);
+        Err(reason)
+    } else {
+        Ok(hub)
+    }
+}
+
 /// デスクトップホストとして[`HubRuntime::start`]を試みる（T16-0/T16-1 の
 /// 従来の起動処理そのもの）。失敗した場合は診断用に同じポートへ
 /// [`HttpHubHealthProbe`]を1回投げてから[`StartupOutcome::Fallback`]を返す -
@@ -1293,23 +1312,11 @@ fn service_outcome(
 /// その間に終了が始まっても、終了はこの Hub を待つ。
 #[allow(unused_variables)]
 fn attempt_desktop_start(
+    app: &AppHandle,
     target: &ProbeTarget,
     slot: &Arc<HubSlot<RunningHub>>,
     scm_state: Option<ScmState>,
 ) -> StartupOutcome {
-    let transport_failure = match shell_tls::transport() {
-        Ok(transport) if transport.is_serving() => None,
-        Ok(_) => Some(shell_tls::SERVE_FAILURE.to_string()),
-        Err(reason) => Some(reason),
-    };
-    if let Some(reason) = transport_failure {
-        return StartupOutcome::Fallback(FallbackInfo {
-            scm_state,
-            health: None,
-            desktop_error: Some(reason),
-            cause: FallbackCause::ShellTransportUnavailable,
-        });
-    }
     let Some(ticket) = slot.begin_start() else {
         return StartupOutcome::Fallback(FallbackInfo {
             scm_state,
@@ -1326,13 +1333,28 @@ fn attempt_desktop_start(
         HubHostKind::Shell,
         hub_drivers(),
     ))) {
-        Ok(mut hub) => match shell_tls::transport() {
-            Ok(transport) => {
+        Ok(hub) => match prepare_desktop_transport(
+            hub,
+            |hub| {
+                shell_tls::initialize(app, hub.local_addr().port(), target.port)?;
+                if shell_tls::transport()?.is_serving() {
+                    Ok(())
+                } else {
+                    Err(shell_tls::SERVE_FAILURE.into())
+                }
+            },
+            |hub| tauri::async_runtime::block_on(hub.shutdown()),
+        ) {
+            Ok(mut hub) => {
+                let transport = shell_tls::transport().expect("registered Desktop transport");
                 hub.attach_shell_transport(transport);
                 StartupOutcome::Desktop(Box::new(StartedHub { hub, ticket }))
             }
             Err(error) => {
-                tauri::async_runtime::block_on(hub.shutdown());
+                report_shell_error(
+                    app,
+                    format!("シェル専用の待ち受けを用意できません: {error}"),
+                );
                 drop(ticket);
                 StartupOutcome::Fallback(FallbackInfo {
                     scm_state,
@@ -1655,7 +1677,7 @@ fn recreate_desktop_tls(app: &AppHandle) {
     let prompt_app = app.clone();
     banto_desktop_tray::ask_confirm(&prompt_app, ConfirmPrompt {
         title: "TLS の証明書を作り直す",
-        message: "ChronoGazer 接続用の TLS の鍵と証明書を作り直します。接続が切れ、再接続には ChronoGazer 側で新しい証明書の取得と接続設定の更新が必要です。管理画面と収集は継続します。続けますか？",
+        message: "先に TLS フォルダと鍵・証明書の所有者・アクセス許可を確認し、異常があれば直してから実行してください。ChronoGazer 接続用の TLS の鍵と証明書を作り直します。接続が切れ、再接続には ChronoGazer 側で新しい証明書の取得と接続設定の更新が必要です。管理画面と収集は継続します。続けますか？",
         ok_label: "作り直す", cancel_label: "キャンセル",
     }, move |confirmed| {
         if !confirmed { host_switch_ipc::end_switch(); return; }
@@ -2000,7 +2022,7 @@ pub(crate) fn retry_startup_locked(app: &AppHandle) {
         return;
     }
     let target = expected_probe_target();
-    let outcome = decide_startup(&target, &slot);
+    let outcome = decide_startup(app, &target, &slot);
     apply_outcome_and_sync(app, &window, outcome);
 }
 
@@ -2215,7 +2237,7 @@ fn apply_host_switch_outcome(app: &AppHandle, target: &ProbeTarget, result: Host
             // まま（PRESHUTDOWN の後の 0・scan より前の 2・3）なら Desktop に進まない。
             // #586: 終了が始まっていれば起動しない（札が取れない）。
             let slot = Arc::clone(&app.state::<AppState>().hub);
-            decide_startup(target, &slot)
+            decide_startup(app, target, &slot)
         }
         HostSwitchResult::Faulted {
             scm_state,
@@ -2614,7 +2636,7 @@ fn restore_setting_body(app: &AppHandle, target: &ProbeTarget) -> SwitchProgress
         // 戻せた（はず）: 再試行と同じ判定。形がまだ締まっていれば Desktop に進まない。
         None => {
             let slot = Arc::clone(&app.state::<AppState>().hub);
-            decide_startup(target, &slot)
+            decide_startup(app, target, &slot)
         }
         Some(reason) => StartupOutcome::Fallback(FallbackInfo {
             scm_state: build_service_manager()
@@ -3051,14 +3073,8 @@ pub fn run() {
             let window = tauri::WebviewWindowBuilder::from_config(app, &config)?
                 .on_navigation(move |url| shell_tls::navigation_allowed(&navigation_app, url))
                 .build()?;
-            // Desktop needs its own bound, authorized origin; Service and the
-            // bundled diagnostic page remain usable if its preparation fails.
-            if let Err(reason) = shell_tls::initialize(app.handle()) {
-                report_shell_error(
-                    app.handle(),
-                    format!("シェル専用の待ち受けを用意できません: {reason}"),
-                );
-            }
+            // Desktop transport is initialized only after Hub binds its plain
+            // listener, so persisted server.port is excluded without reopening DB.
 
             // CloseRequested（×ボタン）はプロセスを終了せずトレイへ格納
             // するだけ（実装指示「CloseRequested -> prevent_close + hide」）。
@@ -3091,7 +3107,7 @@ pub fn run() {
                 Some(launch_gate::placeholder_url(cfg!(windows), use_https));
             let target = expected_probe_target();
             let slot = Arc::clone(&app.state::<AppState>().hub);
-            let outcome = decide_startup(&target, &slot);
+            let outcome = decide_startup(app.handle(), &target, &slot);
             let desktop_started = apply_startup_outcome(app.handle(), &window, outcome);
 
             // トレイ（T16-1/T16-2、desktop-plan §9.9）: 起動直後の見え方
@@ -3268,14 +3284,90 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_desktop_transport_keeps_diagnostics_and_service_available() {
-        let slot = HubSlot::new();
-        let StartupOutcome::Fallback(info) =
-            attempt_desktop_start(&expected_probe_target(), &slot, None)
-        else {
-            panic!("an unavailable Desktop origin must fall back before starting Hub")
+    fn failed_shell_authorization_shuts_down_hub_tls_and_releases_isolated_profile() {
+        use banto_hub_core::hub_tls_prepare::{generate_identity, load::DefaultHubTls};
+        use banto_hub_core::profile_lock::{
+            open_profile_dirs, plain_profile_root_spec, try_acquire_profile_lock_in,
         };
-        assert!(slot.is_idle());
+        use banto_hub_core::profile_paths::resolve_profile_paths;
+        assert!(
+            !banto_hub_core::runtime::hub_tls_env_present(),
+            "isolation requires no explicit TLS env"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let paths = resolve_profile_paths(dir.path(), "transport-failure").unwrap();
+        let open = || open_profile_dirs(&plain_profile_root_spec(&paths), None).unwrap();
+        let guard = try_acquire_profile_lock_in(&paths, HubHostKind::Console, open()).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let identity = generate_identity(now).unwrap();
+        let tls = DefaultHubTls::from_checked_pem(
+            0,
+            identity.cert_pem.into_bytes(),
+            identity.key_pem.as_bytes().to_vec(),
+            dir.path().join("in-memory.pem"),
+            now,
+        )
+        .unwrap();
+        let config = banto_hub_core::runtime::HubConfig {
+            drivers: hub_drivers(),
+            db_path: dir
+                .path()
+                .join("hub.sqlite3")
+                .to_string_lossy()
+                .into_owned(),
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".into()),
+            data_dir_override: Some(dir.path().join("data")),
+            profile_id: "transport-failure".into(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: true,
+            default_tls: Some(tls),
+        };
+        let hub = tauri::async_runtime::block_on(HubRuntime::start(config)).unwrap();
+        let plain = hub.local_addr();
+        let tls = hub.tls_local_addr().unwrap();
+        assert!(try_acquire_profile_lock_in(&paths, HubHostKind::Console, open()).is_err());
+        let result = prepare_desktop_transport(
+            (hub, guard),
+            |(hub, _)| {
+                assert_eq!(hub.local_addr(), plain);
+                Err("injected capability registration failure".into())
+            },
+            |(hub, guard)| {
+                tauri::async_runtime::block_on(hub.shutdown());
+                drop(guard);
+            },
+        );
+        assert!(result.is_err());
+        let _plain = std::net::TcpListener::bind(plain).expect("plain listener stopped");
+        let _tls = std::net::TcpListener::bind(tls).expect("TLS listener stopped");
+        let _guard = try_acquire_profile_lock_in(&paths, HubHostKind::Console, open())
+            .expect("profile released after shutdown");
+    }
+
+    #[test]
+    fn missing_desktop_transport_keeps_diagnostics_and_service_available() {
+        let stopped = std::cell::Cell::new(false);
+        let failure = prepare_desktop_transport(
+            (),
+            |_| Err("準備されていません".into()),
+            |_| stopped.set(true),
+        )
+        .unwrap_err();
+        assert!(
+            stopped.get(),
+            "a started Hub must shut down if bind/authorization fails"
+        );
+        let info = FallbackInfo {
+            scm_state: None,
+            health: None,
+            desktop_error: Some(failure),
+            cause: FallbackCause::ShellTransportUnavailable,
+        };
         assert_eq!(info.cause, FallbackCause::ShellTransportUnavailable);
         assert!(!info.cause.offers_retry());
         assert!(fallback_page(&info, false).message.contains("再起動"));

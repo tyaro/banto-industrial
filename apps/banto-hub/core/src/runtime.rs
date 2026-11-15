@@ -2016,6 +2016,47 @@ mod tests {
     /// `crate::test_support`のモジュール doc: `TempDir::drop`のリトライは
     /// マルチスレッドランタイムを要する。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shell_port_exclusion_uses_resolved_persisted_plain_port() {
+        let dir = crate::test_support::TempDir::new("shell-persisted-port");
+        let mut config = HubConfig {
+            drivers: crate::test_support::test_drivers(),
+            db_path: dir
+                .path()
+                .join("hub.sqlite3")
+                .to_string_lossy()
+                .into_owned(),
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".into()),
+            data_dir_override: Some(dir.path().join("data")),
+            profile_id: "test".into(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: true,
+            default_tls: None,
+        };
+        let hub = HubRuntime::start(config.clone()).await.unwrap();
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let persisted = holder.local_addr().unwrap().port();
+        SettingsService::new(Db::Sqlite(hub.pool.clone()))
+            .set_hub_server_config(&crate::settings::ServerSettings {
+                port: persisted,
+                bind: "127.0.0.1".into(),
+            })
+            .await
+            .unwrap();
+        hub.shutdown().await;
+        drop(holder);
+        config.port_override = None;
+        let hub = HubRuntime::start(config).await.unwrap();
+        assert_eq!(
+            hub.local_addr().port(),
+            persisted,
+            "shell initialization must use this resolved port, not its default probe port"
+        );
+        hub.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn start_local_addr_then_shutdown_round_trip() {
         let dir = crate::test_support::TempDir::new("hub-runtime-smoke");
         let db_path = dir
