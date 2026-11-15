@@ -281,6 +281,9 @@ pub fn restore_setting_mode(
 #[tauri::command]
 pub fn retry_startup(window: tauri::WebviewWindow, app: AppHandle) -> Result<(), String> {
     crate::shell_tls::require_command_origin(&window)?;
+    if let Some(reason) = crate::startup_retry_error(&app) {
+        return Err(reason.into());
+    }
     if !begin_switch_or_warn(&app) {
         return Err("既に切替処理が進行中です".into());
     }

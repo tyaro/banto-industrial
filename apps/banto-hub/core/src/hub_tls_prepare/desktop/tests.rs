@@ -1908,14 +1908,62 @@ fn renewal_crash_recovery_preserves_backup_and_refuses_tls_if_retirement_cannot_
 }
 
 #[test]
-fn renewal_startup_prefers_current_even_with_broken_old_contents() {
+fn renewal_unparseable_backup_refuses_tls_and_preserves_files_for_inspection() {
     let fixture = Fixture::new();
     let old = fixture.0.load().unwrap();
     fixture
         .0
         .put("hub-cert.pem.old", b"broken unused certificate");
     fixture.0.put("hub-key.pem.old", b"broken unused key");
-    assert_eq!(thumb(&fixture.0.load().unwrap()), thumb(&old));
+    let failure = load_in(
+        &WindowsTlsTrustOps,
+        &fixture.0,
+        &ReconcileOptions::default(),
+        NOW,
+    )
+    .unwrap_err()
+    .into_unavailable();
+    assert!(failure.reason.contains(renewal::CERT_OLD));
+    assert!(failure.reason.contains("拇印") && failure.reason.contains("失効を記録できません"));
+    assert!(failure.remedy.contains(renewal::CERT_OLD));
+    assert!(failure
+        .remedy
+        .contains("本体の hub-cert.pem・hub-key.pem は削除せず"));
+    assert!(
+        !failure.requires_recreation,
+        "an unreadable backup must not request deletion of the current pair"
+    );
+    let installed = std::cell::Cell::new(Some(thumb(&old)));
+    assert!(renewal::recreate(
+        &fixture.0,
+        &mut Default::default(),
+        Some(thumb(&old)),
+        NOW,
+        |pair| {
+            assert!(
+                pair.is_none(),
+                "cannot install a replacement before retiring the backup"
+            );
+            installed.set(None);
+            Ok(())
+        },
+        |_| Ok(())
+    )
+    .is_err());
+    assert_eq!(installed.get(), None);
+    assert_eq!(
+        std::fs::read(fixture.0.tls().join(renewal::CERT_OLD)).unwrap(),
+        b"broken unused certificate"
+    );
+    assert_eq!(
+        std::fs::read(fixture.0.tls().join(renewal::KEY_OLD)).unwrap(),
+        b"broken unused key"
+    );
+    assert_eq!(
+        CertThumbprint::of_pem(&std::fs::read(fixture.0.tls().join(CERT_FILE)).unwrap()).unwrap(),
+        thumb(&old)
+    );
+    assert!(!read_user_revocations(&WindowsTlsTrustOps, &fixture.0).is_revoked(&thumb(&old)));
 }
 
 #[test]

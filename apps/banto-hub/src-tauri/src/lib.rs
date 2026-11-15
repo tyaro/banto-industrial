@@ -1299,7 +1299,7 @@ fn attempt_desktop_start(
             scm_state,
             health: None,
             desktop_error: Some(reason),
-            cause: FallbackCause::General,
+            cause: FallbackCause::ShellTransportUnavailable,
         });
     }
     let Some(ticket) = slot.begin_start() else {
@@ -1330,7 +1330,7 @@ fn attempt_desktop_start(
                     scm_state,
                     health: None,
                     desktop_error: Some(error),
-                    cause: FallbackCause::General,
+                    cause: FallbackCause::ShellTransportUnavailable,
                 })
             }
         },
@@ -1703,14 +1703,22 @@ fn spawn_desktop_tls_watch(app: AppHandle) {
             {
                 serve_failure_reported = true;
                 report_shell_error(&app, shell_tls::SERVE_FAILURE);
+                #[cfg(windows)]
+                let scm_state = build_service_manager()
+                    .query_status()
+                    .ok()
+                    .map(|status| status.state);
+                #[cfg(not(windows))]
+                let scm_state = None;
+                let info = FallbackInfo {
+                    scm_state,
+                    health: None,
+                    desktop_error: Some(shell_tls::SERVE_FAILURE.into()),
+                    cause: FallbackCause::ShellTransportUnavailable,
+                };
+                set_view(&state, ShellView::Fallback(info.clone()));
                 if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                    set_placeholder_page(
-                        &window,
-                        PlaceholderPage {
-                            message: shell_tls::SERVE_FAILURE.into(),
-                            actions: vec![],
-                        },
-                    );
+                    render_fallback(&window, &info, state.can_operate_service);
                     navigate_to_placeholder(&app, &window);
                 }
                 let _ = app
@@ -1948,9 +1956,25 @@ fn retry_startup(app: &AppHandle) {
     host_switch_ipc::end_switch();
 }
 
+/// Reject stale page/tray actions for failures that require a fresh process.
+pub(crate) fn startup_retry_error(app: &AppHandle) -> Option<&'static str> {
+    let state = app.state::<AppState>();
+    let view = state.view.lock().expect("view mutex poisoned");
+    match &*view {
+        ShellView::Fallback(info) if !info.cause.offers_retry() => {
+            Some(launch_gate::SHELL_TRANSPORT_RESTART_MESSAGE)
+        }
+        _ => None,
+    }
+}
+
 /// [`retry_startup`] の本体。呼ぶ側が進行中フラグを取ってから呼ぶ（Fallback の窓の [再試行]
 /// - `host_switch_ipc::retry_startup` - も使う）。
 pub(crate) fn retry_startup_locked(app: &AppHandle) {
+    if let Some(reason) = startup_retry_error(app) {
+        report_shell_error(app, reason);
+        return;
+    }
     let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
         return;
     };
@@ -3159,6 +3183,10 @@ mod tests {
             panic!("an unavailable Desktop origin must fall back before starting Hub")
         };
         assert!(slot.is_idle());
+        assert_eq!(info.cause, FallbackCause::ShellTransportUnavailable);
+        assert!(!info.cause.offers_retry());
+        assert!(fallback_page(&info, false).message.contains("再起動"));
+        assert!(fallback_page(&info, false).actions.is_empty());
         assert!(fallback_message(&info, false).contains("準備されていません"));
         assert!(matches!(
             service_outcome(Ok(HealthOutcome::Healthy {

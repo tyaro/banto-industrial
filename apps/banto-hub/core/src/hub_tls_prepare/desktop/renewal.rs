@@ -193,19 +193,20 @@ pub(super) fn recover(
         if let Some(mut file) = old_cert {
             let bytes = TlsFile::read_all(&mut file, MAX_PEM_BYTES)
                 .map_err(|e| DesktopFailure::retry(format!("旧い証明書を読めません: {e}")))?;
-            if let Ok(old) = CertThumbprint::of_pem(&bytes) {
-                let current = current
-                    .0
-                    .as_ref()
-                    .and_then(|cert| CertThumbprint::of_pem(cert).ok());
-                if current != Some(old) {
-                    let report = record(old);
-                    if report.outcome != ReconcileOutcome::Consistent
-                        || !report.revocations.is_settled()
-                        || !report.revocations.is_revoked(&old)
-                    {
-                        return Err(DesktopFailure::retry("公開済みの旧証明書の失効を両方の記録へ書けません。旧いファイルを残し、TLS を使いません"));
-                    }
+            let old = CertThumbprint::of_pem(&bytes).map_err(|error| {
+                DesktopFailure::auxiliary(dir, CERT_OLD, format!("旧い証明書（{CERT_OLD}）の拇印を確定できず、失効を記録できません: {error}。旧いファイルは自動で削除せず、TLS を使いません"))
+            })?;
+            let current = current
+                .0
+                .as_ref()
+                .and_then(|cert| CertThumbprint::of_pem(cert).ok());
+            if current != Some(old) {
+                let report = record(old);
+                if report.outcome != ReconcileOutcome::Consistent
+                    || !report.revocations.is_settled()
+                    || !report.revocations.is_revoked(&old)
+                {
+                    return Err(DesktopFailure::retry("公開済みの旧証明書の失効を両方の記録へ書けません。旧いファイルを残し、TLS を使いません"));
                 }
             }
         }
