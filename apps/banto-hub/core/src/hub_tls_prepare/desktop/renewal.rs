@@ -496,14 +496,34 @@ pub(super) fn recreate<P: UserTlsPlace + ?Sized>(
         if !restored {
             let _ = switch(None);
         }
+        let cleanup_warning = if restored {
+            // Either group may fail independently; still try to remove the
+            // other unused group without touching the restored current pair.
+            let reasons = [cleanup_auxiliary_files(&dir), cleanup_old(dir.dir())]
+                .into_iter()
+                .filter_map(Result::err)
+                .map(|error| error.reason)
+                .collect::<Vec<_>>();
+            if reasons.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "。旧い組への巻き戻し後の片付けに失敗しました: {}",
+                    reasons.join("。")
+                )
+            }
+        } else {
+            String::new()
+        };
         return Err(DesktopFailure::recreate(format!(
-            "作り直しに失敗しました: {}。{}",
+            "作り直しに失敗しました: {}。{}{}",
             error.reason,
             if restored {
                 "旧い組と待ち受けへ戻しました"
             } else {
                 "安全な旧い組へ戻せないため TLS を停止しました。Hub を閉じて置き場とログを確認してください。失効の記録は消さないでください"
-            }
+            },
+            cleanup_warning
         )));
     }
     // Publication is committed. Auxiliary cleanup cannot turn it into an

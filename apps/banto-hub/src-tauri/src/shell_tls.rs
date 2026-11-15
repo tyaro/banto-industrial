@@ -88,7 +88,12 @@ fn capability(origin: &str) -> tauri::ipc::CapabilityBuilder {
 }
 
 pub(crate) fn is_origin(url: &Url, origin: &Url) -> bool {
-    url.origin() == origin.origin() && url.username().is_empty() && url.password().is_none()
+    // Custom Tauri schemes have opaque Url origins, even for the same host.
+    url.scheme() == origin.scheme()
+        && url.host_str() == origin.host_str()
+        && url.port_or_known_default() == origin.port_or_known_default()
+        && url.username().is_empty()
+        && url.password().is_none()
 }
 
 pub(crate) fn desktop_origin(url: &Url) -> bool {
@@ -143,6 +148,22 @@ pub(crate) fn read_pin(request_uri: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn custom_scheme_placeholder_requires_the_exact_host() {
+        let local = Url::parse("tauri://localhost/").unwrap();
+        assert!(is_origin(
+            &Url::parse("tauri://localhost/status").unwrap(),
+            &local
+        ));
+        for url in [
+            "tauri://evil/",
+            "tauri://localhost:1234/",
+            "https://localhost/",
+            "tauri://user@localhost/",
+        ] {
+            assert!(!is_origin(&Url::parse(url).unwrap(), &local), "{url}");
+        }
+    }
     #[test]
     fn failed_bind_skips_capability_and_preserves_diagnostic_reason() {
         let state =

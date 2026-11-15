@@ -17,7 +17,7 @@ static NONCE: AtomicU64 = AtomicU64::new(0);
 const NOW: i64 = 1_795_000_000;
 
 #[derive(Clone)]
-struct Place(PathBuf);
+pub(super) struct Place(PathBuf);
 impl UserTlsPlace for Place {
     fn spec(&self, kind: UserPlaceKind) -> UserPlaceSpec {
         let mut spec = DefaultUserTlsPlace::new(
@@ -34,7 +34,10 @@ impl Place {
         self.spec(UserPlaceKind::Tls).path()
     }
     fn load(&self) -> Result<DefaultHubTls, String> {
-        load_in(&WindowsTlsTrustOps, self, &ReconcileOptions::default(), NOW)
+        self.load_at(NOW)
+    }
+    pub(super) fn load_at(&self, now: i64) -> Result<DefaultHubTls, String> {
+        load_in(&WindowsTlsTrustOps, self, &ReconcileOptions::default(), now)
             .map_err(|error| error.reason)
     }
     fn dir(&self) -> CheckedUserPlace<WinTlsDir> {
@@ -48,9 +51,9 @@ impl Place {
     }
 }
 
-struct Fixture(Place);
+pub(super) struct Fixture(pub(super) Place);
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let exe = std::env::current_exe().unwrap();
         let parent_path = exe.parent().unwrap();
         let parent = WindowsTlsTrustOps.pin_dir(parent_path).unwrap().unwrap();
@@ -1637,8 +1640,72 @@ fn renewal_partial_publish_restores_both_old_files_and_old_acceptor() {
         );
         assert!(result.is_err());
         assert_eq!(installed.get(), Some(thumb(&old)));
+        for name in [
+            KEY_TEMP,
+            CERT_TEMP,
+            CREATING,
+            renewal::KEY_OLD,
+            renewal::CERT_OLD,
+        ] {
+            assert!(
+                !fixture.0.tls().join(name).exists(),
+                "rollback must clean {name}"
+            );
+        }
         assert_eq!(thumb(&fixture.0.load().unwrap()), thumb(&old));
     }
+}
+
+#[test]
+fn renewal_restored_listener_reports_backup_cleanup_failure() {
+    let fixture = Fixture::new();
+    let old = fixture.0.load().unwrap();
+    let held = std::cell::RefCell::new(Vec::new());
+    let error = renewal::recreate(
+        &fixture.0,
+        &mut Default::default(),
+        Some(thumb(&old)),
+        NOW,
+        |pair| {
+            if pair.is_some_and(|(cert, _)| CertThumbprint::of_pem(cert).unwrap() == thumb(&old)) {
+                fixture.0.put(KEY_TEMP, b"unused temporary key");
+                for name in [KEY_TEMP, renewal::KEY_OLD] {
+                    held.borrow_mut().push(
+                        checked_auxiliary_file(&WindowsTlsTrustOps, &fixture.0.dir(), name)
+                            .unwrap()
+                            .unwrap(),
+                    );
+                }
+            }
+            Ok(())
+        },
+        |stage| {
+            if stage == renewal::Stage::AfterKeyPublish {
+                Err("injected publication failure".into())
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .unwrap_err();
+    assert!(
+        error.reason.contains("旧い組と待ち受けへ戻しました"),
+        "{}",
+        error.reason
+    );
+    assert!(
+        error.reason.contains("巻き戻し後の片付けに失敗"),
+        "{}",
+        error.reason
+    );
+    assert!(fixture.0.tls().join(renewal::KEY_OLD).exists());
+    assert!(
+        error.reason.contains(KEY_TEMP) && error.reason.contains(renewal::KEY_OLD),
+        "both cleanup failures must be reported: {}",
+        error.reason
+    );
+    drop(held);
+    assert_eq!(thumb(&fixture.0.load().unwrap()), thumb(&old));
 }
 
 #[test]

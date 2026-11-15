@@ -1632,8 +1632,12 @@ fn recreate_desktop_tls(app: &AppHandle) {
             hub_slot::run_switch(ticket, || {
                 use tauri_plugin_dialog::DialogExt;
                 let result = tauri::async_runtime::block_on(handle.recreate());
-                let message = match result { Ok(()) => "TLS の証明書を作り直しました。ChronoGazer は新しい証明書を読み直して接続します".to_string(), Err(error) => format!("TLS の証明書を作り直せませんでした: {error}") };
-                report_shell_error(&app, &message);
+                let message = match &result { Ok(()) => "TLS の証明書を作り直しました。ChronoGazer は新しい証明書を読み直して接続します".to_string(), Err(error) => format!("TLS の証明書を作り直せませんでした: {error}") };
+                if result.is_ok() {
+                    log_line(&message);
+                } else {
+                    report_shell_error(&app, &message);
+                }
                 app.dialog().message(message).title("TLS の証明書の作り直し").show(|_| {});
                 sync_tray(&app);
             });

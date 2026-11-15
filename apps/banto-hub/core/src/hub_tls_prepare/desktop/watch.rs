@@ -707,22 +707,41 @@ struct RenewalResult {
 }
 
 fn renew_owned(
+    listener: Option<RunningTlsListener>,
+    config: Option<TlsConfig>,
+    router: axum::Router,
+    external: TlsRevoker,
+    pending: BTreeSet<CertThumbprint>,
+) -> RenewalResult {
+    let place = DefaultUserTlsPlace::resolve(&WindowsTlsTrustOps).map_err(|e| e.reason);
+    renew_owned_in(
+        listener,
+        config,
+        router,
+        external,
+        pending,
+        place.as_ref().map_err(String::as_str),
+    )
+}
+
+fn renew_owned_in<P: UserTlsPlace + ?Sized>(
     mut listener: Option<RunningTlsListener>,
     mut config: Option<TlsConfig>,
     router: axum::Router,
     external: TlsRevoker,
     mut pending: BTreeSet<CertThumbprint>,
+    place: Result<&P, &str>,
 ) -> RenewalResult {
     let runtime = tokio::runtime::Handle::current();
     let known_serving = config.as_ref().and_then(TlsConfig::thumbprint);
     let mut switch = |identity: Option<(&[u8], &[u8])>| -> Result<(), String> {
         let Some((cert, key)) = identity else {
-            external.retire_identity();
             if let Some(active) = listener.take() {
                 active.revoker().revoke();
                 runtime.block_on(active.stop());
             }
-            config = None;
+            // The transaction decides below whether this is temporary. Keep
+            // the checked in-memory identity until the typed result is known.
             return Ok(());
         };
         if external.externally_stopped() {
@@ -755,10 +774,18 @@ fn renew_owned(
         config = Some(next);
         Ok(())
     };
+    let mut retryable = false;
     let result = catch_unwind(AssertUnwindSafe(|| {
-        let place = DefaultUserTlsPlace::resolve(&WindowsTlsTrustOps).map_err(|e| e.reason)?;
+        let place = match place {
+            Ok(place) => place,
+            Err(reason) => {
+                retryable = true;
+                let _ = switch(None);
+                return Err(reason.to_string());
+            }
+        };
         super::renewal::recreate(
-            &place,
+            place,
             &mut pending,
             known_serving,
             now_unix(),
@@ -766,13 +793,22 @@ fn renew_owned(
             |_| Ok(()),
         )
         .map_err(|e| {
+            retryable = matches!(e.remedy, DesktopRemedy::RetryLater);
             let failure = e.into_unavailable();
-            format!("{}。{}", failure.reason, failure.remedy)
+            if retryable {
+                format!(
+                    "{}。TLS を一旦停止しました。次の周期で安全性を確認できれば再開します",
+                    failure.reason
+                )
+            } else {
+                format!("{}。{}", failure.reason, failure.remedy)
+            }
         })
     }));
     let result = match result {
         Ok(result) => result,
         Err(_) => {
+            retryable = false;
             let _ = switch(None);
             Err("TLS の作り直しが panic したため TLS を停止しました。Hub を閉じ、ログと鍵・証明書・失効の記録を確認してください".into())
         }
@@ -780,8 +816,13 @@ fn renew_owned(
     if result.is_err() && !pending.is_empty() {
         let _ = switch(None);
         external.retire_identity();
+        retryable = false;
     }
     runtime.block_on(discard_dead_listener(&mut listener));
+    if result.is_err() && listener.is_none() && !retryable {
+        external.retire_identity();
+        config = None;
+    }
     RenewalResult {
         listener,
         config,
@@ -926,6 +967,89 @@ mod tests {
         .expect("panic write-only mode must reject renewal without waiting for retries");
         assert!(result.is_err());
         monitor.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn renewal_lock_contention_stops_temporarily_and_next_check_rebinds() {
+        let fixture = super::super::tests::Fixture::new();
+        let identity = fixture.0.load_at(now_unix()).unwrap();
+        let serving = CertThumbprint::of_pem(identity.cert_pem()).unwrap();
+        let config = TlsConfig::in_memory(
+            0,
+            identity.cert_pem().to_vec(),
+            Zeroizing::new(
+                std::fs::read(fixture.0.spec(UserPlaceKind::Tls).path().join(KEY_FILE)).unwrap(),
+            ),
+        );
+        let router = axum::Router::new();
+        let active = tls_listener::start(&config, router.clone()).await.unwrap();
+        let external = TlsRevoker::following(active.revoker());
+        let held = lock_user_revocations(
+            &WindowsTlsTrustOps,
+            &fixture.0,
+            &ReconcileOptions::default(),
+        )
+        .unwrap();
+        let retained = external.clone();
+        let place = fixture.0.clone();
+        let next_router = router.clone();
+        let renewed = tokio::task::spawn_blocking(move || {
+            renew_owned_in(
+                Some(active),
+                Some(config),
+                next_router,
+                retained,
+                BTreeSet::new(),
+                Ok(&place),
+            )
+        })
+        .await
+        .unwrap();
+        assert!(renewed.outcome.is_err());
+        assert!(
+            renewed.listener.is_none(),
+            "creation preflight must close TLS"
+        );
+        assert!(
+            renewed.config.is_some(),
+            "temporary failure keeps the validated identity"
+        );
+        assert!(
+            !external.is_revoked(),
+            "temporary stop must not retire the identity"
+        );
+        drop(held);
+        let place = fixture.0.clone();
+        let monitor = spawn_actor(
+            ActorInput {
+                listener: renewed.listener,
+                config: renewed.config,
+                initial: DesktopTlsStatus {
+                    address: None,
+                    reason: Some("temporary lock contention".into()),
+                    requires_recreation: false,
+                    can_resume: true,
+                },
+            },
+            router,
+            move |watch, serving| watch.check(&place, serving, &ReconcileOptions::default()),
+            |_| {},
+            MonitorSettings {
+                interval: Duration::from_millis(10),
+                serving,
+            },
+            (),
+        );
+        assert!(monitor.status().can_resume);
+        let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+            while monitor.status().address.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(monitor.status().can_resume);
+        monitor.stop().await;
+        recovered.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
