@@ -165,10 +165,15 @@ impl Watch {
             }
             reason = Some(found.reason);
         }
+        // 読めた証明書の不一致は、鍵の一時的な open/read 失敗とは独立に判定する。
+        if let Some(cert) = &cert {
+            if CertThumbprint::of_pem(cert).ok() != Some(serving) {
+                invalid = true;
+                reason = Some("TLS の証明書が正常でないか、起動時の証明書と一致しません".into());
+            }
+        }
         if let (Some(cert), Some(key)) = (&cert, &key) {
-            if CertThumbprint::of_pem(cert).ok() != Some(serving)
-                || inspect_identity(cert, key, now_unix()).is_err()
-            {
+            if inspect_identity(cert, key, now_unix()).is_err() {
                 invalid = true;
                 reason =
                     Some("TLS の鍵・証明書が正常でないか、起動時の証明書と一致しません".into());

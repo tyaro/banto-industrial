@@ -1529,3 +1529,42 @@ fn desktop_watch_rejects_changed_certificate_and_missing_key_without_revoking() 
     assert!(!watch.check(place, serving, &options).allow);
     assert!(!read_user_revocations(&WindowsTlsTrustOps, place).is_revoked(&serving));
 }
+
+#[test]
+fn desktop_watch_rejects_changed_certificate_even_when_key_is_temporarily_unreadable() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::LockFile;
+
+    for exclusive_open in [false, true] {
+        let fixture = Fixture::new();
+        let place = &fixture.0;
+        let options = ReconcileOptions::default();
+        let cert = load_in(&WindowsTlsTrustOps, place, &options, now_unix()).unwrap();
+        let serving = thumb(&cert);
+        let dir = place.dir();
+        let (exclusive, range) = if exclusive_open {
+            (
+                WindowsTlsTrustOps
+                    .open_child_file_exclusive(dir.dir(), KEY_FILE)
+                    .unwrap(),
+                None,
+            )
+        } else {
+            let file = std::fs::File::open(place.tls().join(KEY_FILE)).unwrap();
+            // SAFETY: 有効な File を保持し、閉じるまで範囲 0..1 をロックする。
+            assert_ne!(unsafe { LockFile(file.as_raw_handle(), 0, 0, 1, 0) }, 0);
+            (None, Some(file))
+        };
+        // 起動時と同じ証明書なら、鍵の一時的な open/read 失敗だけで即停止しない。
+        let mut watch = watch::Watch::default();
+        assert!(watch.check(place, serving, &options).allow);
+        let other = generate_identity(now_unix()).unwrap();
+        std::fs::remove_file(place.tls().join(CERT_FILE)).unwrap();
+        place.put(CERT_FILE, other.cert_pem.as_bytes());
+        // 証明書の不一致は確かに観測できるので、鍵の一時失敗の猶予を適用しない。
+        let mut watch = watch::Watch::default();
+        assert!(!watch.check(place, serving, &options).allow);
+        assert!(!read_user_revocations(&WindowsTlsTrustOps, place).is_revoked(&serving));
+        drop((exclusive, range, dir));
+    }
+}
