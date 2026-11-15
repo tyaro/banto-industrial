@@ -22,7 +22,7 @@ pub struct DesktopTlsStatus {
     pub address: Option<SocketAddr>,
     /// 最後の検査・bind の警告。正常なら None。
     pub reason: Option<String>,
-    /// 露出・失効を確認したため作り直しが必要。
+    /// 露出・失効を確認した、または検査状態を回収できず安全側で作り直しが必要。
     pub requires_recreation: bool,
 }
 
@@ -338,7 +338,8 @@ where
             }
             // await は中断しない。終了/プロファイル切替は検査の完了まで待つ。
             let checked = tokio::task::spawn_blocking(move || {
-                // checker の panic payload は展開せず、更新済みの失効状態を必ず返す。
+                // checker の通常の panic は payload を展開せず状態とともに返す。
+                // payload の解放など、この捕捉の外側の失敗は JoinError 側で状態不明として止める。
                 let round = catch_unwind(AssertUnwindSafe(|| check(&mut watch))).ok();
                 (watch, check, round)
             })
@@ -376,17 +377,21 @@ where
                     return;
                 }
                 Err(_) => {
-                    // パニックの payload に鍵が含まれる可能性があるので展開しない。
+                    // Watch を回収できないため未書込拇印の完全な復元は保証できない。
+                    // payload は展開せず、既知の serving 拇印を残して安全側で止める。
+                    external.revoke();
                     if let Some(active) = listener.take() {
                         active.revoker().revoke();
                         active.stop().await;
                     }
                     let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
-                    state.status.address = None;
-                    state.status.reason = Some(
-                        "TLS の周期検査タスクが異常終了しました。Hub を再起動してください".into(),
-                    );
-                    crate::hub_log::log_err_line("[WARN] banto-hub: TLS の周期検査タスクが異常終了したため TLS を停止しました");
+                    let reason = format!("TLS の周期検査タスクが異常終了し、失効状態と未書込拇印を回収できませんでした。既知の待受証明書の拇印: {}。TLS は停止し、このプロセスでは再開しません。Hub を再起動する前にログと鍵・証明書・失効の記録を確認し、安全側で鍵と証明書を作り直してください。失効の記録は消さないでください", settings.serving);
+                    state.status = DesktopTlsStatus {
+                        address: None,
+                        reason: Some(reason.clone()),
+                        requires_recreation: true,
+                    };
+                    crate::hub_log::log_err_line(&format!("[WARN] banto-hub: {reason}"));
                     drop(keep_alive);
                     return;
                 }
@@ -498,6 +503,10 @@ async fn retry_after_panic<R>(
 ) where
     R: FnMut(&mut Watch) + Send + 'static,
 {
+    // 初めから空なら書込を試していないので、成功の案内は追加しない。
+    if watch.unwritten.is_empty() {
+        return;
+    }
     while !watch.unwritten.is_empty() {
         crate::hub_log::log_err_line(&format!(
             "[WARN] banto-hub: panic 後も未書込の失効拇印を保持しています: {}",
@@ -1054,5 +1063,111 @@ mod tests {
             assert!(tokio::net::TcpStream::connect(address).await.is_err());
             monitor.stop().await;
         }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panic_without_unwritten_entries_does_not_report_successful_recording() {
+        let identity = generate_identity(now_unix()).unwrap();
+        let serving = CertThumbprint::of_pem(identity.cert_pem.as_bytes()).unwrap();
+        let config = TlsConfig::in_memory(
+            0,
+            identity.cert_pem.as_bytes().to_vec(),
+            Zeroizing::new(identity.key_pem.as_bytes().to_vec()),
+        );
+        let router = axum::Router::new();
+        let active = tls_listener::start(&config, router.clone()).await.unwrap();
+        let monitor = spawn_with(
+            active,
+            config,
+            router,
+            |_| panic!("checker failed before observing any exposure"),
+            MonitorSettings {
+                interval: Duration::from_millis(10),
+                serving,
+            },
+            (),
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !monitor.task.as_ref().unwrap().is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let status = monitor.status();
+        assert_eq!(status.address, None);
+        assert!(!status.requires_recreation);
+        let reason = status.reason.unwrap();
+        assert!(reason.contains("panic"));
+        assert!(
+            !reason.contains("すべて記録しました"),
+            "no write was attempted: {reason}"
+        );
+        monitor.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unrecoverable_join_error_revokes_shared_handle_and_requires_safe_recovery() {
+        // catch_unwind は checker の panic を捕捉するが、payload 自身の Drop の panic は
+        // その外側で起こり、blocking task は Watch を返せない JoinError になる。
+        struct FailingPayload;
+        impl Drop for FailingPayload {
+            fn drop(&mut self) {
+                panic!("payload destructor failed");
+            }
+        }
+        let identity = generate_identity(now_unix()).unwrap();
+        let serving = CertThumbprint::of_pem(identity.cert_pem.as_bytes()).unwrap();
+        let config = TlsConfig::in_memory(
+            0,
+            identity.cert_pem.as_bytes().to_vec(),
+            Zeroizing::new(identity.key_pem.as_bytes().to_vec()),
+        );
+        let router = axum::Router::new();
+        let active = tls_listener::start(&config, router.clone()).await.unwrap();
+        let address = active.local_addr();
+        let monitor = spawn_with(
+            active,
+            config,
+            router,
+            move |watch| {
+                watch.unwritten.insert(serving);
+                std::panic::panic_any(FailingPayload);
+            },
+            MonitorSettings {
+                interval: Duration::from_millis(10),
+                serving,
+            },
+            (),
+        );
+        let revoker = monitor.revoker().unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !monitor.task.as_ref().unwrap().is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            revoker.is_revoked(),
+            "unknown watcher state must permanently revoke the shared handle"
+        );
+        let status = monitor.status();
+        assert_eq!(status.address, None);
+        assert!(status.requires_recreation);
+        let reason = status.reason.unwrap();
+        assert!(
+            reason.contains(&serving.to_string()),
+            "known serving thumbprint must remain: {reason}"
+        );
+        assert!(
+            reason.contains("状態") && reason.contains("回収できません"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("再起動") && reason.contains("鍵") && reason.contains("失効の記録"),
+            "{reason}"
+        );
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
+        monitor.stop().await;
     }
 }
