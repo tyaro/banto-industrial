@@ -1317,7 +1317,7 @@
 		{:else}
 			<p class="hint">
 				{#if savedConnection && savedIsPush}クライアント向けの待ち受け URL を確認できません。Hub
-					の待ち受け設定とログを確認してください。{:else}作成すると、ここに送り手向けの{' '}
+					の待ち受け設定とログを確認してください。{:else}作成すると、ここに送り手向けの&nbsp;
 					URL（/api/v1/ingest/接続 id/…）と API キーのスコープ ingest:#接続 id が出ます。
 				{/if}
 			</p>
