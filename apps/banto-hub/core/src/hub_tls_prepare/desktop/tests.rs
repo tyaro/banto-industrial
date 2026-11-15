@@ -2080,7 +2080,15 @@ fn renewal_committed_retirement_write_failure_keeps_new_identity_and_retries_old
         "{warning}"
     );
     assert_eq!(pending, std::collections::BTreeSet::from([thumb(&old)]));
+    assert!(
+        fixture.0.tls().join(renewal::CERT_OLD).exists(),
+        "restart must retain the unrecorded retirement evidence"
+    );
+    // Lose the process-local pending set. Startup recovers it from CERT_OLD.
+    pending.clear();
     let current = fixture.0.load_at(now).unwrap();
+    assert!(read_user_revocations(&WindowsTlsTrustOps, &fixture.0).is_revoked(&thumb(&old)));
+    assert!(!fixture.0.tls().join(renewal::CERT_OLD).exists());
     assert_eq!(installed.get(), Some(thumb(&current)));
     assert_ne!(thumb(&current), thumb(&old));
     let mut watch = watch::Watch::with_unwritten_for_test(pending);
@@ -2093,6 +2101,70 @@ fn renewal_committed_retirement_write_failure_keeps_new_identity_and_retries_old
     let records = read_user_revocations(&WindowsTlsTrustOps, &fixture.0);
     assert!(records.is_revoked(&thumb(&old)));
     assert!(!records.is_revoked(&thumb(&current)));
+}
+
+#[test]
+fn renewal_rejects_distinct_serving_identity_before_creating_unrecoverable_retirements() {
+    let fixture = Fixture::new();
+    let old = fixture.0.load().unwrap();
+    let serving = CertThumbprint::of_der(b"different in-memory certificate");
+    let mut pending = std::collections::BTreeSet::new();
+    let failure = renewal::recreate(
+        &fixture.0,
+        &mut pending,
+        Some(serving),
+        NOW,
+        |pair| {
+            assert!(pair.is_none());
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+    .unwrap_err();
+    assert!(matches!(failure.remedy, DesktopRemedy::RetryLater));
+    assert!(failure.reason.contains("一致しない"));
+    assert_eq!(thumb(&fixture.0.load().unwrap()), thumb(&old));
+    assert!(pending.is_empty());
+    assert!(!fixture.0.tls().join(CREATING).exists());
+    assert!(!read_user_revocations(&WindowsTlsTrustOps, &fixture.0).is_revoked(&thumb(&old)));
+}
+
+#[test]
+fn renewal_missing_backup_copy_returns_failure_without_panic_or_changing_current_pair() {
+    for name in [renewal::CERT_OLD, renewal::KEY_OLD] {
+        let fixture = Fixture::new();
+        let old = fixture.0.load().unwrap();
+        let installed = std::cell::Cell::new(Some(thumb(&old)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            renewal::recreate(
+                &fixture.0,
+                &mut Default::default(),
+                Some(thumb(&old)),
+                NOW,
+                |pair| {
+                    installed.set(pair.map(|(cert, _)| CertThumbprint::of_pem(cert).unwrap()));
+                    Ok(())
+                },
+                |stage| {
+                    if stage == renewal::Stage::AfterBackupCopy {
+                        cleanup(fixture.0.dir().dir(), &[name]).unwrap();
+                    }
+                    Ok(())
+                },
+            )
+        }));
+        let failure = result
+            .expect("a missing backup must not panic")
+            .unwrap_err();
+        assert!(
+            failure.reason.contains("写しがありません"),
+            "{}",
+            failure.reason
+        );
+        assert!(matches!(failure.remedy, DesktopRemedy::RetryRecreation));
+        assert_eq!(installed.get(), Some(thumb(&old)));
+        assert_eq!(thumb(&fixture.0.load().unwrap()), thumb(&old));
+    }
 }
 
 #[test]

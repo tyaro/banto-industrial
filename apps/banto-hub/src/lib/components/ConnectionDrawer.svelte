@@ -686,16 +686,22 @@
 	});
 
 	let ingestOrigin = $state<string | null>(null);
+	let ingestOriginLoading = $state(true);
 	$effect(() => {
 		if (!open || !savedIsPush) {
 			ingestOrigin = null;
+			ingestOriginLoading = true;
 			return;
 		}
 		let cancelled = false;
 		ingestOrigin = null;
+		ingestOriginLoading = true;
 		void getClientIngestOrigin(typeof window === 'undefined' ? '' : window.location.origin).then(
 			(origin) => {
-				if (!cancelled) ingestOrigin = origin;
+				if (!cancelled) {
+					ingestOrigin = origin;
+					ingestOriginLoading = false;
+				}
 			}
 		);
 		return () => {
@@ -1316,9 +1322,11 @@
 			</p>
 		{:else}
 			<p class="hint">
-				{#if savedConnection && savedIsPush}クライアント向けの待ち受け URL を確認できません。Hub
-					の待ち受け設定とログを確認してください。{:else}作成すると、ここに送り手向けの&nbsp;
-					URL（/api/v1/ingest/接続 id/…）と API キーのスコープ ingest:#接続 id が出ます。
+				{#if savedConnection && savedIsPush}
+					{#if ingestOriginLoading}クライアント向けの待ち受け URL を取得中…{:else}クライアント向けの待ち受け
+						URL を確認できません。Hub の待ち受け設定とログを確認してください。{/if}
+				{:else}<span>作成すると、ここに送り手向けの URL</span>（/api/v1/ingest/接続 id/…）と API
+					キーのスコープ ingest:#接続 id が出ます。
 				{/if}
 			</p>
 		{/if}

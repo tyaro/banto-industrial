@@ -120,6 +120,7 @@ pub(super) fn record_backup_failure<P: UserTlsPlace + ?Sized>(
 pub(super) enum Stage {
     BeforeSwitch,
     AfterSwitch,
+    AfterBackupCopy,
     AfterBackup,
     AfterKeyPublish,
     AfterCertPublish,
@@ -393,6 +394,17 @@ pub(super) fn recreate<P: UserTlsPlace + ?Sized>(
     for name in [KEY_OLD, CERT_OLD, KEY_TEMP, CERT_TEMP, CREATING] {
         drop(validated!(checked_auxiliary_file(&ops, &dir, name)));
     }
+    // CERT_OLD is the durable retirement retry evidence. Never commit a
+    // different in-memory identity that this backup cannot represent.
+    if let Some(serving) = known_serving {
+        let disk = old
+            .0
+            .as_ref()
+            .and_then(|cert| CertThumbprint::of_pem(cert).ok());
+        if disk != Some(serving) {
+            validated!(Err::<(), _>(DesktopFailure::retry("待ち受け中とディスク上の旧証明書が一致しないため作り直しません。ログと旧い組を確認し、Hub を再起動してからトレイで再試行してください")));
+        }
+    }
     let old_matches =
         matches!((&old.0, &old.1), (Some(cert), Some(key)) if pair_matches(cert, key));
     if !old_matches {
@@ -465,7 +477,9 @@ pub(super) fn recreate<P: UserTlsPlace + ?Sized>(
             // returning. Originals remain untouched until both copies verify.
             create(dir.dir(), KEY_OLD, key)?;
             create(dir.dir(), CERT_OLD, cert)?;
-            let backup_cert = auxiliary_bytes(&ops, &dir, CERT_OLD)?.unwrap();
+            observe(Stage::AfterBackupCopy).map_err(DesktopFailure::retry)?;
+            let backup_cert = auxiliary_bytes(&ops, &dir, CERT_OLD)?
+                .ok_or_else(|| DesktopFailure::retry("旧い証明書の写しがありません"))?;
             let backup_key = auxiliary_bytes(&ops, &dir, KEY_OLD)
                 .map_err(|error| {
                     if matches!(&error.remedy, DesktopRemedy::BackupKeyExposure) {
@@ -484,7 +498,7 @@ pub(super) fn recreate<P: UserTlsPlace + ?Sized>(
                         report
                     })
                 })?
-                .unwrap();
+                .ok_or_else(|| DesktopFailure::retry("旧い鍵の写しがありません"))?;
             if backup_cert.as_slice() != cert
                 || backup_key.as_slice() != key.as_slice()
                 || !pair_matches(&backup_cert, &backup_key)
@@ -601,7 +615,14 @@ pub(super) fn recreate<P: UserTlsPlace + ?Sized>(
     }
     // Cleanup/record failures are committed warnings, never a rollback request.
     if cleanup_ready {
-        if let Err(error) = cleanup_old(dir.dir()).and_then(|_| cleanup_auxiliary_files(&dir)) {
+        // Keep the old pair until every retirement is durable. Startup can
+        // recover the thumbprint even if this process loses its pending set.
+        let old_cleanup = if pending.is_empty() {
+            cleanup_old(dir.dir())
+        } else {
+            Ok(())
+        };
+        if let Err(error) = old_cleanup.and_then(|_| cleanup_auxiliary_files(&dir)) {
             warnings.push(format!("補助ファイルを片付けられません: {}", error.reason));
         }
     }
