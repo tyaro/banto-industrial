@@ -1647,7 +1647,7 @@ fn recreate_desktop_tls(app: &AppHandle) {
     let prompt_app = app.clone();
     banto_desktop_tray::ask_confirm(&prompt_app, ConfirmPrompt {
         title: "TLS の証明書を作り直す",
-        message: "ChronoGazer 接続用の TLS の鍵と証明書を作り直します。接続は一時的に切れ、ChronoGazer が新しい証明書を読み直して接続します。管理画面と収集は継続します。続けますか？",
+        message: "ChronoGazer 接続用の TLS の鍵と証明書を作り直します。接続が切れ、再接続には ChronoGazer 側で新しい証明書の取得と接続設定の更新が必要です。管理画面と収集は継続します。続けますか？",
         ok_label: "作り直す", cancel_label: "キャンセル",
     }, move |confirmed| {
         if !confirmed { host_switch_ipc::end_switch(); return; }
@@ -1669,7 +1669,7 @@ fn recreate_desktop_tls(app: &AppHandle) {
             hub_slot::run_switch(ticket, || {
                 use tauri_plugin_dialog::DialogExt;
                 let result = tauri::async_runtime::block_on(handle.recreate());
-                let message = match &result { Ok(()) => "TLS の証明書を作り直しました。ChronoGazer は新しい証明書を読み直して接続します".to_string(), Err(error) => format!("TLS の証明書を作り直せませんでした: {error}") };
+                let message = match &result { Ok(()) => "TLS の証明書を作り直しました。再接続には ChronoGazer 側で新しい証明書を取得し、接続設定を更新してください".to_string(), Err(error) => format!("TLS の証明書を作り直せませんでした: {error}") };
                 if result.is_ok() {
                     log_line(&message);
                 } else {
