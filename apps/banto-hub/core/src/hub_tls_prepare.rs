@@ -134,6 +134,8 @@ pub use banto_hub_tls_trust::{
     MAX_PEM_BYTES, ROOT_TAKEOVER_MASK, SERVICE_REVOCATIONS_DIR, TLS_DIR,
 };
 
+#[cfg(windows)]
+pub mod desktop;
 pub mod load;
 pub mod watch;
 #[cfg(windows)]

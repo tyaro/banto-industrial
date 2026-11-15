@@ -1316,6 +1316,23 @@ impl PinnedDir {
         imp::create_child_file(self, name, contents)
     }
 
+    /// 今のトークンの利用者・SYSTEM・Administrators だけにフルを許す、所有者が本人の
+    /// protected DACL を**作成時に**付ける（#1121 PR2d）。既存の物は変えない。
+    /// 親のハンドル基準で辿らずに作るので、一般利用者の秘密の置き場に使える。
+    pub fn create_child_dir_current_user(&self, name: &str) -> Result<Option<PinnedDir>> {
+        imp::create_child_dir_current_user(self, name)
+    }
+
+    /// [`Self::create_child_dir_current_user`] と同じ本人用の DACL でファイルを作り、flush・
+    /// 読み戻しの確かめまで行う。既存なら `None`（置き換えない）。
+    pub fn create_child_file_current_user(
+        &self,
+        name: &str,
+        contents: &[u8],
+    ) -> Result<Option<PinnedFile>> {
+        imp::create_child_file_current_user(self, name, contents)
+    }
+
     /// [`PinnedDir::create_child_dir`] の、記述子を「SYSTEM・Administrators にフル、
     /// `BUILTIN\Users` に読み取りと実行、所有者 `BUILTIN\Administrators`、保護された DACL
     /// （`OICI`）」に固定した版（#644 PR1a。Hub の loopback TLS の置き場 `tls\`。後の PR で
@@ -3356,6 +3373,51 @@ pub(crate) mod imp {
         create_child_file_with(parent, name, contents, &descriptor, super::exposure)
     }
 
+    fn current_user_sd(inheritable: bool) -> Result<(LocalBox, String)> {
+        // SID は OS のトークンから取得・検証する。任意の SDDL の入力は受けない。
+        let user = super::current_user_sid()?;
+        let flags = if inheritable { "OICI" } else { "" };
+        let descriptor = sd_from_sddl(&format!(
+            "O:{}D:P(A;{flags};FA;;;{})(A;{flags};FA;;;{})(A;{flags};FA;;;{})",
+            user.as_str(),
+            super::SYSTEM_SID,
+            super::ADMINISTRATORS_SID,
+            user.as_str(),
+        ))?;
+        Ok((descriptor, user.as_str().to_owned()))
+    }
+
+    pub(super) fn create_child_dir_current_user(
+        parent: &super::PinnedDir,
+        name: &str,
+    ) -> Result<Option<super::PinnedDir>> {
+        let (descriptor, _) = current_user_sd(true)?;
+        child_relative(parent, name, ChildHow::Create(Some(&descriptor)))?
+            .map(|handle| pinned_from_handle(handle, &parent.path.join(name), true))
+            .transpose()
+    }
+
+    pub(super) fn create_child_file_current_user(
+        parent: &super::PinnedDir,
+        name: &str,
+        contents: &[u8],
+    ) -> Result<Option<super::PinnedFile>> {
+        let (descriptor, user) = current_user_sd(false)?;
+        create_child_file_with(parent, name, contents, &descriptor, |security| {
+            super::exposure(security)
+                .into_iter()
+                .filter(|found| {
+                    !matches!(found,
+                        super::Exposure::ForeignOwner(owner) if owner == &user
+                    ) && !matches!(found,
+                        super::Exposure::AllowsOther { ace_type, sid, .. }
+                            if *ace_type == super::ACCESS_ALLOWED_ACE_TYPE && sid == &user
+                    )
+                })
+                .collect()
+        })
+    }
+
     /// [`super::PinnedDir::create_child_dir_users_read`] の本体（#644 PR1a）。
     pub(super) fn create_child_dir_users_read(
         parent: &super::PinnedDir,
@@ -3390,7 +3452,7 @@ pub(crate) mod imp {
         name: &str,
         contents: &[u8],
         descriptor: &LocalBox,
-        check: fn(&super::FileSecurity) -> Vec<super::Exposure>,
+        check: impl Fn(&super::FileSecurity) -> Vec<super::Exposure>,
     ) -> Result<Option<super::PinnedFile>> {
         let Some(handle) = child_relative(parent, name, ChildHow::CreateFile(Some(descriptor)))?
         else {

@@ -166,9 +166,10 @@
 //! BANTO_HUB_TLS_CERT and BANTO_HUB_TLS_KEY here so all Hub hosts retain
 //! their current public config shape. Incomplete settings fail before DB init,
 //! and a bind failure of that explicit listener fails the start.
-//! When none of the three is set, [`HubConfig::default_tls`] (filled only by
-//! the Windows service, #644 PR1b, from `<ProgramData>\BantoHub\tls\` via
-//! `crate::hub_tls_prepare::load`) serves TLS on 127.0.0.1:8723 instead; if
+//! When none of the three is set, [`HubConfig::default_tls`] (filled by the Windows
+//! service from `<ProgramData>\BantoHub\tls\` via `crate::hub_tls_prepare::load`)
+//! or the Windows Shell's user identity (loaded after the profile lock by
+//! `crate::hub_tls_prepare::desktop`) serves TLS on 127.0.0.1:8723 instead; if
 //! that port cannot be bound, the Hub starts without TLS and logs why
 //! (2026-11-13 owner decision B).
 
@@ -278,8 +279,9 @@ pub struct HubConfig {
     /// 呼び出す。
     pub skip_profile_lock: bool,
     /// #644 PR1b: 既定の TLS の識別情報（確かめて読んだメモリ上の PEM とポート。本番は
-    /// Windows サービスだけが `crate::hub_tls_prepare::load::load_default_identity` で
-    /// 組み立てる。ほかのホスト・テストは `None`）。`BANTO_HUB_TLS_*` が設定されていれば
+    /// Windows サービスが `crate::hub_tls_prepare::load::load_default_identity` で
+    /// 組み立てる。Windows Shell は未設定なら profile 排他の取得後に利用者の既定の組を
+    /// 用意する（PR2d）。ほかのホスト・テストは `None`）。`BANTO_HUB_TLS_*` が設定されていれば
     /// そちらを優先し、これは使わない。bind できなければ TLS 無しで起動してログに出す
     /// （オーナー決定 B）。
     pub default_tls: Option<DefaultHubTls>,
@@ -494,6 +496,36 @@ impl HubRuntime {
                 })
                 .map_err(HubStartError::ProfileLock)?;
             Some(guard)
+        };
+
+        // #1121 PR2d: env の検証と profile 排他が済んでから、Windows Shell だけは
+        // 利用者の TLS を用意する。明示 env（不完全なら既に失敗）・注入済みの組が優先。
+        #[cfg(windows)]
+        let (tls_config, profile_lock) = {
+            // start の future が drop されても、blocking pool のファイル操作が終わるまでは
+            // closure が排他を保つ。JoinError のときもこちらの握りは残るので TLS 無しで続けられる。
+            let profile_lock = Arc::new(profile_lock);
+            let loaded = crate::hub_tls_prepare::desktop::load_for_shell(
+                host_kind,
+                skip_profile_lock,
+                tls_config.is_some(),
+                profile_lock.clone(),
+            )
+            .await;
+            let profile_lock = Arc::try_unwrap(profile_lock).map_err(|_| {
+                HubStartError::Tls("TLS の準備後に profile の排他を回収できませんでした".into())
+            })?;
+            let tls_config = match loaded {
+                Some(Ok(identity)) => Some(TlsPlan::Default(identity)),
+                Some(Err(found)) => {
+                    for line in found.log_lines() {
+                        log_err_line(&line);
+                    }
+                    None
+                }
+                None => tls_config,
+            };
+            (tls_config, profile_lock)
         };
 
         // #661 661-1・#623 PR2a: 握った組を渡されたときだけ、profile の中の設定 DB は本体・
@@ -1119,7 +1151,17 @@ impl HubRuntime {
                         Some(listener)
                     }
                     Err(err) => {
-                        for line in bind_failure_lines(config.port(), &err.to_string()) {
+                        let lines = bind_failure_lines(config.port(), &err.to_string());
+                        #[cfg(windows)]
+                        let lines = if host_kind == HubHostKind::Shell {
+                            crate::hub_tls_prepare::desktop::bind_failure_lines(
+                                config.port(),
+                                &err.to_string(),
+                            )
+                        } else {
+                            lines
+                        };
+                        for line in lines {
                             log_err_line(&line);
                         }
                         None
@@ -3559,7 +3601,7 @@ mod tests {
             now,
         )
         .unwrap();
-        let make = |tls: DefaultHubTls| HubConfig {
+        let make = |host_kind, tls: DefaultHubTls| HubConfig {
             drivers: crate::test_support::test_drivers(),
             db_path: dir
                 .path()
@@ -3571,27 +3613,29 @@ mod tests {
             bind_override: Some("127.0.0.1".to_string()),
             data_dir_override: Some(dir.path().join("data")),
             profile_id: "test".to_string(),
-            host_kind: HubHostKind::Service,
+            host_kind,
             skip_profile_lock: true,
             default_tls: Some(tls),
         };
 
-        let hub = HubRuntime::start(make(default_tls.clone()))
-            .await
-            .expect("default TLS should start");
-        let tls_addr = hub.tls_local_addr().expect("default TLS should listen");
-        assert_eq!(tls_addr.ip().to_string(), "127.0.0.1");
-        assert_ne!(tls_addr.port(), 0);
-        hub.shutdown().await;
+        for host_kind in [HubHostKind::Service, HubHostKind::Shell] {
+            let hub = HubRuntime::start(make(host_kind, default_tls.clone()))
+                .await
+                .expect("default TLS should start");
+            let tls_addr = hub.tls_local_addr().expect("default TLS should listen");
+            assert_eq!(tls_addr.ip().to_string(), "127.0.0.1");
+            assert_ne!(tls_addr.port(), 0);
+            hub.shutdown().await;
 
-        let holder = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
-        let busy = holder.local_addr().unwrap().port();
-        let hub = HubRuntime::start(make(default_tls.with_port(busy)))
-            .await
-            .expect("a taken default TLS port must not stop the Hub");
-        assert_eq!(hub.tls_local_addr(), None);
-        hub.shutdown().await;
-        drop(holder);
+            let holder = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+            let busy = holder.local_addr().unwrap().port();
+            let hub = HubRuntime::start(make(host_kind, default_tls.clone().with_port(busy)))
+                .await
+                .expect("a taken default TLS port must not stop the Hub");
+            assert_eq!(hub.tls_local_addr(), None);
+            hub.shutdown().await;
+            drop(holder);
+        }
     }
 
     /// #500: `HubRuntime::start` が組み立てる Router（コンソール/サービス/
