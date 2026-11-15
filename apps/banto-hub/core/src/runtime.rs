@@ -516,13 +516,7 @@ impl HubRuntime {
             let tls_config = match loaded {
                 Some(Ok(identity)) => Some(TlsPlan::Desktop(identity)),
                 Some(Err(found)) => {
-                    initial_status =
-                        Some(crate::hub_tls_prepare::desktop::watch::DesktopTlsStatus {
-                            address: None,
-                            reason: Some(format!("{}。{}", found.reason, found.remedy)),
-                            requires_recreation: false,
-                            can_resume: false,
-                        });
+                    initial_status = Some(found.status());
                     for line in found.log_lines() {
                         log_err_line(&line);
                     }
@@ -602,6 +596,7 @@ impl HubRuntime {
             bind_override,
             data_dir_override,
             profile_id,
+            #[cfg(windows)]
             host_kind,
             db_path,
             given_dirs: &given_dirs,
@@ -652,6 +647,7 @@ impl HubRuntime {
             bind_override,
             data_dir_override,
             profile_id,
+            #[cfg(windows)]
             host_kind,
             db_path,
             given_dirs,
@@ -1373,6 +1369,7 @@ struct StartOnDb<'a> {
     bind_override: Option<String>,
     data_dir_override: Option<PathBuf>,
     profile_id: String,
+    #[cfg(windows)]
     host_kind: HubHostKind,
     db_path: String,
     given_dirs: &'a Option<ProfileDirs>,

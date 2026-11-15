@@ -53,6 +53,22 @@ mod tests {
     use super::*;
     use banto_hub_core::hub_tls_prepare::desktop::watch::DesktopTlsStatus;
     #[test]
+    fn startup_recreation_and_retry_failures_have_distinct_native_guidance() {
+        use banto_hub_core::hub_tls_prepare::desktop::DesktopTlsUnavailable;
+        let mut failure = DesktopTlsUnavailable {
+            reason: "same reason".into(),
+            remedy: "typed remedy".into(),
+            requires_recreation: true,
+        };
+        let recreation = present(&failure.status());
+        assert!(recreation.label.contains("作り直し"));
+        failure.requires_recreation = false;
+        let retry = present(&failure.status());
+        assert!(retry.label.contains("再開できません"));
+        assert!(retry.remedy.contains("再起動"));
+        assert_eq!(recreation.reason, retry.reason);
+    }
+    #[test]
     fn temporary_pause_and_panic_have_different_recovery_without_reason_parsing() {
         let mut status = DesktopTlsStatus {
             address: None,

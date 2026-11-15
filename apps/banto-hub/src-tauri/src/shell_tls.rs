@@ -5,29 +5,66 @@ use banto_hub_core::shell_transport::ShellTransport;
 use std::sync::{Arc, OnceLock};
 use tauri::{Manager, Url, WebviewWindow};
 
-static TRANSPORT: OnceLock<Result<Arc<ShellTransport>, String>> = OnceLock::new();
+static TRANSPORT: OnceLock<Initialization<Arc<ShellTransport>>> = OnceLock::new();
+
+/// Retain the bound origin even when registration fails (including a partially
+/// applied capability), but expose it only after registration succeeds.
+struct Initialization<T> {
+    retained: Option<T>,
+    authorization: Result<(), String>,
+}
+
+impl<T> Initialization<T> {
+    fn new(bind: Result<T, String>, register: impl FnOnce(&T) -> Result<(), String>) -> Self {
+        match bind {
+            Ok(transport) => Self {
+                authorization: register(&transport),
+                retained: Some(transport),
+            },
+            Err(error) => Self {
+                retained: None,
+                authorization: Err(error),
+            },
+        }
+    }
+
+    fn usable(&self) -> Result<&T, String> {
+        self.authorization.as_ref().map_err(Clone::clone)?;
+        self.retained
+            .as_ref()
+            .ok_or_else(|| "シェルの待ち受けがありません".into())
+    }
+}
 pub(crate) const SERVE_FAILURE: &str = "管理画面の待ち受けが異常終了しました。ポートはこのプロセスが保持しており、別のアプリへは接続しません。収集状態を確認してから、Hub を終了し起動し直してください";
 
 pub(crate) fn transport() -> Result<&'static Arc<ShellTransport>, String> {
     TRANSPORT
         .get()
         .ok_or_else(|| "シェルの HTTPS は準備されていません".to_string())?
-        .as_ref()
-        .map_err(Clone::clone)
+        .usable()
 }
 
 pub(crate) fn initialize(app: &tauri::AppHandle) -> Result<(), String> {
-    let value = tauri::async_runtime::block_on(ShellTransport::start());
-    // Retain even if capability registration fails; never leave an authorized port free.
+    // Registration and retention happen once together. Repeated setup must not
+    // authorize another origin and then release that origin's reserved socket.
     TRANSPORT
-        .set(value)
-        .map_err(|_| "シェルの HTTPS は既に初期化されています".to_string())?;
-    let transport = transport()?;
-    app.add_capability(capability(&transport.url()))
-        .map_err(|e| format!("シェルの origin の権限を登録できません: {e}"))
+        .get_or_init(|| {
+            Initialization::new(
+                tauri::async_runtime::block_on(ShellTransport::start()),
+                |transport| {
+                    app.add_capability(capability(&transport.url()))
+                        .map_err(|e| format!("シェルの origin の権限を登録できません: {e}"))
+                },
+            )
+        })
+        .usable()
+        .map(|_| ())
 }
 
 fn capability(origin: &str) -> tauri::ipc::CapabilityBuilder {
+    // The management UI uses @tauri-apps/api/core invoke for the app commands
+    // below and @tauri-apps/api/event listen (whose returned disposer unlistens).
+    // No window/webview/app/plugin core APIs are used, so core:default is unnecessary.
     let mut capability = tauri::ipc::CapabilityBuilder::new("desktop-shell")
         .local(false)
         .window(crate::MAIN_WINDOW_LABEL)
@@ -107,6 +144,36 @@ pub(crate) fn read_pin(request_uri: &str) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
     #[test]
+    fn failed_bind_skips_capability_and_preserves_diagnostic_reason() {
+        let state =
+            Initialization::<()>::new(Err("injected certificate/bind failure".into()), |_| {
+                panic!("must not authorize an unbound origin")
+            });
+        assert!(state.retained.is_none());
+        assert_eq!(
+            state.usable().unwrap_err(),
+            "injected certificate/bind failure"
+        );
+    }
+
+    #[test]
+    fn failed_registration_retains_bound_socket_but_does_not_expose_desktop_origin() {
+        let socket = Arc::new(());
+        let state = Initialization::new(Ok(socket.clone()), |_| {
+            Err("injected partial registration failure".into())
+        });
+        assert_eq!(
+            Arc::strong_count(&socket),
+            2,
+            "the reserved socket must remain owned"
+        );
+        assert_eq!(
+            state.usable().unwrap_err(),
+            "injected partial registration failure"
+        );
+    }
+
+    #[test]
     fn capabilities_authorize_exact_port_and_have_no_static_http_alternative() {
         use tauri::ipc::RuntimeCapability;
         let static_capability: serde_json::Value =
@@ -124,6 +191,19 @@ mod tests {
             assert_eq!(value.remote.unwrap().urls, vec![format!("{origin}*")]);
             assert!(!value.local);
             assert_eq!(value.windows, vec![crate::MAIN_WINDOW_LABEL]);
+            let permissions = serde_json::to_value(value.permissions).unwrap();
+            let core: Vec<_> = permissions
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|permission| permission.as_str())
+                .filter(|permission| permission.starts_with("core:"))
+                .collect();
+            assert_eq!(
+                core,
+                ["core:event:allow-listen", "core:event:allow-unlisten"],
+                "UI invokes app commands and only uses event.listen/disposer among core APIs"
+            );
         }
     }
     #[test]

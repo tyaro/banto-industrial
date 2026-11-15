@@ -1936,3 +1936,14 @@ fn renewal_auxiliary_validation_failure_stops_existing_tls_before_generation() {
     assert!(stopped.get());
     assert!(!fixture.0.tls().join(KEY_TEMP).exists());
 }
+
+#[test]
+fn typed_startup_failures_keep_recreation_requirement_without_parsing_reason() {
+    let recreation = DesktopFailure::recreate("same reason").into_unavailable();
+    let retry = DesktopFailure::retry("same reason").into_unavailable();
+    assert!(recreation.status().requires_recreation);
+    assert!(!retry.status().requires_recreation);
+    assert!(!recreation.status().can_resume);
+    assert!(!retry.status().can_resume);
+    assert_eq!(recreation.reason, retry.reason);
+}

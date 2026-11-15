@@ -394,6 +394,7 @@ impl Listener for TlsListener {
 }
 
 pub struct RunningTlsListener {
+    #[cfg(windows)]
     acceptor: Option<Arc<RwLock<TlsAcceptor>>>,
     local_addr: SocketAddr,
     shutdown: oneshot::Sender<()>,
@@ -720,7 +721,6 @@ pub(crate) async fn start_plain_reserved(
         .await;
     });
     Ok(RunningTlsListener {
-        acceptor: None,
         local_addr,
         shutdown,
         task,
@@ -775,6 +775,7 @@ async fn start_inner(
         .await;
     });
     let running = RunningTlsListener {
+        #[cfg(windows)]
         acceptor: Some(acceptor),
         local_addr,
         shutdown,
@@ -919,6 +920,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let server = RunningTlsListener {
+            #[cfg(windows)]
             acceptor: None,
             local_addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
             shutdown,

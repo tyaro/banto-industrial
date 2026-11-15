@@ -1289,11 +1289,16 @@ fn attempt_desktop_start(
     slot: &Arc<HubSlot<RunningHub>>,
     scm_state: Option<ScmState>,
 ) -> StartupOutcome {
-    if shell_tls::transport().is_ok_and(|transport| !transport.is_serving()) {
+    let transport_failure = match shell_tls::transport() {
+        Ok(transport) if transport.is_serving() => None,
+        Ok(_) => Some(shell_tls::SERVE_FAILURE.to_string()),
+        Err(reason) => Some(reason),
+    };
+    if let Some(reason) = transport_failure {
         return StartupOutcome::Fallback(FallbackInfo {
             scm_state,
             health: None,
-            desktop_error: Some(shell_tls::SERVE_FAILURE.into()),
+            desktop_error: Some(reason),
             cause: FallbackCause::General,
         });
     }
@@ -2938,9 +2943,14 @@ pub fn run() {
             let window = tauri::WebviewWindowBuilder::from_config(app, &config)?
                 .on_navigation(move |url| shell_tls::navigation_allowed(&navigation_app, url))
                 .build()?;
-            // Bind and authorize before any desktop navigation. Failure is fatal,
-            // without authorizing an HTTP or wildcard alternative.
-            shell_tls::initialize(app.handle()).map_err(std::io::Error::other)?;
+            // Desktop needs its own bound, authorized origin; Service and the
+            // bundled diagnostic page remain usable if its preparation fails.
+            if let Err(reason) = shell_tls::initialize(app.handle()) {
+                report_shell_error(
+                    app.handle(),
+                    format!("シェル専用の待ち受けを用意できません: {reason}"),
+                );
+            }
 
             // CloseRequested（×ボタン）はプロセスを終了せずトレイへ格納
             // するだけ（実装指示「CloseRequested -> prevent_close + hide」）。
@@ -3070,6 +3080,24 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_desktop_transport_keeps_diagnostics_and_service_available() {
+        let slot = HubSlot::new();
+        let StartupOutcome::Fallback(info) =
+            attempt_desktop_start(&expected_probe_target(), &slot, None)
+        else {
+            panic!("an unavailable Desktop origin must fall back before starting Hub")
+        };
+        assert!(slot.is_idle());
+        assert!(fallback_message(&info, false).contains("準備されていません"));
+        assert!(matches!(
+            service_outcome(Ok(HealthOutcome::Healthy {
+                version: "v1".into()
+            })),
+            StartupOutcome::Service { .. }
+        ));
+    }
 
     #[test]
     fn manual_main_window_boot_config_has_one_nonautomatic_main_window() {

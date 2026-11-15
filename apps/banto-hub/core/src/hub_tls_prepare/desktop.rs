@@ -32,8 +32,37 @@ const LOCK_FILE: &str = "identity.lock";
 const CREATING: &str = "creating";
 const CREATING_CONTENTS: &[u8] = b"banto-hub-tls-creating 1\n";
 
-fn unavailable(reason: impl Into<String>) -> DefaultTlsUnavailable {
-    DefaultTlsUnavailable {
+/// Desktop startup failure keeps the typed remedy decision for native UI.
+/// Service failures retain their existing DefaultTlsUnavailable API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopTlsUnavailable {
+    pub reason: String,
+    pub remedy: String,
+    pub requires_recreation: bool,
+}
+
+impl DesktopTlsUnavailable {
+    pub fn log_lines(&self) -> Vec<String> {
+        DefaultTlsUnavailable {
+            reason: self.reason.clone(),
+            remedy: self.remedy.clone(),
+        }
+        .log_lines()
+    }
+
+    pub fn status(&self) -> watch::DesktopTlsStatus {
+        watch::DesktopTlsStatus {
+            address: None,
+            reason: Some(format!("{}。{}", self.reason, self.remedy)),
+            requires_recreation: self.requires_recreation,
+            can_resume: false,
+        }
+    }
+}
+
+fn unavailable(reason: impl Into<String>) -> DesktopTlsUnavailable {
+    DesktopTlsUnavailable {
+        requires_recreation: true,
         reason: reason.into(),
         remedy: "Hub を閉じ、ログの理由と TLS・失効の記録の置き場の所有者・アクセス許可を確かめてください。本体の TLS の組が壊れた・失効した場合や、本体の鍵・証明書・置き場に露出や所有者の異常を見た場合は、ACL を直すだけでは漏れた鍵は無効になりません。利用者の TLS フォルダ（既定は %LOCALAPPDATA%\\BantoHub\\tls）だけを、中身を確認してフォルダごと削除し、Hub のデスクトップ版を再起動してください。親の置き場の所有者・アクセス許可が異常なら先に直してください。失効の記録は消さないでください".into(),
     }
@@ -84,7 +113,7 @@ impl DesktopFailure {
         }
     }
 
-    fn into_unavailable(self) -> DefaultTlsUnavailable {
+    fn into_unavailable(self) -> DesktopTlsUnavailable {
         let remedy = match self.remedy {
             DesktopRemedy::InspectAndRecreate => return unavailable(self.reason),
             DesktopRemedy::RetryLater => "本体の hub-cert.pem・hub-key.pem は削除せず、ログの理由に従って置き場の指定・所有者・アクセス許可や読み書きの失敗の原因を確かめ、ロックの競合は終了まで待ってから、Hub のデスクトップ版を再起動してください".into(),
@@ -93,7 +122,8 @@ impl DesktopFailure {
             DesktopRemedy::InspectAuxiliaryFile(path) => format!("本体の hub-cert.pem・hub-key.pem は削除せず、Hub を閉じ、補助ファイル（{}）の中身・所有者・アクセス許可を確認してください。補助ファイルだけを安全に削除するか、その所有者・アクセス許可を修復してから再起動してください", path.display()),
             DesktopRemedy::CleanupAuxiliaryFile(path) => format!("本体の鍵・証明書の検査と失効照合は済んでいます。本体の hub-cert.pem・hub-key.pem は削除せず、Hub を閉じ、補助ファイル（{}）の中身・アクセス許可と他のプロセスによる使用を確認し、安全に片付けてから再起動してください", path.display()),
         };
-        DefaultTlsUnavailable {
+        DesktopTlsUnavailable {
+            requires_recreation: false,
             reason: self.reason,
             remedy,
         }
@@ -108,7 +138,7 @@ pub async fn load_for_shell(
     skip_profile_lock: bool,
     tls_configured: bool,
     keep_alive: std::sync::Arc<Option<crate::profile_lock::ProfileLockGuard>>,
-) -> Option<Result<DefaultHubTls, DefaultTlsUnavailable>> {
+) -> Option<Result<DefaultHubTls, DesktopTlsUnavailable>> {
     load_for_shell_with(
         host,
         skip_profile_lock,
@@ -125,10 +155,10 @@ async fn load_for_shell_with<G, F>(
     tls_configured: bool,
     keep_alive: G,
     load: F,
-) -> Option<Result<DefaultHubTls, DefaultTlsUnavailable>>
+) -> Option<Result<DefaultHubTls, DesktopTlsUnavailable>>
 where
     G: Send + 'static,
-    F: FnOnce() -> Result<DefaultHubTls, DefaultTlsUnavailable> + Send + 'static,
+    F: FnOnce() -> Result<DefaultHubTls, DesktopTlsUnavailable> + Send + 'static,
 {
     let task = select_default(host, skip_profile_lock, tls_configured, || {
         tokio::task::spawn_blocking(move || {
@@ -163,7 +193,7 @@ fn select_default<T>(
 }
 
 /// 明示した TLS の環境変数が無い Shell からだけ呼ぶ。本番は既知のフォルダとトークンの SID。
-pub fn load_desktop_identity() -> Result<DefaultHubTls, DefaultTlsUnavailable> {
+pub fn load_desktop_identity() -> Result<DefaultHubTls, DesktopTlsUnavailable> {
     let ops = WindowsTlsTrustOps;
     let place = DefaultUserTlsPlace::resolve(&ops)
         .map_err(|error| DesktopFailure::retry(error.reason).into_unavailable())?;
