@@ -334,6 +334,7 @@ fn initial_creation_holds_the_record_lock_until_identity_is_published() {
     assert_eq!(
         stages,
         vec![
+            CreationStage::BeforeIdentityCheck,
             CreationStage::BeforeGeneration,
             CreationStage::BeforePublish,
             CreationStage::AfterPublish
@@ -1385,7 +1386,7 @@ fn creation_child() {
                     signal(&place, "after-publish");
                     wait_for_signal(&place, "finish-creation");
                 }
-                CreationStage::BeforePublish => {}
+                CreationStage::BeforeIdentityCheck | CreationStage::BeforePublish => {}
             },
         )
         .unwrap();
@@ -1583,6 +1584,12 @@ fn renewal_swap_failure_preserves_the_current_pair() {
         |_| Ok(()),
     );
     assert!(result.is_err());
+    for name in [KEY_TEMP, CERT_TEMP, CREATING] {
+        assert!(
+            !fixture.0.tls().join(name).exists(),
+            "swap failure must remove {name}"
+        );
+    }
     assert_eq!(thumb(&fixture.0.load().unwrap()), thumb(&old));
 }
 
@@ -1829,14 +1836,14 @@ fn renewal_success_confirms_every_pending_thumbprint_before_returning_empty_pend
 }
 
 #[test]
-fn renewal_current_valid_does_not_hide_unsafe_backup_acl() {
+fn renewal_current_valid_does_not_hide_unsafe_public_backup_acl() {
     let fixture = Fixture::new();
     let old = fixture.0.load().unwrap();
     fixture.0.put("hub-cert.pem.old", b"unused broken content");
     fixture.0.put("hub-key.pem.old", b"unused broken key");
     acl(
-        &fixture.0.tls().join("hub-key.pem.old"),
-        &["/grant", "*S-1-5-32-545:(R)"],
+        &fixture.0.tls().join("hub-cert.pem.old"),
+        &["/grant", "*S-1-1-0:(M)"],
     );
     assert!(
         fixture.0.load().is_err(),
@@ -1844,7 +1851,7 @@ fn renewal_current_valid_does_not_hide_unsafe_backup_acl() {
     );
     assert!(
         !read_user_revocations(&WindowsTlsTrustOps, &fixture.0).is_revoked(&thumb(&old)),
-        "unused backup ACL does not expose current identity"
+        "public certificate backup alone does not expose the private key"
     );
 }
 
@@ -1946,4 +1953,122 @@ fn typed_startup_failures_keep_recreation_requirement_without_parsing_reason() {
     assert!(!recreation.status().can_resume);
     assert!(!retry.status().can_resume);
     assert_eq!(recreation.reason, retry.reason);
+}
+
+#[test]
+fn backup_key_exposure_revokes_current_identity_and_acl_repair_cannot_restore_it() {
+    let fixture = Fixture::new();
+    let current = fixture.0.load().unwrap();
+    fixture.0.put("hub-cert.pem.old", current.cert_pem());
+    fixture.0.put(
+        "hub-key.pem.old",
+        &std::fs::read(fixture.0.tls().join(KEY_FILE)).unwrap(),
+    );
+    let key = fixture.0.tls().join("hub-key.pem.old");
+    acl(&key, &["/grant", "*S-1-5-32-545:(R)"]);
+    let failure = fixture.0.load().unwrap_err();
+    assert!(failure.contains("hub-key.pem.old"), "{failure}");
+    assert!(read_user_revocations(&WindowsTlsTrustOps, &fixture.0).is_revoked(&thumb(&current)));
+    acl(&key, &["/remove:g", "*S-1-5-32-545"]);
+    assert!(
+        fixture.0.load().is_err(),
+        "ACL repair cannot un-revoke a leaked current key"
+    );
+}
+
+#[test]
+fn backup_key_exposure_with_unwritable_records_refuses_tls_for_this_startup() {
+    let fixture = Fixture::new();
+    let current = fixture.0.load().unwrap();
+    fixture.0.put("hub-cert.pem.old", current.cert_pem());
+    fixture.0.put(
+        "hub-key.pem.old",
+        &std::fs::read(fixture.0.tls().join(KEY_FILE)).unwrap(),
+    );
+    acl(
+        &fixture.0.tls().join("hub-key.pem.old"),
+        &["/grant", "*S-1-5-32-545:(R)"],
+    );
+    let records_a = fixture.0.spec(UserPlaceKind::RevocationsA).path();
+    let user = WindowsTlsTrustOps.current_user_sid().unwrap();
+    let result = load_in_observed(
+        &WindowsTlsTrustOps,
+        &fixture.0,
+        &ReconcileOptions::default(),
+        NOW,
+        |stage| {
+            if stage == CreationStage::BeforeIdentityCheck {
+                acl(&records_a, &["/deny", &format!("*{user}:(W)")]);
+            }
+        },
+    );
+    acl(&records_a, &["/remove:d", &format!("*{user}")]);
+    let failure = result.unwrap_err();
+    assert!(failure.reason.contains("今回の起動"), "{}", failure.reason);
+    assert!(failure.reason.contains("書けません"), "{}", failure.reason);
+}
+
+#[test]
+fn backup_key_watch_retains_current_and_old_thumbprints_until_records_can_be_written() {
+    let fixture = Fixture::new();
+    let current = fixture.0.load().unwrap();
+    let old = generate_identity(NOW).unwrap();
+    let old_thumbprint = CertThumbprint::of_pem(old.cert_pem.as_bytes()).unwrap();
+    fixture.0.put("hub-cert.pem.old", old.cert_pem.as_bytes());
+    fixture.0.put("hub-key.pem.old", old.key_pem.as_bytes());
+    let key = fixture.0.tls().join("hub-key.pem.old");
+    acl(&key, &["/grant", "*S-1-5-32-545:(R)"]);
+    let options = ReconcileOptions {
+        lock_wait: Duration::ZERO,
+        ..Default::default()
+    };
+    let held = lock_user_revocations(&WindowsTlsTrustOps, &fixture.0, &options).unwrap();
+    let mut watch = watch::Watch::default();
+    assert!(!watch.check(&fixture.0, thumb(&current), &options).allow);
+    assert_eq!(
+        watch.unwritten_for_test(),
+        std::collections::BTreeSet::from([thumb(&current), old_thumbprint])
+    );
+    acl(&key, &["/remove:g", "*S-1-5-32-545"]);
+    drop(held);
+    assert!(
+        !watch.check(&fixture.0, thumb(&current), &options).allow,
+        "repair must not re-enable current key"
+    );
+    assert!(watch.unwritten_for_test().is_empty());
+    let records = read_user_revocations(&WindowsTlsTrustOps, &fixture.0);
+    assert!(records.is_revoked(&thumb(&current)));
+    assert!(records.is_revoked(&old_thumbprint));
+}
+
+#[test]
+fn renewal_swap_failure_reports_cleanup_failure_without_modifying_current_files() {
+    let fixture = Fixture::new();
+    let current = fixture.0.load().unwrap();
+    let held = std::cell::RefCell::new(None);
+    let failure = renewal::recreate(
+        &fixture.0,
+        &mut Default::default(),
+        Some(thumb(&current)),
+        NOW,
+        |_| {
+            *held.borrow_mut() =
+                checked_auxiliary_file(&WindowsTlsTrustOps, &fixture.0.dir(), KEY_TEMP).unwrap();
+            Err("injected swap failure".into())
+        },
+        |_| Ok(()),
+    )
+    .unwrap_err();
+    assert!(failure.reason.contains("injected swap failure"));
+    assert!(
+        failure.reason.contains("片付け") && failure.reason.contains(KEY_TEMP),
+        "{}",
+        failure.reason
+    );
+    assert!(
+        fixture.0.tls().join(CREATING).exists(),
+        "incomplete cleanup retains recovery marker"
+    );
+    drop(held);
+    assert_eq!(thumb(&fixture.0.load().unwrap()), thumb(&current));
 }

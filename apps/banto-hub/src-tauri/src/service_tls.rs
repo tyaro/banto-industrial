@@ -60,7 +60,8 @@
 //!
 //! Desktop の Windows WebView2 は、プロセス所有の専用 origin でだけメモリ上の証明書を
 //! pin にする（[`crate::shell_tls`]）。サービスの pin は従来どおりディスクから読む。
-//! 非 Windows の Desktop は専用の安定した HTTP origin を使用する（設計 §4.5）。
+//! 非 Windows の Desktop はプロセスの間だけ同じ socket を保持する HTTP origin を使用する
+//! （ポートは起動ごとに OS が選ぶ。設計 §4.5）。
 
 use std::path::PathBuf;
 use std::sync::Mutex;

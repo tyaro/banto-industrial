@@ -126,6 +126,10 @@ pub(super) struct Round {
     reason: Option<String>,
 }
 impl Watch {
+    #[cfg(test)]
+    pub(super) fn unwritten_for_test(&self) -> BTreeSet<CertThumbprint> {
+        self.unwritten.clone()
+    }
     fn decide(&mut self, outcome: ReconcileOutcome, invalid: bool, revoked: bool) -> bool {
         self.permanently_revoked |= revoked;
         self.incomplete = if outcome == ReconcileOutcome::Incomplete {
@@ -162,6 +166,19 @@ impl Watch {
         let mut key = None;
         match open_user_place(&ops, place, UserPlaceKind::Tls) {
             Ok(UserPlaceState::Present(dir)) => {
+                if let Err(problem) =
+                    super::renewal::check_backup_key(&ops, place, &dir, Some(serving))
+                {
+                    if let Some(affected) = problem.affected {
+                        self.unwritten.extend(affected);
+                        revoked = true;
+                    } else if matches!(problem.failure.remedy, DesktopRemedy::RetryLater) {
+                        transient = true;
+                    } else {
+                        invalid = true;
+                    }
+                    reason = Some(problem.failure.reason);
+                }
                 // 片方の欠損/失敗で他方の露出を見落とさない。
                 for (name, role, target) in [
                     (CERT_FILE, UserFileRole::Public, &mut cert),

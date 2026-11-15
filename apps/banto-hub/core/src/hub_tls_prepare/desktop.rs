@@ -78,6 +78,7 @@ struct DesktopFailure {
 #[derive(Debug)]
 enum DesktopRemedy {
     InspectAndRecreate,
+    BackupKeyExposure,
     RepairPlaceOnly,
     InspectRemainingKey,
     InspectAuxiliaryFile(std::path::PathBuf),
@@ -115,7 +116,7 @@ impl DesktopFailure {
 
     fn into_unavailable(self) -> DesktopTlsUnavailable {
         let remedy = match self.remedy {
-            DesktopRemedy::InspectAndRecreate => return unavailable(self.reason),
+            DesktopRemedy::InspectAndRecreate | DesktopRemedy::BackupKeyExposure => return unavailable(self.reason),
             DesktopRemedy::RetryLater => "本体の hub-cert.pem・hub-key.pem は削除せず、ログの理由に従って置き場の指定・所有者・アクセス許可や読み書きの失敗の原因を確かめ、ロックの競合は終了まで待ってから、Hub のデスクトップ版を再起動してください".into(),
             DesktopRemedy::RepairPlaceOnly => "証明書も鍵もありません。Hub を閉じ、置き場と親の置き場の所有者・アクセス許可を修復してから、Hub のデスクトップ版を再起動してください".into(),
             DesktopRemedy::InspectRemainingKey => "証明書はありません。Hub を閉じ、利用者の TLS フォルダの中身を確認してください。鍵が残る場合はフォルダごと削除して作り直してください。鍵も無い場合は、置き場と親の置き場の所有者・アクセス許可を修復してから再起動してください。失効の記録は消さないでください".into(),
@@ -353,19 +354,25 @@ fn checked_identity_file<P: UserTlsPlace + ?Sized>(
 }
 
 /// 初回作成の印・一時ファイルは安全性を確かめ、問題があれば TLS を使わず残す。
-/// 本体とは別の未使用の補助ファイルなので、所有者や ACL の問題でも本体の失効には渡さない。
+/// 未使用の補助ファイルの問題だけでは本体を失効にしない。秘密鍵のコピーを含みうる
+/// `.old` のキーの露出は型を保ち、呼び出し側でも失効を記録してから断る。
 fn checked_auxiliary_file(
     ops: &WindowsTlsTrustOps,
     dir: &CheckedUserPlace<WinTlsDir>,
     name: &str,
 ) -> Result<Option<PinnedFile>, DesktopFailure> {
-    let role = if name == CREATING {
+    let role = if name == CREATING || name == renewal::CERT_OLD {
         UserFileRole::Public
     } else {
         UserFileRole::Secret
     };
     open_user_file(ops, dir, name, name, role).map_err(|found| {
-        if found.fault == UserFault::Transient {
+        if name == renewal::KEY_OLD && found.fault.revokes() {
+            DesktopFailure {
+                reason: found.reason,
+                remedy: DesktopRemedy::BackupKeyExposure,
+            }
+        } else if found.fault == UserFault::Transient {
             DesktopFailure::retry(found.reason)
         } else {
             DesktopFailure::auxiliary(dir, name, found.reason)
@@ -522,6 +529,31 @@ fn read_pair<P: UserTlsPlace + ?Sized>(
     Ok((cert, key))
 }
 
+/// Neither a main-file I/O failure nor an auxiliary failure may hide exposure
+/// of the other copy of the private key. Inspect both before returning an error.
+fn read_pair_and_backup<P: UserTlsPlace + ?Sized>(
+    ops: &WindowsTlsTrustOps,
+    place: &P,
+    dir: &CheckedUserPlace<WinTlsDir>,
+    serving: Option<CertThumbprint>,
+    record: &mut impl FnMut(CertThumbprint) -> ReconcileReport,
+) -> Result<PairBytes, DesktopFailure> {
+    let pair = read_pair(ops, place, dir, record);
+    let backup = renewal::check_backup_key(ops, place, dir, serving)
+        .map_err(|problem| problem.record(record));
+    match (pair, backup) {
+        (Ok(pair), Ok(())) => Ok(pair),
+        (Err(mut current), Err(backup)) => {
+            current.reason.push_str(&format!("。{}", backup.reason));
+            if matches!(backup.remedy, DesktopRemedy::InspectAndRecreate) {
+                current.remedy = DesktopRemedy::InspectAndRecreate;
+            }
+            Err(current)
+        }
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    }
+}
+
 fn identity_read_failure(name: &str, error: ReadError) -> DesktopFailure {
     let reason = format!("TLS の {name} を読めませんでした: {error}");
     match error {
@@ -577,6 +609,7 @@ fn cleanup_auxiliary_files(dir: &CheckedUserPlace<WinTlsDir>) -> Result<(), Desk
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CreationStage {
+    BeforeIdentityCheck,
     BeforeGeneration,
     BeforePublish,
     AfterPublish,
@@ -604,13 +637,19 @@ fn load_in_observed<P: UserTlsPlace + ?Sized>(
     let mut records = lock_user_revocations(ops, place, options)
         .map_err(|report| failure_from_report(*report))?;
     settle_with(|| records.reconcile())?;
+    observe(CreationStage::BeforeIdentityCheck);
     // 本体の露出を補助ファイルの異常で隠さない。失効の記録への書き足しまで先に行う。
-    let mut pair = read_pair(ops, place, &dir, &mut |thumbprint| {
+    let mut pair = read_pair_and_backup(ops, place, &dir, None, &mut |thumbprint| {
         records.record(thumbprint, RevokedCertPlace::User)
     })?;
-    let recovering_renewal = renewal::recover(ops, &dir, &records.read(), now, &pair, false)?;
+    let recovering_renewal = renewal::recover(ops, &dir, &records.read(), now, &pair, false)
+        .map_err(|error| {
+            renewal::record_backup_failure(error, ops, place, &dir, None, |thumbprint| {
+                records.record(thumbprint, RevokedCertPlace::User)
+            })
+        })?;
     if recovering_renewal {
-        pair = read_pair(ops, place, &dir, &mut |thumbprint| {
+        pair = read_pair_and_backup(ops, place, &dir, None, &mut |thumbprint| {
             records.record(thumbprint, RevokedCertPlace::User)
         })?;
     }

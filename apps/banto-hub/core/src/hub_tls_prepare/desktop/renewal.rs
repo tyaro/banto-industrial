@@ -3,8 +3,118 @@
 //! swaps in memory before publishing files and never releases an active socket.
 use super::*;
 
-const CERT_OLD: &str = "hub-cert.pem.old";
-const KEY_OLD: &str = "hub-key.pem.old";
+pub(super) const CERT_OLD: &str = "hub-cert.pem.old";
+pub(super) const KEY_OLD: &str = "hub-key.pem.old";
+
+pub(super) struct BackupKeyProblem {
+    pub(super) failure: DesktopFailure,
+    /// Some (including empty) means secret-key exposure/foreign ownership.
+    pub(super) affected: Option<std::collections::BTreeSet<CertThumbprint>>,
+}
+
+impl BackupKeyProblem {
+    pub(super) fn record(
+        self,
+        mut record: impl FnMut(CertThumbprint) -> ReconcileReport,
+    ) -> DesktopFailure {
+        let Some(affected) = self.affected else {
+            return self.failure;
+        };
+        let mut reason = self.failure.reason;
+        let mut settled = !affected.is_empty();
+        for thumbprint in affected {
+            let report = record(thumbprint);
+            if report.outcome != ReconcileOutcome::Consistent
+                || !report.revocations.is_settled()
+                || !report.revocations.is_revoked(&thumbprint)
+            {
+                settled = false;
+                reason.push_str(&format!(
+                    "。拇印 {thumbprint} の失効を両方の記録へ書けませんでした"
+                ));
+            }
+        }
+        reason.push_str(if settled { "。退避した秘密鍵に対応しうる証明書の失効を記録しました" } else {
+            "。今回の起動ではこの証明書を使いません。失効の記録が無いまま再起動すると同じ証明書が使われることがあります。ACL を直すだけでは漏れた鍵は無効になりません。Hub を閉じて TLS フォルダの中身を確認し、鍵と証明書を作り直してください。失効の記録は消さないでください"
+        });
+        DesktopFailure::recreate(reason)
+    }
+}
+
+/// An old key can be a copy of the current key. Its exposure is never merely an
+/// unused-auxiliary failure. Do not read untrusted secret bytes to infer safety:
+/// their current contents cannot prove which key was exposed before replacement.
+pub(super) fn check_backup_key<P: UserTlsPlace + ?Sized>(
+    ops: &WindowsTlsTrustOps,
+    place: &P,
+    dir: &CheckedUserPlace<WinTlsDir>,
+    serving: Option<CertThumbprint>,
+) -> Result<(), BackupKeyProblem> {
+    let Err(found) = open_user_file(ops, dir, KEY_OLD, KEY_OLD, UserFileRole::Secret) else {
+        return Ok(());
+    };
+    if !found.fault.revokes() {
+        return Err(BackupKeyProblem {
+            affected: None,
+            failure: if found.fault == UserFault::Transient {
+                DesktopFailure::retry(found.reason)
+            } else {
+                DesktopFailure::auxiliary(dir, KEY_OLD, found.reason)
+            },
+        });
+    }
+    let affected = affected_backup_certificates(ops, place, dir, serving);
+    Err(BackupKeyProblem { affected: Some(affected), failure: DesktopFailure::recreate(format!("{}。退避した秘密鍵（{KEY_OLD}）は現在の鍵を含む可能性があるため、現在と旧い証明書を使いません", found.reason)) })
+}
+
+fn affected_backup_certificates<P: UserTlsPlace + ?Sized>(
+    ops: &WindowsTlsTrustOps,
+    place: &P,
+    dir: &CheckedUserPlace<WinTlsDir>,
+    serving: Option<CertThumbprint>,
+) -> std::collections::BTreeSet<CertThumbprint> {
+    let mut affected = std::collections::BTreeSet::new();
+    affected.extend(serving);
+    if let UncheckedUserCert::Seen(cert) = peek_user_cert(ops, place) {
+        affected.insert(cert.thumbprint);
+    }
+    // Public bytes only, through the checked parent and a no-follow pinned file.
+    if let Ok(Some(mut file)) = TlsTrustOps::open_child_file(ops, dir.dir(), CERT_OLD) {
+        let security = TlsFile::security(&file);
+        if !security.is_dir
+            && !security.is_reparse_point
+            && security.links == 1
+            && paths_match(&TlsFile::final_path(&file), &dir.dir_real().join(CERT_OLD))
+        {
+            if let Ok(bytes) = TlsFile::read_all(&mut file, MAX_PEM_BYTES) {
+                if let Ok(thumbprint) = CertThumbprint::of_pem(&bytes) {
+                    affected.insert(thumbprint);
+                }
+            }
+        }
+    }
+    affected
+}
+
+/// Preserve a revoking fault observed by later reads too; a subsequent ACL
+/// repair must not erase the exposure already seen by that pinned read.
+pub(super) fn record_backup_failure<P: UserTlsPlace + ?Sized>(
+    error: DesktopFailure,
+    ops: &WindowsTlsTrustOps,
+    place: &P,
+    dir: &CheckedUserPlace<WinTlsDir>,
+    serving: Option<CertThumbprint>,
+    record: impl FnMut(CertThumbprint) -> ReconcileReport,
+) -> DesktopFailure {
+    if !matches!(&error.remedy, DesktopRemedy::BackupKeyExposure) {
+        return error;
+    }
+    BackupKeyProblem {
+        failure: error,
+        affected: Some(affected_backup_certificates(ops, place, dir, serving)),
+    }
+    .record(record)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Stage {
@@ -187,34 +297,64 @@ pub(super) fn recreate<P: UserTlsPlace + ?Sized>(
         pending.remove(&thumbprint);
     }
     let mut exposure_seen = false;
-    let mut old = validated!(read_pair(&ops, place, &dir, &mut |thumbprint| {
-        exposure_seen = true;
-        pending.insert(thumbprint);
-        pending.extend(known_serving);
-        let _ = switch(None);
-        let report = records.record(thumbprint, RevokedCertPlace::User);
-        // Keep the serving thumbprint pending too if it differs from the disk.
-        if report.outcome == ReconcileOutcome::Consistent
-            && report.revocations.is_revoked(&thumbprint)
-        {
-            pending.remove(&thumbprint);
-        }
-        report
-    }));
-    if validated!(recover(&ops, &dir, &records.read(), now, &old, true)) {
-        old = validated!(read_pair(&ops, place, &dir, &mut |thumbprint| {
+    let mut old = validated!(read_pair_and_backup(
+        &ops,
+        place,
+        &dir,
+        known_serving,
+        &mut |thumbprint| {
             exposure_seen = true;
             pending.insert(thumbprint);
             pending.extend(known_serving);
             let _ = switch(None);
             let report = records.record(thumbprint, RevokedCertPlace::User);
+            // Keep the serving thumbprint pending too if it differs from the disk.
             if report.outcome == ReconcileOutcome::Consistent
                 && report.revocations.is_revoked(&thumbprint)
             {
                 pending.remove(&thumbprint);
             }
             report
-        }));
+        }
+    ));
+    if validated!(
+        recover(&ops, &dir, &records.read(), now, &old, true).map_err(|error| {
+            if matches!(&error.remedy, DesktopRemedy::BackupKeyExposure) {
+                exposure_seen = true;
+                let _ = switch(None);
+            }
+            record_backup_failure(error, &ops, place, &dir, known_serving, |thumbprint| {
+                pending.insert(thumbprint);
+                let report = records.record(thumbprint, RevokedCertPlace::User);
+                if report.outcome == ReconcileOutcome::Consistent
+                    && report.revocations.is_settled()
+                    && report.revocations.is_revoked(&thumbprint)
+                {
+                    pending.remove(&thumbprint);
+                }
+                report
+            })
+        })
+    ) {
+        old = validated!(read_pair_and_backup(
+            &ops,
+            place,
+            &dir,
+            known_serving,
+            &mut |thumbprint| {
+                exposure_seen = true;
+                pending.insert(thumbprint);
+                pending.extend(known_serving);
+                let _ = switch(None);
+                let report = records.record(thumbprint, RevokedCertPlace::User);
+                if report.outcome == ReconcileOutcome::Consistent
+                    && report.revocations.is_revoked(&thumbprint)
+                {
+                    pending.remove(&thumbprint);
+                }
+                report
+            }
+        ));
     }
     for name in [KEY_OLD, CERT_OLD, KEY_TEMP, CERT_TEMP, CREATING] {
         drop(validated!(checked_auxiliary_file(&ops, &dir, name)));
@@ -267,7 +407,19 @@ pub(super) fn recreate<P: UserTlsPlace + ?Sized>(
         _ => false,
     };
     validated!(observe(Stage::BeforeSwitch).map_err(DesktopFailure::retry));
-    switch(Some((&cert, &key))).map_err(DesktopFailure::retry)?;
+    if let Err(reason) = switch(Some((&cert, &key))) {
+        let mut failure = DesktopFailure::retry(reason);
+        // No current files have changed. Remove only the checked unused new
+        // pair and creating marker; retain the marker if cleanup is incomplete.
+        if let Err(cleanup) = cleanup_auxiliary_files(&dir) {
+            failure.reason.push_str(&format!(
+                "。新しい組の片付けにも失敗しました: {}",
+                cleanup.reason
+            ));
+            failure.remedy = cleanup.remedy;
+        }
+        return Err(failure);
+    }
     let mut published = false;
     let result = (|| {
         observe(Stage::AfterSwitch).map_err(DesktopFailure::retry)?;
@@ -280,7 +432,25 @@ pub(super) fn recreate<P: UserTlsPlace + ?Sized>(
             create(dir.dir(), KEY_OLD, key)?;
             create(dir.dir(), CERT_OLD, cert)?;
             let backup_cert = auxiliary_bytes(&ops, &dir, CERT_OLD)?.unwrap();
-            let backup_key = auxiliary_bytes(&ops, &dir, KEY_OLD)?.unwrap();
+            let backup_key = auxiliary_bytes(&ops, &dir, KEY_OLD)
+                .map_err(|error| {
+                    if matches!(&error.remedy, DesktopRemedy::BackupKeyExposure) {
+                        exposure_seen = true;
+                        let _ = switch(None);
+                    }
+                    record_backup_failure(error, &ops, place, &dir, known_serving, |thumbprint| {
+                        pending.insert(thumbprint);
+                        let report = records.record(thumbprint, RevokedCertPlace::User);
+                        if report.outcome == ReconcileOutcome::Consistent
+                            && report.revocations.is_settled()
+                            && report.revocations.is_revoked(&thumbprint)
+                        {
+                            pending.remove(&thumbprint);
+                        }
+                        report
+                    })
+                })?
+                .unwrap();
             if backup_cert.as_slice() != cert
                 || backup_key.as_slice() != key.as_slice()
                 || !pair_matches(&backup_cert, &backup_key)
@@ -294,7 +464,7 @@ pub(super) fn recreate<P: UserTlsPlace + ?Sized>(
         observe(Stage::AfterKeyPublish).map_err(DesktopFailure::retry)?;
         replace(dir.dir(), CERT_TEMP, CERT_FILE)?;
         observe(Stage::AfterCertPublish).map_err(DesktopFailure::retry)?;
-        let current = read_pair(&ops, place, &dir, &mut |thumbprint| {
+        let current = read_pair_and_backup(&ops, place, &dir, known_serving, &mut |thumbprint| {
             exposure_seen = true;
             pending.insert(thumbprint);
             pending.extend(known_serving);
