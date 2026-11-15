@@ -1295,6 +1295,17 @@ fn prepare_desktop_transport<H>(
     }
 }
 
+fn desktop_start_failure(
+    error: &str,
+    failed_plain_port: Option<u16>,
+    shell_port: Option<u16>,
+) -> (String, FallbackCause) {
+    if let Some(port) = failed_plain_port.filter(|port| Some(*port) == shell_port) {
+        return (format!("{error}。設定した平文の待ち受けポート {port} は、このプロセスが管理画面用に予約しているポートと同じです。アプリを終了して起動し直してください。再起動時は平文の設定ポートを避けて管理画面用ポートを選び直します。TLS フォルダや設定の削除は不要です"), FallbackCause::ShellTransportUnavailable);
+    }
+    (error.to_string(), FallbackCause::General)
+}
+
 /// デスクトップホストとして[`HubRuntime::start`]を試みる（T16-0/T16-1 の
 /// 従来の起動処理そのもの）。失敗した場合は診断用に同じポートへ
 /// [`HttpHubHealthProbe`]を1回投げてから[`StartupOutcome::Fallback`]を返す -
@@ -1367,18 +1378,27 @@ fn attempt_desktop_start(
         Err(err) => {
             // 起動できなかった - 札を返す（終了が待っていればここで起きる）。
             drop(ticket);
+            let (desktop_error, cause) = desktop_start_failure(
+                &err.to_string(),
+                err.failed_plain_port(),
+                shell_tls::reserved_port(),
+            );
             // ここは「このアプリの Hub が平文の期待ポートを取れなかった」相手の診断だけで、
             // 結果で Service へ進むことは無い（Fallback にしかならない）ので、平文の probe の
             // まま（#644 PR4。Service へ進む判定は pin した TLS の [`probe_service_or_fallback`]・
             // [`run_host_switch`] だけ）。
-            let health = HttpHubHealthProbe::with_host(target.root.clone(), target.host.clone())
-                .probe(&target.profile_id, target.port)
-                .ok();
+            let health = if cause == FallbackCause::ShellTransportUnavailable {
+                None
+            } else {
+                HttpHubHealthProbe::with_host(target.root.clone(), target.host.clone())
+                    .probe(&target.profile_id, target.port)
+                    .ok()
+            };
             StartupOutcome::Fallback(FallbackInfo {
                 scm_state,
                 health,
-                desktop_error: Some(err.to_string()),
-                cause: FallbackCause::General,
+                desktop_error: Some(desktop_error),
+                cause,
             })
         }
     }
@@ -3203,6 +3223,25 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plain_port_conflicting_with_retained_shell_origin_requires_process_restart() {
+        let (message, cause) = desktop_start_failure("bind failed", Some(49152), Some(49152));
+        assert_eq!(cause, FallbackCause::ShellTransportUnavailable);
+        assert!(message.contains("平文の待ち受けポート 49152"));
+        assert!(message.contains("予約") && message.contains("起動し直"));
+        assert!(message.contains("削除は不要"));
+        assert!(!cause.offers_retry());
+        for (failed, reserved) in [
+            (Some(49153), Some(49152)),
+            (None, Some(49152)),
+            (Some(49152), None),
+        ] {
+            assert_eq!(
+                desktop_start_failure("original failure", failed, reserved),
+                ("original failure".into(), FallbackCause::General)
+            );
+        }
+    }
     #[cfg(windows)]
     #[test]
     fn fallback_with_a_live_hub_blocks_repair_and_stops_desktop_before_service_start() {

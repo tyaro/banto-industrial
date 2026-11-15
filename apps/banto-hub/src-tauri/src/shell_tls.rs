@@ -37,6 +37,14 @@ impl<T> Initialization<T> {
 }
 pub(crate) const SERVE_FAILURE: &str = "管理画面の待ち受けが異常終了しました。ポートはこのプロセスが保持しており、別のアプリへは接続しません。収集状態を確認してから、Hub を終了し起動し直してください";
 
+pub(crate) fn reserved_port() -> Option<u16> {
+    TRANSPORT
+        .get()?
+        .retained
+        .as_ref()
+        .map(|transport| transport.local_addr().port())
+}
+
 pub(crate) fn transport() -> Result<&'static Arc<ShellTransport>, String> {
     TRANSPORT
         .get()
@@ -245,6 +253,9 @@ mod tests {
             "https://127.0.0.1:49153/",
             "https://localhost:49152/",
             "https://user@127.0.0.1:49152/",
+            "blob:https://127.0.0.1:49152/untrusted-document",
+            "data:text/html,<script>alert(1)</script>",
+            "https://example.com/",
         ] {
             assert!(!is_origin(&Url::parse(url).unwrap(), &origin), "{url}");
         }

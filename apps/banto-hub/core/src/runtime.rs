@@ -364,8 +364,8 @@ pub enum HubStartError {
     #[error("banto-hub: ストア設定の読み取りに失敗しました: {0}")]
     StoreConfig(BantoError),
     /// `banto_server::start`失敗（旧: `"server should start"`で `expect`）。
-    #[error("banto-hub: サーバーの起動に失敗しました: {0}")]
-    ServerStart(BantoError),
+    #[error("banto-hub: サーバーの起動に失敗しました: {source}")]
+    ServerStart { port: u16, source: BantoError },
     /// T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P2）:
     /// `crate::profile_lock::try_acquire_profile_lock`失敗（既に別プロセスが
     /// この profile を保持している、または profile ディレクトリ・lock
@@ -401,6 +401,14 @@ pub enum HubStartError {
 }
 
 impl HubStartError {
+    /// Resolved plain listener port, including persisted settings and wrapped failures.
+    pub fn failed_plain_port(&self) -> Option<u16> {
+        match self {
+            Self::ServerStart { port, .. } => Some(*port),
+            Self::DbLeftOpen(inner) => inner.failed_plain_port(),
+            _ => None,
+        }
+    }
     /// 起動に失敗し、設定 DB も閉じ終えられなかったか（[`Self::DbLeftOpen`]）。`true` なら、
     /// 握りが残っているので呼ぶ側は保護を外さない（サービスは ACL を緩めずに終わる）。
     pub fn db_left_open(&self) -> bool {
@@ -1139,7 +1147,7 @@ impl HubRuntime {
                 mqtt.shutdown().await;
                 grpc_server.shutdown().await;
                 opcua.shutdown().await;
-                return Err(HubStartError::ServerStart(err));
+                return Err(HubStartError::ServerStart { port, source: err });
             }
         };
         // `Some(line)` は既定の TLS を待ち受けたときの行（ログは下でまとめて出す）。
@@ -3583,7 +3591,12 @@ mod tests {
             Ok(_) => panic!("an explicit busy port must not fall back"),
             Err(err) => err,
         };
-        assert!(matches!(err, HubStartError::ServerStart(_)), "{err:?}");
+        assert!(matches!(err, HubStartError::ServerStart { .. }), "{err:?}");
+        assert_eq!(err.failed_plain_port(), Some(busy));
+        assert_eq!(
+            HubStartError::DbLeftOpen(Box::new(err)).failed_plain_port(),
+            Some(busy)
+        );
 
         // 失敗した起動が何も残していない: 同じ DB・data_dir でもう一度起動できる。
         let hub = HubRuntime::start(make(0))
