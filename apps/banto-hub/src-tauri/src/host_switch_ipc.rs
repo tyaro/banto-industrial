@@ -136,7 +136,16 @@ pub fn host_switch_status(
 
 fn client_ingest_origin(view: &str, address: Option<std::net::SocketAddr>) -> Option<String> {
     match view {
-        "desktop" => address.map(|address| format!("http://127.0.0.1:{}", address.port())),
+        "desktop" => address.map(|mut address| {
+            if address.ip().is_unspecified() {
+                address.set_ip(match address.ip() {
+                    std::net::IpAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+                    std::net::IpAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+                });
+            }
+            // SocketAddr preserves a specific bind IP and brackets IPv6.
+            format!("http://{address}")
+        }),
         "service" => Some(
             crate::service_tls::service_url()
                 .trim_end_matches('/')
@@ -381,6 +390,17 @@ pub(crate) fn elev_result_message(
 mod tests {
     #[test]
     fn sender_origin_uses_the_plain_listener_port_and_never_the_shell_socket() {
+        for (address, expected) in [
+            ("192.0.2.42:18722", "http://192.0.2.42:18722"),
+            ("[2001:db8::42]:18722", "http://[2001:db8::42]:18722"),
+            ("[::]:18722", "http://[::1]:18722"),
+            ("127.0.0.1:18722", "http://127.0.0.1:18722"),
+        ] {
+            assert_eq!(
+                super::client_ingest_origin("desktop", Some(address.parse().unwrap())).as_deref(),
+                Some(expected)
+            );
+        }
         let address = "0.0.0.0:18722".parse().unwrap();
         assert_eq!(
             super::client_ingest_origin("desktop", Some(address)).as_deref(),

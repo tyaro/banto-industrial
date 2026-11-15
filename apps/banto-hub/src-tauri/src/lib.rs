@@ -1612,6 +1612,33 @@ fn show_desktop_tls_status(app: &AppHandle) {
 }
 
 #[cfg(windows)]
+fn tls_recreation_unavailable_reason(
+    accepts_switch: bool,
+    hub_present: bool,
+    monitor_available: bool,
+) -> Option<&'static str> {
+    if !accepts_switch {
+        Some("Hub を終了中または切替中のため TLS の証明書を作り直せません。処理の終了を待ってから、Hub のデスクトップ画面で再試行してください")
+    } else if !hub_present {
+        Some("Hub が停止中のため TLS の証明書を作り直せません。Hub のデスクトップ画面を開いてから再試行してください")
+    } else if !monitor_available {
+        Some("この Hub ではデスクトップ用 TLS の作り直しを利用できません。動作モードと TLS の設定を確認してください")
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn show_tls_recreation_unavailable(app: &AppHandle, reason: &str) {
+    use tauri_plugin_dialog::DialogExt;
+    report_shell_error(app, reason);
+    app.dialog()
+        .message(reason)
+        .title("TLS の証明書の作り直し")
+        .show(|_| {});
+}
+
+#[cfg(windows)]
 fn recreate_desktop_tls(app: &AppHandle) {
     if !host_switch_ipc::begin_switch_or_warn(app) {
         return;
@@ -1625,8 +1652,18 @@ fn recreate_desktop_tls(app: &AppHandle) {
     }, move |confirmed| {
         if !confirmed { host_switch_ipc::end_switch(); return; }
         let state = app.state::<AppState>();
-        let Some(ticket) = state.hub.begin_switch() else { host_switch_ipc::end_switch(); return; };
-        let Some(handle) = state.hub.inspect(|hub| hub.desktop_tls_recreation()).flatten() else { host_switch_ipc::end_switch(); return; };
+        let Some(ticket) = state.hub.begin_switch() else {
+            host_switch_ipc::end_switch();
+            show_tls_recreation_unavailable(&app, tls_recreation_unavailable_reason(false, false, false).unwrap());
+            return;
+        };
+        let available = state.hub.inspect(|hub| hub.desktop_tls_recreation());
+        let hub_present = available.is_some();
+        let Some(handle) = available.flatten() else {
+            host_switch_ipc::end_switch();
+            show_tls_recreation_unavailable(&app, tls_recreation_unavailable_reason(true, hub_present, false).unwrap());
+            return;
+        };
         let app = app.clone();
         std::thread::spawn(move || {
             hub_slot::run_switch(ticket, || {
@@ -3088,6 +3125,25 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn tls_recreation_rejections_explain_closing_stopped_and_unavailable_states() {
+        assert!(
+            super::tls_recreation_unavailable_reason(false, false, false)
+                .unwrap()
+                .contains("終了中または切替中")
+        );
+        assert!(super::tls_recreation_unavailable_reason(true, false, false)
+            .unwrap()
+            .contains("停止中"));
+        assert!(super::tls_recreation_unavailable_reason(true, true, false)
+            .unwrap()
+            .contains("設定を確認"));
+        assert_eq!(
+            super::tls_recreation_unavailable_reason(true, true, true),
+            None
+        );
+    }
     use super::*;
 
     #[test]
