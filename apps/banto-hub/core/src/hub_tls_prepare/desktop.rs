@@ -1,8 +1,9 @@
 //! デスクトップ Hub の既定の TLS（#1121 PR2d、設計 §4.1〜4.4）。
 //!
 //! 既知の利用者の置き場を確かめ、`tls\` の排他のファイル open でセッションをまたいで
-//! 直列化する（上限 5 秒）。記録 A・B を確定させてから、無い組だけを protected DACL で
-//! 作る。`creating` がある作りかけだけは復旧する。既存の壊れ・露出は自動で作り直さない。
+//! 直列化する（上限 5 秒）。次に記録の排他も取り、両方を保ったまま記録 A・B の確定・
+//! 初回作成・最後の照合と片付けを行う。無い組だけを protected DACL で作り、`creating` が
+//! ある作りかけだけは復旧する。既存の壊れ・露出は自動で作り直さない。
 //! 鍵を含むファイルはすべて、確かめて握ったフォルダのハンドル基準で操作する。
 //! 読んだ組をメモリ上で確かめて渡す。周期の見張りは PR2e、作り直しとシェルの https は PR3。
 
@@ -10,11 +11,11 @@ use std::time::{Duration, Instant};
 
 use banto_hub_tls_trust::win::{WinTlsDir, WindowsTlsTrustOps};
 use banto_hub_tls_trust::{
-    check_place_layout, check_spec, open_user_file, open_user_place, peek_user_cert,
-    read_user_revocations, reconcile_user_revocations, record_user_revocation, user_place_problems,
-    CertThumbprint, CheckedUserPlace, DefaultUserTlsPlace, FileOpenError, ReconcileOptions,
-    ReconcileOutcome, RevocationOps, RevokedCertPlace, TlsFile, TlsTrustOps, UncheckedUserCert,
-    UserFileRole, UserPlaceKind, UserPlaceProblem, UserPlaceState, UserTlsPlace,
+    check_place_layout, check_spec, lock_user_revocations, open_user_file, open_user_place,
+    peek_user_cert, record_user_revocation, user_place_problems, CertThumbprint, CheckedUserPlace,
+    DefaultUserTlsPlace, FileOpenError, ReconcileOptions, ReconcileOutcome, ReconcileReport,
+    RevocationOps, RevocationSide, RevokedCertPlace, SideContent, TlsFile, TlsTrustOps,
+    UncheckedUserCert, UserFileRole, UserPlaceKind, UserPlaceProblem, UserPlaceState, UserTlsPlace,
 };
 use banto_safe_root::acl::PinnedFile;
 use banto_safe_root::guard::paths_match;
@@ -50,6 +51,7 @@ enum DesktopRemedy {
     InspectRemainingKey,
     InspectAuxiliaryFile(std::path::PathBuf),
     CleanupAuxiliaryFile(std::path::PathBuf),
+    RetryLater,
 }
 
 impl From<String> for DesktopFailure {
@@ -74,6 +76,13 @@ impl std::fmt::Display for DesktopFailure {
 }
 
 impl DesktopFailure {
+    fn retry(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            remedy: DesktopRemedy::RetryLater,
+        }
+    }
+
     fn auxiliary(dir: &CheckedUserPlace<WinTlsDir>, name: &str, reason: impl Into<String>) -> Self {
         Self {
             reason: reason.into(),
@@ -84,6 +93,7 @@ impl DesktopFailure {
     fn into_unavailable(self) -> DefaultTlsUnavailable {
         let remedy = match self.remedy {
             DesktopRemedy::InspectAndRecreate => return unavailable(self.reason),
+            DesktopRemedy::RetryLater => "本体の hub-cert.pem・hub-key.pem は削除せず、他の処理がロックを放すまで待ち、ログに出た読み書きの失敗などの原因を取り除いてから、Hub のデスクトップ版を再起動してください".into(),
             DesktopRemedy::RepairPlaceOnly => "証明書も鍵もありません。Hub を閉じ、置き場と親の置き場の所有者・アクセス許可を修復してから、Hub のデスクトップ版を再起動してください".into(),
             DesktopRemedy::InspectRemainingKey => "証明書はありません。Hub を閉じ、利用者の TLS フォルダの中身を確認してください。鍵が残る場合はフォルダごと削除して作り直してください。鍵も無い場合は、置き場と親の置き場の所有者・アクセス許可を修復してから再起動してください。失効の記録は消さないでください".into(),
             DesktopRemedy::InspectAuxiliaryFile(path) => format!("本体の hub-cert.pem・hub-key.pem は削除せず、Hub を閉じ、補助ファイル（{}）の中身・所有者・アクセス許可を確認してください。補助ファイルだけを安全に削除するか、その所有者・アクセス許可を修復してから再起動してください", path.display()),
@@ -214,6 +224,17 @@ fn problem<P: UserTlsPlace + ?Sized>(
     options: &ReconcileOptions,
     found: UserPlaceProblem,
 ) -> DesktopFailure {
+    problem_recording(ops, place, found, |thumbprint| {
+        record_user_revocation(ops, place, options, thumbprint, RevokedCertPlace::User)
+    })
+}
+
+fn problem_recording<P: UserTlsPlace + ?Sized>(
+    ops: &WindowsTlsTrustOps,
+    place: &P,
+    found: UserPlaceProblem,
+    record: impl FnOnce(CertThumbprint) -> ReconcileReport,
+) -> DesktopFailure {
     let mut reason = found.reason;
     if found.fault.revokes() {
         let seen = peek_user_cert(ops, place);
@@ -228,13 +249,7 @@ fn problem<P: UserTlsPlace + ?Sized>(
             return DesktopFailure { reason, remedy };
         }
         let recorded = if let UncheckedUserCert::Seen(seen) = seen {
-            let report = record_user_revocation(
-                ops,
-                place,
-                options,
-                seen.thumbprint,
-                RevokedCertPlace::User,
-            );
+            let report = record(seen.thumbprint);
             if report.revocations.is_revoked(&seen.thumbprint) {
                 reason.push_str("。証明書の拇印を失効の記録に残しました");
                 true
@@ -285,12 +300,13 @@ fn tls_place<P: UserTlsPlace + ?Sized>(
 fn checked_identity_file<P: UserTlsPlace + ?Sized>(
     ops: &WindowsTlsTrustOps,
     place: &P,
-    options: &ReconcileOptions,
     dir: &CheckedUserPlace<WinTlsDir>,
     name: &str,
     role: UserFileRole,
+    record: &mut impl FnMut(CertThumbprint) -> ReconcileReport,
 ) -> Result<Option<PinnedFile>, DesktopFailure> {
-    open_user_file(ops, dir, name, name, role).map_err(|found| problem(ops, place, options, found))
+    open_user_file(ops, dir, name, name, role)
+        .map_err(|found| problem_recording(ops, place, found, record))
 }
 
 /// 初回作成の印・一時ファイルは安全性を確かめ、問題があれば TLS を使わず残す。
@@ -324,7 +340,7 @@ fn lock(
     ops: &WindowsTlsTrustOps,
     dir: &CheckedUserPlace<WinTlsDir>,
     options: &ReconcileOptions,
-) -> Result<PinnedFile, String> {
+) -> Result<PinnedFile, DesktopFailure> {
     lock_with_sleep(ops, dir, options, |duration| ops.sleep(duration))
 }
 
@@ -333,7 +349,7 @@ fn lock_with_sleep(
     dir: &CheckedUserPlace<WinTlsDir>,
     options: &ReconcileOptions,
     mut sleep: impl FnMut(Duration),
-) -> Result<PinnedFile, String> {
+) -> Result<PinnedFile, DesktopFailure> {
     let until = Instant::now() + options.lock_wait;
     loop {
         match ops.open_child_file_exclusive(dir.dir(), LOCK_FILE) {
@@ -362,14 +378,20 @@ fn lock_with_sleep(
                     Err(banto_safe_root::SafeRootError::Io {
                         os_error: Some(32), ..
                     }) => {}
-                    Err(error) => return Err(format!("TLS のロックファイルを作れません: {error}")),
+                    Err(error) => {
+                        return Err(DesktopFailure::retry(format!(
+                            "TLS のロックファイルを作れません: {error}"
+                        )))
+                    }
                 }
             }
             Err(FileOpenError::InUse) => {}
-            Err(FileOpenError::Other(error)) => return Err(error),
+            Err(FileOpenError::Other(error)) => return Err(DesktopFailure::retry(error)),
         }
         if Instant::now() >= until {
-            return Err("TLS のロックを上限までに取れませんでした".into());
+            return Err(DesktopFailure::retry(
+                "TLS のロック（identity.lock）を上限までに取れませんでした",
+            ));
         }
         sleep(
             options
@@ -380,24 +402,38 @@ fn lock_with_sleep(
     }
 }
 
+#[cfg(test)]
 fn settled<P: UserTlsPlace + ?Sized>(
     ops: &WindowsTlsTrustOps,
     place: &P,
     options: &ReconcileOptions,
-) -> Result<(), String> {
-    let mut report = reconcile_user_revocations(ops, place, options);
-    // PR2 の決定: この回で消失を修復したときだけもう一度確認する。
+) -> Result<(), DesktopFailure> {
+    settle_with(|| banto_hub_tls_trust::reconcile_user_revocations(ops, place, options))
+}
+
+fn failure_from_report(report: ReconcileReport) -> DesktopFailure {
+    let reason = format!(
+        "利用者の失効の記録 A・B を確定できません: {:?}（{:?}）",
+        report.outcome, report.warnings
+    );
+    if report.outcome == ReconcileOutcome::Incomplete {
+        DesktopFailure::retry(reason)
+    } else {
+        reason.into()
+    }
+}
+
+fn settle_with(mut reconcile: impl FnMut() -> ReconcileReport) -> Result<(), DesktopFailure> {
+    let mut report = reconcile();
+    // 修復後の再確認も、保持する口なら同じロックの下で行う。
     if report.outcome == ReconcileOutcome::Refused
         && report.saw_loss()
         && report.revocations.is_settled()
     {
-        report = reconcile_user_revocations(ops, place, options);
+        report = reconcile();
     }
     if report.outcome != ReconcileOutcome::Consistent {
-        return Err(format!(
-            "利用者の失効の記録 A・B を確定できません: {:?}（{:?}）",
-            report.outcome, report.warnings
-        ));
+        return Err(failure_from_report(report));
     }
     Ok(())
 }
@@ -407,13 +443,12 @@ type PairBytes = (Option<Vec<u8>>, Option<Zeroizing<Vec<u8>>>);
 fn read_pair<P: UserTlsPlace + ?Sized>(
     ops: &WindowsTlsTrustOps,
     place: &P,
-    options: &ReconcileOptions,
     dir: &CheckedUserPlace<WinTlsDir>,
+    record: &mut impl FnMut(CertThumbprint) -> ReconcileReport,
 ) -> Result<PairBytes, DesktopFailure> {
     // 両方のハンドルを握ってから読む。ACL やリンクの問題は作成中でも復旧しない。
-    let mut cert =
-        checked_identity_file(ops, place, options, dir, CERT_FILE, UserFileRole::Public)?;
-    let mut key = checked_identity_file(ops, place, options, dir, KEY_FILE, UserFileRole::Secret)?;
+    let mut cert = checked_identity_file(ops, place, dir, CERT_FILE, UserFileRole::Public, record)?;
+    let mut key = checked_identity_file(ops, place, dir, KEY_FILE, UserFileRole::Secret, record)?;
     let cert = cert
         .as_mut()
         .map(|file| TlsFile::read_all(file, MAX_PEM_BYTES))
@@ -470,18 +505,38 @@ fn cleanup_auxiliary_files(dir: &CheckedUserPlace<WinTlsDir>) -> Result<(), Desk
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreationStage {
+    BeforeGeneration,
+    AfterPublish,
+}
+
 fn load_in<P: UserTlsPlace + ?Sized>(
     ops: &WindowsTlsTrustOps,
     place: &P,
     options: &ReconcileOptions,
     now: i64,
 ) -> Result<DefaultHubTls, DesktopFailure> {
+    load_in_observed(ops, place, options, now, |_| {})
+}
+
+fn load_in_observed<P: UserTlsPlace + ?Sized>(
+    ops: &WindowsTlsTrustOps,
+    place: &P,
+    options: &ReconcileOptions,
+    now: i64,
+    mut observe: impl FnMut(CreationStage),
+) -> Result<DefaultHubTls, DesktopFailure> {
     check_place_layout(place)?;
     let dir = tls_place(ops, place, options)?;
     let _lock = lock(ops, &dir, options)?;
-    settled(ops, place, options)?;
+    let mut records = lock_user_revocations(ops, place, options)
+        .map_err(|report| failure_from_report(*report))?;
+    settle_with(|| records.reconcile())?;
     // 本体の露出を補助ファイルの異常で隠さない。失効の記録への書き足しまで先に行う。
-    let (cert, key) = read_pair(ops, place, options, &dir)?;
+    let (cert, key) = read_pair(ops, place, &dir, &mut |thumbprint| {
+        records.record(thumbprint, RevokedCertPlace::User)
+    })?;
     let complete = matches!((&cert, &key), (Some(cert), Some(key)) if pair_matches(cert, key));
     let marker = checked_auxiliary_file(ops, &dir, CREATING)?;
     let creating = if let Some(mut marker) = marker {
@@ -524,6 +579,7 @@ fn load_in<P: UserTlsPlace + ?Sized>(
             create(dir.dir(), CREATING, CREATING_CONTENTS)?;
         }
         cleanup(dir.dir(), &[KEY_FILE, CERT_FILE, KEY_TEMP, CERT_TEMP])?;
+        observe(CreationStage::BeforeGeneration);
         let identity = generate_identity(now)?;
         create(dir.dir(), KEY_TEMP, identity.key_pem.as_bytes())?;
         create(dir.dir(), CERT_TEMP, identity.cert_pem.as_bytes())?;
@@ -538,7 +594,12 @@ fn load_in<P: UserTlsPlace + ?Sized>(
             }
         }
     }
-    let (cert, key) = read_pair(ops, place, options, &dir)?;
+    if !complete {
+        observe(CreationStage::AfterPublish);
+    }
+    let (cert, key) = read_pair(ops, place, &dir, &mut |thumbprint| {
+        records.record(thumbprint, RevokedCertPlace::User)
+    })?;
     let cert = cert.ok_or("TLS の証明書がありません")?;
     let key = key.ok_or("TLS の鍵がありません")?;
     let identity = DefaultHubTls::from_checked_pem(
@@ -549,9 +610,19 @@ fn load_in<P: UserTlsPlace + ?Sized>(
         now,
     )?;
     let thumbprint = CertThumbprint::of_pem(identity.cert_pem())?;
-    let records = read_user_revocations(ops, place);
-    if !records.is_settled() || records.is_revoked(&thumbprint) {
+    let current = records.read();
+    if current.is_revoked(&thumbprint) {
         return Err("利用者の失効の記録が揃っていないか、この証明書は失効しています".into());
+    }
+    if !current.is_settled() {
+        let reason = "利用者の失効の記録が揃っていません";
+        if RevocationSide::BOTH
+            .iter()
+            .any(|side| matches!(current.side(*side), SideContent::Unread { .. }))
+        {
+            return Err(DesktopFailure::retry(reason));
+        }
+        return Err(reason.into());
     }
     cleanup_auxiliary_files(&dir)?;
     Ok(identity)

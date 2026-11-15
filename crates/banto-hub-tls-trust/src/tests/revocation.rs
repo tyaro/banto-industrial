@@ -398,6 +398,52 @@ fn has_io_warning(report: &ReconcileReport) -> bool {
         .any(|warning| matches!(warning, RevocationWarning::Io(_)))
 }
 
+#[test]
+fn held_api_repairs_rechecks_and_records_without_reacquiring() {
+    let ops = FakeRevOps::fresh();
+    let place = ops.place();
+    let mut held = lock_user_revocations(&ops, &place, &FakeRevOps::options()).unwrap();
+    assert_eq!(held.reconcile().outcome, ReconcileOutcome::Consistent);
+    let current = ops.put_cert();
+    ops.files.borrow_mut().remove(&record_path(A));
+    let repaired = held.reconcile();
+    assert_eq!(repaired.outcome, ReconcileOutcome::Refused);
+    assert!(repaired.saw_loss() && repaired.revocations.is_settled());
+    assert!(repaired.revocations.is_revoked(&current));
+    assert_eq!(held.reconcile().outcome, ReconcileOutcome::Consistent);
+    assert_eq!(
+        held.record(thumb(9), RevokedCertPlace::Service).outcome,
+        ReconcileOutcome::Consistent
+    );
+    assert!(held.read().is_revoked(&thumb(9)));
+    assert_eq!(
+        ops.steps()
+            .iter()
+            .filter(|step| step.as_str() == "lock")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn held_api_lock_failures_match_the_regular_api_without_writing() {
+    for untrusted in [false, true] {
+        let ops = FakeRevOps::settled(&[1]);
+        if untrusted {
+            ops.loosen_dir(&local());
+        } else {
+            ops.lock_busy.set(u32::MAX);
+        }
+        let place = ops.place();
+        let report = match lock_user_revocations(&ops, &place, &FakeRevOps::options()) {
+            Ok(_) => panic!("ロックは取れない"),
+            Err(report) => *report,
+        };
+        assert_eq!(report, ops.reconcile());
+        assert!(ops.writes().is_empty());
+    }
+}
+
 // --- 記録の形 -------------------------------------------------------------------------
 
 #[test]

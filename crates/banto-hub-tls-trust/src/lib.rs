@@ -142,6 +142,10 @@
 //!   [`DEFAULT_LOCK_WAIT`]）。名前付き mutex は使わない（別のアカウントが先に作って握れる）。
 //!   ロックファイルも、置き場のフォルダと、開いた後のハンドルで確かめる。取れない・通らない
 //!   ときは何も書かない。握ったプロセスが落ちれば OS がハンドルを閉じるので、残らない。
+//! - **証明書の作成中も保持する口**（[`lock_user_revocations`]・[`LockedUserRevocations`]）:
+//!   Hub は先に `tls\` の排他を取り、記録の初期化・消失修復後の再確認から鍵と証明書の作成・
+//!   公開・最後の照合まで記録の排他も保つ。保持中の書き足しも同じ型で行い、取り直さない。
+//!   通常の整える口・書き足す口の契約は変えない。
 //!
 //! ## サービスの失効の記録（#1121 PR2b、2026-11-14 オーナー決定）
 //!
@@ -191,11 +195,12 @@ pub use place::{
     Unavailable,
 };
 pub use revocation::{
-    read_user_revocations, reconcile_user_revocations, record_user_revocation, CertThumbprint,
-    ReconcileOptions, ReconcileOutcome, ReconcileReport, RecordState, RevocationOps,
-    RevocationRecord, RevocationSide, RevocationWarning, RevokedCert, RevokedCertPlace,
-    SideContent, UserRevocations, DEFAULT_LOCK_POLL, DEFAULT_LOCK_WAIT, MAX_REVOCATIONS_BYTES,
-    REVOCATIONS_FILE, REVOCATIONS_HEADER,
+    lock_user_revocations, read_user_revocations, reconcile_user_revocations,
+    record_user_revocation, CertThumbprint, LockedUserRevocations, ReconcileOptions,
+    ReconcileOutcome, ReconcileReport, RecordState, RevocationOps, RevocationRecord,
+    RevocationSide, RevocationWarning, RevokedCert, RevokedCertPlace, SideContent, UserRevocations,
+    DEFAULT_LOCK_POLL, DEFAULT_LOCK_WAIT, MAX_REVOCATIONS_BYTES, REVOCATIONS_FILE,
+    REVOCATIONS_HEADER,
 };
 pub use service_revocation::{
     create_service_revocations_if_absent, ensure_service_revocations,

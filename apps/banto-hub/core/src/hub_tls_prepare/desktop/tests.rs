@@ -6,7 +6,8 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use banto_hub_tls_trust::{
-    RevocationSide, TlsTrustOps, UserFault, UserPlaceSpec, UserTlsOps, REVOCATIONS_FILE,
+    read_user_revocations, reconcile_user_revocations, RevocationSide, TlsTrustOps, UserFault,
+    UserPlaceSpec, UserTlsOps, REVOCATIONS_FILE,
 };
 use banto_safe_root::acl::{inspect_file, ADMINISTRATORS_SID, SYSTEM_SID};
 
@@ -271,10 +272,18 @@ fn file_and_place_faults_use_the_callers_revocation_lock_options() {
             let reason = match checked_identity_file(
                 &WindowsTlsTrustOps,
                 place,
-                &options,
                 &dir,
                 KEY_FILE,
                 UserFileRole::Secret,
+                &mut |thumbprint| {
+                    record_user_revocation(
+                        &WindowsTlsTrustOps,
+                        place,
+                        &options,
+                        thumbprint,
+                        RevokedCertPlace::User,
+                    )
+                },
             ) {
                 Ok(_) => panic!("通らない鍵"),
                 Err(reason) => reason,
@@ -292,6 +301,40 @@ fn file_and_place_faults_use_the_callers_revocation_lock_options() {
         drop(held);
         drop(parent);
     }
+}
+
+#[test]
+fn initial_creation_holds_the_record_lock_until_identity_is_published() {
+    let fixture = Fixture::new();
+    let place = &fixture.0;
+    let spec = place.spec(UserPlaceKind::RevocationsLock);
+    let mut stages = Vec::new();
+    load_in_observed(
+        &WindowsTlsTrustOps,
+        place,
+        &ReconcileOptions::default(),
+        NOW,
+        |stage| {
+            stages.push(stage);
+            let parent = WindowsTlsTrustOps
+                .pin_dir(&spec.dir_path())
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(
+                    WindowsTlsTrustOps
+                        .open_child_file_exclusive(&parent, spec.file.as_deref().unwrap()),
+                    Err(FileOpenError::InUse)
+                ),
+                "記録のロックを保持する: {stage:?}"
+            );
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        stages,
+        vec![CreationStage::BeforeGeneration, CreationStage::AfterPublish]
+    );
 }
 
 #[test]
@@ -749,10 +792,9 @@ fn identity_and_record_locks_wait_then_fail_without_creating_key() {
         lock_poll: Duration::from_millis(10),
     };
     let started = Instant::now();
-    assert!(load_in(&WindowsTlsTrustOps, place, &options, NOW)
-        .unwrap_err()
-        .reason
-        .contains("ロック"));
+    let error = load_in(&WindowsTlsTrustOps, place, &options, NOW).unwrap_err();
+    assert!(error.reason.contains("ロック"));
+    assert_retry_later(&error.into_unavailable().log_lines().join("\n"));
     assert!(started.elapsed() >= options.lock_wait);
     assert!(!place.tls().join(KEY_FILE).exists());
     drop(held);
@@ -767,14 +809,97 @@ fn identity_and_record_locks_wait_then_fail_without_creating_key() {
         .open_child_file_exclusive(&parent, lock_spec.file.as_deref().unwrap())
         .unwrap()
         .unwrap();
-    assert!(load_in(&WindowsTlsTrustOps, place, &options, NOW)
-        .unwrap_err()
-        .reason
-        .contains("確定できません"));
+    let error = load_in(&WindowsTlsTrustOps, place, &options, NOW).unwrap_err();
+    assert!(error.reason.contains("確定できません"));
+    assert_retry_later(&error.into_unavailable().log_lines().join("\n"));
     assert!(!place.tls().join(KEY_FILE).exists());
     drop(held);
     drop(parent);
     assert!(place.load().is_ok());
+}
+
+fn assert_retry_later(lines: &str) {
+    assert!(
+        lines.contains("本体の hub-cert.pem・hub-key.pem は削除せず"),
+        "{lines}"
+    );
+    assert!(lines.contains("再起動"), "{lines}");
+    assert!(!lines.contains("作り直"), "{lines}");
+    assert!(!lines.contains("漏れた鍵"), "{lines}");
+    assert!(!lines.contains("フォルダごと削除"), "{lines}");
+}
+
+#[test]
+fn unread_record_retries_without_recreation_but_broken_record_revokes_the_identity() {
+    let fixture = Fixture::new();
+    let place = &fixture.0;
+    let cert = place.load().unwrap();
+    let records_dir =
+        match open_user_place(&WindowsTlsTrustOps, place, UserPlaceKind::RevocationsA).unwrap() {
+            UserPlaceState::Present(dir) => dir,
+            _ => panic!("初期化済みの記録 A"),
+        };
+    let held = WindowsTlsTrustOps
+        .open_child_file_exclusive(records_dir.dir(), REVOCATIONS_FILE)
+        .unwrap()
+        .unwrap();
+    let error = load_in(
+        &WindowsTlsTrustOps,
+        place,
+        &ReconcileOptions::default(),
+        NOW,
+    )
+    .unwrap_err();
+    assert_retry_later(&error.into_unavailable().log_lines().join("\n"));
+    drop(held);
+    drop(records_dir);
+    assert_eq!(thumb(&place.load().unwrap()), thumb(&cert));
+
+    std::fs::write(
+        place
+            .spec(UserPlaceKind::RevocationsA)
+            .path()
+            .join(REVOCATIONS_FILE),
+        b"broken",
+    )
+    .unwrap();
+    let error = load_in(
+        &WindowsTlsTrustOps,
+        place,
+        &ReconcileOptions::default(),
+        NOW,
+    )
+    .unwrap_err();
+    let lines = error.into_unavailable().log_lines().join("\n");
+    assert!(lines.contains("フォルダごと削除"), "{lines}");
+    assert!(read_user_revocations(&WindowsTlsTrustOps, place).is_revoked(&thumb(&cert)));
+}
+
+#[test]
+fn final_record_read_failure_only_requires_retrying_the_checked_pair() {
+    let fixture = Fixture::new();
+    let place = &fixture.0;
+    let mut held = None;
+    let error = load_in_observed(
+        &WindowsTlsTrustOps,
+        place,
+        &ReconcileOptions::default(),
+        NOW,
+        |stage| {
+            if stage == CreationStage::AfterPublish {
+                let spec = place.spec(UserPlaceKind::RevocationsA);
+                let dir = WindowsTlsTrustOps.pin_dir(&spec.path()).unwrap().unwrap();
+                held = WindowsTlsTrustOps
+                    .open_child_file_exclusive(&dir, REVOCATIONS_FILE)
+                    .unwrap();
+            }
+        },
+    )
+    .unwrap_err();
+    assert_retry_later(&error.into_unavailable().log_lines().join("\n"));
+    let cert = std::fs::read(place.tls().join(CERT_FILE)).unwrap();
+    drop(held);
+    assert_eq!(place.load().unwrap().cert_pem(), cert);
 }
 
 #[test]
@@ -869,28 +994,86 @@ impl Drop for ChildGuard {
     }
 }
 
+fn spawn_child(place: &Place, mode: &str) -> ChildGuard {
+    ChildGuard(Some(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "hub_tls_prepare::desktop::tests::creation_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("BANTO_TEST_TLS_ANCHOR", &place.0)
+            .env("BANTO_TEST_TLS_MODE", mode)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ))
+}
+
+fn wait_for_signal(place: &Place, name: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !place.0.join(name).exists() {
+        assert!(Instant::now() < deadline, "子プロセスとの合図待ち: {name}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn signal(place: &Place, name: &str) {
+    std::fs::write(place.0.join(name), b"").unwrap();
+}
+
+fn assert_child_success(child: ChildGuard) -> std::process::Output {
+    let output = child.output();
+    assert!(
+        output.status.success(),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+#[test]
+fn another_process_cannot_repair_loss_during_creation_or_revoke_the_new_identity() {
+    let fixture = Fixture::new();
+    let place = &fixture.0;
+    place.initialize_records();
+    std::fs::remove_file(
+        place
+            .spec(UserPlaceKind::RevocationsA)
+            .path()
+            .join(REVOCATIONS_FILE),
+    )
+    .unwrap();
+    // 他のプロセスが消失を先に観測しても、整える処理はロック下で読み直す。
+    let repair = spawn_child(place, "repair-after-loss");
+    wait_for_signal(place, "repair-observed");
+    let creator = spawn_child(place, "create-paused");
+    wait_for_signal(place, "before-generation");
+    signal(place, "repair-probe-1");
+    wait_for_signal(place, "repair-blocked-1");
+    signal(place, "generate");
+    wait_for_signal(place, "after-publish");
+    signal(place, "repair-probe-2");
+    wait_for_signal(place, "repair-blocked-2");
+    signal(place, "finish-creation");
+    assert_child_success(creator);
+    signal(place, "finish-repair");
+    assert_child_success(repair);
+    let cert = place.load().unwrap();
+    let records = read_user_revocations(&WindowsTlsTrustOps, place);
+    assert!(records.is_settled());
+    assert!(!records.is_revoked(&thumb(&cert)));
+}
+
 #[test]
 fn two_processes_create_one_identity_and_interrupted_process_releases_lock() {
     for interrupted in [false, true] {
         let fixture = Fixture::new();
         let place = &fixture.0;
-        let spawn = |mode: &str| {
-            ChildGuard(Some(
-                Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "hub_tls_prepare::desktop::tests::creation_child",
-                        "--ignored",
-                        "--nocapture",
-                    ])
-                    .env("BANTO_TEST_TLS_ANCHOR", &place.0)
-                    .env("BANTO_TEST_TLS_MODE", mode)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap(),
-            ))
-        };
+        let spawn = |mode: &str| spawn_child(place, mode);
         if interrupted {
             let mut first = spawn("lock");
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -954,7 +1137,57 @@ fn creation_child() {
     let place = Place(PathBuf::from(
         std::env::var_os("BANTO_TEST_TLS_ANCHOR").expect("親からの置き場"),
     ));
-    if std::env::var("BANTO_TEST_TLS_MODE").unwrap() == "lock" {
+    let mode = std::env::var("BANTO_TEST_TLS_MODE").unwrap();
+    if mode == "repair-after-loss" {
+        assert!(!read_user_revocations(&WindowsTlsTrustOps, &place).is_settled());
+        signal(&place, "repair-observed");
+        let options = ReconcileOptions {
+            lock_wait: Duration::from_millis(70),
+            lock_poll: Duration::from_millis(5),
+        };
+        for phase in [1, 2] {
+            wait_for_signal(&place, &format!("repair-probe-{phase}"));
+            let report = reconcile_user_revocations(&WindowsTlsTrustOps, &place, &options);
+            assert_eq!(report.outcome, ReconcileOutcome::Incomplete, "{report:?}");
+            assert!(
+                report.warnings.iter().any(|warning| matches!(
+                    warning,
+                    banto_hub_tls_trust::RevocationWarning::LockTimeout(_)
+                )),
+                "{report:?}"
+            );
+            signal(&place, &format!("repair-blocked-{phase}"));
+        }
+        wait_for_signal(&place, "finish-repair");
+        let report = reconcile_user_revocations(&WindowsTlsTrustOps, &place, &options);
+        assert_eq!(report.outcome, ReconcileOutcome::Consistent, "{report:?}");
+        let UncheckedUserCert::Seen(cert) = peek_user_cert(&WindowsTlsTrustOps, &place) else {
+            panic!("公開済みの証明書");
+        };
+        assert!(!report.revocations.is_revoked(&cert.thumbprint));
+        return;
+    }
+    if mode == "create-paused" {
+        load_in_observed(
+            &WindowsTlsTrustOps,
+            &place,
+            &ReconcileOptions::default(),
+            NOW,
+            |stage| match stage {
+                CreationStage::BeforeGeneration => {
+                    signal(&place, "before-generation");
+                    wait_for_signal(&place, "generate");
+                }
+                CreationStage::AfterPublish => {
+                    signal(&place, "after-publish");
+                    wait_for_signal(&place, "finish-creation");
+                }
+            },
+        )
+        .unwrap();
+        return;
+    }
+    if mode == "lock" {
         let dir = place.dir();
         let _held = lock(
             &WindowsTlsTrustOps,
