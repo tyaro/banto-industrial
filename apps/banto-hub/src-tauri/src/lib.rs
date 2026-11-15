@@ -1690,9 +1690,6 @@ fn show_tls_recreation_unavailable(app: &AppHandle, reason: &str) {
 
 #[cfg(windows)]
 fn recreate_desktop_tls(app: &AppHandle) {
-    if !host_switch_ipc::begin_switch_or_warn(app) {
-        return;
-    }
     let app = app.clone();
     let prompt_app = app.clone();
     banto_desktop_tray::ask_confirm(&prompt_app, ConfirmPrompt {
@@ -1700,7 +1697,11 @@ fn recreate_desktop_tls(app: &AppHandle) {
         message: "先に TLS フォルダと鍵・証明書の所有者・アクセス許可を確認し、異常があれば直してから実行してください。ChronoGazer 接続用の TLS の鍵と証明書を作り直します。接続が切れ、再接続には ChronoGazer 側で新しい証明書の取得と接続設定の更新が必要です。管理画面と収集は継続します。続けますか？",
         ok_label: "作り直す", cancel_label: "キャンセル",
     }, move |confirmed| {
-        if !confirmed { host_switch_ipc::end_switch(); return; }
+        match host_switch_ipc::try_begin_confirmed_switch(confirmed) {
+            Ok(true) => {},
+            Ok(false) => return,
+            Err(reason) => { show_tls_recreation_unavailable(&app, reason); return; }
+        }
         let state = app.state::<AppState>();
         let Some(ticket) = state.hub.begin_switch() else {
             host_switch_ipc::end_switch();

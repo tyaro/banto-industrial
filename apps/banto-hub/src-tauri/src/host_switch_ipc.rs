@@ -74,6 +74,21 @@ pub(crate) fn try_begin_switch() -> bool {
         .is_ok()
 }
 
+#[cfg(windows)]
+pub(crate) fn try_begin_confirmed_switch(confirmed: bool) -> Result<bool, &'static str> {
+    confirmed_switch(confirmed, &SWITCHING)
+}
+
+#[cfg(any(windows, test))]
+fn confirmed_switch(confirmed: bool, switching: &AtomicBool) -> Result<bool, &'static str> {
+    if !confirmed {
+        return Ok(false);
+    }
+    switching.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .map(|_| true)
+        .map_err(|_| "既に切替処理が進行中のため TLS の証明書を作り直せません。処理の終了を待ってから再試行してください")
+}
+
 /// 切替（「設定モードに戻す」・見張りの適用を含む）が進行中か。
 #[cfg(windows)]
 pub(crate) fn is_switching() -> bool {
@@ -386,6 +401,29 @@ pub(crate) fn elev_result_message(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn confirmation_acquires_only_after_approval_and_never_releases_another_switch() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let switching = AtomicBool::new(false);
+        assert_eq!(super::confirmed_switch(false, &switching), Ok(false));
+        assert!(!switching.load(Ordering::SeqCst));
+        // Another operation can take the flag while the confirmation is open.
+        assert!(!switching.swap(true, Ordering::SeqCst));
+        assert_eq!(super::confirmed_switch(false, &switching), Ok(false));
+        assert!(
+            switching.load(Ordering::SeqCst),
+            "cancel must not release another operation"
+        );
+        let reason = super::confirmed_switch(true, &switching).unwrap_err();
+        assert!(reason.contains("切替処理が進行中"));
+        assert!(
+            switching.load(Ordering::SeqCst),
+            "rejection must preserve the owner's flag"
+        );
+        switching.store(false, Ordering::SeqCst);
+        assert_eq!(super::confirmed_switch(true, &switching), Ok(true));
+        assert!(switching.load(Ordering::SeqCst));
+    }
     #[test]
     fn sender_origin_uses_the_plain_listener_port_and_never_the_shell_socket() {
         for (address, expected) in [
