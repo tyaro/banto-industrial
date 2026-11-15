@@ -127,6 +127,13 @@ pub(super) struct Round {
 }
 impl Watch {
     #[cfg(test)]
+    pub(super) fn with_unwritten_for_test(unwritten: BTreeSet<CertThumbprint>) -> Self {
+        Self {
+            unwritten,
+            ..Default::default()
+        }
+    }
+    #[cfg(test)]
     pub(super) fn unwritten_for_test(&self) -> BTreeSet<CertThumbprint> {
         self.unwritten.clone()
     }
@@ -311,18 +318,28 @@ pub(crate) fn spawn(
 
 pub(crate) fn spawn_idle(
     router: axum::Router,
+    config: Option<TlsConfig>,
     initial: DesktopTlsStatus,
     keep_alive: Arc<Option<crate::profile_lock::ProfileLockGuard>>,
 ) -> Monitor {
-    spawn_production(
+    let (input, serving) = idle_input(config, initial);
+    spawn_production(input, router, serving, keep_alive)
+}
+
+fn idle_input(
+    config: Option<TlsConfig>,
+    mut initial: DesktopTlsStatus,
+) -> (ActorInput, CertThumbprint) {
+    let serving = config.as_ref().and_then(TlsConfig::thumbprint);
+    initial.can_resume = serving.is_some();
+    let config = config.filter(|_| serving.is_some());
+    (
         ActorInput {
             listener: None,
-            config: None,
+            config,
             initial,
         },
-        router,
-        CertThumbprint::of_der(b"no active desktop identity"),
-        keep_alive,
+        serving.unwrap_or_else(|| CertThumbprint::of_der(b"no active desktop identity")),
     )
 }
 
@@ -967,6 +984,82 @@ mod tests {
         .expect("panic write-only mode must reject renewal without waiting for retries");
         assert!(result.is_err());
         monitor.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_bind_contention_keeps_config_and_recovers_after_port_is_released() {
+        let fixture = super::super::tests::Fixture::new();
+        let identity = fixture.0.load_at(now_unix()).unwrap();
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = blocker.local_addr().unwrap();
+        let config = TlsConfig::in_memory(
+            address.port(),
+            identity.cert_pem().to_vec(),
+            Zeroizing::new(
+                std::fs::read(fixture.0.spec(UserPlaceKind::Tls).path().join(KEY_FILE)).unwrap(),
+            ),
+        );
+        let router = axum::Router::new();
+        assert!(tls_listener::start(&config, router.clone()).await.is_err());
+        let (input, serving) = idle_input(
+            Some(config),
+            DesktopTlsStatus {
+                address: None,
+                reason: Some("injected port contention".into()),
+                requires_recreation: false,
+                can_resume: false,
+            },
+        );
+        assert!(input.initial.can_resume);
+        assert!(input.config.is_some());
+        let place = fixture.0.clone();
+        let monitor = spawn_actor(
+            input,
+            router,
+            move |watch, serving| watch.check(&place, serving, &ReconcileOptions::default()),
+            |_| {},
+            MonitorSettings {
+                interval: Duration::from_millis(10),
+                serving,
+            },
+            (),
+        );
+        // Let one complete check attempt the still-occupied port.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !monitor
+                .status()
+                .reason
+                .as_ref()
+                .is_some_and(|reason| reason.contains("待ち受け"))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(monitor.status().can_resume);
+        assert!(monitor.status().address.is_none());
+        drop(blocker);
+        let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+            while monitor.status().address.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let status = monitor.status();
+        monitor.revoker().unwrap().revoke();
+        let stopped = tokio::time::timeout(Duration::from_secs(10), async {
+            while monitor.status().address.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(!monitor.status().can_resume);
+        monitor.stop().await;
+        recovered.unwrap();
+        stopped.unwrap();
+        assert_eq!(status.address, Some(address));
+        assert!(status.can_resume);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

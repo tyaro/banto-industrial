@@ -1900,6 +1900,62 @@ fn renewal_success_confirms_every_pending_thumbprint_before_returning_empty_pend
     let records = read_user_revocations(&WindowsTlsTrustOps, &fixture.0);
     assert!(records.is_revoked(&first));
     assert!(records.is_revoked(&second));
+    assert!(
+        records.is_revoked(&thumb(&old)),
+        "committed renewal retires the old identity"
+    );
+    let current = fixture.0.load().unwrap();
+    assert_ne!(thumb(&current), thumb(&old));
+    assert!(!records.is_revoked(&thumb(&current)));
+}
+
+#[test]
+fn renewal_committed_retirement_write_failure_keeps_new_identity_and_retries_old_thumbprint() {
+    let fixture = Fixture::new();
+    let now = now_unix();
+    let old = fixture.0.load_at(now).unwrap();
+    let records_a = fixture.0.spec(UserPlaceKind::RevocationsA).path();
+    let user = WindowsTlsTrustOps.current_user_sid().unwrap();
+    let mut pending = std::collections::BTreeSet::new();
+    let installed = std::cell::Cell::new(Some(thumb(&old)));
+    let result = renewal::recreate(
+        &fixture.0,
+        &mut pending,
+        Some(thumb(&old)),
+        now,
+        |pair| {
+            installed.set(pair.map(|(cert, _)| CertThumbprint::of_pem(cert).unwrap()));
+            Ok(())
+        },
+        |stage| {
+            if stage == renewal::Stage::AfterCommitBeforeCleanup {
+                acl(&records_a, &["/deny", &format!("*{user}:(W)")]);
+            }
+            Ok(())
+        },
+    );
+    acl(&records_a, &["/remove:d", &format!("*{user}")]);
+    let warning = result
+        .unwrap()
+        .expect("committed retirement failure is a warning");
+    assert!(
+        warning.contains("失効") && warning.contains("次の周期"),
+        "{warning}"
+    );
+    assert_eq!(pending, std::collections::BTreeSet::from([thumb(&old)]));
+    let current = fixture.0.load_at(now).unwrap();
+    assert_eq!(installed.get(), Some(thumb(&current)));
+    assert_ne!(thumb(&current), thumb(&old));
+    let mut watch = watch::Watch::with_unwritten_for_test(pending);
+    assert!(
+        watch
+            .check(&fixture.0, thumb(&current), &ReconcileOptions::default())
+            .allow
+    );
+    assert!(watch.unwritten_for_test().is_empty());
+    let records = read_user_revocations(&WindowsTlsTrustOps, &fixture.0);
+    assert!(records.is_revoked(&thumb(&old)));
+    assert!(!records.is_revoked(&thumb(&current)));
 }
 
 #[test]

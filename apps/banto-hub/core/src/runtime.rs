@@ -1224,11 +1224,21 @@ impl HubRuntime {
                         }
                         #[cfg(windows)]
                         if host_kind == HubHostKind::Shell {
-                            desktop_tls_initial_status = Some(crate::hub_tls_prepare::desktop::watch::DesktopTlsStatus {
+                            let initial = crate::hub_tls_prepare::desktop::watch::DesktopTlsStatus {
                                 address: None,
-                                reason: Some(format!("127.0.0.1:{} で TLS を待ち受けられません: {err}。ポートを使用しているアプリを確認してから Hub を再起動してください", config.port())),
-                                requires_recreation: false, can_resume: false,
-                            });
+                                reason: Some(format!("127.0.0.1:{} で TLS を待ち受けられません: {err}。ポートを使用しているアプリを確認してください。次の周期で安全性を確認できれば再開します", config.port())),
+                                requires_recreation: false, can_resume: true,
+                            };
+                            desktop_tls_initial_status = Some(initial.clone());
+                            if desktop_selected {
+                                desktop_tls_monitor =
+                                    Some(crate::hub_tls_prepare::desktop::watch::spawn_idle(
+                                        shell_router.clone(),
+                                        Some(config),
+                                        initial,
+                                        tls_keep_alive.clone(),
+                                    ));
+                            }
                         }
                         None
                     }
@@ -1248,6 +1258,7 @@ impl HubRuntime {
             );
             desktop_tls_monitor = Some(crate::hub_tls_prepare::desktop::watch::spawn_idle(
                 shell_router.clone(),
+                None,
                 initial,
                 tls_keep_alive,
             ));

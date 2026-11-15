@@ -526,17 +526,43 @@ pub(super) fn recreate<P: UserTlsPlace + ?Sized>(
             cleanup_warning
         )));
     }
-    // Publication is committed. Auxiliary cleanup cannot turn it into an
-    // uncommitted result or make the actor keep monitoring the old thumbprint.
-    if let Err(error) = observe(Stage::AfterCommitBeforeCleanup)
-        .map_err(DesktopFailure::retry)
-        .and_then(|_| cleanup_old(dir.dir()))
-        .and_then(|_| cleanup_auxiliary_files(&dir))
-    {
-        return Ok(Some(format!(
-            "証明書の作り直しは完了しましたが補助ファイルを片付けられません: {}",
-            error.reason
-        )));
+    // Publication is committed. Only now retire the old identities: doing this
+    // before commit would make a safe rollback or startup recovery impossible.
+    let mut warnings = Vec::new();
+    let cleanup_ready = match observe(Stage::AfterCommitBeforeCleanup) {
+        Ok(()) => true,
+        Err(reason) => {
+            warnings.push(reason);
+            false
+        }
+    };
+    let new_thumbprint = CertThumbprint::of_pem(&cert).expect("validated published certificate");
+    let mut retired = std::collections::BTreeSet::new();
+    retired.extend(known_serving);
+    retired.extend(
+        old.0
+            .as_ref()
+            .and_then(|cert| CertThumbprint::of_pem(cert).ok()),
+    );
+    retired.remove(&new_thumbprint);
+    for thumbprint in retired {
+        pending.insert(thumbprint);
+        let report = records.record(thumbprint, RevokedCertPlace::User);
+        if report.outcome == ReconcileOutcome::Consistent
+            && report.revocations.is_settled()
+            && report.revocations.is_revoked(&thumbprint)
+        {
+            pending.remove(&thumbprint);
+        } else {
+            warnings.push(format!("旧い証明書（拇印 {thumbprint}）の失効を両方の記録へ書けませんでした。次の周期に再試行します"));
+        }
     }
-    Ok(None)
+    // Cleanup/record failures are committed warnings, never a rollback request.
+    if cleanup_ready {
+        if let Err(error) = cleanup_old(dir.dir()).and_then(|_| cleanup_auxiliary_files(&dir)) {
+            warnings.push(format!("補助ファイルを片付けられません: {}", error.reason));
+        }
+    }
+    Ok((!warnings.is_empty())
+        .then(|| format!("証明書の作り直しは完了しましたが、{}", warnings.join("。"))))
 }
