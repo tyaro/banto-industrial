@@ -264,9 +264,17 @@ pub(crate) fn spawn(
                 error.reason
             )),
         },
-        INTERVAL,
+        MonitorSettings {
+            interval: INTERVAL,
+            serving,
+        },
         task_guard,
     )
+}
+
+struct MonitorSettings {
+    interval: Duration,
+    serving: CertThumbprint,
 }
 
 #[cfg(test)]
@@ -275,7 +283,7 @@ fn spawn_with<F>(
     config: TlsConfig,
     router: axum::Router,
     check: F,
-    interval: Duration,
+    settings: MonitorSettings,
     keep_alive: impl Send + 'static,
 ) -> Monitor
 where
@@ -287,7 +295,7 @@ where
         router,
         check,
         |_| {},
-        interval,
+        settings,
         keep_alive,
     )
 }
@@ -298,7 +306,7 @@ fn spawn_with_retry<F, R>(
     router: axum::Router,
     mut check: F,
     retry: R,
-    interval: Duration,
+    settings: MonitorSettings,
     keep_alive: impl Send + 'static,
 ) -> Monitor
 where
@@ -320,7 +328,7 @@ where
     let task = tokio::spawn(async move {
         let mut listener = Some(listener);
         let mut watch = Watch::default();
-        let mut ticks = tokio::time::interval(interval);
+        let mut ticks = tokio::time::interval(settings.interval);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticks.tick().await; // 初回の検査は起動時に済んでいる。
         loop {
@@ -409,15 +417,18 @@ where
                             active.stop().await;
                             round.reason = Some(external_stop_reason().into());
                         } else {
+                            crate::hub_log::log_line(&format!(
+                                "banto-hub: 既定の TLS が復帰しました: https://{}（拇印 {}）",
+                                active.local_addr(),
+                                settings.serving
+                            ));
                             listener = Some(active);
                         }
                     }
                     Err(error) => {
-                        crate::hub_log::log_err_line(&format!("[WARN] banto-hub: TLS の復帰で待ち受けられません。次の周期に再試行します: {error}"));
-                        let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
-                        state.status.reason =
-                            Some(format!("TLS の復帰で待ち受けられません: {error}"));
-                        continue;
+                        round.reason = Some(format!(
+                            "TLS の復帰で待ち受けられません。次の周期に再試行します: {error}"
+                        ));
                     }
                 }
             }
@@ -593,7 +604,10 @@ mod tests {
                 allow: seen.load(Ordering::SeqCst),
                 reason: (!seen.load(Ordering::SeqCst)).then(|| "test stop".into()),
             },
-            Duration::from_millis(10),
+            MonitorSettings {
+                interval: Duration::from_millis(10),
+                serving: CertThumbprint::of_pem(identity.cert_pem.as_bytes()).unwrap(),
+            },
             (),
         );
         let bound = Duration::from_secs(10);
@@ -610,7 +624,32 @@ mod tests {
             .unwrap();
         assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
         assert!(tokio::net::TcpStream::connect(first).await.is_err());
+        let blocker = std::net::TcpListener::bind(first).unwrap();
         healthy.store(true, Ordering::SeqCst);
+        tokio::time::timeout(bound, async {
+            while !monitor
+                .status()
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("復帰で待ち受けられません"))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let failed = monitor.status();
+        assert_eq!(failed.address, None);
+        assert!(!failed.requires_recreation);
+        assert!(
+            failed
+                .reason
+                .as_ref()
+                .unwrap()
+                .contains("次の周期に再試行します"),
+            "bind failure must publish the complete round reason: {failed:?}"
+        );
+        drop(blocker);
         tokio::time::timeout(bound, async {
             while monitor.status().address.is_none() {
                 tokio::task::yield_now().await;
@@ -654,7 +693,10 @@ mod tests {
                     reason: None,
                 }
             },
-            Duration::from_millis(10),
+            MonitorSettings {
+                interval: Duration::from_millis(10),
+                serving: CertThumbprint::of_pem(identity.cert_pem.as_bytes()).unwrap(),
+            },
             (),
         );
         let bound = Duration::from_secs(10);
@@ -707,7 +749,10 @@ mod tests {
                     reason: None,
                 }
             },
-            Duration::from_millis(10),
+            MonitorSettings {
+                interval: Duration::from_millis(10),
+                serving: CertThumbprint::of_pem(identity.cert_pem.as_bytes()).unwrap(),
+            },
             guard,
         );
         let bound = Duration::from_secs(10);
@@ -764,7 +809,10 @@ mod tests {
                         reason: (!seen.load(Ordering::SeqCst)).then(|| "test stop".into()),
                     }
                 },
-                Duration::from_millis(10),
+                MonitorSettings {
+                    interval: Duration::from_millis(10),
+                    serving: CertThumbprint::of_pem(identity.cert_pem.as_bytes()).unwrap(),
+                },
                 (),
             );
             let old = monitor.revoker().unwrap();
@@ -839,7 +887,10 @@ mod tests {
                     reason: Some("specific exposure or revocation".into()),
                 }
             },
-            Duration::from_millis(10),
+            MonitorSettings {
+                interval: Duration::from_millis(10),
+                serving: CertThumbprint::of_pem(identity.cert_pem.as_bytes()).unwrap(),
+            },
             (),
         );
         let original = monitor.revoker().unwrap();
@@ -884,7 +935,10 @@ mod tests {
                 watch.unwritten.extend([serving, disk]);
                 panic!("injected checker failure");
             },
-            Duration::from_millis(10),
+            MonitorSettings {
+                interval: Duration::from_millis(10),
+                serving: CertThumbprint::of_pem(identity.cert_pem.as_bytes()).unwrap(),
+            },
             (),
         );
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -963,7 +1017,10 @@ mod tests {
                         watch.unwritten.clear();
                     }
                 },
-                Duration::from_millis(10),
+                MonitorSettings {
+                    interval: Duration::from_millis(10),
+                    serving: CertThumbprint::of_pem(identity.cert_pem.as_bytes()).unwrap(),
+                },
                 (),
             );
             tokio::time::timeout(Duration::from_secs(10), async {
