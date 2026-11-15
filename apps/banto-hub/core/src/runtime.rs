@@ -2061,6 +2061,20 @@ mod tests {
             persisted,
             "shell initialization must use this resolved port, not its default probe port"
         );
+        let transport =
+            crate::shell_transport::ShellTransport::start_avoiding(&[hub.local_addr().port()])
+                .await
+                .unwrap();
+        assert_ne!(
+            transport.local_addr().port(),
+            persisted,
+            "shell origin must exclude the resolved persisted plain port"
+        );
+        assert!(
+            std::net::TcpListener::bind(hub.local_addr()).is_err(),
+            "Hub retains its configured plain listener"
+        );
+        transport.stop_for_test().await;
         hub.shutdown().await;
     }
 

@@ -1303,6 +1303,9 @@ fn desktop_start_failure(
     if let Some(port) = failed_plain_port.filter(|port| Some(*port) == shell_port) {
         return (format!("{error}。設定した平文の待ち受けポート {port} は、このプロセスが管理画面用に予約しているポートと同じです。アプリを終了して起動し直してください。再起動時は平文の設定ポートを避けて管理画面用ポートを選び直します。TLS フォルダや設定の削除は不要です"), FallbackCause::ShellTransportUnavailable);
     }
+    if failed_plain_port == Some(banto_hub_core::settings::DEFAULT_PORT) {
+        return (format!("{error}。8722 が他のアプリで使用中の場合は、そのアプリを止めるか、PORT またはサーバー設定（server.port）を空いているポートへ変更してください。平文ポートは自動で退避しません"), FallbackCause::General);
+    }
     (error.to_string(), FallbackCause::General)
 }
 
@@ -3073,15 +3076,6 @@ pub fn run() {
             pending_log: StdMutex::new(Vec::new()),
         })
         .setup(|app| {
-            let use_https = app
-                .config()
-                .app
-                .windows
-                .iter()
-                .find(|c| c.label == MAIN_WINDOW_LABEL)
-                .is_some_and(|c| c.use_https_scheme);
-            *app.state::<AppState>().placeholder_url.lock().unwrap() =
-                Some(launch_gate::placeholder_url(cfg!(windows), use_https));
             let config = app
                 .config()
                 .app
@@ -3090,6 +3084,10 @@ pub fn run() {
                 .find(|c| c.label == MAIN_WINDOW_LABEL)
                 .expect("main window config")
                 .clone();
+            // Before window creation: its initial URL may still be about:blank.
+            *app.state::<AppState>().placeholder_url.lock().unwrap() = Some(
+                launch_gate::placeholder_url(cfg!(windows), config.use_https_scheme),
+            );
             let navigation_app = app.handle().clone();
             let window = tauri::WebviewWindowBuilder::from_config(app, &config)?
                 .on_navigation(move |url| shell_tls::navigation_allowed(&navigation_app, url))
@@ -3110,22 +3108,6 @@ pub fn run() {
 
             // T16-2: サービス検出 → 接続 / デスクトップ起動 / fallback の
             // 判定（このモジュール doc「起動シーケンス」節参照）。
-            // サービスが止まったときの navigate 先（プレースホルダ）。#706 実機確認: ここで
-            // `window.url()` を読むと、最初の読み込みが確定する前なので `about:blank` が返る
-            // （WebView2 の Source）。窓の設定から組み立て、読み込みの完了で覚え直す
-            // （[`reapply_status_text`]）。
-            let use_https = app
-                .config()
-                .app
-                .windows
-                .iter()
-                .find(|config| config.label == MAIN_WINDOW_LABEL)
-                .is_some_and(|config| config.use_https_scheme);
-            *app.state::<AppState>()
-                .placeholder_url
-                .lock()
-                .expect("placeholder_url mutex poisoned") =
-                Some(launch_gate::placeholder_url(cfg!(windows), use_https));
             let target = expected_probe_target();
             let slot = Arc::clone(&app.state::<AppState>().hub);
             let outcome = decide_startup(app.handle(), &target, &slot);
@@ -3224,6 +3206,22 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn default_plain_port_start_failure_has_conditional_conflict_remedy_only() {
+        let (message, cause) = desktop_start_failure("original bind failure", Some(8722), None);
+        assert_eq!(cause, FallbackCause::General);
+        assert!(message.starts_with("original bind failure"));
+        assert!(message.contains("使用中の場合"));
+        assert!(message.contains("そのアプリを止める"));
+        assert!(message.contains("PORT") && message.contains("server.port"));
+        assert!(message.contains("自動で退避しません"));
+        for port in [None, Some(8723), Some(49152)] {
+            assert_eq!(
+                desktop_start_failure("other failure", port, None),
+                ("other failure".into(), FallbackCause::General)
+            );
+        }
+    }
     #[test]
     fn plain_port_conflicting_with_retained_shell_origin_requires_process_restart() {
         let (message, cause) = desktop_start_failure("bind failed", Some(49152), Some(49152));

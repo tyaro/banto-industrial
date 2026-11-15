@@ -94,6 +94,17 @@ impl ShellTransport {
     pub fn local_addr(&self) -> SocketAddr {
         self.listener.local_addr()
     }
+
+    /// Production keeps this transport until process exit; tests must join it.
+    #[cfg(test)]
+    pub(crate) async fn stop_for_test(self: Arc<Self>) {
+        Arc::try_unwrap(self)
+            .ok()
+            .expect("unshared test transport")
+            .listener
+            .stop()
+            .await;
+    }
     pub fn is_serving(&self) -> bool {
         self.listener.is_serving()
     }
