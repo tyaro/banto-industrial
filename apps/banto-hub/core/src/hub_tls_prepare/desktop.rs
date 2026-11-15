@@ -5,7 +5,7 @@
 //! 初回作成・最後の照合と片付けを行う。無い組だけを protected DACL で作り、`creating` が
 //! ある作りかけだけは復旧する。既存の壊れ・露出は自動で作り直さない。
 //! 鍵を含むファイルはすべて、確かめて握ったフォルダのハンドル基準で操作する。
-//! 読んだ組をメモリ上で確かめて渡す。周期の見張りは PR2e、作り直しとシェルの https は PR3。
+//! 読んだ組をメモリ上で確かめて渡す。周期の見張りは [`watch`]（PR2e）、作り直しとシェルの https は PR3。
 
 use std::time::{Duration, Instant};
 
@@ -678,3 +678,6 @@ fn load_in_observed<P: UserTlsPlace + ?Sized>(
 
 #[cfg(test)]
 mod tests;
+
+/// デスクトップ既定 TLS の周期検査と停止・復帰。
+pub mod watch;

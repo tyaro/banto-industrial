@@ -394,21 +394,78 @@ pub struct RunningTlsListener {
 /// [`RunningTlsListener::revoker`]。複製して別のスレッド・タスクから呼べる）。
 #[derive(Clone)]
 pub struct TlsRevoker {
-    severance: Arc<Severance>,
-    abort: Arc<AbortHandle>,
+    target: RevocationTarget,
+}
+
+#[derive(Clone)]
+enum RevocationTarget {
+    Listener {
+        severance: Arc<Severance>,
+        abort: Arc<AbortHandle>,
+    },
+    #[cfg(windows)]
+    Following(Arc<Mutex<FollowingRevocation>>),
+}
+
+#[cfg(windows)]
+struct FollowingRevocation {
+    revoked: bool,
+    current: TlsRevoker,
 }
 
 impl TlsRevoker {
     /// 張られた接続をすべて OS の上で閉じ、serve のタスクを abort する（待ち受けのポートも閉じる）。
     /// 待たない（同期）。何度呼んでもよい。止めた後は再開しない。
+    /// デスクトップ監視の共有ハンドルは、復帰した listener にも同じ停止の印を伝える。
     pub fn revoke(&self) {
-        self.severance.sever();
-        self.abort.abort();
+        match &self.target {
+            RevocationTarget::Listener { severance, abort } => {
+                severance.sever();
+                abort.abort();
+            }
+            #[cfg(windows)]
+            RevocationTarget::Following(shared) => {
+                let mut shared = shared.lock().unwrap_or_else(|p| p.into_inner());
+                shared.revoked = true;
+                shared.current.revoke();
+            }
+        }
     }
 
-    /// 失効で止めたか。
+    /// 失効で止めたか（共有ハンドルの印は listener の交換後も消えない）。
     pub fn is_revoked(&self) -> bool {
-        self.severance.is_severed()
+        match &self.target {
+            RevocationTarget::Listener { severance, .. } => severance.is_severed(),
+            #[cfg(windows)]
+            RevocationTarget::Following(shared) => {
+                shared.lock().unwrap_or_else(|p| p.into_inner()).revoked
+            }
+        }
+    }
+
+    /// 監視の寿命に対応する安定した停止口。current には listener 固有の停止口だけを渡す。
+    #[cfg(windows)]
+    pub(crate) fn following(current: TlsRevoker) -> Self {
+        Self {
+            target: RevocationTarget::Following(Arc::new(Mutex::new(FollowingRevocation {
+                revoked: false,
+                current,
+            }))),
+        }
+    }
+
+    /// 失効と登録を同じロックで直列化する。既に失効していれば新 listener も即座に止める。
+    /// 呼び手は、この登録が済むまで新 listener に accept させない。
+    #[cfg(windows)]
+    fn follow(&self, current: TlsRevoker) {
+        let RevocationTarget::Following(shared) = &self.target else {
+            unreachable!("monitor revoker must follow listeners")
+        };
+        let mut shared = shared.lock().unwrap_or_else(|p| p.into_inner());
+        if shared.revoked {
+            current.revoke();
+        }
+        shared.current = current;
     }
 }
 
@@ -420,8 +477,10 @@ impl RunningTlsListener {
     /// 失効で止める口（モジュール doc「失効による停止」）。
     pub fn revoker(&self) -> TlsRevoker {
         TlsRevoker {
-            severance: self.severance.clone(),
-            abort: Arc::new(self.task.abort_handle()),
+            target: RevocationTarget::Listener {
+                severance: self.severance.clone(),
+                abort: Arc::new(self.task.abort_handle()),
+            },
         }
     }
 
@@ -442,6 +501,31 @@ pub(crate) async fn start(
     config: &TlsConfig,
     app: axum::Router,
 ) -> Result<RunningTlsListener, TlsError> {
+    #[cfg(windows)]
+    {
+        start_inner(config, app, None).await
+    }
+    #[cfg(not(windows))]
+    {
+        start_inner(config, app).await
+    }
+}
+
+/// 再 bind の serve は、永続の失効印を登録してからだけ動かす。
+#[cfg(windows)]
+pub(crate) async fn start_following(
+    config: &TlsConfig,
+    app: axum::Router,
+    follows: &TlsRevoker,
+) -> Result<RunningTlsListener, TlsError> {
+    start_inner(config, app, Some(follows)).await
+}
+
+async fn start_inner(
+    config: &TlsConfig,
+    app: axum::Router,
+    #[cfg(windows)] follows: Option<&TlsRevoker>,
+) -> Result<RunningTlsListener, TlsError> {
     let acceptor = config.acceptor()?;
     let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, config.port);
     let tcp = crate::bind_exclusive::bind_exclusive(address)
@@ -456,7 +540,12 @@ pub(crate) async fn start(
         handshakes: JoinSet::new(),
     };
     let (shutdown, receiver) = oneshot::channel();
+    // spawn と共有停止口への登録の間にも別 worker は動ける。accept は登録後まで待たせる。
+    let (begin, begun) = oneshot::channel();
     let task = tokio::spawn(async move {
+        if begun.await.is_err() {
+            return;
+        }
         let _ = axum::serve(
             // TapIo supplies axum's generic Connected<Addr> implementation
             // for custom listeners, preserving ConnectInfo<SocketAddr>.
@@ -468,12 +557,18 @@ pub(crate) async fn start(
         })
         .await;
     });
-    Ok(RunningTlsListener {
+    let running = RunningTlsListener {
         local_addr,
         shutdown,
         task,
         severance,
-    })
+    };
+    #[cfg(windows)]
+    if let Some(follows) = follows {
+        follows.follow(running.revoker());
+    }
+    let _ = begin.send(());
+    Ok(running)
 }
 
 #[cfg(test)]
@@ -875,5 +970,32 @@ mod tests {
             !closes_within(&mut tls, Duration::from_millis(500)).await,
             "通常の停止で接続が切れた（比べの前提が変わった）"
         );
+    }
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn following_revoker_severs_new_listener_when_revoked_before_registration() {
+        let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let config = TlsConfig::in_memory(
+            0,
+            identity.cert.pem().into_bytes(),
+            Zeroizing::new(identity.signing_key.serialize_pem().into_bytes()),
+        );
+        let initial = start(&config, Router::new()).await.unwrap();
+        let stable = TlsRevoker::following(initial.revoker());
+        initial.stop().await;
+        assert!(
+            !stable.is_revoked(),
+            "temporary listener stop must not permanently revoke the monitor"
+        );
+        stable.revoke();
+        let replacement = start_following(&config, Router::new(), &stable)
+            .await
+            .unwrap();
+        // 登録時に既に失効なら、開始ゲートを開ける前に必ず serve と TCP を失効させる。
+        assert!(replacement.revoker().is_revoked());
+        let address = replacement.local_addr();
+        replacement.stop().await;
+        assert!(TcpStream::connect(address).await.is_err());
+        assert!(stable.is_revoked());
     }
 }

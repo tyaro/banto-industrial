@@ -1421,3 +1421,150 @@ fn creation_child() {
     let cert = place.load().unwrap();
     println!("CERT {}", thumb(&cert));
 }
+
+#[test]
+fn desktop_watch_observes_external_revocation_even_when_record_lock_is_held() {
+    let fixture = Fixture::new();
+    let place = &fixture.0;
+    let options = ReconcileOptions {
+        lock_wait: Duration::ZERO,
+        ..ReconcileOptions::default()
+    };
+    let cert = load_in(
+        &WindowsTlsTrustOps,
+        place,
+        &ReconcileOptions::default(),
+        now_unix(),
+    )
+    .unwrap();
+    let serving = thumb(&cert);
+    let mut watch = watch::Watch::default();
+    assert!(watch.check(place, serving, &options).allow);
+    record_user_revocation(
+        &WindowsTlsTrustOps,
+        place,
+        &options,
+        serving,
+        RevokedCertPlace::User,
+    );
+    let _lock = lock_user_revocations(&WindowsTlsTrustOps, place, &options).unwrap();
+    assert!(!watch.check(place, serving, &options).allow);
+}
+
+#[test]
+fn desktop_watch_lock_contention_stops_on_third_round_and_recovers() {
+    let fixture = Fixture::new();
+    let place = &fixture.0;
+    let options = ReconcileOptions {
+        lock_wait: Duration::ZERO,
+        ..ReconcileOptions::default()
+    };
+    let cert = load_in(
+        &WindowsTlsTrustOps,
+        place,
+        &ReconcileOptions::default(),
+        now_unix(),
+    )
+    .unwrap();
+    let serving = thumb(&cert);
+    let mut watch = watch::Watch::default();
+    let lock = lock_user_revocations(&WindowsTlsTrustOps, place, &options).unwrap();
+    assert!(watch.check(place, serving, &options).allow);
+    assert!(watch.check(place, serving, &options).allow);
+    assert!(!watch.check(place, serving, &options).allow);
+    drop(lock);
+    assert!(watch.check(place, serving, &options).allow);
+}
+
+#[test]
+fn desktop_watch_exposure_remains_revoked_after_acl_repair_and_retries_recording() {
+    let fixture = Fixture::new();
+    let place = &fixture.0;
+    let options = ReconcileOptions {
+        lock_wait: Duration::ZERO,
+        ..ReconcileOptions::default()
+    };
+    let cert = load_in(
+        &WindowsTlsTrustOps,
+        place,
+        &ReconcileOptions::default(),
+        now_unix(),
+    )
+    .unwrap();
+    let serving = thumb(&cert);
+    let path = place.tls().join(KEY_FILE);
+    let mut watch = watch::Watch::default();
+    let lock = lock_user_revocations(&WindowsTlsTrustOps, place, &options).unwrap();
+    acl(&path, &["/grant", "*S-1-5-32-545:(R)"]);
+    assert!(!watch.check(place, serving, &options).allow);
+    acl(&path, &["/remove:g", "*S-1-5-32-545"]);
+    drop(lock);
+    assert!(!watch.check(place, serving, &options).allow);
+    assert!(read_user_revocations(&WindowsTlsTrustOps, place).is_revoked(&serving));
+}
+
+#[test]
+fn desktop_watch_rejects_changed_certificate_and_missing_key_without_revoking() {
+    let fixture = Fixture::new();
+    let place = &fixture.0;
+    let options = ReconcileOptions::default();
+    let cert = load_in(
+        &WindowsTlsTrustOps,
+        place,
+        &ReconcileOptions::default(),
+        now_unix(),
+    )
+    .unwrap();
+    let serving = thumb(&cert);
+    let mut watch = watch::Watch::default();
+    let key_path = place.tls().join(KEY_FILE);
+    let saved = Zeroizing::new(std::fs::read(&key_path).unwrap());
+    std::fs::remove_file(&key_path).unwrap();
+    assert!(!watch.check(place, serving, &options).allow);
+    place.put(KEY_FILE, &saved);
+    assert!(watch.check(place, serving, &options).allow);
+    let other = generate_identity(now_unix()).unwrap();
+    std::fs::remove_file(place.tls().join(CERT_FILE)).unwrap();
+    place.put(CERT_FILE, other.cert_pem.as_bytes());
+    assert!(!watch.check(place, serving, &options).allow);
+    assert!(!read_user_revocations(&WindowsTlsTrustOps, place).is_revoked(&serving));
+}
+
+#[test]
+fn desktop_watch_rejects_changed_certificate_even_when_key_is_temporarily_unreadable() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::LockFile;
+
+    for exclusive_open in [false, true] {
+        let fixture = Fixture::new();
+        let place = &fixture.0;
+        let options = ReconcileOptions::default();
+        let cert = load_in(&WindowsTlsTrustOps, place, &options, now_unix()).unwrap();
+        let serving = thumb(&cert);
+        let dir = place.dir();
+        let (exclusive, range) = if exclusive_open {
+            (
+                WindowsTlsTrustOps
+                    .open_child_file_exclusive(dir.dir(), KEY_FILE)
+                    .unwrap(),
+                None,
+            )
+        } else {
+            let file = std::fs::File::open(place.tls().join(KEY_FILE)).unwrap();
+            // SAFETY: 有効な File を保持し、閉じるまで範囲 0..1 をロックする。
+            assert_ne!(unsafe { LockFile(file.as_raw_handle(), 0, 0, 1, 0) }, 0);
+            (None, Some(file))
+        };
+        // 起動時と同じ証明書なら、鍵の一時的な open/read 失敗だけで即停止しない。
+        let mut watch = watch::Watch::default();
+        assert!(watch.check(place, serving, &options).allow);
+        let other = generate_identity(now_unix()).unwrap();
+        std::fs::remove_file(place.tls().join(CERT_FILE)).unwrap();
+        place.put(CERT_FILE, other.cert_pem.as_bytes());
+        // 証明書の不一致は確かに観測できるので、鍵の一時失敗の猶予を適用しない。
+        let mut watch = watch::Watch::default();
+        assert!(!watch.check(place, serving, &options).allow);
+        assert!(!read_user_revocations(&WindowsTlsTrustOps, place).is_revoked(&serving));
+        drop((exclusive, range, dir));
+    }
+}
