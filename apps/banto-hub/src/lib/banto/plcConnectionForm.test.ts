@@ -20,6 +20,7 @@ import {
 	blankBridgeQuery,
 	formatBridgeReferenceDeleteRefusal,
 	ingestEndpoints,
+	ingestUsesLoopback,
 	isSavedPushConnection,
 	resolveSavedConnection,
 	mapPushFieldErrors,
@@ -666,6 +667,18 @@ describe('R2a-2e: mapPushFieldErrors（サーバーの settings.* の項目エ�
 });
 
 describe('R2a-2e: ingestEndpoints（送り手向けの URL とスコープ）', () => {
+	it.each([
+		['http://127.0.0.1:8722', true],
+		['http://[::1]:8722', true],
+		['http://192.0.2.42:8722', false],
+		['http://[2001:db8::42]:8722', false],
+		['https://hub.example:8723', false],
+		['http://localhost:8722', false],
+		['invalid', false],
+		[null, false]
+	])('same-PC notice for %s is %s', (origin, expected) => {
+		expect(ingestUsesLoopback(origin)).toBe(expected);
+	});
 	it('接続 id で組み立てる（http → ws、https → wss）', () => {
 		expect(ingestEndpoints('http://127.0.0.1:8765', 12)).toEqual({
 			restUrl: 'http://127.0.0.1:8765/api/v1/ingest/12/values',

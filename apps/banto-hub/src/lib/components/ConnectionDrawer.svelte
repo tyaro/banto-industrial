@@ -141,6 +141,7 @@
 		bridgeQueryErrorKey,
 		formatBridgeReferenceDeleteRefusal,
 		ingestEndpoints,
+		ingestUsesLoopback,
 		isSavedPushConnection,
 		resolveSavedConnection,
 		type SavedConnectionRecord,
@@ -1305,9 +1306,11 @@
 				<dd><code data-testid="ingest-scope">{endpoints.scope}</code></dd>
 			</dl>
 			<p class="hint">
-				127.0.0.1 は Hub と同じ PC の送り手向けです。別の PC から送る場合は、アクセスできる Hub
-				のアドレスと待ち受け設定を確認してください。 送り手の API キーは「API
-				キー」の画面で、取り込み（この接続）を選んで発行します（スコープ
+				{#if ingestUsesLoopback(ingestOrigin)}
+					この loopback URL は Hub と同じ PC の送り手向けです。別の PC
+					から送る場合は、アクセスできる Hub のアドレスと待ち受け設定を確認してください。
+				{/if}
+				送り手の API キーは「API キー」の画面で、取り込み（この接続）を選んで発行します（スコープ
 				{endpoints.scope}）。URL とスコープは接続の id で決まるので、名前を変えても変わりません。
 				構成パッケージで別の Hub に移すと id が変わり、キーも移りません。
 			</p>

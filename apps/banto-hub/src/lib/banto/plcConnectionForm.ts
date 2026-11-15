@@ -718,6 +718,17 @@ export function ingestEndpoints(origin: string, connectionId: number): IngestEnd
 	};
 }
 
+/** Only these literal loopback hosts need the same-PC sender notice. */
+export function ingestUsesLoopback(origin: string | null): boolean {
+	if (!origin) return false;
+	try {
+		const hostname = new URL(origin).hostname;
+		return hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '::1';
+	} catch {
+		return false;
+	}
+}
+
 /**
  * 保存成功時の「保存済みの接続」の記録。`base` は保存時に親から渡されていた
  * `connection` prop（参照）、`saved` は更新 API が返した正規化済みの接続。
