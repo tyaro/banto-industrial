@@ -5,7 +5,32 @@ import { describe, expect, it, vi } from 'vitest';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
 
-import { describeInvokeError, INVOKE_ERROR_FALLBACK } from './hostSwitchShell';
+import {
+	describeInvokeError,
+	getClientIngestOrigin,
+	INVOKE_ERROR_FALLBACK
+} from './hostSwitchShell';
+import { invoke } from '@tauri-apps/api/core';
+
+describe('client ingest origin', () => {
+	it('browser keeps its Hub origin', async () => {
+		expect(await getClientIngestOrigin('https://hub.example:8723', false)).toBe(
+			'https://hub.example:8723'
+		);
+	});
+	it('Desktop uses its configured plain listener, never the shell origin', async () => {
+		vi.mocked(invoke).mockResolvedValueOnce({ ingestOrigin: 'http://127.0.0.1:18722' });
+		expect(await getClientIngestOrigin('https://127.0.0.1:49152', true)).toBe(
+			'http://127.0.0.1:18722'
+		);
+	});
+	it('missing listener or failed IPC never falls back to the shell origin', async () => {
+		vi.mocked(invoke).mockResolvedValueOnce({});
+		expect(await getClientIngestOrigin('https://127.0.0.1:49152', true)).toBeNull();
+		vi.mocked(invoke).mockRejectedValueOnce('stopped');
+		expect(await getClientIngestOrigin('https://127.0.0.1:49152', true)).toBeNull();
+	});
+});
 
 describe('describeInvokeError', () => {
 	it('文字列（command の Err(String)）はそのまま', () => {

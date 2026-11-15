@@ -642,7 +642,10 @@ fn load_in_observed<P: UserTlsPlace + ?Sized>(
     let mut pair = read_pair_and_backup(ops, place, &dir, None, &mut |thumbprint| {
         records.record(thumbprint, RevokedCertPlace::User)
     })?;
-    let recovering_renewal = renewal::recover(ops, &dir, &records.read(), now, &pair, false)
+    let recovering_renewal =
+        renewal::recover(ops, &dir, &records.read(), now, &pair, false, |thumb| {
+            records.record(thumb, RevokedCertPlace::User)
+        })
         .map_err(|error| {
             renewal::record_backup_failure(error, ops, place, &dir, None, |thumbprint| {
                 records.record(thumbprint, RevokedCertPlace::User)

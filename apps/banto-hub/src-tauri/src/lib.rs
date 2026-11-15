@@ -1686,7 +1686,12 @@ fn spawn_desktop_tls_watch(app: AppHandle) {
             let current = desktop_tls_status::current(&state);
             if current != previous {
                 if let Some(tls) = &current {
-                    if tls.reason.is_some() {
+                    if tls.reason.is_some()
+                        && desktop_tls_status::notification_changed(
+                            previous.as_ref(),
+                            current.as_ref(),
+                        )
+                    {
                         let _ = app
                             .notification()
                             .builder()

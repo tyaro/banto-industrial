@@ -706,7 +706,7 @@ export interface IngestEndpoints {
 }
 
 /**
- * `origin`（`window.location.origin`。管理画面を開いている Hub）と接続 id から、
+ * クライアント向け listener の `origin` と接続 id から、
  * 送り手向けの URL とスコープを組み立てる。WS は `http` → `ws`・`https` → `wss`。
  */
 export function ingestEndpoints(origin: string, connectionId: number): IngestEndpoints {

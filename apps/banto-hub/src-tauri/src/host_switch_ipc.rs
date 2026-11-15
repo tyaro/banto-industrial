@@ -33,6 +33,7 @@ pub(crate) static SWITCHING: AtomicBool = AtomicBool::new(false);
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostSwitchStatusDto {
+    pub ingest_origin: Option<String>,
     pub desktop_tls: Option<crate::desktop_tls_status::Presentation>,
     /// SCM 状態の表示用文字列（未インストール等含む）。照会失敗時は`null`。
     pub scm_state: Option<String>,
@@ -122,6 +123,7 @@ pub fn host_switch_status(
     };
     let (scm_state, auto_start) = query_scm_summary();
     Ok(HostSwitchStatusDto {
+        ingest_origin: client_ingest_origin(&view, state.hub.inspect(|hub| hub.local_addr())),
         desktop_tls: crate::desktop_tls_status::current(&state),
         scm_state,
         auto_start,
@@ -130,6 +132,18 @@ pub fn host_switch_status(
         switching: SWITCHING.load(Ordering::SeqCst),
         fallback_cause,
     })
+}
+
+fn client_ingest_origin(view: &str, address: Option<std::net::SocketAddr>) -> Option<String> {
+    match view {
+        "desktop" => address.map(|address| format!("http://127.0.0.1:{}", address.port())),
+        "service" => Some(
+            crate::service_tls::service_url()
+                .trim_end_matches('/')
+                .into(),
+        ),
+        _ => None,
+    }
 }
 
 fn query_scm_summary() -> (Option<String>, bool) {
@@ -365,6 +379,20 @@ pub(crate) fn elev_result_message(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sender_origin_uses_the_plain_listener_port_and_never_the_shell_socket() {
+        let address = "0.0.0.0:18722".parse().unwrap();
+        assert_eq!(
+            super::client_ingest_origin("desktop", Some(address)).as_deref(),
+            Some("http://127.0.0.1:18722")
+        );
+        assert_eq!(super::client_ingest_origin("desktop", None), None);
+        assert_eq!(super::client_ingest_origin("fallback", Some(address)), None);
+        assert_eq!(
+            super::client_ingest_origin("service", None).as_deref(),
+            Some("https://127.0.0.1:8723")
+        );
+    }
     use super::{elev_or_reinstall, elev_result_message, resolve_elev_exe_next_to, ELEV_NOT_FOUND};
     use banto_service_elev::launch::LaunchError;
     use std::fs;

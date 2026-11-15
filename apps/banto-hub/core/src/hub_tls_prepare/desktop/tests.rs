@@ -1819,6 +1819,90 @@ fn renewal_committed_cleanup_warning_keeps_new_acceptor_and_startup_prefers_curr
 }
 
 #[test]
+fn renewal_crash_after_pair_publication_retires_backup_on_startup_or_next_recreation() {
+    for recreate_again in [false, true] {
+        let fixture = Fixture::new();
+        let old = fixture.0.load().unwrap();
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            renewal::recreate(
+                &fixture.0,
+                &mut Default::default(),
+                Some(thumb(&old)),
+                NOW,
+                |_| Ok(()),
+                |stage| {
+                    if stage == renewal::Stage::AfterCertPublish {
+                        panic!("injected process interruption");
+                    }
+                    Ok(())
+                },
+            )
+        }));
+        assert!(interrupted.is_err());
+        assert!(!read_user_revocations(&WindowsTlsTrustOps, &fixture.0).is_revoked(&thumb(&old)));
+        let published =
+            CertThumbprint::of_pem(&std::fs::read(fixture.0.tls().join(CERT_FILE)).unwrap())
+                .unwrap();
+        assert_ne!(published, thumb(&old));
+        if recreate_again {
+            renewal::recreate(
+                &fixture.0,
+                &mut Default::default(),
+                Some(published),
+                NOW,
+                |_| Ok(()),
+                |_| Ok(()),
+            )
+            .unwrap();
+        } else {
+            fixture.0.load().unwrap();
+        }
+        assert!(read_user_revocations(&WindowsTlsTrustOps, &fixture.0).is_revoked(&thumb(&old)));
+        assert!(!fixture.0.tls().join(renewal::CERT_OLD).exists());
+    }
+}
+
+#[test]
+fn renewal_crash_recovery_preserves_backup_and_refuses_tls_if_retirement_cannot_be_written() {
+    let fixture = Fixture::new();
+    let old = fixture.0.load().unwrap();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        renewal::recreate(
+            &fixture.0,
+            &mut Default::default(),
+            Some(thumb(&old)),
+            NOW,
+            |_| Ok(()),
+            |stage| {
+                if stage == renewal::Stage::AfterCertPublish {
+                    panic!("injected interruption");
+                }
+                Ok(())
+            },
+        )
+    }));
+    let records_a = fixture.0.spec(UserPlaceKind::RevocationsA).path();
+    let user = WindowsTlsTrustOps.current_user_sid().unwrap();
+    let result = load_in_observed(
+        &WindowsTlsTrustOps,
+        &fixture.0,
+        &ReconcileOptions::default(),
+        NOW,
+        |stage| {
+            if stage == CreationStage::BeforeIdentityCheck {
+                acl(&records_a, &["/deny", &format!("*{user}:(W)")]);
+            }
+        },
+    );
+    acl(&records_a, &["/remove:d", &format!("*{user}")]);
+    assert!(result.is_err());
+    assert!(fixture.0.tls().join(renewal::CERT_OLD).exists());
+    assert!(fixture.0.tls().join(renewal::KEY_OLD).exists());
+    fixture.0.load().unwrap();
+    assert!(read_user_revocations(&WindowsTlsTrustOps, &fixture.0).is_revoked(&thumb(&old)));
+}
+
+#[test]
 fn renewal_startup_prefers_current_even_with_broken_old_contents() {
     let fixture = Fixture::new();
     let old = fixture.0.load().unwrap();

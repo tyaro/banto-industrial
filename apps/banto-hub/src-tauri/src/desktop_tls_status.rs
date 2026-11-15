@@ -5,6 +5,8 @@ use serde::Serialize;
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Presentation {
+    pub requires_recreation: bool,
+    pub can_resume: bool,
     pub label: String,
     pub reason: Option<String>,
     pub remedy: String,
@@ -27,10 +29,20 @@ pub(crate) fn present(
         ("ChronoGazer 接続用 TLS: この起動では再開できません", "理由とログを確認し、原因を取り除いて Hub を再起動してください。露出が疑われる場合は鍵・証明書を作り直し、失効の記録は消さないでください")
     };
     Presentation {
+        requires_recreation: status.requires_recreation,
+        can_resume: status.can_resume,
         label: label.into(),
         reason: status.reason.clone(),
         remedy: remedy.into(),
     }
+}
+
+pub(crate) fn notification_changed(
+    previous: Option<&Presentation>,
+    current: Option<&Presentation>,
+) -> bool {
+    previous.map(|p| (&p.label, p.requires_recreation, p.can_resume))
+        != current.map(|p| (&p.label, p.requires_recreation, p.can_resume))
 }
 
 pub(crate) fn current(state: &crate::AppState) -> Option<Presentation> {
@@ -52,6 +64,25 @@ pub(crate) fn current(state: &crate::AppState) -> Option<Presentation> {
 mod tests {
     use super::*;
     use banto_hub_core::hub_tls_prepare::desktop::watch::DesktopTlsStatus;
+    #[test]
+    fn notifications_ignore_reason_changes_but_track_recovery_and_recreation() {
+        let mut status = DesktopTlsStatus {
+            address: None,
+            reason: Some("first".into()),
+            requires_recreation: false,
+            can_resume: true,
+        };
+        let before = present(&status);
+        status.reason = Some("another retry detail".into());
+        assert!(!notification_changed(
+            Some(&before),
+            Some(&present(&status))
+        ));
+        status.can_resume = false;
+        assert!(notification_changed(Some(&before), Some(&present(&status))));
+        status.requires_recreation = true;
+        assert!(notification_changed(Some(&before), Some(&present(&status))));
+    }
     #[test]
     fn startup_recreation_and_retry_failures_have_distinct_native_guidance() {
         use banto_hub_core::hub_tls_prepare::desktop::DesktopTlsUnavailable;

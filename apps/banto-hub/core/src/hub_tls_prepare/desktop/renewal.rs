@@ -175,6 +175,7 @@ pub(super) fn recover(
     now: i64,
     current: &PairBytes,
     explicit_recreation: bool,
+    mut record: impl FnMut(CertThumbprint) -> ReconcileReport,
 ) -> Result<bool, DesktopFailure> {
     let old_cert = checked_auxiliary_file(ops, dir, CERT_OLD)?;
     let old_key = checked_auxiliary_file(ops, dir, KEY_OLD)?;
@@ -186,6 +187,28 @@ pub(super) fn recover(
         drop(checked_auxiliary_file(ops, dir, name)?);
     }
     if matches!((&current.0, &current.1), (Some(cert), Some(key)) if pair_matches(cert, key)) {
+        // A complete current pair different from the backup proves publication
+        // completed. Retire the backup before cleanup, including crash recovery.
+        // The same pair may instead be a completed rollback; never revoke it.
+        if let Some(mut file) = old_cert {
+            let bytes = TlsFile::read_all(&mut file, MAX_PEM_BYTES)
+                .map_err(|e| DesktopFailure::retry(format!("旧い証明書を読めません: {e}")))?;
+            if let Ok(old) = CertThumbprint::of_pem(&bytes) {
+                let current = current
+                    .0
+                    .as_ref()
+                    .and_then(|cert| CertThumbprint::of_pem(cert).ok());
+                if current != Some(old) {
+                    let report = record(old);
+                    if report.outcome != ReconcileOutcome::Consistent
+                        || !report.revocations.is_settled()
+                        || !report.revocations.is_revoked(&old)
+                    {
+                        return Err(DesktopFailure::retry("公開済みの旧証明書の失効を両方の記録へ書けません。旧いファイルを残し、TLS を使いません"));
+                    }
+                }
+            }
+        }
         return Ok(true);
     }
     let read = |file: Option<PinnedFile>| {
@@ -318,7 +341,17 @@ pub(super) fn recreate<P: UserTlsPlace + ?Sized>(
         }
     ));
     if validated!(
-        recover(&ops, &dir, &records.read(), now, &old, true).map_err(|error| {
+        recover(&ops, &dir, &records.read(), now, &old, true, |thumb| {
+            let report = records.record(thumb, RevokedCertPlace::User);
+            if report.outcome != ReconcileOutcome::Consistent
+                || !report.revocations.is_settled()
+                || !report.revocations.is_revoked(&thumb)
+            {
+                pending.insert(thumb);
+            }
+            report
+        })
+        .map_err(|error| {
             if matches!(&error.remedy, DesktopRemedy::BackupKeyExposure) {
                 exposure_seen = true;
                 let _ = switch(None);
