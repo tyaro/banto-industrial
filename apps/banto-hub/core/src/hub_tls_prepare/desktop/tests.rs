@@ -333,7 +333,11 @@ fn initial_creation_holds_the_record_lock_until_identity_is_published() {
     .unwrap();
     assert_eq!(
         stages,
-        vec![CreationStage::BeforeGeneration, CreationStage::AfterPublish]
+        vec![
+            CreationStage::BeforeGeneration,
+            CreationStage::BeforePublish,
+            CreationStage::AfterPublish
+        ]
     );
 }
 
@@ -685,6 +689,205 @@ fn assert_auxiliary_repair(lines: &str, name: &str) {
     assert!(!lines.contains("漏れた鍵"), "{lines}");
     assert!(!lines.contains("フォルダごと削除"), "{lines}");
     assert!(!lines.contains("作り直"), "{lines}");
+}
+
+#[test]
+fn interrupted_cleanup_io_failure_can_retry_without_deleting_tls() {
+    let fixture = Fixture::new();
+    let place = &fixture.0;
+    place.initialize_records();
+    place.put(CREATING, CREATING_CONTENTS);
+    place.put(KEY_FILE, b"interrupted");
+    let dir = place.dir();
+    let held = WindowsTlsTrustOps
+        .open_child_file(dir.dir(), KEY_FILE)
+        .unwrap()
+        .unwrap();
+    let error = load_in(
+        &WindowsTlsTrustOps,
+        place,
+        &ReconcileOptions::default(),
+        NOW,
+    )
+    .unwrap_err();
+    assert_retry_later(&error.into_unavailable().log_lines().join("\n"));
+    assert!(place.tls().join(CREATING).exists());
+    assert_eq!(
+        std::fs::read(place.tls().join(KEY_FILE)).unwrap(),
+        b"interrupted"
+    );
+    drop(held);
+    drop(dir);
+    assert!(place.load().is_ok());
+}
+
+#[test]
+fn open_and_read_io_failures_only_require_retrying_the_same_identity() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::LockFile;
+
+    for name in [CERT_FILE, KEY_FILE, CREATING] {
+        for exclusive_open in [true, false] {
+            let fixture = Fixture::new();
+            let place = &fixture.0;
+            let cert = place.load().unwrap();
+            if name == CREATING {
+                place.put(CREATING, CREATING_CONTENTS);
+            }
+            let dir = place.dir();
+            let (exclusive, range) = if exclusive_open {
+                (
+                    WindowsTlsTrustOps
+                        .open_child_file_exclusive(dir.dir(), name)
+                        .unwrap(),
+                    None,
+                )
+            } else {
+                let file = std::fs::File::open(place.tls().join(name)).unwrap();
+                // open/ACL 確認は通るが、別ハンドルからの ReadFile だけを os error 33 にする。
+                // SAFETY: 有効な File のハンドルを持ち、範囲 0..1 を閉じるまで排他にする。
+                assert_ne!(unsafe { LockFile(file.as_raw_handle(), 0, 0, 1, 0) }, 0);
+                (None, Some(file))
+            };
+            let error = load_in(
+                &WindowsTlsTrustOps,
+                place,
+                &ReconcileOptions::default(),
+                NOW,
+            )
+            .unwrap_err();
+            let lines = error.into_unavailable().log_lines().join("\n");
+            assert!(lines.contains(name), "{lines}");
+            if !exclusive_open {
+                assert!(
+                    lines.contains("os error 33"),
+                    "実際の read I/O 失敗: {lines}"
+                );
+            }
+            assert_retry_later(&lines);
+            drop((exclusive, range, dir));
+            assert_eq!(thumb(&place.load().unwrap()), thumb(&cert));
+            assert!(!read_user_revocations(&WindowsTlsTrustOps, place).is_revoked(&thumb(&cert)));
+        }
+    }
+}
+
+#[test]
+fn creation_collisions_and_rename_io_failures_preserve_the_marker_for_retry() {
+    for rename in [false, true] {
+        let fixture = Fixture::new();
+        let place = &fixture.0;
+        let mut held = None;
+        let error = load_in_observed(
+            &WindowsTlsTrustOps,
+            place,
+            &ReconcileOptions::default(),
+            NOW,
+            |stage| match (rename, stage) {
+                (false, CreationStage::BeforeGeneration) => place.put(KEY_TEMP, b"collision"),
+                (true, CreationStage::BeforePublish) => {
+                    held = WindowsTlsTrustOps
+                        .open_child_file(place.dir().dir(), KEY_TEMP)
+                        .unwrap();
+                }
+                _ => {}
+            },
+        )
+        .unwrap_err();
+        let lines = error.into_unavailable().log_lines().join("\n");
+        assert!(lines.contains(KEY_TEMP), "{lines}");
+        if rename {
+            assert!(
+                lines.contains("os error 32"),
+                "実際の rename I/O 失敗: {lines}"
+            );
+        }
+        assert_retry_later(&lines);
+        assert!(place.tls().join(CREATING).exists());
+        assert!(place.tls().join(KEY_TEMP).exists());
+        drop(held);
+        assert!(place.load().is_ok());
+    }
+}
+
+#[test]
+fn folder_creation_denied_by_the_owner_is_retryable_without_deleting_tls() {
+    let fixture = Fixture::new();
+    let place = &fixture.0;
+    let sid = format!("*{}", WindowsTlsTrustOps.current_user_sid().unwrap());
+    acl(&place.0, &["/deny", &format!("{sid}:(AD)")]);
+    let error = load_in(
+        &WindowsTlsTrustOps,
+        place,
+        &ReconcileOptions::default(),
+        NOW,
+    )
+    .unwrap_err();
+    assert!(error.reason.contains("作れません"), "{error}");
+    assert_retry_later(&error.into_unavailable().log_lines().join("\n"));
+    acl(&place.0, &["/remove:d", &sid]);
+    assert!(place.load().is_ok());
+}
+
+#[test]
+fn untrusted_lock_files_do_not_require_deleting_the_valid_identity() {
+    for records_lock in [false, true] {
+        let fixture = Fixture::new();
+        let place = &fixture.0;
+        let cert = place.load().unwrap();
+        let path = if records_lock {
+            place.spec(UserPlaceKind::RevocationsLock).path()
+        } else {
+            place.tls().join(LOCK_FILE)
+        };
+        acl(&path, &["/grant", "*S-1-1-0:(M)"]);
+        let error = load_in(
+            &WindowsTlsTrustOps,
+            place,
+            &ReconcileOptions::default(),
+            NOW,
+        )
+        .unwrap_err();
+        let lines = error.into_unavailable().log_lines().join("\n");
+        if records_lock {
+            assert_retry_later(&lines);
+        } else {
+            assert_auxiliary_repair(&lines, LOCK_FILE);
+        }
+        assert!(!read_user_revocations(&WindowsTlsTrustOps, place).is_revoked(&thumb(&cert)));
+        acl(&path, &["/remove:g", "*S-1-1-0"]);
+        assert_eq!(thumb(&place.load().unwrap()), thumb(&cert));
+    }
+}
+
+#[test]
+fn oversized_identity_still_requires_recreation_but_generation_failure_only_retries() {
+    let fixture = Fixture::new();
+    let place = &fixture.0;
+    place.load().unwrap();
+    std::fs::write(place.tls().join(KEY_FILE), vec![b'x'; MAX_PEM_BYTES + 1]).unwrap();
+    let error = load_in(
+        &WindowsTlsTrustOps,
+        place,
+        &ReconcileOptions::default(),
+        NOW,
+    )
+    .unwrap_err();
+    let lines = error.into_unavailable().log_lines().join("\n");
+    assert!(lines.contains("大きすぎます"), "{lines}");
+    assert!(lines.contains("フォルダごと削除"), "{lines}");
+
+    let fresh = Fixture::new();
+    let error = load_in(
+        &WindowsTlsTrustOps,
+        &fresh.0,
+        &ReconcileOptions::default(),
+        i64::MAX,
+    )
+    .unwrap_err();
+    assert_retry_later(&error.into_unavailable().log_lines().join("\n"));
+    assert!(fresh.0.tls().join(CREATING).exists());
+    assert!(fresh.0.load().is_ok());
 }
 
 #[test]
@@ -1182,6 +1385,7 @@ fn creation_child() {
                     signal(&place, "after-publish");
                     wait_for_signal(&place, "finish-creation");
                 }
+                CreationStage::BeforePublish => {}
             },
         )
         .unwrap();
