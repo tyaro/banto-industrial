@@ -13,6 +13,13 @@ pub(crate) struct Presentation {
 }
 
 #[cfg(windows)]
+pub(crate) fn offers_recreation(
+    status: &banto_hub_core::hub_tls_prepare::desktop::watch::DesktopTlsStatus,
+) -> bool {
+    status.requires_recreation || status.address.is_some()
+}
+
+#[cfg(windows)]
 pub(crate) fn present(
     status: &banto_hub_core::hub_tls_prepare::desktop::watch::DesktopTlsStatus,
 ) -> Presentation {
@@ -65,6 +72,24 @@ pub(crate) fn current(state: &crate::AppState) -> Option<Presentation> {
 mod tests {
     use super::*;
     use banto_hub_core::hub_tls_prepare::desktop::watch::DesktopTlsStatus;
+    #[test]
+    fn recreation_is_offered_only_for_an_active_or_recreation_required_identity() {
+        let mut status = DesktopTlsStatus {
+            remedy: None,
+            address: None,
+            reason: Some("temporary lock failure".into()),
+            requires_recreation: false,
+            can_resume: true,
+        };
+        assert!(!offers_recreation(&status));
+        status.can_resume = false;
+        assert!(!offers_recreation(&status));
+        status.requires_recreation = true;
+        assert!(offers_recreation(&status));
+        status.requires_recreation = false;
+        status.address = Some("127.0.0.1:8723".parse().unwrap());
+        assert!(offers_recreation(&status));
+    }
     #[test]
     fn notifications_ignore_reason_changes_but_track_recovery_and_recreation() {
         let mut status = DesktopTlsStatus {

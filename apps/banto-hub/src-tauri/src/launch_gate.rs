@@ -395,6 +395,14 @@ pub(crate) const RESTORE_REPAIRING_MESSAGE: &str =
 /// Fallback の窓の見出しと本文（一般は `None` で、従来の診断の行だけを出す）。
 pub(crate) const SHELL_TRANSPORT_RESTART_MESSAGE: &str = "このプロセスでは管理画面の待ち受けを復旧できません。ログの原因を確認し、アプリを終了してから再起動してください。";
 
+pub(crate) fn require_stopped_local_hub(idle: bool) -> Result<(), &'static str> {
+    if idle {
+        Ok(())
+    } else {
+        Err("このアプリの Hub が稼働中または起動・停止処理中のため、設定モードの復旧は行いません。Hub の停止を確認してから再試行してください")
+    }
+}
+
 pub(crate) fn cause_page(cause: FallbackCause) -> Option<(&'static str, Vec<&'static str>)> {
     let service_log =
         "原因はサービスのログ（profile の logs\\banto-hub-service.log）で確かめられます。";

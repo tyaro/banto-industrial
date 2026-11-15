@@ -412,7 +412,8 @@ struct ProbeTarget {
 /// `app.manage()` で保持するアプリ全体の唯一の可変状態。
 pub(crate) struct AppState {
     /// 稼働中の Hub の置き場所。デスクトップホストとして起動できた場合のみ
-    /// Hub が置かれる（サービス接続時・fallback 時は空 - [`render_fallback`]・
+    /// Hub が置かれる（管理画面の待ち受けだけを失った Fallback でも稼働し続ける。
+    /// 表示ではなくこの置き場所で稼働を判定する - [`render_fallback`]・
     /// [`show_startup_error`]参照）。
     ///
     /// #586: 以前は `tokio::sync::Mutex<Option<RunningHub>>` で、空かどうか
@@ -635,9 +636,16 @@ fn fallback_message(info: &FallbackInfo, can_operate: bool) -> String {
         ));
     }
     if let Some(err) = &info.desktop_error {
-        lines.push(format!("このアプリでの起動に失敗しました: {err}"));
+        lines.push(if info.cause == FallbackCause::ShellTransportUnavailable {
+            format!("管理画面の待ち受けに問題が起きました: {err}")
+        } else {
+            format!("このアプリでの起動に失敗しました: {err}")
+        });
     }
-    lines.push(if can_operate {
+    lines.push(if !info.cause.offers_retry() {
+        if can_operate { "利用できる操作は下のボタンかトレイに表示します。管理画面の待ち受けの復旧にはアプリの再起動が必要です。".to_string() }
+        else { "サービス操作には 'BantoHub Operators' グループへの参加が必要です。管理画面の待ち受けの復旧にはアプリの再起動が必要です。".to_string() }
+    } else if can_operate {
         "下のボタンかタスクトレイからサービスの開始・停止や再試行を操作できます。".to_string()
     } else {
         "サービス操作には 'BantoHub Operators' グループへの参加が必要です。下のボタンかトレイの「再試行」で状態を再確認できます。".to_string()
@@ -1775,7 +1783,13 @@ fn build_desktop_tray_menu(
     if app
         .state::<AppState>()
         .hub
-        .inspect(|hub| hub.desktop_tls_recreation().is_some())
+        .inspect(|hub| {
+            hub.desktop_tls_recreation().is_some()
+                && hub
+                    .desktop_tls_status()
+                    .as_ref()
+                    .is_some_and(desktop_tls_status::offers_recreation)
+        })
         .unwrap_or(false)
     {
         builder = builder.text("recreate_tls", "TLS の証明書を作り直す…");
@@ -2244,6 +2258,17 @@ fn apply_host_switch_outcome(app: &AppHandle, target: &ProbeTarget, result: Host
 ///    Hub を起動しない（Service→Desktop の途中で終了すると、サービスは止まり
 ///    アプリも終わる。終了がサービスを開始し直すことはしない）。
 #[cfg(windows)]
+fn switch_host_kind(view: &ShellView, local_hub_idle: bool) -> HostKind {
+    if !local_hub_idle {
+        return HostKind::Desktop;
+    }
+    match view {
+        ShellView::Service { .. } => HostKind::Service,
+        _ => HostKind::Offline,
+    }
+}
+
+#[cfg(windows)]
 pub(crate) fn run_host_switch(app: &AppHandle, command: SwitchCommand) {
     let state = app.state::<AppState>();
     let Some(switch_ticket) = state.hub.begin_switch() else {
@@ -2260,11 +2285,10 @@ pub(crate) fn run_host_switch(app: &AppHandle, command: SwitchCommand) {
         );
         return;
     };
-    let initial_host = match &*state.view.lock().expect("view mutex poisoned") {
-        ShellView::Desktop => HostKind::Desktop,
-        ShellView::Service { .. } => HostKind::Service,
-        ShellView::Fallback(_) => HostKind::Offline,
-    };
+    let initial_host = switch_host_kind(
+        &state.view.lock().expect("view mutex poisoned"),
+        state.hub.is_idle(),
+    );
     let can_operate = state.can_operate_service;
     let target = expected_probe_target();
     let manager = build_service_manager();
@@ -2531,6 +2555,16 @@ pub(crate) fn run_restore_setting(app: &AppHandle) {
 /// [`run_restore_setting`] の本体（札を持った背景のスレッドで呼ぶ）。
 #[cfg(windows)]
 fn restore_setting_body(app: &AppHandle, target: &ProbeTarget) -> SwitchProgress {
+    if let Err(reason) =
+        launch_gate::require_stopped_local_hub(app.state::<AppState>().hub.is_idle())
+    {
+        return SwitchProgress {
+            phase: "faulted",
+            message: reason.into(),
+            error: Some(reason.into()),
+            fallback_cause: None,
+        };
+    }
     let manager = build_service_manager();
     let outcome = relax_only_and_wait(&manager, &RealClock, SWITCH_TIMINGS);
     let after = launch_gate::after_relax(&outcome);
@@ -3153,6 +3187,65 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn fallback_with_a_live_hub_blocks_repair_and_stops_desktop_before_service_start() {
+        use banto_hub_core::host_switch::{
+            DesktopHostError, FaultStage, MockDesktopHostControl, StepOutcome,
+        };
+        use banto_hub_core::hub_health::MockHubHealthProbe;
+        use banto_hub_core::service_manager::MockServiceManager;
+        let view = ShellView::Fallback(FallbackInfo {
+            scm_state: Some(ScmState::Stopped),
+            health: None,
+            desktop_error: Some("shell listener stopped".into()),
+            cause: FallbackCause::ShellTransportUnavailable,
+        });
+        let slot = HubSlot::new();
+        let start = slot.begin_start().unwrap();
+        assert!(slot.install((), start).is_ok());
+        assert!(launch_gate::require_stopped_local_hub(slot.is_idle()).is_err());
+        assert_eq!(switch_host_kind(&view, slot.is_idle()), HostKind::Desktop);
+        let mut desktop = MockDesktopHostControl::new();
+        desktop.inject_stop_error(DesktopHostError::Other(
+            "desktop stop must happen before SCM start".into(),
+        ));
+        let mut engine = HostSwitchEngine::new(
+            MockServiceManager::new(),
+            MockHubHealthProbe::unreachable(),
+            desktop,
+            HostSwitchConfig {
+                expected_profile: "default".into(),
+                expected_port: 8722,
+                can_operate_service: true,
+                initial_host: switch_host_kind(&view, slot.is_idle()),
+                phase_timeout: Duration::from_secs(5),
+            },
+        );
+        assert!(matches!(
+            engine.step(SwitchCommand::SwitchToService).unwrap(),
+            StepOutcome::Faulted {
+                stage: FaultStage::DesktopStopping,
+                ..
+            }
+        ));
+        let (_, stopping) = slot.take_for_stop().unwrap();
+        assert!(launch_gate::require_stopped_local_hub(slot.is_idle()).is_err());
+        drop(stopping);
+        assert!(launch_gate::require_stopped_local_hub(slot.is_idle()).is_ok());
+        assert_eq!(switch_host_kind(&view, slot.is_idle()), HostKind::Offline);
+        for can_operate in [false, true] {
+            let ShellView::Fallback(info) = &view else {
+                unreachable!()
+            };
+            let page = fallback_page(info, can_operate);
+            assert!(!page.message.contains("再試行"));
+            assert!(!page.message.contains("起動に失敗"));
+            assert!(page.message.contains("管理画面の待ち受けに問題"));
+            assert!(page.message.contains("再起動"));
+            assert!(page.actions.iter().all(|action| action.id != "retry"));
+        }
+    }
     #[cfg(windows)]
     #[test]
     fn tls_recreation_rejections_explain_closing_stopped_and_unavailable_states() {

@@ -1702,7 +1702,7 @@ impl RunningHub {
         if !detached.wait(detached_stop_timeout).await {
             log_err_line(&format!(
                 "banto-hub: [WARN] 切り離した保存・監査のタスクが {} 秒のうちに終わりませんでした（{} 件が残ったまま終了へ進みます）",
-                DETACHED_STOP_TIMEOUT.as_secs(),
+                detached_stop_timeout.as_secs_f64(),
                 detached.pending()
             ));
         }

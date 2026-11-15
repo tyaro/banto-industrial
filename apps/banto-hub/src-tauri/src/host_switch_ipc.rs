@@ -254,12 +254,7 @@ pub fn restore_setting_mode(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     crate::shell_tls::require_command_origin(&window)?;
-    if matches!(
-        *state.view.lock().expect("view mutex poisoned"),
-        ShellView::Desktop
-    ) {
-        return Err("既に設定モードです（このアプリで Hub が動いています）".into());
-    }
+    crate::launch_gate::require_stopped_local_hub(state.hub.is_idle()).map_err(str::to_string)?;
     if !begin_switch_or_warn(&app) {
         return Err("既に切替処理が進行中です".into());
     }
