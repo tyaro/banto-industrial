@@ -512,11 +512,8 @@ impl HubRuntime {
                 profile_lock.clone(),
             )
             .await;
-            let profile_lock = Arc::try_unwrap(profile_lock).map_err(|_| {
-                HubStartError::Tls("TLS の準備後に profile の排他を回収できませんでした".into())
-            })?;
             let tls_config = match loaded {
-                Some(Ok(identity)) => Some(TlsPlan::Default(identity)),
+                Some(Ok(identity)) => Some(TlsPlan::Desktop(identity)),
                 Some(Err(found)) => {
                     for line in found.log_lines() {
                         log_err_line(&line);
@@ -527,6 +524,9 @@ impl HubRuntime {
             };
             (tls_config, profile_lock)
         };
+
+        #[cfg(not(windows))]
+        let profile_lock = Arc::new(profile_lock);
 
         // #661 661-1・#623 PR2a: 握った組を渡されたときだけ、profile の中の設定 DB は本体・
         // `-wal`・`-shm` を握ってから開く（`start` の経路 = デスクトップ・コンソールは以前と
@@ -582,6 +582,8 @@ impl HubRuntime {
         // から返るので、上の `?` で握りを落としてよい。
         let started = Self::start_on_db(StartOnDb {
             pool: pool.clone(),
+            #[cfg(windows)]
+            tls_keep_alive: profile_lock.clone(),
             registry,
             drivers,
             tls_config,
@@ -598,7 +600,7 @@ impl HubRuntime {
         match started {
             Ok(mut hub) => {
                 hub.db_pins = db_pins;
-                hub._profile_lock = profile_lock;
+                hub._profile_lock = Some(profile_lock);
                 hub._profile_dirs = given_dirs;
                 Ok(hub)
             }
@@ -628,6 +630,8 @@ impl HubRuntime {
     async fn start_on_db(on_db: StartOnDb<'_>) -> Result<RunningHub, HubStartError> {
         let StartOnDb {
             pool,
+            #[cfg(windows)]
+            tls_keep_alive,
             registry,
             drivers,
             tls_config,
@@ -1127,6 +1131,10 @@ impl HubRuntime {
             };
         // `Some(line)` は既定の TLS を待ち受けたときの行（ログは下でまとめて出す）。
         let mut default_tls_line: Option<String> = None;
+        #[cfg(windows)]
+        let mut desktop_tls_monitor = None;
+        #[cfg(windows)]
+        let desktop_selected = matches!(&tls_config, Some(TlsPlan::Desktop(_)));
         let tls_server = match tls_config {
             Some(TlsPlan::Explicit(config)) => match tls_listener::start(&config, app).await {
                 Ok(listener) => Some(listener),
@@ -1140,15 +1148,51 @@ impl HubRuntime {
                     return Err(HubStartError::Tls(err.to_string()));
                 }
             },
-            Some(TlsPlan::Default(mut identity)) => {
+            Some(plan) => {
+                let mut identity = match plan {
+                    TlsPlan::Default(identity) => identity,
+                    #[cfg(windows)]
+                    TlsPlan::Desktop(identity) => identity,
+                    TlsPlan::Explicit(_) => unreachable!("explicit TLS handled above"),
+                };
                 // #644 PR1b・オーナー決定 B: 既定の 8723 を取れない（別のプロセスが先に取った）
                 // ときも Hub は TLS 無しで起動し、理由と対処をログに出す。
+                #[cfg(windows)]
+                let serving = banto_hub_tls_trust::CertThumbprint::of_pem(identity.cert_pem()).ok();
                 let (cert, key) = identity.take_pem();
                 let config = TlsConfig::in_memory(identity.port(), cert, key);
-                match tls_listener::start(&config, app).await {
+                match tls_listener::start(&config, app.clone()).await {
                     Ok(listener) => {
-                        default_tls_line = Some(identity.listening_line(listener.local_addr()));
-                        Some(listener)
+                        let listening_line = identity.listening_line(listener.local_addr());
+                        #[cfg(windows)]
+                        if desktop_selected {
+                            if let Some(serving) = serving {
+                                default_tls_line = Some(listening_line);
+                                desktop_tls_monitor =
+                                    Some(crate::hub_tls_prepare::desktop::watch::spawn(
+                                        listener,
+                                        config,
+                                        app,
+                                        serving,
+                                        tls_keep_alive,
+                                    ));
+                                // 所有者は monitor。停止時に listener を回収して通常の順序で閉じる。
+                                None
+                            } else {
+                                listener.revoker().revoke();
+                                listener.stop().await;
+                                log_err_line("[WARN] banto-hub: 既定 TLS の拇印を取得できないため待ち受けを停止しました");
+                                None
+                            }
+                        } else {
+                            default_tls_line = Some(listening_line);
+                            Some(listener)
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            default_tls_line = Some(listening_line);
+                            Some(listener)
+                        }
                     }
                     Err(err) => {
                         let lines = bind_failure_lines(config.port(), &err.to_string());
@@ -1248,6 +1292,8 @@ impl HubRuntime {
             sim_registry,
             server,
             tls_server,
+            #[cfg(windows)]
+            desktop_tls_monitor,
             port_fallback_from,
             eval_handle,
             prune_handle,
@@ -1269,11 +1315,15 @@ enum TlsPlan {
     Explicit(TlsConfig),
     /// サービスの既定（bind の失敗は TLS 無しで続ける）。
     Default(DefaultHubTls),
+    #[cfg(windows)]
+    Desktop(DefaultHubTls),
 }
 
 /// [`HubRuntime::start_on_db`] に渡す、設定 DB を開くまでに決めたもの。
 struct StartOnDb<'a> {
     pool: SqlitePool,
+    #[cfg(windows)]
+    tls_keep_alive: Arc<Option<ProfileLockGuard>>,
     registry: Arc<banto_driver_api::DriverRegistry>,
     drivers: crate::broker_glue::HubDrivers,
     tls_config: Option<TlsPlan>,
@@ -1443,6 +1493,8 @@ pub struct RunningHub {
     sim_registry: Arc<BrokerSimRegistry>,
     server: RunningServer,
     tls_server: Option<RunningTlsServer>,
+    #[cfg(windows)]
+    desktop_tls_monitor: Option<crate::hub_tls_prepare::desktop::watch::Monitor>,
     /// #479: デスクトップシェルが既定ポートの競合で OS 割り当てへ退避したとき、
     /// 本来 bind したかったポート。退避しなかったら `None`。
     port_fallback_from: Option<u16>,
@@ -1467,7 +1519,7 @@ pub struct RunningHub {
     /// close（`flock`自動解放）を行う。`skip_profile_lock: true`で構築した
     /// 場合は`None`。例外: [`RunningHub::shutdown_and_report`] で設定 DB を閉じ終えられ
     /// なかったとき（`db_closed == false`）は drop で離さず、プロセスの終わりまで持つ。
-    _profile_lock: Option<ProfileLockGuard>,
+    _profile_lock: Option<Arc<Option<ProfileLockGuard>>>,
     /// 設定 DB の pool（#661 661-1）。[`RunningHub::shutdown`] の最後に閉じる
     /// （[`RunningHub::shutdown_and_report`]）。
     pool: SqlitePool,
@@ -1525,6 +1577,10 @@ impl RunningHub {
 
     /// The dedicated loopback TLS address, when configured.
     pub fn tls_local_addr(&self) -> Option<std::net::SocketAddr> {
+        #[cfg(windows)]
+        if let Some(monitor) = &self.desktop_tls_monitor {
+            return monitor.status().address;
+        }
         self.tls_server.as_ref().map(RunningTlsServer::local_addr)
     }
 
@@ -1533,7 +1589,21 @@ impl RunningHub {
     /// 再開しない（`crate::tls_listener` のモジュール doc「失効による停止」）。通常の停止
     /// （[`Self::shutdown_and_report`]）の挙動は変えない。
     pub fn tls_revoker(&self) -> Option<TlsRevoker> {
+        #[cfg(windows)]
+        if let Some(monitor) = &self.desktop_tls_monitor {
+            return monitor.revoker();
+        }
         self.tls_server.as_ref().map(RunningTlsServer::revoker)
+    }
+
+    /// デスクトップ既定 TLS の状態と理由（表示は PR3 で接続する）。
+    #[cfg(windows)]
+    pub fn desktop_tls_status(
+        &self,
+    ) -> Option<crate::hub_tls_prepare::desktop::watch::DesktopTlsStatus> {
+        self.desktop_tls_monitor
+            .as_ref()
+            .map(|monitor| monitor.status())
     }
 
     /// #479: 既定ポートが埋まっていて OS 割り当てのポートへ退避して起動したとき、
@@ -1564,6 +1634,11 @@ impl RunningHub {
     /// 閉じ終えてから ACL を緩める）。閉じ終えられなかったら、DB の握りに加えて profile の
     /// 排他と握ったフォルダもプロセスの終わりまで離さない。
     pub async fn shutdown_and_report(mut self) -> HubShutdownReport {
+        // 周期の検査/再 bind を先に待ち切り、以後の停止や profile の解放と競合させない。
+        #[cfg(windows)]
+        if let Some(monitor) = &mut self.desktop_tls_monitor {
+            monitor.signal_stop();
+        }
         log_line("banto-hub: shutting down");
         // #392 A2 レビュー（2026-10-12）: 終了の受付の**取り消せない**印を立て、以降の収集の
         // 開始（REST/MCP はこの関数の最後の `server.stop()` まで受け付けて
@@ -1637,6 +1712,10 @@ impl RunningHub {
         // (`sessions`), so they are stopped last - see this module's doc
         // comment ("シャットダウン順序").
         self.sim_registry.shutdown().await;
+        #[cfg(windows)]
+        if let Some(monitor) = self.desktop_tls_monitor.take() {
+            monitor.stop().await;
+        }
         if let Some(tls_server) = self.tls_server {
             tls_server.stop().await;
         }
