@@ -1525,6 +1525,7 @@ impl RunningHub {
                     .as_ref()
                     .expect("running Hub router")
                     .clone(),
+                self.manager.detached().clone(),
             ),
         );
     }
@@ -1598,7 +1599,15 @@ impl RunningHub {
     /// 排他と握ったフォルダもプロセスの終わりまで離さない。
     pub async fn shutdown_and_report(mut self) -> HubShutdownReport {
         // Detach before any collector, transport or DB shutdown.
-        self.shell_attachment.take();
+        let detached_stop_timeout = if let Some(attachment) = self.shell_attachment.take() {
+            let started = tokio::time::Instant::now();
+            attachment.detach().await;
+            // Share the existing detached-task budget rather than adding
+            // another wait to the desktop host's shutdown deadline.
+            DETACHED_STOP_TIMEOUT.saturating_sub(started.elapsed())
+        } else {
+            DETACHED_STOP_TIMEOUT
+        };
         self.shell_router.take();
         // 周期の検査/再 bind を先に待ち切り、以後の停止や profile の解放と競合させない。
         #[cfg(windows)]
@@ -1690,7 +1699,7 @@ impl RunningHub {
         // 含め、切り離したタスク（監査を書く）の終わりを pool を閉じる前に待つ。上限を
         // 過ぎても abort しない（DB を触るタスクを `abort()` で止めない）。
         let detached = self.manager.detached();
-        if !detached.wait(DETACHED_STOP_TIMEOUT).await {
+        if !detached.wait(detached_stop_timeout).await {
             log_err_line(&format!(
                 "banto-hub: [WARN] 切り離した保存・監査のタスクが {} 秒のうちに終わりませんでした（{} 件が残ったまま終了へ進みます）",
                 DETACHED_STOP_TIMEOUT.as_secs(),

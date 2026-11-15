@@ -152,7 +152,10 @@ test.describe.serial('banto-hub 取り込み口 push（R2a-2e）', () => {
 
 		await expect(wizard.getByText('60000 ms')).toBeVisible();
 		await expect(wizard.getByText('なし（スクリプトなどの送り手が送る）')).toBeVisible();
-		await expect(wizard.getByText(/作成すると、ここに送り手向けの URL/)).toBeVisible();
+		const ingestInfo = wizard.getByRole('region', { name: '送り手向けの URL とスコープ' });
+		await expect(ingestInfo).toContainText('作成すると、ここに送り手向けの');
+		await expect(ingestInfo).toContainText('接続 id');
+		await expect(ingestInfo).toContainText('API キーのスコープ');
 
 		const created = page.waitForResponse(
 			(r) => r.url().endsWith('/api/plc-connections') && r.request().method() === 'POST'
