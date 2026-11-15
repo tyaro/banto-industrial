@@ -19,6 +19,8 @@ const INTERVAL: Duration = Duration::from_secs(30);
 /// PR3 の画面が参照する状態。理由は鍵の内容を含まない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesktopTlsStatus {
+    /// Precise typed startup guidance; runtime states use presentation defaults.
+    pub remedy: Option<String>,
     /// 現在の待ち受け（停止中なら None）。
     pub address: Option<SocketAddr>,
     /// 最後の検査・bind の警告。正常なら None。
@@ -299,6 +301,7 @@ pub(crate) fn spawn(
     keep_alive: Arc<Option<crate::profile_lock::ProfileLockGuard>>,
 ) -> Monitor {
     let initial = DesktopTlsStatus {
+        remedy: None,
         address: Some(listener.local_addr()),
         reason: None,
         requires_recreation: false,
@@ -429,6 +432,7 @@ where
     R: FnMut(&mut Watch) + Send + 'static,
 {
     let initial = DesktopTlsStatus {
+        remedy: None,
         address: Some(listener.local_addr()),
         reason: None,
         requires_recreation: false,
@@ -511,6 +515,7 @@ where
                                 let reason = match &result { Ok(warning) => warning.clone(), Err(reason) => Some(reason.clone()) };
                                 let mut snapshot = state.lock().unwrap_or_else(|p| p.into_inner());
                                 snapshot.status = DesktopTlsStatus {
+                                    remedy: None,
                                     address: listener.as_ref().filter(|l| l.is_serving()).map(RunningTlsListener::local_addr),
                                     reason, requires_recreation: watch.permanently_revoked || (config.is_none() && result.is_err()),
                                     can_resume: config.is_some() && !external.is_revoked(),
@@ -521,7 +526,7 @@ where
                                 external.retire_identity();
                                 listener = None; config = None;
                                 let reason = "TLS の作り直しタスクが異常終了しました。TLS を停止しました。ログと鍵・証明書・失効の記録を確認して Hub を再起動してください".to_string();
-                                state.lock().unwrap_or_else(|p| p.into_inner()).status = DesktopTlsStatus { address: None, reason: Some(reason.clone()), requires_recreation: true, can_resume: false };
+                                state.lock().unwrap_or_else(|p| p.into_inner()).status = DesktopTlsStatus { remedy: None, address: None, reason: Some(reason.clone()), requires_recreation: true, can_resume: false };
                                 let _ = reply.send(Err(reason));
                             }
                         }
@@ -579,6 +584,7 @@ where
                     {
                         let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
                         state.status = DesktopTlsStatus {
+                            remedy: None,
                             address: None,
                             reason: Some(reason),
                             requires_recreation: failed.permanently_revoked
@@ -608,6 +614,7 @@ where
                     let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
                     let reason = format!("TLS の周期検査タスクが異常終了し、失効状態と未書込拇印を回収できませんでした。既知の待受証明書の拇印: {}。TLS は停止し、このプロセスでは再開しません。Hub を再起動する前にログと鍵・証明書・失効の記録を確認し、安全側で鍵と証明書を作り直してください。失効の記録は消さないでください", serving);
                     state.status = DesktopTlsStatus {
+                        remedy: None,
                         address: None,
                         reason: Some(reason.clone()),
                         requires_recreation: true,
@@ -672,6 +679,7 @@ where
             }
             let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
             state.status = DesktopTlsStatus {
+                remedy: None,
                 address: listener
                     .as_ref()
                     .filter(|listener| listener.is_serving())
@@ -1004,6 +1012,7 @@ mod tests {
         let (input, serving) = idle_input(
             Some(config),
             DesktopTlsStatus {
+                remedy: None,
                 address: None,
                 reason: Some("injected port contention".into()),
                 requires_recreation: false,
@@ -1118,6 +1127,7 @@ mod tests {
                 listener: renewed.listener,
                 config: renewed.config,
                 initial: DesktopTlsStatus {
+                    remedy: None,
                     address: None,
                     reason: Some("temporary lock contention".into()),
                     requires_recreation: false,

@@ -1689,6 +1689,7 @@ fn recreate_desktop_tls(_app: &AppHandle) {}
 fn spawn_desktop_tls_watch(app: AppHandle) {
     std::thread::spawn(move || {
         use tauri_plugin_notification::NotificationExt;
+        #[cfg(windows)]
         let mut previous = None;
         let mut serve_failure_reported = false;
         loop {
@@ -1720,29 +1721,32 @@ fn spawn_desktop_tls_watch(app: AppHandle) {
                     .show();
                 sync_tray(&app);
             }
-            let current = desktop_tls_status::current(&state);
-            if current != previous {
-                if let Some(tls) = &current {
-                    if tls.reason.is_some()
-                        && desktop_tls_status::notification_changed(
-                            previous.as_ref(),
-                            current.as_ref(),
-                        )
-                    {
-                        let _ = app
-                            .notification()
-                            .builder()
-                            .title(&tls.label)
-                            .body(format!(
-                                "{}。{}",
-                                tls.reason.as_deref().unwrap_or_default(),
-                                tls.remedy
-                            ))
-                            .show();
+            #[cfg(windows)]
+            {
+                let current = desktop_tls_status::current(&state);
+                if current != previous {
+                    if let Some(tls) = &current {
+                        if tls.reason.is_some()
+                            && desktop_tls_status::notification_changed(
+                                previous.as_ref(),
+                                current.as_ref(),
+                            )
+                        {
+                            let _ = app
+                                .notification()
+                                .builder()
+                                .title(&tls.label)
+                                .body(format!(
+                                    "{}。{}",
+                                    tls.reason.as_deref().unwrap_or_default(),
+                                    tls.remedy
+                                ))
+                                .show();
+                        }
                     }
+                    previous = current;
+                    sync_tray(&app);
                 }
-                previous = current;
-                sync_tray(&app);
             }
             std::thread::sleep(Duration::from_secs(1));
         }

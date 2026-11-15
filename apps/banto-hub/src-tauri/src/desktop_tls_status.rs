@@ -33,10 +33,11 @@ pub(crate) fn present(
         can_resume: status.can_resume,
         label: label.into(),
         reason: status.reason.clone(),
-        remedy: remedy.into(),
+        remedy: status.remedy.as_deref().unwrap_or(remedy).into(),
     }
 }
 
+#[cfg(windows)]
 pub(crate) fn notification_changed(
     previous: Option<&Presentation>,
     current: Option<&Presentation>,
@@ -67,6 +68,7 @@ mod tests {
     #[test]
     fn notifications_ignore_reason_changes_but_track_recovery_and_recreation() {
         let mut status = DesktopTlsStatus {
+            remedy: None,
             address: None,
             reason: Some("first".into()),
             requires_recreation: false,
@@ -88,7 +90,7 @@ mod tests {
         use banto_hub_core::hub_tls_prepare::desktop::DesktopTlsUnavailable;
         let mut failure = DesktopTlsUnavailable {
             reason: "same reason".into(),
-            remedy: "typed remedy".into(),
+            remedy: r"補助ファイル C:\TLS\creating の所有者・アクセス許可を修復してから再起動してください".into(),
             requires_recreation: true,
         };
         let recreation = present(&failure.status());
@@ -97,11 +99,16 @@ mod tests {
         let retry = present(&failure.status());
         assert!(retry.label.contains("再開できません"));
         assert!(retry.remedy.contains("再起動"));
+        assert!(retry.remedy.contains(r"C:\TLS\creating"));
+        assert!(retry.remedy.contains("所有者・アクセス許可"));
+        assert_eq!(retry.remedy, failure.remedy);
+        assert_eq!(retry.reason.as_deref(), Some("same reason"));
         assert_eq!(recreation.reason, retry.reason);
     }
     #[test]
     fn temporary_pause_and_panic_have_different_recovery_without_reason_parsing() {
         let mut status = DesktopTlsStatus {
+            remedy: None,
             address: None,
             reason: Some("same reason".into()),
             requires_recreation: false,

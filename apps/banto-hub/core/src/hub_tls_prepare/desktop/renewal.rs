@@ -548,7 +548,7 @@ pub(super) fn recreate<P: UserTlsPlace + ?Sized>(
         } else {
             String::new()
         };
-        return Err(DesktopFailure::recreate(format!(
+        let reason = format!(
             "作り直しに失敗しました: {}。{}{}",
             error.reason,
             if restored {
@@ -557,7 +557,15 @@ pub(super) fn recreate<P: UserTlsPlace + ?Sized>(
                 "安全な旧い組へ戻せないため TLS を停止しました。Hub を閉じて置き場とログを確認してください。失効の記録は消さないでください"
             },
             cleanup_warning
-        )));
+        );
+        return Err(if restored {
+            DesktopFailure {
+                reason,
+                remedy: DesktopRemedy::RetryRecreation,
+            }
+        } else {
+            DesktopFailure::recreate(reason)
+        });
     }
     // Publication is committed. Only now retire the old identities: doing this
     // before commit would make a safe rollback or startup recovery impossible.

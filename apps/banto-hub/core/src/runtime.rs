@@ -1225,6 +1225,7 @@ impl HubRuntime {
                         #[cfg(windows)]
                         if host_kind == HubHostKind::Shell {
                             let initial = crate::hub_tls_prepare::desktop::watch::DesktopTlsStatus {
+                                remedy: None,
                                 address: None,
                                 reason: Some(format!("127.0.0.1:{} で TLS を待ち受けられません: {err}。ポートを使用しているアプリを確認してください。次の周期で安全性を確認できれば再開します", config.port())),
                                 requires_recreation: false, can_resume: true,
@@ -1250,6 +1251,7 @@ impl HubRuntime {
         if desktop_selected && desktop_tls_monitor.is_none() {
             let initial = desktop_tls_initial_status.clone().unwrap_or(
                 crate::hub_tls_prepare::desktop::watch::DesktopTlsStatus {
+                    remedy: None,
                     address: None,
                     reason: Some("既定 TLS は待ち受けていません".into()),
                     requires_recreation: false,

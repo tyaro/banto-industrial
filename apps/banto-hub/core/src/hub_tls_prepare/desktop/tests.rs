@@ -1638,7 +1638,12 @@ fn renewal_partial_publish_restores_both_old_files_and_old_acceptor() {
                 }
             },
         );
-        assert!(result.is_err());
+        let failure = result.unwrap_err().into_unavailable();
+        assert!(!failure.requires_recreation);
+        assert!(failure.reason.contains("旧い組と待ち受けへ戻しました"));
+        assert!(failure.remedy.contains("トレイ"));
+        assert!(!failure.remedy.contains("再起動"));
+        assert!(!failure.remedy.contains("フォルダごと削除"));
         assert_eq!(installed.get(), Some(thumb(&old)));
         for name in [
             KEY_TEMP,

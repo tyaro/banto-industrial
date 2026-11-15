@@ -53,7 +53,8 @@ impl DesktopTlsUnavailable {
     pub fn status(&self) -> watch::DesktopTlsStatus {
         watch::DesktopTlsStatus {
             address: None,
-            reason: Some(format!("{}。{}", self.reason, self.remedy)),
+            reason: Some(self.reason.clone()),
+            remedy: Some(self.remedy.clone()),
             requires_recreation: self.requires_recreation,
             can_resume: false,
         }
@@ -84,6 +85,7 @@ enum DesktopRemedy {
     InspectAuxiliaryFile(std::path::PathBuf),
     CleanupAuxiliaryFile(std::path::PathBuf),
     RetryLater,
+    RetryRecreation,
 }
 
 impl std::fmt::Display for DesktopFailure {
@@ -116,6 +118,7 @@ impl DesktopFailure {
 
     fn into_unavailable(self) -> DesktopTlsUnavailable {
         let remedy = match self.remedy {
+            DesktopRemedy::RetryRecreation => "旧い正常な組と待ち受けへ戻して稼働しています。本体の鍵・証明書は削除せず、失敗の原因を確認してからトレイで作り直しを再試行してください".into(),
             DesktopRemedy::InspectAndRecreate | DesktopRemedy::BackupKeyExposure => return unavailable(self.reason),
             DesktopRemedy::RetryLater => "本体の hub-cert.pem・hub-key.pem は削除せず、ログの理由に従って置き場の指定・所有者・アクセス許可や読み書きの失敗の原因を確かめ、ロックの競合は終了まで待ってから、Hub のデスクトップ版を再起動してください".into(),
             DesktopRemedy::RepairPlaceOnly => "証明書も鍵もありません。Hub を閉じ、置き場と親の置き場の所有者・アクセス許可を修復してから、Hub のデスクトップ版を再起動してください".into(),
