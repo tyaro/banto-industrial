@@ -1186,6 +1186,13 @@
 				</dd>
 			</dl>
 
+			{#if hostSwitch.desktopTls}
+				<div role="status">
+					<p><strong>{hostSwitch.desktopTls.label}</strong></p>
+					{#if hostSwitch.desktopTls.reason}<p>{hostSwitch.desktopTls.reason}</p>{/if}
+					{#if hostSwitch.desktopTls.remedy}<p>{hostSwitch.desktopTls.remedy}</p>{/if}
+				</div>
+			{/if}
 			{#if hostSwitchBusy || (hostProgress && !hostProgress.done)}
 				<p class="switch-progress" role="status">
 					{hostProgress?.message ?? '切替処理が進行中です…'}

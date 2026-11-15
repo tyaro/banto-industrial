@@ -79,11 +79,15 @@ fn describe_error(err: ServiceManagerError) -> String {
 
 /// `BantoHubSink`の SCM 状態を照会する（読み取り専用、権限不問）。
 #[tauri::command]
-pub fn sink_service_status(state: State<'_, AppState>) -> SinkServiceStatusDto {
-    SinkServiceStatusDto {
+pub fn sink_service_status(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<SinkServiceStatusDto, String> {
+    crate::shell_tls::require_command_origin(&window)?;
+    Ok(SinkServiceStatusDto {
         scm_state: query_sink_scm_state(),
         can_operate: state.can_operate_service,
-    }
+    })
 }
 
 fn query_sink_scm_state() -> Option<String> {
@@ -100,7 +104,11 @@ fn query_sink_scm_state() -> Option<String> {
 
 /// `BantoHubSink`を開始する（[`ServiceManager::start`]と同様に冪等）。
 #[tauri::command]
-pub fn sink_service_start(state: State<'_, AppState>) -> Result<(), String> {
+pub fn sink_service_start(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    crate::shell_tls::require_command_origin(&window)?;
     if !state.can_operate_service {
         return Err("サービス操作の権限がありません（BantoHub Operators または管理者）".into());
     }
@@ -117,7 +125,11 @@ pub fn sink_service_start(state: State<'_, AppState>) -> Result<(), String> {
 
 /// `BantoHubSink`を停止する（冪等）。
 #[tauri::command]
-pub fn sink_service_stop(state: State<'_, AppState>) -> Result<(), String> {
+pub fn sink_service_stop(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    crate::shell_tls::require_command_origin(&window)?;
     if !state.can_operate_service {
         return Err("サービス操作の権限がありません（BantoHub Operators または管理者）".into());
     }

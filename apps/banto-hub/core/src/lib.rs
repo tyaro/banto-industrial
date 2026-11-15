@@ -271,6 +271,7 @@ pub mod service_install;
 pub mod service_manager;
 pub mod service_operators;
 pub mod settings;
+pub mod shell_transport;
 pub mod sink;
 pub mod sink_config_prepare;
 pub mod stream;

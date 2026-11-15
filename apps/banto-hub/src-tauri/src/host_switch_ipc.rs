@@ -33,6 +33,7 @@ pub(crate) static SWITCHING: AtomicBool = AtomicBool::new(false);
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostSwitchStatusDto {
+    pub desktop_tls: Option<crate::desktop_tls_status::Presentation>,
     /// SCM 状態の表示用文字列（未インストール等含む）。照会失敗時は`null`。
     pub scm_state: Option<String>,
     /// 次回 Windows 起動で自動起動するか（Demand のときは`false`）。
@@ -109,21 +110,26 @@ pub(crate) fn begin_switch_or_warn(app: &AppHandle) -> bool {
 
 /// SCM / ビュー / 権限のスナップショットを返す。
 #[tauri::command]
-pub fn host_switch_status(state: State<'_, AppState>) -> HostSwitchStatusDto {
+pub fn host_switch_status(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<HostSwitchStatusDto, String> {
+    crate::shell_tls::require_command_origin(&window)?;
     let (view, fallback_cause) = match &*state.view.lock().expect("view mutex poisoned") {
         ShellView::Desktop => ("desktop".to_string(), None),
         ShellView::Service { .. } => ("service".to_string(), None),
         ShellView::Fallback(info) => ("fallback".to_string(), info.cause.key().map(str::to_string)),
     };
     let (scm_state, auto_start) = query_scm_summary();
-    HostSwitchStatusDto {
+    Ok(HostSwitchStatusDto {
+        desktop_tls: crate::desktop_tls_status::current(&state),
         scm_state,
         auto_start,
         can_operate: state.can_operate_service,
         view,
         switching: SWITCHING.load(Ordering::SeqCst),
         fallback_cause,
-    }
+    })
 }
 
 fn query_scm_summary() -> (Option<String>, bool) {
@@ -143,7 +149,12 @@ fn query_scm_summary() -> (Option<String>, bool) {
 
 /// Desktop/Offline → Service。権限なし・進行中は即エラー文字列。
 #[tauri::command]
-pub fn switch_to_service(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+pub fn switch_to_service(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    crate::shell_tls::require_command_origin(&window)?;
     if !state.can_operate_service {
         return Err("サービス操作の権限がありません（BantoHub Operators または管理者）".into());
     }
@@ -174,7 +185,12 @@ pub fn switch_to_service(app: AppHandle, state: State<'_, AppState>) -> Result<(
 
 /// Service → Desktop。
 #[tauri::command]
-pub fn switch_to_desktop(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+pub fn switch_to_desktop(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    crate::shell_tls::require_command_origin(&window)?;
     if !state.can_operate_service {
         return Err("サービス操作の権限がありません（BantoHub Operators または管理者）".into());
     }
@@ -209,7 +225,12 @@ pub fn switch_to_desktop(app: AppHandle, state: State<'_, AppState>) -> Result<(
 /// （Operators でなければ修復の UAC が最後の手段）。このアプリで Hub が動いている間
 /// （設定モード）は断る。
 #[tauri::command]
-pub fn restore_setting_mode(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+pub fn restore_setting_mode(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    crate::shell_tls::require_command_origin(&window)?;
     if matches!(
         *state.view.lock().expect("view mutex poisoned"),
         ShellView::Desktop
@@ -235,7 +256,8 @@ pub fn restore_setting_mode(app: AppHandle, state: State<'_, AppState>) -> Resul
 /// 判定し直す（`crate::retry_startup`）。画面を変えるので進行中フラグを取り、判定は別のスレッドで
 /// 走らせる（health の確かめ・Hub の起動で待つため）。
 #[tauri::command]
-pub fn retry_startup(app: AppHandle) -> Result<(), String> {
+pub fn retry_startup(window: tauri::WebviewWindow, app: AppHandle) -> Result<(), String> {
+    crate::shell_tls::require_command_origin(&window)?;
     if !begin_switch_or_warn(&app) {
         return Err("既に切替処理が進行中です".into());
     }
@@ -248,7 +270,12 @@ pub fn retry_startup(app: AppHandle) -> Result<(), String> {
 
 /// 自動起動の ON/OFF。UAC 経由で `banto-hub-elev.exe` を起動する。
 #[tauri::command]
-pub fn set_service_autostart(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+pub fn set_service_autostart(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    crate::shell_tls::require_command_origin(&window)?;
     if !state.can_operate_service {
         return Err("サービス操作の権限がありません（BantoHub Operators または管理者）".into());
     }

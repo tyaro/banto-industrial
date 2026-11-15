@@ -4,8 +4,8 @@
 //! ## この crate がやること・やらないこと
 //!
 //! [`banto_hub_core::runtime::HubRuntime`] をそのまま埋め込み、起動できたら
-//! メインウィンドウを Hub 自身が配信する `http://127.0.0.1:{port}/`
-//! （axum が同一 origin で UI + `/api/*` を配信する - 設計 §4「P3」）へ
+//! メインウィンドウをプロセス所有の OS 割り当て loopback origin
+//! （Windows はメモリ上の使い捨て証明書で pin した HTTPS、他 OS は HTTP 互換経路）へ
 //! `navigate` するだけの composition root。**独自の `frontendDist`/`invoke`
 //! コマンドは一切持たない** - タグ CRUD・収集開始/停止などの「運転 API」は
 //! Hub の REST/WS を管理 UI (SvelteKit) 側から叩くものであり、この crate が
@@ -206,10 +206,10 @@
 //! ただし当時の論拠「自プロセス内`HubRuntime`以外へ navigate する経路を持たない」は
 //! 事実と違っていた - Service モードはサービスの平文の`http://127.0.0.1:8722/`へ移っており、
 //! Hub の停止中に 8722 を先取りした偽の画面からもシェルの invoke を呼べた（#644）。
-//! #644 PR4（2026-11-14）で Service は pin した`https://127.0.0.1:8723/*`だけになり
-//! （下の「Service モードは pin した https だけ」節）、`http://127.0.0.1:*/*`は Desktop モードの
-//! 自プロセスの Hub のために残している（#1121 で Desktop も TLS 化する予定。論拠は
-//! `capabilities/default.json`の`description`）。
+//! #644 PR4 で Service は pin した `https://127.0.0.1:8723/*` へ移行し、
+//! #1121 PR3 で Desktop もプロセス所有の専用 origin へ移した（[`shell_tls`]）。
+//! 静的な HTTP capability は廃止し、bind 後の正確な origin にだけ実行時の capability を
+//! 付ける。Windows は使い捨ての証明書で pin し、WebView2 を持たない OS は HTTP を維持する。
 //!
 //! ## OS の終了で収集を止める（#586、2026-10-12）
 //!
@@ -258,7 +258,7 @@
 //!   Service→Desktop の`Unreachable`待ち）。[`attempt_desktop_start`]の失敗時の probe は診断だけ
 //!   （Service へは進まない）なので平文のまま。
 //! - **Service→Desktop の「消えた」**: Desktop が取りに行く平文の期待ポート（既定 8722）が応答
-//!   しなくなったことで決める（Desktop は 8723 を使わない。根拠は
+//!   しなくなったことで決める（Desktop も 8723 を ChronoGazer 向けに使うため。根拠は
 //!   `banto_hub_core::pinned_hub_health`の doc「消えた」）。
 //! - **webview の pin**（[`service_tls::install_certificate_pin`]）: WebView2 の
 //!   `ServerCertificateErrorDetected`で、`https://127.0.0.1:8723`の相手の証明書がその場で読んだ
@@ -312,9 +312,11 @@ use launch_gate::{FallbackCause, ProfileModeObservation, StartupPlan};
 mod host_switch_ipc;
 mod hub_slot;
 // 見張り・切り替え・「設定モードに戻す」 の部品は Windows だけで使う（テストはどの OS でも走る）。
+mod desktop_tls_status;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod launch_gate;
 mod service_tls;
+mod shell_tls;
 mod sink_service_ipc;
 mod tray_status;
 
@@ -675,8 +677,7 @@ fn fallback_actions(info: &FallbackInfo, can_operate: bool) -> Vec<launch_gate::
 /// T16-2: サービス接続時（[`StartupOutcome::Service`]）の navigate にも
 /// 共用する - 接続先が自プロセスの`RunningHub`かサービスかは呼び出し元が
 /// 区別するだけで、navigate 自体の処理は同じ。`url`は呼び出し元が組み立てる:
-/// Desktop は`http://{RunningHub::local_addr()}/`（自プロセスの Hub。TLS 化は #1121）、
-/// Service は #644 PR4（2026-11-14）から常に[`service_tls::service_url`]
+/// Desktop は [`shell_tls`] のプロセス専用 origin、Service は常に[`service_tls::service_url`]
 /// （`https://127.0.0.1:8723/`、webview は[`service_tls::install_certificate_pin`]で pin する）。
 /// 以前の Service は`BANTO_BIND`から組み立てた平文の`http://{host}:{port}/`だった。
 fn navigate_to_hub(window: &WebviewWindow, url: &str) {
@@ -1105,15 +1106,8 @@ fn stop_collection(app: &AppHandle) {
 /// （`PORT` 環境変数、無ければ既定 8722）で、平文の口の health probe・
 /// host_switch の判定に使う（#644 PR4 から、サービスへの接続と Service と見なす判定は
 /// 平文の口ではなく 127.0.0.1:8723 の TLS - [`service_tls`]。この値は「旧サービスが平文の口から
-/// 消えたか」と Desktop の失敗の診断にだけ効く）。デスクトップシェルの Hub は、`PORT` 指定が無く既定の
-/// ポートが埋まっているときだけ OS 割り当てのポートへ退避する
-/// （`banto_hub_core::runtime::port_fallback_applies`）ので、デスクトップが実際に
-/// 待ち受けているポートとは限らない。デスクトップ側の実ポートは常に
-/// `RunningHub::local_addr()` を使うこと（navigate は
-/// [`apply_startup_outcome`] がそうしている）。host_switch の待ちは
-/// 「サービスの」health（Service→Desktop は旧サービスの消失、Desktop→Service は
-/// サービスの起動）を期待ポートで見るだけで、デスクトップの実ポートを待つ
-/// ことはない（切替前にデスクトップの Hub は `shutdown` 済みでポートも解放済み）。
+/// 消えたか」と Desktop の失敗の診断にだけ効く）。平文の待ち受けは設定どおりのポートで
+/// 起動し、埋まっていても退避しない。Desktop の画面は [`shell_tls`] の専用 origin を使う。
 fn expected_probe_target() -> ProbeTarget {
     let paths = resolve_profile_paths_from_env();
     let port = std::env::var("PORT")
@@ -1280,11 +1274,8 @@ fn service_outcome(
 /// 「ポート競合の相手が別の banto-hub インスタンスかどうか」の手がかりに
 /// なる（`scm_state`の`allow(dead_code)`同様、Err時のみ使う値）。
 ///
-/// #479: 既定ポートが埋まっているだけなら、`PORT` 指定が無い限り
-/// [`HubRuntime::start`] が OS 割り当てのポートへ退避して起動するので、
-/// ここには来ない（退避のログは `RunningHub::port_fallback_from` と
-/// `hub_log` に出る）。`PORT` を明示した構成でそのポートが埋まっていれば、
-/// 従来どおりここへ来て、同じポートへの probe で相手を診断する。
+/// 平文の設定ポートが埋まっていれば起動を断り、同じポートの probe で診断する。
+/// 管理画面へ移るのは専用 origin の bind と runtime capability の登録が済んだ場合だけ。
 ///
 /// #586: 起動の前に置き場所（`slot`）から「進行中の起動」の札を取る。終了が
 /// 始まっていれば（置き場所が閉じていれば）札は取れず、**起動しない**
@@ -1298,6 +1289,14 @@ fn attempt_desktop_start(
     slot: &Arc<HubSlot<RunningHub>>,
     scm_state: Option<ScmState>,
 ) -> StartupOutcome {
+    if shell_tls::transport().is_ok_and(|transport| !transport.is_serving()) {
+        return StartupOutcome::Fallback(FallbackInfo {
+            scm_state,
+            health: None,
+            desktop_error: Some(shell_tls::SERVE_FAILURE.into()),
+            cause: FallbackCause::General,
+        });
+    }
     let Some(ticket) = slot.begin_start() else {
         return StartupOutcome::Fallback(FallbackInfo {
             scm_state,
@@ -1314,7 +1313,22 @@ fn attempt_desktop_start(
         HubHostKind::Shell,
         hub_drivers(),
     ))) {
-        Ok(hub) => StartupOutcome::Desktop(Box::new(StartedHub { hub, ticket })),
+        Ok(mut hub) => match shell_tls::transport() {
+            Ok(transport) => {
+                hub.attach_shell_transport(transport);
+                StartupOutcome::Desktop(Box::new(StartedHub { hub, ticket }))
+            }
+            Err(error) => {
+                tauri::async_runtime::block_on(hub.shutdown());
+                drop(ticket);
+                StartupOutcome::Fallback(FallbackInfo {
+                    scm_state,
+                    health: None,
+                    desktop_error: Some(error),
+                    cause: FallbackCause::General,
+                })
+            }
+        },
         Err(err) => {
             // 起動できなかった - 札を返す（終了が待っていればここで起きる）。
             drop(ticket);
@@ -1389,7 +1403,6 @@ fn apply_startup_outcome(
         }
         StartupOutcome::Desktop(started) => {
             let StartedHub { hub, ticket } = *started;
-            let addr = hub.local_addr();
             let controller = hub.controller();
             // 先に置く（置けなければ画面を Hub へ移さない）。置けなかったのは
             // 終了が始まった（または別の Hub が置かれていた）ときで、起動した
@@ -1401,7 +1414,12 @@ fn apply_startup_outcome(
             let status = controller.status();
             *state.controller.lock().expect("controller mutex poisoned") = Some(controller.clone());
             set_view(&state, ShellView::Desktop);
-            navigate_to_hub(window, &format!("http://{addr}/"));
+            navigate_to_hub(
+                window,
+                &shell_tls::transport()
+                    .expect("attached shell transport")
+                    .url(),
+            );
             Some((status, controller))
         }
         StartupOutcome::Fallback(info) => {
@@ -1566,11 +1584,139 @@ const EXITING_SWITCH_MESSAGE: &str =
 /// 状態項目は disabled の [`MenuItemBuilder`] - クリックしても
 /// `on_menu_event`には来る（`_ => {}`で無視される）が、無効化されているため
 /// クリック自体が UI 上できない。
+fn show_desktop_tls_status(app: &AppHandle) {
+    use tauri_plugin_dialog::DialogExt;
+    if shell_tls::transport().is_ok_and(|transport| !transport.is_serving()) {
+        app.dialog()
+            .message(shell_tls::SERVE_FAILURE)
+            .title("管理画面の待ち受け停止")
+            .show(|_| {});
+        return;
+    }
+    if let Some(tls) = desktop_tls_status::current(&app.state::<AppState>()) {
+        app.dialog()
+            .message(format!(
+                "{}\n\n{}\n\n{}",
+                tls.label,
+                tls.reason.unwrap_or_default(),
+                tls.remedy
+            ))
+            .title("Hub の TLS の状態")
+            .show(|_| {});
+    }
+}
+
+#[cfg(windows)]
+fn recreate_desktop_tls(app: &AppHandle) {
+    if !host_switch_ipc::begin_switch_or_warn(app) {
+        return;
+    }
+    let app = app.clone();
+    let prompt_app = app.clone();
+    banto_desktop_tray::ask_confirm(&prompt_app, ConfirmPrompt {
+        title: "TLS の証明書を作り直す",
+        message: "ChronoGazer 接続用の TLS の鍵と証明書を作り直します。接続は一時的に切れ、ChronoGazer が新しい証明書を読み直して接続します。管理画面と収集は継続します。続けますか？",
+        ok_label: "作り直す", cancel_label: "キャンセル",
+    }, move |confirmed| {
+        if !confirmed { host_switch_ipc::end_switch(); return; }
+        let state = app.state::<AppState>();
+        let Some(ticket) = state.hub.begin_switch() else { host_switch_ipc::end_switch(); return; };
+        let Some(handle) = state.hub.inspect(|hub| hub.desktop_tls_recreation()).flatten() else { host_switch_ipc::end_switch(); return; };
+        let app = app.clone();
+        std::thread::spawn(move || {
+            hub_slot::run_switch(ticket, || {
+                use tauri_plugin_dialog::DialogExt;
+                let result = tauri::async_runtime::block_on(handle.recreate());
+                let message = match result { Ok(()) => "TLS の証明書を作り直しました。ChronoGazer は新しい証明書を読み直して接続します".to_string(), Err(error) => format!("TLS の証明書を作り直せませんでした: {error}") };
+                report_shell_error(&app, &message);
+                app.dialog().message(message).title("TLS の証明書の作り直し").show(|_| {});
+                sync_tray(&app);
+            });
+            host_switch_ipc::end_switch();
+        });
+    });
+}
+
+#[cfg(not(windows))]
+fn recreate_desktop_tls(_app: &AppHandle) {}
+
+fn spawn_desktop_tls_watch(app: AppHandle) {
+    std::thread::spawn(move || {
+        use tauri_plugin_notification::NotificationExt;
+        let mut previous = None;
+        let mut serve_failure_reported = false;
+        loop {
+            let state = app.state::<AppState>();
+            if state.hub.is_closed() {
+                break;
+            }
+            if !serve_failure_reported
+                && shell_tls::transport().is_ok_and(|transport| !transport.is_serving())
+                && matches!(*state.view.lock().unwrap(), ShellView::Desktop)
+            {
+                serve_failure_reported = true;
+                report_shell_error(&app, shell_tls::SERVE_FAILURE);
+                if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+                    set_placeholder_page(
+                        &window,
+                        PlaceholderPage {
+                            message: shell_tls::SERVE_FAILURE.into(),
+                            actions: vec![],
+                        },
+                    );
+                    navigate_to_placeholder(&app, &window);
+                }
+                let _ = app
+                    .notification()
+                    .builder()
+                    .title("管理画面の待ち受け停止")
+                    .body(shell_tls::SERVE_FAILURE)
+                    .show();
+                sync_tray(&app);
+            }
+            let current = desktop_tls_status::current(&state);
+            if current != previous {
+                if let Some(tls) = &current {
+                    if tls.reason.is_some() {
+                        let _ = app
+                            .notification()
+                            .builder()
+                            .title(&tls.label)
+                            .body(format!(
+                                "{}。{}",
+                                tls.reason.as_deref().unwrap_or_default(),
+                                tls.remedy
+                            ))
+                            .show();
+                    }
+                }
+                previous = current;
+                sync_tray(&app);
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
+}
+
 fn build_desktop_tray_menu(
     app: &AppHandle,
     status: Option<&RuntimeStatus>,
 ) -> tauri::Result<Menu<Wry>> {
     let mut builder = MenuBuilder::new(app);
+    if shell_tls::transport().is_ok_and(|transport| !transport.is_serving()) {
+        builder = builder.text("tls_status", "管理画面の待ち受け停止（再起動してください）");
+    } else if let Some(tls) = desktop_tls_status::current(&app.state::<AppState>()) {
+        builder = builder.text("tls_status", tls.label);
+    }
+    #[cfg(windows)]
+    if app
+        .state::<AppState>()
+        .hub
+        .inspect(|hub| hub.desktop_tls_recreation().is_some())
+        .unwrap_or(false)
+    {
+        builder = builder.text("recreate_tls", "TLS の証明書を作り直す…");
+    }
     if let Some(status) = status {
         let status_item = MenuItemBuilder::with_id("status", tray_status::status_label(status))
             .enabled(false)
@@ -2045,7 +2191,7 @@ pub(crate) fn run_host_switch(app: &AppHandle, command: SwitchCommand) {
     let manager = build_service_manager();
     // #644 PR4: Desktop→Service の `Healthy` は pin した TLS（8723）で確かめる。Service→Desktop の
     // 「旧サービスが消えた」（`Unreachable`）は、Desktop が取りに行く平文の期待ポート（`target.port`、
-    // 既定 8722）が応答しなくなったことで決める（Desktop は 8723 を使わない - #1121 まで。根拠は
+    // 既定 8722）が応答しなくなったことで決める（Desktop も 8723 を使う。根拠は
     // `banto_hub_core::pinned_hub_health` の doc「消えた」）。
     let probe = service_tls::service_probe(target.root.clone(), target.host.clone());
     let mut engine = HostSwitchEngine::new(
@@ -2771,9 +2917,30 @@ pub fn run() {
             pending_log: StdMutex::new(Vec::new()),
         })
         .setup(|app| {
-            let window = app
-                .get_webview_window(MAIN_WINDOW_LABEL)
-                .expect("tauri.conf.json の app.windows にメインウィンドウを定義済み");
+            let use_https = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|c| c.label == MAIN_WINDOW_LABEL)
+                .is_some_and(|c| c.use_https_scheme);
+            *app.state::<AppState>().placeholder_url.lock().unwrap() =
+                Some(launch_gate::placeholder_url(cfg!(windows), use_https));
+            let config = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|c| c.label == MAIN_WINDOW_LABEL)
+                .expect("main window config")
+                .clone();
+            let navigation_app = app.handle().clone();
+            let window = tauri::WebviewWindowBuilder::from_config(app, &config)?
+                .on_navigation(move |url| shell_tls::navigation_allowed(&navigation_app, url))
+                .build()?;
+            // Bind and authorize before any desktop navigation. Failure is fatal,
+            // without authorizing an HTTP or wildcard alternative.
+            shell_tls::initialize(app.handle()).map_err(std::io::Error::other)?;
 
             // CloseRequested（×ボタン）はプロセスを終了せずトレイへ格納
             // するだけ（実装指示「CloseRequested -> prevent_close + hide」）。
@@ -2843,6 +3010,8 @@ pub fn run() {
                     "start_service" => start_service(app),
                     "retry" => retry_startup(app),
                     "restore_setting" => restore_setting(app),
+                    "tls_status" => show_desktop_tls_status(app),
+                    "recreate_tls" => recreate_desktop_tls(app),
                     "quit" => confirm_quit(app),
                     _ => {}
                 });
@@ -2854,6 +3023,7 @@ pub fn run() {
             // 保持するためだけに managed state へ入れる
             // （[`apply_status_to_tray`]・[`sync_tray`]が`try_state`で読み出す）。
             app.manage(tray);
+            spawn_desktop_tls_watch(app.handle().clone());
 
             // デスクトップホストとして起動できていれば、状態購読を開始する
             // （[`watch_collection_status`]のモジュール doc 参照 - tray が
@@ -2900,6 +3070,27 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_main_window_boot_config_has_one_nonautomatic_main_window() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let windows = config["app"]["windows"].as_array().unwrap();
+        assert_eq!(
+            windows.len(),
+            1,
+            "setup creates the main window with navigation guard"
+        );
+        assert_eq!(windows[0]["label"], MAIN_WINDOW_LABEL);
+        assert_eq!(
+            windows[0]["create"], false,
+            "never create an unguarded automatic window"
+        );
+        assert!(
+            config["build"].get("devUrl").is_none(),
+            "development uses the same bundled boot page"
+        );
+    }
 
     fn settled() -> HubExitReport {
         HubExitReport {

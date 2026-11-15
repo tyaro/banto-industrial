@@ -14,6 +14,7 @@ import { invoke } from '@tauri-apps/api/core';
 
 /** `host_switch_status` の戻り値。 */
 export type HostSwitchStatus = {
+	desktopTls?: { label: string; reason: string | null; remedy: string } | null;
 	scmState: string | null;
 	autoStart: boolean;
 	canOperate: boolean;

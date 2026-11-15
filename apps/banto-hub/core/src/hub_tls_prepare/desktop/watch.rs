@@ -1,4 +1,5 @@
-//! デスクトップ既定 TLS の周期監視。記録のロックだけを取り、TLS は作成・変更しない。
+//! デスクトップ既定 TLS の周期監視と、明示的な証明書の作り直しを直列化する actor。
+//! 周期検査は記録のロックだけを取り、作り直しは identity → 記録の順で握る。
 //! 停止後も検査を続け、失効・露出以外なら同じメモリ上の組で復帰する。
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -7,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use banto_hub_tls_trust::{read_user_revocations, reconcile_user_revocations};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use super::*;
@@ -24,10 +25,36 @@ pub struct DesktopTlsStatus {
     pub reason: Option<String>,
     /// 露出・失効を確認した、または検査状態を回収できず安全側で作り直しが必要。
     pub requires_recreation: bool,
+    /// このプロセスで周期検査による自動復帰が可能か。panic は露出の有無と独立に false。
+    pub can_resume: bool,
 }
 
 struct Snapshot {
     status: DesktopTlsStatus,
+}
+
+/// Sends an explicit user-approved renewal to the monitor actor. Dropping the
+/// requesting future never cancels an already accepted filesystem transaction.
+#[derive(Clone)]
+pub struct RecreationHandle {
+    renew: mpsc::Sender<oneshot::Sender<Result<(), String>>>,
+}
+impl RecreationHandle {
+    pub async fn recreate(&self) -> Result<(), String> {
+        let (reply, result) = oneshot::channel();
+        self.renew.try_send(reply).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => {
+                "TLS の作り直し要求が既に待機しています".to_string()
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                "TLS の検査タスクが停止しています。ログを確認して Hub を再起動してください"
+                    .to_string()
+            }
+        })?;
+        result
+            .await
+            .map_err(|_| "TLS の作り直しタスクが終了しました。ログを確認してください".to_string())?
+    }
 }
 
 pub(crate) struct Monitor {
@@ -36,6 +63,7 @@ pub(crate) struct Monitor {
     finish: Option<oneshot::Sender<bool>>,
     snapshot: Arc<Mutex<Snapshot>>,
     revoker: TlsRevoker,
+    renew: mpsc::Sender<oneshot::Sender<Result<(), String>>>,
 }
 impl Drop for Monitor {
     fn drop(&mut self) {
@@ -46,6 +74,11 @@ impl Drop for Monitor {
     }
 }
 impl Monitor {
+    pub(crate) fn recreation_handle(&self) -> RecreationHandle {
+        RecreationHandle {
+            renew: self.renew.clone(),
+        }
+    }
     pub(crate) fn status(&self) -> DesktopTlsStatus {
         let mut status = self
             .snapshot
@@ -55,6 +88,7 @@ impl Monitor {
             .clone();
         if self.revoker.is_revoked() {
             status.address = None;
+            status.can_resume = false;
             if !status.requires_recreation {
                 status.reason = Some(external_stop_reason().into());
             }
@@ -81,7 +115,7 @@ impl Monitor {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(super) struct Watch {
     incomplete: u8,
     permanently_revoked: bool,
@@ -240,12 +274,52 @@ pub(crate) fn spawn(
     serving: CertThumbprint,
     keep_alive: Arc<Option<crate::profile_lock::ProfileLockGuard>>,
 ) -> Monitor {
-    let task_guard = keep_alive.clone();
-    spawn_with_retry(
-        listener,
-        config,
+    let initial = DesktopTlsStatus {
+        address: Some(listener.local_addr()),
+        reason: None,
+        requires_recreation: false,
+        can_resume: true,
+    };
+    spawn_production(
+        ActorInput {
+            listener: Some(listener),
+            config: Some(config),
+            initial,
+        },
         router,
-        move |watch| {
+        serving,
+        keep_alive,
+    )
+}
+
+pub(crate) fn spawn_idle(
+    router: axum::Router,
+    initial: DesktopTlsStatus,
+    keep_alive: Arc<Option<crate::profile_lock::ProfileLockGuard>>,
+) -> Monitor {
+    spawn_production(
+        ActorInput {
+            listener: None,
+            config: None,
+            initial,
+        },
+        router,
+        CertThumbprint::of_der(b"no active desktop identity"),
+        keep_alive,
+    )
+}
+
+fn spawn_production(
+    input: ActorInput,
+    router: axum::Router,
+    serving: CertThumbprint,
+    keep_alive: Arc<Option<crate::profile_lock::ProfileLockGuard>>,
+) -> Monitor {
+    let task_guard = keep_alive.clone();
+    spawn_actor(
+        input,
+        router,
+        move |watch, serving| {
             let _keep_alive = &keep_alive;
             match DefaultUserTlsPlace::resolve(&WindowsTlsTrustOps) {
                 Ok(place) => watch.check(&place, serving, &ReconcileOptions::default()),
@@ -270,6 +344,12 @@ pub(crate) fn spawn(
         },
         task_guard,
     )
+}
+
+struct ActorInput {
+    listener: Option<RunningTlsListener>,
+    config: Option<TlsConfig>,
+    initial: DesktopTlsStatus,
 }
 
 struct MonitorSettings {
@@ -300,6 +380,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn spawn_with_retry<F, R>(
     listener: RunningTlsListener,
     config: TlsConfig,
@@ -313,20 +394,55 @@ where
     F: FnMut(&mut Watch) -> Round + Send + 'static,
     R: FnMut(&mut Watch) + Send + 'static,
 {
-    let revoker = TlsRevoker::following(listener.revoker());
+    let initial = DesktopTlsStatus {
+        address: Some(listener.local_addr()),
+        reason: None,
+        requires_recreation: false,
+        can_resume: true,
+    };
+    spawn_actor(
+        ActorInput {
+            listener: Some(listener),
+            config: Some(config),
+            initial,
+        },
+        router,
+        move |watch, _| check(watch),
+        retry,
+        settings,
+        keep_alive,
+    )
+}
+
+fn spawn_actor<F, R>(
+    input: ActorInput,
+    router: axum::Router,
+    mut check: F,
+    retry: R,
+    settings: MonitorSettings,
+    keep_alive: impl Send + 'static,
+) -> Monitor
+where
+    F: FnMut(&mut Watch, CertThumbprint) -> Round + Send + 'static,
+    R: FnMut(&mut Watch) + Send + 'static,
+{
+    let revoker = input
+        .listener
+        .as_ref()
+        .map(|listener| TlsRevoker::following(listener.revoker()))
+        .unwrap_or_else(TlsRevoker::idle_following);
     let external = revoker.clone();
     let snapshot = Arc::new(Mutex::new(Snapshot {
-        status: DesktopTlsStatus {
-            address: Some(listener.local_addr()),
-            reason: None,
-            requires_recreation: false,
-        },
+        status: input.initial,
     }));
     let state = snapshot.clone();
     let (stop, mut stopped) = oneshot::channel();
     let (finish, finished) = oneshot::channel();
+    let (renew, mut requests) = mpsc::channel::<oneshot::Sender<Result<(), String>>>(1);
     let task = tokio::spawn(async move {
-        let mut listener = Some(listener);
+        let mut listener = input.listener;
+        let mut config = input.config;
+        let mut serving = settings.serving;
         let mut watch = Watch::default();
         let mut ticks = tokio::time::interval(settings.interval);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -335,12 +451,75 @@ where
             tokio::select! { biased;
                 _ = &mut stopped => break,
                 _ = ticks.tick() => {}
+                request = requests.recv() => {
+                    if let Some(reply) = request {
+                        if external.externally_stopped() {
+                            let _ = reply.send(Err(external_stop_reason().into()));
+                            continue;
+                        }
+                        let pending = watch.unwritten.clone();
+                        let transport = external.clone();
+                        let router = router.clone();
+                        let renewed = tokio::task::spawn_blocking(move || renew_owned(listener, config, router, transport, pending)).await;
+                        match renewed {
+                            Ok(RenewalResult { listener: active, config: next, outcome: result, pending }) => {
+                                watch.permanently_revoked |= pending.contains(&serving);
+                                watch.unwritten = pending;
+                                listener = active; config = next;
+                                if let Some(next) = &config {
+                                    let next_serving = next.thumbprint().expect("checked in-memory desktop certificate");
+                                    if next_serving != serving && listener.is_some() {
+                                        watch.permanently_revoked = false;
+                                        watch.incomplete = 0;
+                                        serving = next_serving;
+                                    }
+                                }
+                                let reason = match &result { Ok(warning) => warning.clone(), Err(reason) => Some(reason.clone()) };
+                                let mut snapshot = state.lock().unwrap_or_else(|p| p.into_inner());
+                                snapshot.status = DesktopTlsStatus {
+                                    address: listener.as_ref().filter(|l| l.is_serving()).map(RunningTlsListener::local_addr),
+                                    reason, requires_recreation: watch.permanently_revoked || (config.is_none() && result.is_err()),
+                                    can_resume: config.is_some() && !external.is_revoked(),
+                                };
+                                let _ = reply.send(result.map(|_| ()));
+                            }
+                            Err(_) => {
+                                external.retire_identity();
+                                listener = None; config = None;
+                                let reason = "TLS の作り直しタスクが異常終了しました。TLS を停止しました。ログと鍵・証明書・失効の記録を確認して Hub を再起動してください".to_string();
+                                state.lock().unwrap_or_else(|p| p.into_inner()).status = DesktopTlsStatus { address: None, reason: Some(reason.clone()), requires_recreation: true, can_resume: false };
+                                let _ = reply.send(Err(reason));
+                            }
+                        }
+                        continue;
+                    } else { break; }
+                }
+            }
+            discard_dead_listener(&mut listener).await;
+            if config.is_none() {
+                if !watch.unwritten.is_empty() {
+                    let next = tokio::task::spawn_blocking(move || {
+                        if let Ok(place) = DefaultUserTlsPlace::resolve(&WindowsTlsTrustOps) {
+                            watch.write_unwritten(&place, serving, &ReconcileOptions::default());
+                        }
+                        watch
+                    })
+                    .await;
+                    match next {
+                        Ok(next) => watch = next,
+                        Err(_) => {
+                            external.retire_identity();
+                            break;
+                        }
+                    }
+                }
+                continue;
             }
             // await は中断しない。終了/プロファイル切替は検査の完了まで待つ。
             let checked = tokio::task::spawn_blocking(move || {
                 // checker の通常の panic は payload を展開せず状態とともに返す。
                 // payload の解放など、この捕捉の外側の失敗は JoinError 側で状態不明として止める。
-                let round = catch_unwind(AssertUnwindSafe(|| check(&mut watch))).ok();
+                let round = catch_unwind(AssertUnwindSafe(|| check(&mut watch, serving))).ok();
                 (watch, check, round)
             })
             .await;
@@ -355,7 +534,7 @@ where
                     // panic した checker は再利用しない。TLS を閉じ切ってから書込専用へ縮退する。
                     drop(failed_check);
                     if failed.permanently_revoked || !failed.unwritten.is_empty() {
-                        external.revoke();
+                        external.retire_identity();
                     }
                     if let Some(active) = listener.take() {
                         active.revoker().revoke();
@@ -370,7 +549,15 @@ where
                             reason: Some(reason),
                             requires_recreation: failed.permanently_revoked
                                 || !failed.unwritten.is_empty(),
+                            can_resume: false,
                         };
+                    }
+                    requests.close();
+                    while let Ok(reply) = requests.try_recv() {
+                        let _ = reply.send(Err(
+                            "TLS の検査は panic で永久停止しました。Hub を再起動してください"
+                                .into(),
+                        ));
                     }
                     retry_after_panic(failed, retry, ticks, stopped, state.clone()).await;
                     drop(keep_alive);
@@ -379,17 +566,18 @@ where
                 Err(_) => {
                     // Watch を回収できないため未書込拇印の完全な復元は保証できない。
                     // payload は展開せず、既知の serving 拇印を残して安全側で止める。
-                    external.revoke();
+                    external.retire_identity();
                     if let Some(active) = listener.take() {
                         active.revoker().revoke();
                         active.stop().await;
                     }
                     let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
-                    let reason = format!("TLS の周期検査タスクが異常終了し、失効状態と未書込拇印を回収できませんでした。既知の待受証明書の拇印: {}。TLS は停止し、このプロセスでは再開しません。Hub を再起動する前にログと鍵・証明書・失効の記録を確認し、安全側で鍵と証明書を作り直してください。失効の記録は消さないでください", settings.serving);
+                    let reason = format!("TLS の周期検査タスクが異常終了し、失効状態と未書込拇印を回収できませんでした。既知の待受証明書の拇印: {}。TLS は停止し、このプロセスでは再開しません。Hub を再起動する前にログと鍵・証明書・失効の記録を確認し、安全側で鍵と証明書を作り直してください。失効の記録は消さないでください", serving);
                     state.status = DesktopTlsStatus {
                         address: None,
                         reason: Some(reason.clone()),
                         requires_recreation: true,
+                        can_resume: false,
                     };
                     crate::hub_log::log_err_line(&format!("[WARN] banto-hub: {reason}"));
                     drop(keep_alive);
@@ -397,7 +585,7 @@ where
                 }
             }
             if watch.permanently_revoked {
-                external.revoke();
+                external.retire_identity();
             }
             if external.is_revoked() {
                 round.allow = false;
@@ -416,7 +604,13 @@ where
                 if stopped.try_recv() != Err(tokio::sync::oneshot::error::TryRecvError::Empty) {
                     break;
                 }
-                match tls_listener::start_following(&config, router.clone(), &external).await {
+                match tls_listener::start_following(
+                    config.as_ref().expect("active config"),
+                    router.clone(),
+                    &external,
+                )
+                .await
+                {
                     Ok(active) => {
                         if external.is_revoked() {
                             active.stop().await;
@@ -425,7 +619,7 @@ where
                             crate::hub_log::log_line(&format!(
                                 "banto-hub: 既定の TLS が復帰しました: https://{}（拇印 {}）",
                                 active.local_addr(),
-                                settings.serving
+                                serving
                             ));
                             listener = Some(active);
                         }
@@ -444,13 +638,21 @@ where
             }
             let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
             state.status = DesktopTlsStatus {
-                address: listener.as_ref().map(RunningTlsListener::local_addr),
+                address: listener
+                    .as_ref()
+                    .filter(|listener| listener.is_serving())
+                    .map(RunningTlsListener::local_addr),
                 reason: round.reason,
                 requires_recreation: watch.permanently_revoked,
+                can_resume: !external.is_revoked(),
             };
         }
         // 検査停止と listener 停止を分け、runtime の既存の停止順序を保つ。
         // 異常 drop / stop future のキャンセルでも、この task 自身が最後まで閉じる。
+        requests.close();
+        while let Ok(reply) = requests.try_recv() {
+            let _ = reply.send(Err("TLS の検査は停止しています".into()));
+        }
         let graceful = finished.await.unwrap_or(false);
         if let Some(active) = listener {
             if !graceful {
@@ -467,6 +669,107 @@ where
         snapshot,
         finish: Some(finish),
         revoker,
+        renew,
+    }
+}
+
+async fn discard_dead_listener(listener: &mut Option<RunningTlsListener>) {
+    if listener
+        .as_ref()
+        .is_some_and(|listener| !listener.is_serving())
+    {
+        listener.take().unwrap().stop().await;
+    }
+}
+
+struct RenewalResult {
+    listener: Option<RunningTlsListener>,
+    config: Option<TlsConfig>,
+    outcome: Result<Option<String>, String>,
+    pending: BTreeSet<CertThumbprint>,
+}
+
+fn renew_owned(
+    mut listener: Option<RunningTlsListener>,
+    mut config: Option<TlsConfig>,
+    router: axum::Router,
+    external: TlsRevoker,
+    mut pending: BTreeSet<CertThumbprint>,
+) -> RenewalResult {
+    let runtime = tokio::runtime::Handle::current();
+    let known_serving = config.as_ref().and_then(TlsConfig::thumbprint);
+    let mut switch = |identity: Option<(&[u8], &[u8])>| -> Result<(), String> {
+        let Some((cert, key)) = identity else {
+            external.retire_identity();
+            if let Some(active) = listener.take() {
+                active.revoker().revoke();
+                runtime.block_on(active.stop());
+            }
+            config = None;
+            return Ok(());
+        };
+        if external.externally_stopped() {
+            return Err(external_stop_reason().into());
+        }
+        let next = TlsConfig::in_memory(
+            DEFAULT_TLS_PORT,
+            cert.to_vec(),
+            Zeroizing::new(key.to_vec()),
+        );
+        if let Some(active) = &listener {
+            active.replace_identity(&next, &external)?;
+        } else {
+            listener = Some(
+                runtime
+                    .block_on(tls_listener::start_renewed(
+                        &next,
+                        router.clone(),
+                        &external,
+                    ))
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        if !listener
+            .as_ref()
+            .is_some_and(RunningTlsListener::is_serving)
+        {
+            return Err("TLS の待ち受けタスクが証明書の差し替え中に停止しました".into());
+        }
+        config = Some(next);
+        Ok(())
+    };
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let place = DefaultUserTlsPlace::resolve(&WindowsTlsTrustOps).map_err(|e| e.reason)?;
+        super::renewal::recreate(
+            &place,
+            &mut pending,
+            known_serving,
+            now_unix(),
+            &mut switch,
+            |_| Ok(()),
+        )
+        .map_err(|e| {
+            let failure = e.into_unavailable();
+            format!("{}。{}", failure.reason, failure.remedy)
+        })
+    }));
+    let result = match result {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = switch(None);
+            Err("TLS の作り直しが panic したため TLS を停止しました。Hub を閉じ、ログと鍵・証明書・失効の記録を確認してください".into())
+        }
+    };
+    if result.is_err() && !pending.is_empty() {
+        let _ = switch(None);
+        external.retire_identity();
+    }
+    runtime.block_on(discard_dead_listener(&mut listener));
+    RenewalResult {
+        listener,
+        config,
+        outcome: result,
+        pending,
     }
 }
 
@@ -565,6 +868,109 @@ fn external_stop_reason() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn renewal_after_checker_panic_with_unwritten_entries_returns_promptly() {
+        let identity = generate_identity(now_unix()).unwrap();
+        let serving = CertThumbprint::of_pem(identity.cert_pem.as_bytes()).unwrap();
+        let config = TlsConfig::in_memory(
+            0,
+            identity.cert_pem.as_bytes().to_vec(),
+            Zeroizing::new(identity.key_pem.as_bytes().to_vec()),
+        );
+        let router = axum::Router::new();
+        let active = tls_listener::start(&config, router.clone()).await.unwrap();
+        let monitor = spawn_with_retry(
+            active,
+            config,
+            router,
+            move |watch| {
+                watch.unwritten.insert(serving);
+                panic!("injected check panic");
+            },
+            |_| {},
+            MonitorSettings {
+                interval: Duration::from_millis(10),
+                serving,
+            },
+            (),
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while monitor.status().can_resume {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            monitor.recreation_handle().recreate(),
+        )
+        .await
+        .expect("panic write-only mode must reject renewal without waiting for retries");
+        assert!(result.is_err());
+        monitor.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn renewal_dead_listener_is_discarded_and_rebound_unless_external_stop_is_latched() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let identity = generate_identity(now_unix()).unwrap();
+        let serving = CertThumbprint::of_pem(identity.cert_pem.as_bytes()).unwrap();
+        let config = TlsConfig::in_memory(
+            0,
+            identity.cert_pem.as_bytes().to_vec(),
+            Zeroizing::new(identity.key_pem.as_bytes().to_vec()),
+        );
+        let router = axum::Router::new();
+        let active = tls_listener::start(&config, router.clone()).await.unwrap();
+        let dead = active.revoker();
+        let checks = Arc::new(AtomicUsize::new(0));
+        let observed = checks.clone();
+        let monitor = spawn_with(
+            active,
+            config,
+            router,
+            move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Round {
+                    allow: true,
+                    reason: None,
+                }
+            },
+            MonitorSettings {
+                interval: Duration::from_millis(10),
+                serving,
+            },
+            (),
+        );
+        dead.revoke(); // Simulate serve exiting after an attempted identity swap.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while checks.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let recovered = monitor.status();
+        assert!(recovered.can_resume);
+        assert!(std::net::TcpListener::bind(
+            recovered.address.expect("replacement is actually bound")
+        )
+        .is_err());
+        monitor.revoker().unwrap().revoke();
+        let before = checks.load(Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while checks.load(Ordering::SeqCst) < before + 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(monitor.status().address, None);
+        assert!(!monitor.status().can_resume);
+        monitor.stop().await;
+    }
+
     #[test]
     fn incomplete_three_times_stops_and_consistent_restores() {
         let mut watch = Watch::default();
@@ -650,6 +1056,7 @@ mod tests {
         let failed = monitor.status();
         assert_eq!(failed.address, None);
         assert!(!failed.requires_recreation);
+        assert!(failed.can_resume);
         assert!(
             failed
                 .reason
@@ -968,6 +1375,7 @@ mod tests {
             "disk thumbprint lost: {reason}"
         );
         assert!(status.requires_recreation);
+        assert!(!status.can_resume);
         assert!(monitor.revoker().unwrap().is_revoked());
         assert!(tokio::net::TcpStream::connect(address).await.is_err());
         monitor.stop().await;
@@ -1049,6 +1457,7 @@ mod tests {
             }
             let status = monitor.status();
             assert!(status.requires_recreation);
+            assert!(!status.can_resume);
             assert!(status
                 .reason
                 .as_ref()
@@ -1096,6 +1505,10 @@ mod tests {
         let status = monitor.status();
         assert_eq!(status.address, None);
         assert!(!status.requires_recreation);
+        assert!(
+            !status.can_resume,
+            "panic cannot resume even without observed exposure"
+        );
         let reason = status.reason.unwrap();
         assert!(reason.contains("panic"));
         assert!(
@@ -1154,6 +1567,7 @@ mod tests {
         let status = monitor.status();
         assert_eq!(status.address, None);
         assert!(status.requires_recreation);
+        assert!(!status.can_resume);
         let reason = status.reason.unwrap();
         assert!(
             reason.contains(&serving.to_string()),

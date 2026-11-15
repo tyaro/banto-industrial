@@ -58,7 +58,9 @@
 //! 決定 A・B）。そのときシェルは平文の 8722 へ navigate せず、Fallback の窓に理由と対処
 //! （[`TLS_REMEDY`]、`tray_status::describe_health_outcome`）を出す。
 //!
-//! Desktop モード（このプロセスが握る自分の Hub）は今の main では平文のまま（#1121 で TLS 化）。
+//! Desktop の Windows WebView2 は、プロセス所有の専用 origin でだけメモリ上の証明書を
+//! pin にする（[`crate::shell_tls`]）。サービスの pin は従来どおりディスクから読む。
+//! 非 Windows の Desktop は専用の安定した HTTP origin を使用する（設計 §4.5）。
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -180,10 +182,11 @@ pub(crate) fn certificate_error_action(
     let uri =
         tauri::Url::parse(request_uri).map_err(|_| "要求の URI を解釈できません".to_string())?;
     // WebSocket（`wss`）も同じ口・同じ pin（イベントは WebSocket を含むすべての資源で来る）。
-    let is_hub_tls = matches!(uri.scheme(), "https" | "wss")
+    let is_service = matches!(uri.scheme(), "https" | "wss")
         && uri.host_str() == Some(SERVICE_TLS_HOST)
         && uri.port_or_known_default() == Some(SERVICE_TLS_PORT);
-    if !is_hub_tls {
+    let is_desktop = crate::shell_tls::read_pin(request_uri).is_ok();
+    if !is_service && !is_desktop {
         return Err(format!(
             "Hub の TLS の口（https://{SERVICE_TLS_HOST}:{SERVICE_TLS_PORT}）ではない相手の証明書の誤りです（{}://{}）",
             uri.scheme(),
@@ -209,7 +212,7 @@ pub(crate) fn certificate_error_action(
 }
 
 /// メインの窓の WebView2 に `ServerCertificateErrorDetected` のハンドラを 1 回だけ付ける（窓を
-/// 作った直後の `setup` から呼ぶ。Desktop モードの平文の http では来ないので害は無い）。付けられ
+/// 作った直後の `setup` から呼ぶ。Desktop の pin は同じプロセスのメモリから取る）。付けられ
 /// なければログに残すだけ - そのときは WebView2 の既定（証明書の誤りのページ）になり、Service の
 /// 画面は開かない（安全側）。
 #[cfg(windows)]
@@ -386,12 +389,14 @@ unsafe fn decide_and_set(
             unsafe { cert.ToPemEncoding(&mut pem) }.map(|()| webview2_com::take_pwstr(pem))
         })
         .map_err(|err| format!("相手の証明書を取れません: {err}"));
-    let decision = certificate_error_action(
-        &request_uri,
-        untrusted_authority,
-        server_pem,
-        read_hub_cert_pem,
-    );
+    let decision = certificate_error_action(&request_uri, untrusted_authority, server_pem, || {
+        let uri = tauri::Url::parse(&request_uri).map_err(|e| e.to_string())?;
+        if uri.port_or_known_default() == Some(SERVICE_TLS_PORT) {
+            read_hub_cert_pem()
+        } else {
+            crate::shell_tls::read_pin(&request_uri)
+        }
+    });
     let action = match decision {
         Ok(der) => {
             log_line(&format!(

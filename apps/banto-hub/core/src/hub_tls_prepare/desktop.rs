@@ -5,7 +5,8 @@
 //! 初回作成・最後の照合と片付けを行う。無い組だけを protected DACL で作り、`creating` が
 //! ある作りかけだけは復旧する。既存の壊れ・露出は自動で作り直さない。
 //! 鍵を含むファイルはすべて、確かめて握ったフォルダのハンドル基準で操作する。
-//! 読んだ組をメモリ上で確かめて渡す。周期の見張りは [`watch`]（PR2e）、作り直しとシェルの https は PR3。
+//! 読んだ組をメモリ上で確かめて渡す。周期検査と作り直し要求の直列化は [`watch`]、
+//! 作り直しの順序・ファイルの復旧は [`renewal`]。シェル専用 origin は [`crate::shell_transport`]。
 
 use std::time::{Duration, Instant};
 
@@ -272,11 +273,21 @@ fn tls_place<P: UserTlsPlace + ?Sized>(
     place: &P,
     options: &ReconcileOptions,
 ) -> Result<CheckedUserPlace<WinTlsDir>, DesktopFailure> {
+    tls_place_observed(ops, place, options, |_| {})
+}
+
+fn tls_place_observed<P: UserTlsPlace + ?Sized>(
+    ops: &WindowsTlsTrustOps,
+    place: &P,
+    options: &ReconcileOptions,
+    mut observe_fault: impl FnMut(&UserPlaceProblem),
+) -> Result<CheckedUserPlace<WinTlsDir>, DesktopFailure> {
     // 作った直後も起点から読み直す。既存のフォルダの DACL は書き換えない。
     for _ in 0..16 {
-        match open_user_place(ops, place, UserPlaceKind::Tls)
-            .map_err(|found| problem(ops, place, options, found))?
-        {
+        match open_user_place(ops, place, UserPlaceKind::Tls).map_err(|found| {
+            observe_fault(&found);
+            problem(ops, place, options, found)
+        })? {
             UserPlaceState::Present(dir) => return Ok(dir),
             UserPlaceState::Absent(missing) => {
                 let name = missing
@@ -564,9 +575,16 @@ fn load_in_observed<P: UserTlsPlace + ?Sized>(
         .map_err(|report| failure_from_report(*report))?;
     settle_with(|| records.reconcile())?;
     // 本体の露出を補助ファイルの異常で隠さない。失効の記録への書き足しまで先に行う。
-    let (cert, key) = read_pair(ops, place, &dir, &mut |thumbprint| {
+    let mut pair = read_pair(ops, place, &dir, &mut |thumbprint| {
         records.record(thumbprint, RevokedCertPlace::User)
     })?;
+    let recovering_renewal = renewal::recover(ops, &dir, &records.read(), now, &pair, false)?;
+    if recovering_renewal {
+        pair = read_pair(ops, place, &dir, &mut |thumbprint| {
+            records.record(thumbprint, RevokedCertPlace::User)
+        })?;
+    }
+    let (cert, key) = pair;
     let complete = matches!((&cert, &key), (Some(cert), Some(key)) if pair_matches(cert, key));
     let marker = checked_auxiliary_file(ops, &dir, CREATING)?;
     let creating = if let Some(mut marker) = marker {
@@ -591,7 +609,7 @@ fn load_in_observed<P: UserTlsPlace + ?Sized>(
     // 印が無い一時ファイルを「前の作りかけ」と決めつけない。完全な組を使う場合も、
     // 印を片付ける前に一時ファイルの種類・所有者・ACL を確かめる。
     for name in [KEY_TEMP, CERT_TEMP] {
-        if checked_auxiliary_file(ops, &dir, name)?.is_some() && !creating {
+        if checked_auxiliary_file(ops, &dir, name)?.is_some() && !creating && !recovering_renewal {
             return Err(DesktopFailure::auxiliary(
                 &dir,
                 name,
@@ -673,11 +691,13 @@ fn load_in_observed<P: UserTlsPlace + ?Sized>(
         return Err(DesktopFailure::recreate(reason));
     }
     cleanup_auxiliary_files(&dir)?;
+    renewal::cleanup_old(dir.dir())?;
     Ok(identity)
 }
 
 #[cfg(test)]
 mod tests;
 
+mod renewal;
 /// デスクトップ既定 TLS の周期検査と停止・復帰。
 pub mod watch;
