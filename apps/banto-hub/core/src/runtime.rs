@@ -1223,7 +1223,7 @@ impl HubRuntime {
                             log_err_line(&line);
                         }
                         #[cfg(windows)]
-                        if host_kind == HubHostKind::Shell {
+                        if host_kind == HubHostKind::Shell && desktop_selected {
                             let initial = crate::hub_tls_prepare::desktop::watch::DesktopTlsStatus {
                                 remedy: None,
                                 address: None,
@@ -1231,15 +1231,13 @@ impl HubRuntime {
                                 requires_recreation: false, can_resume: true,
                             };
                             desktop_tls_initial_status = Some(initial.clone());
-                            if desktop_selected {
-                                desktop_tls_monitor =
-                                    Some(crate::hub_tls_prepare::desktop::watch::spawn_idle(
-                                        shell_router.clone(),
-                                        Some(config),
-                                        initial,
-                                        tls_keep_alive.clone(),
-                                    ));
-                            }
+                            desktop_tls_monitor =
+                                Some(crate::hub_tls_prepare::desktop::watch::spawn_idle(
+                                    shell_router.clone(),
+                                    Some(config),
+                                    initial,
+                                    tls_keep_alive.clone(),
+                                ));
                         }
                         None
                     }
