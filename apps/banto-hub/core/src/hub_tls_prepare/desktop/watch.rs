@@ -27,7 +27,6 @@ pub struct DesktopTlsStatus {
 
 struct Snapshot {
     status: DesktopTlsStatus,
-    revoker: Option<TlsRevoker>,
 }
 
 pub(crate) struct Monitor {
@@ -35,6 +34,7 @@ pub(crate) struct Monitor {
     task: Option<JoinHandle<()>>,
     finish: Option<oneshot::Sender<bool>>,
     snapshot: Arc<Mutex<Snapshot>>,
+    revoker: TlsRevoker,
 }
 impl Drop for Monitor {
     fn drop(&mut self) {
@@ -46,18 +46,22 @@ impl Drop for Monitor {
 }
 impl Monitor {
     pub(crate) fn status(&self) -> DesktopTlsStatus {
-        self.snapshot
+        let mut status = self
+            .snapshot
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .status
-            .clone()
+            .clone();
+        if self.revoker.is_revoked() {
+            status.address = None;
+            if !status.requires_recreation {
+                status.reason = Some(external_stop_reason().into());
+            }
+        }
+        status
     }
     pub(crate) fn revoker(&self) -> Option<TlsRevoker> {
-        self.snapshot
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .revoker
-            .clone()
+        Some(self.revoker.clone())
     }
     /// shutdown の冒頭で新しい検査/再 bind を止める。listener は TLS の停止位置まで保持する。
     pub(crate) fn signal_stop(&mut self) {
@@ -132,8 +136,10 @@ impl Watch {
                         Ok(Some(mut file)) => match file.read_all(MAX_PEM_BYTES) {
                             Ok(bytes) => *target = Some(Zeroizing::new(bytes)),
                             Err(error) => {
-                                transient |= matches!(error, ReadError::Other(_));
-                                invalid |= matches!(error, ReadError::TooLarge);
+                                match &error {
+                                    ReadError::Other(_) => transient = true,
+                                    ReadError::TooLarge => invalid = true,
+                                }
                                 reason = Some(format!("TLS の {name} を読めません: {error}"));
                             }
                         },
@@ -248,13 +254,14 @@ fn spawn_with<F>(
 where
     F: FnMut(&mut Watch) -> Round + Send + 'static,
 {
+    let revoker = TlsRevoker::following(listener.revoker());
+    let external = revoker.clone();
     let snapshot = Arc::new(Mutex::new(Snapshot {
         status: DesktopTlsStatus {
             address: Some(listener.local_addr()),
             reason: None,
             requires_recreation: false,
         },
-        revoker: Some(listener.revoker()),
     }));
     let state = snapshot.clone();
     let (stop, mut stopped) = oneshot::channel();
@@ -276,7 +283,7 @@ where
                 (watch, check, round)
             })
             .await;
-            let round;
+            let mut round;
             match checked {
                 Ok((next, next_check, found)) => {
                     watch = next;
@@ -294,10 +301,18 @@ where
                     state.status.reason = Some(
                         "TLS の周期検査タスクが異常終了しました。Hub を再起動してください".into(),
                     );
-                    state.revoker = None;
                     crate::hub_log::log_err_line("[WARN] banto-hub: TLS の周期検査タスクが異常終了したため TLS を停止しました");
                     drop(keep_alive);
                     return;
+                }
+            }
+            if watch.permanently_revoked {
+                external.revoke();
+            }
+            if external.is_revoked() {
+                round.allow = false;
+                if !watch.permanently_revoked {
+                    round.reason = Some(external_stop_reason().into());
                 }
             }
             if !round.allow {
@@ -311,8 +326,15 @@ where
                 if stopped.try_recv() != Err(tokio::sync::oneshot::error::TryRecvError::Empty) {
                     break;
                 }
-                match tls_listener::start(&config, router.clone()).await {
-                    Ok(active) => listener = Some(active),
+                match tls_listener::start_following(&config, router.clone(), &external).await {
+                    Ok(active) => {
+                        if external.is_revoked() {
+                            active.stop().await;
+                            round.reason = Some(external_stop_reason().into());
+                        } else {
+                            listener = Some(active);
+                        }
+                    }
                     Err(error) => {
                         crate::hub_log::log_err_line(&format!("[WARN] banto-hub: TLS の復帰で待ち受けられません。次の周期に再試行します: {error}"));
                         let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
@@ -333,7 +355,6 @@ where
                 reason: round.reason,
                 requires_recreation: watch.permanently_revoked,
             };
-            state.revoker = listener.as_ref().map(RunningTlsListener::revoker);
         }
         // 検査停止と listener 停止を分け、runtime の既存の停止順序を保つ。
         // 異常 drop / stop future のキャンセルでも、この task 自身が最後まで閉じる。
@@ -352,7 +373,12 @@ where
         task: Some(task),
         snapshot,
         finish: Some(finish),
+        revoker,
     }
+}
+
+fn external_stop_reason() -> &'static str {
+    "外部から TLS の失効停止が要求されました。このプロセスでは再開しません"
 }
 
 #[cfg(test)]
@@ -542,5 +568,134 @@ mod tests {
         .await
         .unwrap();
         assert!(tokio::net::TcpStream::connect(address).await.is_err());
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn external_revoker_stops_replacement_listener_and_prevents_future_rebind() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tokio::io::AsyncReadExt;
+        for revoke_while_stopped in [false, true] {
+            let identity = generate_identity(now_unix()).unwrap();
+            let config = TlsConfig::in_memory(
+                0,
+                identity.cert_pem.as_bytes().to_vec(),
+                Zeroizing::new(identity.key_pem.as_bytes().to_vec()),
+            );
+            let router = axum::Router::new();
+            let active = tls_listener::start(&config, router.clone()).await.unwrap();
+            let address = active.local_addr();
+            let config = TlsConfig::in_memory(
+                address.port(),
+                identity.cert_pem.as_bytes().to_vec(),
+                Zeroizing::new(identity.key_pem.as_bytes().to_vec()),
+            );
+            let healthy = Arc::new(AtomicBool::new(false));
+            let checks = Arc::new(AtomicUsize::new(0));
+            let seen = healthy.clone();
+            let counted = checks.clone();
+            let monitor = spawn_with(
+                active,
+                config,
+                router,
+                move |_| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Round {
+                        allow: seen.load(Ordering::SeqCst),
+                        reason: (!seen.load(Ordering::SeqCst)).then(|| "test stop".into()),
+                    }
+                },
+                Duration::from_millis(10),
+                (),
+            );
+            let old = monitor.revoker().unwrap();
+            let bound = Duration::from_secs(10);
+            tokio::time::timeout(bound, async {
+                while monitor.status().address.is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if revoke_while_stopped {
+                old.revoke();
+            }
+            healthy.store(true, Ordering::SeqCst);
+            if !revoke_while_stopped {
+                tokio::time::timeout(bound, async {
+                    while monitor.status().address.is_none() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let mut pending = tokio::net::TcpStream::connect(monitor.status().address.unwrap())
+                    .await
+                    .unwrap();
+                old.revoke();
+                let mut byte = [0];
+                let read = tokio::time::timeout(Duration::from_secs(1), pending.read(&mut byte))
+                    .await
+                    .expect("old revoker must immediately sever replacement listener connections");
+                assert!(matches!(read, Ok(0) | Err(_)));
+            }
+            assert!(old.is_revoked());
+            let observed = checks.load(Ordering::SeqCst);
+            tokio::time::timeout(bound, async {
+                while checks.load(Ordering::SeqCst) < observed + 2 {
+                    tokio::task::yield_now().await;
+                }
+                while monitor.status().address.is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(monitor.revoker().unwrap().is_revoked());
+            assert!(
+                tokio::net::TcpStream::connect(address).await.is_err(),
+                "external revocation must keep the fixed port closed"
+            );
+            monitor.stop().await;
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watcher_revocation_marks_shared_handle_and_preserves_specific_reason() {
+        let identity = generate_identity(now_unix()).unwrap();
+        let config = TlsConfig::in_memory(
+            0,
+            identity.cert_pem.as_bytes().to_vec(),
+            Zeroizing::new(identity.key_pem.as_bytes().to_vec()),
+        );
+        let router = axum::Router::new();
+        let active = tls_listener::start(&config, router.clone()).await.unwrap();
+        let monitor = spawn_with(
+            active,
+            config,
+            router,
+            |watch| {
+                let allow = watch.decide(ReconcileOutcome::Consistent, false, true);
+                Round {
+                    allow,
+                    reason: Some("specific exposure or revocation".into()),
+                }
+            },
+            Duration::from_millis(10),
+            (),
+        );
+        let original = monitor.revoker().unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !monitor.status().requires_recreation {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(original.is_revoked());
+        let status = monitor.status();
+        assert_eq!(status.address, None);
+        assert_eq!(
+            status.reason.as_deref(),
+            Some("specific exposure or revocation")
+        );
+        monitor.stop().await;
     }
 }

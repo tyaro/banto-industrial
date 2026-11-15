@@ -600,7 +600,7 @@ impl HubRuntime {
         match started {
             Ok(mut hub) => {
                 hub.db_pins = db_pins;
-                hub._profile_lock = Some(profile_lock);
+                hub._profile_lock = profile_lock.as_ref().is_some().then_some(profile_lock);
                 hub._profile_dirs = given_dirs;
                 Ok(hub)
             }
@@ -1585,7 +1585,8 @@ impl RunningHub {
     }
 
     /// 8723 の TLS を失効で止める口（#1121 PR2c。サービスの Hub の周期の確かめが使う）。TLS を
-    /// 待ち受けていなければ `None`。止めると、その証明書で張られた接続もすぐ切り、そのプロセスでは
+    /// 待ち受けていなければ `None`（デスクトップの監視中は一時停止中も同じ共有ハンドルを返す）。
+    /// 共有ハンドルは取得後の復帰先も止める。止めると、その証明書で張られた接続もすぐ切り、そのプロセスでは
     /// 再開しない（`crate::tls_listener` のモジュール doc「失効による停止」）。通常の停止
     /// （[`Self::shutdown_and_report`]）の挙動は変えない。
     pub fn tls_revoker(&self) -> Option<TlsRevoker> {
@@ -3701,6 +3702,10 @@ mod tests {
             let hub = HubRuntime::start(make(host_kind, default_tls.clone()))
                 .await
                 .expect("default TLS should start");
+            assert!(
+                hub._profile_lock.is_none(),
+                "skip_profile_lock must not store an empty guard"
+            );
             let tls_addr = hub.tls_local_addr().expect("default TLS should listen");
             assert_eq!(tls_addr.ip().to_string(), "127.0.0.1");
             assert_ne!(tls_addr.port(), 0);
