@@ -2,6 +2,7 @@
 //! 停止後も検査を続け、失効・露出以外なら同じメモリ上の組で復帰する。
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -185,19 +186,7 @@ impl Watch {
                     Some("TLS の鍵・証明書が正常でないか、起動時の証明書と一致しません".into());
             }
         }
-        for thumbprint in self.unwritten.clone() {
-            let written =
-                record_user_revocation(&ops, place, options, thumbprint, RevokedCertPlace::User);
-            if written.outcome == ReconcileOutcome::Consistent
-                && written.revocations.is_settled()
-                && written.revocations.is_revoked(&thumbprint)
-            {
-                self.unwritten.remove(&thumbprint);
-            } else {
-                crate::hub_log::log_err_line(&format!("[WARN] banto-hub: 露出を見た証明書（拇印 {thumbprint}）の失効を両方の記録に書けません。プロセス内に覚えて使わず、次の周期に再試行します: {:?}", written.warnings));
-            }
-            revoked |= written.revocations.is_revoked(&serving);
-        }
+        revoked |= self.write_unwritten(place, serving, options);
         // reconcile の後で別の読み手が記録した失効も見る。
         revoked |= read_user_revocations(&ops, place).is_revoked(&serving);
         if revoked || self.permanently_revoked {
@@ -214,6 +203,34 @@ impl Watch {
         let allow = self.decide(outcome, invalid, revoked);
         Round { allow, reason }
     }
+    /// 通常検査と panic 後の縮退経路が共有する、未書込拇印だけの再試行。
+    fn write_unwritten<P: UserTlsPlace + ?Sized>(
+        &mut self,
+        place: &P,
+        serving: CertThumbprint,
+        options: &ReconcileOptions,
+    ) -> bool {
+        let mut revoked = false;
+        for thumbprint in self.unwritten.clone() {
+            let written = record_user_revocation(
+                &WindowsTlsTrustOps,
+                place,
+                options,
+                thumbprint,
+                RevokedCertPlace::User,
+            );
+            if written.outcome == ReconcileOutcome::Consistent
+                && written.revocations.is_settled()
+                && written.revocations.is_revoked(&thumbprint)
+            {
+                self.unwritten.remove(&thumbprint);
+            } else {
+                crate::hub_log::log_err_line(&format!("[WARN] banto-hub: 露出を見た証明書（拇印 {thumbprint}）の失効を両方の記録に書けません。プロセス内に覚えて使わず、次の周期に再試行します: {:?}", written.warnings));
+            }
+            revoked |= written.revocations.is_revoked(&serving);
+        }
+        revoked
+    }
 }
 
 pub(crate) fn spawn(
@@ -224,7 +241,7 @@ pub(crate) fn spawn(
     keep_alive: Arc<Option<crate::profile_lock::ProfileLockGuard>>,
 ) -> Monitor {
     let task_guard = keep_alive.clone();
-    spawn_with(
+    spawn_with_retry(
         listener,
         config,
         router,
@@ -238,21 +255,55 @@ pub(crate) fn spawn(
                 },
             }
         },
+        move |watch| match DefaultUserTlsPlace::resolve(&WindowsTlsTrustOps) {
+            Ok(place) => {
+                watch.write_unwritten(&place, serving, &ReconcileOptions::default());
+            }
+            Err(error) => crate::hub_log::log_err_line(&format!(
+                "[WARN] banto-hub: panic 後の失効の記録の置き場を取得できません: {}",
+                error.reason
+            )),
+        },
         INTERVAL,
         task_guard,
     )
 }
 
+#[cfg(test)]
 fn spawn_with<F>(
     listener: RunningTlsListener,
     config: TlsConfig,
     router: axum::Router,
-    mut check: F,
+    check: F,
     interval: Duration,
     keep_alive: impl Send + 'static,
 ) -> Monitor
 where
     F: FnMut(&mut Watch) -> Round + Send + 'static,
+{
+    spawn_with_retry(
+        listener,
+        config,
+        router,
+        check,
+        |_| {},
+        interval,
+        keep_alive,
+    )
+}
+
+fn spawn_with_retry<F, R>(
+    listener: RunningTlsListener,
+    config: TlsConfig,
+    router: axum::Router,
+    mut check: F,
+    retry: R,
+    interval: Duration,
+    keep_alive: impl Send + 'static,
+) -> Monitor
+where
+    F: FnMut(&mut Watch) -> Round + Send + 'static,
+    R: FnMut(&mut Watch) + Send + 'static,
 {
     let revoker = TlsRevoker::following(listener.revoker());
     let external = revoker.clone();
@@ -279,16 +330,42 @@ where
             }
             // await は中断しない。終了/プロファイル切替は検査の完了まで待つ。
             let checked = tokio::task::spawn_blocking(move || {
-                let round = check(&mut watch);
+                // checker の panic payload は展開せず、更新済みの失効状態を必ず返す。
+                let round = catch_unwind(AssertUnwindSafe(|| check(&mut watch))).ok();
                 (watch, check, round)
             })
             .await;
             let mut round;
             match checked {
-                Ok((next, next_check, found)) => {
+                Ok((next, next_check, Some(found))) => {
                     watch = next;
                     check = next_check;
                     round = found;
+                }
+                Ok((failed, failed_check, None)) => {
+                    // panic した checker は再利用しない。TLS を閉じ切ってから書込専用へ縮退する。
+                    drop(failed_check);
+                    if failed.permanently_revoked || !failed.unwritten.is_empty() {
+                        external.revoke();
+                    }
+                    if let Some(active) = listener.take() {
+                        active.revoker().revoke();
+                        active.stop().await;
+                    }
+                    let reason = panic_reason(&failed);
+                    crate::hub_log::log_err_line(&format!("[WARN] banto-hub: {reason}"));
+                    {
+                        let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
+                        state.status = DesktopTlsStatus {
+                            address: None,
+                            reason: Some(reason),
+                            requires_recreation: failed.permanently_revoked
+                                || !failed.unwritten.is_empty(),
+                        };
+                    }
+                    retry_after_panic(failed, retry, ticks, stopped, state.clone()).await;
+                    drop(keep_alive);
+                    return;
                 }
                 Err(_) => {
                     // パニックの payload に鍵が含まれる可能性があるので展開しない。
@@ -375,6 +452,90 @@ where
         finish: Some(finish),
         revoker,
     }
+}
+
+fn pending_thumbprints(watch: &Watch) -> String {
+    watch
+        .unwritten
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn panic_reason(watch: &Watch) -> String {
+    let mut reason = "TLS の周期検査が panic したため、このプロセスでは TLS を再開しません。Hub を再起動する前にログを確認してください".to_string();
+    if !watch.unwritten.is_empty() {
+        reason.push_str(&format!(
+            "。panic 時の未書込の失効拇印: {}。失効の記録への書き込みだけを次の周期に再試行します",
+            pending_thumbprints(watch)
+        ));
+    }
+    if watch.permanently_revoked || !watch.unwritten.is_empty() {
+        reason.push_str(&format!("。{}", unavailable("").remedy));
+    }
+    reason
+}
+
+/// 既知の失効だけを書き直す。TLS の検査・復帰や panic した checker の再利用はしない。
+async fn retry_after_panic<R>(
+    mut watch: Watch,
+    mut retry: R,
+    mut ticks: tokio::time::Interval,
+    mut stopped: oneshot::Receiver<()>,
+    state: Arc<Mutex<Snapshot>>,
+) where
+    R: FnMut(&mut Watch) + Send + 'static,
+{
+    while !watch.unwritten.is_empty() {
+        crate::hub_log::log_err_line(&format!(
+            "[WARN] banto-hub: panic 後も未書込の失効拇印を保持しています: {}",
+            pending_thumbprints(&watch)
+        ));
+        tokio::select! { biased;
+            _ = &mut stopped => return,
+            _ = ticks.tick() => {}
+        }
+        // 書込中の停止でも完了まで待ち、profile 排他を先に離さない。
+        match tokio::task::spawn_blocking(move || {
+            let succeeded = catch_unwind(AssertUnwindSafe(|| retry(&mut watch))).is_ok();
+            (watch, retry, succeeded)
+        })
+        .await
+        {
+            Ok((next, next_retry, true)) => {
+                watch = next;
+                retry = next_retry;
+            }
+            Ok((next, _, false)) => {
+                let note = format!(
+                    "失効の書込専用タスクも panic したため再利用しません。残った未書込拇印: {}。{}",
+                    pending_thumbprints(&next),
+                    unavailable("").remedy
+                );
+                crate::hub_log::log_err_line(&format!("[WARN] banto-hub: {note}"));
+                annotate_retry_status(&state, &note);
+                return;
+            }
+            Err(_) => {
+                // 通常の callback panic は上で捕捉する。タスク自体の異常は直前の全件ログを残す。
+                let note = "失効の書込専用タスクが異常終了しました。直前の未書込拇印のログを確認してください";
+                crate::hub_log::log_err_line(&format!("[WARN] banto-hub: {note}"));
+                annotate_retry_status(&state, note);
+                return;
+            }
+        }
+    }
+    let note = "panic 後に保持していた未書込の失効拇印をすべて記録しました。TLS は停止を保ちます";
+    crate::hub_log::log_line(&format!("banto-hub: {note}"));
+    annotate_retry_status(&state, note);
+}
+
+fn annotate_retry_status(state: &Mutex<Snapshot>, note: &str) {
+    let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
+    let reason = state.status.reason.get_or_insert_with(String::new);
+    reason.push_str("。現在の状態: ");
+    reason.push_str(note);
 }
 
 fn external_stop_reason() -> &'static str {
@@ -697,5 +858,144 @@ mod tests {
             Some("specific exposure or revocation")
         );
         monitor.stop().await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panicking_check_preserves_all_unwritten_thumbprints_and_stops_tls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let identity = generate_identity(now_unix()).unwrap();
+        let serving = CertThumbprint::of_pem(identity.cert_pem.as_bytes()).unwrap();
+        let disk = CertThumbprint::of_der(b"different certificate seen on disk");
+        let config = TlsConfig::in_memory(
+            0,
+            identity.cert_pem.as_bytes().to_vec(),
+            Zeroizing::new(identity.key_pem.as_bytes().to_vec()),
+        );
+        let router = axum::Router::new();
+        let active = tls_listener::start(&config, router.clone()).await.unwrap();
+        let address = active.local_addr();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let monitor = spawn_with(
+            active,
+            config,
+            router,
+            move |watch| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                watch.unwritten.extend([serving, disk]);
+                panic!("injected checker failure");
+            },
+            Duration::from_millis(10),
+            (),
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !monitor.status().requires_recreation {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let status = monitor.status();
+        let reason = status.reason.unwrap();
+        assert!(
+            reason.contains(&serving.to_string()),
+            "serving thumbprint lost: {reason}"
+        );
+        assert!(
+            reason.contains(&disk.to_string()),
+            "disk thumbprint lost: {reason}"
+        );
+        assert!(status.requires_recreation);
+        assert!(monitor.revoker().unwrap().is_revoked());
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
+        monitor.stop().await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "panicking checker must not be reused"
+        );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panic_degrades_to_write_only_retries_and_never_reuses_panicking_callback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for writer_panics in [false, true] {
+            let identity = generate_identity(now_unix()).unwrap();
+            let serving = CertThumbprint::of_pem(identity.cert_pem.as_bytes()).unwrap();
+            let disk = CertThumbprint::of_der(b"disk certificate pending before panic");
+            let config = TlsConfig::in_memory(
+                0,
+                identity.cert_pem.as_bytes().to_vec(),
+                Zeroizing::new(identity.key_pem.as_bytes().to_vec()),
+            );
+            let router = axum::Router::new();
+            let active = tls_listener::start(&config, router.clone()).await.unwrap();
+            let address = active.local_addr();
+            let checks = Arc::new(AtomicUsize::new(0));
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let written = Arc::new(Mutex::new(BTreeSet::new()));
+            let checked = checks.clone();
+            let retried = attempts.clone();
+            let recorded = written.clone();
+            let monitor = spawn_with_retry(
+                active,
+                config,
+                router,
+                move |watch| {
+                    checked.fetch_add(1, Ordering::SeqCst);
+                    watch.unwritten.extend([serving, disk]);
+                    panic!("injected checker failure");
+                },
+                move |watch| {
+                    let attempt = retried.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(
+                        watch.unwritten,
+                        BTreeSet::from([serving, disk]),
+                        "both thumbprints must survive failed attempts"
+                    );
+                    assert!(!watch.unwritten.is_empty());
+                    if writer_panics {
+                        panic!("injected writer failure");
+                    }
+                    if attempt > 0 {
+                        recorded
+                            .lock()
+                            .unwrap()
+                            .extend(watch.unwritten.iter().copied());
+                        watch.unwritten.clear();
+                    }
+                },
+                Duration::from_millis(10),
+                (),
+            );
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !monitor.task.as_ref().unwrap().is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(checks.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                if writer_panics { 1 } else { 2 }
+            );
+            if !writer_panics {
+                assert_eq!(*written.lock().unwrap(), BTreeSet::from([serving, disk]));
+            }
+            let status = monitor.status();
+            assert!(status.requires_recreation);
+            assert!(status
+                .reason
+                .as_ref()
+                .unwrap()
+                .contains(&serving.to_string()));
+            assert!(status.reason.as_ref().unwrap().contains(&disk.to_string()));
+            assert!(status.reason.as_ref().unwrap().contains(if writer_panics {
+                "書込専用タスクも panic"
+            } else {
+                "すべて記録しました"
+            }));
+            assert!(tokio::net::TcpStream::connect(address).await.is_err());
+            monitor.stop().await;
+        }
     }
 }
