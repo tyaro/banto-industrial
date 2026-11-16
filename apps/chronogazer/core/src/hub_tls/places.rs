@@ -27,7 +27,8 @@ use banto_hub_tls_trust::{CertThumbprint, ReconcileOutcome, RevokedCertPlace};
 pub(crate) enum CertRead {
     /// 無い（置き場か証明書がまだ作られていない）。黙って外す。
     Absent,
-    /// 確かめに通った証明書（PEM のバイト列）。
+    /// 確かめに通った証明書（PEM のバイト列）。Windows 以外の本番の実装は作らない（試験の偽物だけ）。
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
     Usable(Vec<u8>),
     /// あるが通らない。pin に入れず、接続できても警告を出す。
     Unusable(UnusableCert),
@@ -51,7 +52,8 @@ pub(crate) enum ServiceRecordRead {
     /// 確かめに通って読めた拇印（記録が無ければ空）。
     Revoked(BTreeSet<CertThumbprint>),
     /// 使えない（置き場が通らない・形が壊れている・読めなかった）。サービスの証明書を
-    /// 使わない（設計 §4.4.1「サービスの記録」）。
+    /// 使わない（設計 §4.4.1「サービスの記録」）。Windows 以外の本番の実装は作らない。
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
     Unusable {
         /// 理由（表示用）。
         reason: String,
