@@ -32,7 +32,7 @@
 //! transaction (`banto_tstore::TstoreError::Uninitialized`'s doc comment)
 //! returns `Ok(None)` here - the same "this file contributes nothing"
 //! outcome as a file that simply never described `group_key`. `catalog.rs`
-//! (which shares [`open_readonly`] but does not build a [`FilePlan`]) calls
+//! (which shares [`open_file`] but does not build a [`FilePlan`]) calls
 //! [`is_uninitialized`] directly for the same reason.
 //!
 //! ## SQL-identifier safety
@@ -52,9 +52,9 @@
 //!   skipping if it does not match. Defense in depth, not a normal-path
 //!   check: no real `banto-tstore` file should ever trip it.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use banto_tstore::{DataFileInfo, DataPlace, ReadOnlyFile};
 use sqlx::{Row, SqlitePool};
 
 use crate::error::TsQueryError;
@@ -64,7 +64,9 @@ use crate::error::TsQueryError;
 /// period, and - for the caller's requested `tag_keys`, in that exact order
 /// - which physical column (if any) holds each one in *this* file.
 pub(crate) struct FilePlan {
-    pub(crate) pool: SqlitePool,
+    /// The open read-only file (a pinned one on a [`DataPlace::Managed`] -
+    /// #623 PR7; see [`open_file`]).
+    pub(crate) file: ReadOnlyFile,
     pub(crate) table_name: String,
     pub(crate) period_ms: i64,
     /// Same length/order as the caller's `tag_keys`; `None` at index `i`
@@ -74,17 +76,30 @@ pub(crate) struct FilePlan {
     pub(crate) columns: Vec<Option<String>>,
 }
 
-/// Open `path` read-only. Mirrors `banto-tstore/src/schema.rs::connect_readonly`
-/// (not reusable directly - `pub(crate)` there, and this crate does not want
-/// a dependency on `banto-tstore`'s internal module layout beyond its public
-/// API). Also used directly by `catalog.rs`, which needs every group/tag in
-/// a file rather than one `FilePlan`'s worth.
-pub(crate) async fn open_readonly(path: &Path) -> Result<SqlitePool, TsQueryError> {
-    let options = SqliteConnectOptions::new()
-        .filename(path)
-        .create_if_missing(false)
-        .read_only(true);
-    Ok(SqlitePoolOptions::new().connect_with(options).await?)
+/// Open one listed data file read-only through its [`DataPlace`] (#623 PR7):
+/// [`DataPlace::open_readonly`] by the file's own name. A
+/// [`DataPlace::Path`] opens by path exactly as `banto-tstore`'s
+/// `connect_readonly` (same options this module always mirrored); a
+/// [`DataPlace::Managed`] pins the file and its `-wal`/`-shm` first and
+/// refuses (without opening) a name that is a link/reparse point. Close the
+/// result with [`ReadOnlyFile::close`] (pool first, then the pins).
+pub(crate) async fn open_file(
+    place: &DataPlace,
+    file: &DataFileInfo,
+) -> Result<ReadOnlyFile, TsQueryError> {
+    Ok(place.open_readonly(&file_name(file)?).await?)
+}
+
+/// The listed file's own name (one path element) - what
+/// [`DataPlace::open_readonly`] takes.
+pub(crate) fn file_name(file: &DataFileInfo) -> Result<String, TsQueryError> {
+    file.path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            TsQueryError::Storage(format!("ファイル名を読めません: {}", file.path.display()))
+        })
 }
 
 /// `true` if `pool` has no `banto-tstore` schema at all yet - no
@@ -124,39 +139,65 @@ pub(crate) fn is_safe_column_name(name: &str) -> bool {
 /// created; the caller treats it the same as "this file contributes nothing
 /// to this group's query").
 pub(crate) async fn plan_file(
-    path: &Path,
+    place: &DataPlace,
+    info: &DataFileInfo,
     group_key: &str,
     tag_keys: &[String],
 ) -> Result<Option<FilePlan>, TsQueryError> {
-    let pool = open_readonly(path).await?;
+    let path = info.path.as_path();
+    let file = open_file(place, info).await?;
+    match plan_opened(&file, path, group_key, tag_keys).await {
+        Ok(Some((table_name, period_ms, columns))) => Ok(Some(FilePlan {
+            file,
+            table_name,
+            period_ms,
+            columns,
+        })),
+        Ok(None) => {
+            file.close().await;
+            Ok(None)
+        }
+        Err(error) => {
+            file.close().await;
+            Err(error)
+        }
+    }
+}
 
-    if is_uninitialized(&pool)
+type PlanParts = (String, i64, Vec<Option<String>>);
+
+async fn plan_opened(
+    file: &ReadOnlyFile,
+    path: &Path,
+    group_key: &str,
+    tag_keys: &[String],
+) -> Result<Option<PlanParts>, TsQueryError> {
+    let pool = file.pool();
+
+    if is_uninitialized(pool)
         .await
         .map_err(|e| incompatible(path, e))?
     {
         // Writer has not yet committed this file's schema-creation
         // transaction (raced) - treat it exactly like "this file does not
         // describe group_key at all" below, not as an error.
-        pool.close().await;
         return Ok(None);
     }
 
     let group_row =
         sqlx::query("SELECT table_name, period_ms FROM tstore_groups WHERE group_key = ? LIMIT 1")
             .bind(group_key)
-            .fetch_optional(&pool)
+            .fetch_optional(pool)
             .await
             .map_err(|e| incompatible(path, e))?;
 
     let Some(group_row) = group_row else {
-        pool.close().await;
         return Ok(None);
     };
     let table_name: String = group_row.get("table_name");
     let period_ms: i64 = group_row.get("period_ms");
 
     if !is_safe_table_name(&table_name) {
-        pool.close().await;
         return Err(TsQueryError::UnsafeIdentifier {
             path: path.to_path_buf(),
             identifier: table_name,
@@ -167,7 +208,7 @@ pub(crate) async fn plan_file(
         "SELECT column_name, tag_key FROM tstore_columns WHERE group_key = ? ORDER BY column_index ASC",
     )
     .bind(group_key)
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .await
     .map_err(|e| incompatible(path, e))?;
 
@@ -177,7 +218,6 @@ pub(crate) async fn plan_file(
         let column_name: String = row.get("column_name");
         let tag_key: String = row.get("tag_key");
         if !is_safe_column_name(&column_name) {
-            pool.close().await;
             return Err(TsQueryError::UnsafeIdentifier {
                 path: path.to_path_buf(),
                 identifier: column_name,
@@ -191,12 +231,7 @@ pub(crate) async fn plan_file(
         .map(|tag_key| by_tag_key.get(tag_key).cloned())
         .collect();
 
-    Ok(Some(FilePlan {
-        pool,
-        table_name,
-        period_ms,
-        columns,
-    }))
+    Ok(Some((table_name, period_ms, columns)))
 }
 
 pub(crate) fn incompatible(path: &Path, err: sqlx::Error) -> TsQueryError {
@@ -209,17 +244,38 @@ pub(crate) fn incompatible(path: &Path, err: sqlx::Error) -> TsQueryError {
 /// Build one [`FilePlan`] per candidate file that actually describes
 /// `group_key`, skipping (not erroring on) files that do not.
 pub(crate) async fn plan_files(
-    paths: &[PathBuf],
+    place: &DataPlace,
+    files: &[DataFileInfo],
     group_key: &str,
     tag_keys: &[String],
 ) -> Result<Vec<FilePlan>, TsQueryError> {
-    let mut plans = Vec::with_capacity(paths.len());
-    for path in paths {
-        if let Some(plan) = plan_file(path, group_key, tag_keys).await? {
-            plans.push(plan);
+    let mut plans = Vec::with_capacity(files.len());
+    for file in files {
+        match plan_file(place, file, group_key, tag_keys).await {
+            Ok(Some(plan)) => plans.push(plan),
+            Ok(None) => {}
+            Err(error) => {
+                close_plans(plans).await;
+                return Err(error);
+            }
         }
     }
     Ok(plans)
+}
+
+/// Close every plan's file (pool first, then its pins - [`ReadOnlyFile::close`]).
+/// Plans dropped without this (an error mid-query, a caller's timeout) still
+/// release their pins right after their pool (field order).
+pub(crate) async fn close_plans(plans: Vec<FilePlan>) {
+    for plan in plans {
+        plan.file.close().await;
+    }
+}
+
+impl FilePlan {
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        self.file.pool()
+    }
 }
 
 #[cfg(test)]

@@ -29,3 +29,6 @@ sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
 # (not hand-written SQL) so fixtures stay faithful to what a real collector
 # (I3b) produces - see `tests/` module docs.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# 握った置き場（`DataPlace::Managed`）で読む試験（#623 PR7、`tests/managed_place.rs`）。
+banto-safe-root = { path = "../banto-safe-root" }
+tempfile = { workspace = true }

@@ -14,6 +14,9 @@
 //! 本体・`-wal`・`-shm` を `pin_sqlite(_checked)` で握ったまま開く（`banto_tstore::DataPlace`
 //! の `Managed`。`CollectorService::new_for_service`）。保持期間の削除も握った子の基準で、
 //! 本体と付随の `-wal`・`-shm`・`-journal` を消す（`banto_tstore::prune_managed_files_with`）。
+//! #623 PR7: 履歴の読み手も同じ置き場で、本体は作らずに 3 つを握ってから読み取り専用で開く
+//! （`banto_tsquery::TsQuery::with_place`）。読み手が開いている間はその日付を消せず、その日の
+//! 掃除は失敗としてログに出し、その日は済んだと記録するので、やり直すのは次の日付の変わり目か再起動のとき。
 //! 守れないのは、握っていない名前（`-journal`・SQLite の一時ファイル）、開いていない日付の
 //! ファイル（消す直前に開いたハンドルで確かめ直すだけ）、運用モードに締める前から書き込みの
 //! 権利で開いていた古いハンドル（`banto_safe_root::root` の「守れないこと」）。

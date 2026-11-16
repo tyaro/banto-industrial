@@ -18,12 +18,11 @@
 //! never described `group_key` at all. Any other open failure is still a
 //! hard [`TsQueryError::IncompatibleFile`].
 
-use std::path::Path;
-
-use banto_tstore::{TsReader, TstoreError};
+use banto_tstore::{DataPlace, TsReader, TstoreError};
 
 use crate::error::TsQueryError;
 use crate::files::candidate_files;
+use crate::plan::file_name;
 use crate::types::{RawRange, RawRow};
 
 /// Default cap on [`crate::TsQuery::read_range`]'s total row count when the
@@ -31,7 +30,7 @@ use crate::types::{RawRange, RawRow};
 pub const DEFAULT_MAX_RAW_ROWS: usize = 100_000;
 
 pub(crate) async fn read_range(
-    data_dir: &Path,
+    place: &DataPlace,
     group_key: &str,
     tag_keys: &[String],
     from_ms: i64,
@@ -45,11 +44,12 @@ pub(crate) async fn read_range(
     }
     let max_rows = max_rows.unwrap_or(DEFAULT_MAX_RAW_ROWS);
 
-    let files = candidate_files(data_dir, from_ms, to_ms)?;
+    let files = candidate_files(place, from_ms, to_ms)?;
     let mut rows: Vec<RawRow> = Vec::new();
 
     for file in &files {
-        let reader = match TsReader::open(&file.path).await {
+        // Pinned on a `DataPlace::Managed` (#623 PR7 - `TsReader::open_in`).
+        let reader = match TsReader::open_in(place, &file_name(file)?).await {
             Ok(reader) => reader,
             // Uninitialized: the writer created this file but has not yet
             // committed its schema-creation transaction (raced) - not a
@@ -64,8 +64,34 @@ pub(crate) async fn read_range(
                 })
             }
         };
+        let result = read_file(
+            &reader, group_key, tag_keys, from_ms, to_ms, max_rows, &mut rows,
+        )
+        .await;
+        reader.close().await;
+        result?;
+    }
+
+    Ok(RawRange {
+        tag_keys: tag_keys.to_vec(),
+        rows,
+    })
+}
+
+/// One opened file's rows appended to `rows` (nothing if this file never
+/// described `group_key`).
+async fn read_file(
+    reader: &TsReader,
+    group_key: &str,
+    tag_keys: &[String],
+    from_ms: i64,
+    to_ms: i64,
+    max_rows: usize,
+    rows: &mut Vec<RawRow>,
+) -> Result<(), TsQueryError> {
+    {
         let Some(group) = reader.group(group_key) else {
-            continue; // this file's schema never included this group - not an error.
+            return Ok(()); // this file's schema never included this group - not an error.
         };
 
         // tag_keys[i] -> index into this file's GroupMeta::columns, or None
@@ -95,9 +121,5 @@ pub(crate) async fn read_range(
             });
         }
     }
-
-    Ok(RawRange {
-        tag_keys: tag_keys.to_vec(),
-        rows,
-    })
+    Ok(())
 }

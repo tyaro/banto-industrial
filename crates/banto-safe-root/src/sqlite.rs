@@ -95,22 +95,51 @@ impl ManagedDir {
         self.pin_sqlite_with(name, Some(expected))
     }
 
+    /// 読み手の口（#623 PR7）: [`ManagedDir::pin_sqlite`] と同じく握るが、**本体は作らない**
+    /// （無ければ `Ok(None)` で、`-wal`・`-shm` も作らない）。本体が在れば `-wal`・`-shm` は
+    /// 無ければ空で作って握る（読み取りでも SQLite は `-shm` を書き込みで開くので、握らずに
+    /// 渡さない）。`expected` が `Some` なら [`ManagedDir::pin_sqlite_checked`] と同じ確かめ。
+    ///
+    /// 握りの共有は書き手と同じ読み書き（削除なし）で、権利は読み取りなので、書き手が同じ名前を
+    /// 握って SQLite で書いている間（当日のファイル）も重ねて握れる（互いの権利を共有が許す）。
+    pub fn pin_existing_sqlite(
+        &self,
+        name: &str,
+        expected: Option<&DirAccess>,
+    ) -> Result<Option<PinnedSqlite>> {
+        self.pin_sqlite_inner(name, expected, false)
+    }
+
     fn pin_sqlite_with(&self, name: &str, expected: Option<&DirAccess>) -> Result<PinnedSqlite> {
-        let pin = |name: &str| -> Result<PinnedName> {
-            let pinned = match expected {
-                Some(expected) => self.pin_file_checked(name, true, expected)?,
-                None => self.pin_file(name, true)?,
-            };
-            Ok(pinned.expect("create が真なら None にならない"))
+        Ok(self
+            .pin_sqlite_inner(name, expected, true)?
+            .expect("create が真なら None にならない"))
+    }
+
+    fn pin_sqlite_inner(
+        &self,
+        name: &str,
+        expected: Option<&DirAccess>,
+        create_db: bool,
+    ) -> Result<Option<PinnedSqlite>> {
+        let pin = |name: &str, create: bool| -> Result<Option<PinnedName>> {
+            match expected {
+                Some(expected) => self.pin_file_checked(name, create, expected),
+                None => self.pin_file(name, create),
+            }
         };
-        let db = pin(name)?;
-        let wal = pin(&format!("{name}{WAL_SUFFIX}"))?;
-        let shm = pin(&format!("{name}{SHM_SUFFIX}"))?;
+        let Some(db) = pin(name, create_db)? else {
+            return Ok(None);
+        };
+        let wal =
+            pin(&format!("{name}{WAL_SUFFIX}"), true)?.expect("create が真なら None にならない");
+        let shm =
+            pin(&format!("{name}{SHM_SUFFIX}"), true)?.expect("create が真なら None にならない");
         match expected {
             Some(expected) => self.reopen_path_checked(name, &[JOURNAL_SUFFIX], expected)?,
             None => self.reopen_path(name, &[JOURNAL_SUFFIX])?,
         };
-        Ok(PinnedSqlite { db, wal, shm })
+        Ok(Some(PinnedSqlite { db, wal, shm }))
     }
 }
 
@@ -167,17 +196,36 @@ impl PinnedSqlite {
     /// [`sqlx::Error::PoolTimedOut`] になるため（`tests` の
     /// `a_failed_after_connect_only_times_out_the_pool`）。
     pub async fn connect(&self) -> std::result::Result<SqlitePool, sqlx::Error> {
+        self.connect_with(self.connect_options()).await
+    }
+
+    /// 読み取り専用の開き方（#623 PR7、tstore の読み手）: 本体のパスで `create_if_missing`
+    /// なし・`read_only`。`journal_mode` は流さない（書き手が WAL にしたファイルをそのまま読む）。
+    pub fn read_only_options(&self) -> SqliteConnectOptions {
+        SqliteConnectOptions::new()
+            .filename(self.path())
+            .create_if_missing(false)
+            .read_only(true)
+    }
+
+    /// [`PinnedSqlite::connect`] の、開き方を渡す版（読み手は
+    /// [`PinnedSqlite::read_only_options`]）。握っているときの PERSIST_WAL の確かめと pool の
+    /// `after_connect` は同じ。読み手の接続にも立てるのは、読み手が最後の接続として閉じるとき
+    /// 握った `-wal`・`-shm` を消しに行って数秒待たないため（書き手が握っている当日のファイル
+    /// でも、書き手が先に閉じれば読み手が最後になる）。
+    pub async fn connect_with(
+        &self,
+        options: SqliteConnectOptions,
+    ) -> std::result::Result<SqlitePool, sqlx::Error> {
         if self.is_held() {
-            let mut probe = self.connect_options().connect().await?;
+            let mut probe = options.clone().connect().await?;
             let set = set_persist_wal(&mut probe).await;
             // 立てられなかったときは `close` が `-wal`・`-shm` を消しに行き数秒待つが、失敗の
             // 経路なので待つ。閉じる失敗は捨てる（理由は `set` の方を返す）。
             let _ = probe.close().await;
             set?;
         }
-        self.pool_options()
-            .connect_with(self.connect_options())
-            .await
+        self.pool_options().connect_with(options).await
     }
 }
 

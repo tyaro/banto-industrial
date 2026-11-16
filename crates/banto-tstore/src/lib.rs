@@ -99,6 +99,6 @@ pub use files::{
 };
 pub use findable::{candidate_date_range, ptime_is_findable_in, MAX_OFFSET_PAD_MS};
 pub use meta::{ColumnMeta, GroupMeta};
-pub use place::{prune_managed_files_with, DataPlace};
+pub use place::{prune_managed_files_with, DataPlace, ReadOnlyFile};
 pub use reader::{Sample, TsReader};
 pub use writer::{TsWriter, WriterOptions};
