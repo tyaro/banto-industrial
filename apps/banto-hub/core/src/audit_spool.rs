@@ -67,6 +67,13 @@ use crate::hub_log::log_err_line;
 /// データディレクトリの中の、監査の保留ディレクトリの名前。
 pub const SPOOL_DIR_NAME: &str = "audit-spool";
 
+/// 保留の中の、読めない保留ファイルの退避先フォルダの名前（#623 PR5）。banto の
+/// `banto-admin-services` の `audit::spool` の `QUARANTINE_DIR` と同じ値でなければならない:
+/// banto が読めない保留ファイルを `<spool>/quarantine/` へ**パスで**
+/// `create_dir_all` → `rename` するので、ここで同じ名前のフォルダを先に握っておく
+/// （`crate::profile_lock::DIR_AUDIT_QUARANTINE`）。banto 側の名前が変わったら合わせる。
+pub const QUARANTINE_DIR_NAME: &str = "quarantine";
+
 /// `data_dir`（実効値）の中の監査の保留ディレクトリ。
 pub fn spool_dir(data_dir: &Path) -> PathBuf {
     data_dir.join(SPOOL_DIR_NAME)

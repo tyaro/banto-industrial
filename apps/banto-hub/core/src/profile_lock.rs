@@ -112,6 +112,12 @@ pub const DIR_LOGS: &str = "logs";
 /// `{profile_dir}/data/audit-spool`（監査の保留。名前は
 /// [`crate::audit_spool::SPOOL_DIR_NAME`]）。
 pub const DIR_AUDIT_SPOOL: &str = "audit-spool";
+/// `{profile_dir}/data/audit-spool/quarantine`（読めない保留ファイルの退避先。名前は
+/// [`crate::audit_spool::QUARANTINE_DIR_NAME`]。#623 PR5）。banto は退避を**パスで**行う
+/// ので、`quarantine` を junction にされると LocalSystem が利用者のファイルを任意の場所へ
+/// 移してしまう。サービスはこのフォルダを握り続け（握っている間は改名・削除・差し替え不可）、
+/// 作る時点でリンクなら開かずに断る。
+pub const DIR_AUDIT_QUARANTINE: &str = "audit-spool-quarantine";
 
 /// profile の中で開いて握るフォルダ（親から順に 1 段ずつ。無ければ作る）。
 /// 監査の保留（[`AUDIT_SPOOL_SPECS`]）は必須にしない（開けなくても起動は続ける）。
@@ -160,7 +166,7 @@ const AUDIT_SPOOL_SPECS: [ManagedSpec; 2] = [
 /// 改ざんで、黙って保留なしで動かすより、緩め直して止める方が安全（ChronoGazer の
 /// `audit-spool` も管理するフォルダの必須の 1 つ）。`data` を親として 1 回だけ並べる
 /// （661-1 の別に試す形のように `data` を 2 回握らない）。
-pub const SERVICE_PROFILE_MANAGED_SPECS: [ManagedSpec; 4] = [
+pub const SERVICE_PROFILE_MANAGED_SPECS: [ManagedSpec; 5] = [
     PROFILE_MANAGED_SPECS[0],
     PROFILE_MANAGED_SPECS[1],
     PROFILE_MANAGED_SPECS[2],
@@ -168,6 +174,13 @@ pub const SERVICE_PROFILE_MANAGED_SPECS: [ManagedSpec; 4] = [
         key: DIR_AUDIT_SPOOL,
         parent: Some(DIR_DATA),
         name: crate::audit_spool::SPOOL_DIR_NAME,
+        create: true,
+    },
+    // #623 PR5: 保留の退避先も握る（デスクトップの `PROFILE_MANAGED_SPECS` には足さない）。
+    ManagedSpec {
+        key: DIR_AUDIT_QUARANTINE,
+        parent: Some(DIR_AUDIT_SPOOL),
+        name: crate::audit_spool::QUARANTINE_DIR_NAME,
         create: true,
     },
 ];
@@ -187,6 +200,10 @@ pub struct ProfileDirs {
     pub logs: Arc<ManagedDir>,
     /// `{profile_dir}/data/audit-spool`。開けなかったときは `None`（保留なしで続ける）。
     pub audit_spool: Option<Arc<ManagedDir>>,
+    /// `{profile_dir}/data/audit-spool/quarantine`（#623 PR5）。サービス
+    /// （[`open_profile_dirs_checked`]）だけが `Some`（必須）。`RunningHub` の生存中握り続けて、
+    /// banto のパスでの退避（`create_dir_all` → `rename`）の相手のすり替えを防ぐ。
+    pub audit_quarantine: Option<Arc<ManagedDir>>,
     /// 運用モードの形（#661 661-2。[`open_profile_dirs_checked`] だけが `Some`）。`Some` なら
     /// 設定 DB は、`config` と本体・`-wal`・`-shm` の記述子がこの形かを確かめて握ってから開く
     /// （`ManagedDir::pin_sqlite_checked`。#623 PR2a）。
@@ -257,6 +274,7 @@ pub fn open_profile_dirs(
         data,
         logs,
         audit_spool,
+        audit_quarantine: None,
         checked_access: None,
     })
 }
@@ -279,12 +297,14 @@ pub fn open_profile_dirs_checked(
     let data = take(DIR_DATA);
     let logs = take(DIR_LOGS);
     let audit_spool = take(DIR_AUDIT_SPOOL);
+    let audit_quarantine = take(DIR_AUDIT_QUARANTINE);
     Ok(ProfileDirs {
         profile,
         config,
         data,
         logs,
         audit_spool: Some(audit_spool),
+        audit_quarantine: Some(audit_quarantine),
         checked_access: Some(operation.clone()),
     })
 }
@@ -571,6 +591,62 @@ mod tests {
             .expect("a bad audit-spool must not stop the lock");
         assert!(guard.dirs().audit_spool.is_none());
         assert!(guard.dirs().data.path().is_dir());
+    }
+
+    /// #623 PR5: サービスの specs で開くと、保留の退避先 `audit-spool\quarantine` も握る。
+    #[test]
+    fn service_specs_hold_the_audit_quarantine_under_the_spool() {
+        let root = TempDir::new("profile-lock-quarantine");
+        let paths = resolve_profile_paths(root.path(), "quarantine").expect("valid profile id");
+        let profile = Arc::new(open_root(&plain_profile_root_spec(&paths)).expect("profile"));
+
+        let dirs = open_profile_dirs_checked(profile, &DirAccess::service_only())
+            .expect("service specs open");
+        let quarantine = dirs.audit_quarantine.as_ref().expect("held");
+        let expected = paths
+            .data_dir
+            .join(crate::audit_spool::SPOOL_DIR_NAME)
+            .join(crate::audit_spool::QUARANTINE_DIR_NAME);
+        assert!(expected.is_dir());
+        assert!(quarantine.final_path().ends_with(
+            Path::new(crate::audit_spool::SPOOL_DIR_NAME)
+                .join(crate::audit_spool::QUARANTINE_DIR_NAME)
+        ));
+        // デスクトップ・コンソールの組には足さない。
+        let plain = open_profile_dirs(&plain_profile_root_spec(&paths), None).expect("plain");
+        assert!(plain.audit_quarantine.is_none());
+    }
+
+    /// #623 PR5: `quarantine` が junction だと、サービスの specs では開かずに断る
+    /// （LocalSystem が外へ移してしまうのを防ぐ）。
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_in_place_of_the_quarantine_is_refused() {
+        let root = TempDir::new("profile-lock-quarantine-junction");
+        let paths = resolve_profile_paths(root.path(), "junction").expect("valid profile id");
+        let spool = paths.data_dir.join(crate::audit_spool::SPOOL_DIR_NAME);
+        std::fs::create_dir_all(&spool).unwrap();
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(spool.join(crate::audit_spool::QUARANTINE_DIR_NAME))
+            .arg(&outside)
+            .output()
+            .expect("mklink")
+            .status;
+        assert!(status.success(), "mklink /J に失敗した");
+
+        // junction を辿らず断るのは Guarded だけ（Plain は `std::fs` のまま）。
+        let mut spec = plain_profile_root_spec(&paths);
+        spec.mode = Mode::Guarded;
+        spec.owners = vec![banto_safe_root::acl::current_user_sid().expect("今の利用者の SID")];
+        let profile = Arc::new(open_root(&spec).expect("profile"));
+        match open_profile_dirs_checked(profile, &DirAccess::service_only()) {
+            Err(ProfileDirsError::Managed(stop)) => assert_eq!(stop.key, DIR_AUDIT_QUARANTINE),
+            Err(other) => panic!("expected Managed(quarantine), got {other}"),
+            Ok(_) => panic!("a junction quarantine must be refused"),
+        }
     }
 
     #[test]

@@ -181,7 +181,7 @@ const LOGS_SPEC: ManagedSpec = ManagedSpec {
 
 /// 締めた後に開く残りの管理するフォルダ（設計 §6.1。`data.dir` が外部でも `data` は握る -
 /// 無ければ作って締めた形で置くだけで、外部の置き場には触れない）。
-const MANAGED_SPECS: [ManagedSpec; 8] = [
+const MANAGED_SPECS: [ManagedSpec; 9] = [
     ManagedSpec {
         key: "data",
         parent: None,
@@ -216,6 +216,16 @@ const MANAGED_SPECS: [ManagedSpec; 8] = [
         key: "audit-spool-db",
         parent: Some("audit-spool"),
         name: DB_FILE_NAME,
+        create: true,
+    },
+    // #623 PR5: banto の保留は読めないファイルを `audit-spool/quarantine` へ**パスで**
+    // 移す（`create_dir_all` → `rename`）。リンクにすり替えられないよう握っておく
+    // （握っている間は改名・削除不可。リンクなら開かずに断る）。名前は banto の
+    // `banto-admin-services` の `audit::spool::QUARANTINE_DIR` と同じ。
+    ManagedSpec {
+        key: "audit-spool-quarantine",
+        parent: Some("audit-spool"),
+        name: "quarantine",
         create: true,
     },
     ManagedSpec {

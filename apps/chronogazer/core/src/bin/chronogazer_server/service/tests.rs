@@ -531,6 +531,7 @@ fn assert_tightened_before_engine(lines: &[String]) {
         "data",
         "backups",
         "audit-spool",
+        "quarantine",
         "secrets",
     ] {
         let marker = position(lines, &format!("acl:marker:{key}"));
