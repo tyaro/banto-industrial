@@ -728,6 +728,42 @@ async fn an_exposure_that_cannot_be_recorded_is_remembered_and_retried() {
     assert!(!connects(&policy));
 }
 
+/// 保存済みの接続が無い PC（見張りが `refresh` を呼ばない）では、整える手順が「整っている」でも、
+/// 書けなかった失効は操作の入口（`ensure_started`）が書き直す。書けたら、もう何も呼ばない。
+#[tokio::test]
+async fn ensure_started_retries_an_unwritten_revocation_until_it_is_recorded() {
+    let user = cert_pem();
+    let places = FakePlaces::new();
+    places.fail_records(true);
+    places.set_user(exposed("鍵を Users が読めます", &user));
+    let policy = desktop(&places);
+
+    policy.ensure_started(HUB).await;
+    assert_eq!(places.calls().reconcile, 1);
+    assert_eq!(places.calls().record.len(), 1);
+    assert!(warnings(&policy)
+        .iter()
+        .any(|w| w.contains("失効の記録に書けていません")));
+
+    // 整っていても、書けていない失効があるので走らせ直す。
+    policy.ensure_started(HUB).await;
+    assert_eq!(places.calls().record.len(), 2);
+
+    places.fail_records(false);
+    policy.ensure_started(HUB).await;
+    assert_eq!(places.calls().record.len(), 3);
+    assert!(places.user_revoked().contains(&thumbprint(&user)));
+    assert!(!warnings(&policy)
+        .iter()
+        .any(|w| w.contains("書けていません")));
+
+    // 書けたので、次は整える手順も書き足しも呼ばない。
+    let (reconcile, record) = (places.calls().reconcile, places.calls().record.len());
+    policy.ensure_started(HUB).await;
+    assert_eq!(places.calls().reconcile, reconcile);
+    assert_eq!(places.calls().record.len(), record);
+}
+
 /// ほかのプロセス（Hub のデスクトップ版）が先に同じ拇印を書いていれば、書き足しを頼まない。
 #[tokio::test]
 async fn an_exposure_already_in_the_record_is_not_written_again() {

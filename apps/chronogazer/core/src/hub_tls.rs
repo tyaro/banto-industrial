@@ -768,7 +768,8 @@ impl HubTlsPolicy {
 
     /// 起動の初回の整える手順（モジュール doc「いつ読むか」）。`endpoint` が loopback の https
     /// で、利用者の記録を持つ決まりで、まだ 1 回も走らせていないか、最後の結果が「整っている」
-    /// でないときだけ走らせる（「できなかった」「通らない」で終わった回は、次の操作でやり直す。
+    /// でないか、露出を見た拇印の書き足しが残っている（`unwritten`）ときだけ走らせる
+    /// （「できなかった」「通らない」で終わった回・書けなかった失効は、次の操作でやり直す。
     /// やり直しは「できなかった」の連続数を進めない: 3 周期は見張りの周期で数える）。操作の
     /// 入口（`crate::hub` の `begin_operation`・`connect`・`adopt_manual_key`）が、Hub と話す
     /// 前に呼ぶ - 走らせる前の判定は、利用者の証明書を使い始めない。
@@ -789,20 +790,21 @@ impl HubTlsPolicy {
         if !pinned.reads_user {
             return;
         }
-        let (started, consistent) = {
+        let (started, settled) = {
             let state = pinned.state();
             (
                 state.reconcile.is_some(),
                 state
                     .reconcile
                     .as_ref()
-                    .is_some_and(|seen| seen.outcome == ReconcileOutcome::Consistent),
+                    .is_some_and(|seen| seen.outcome == ReconcileOutcome::Consistent)
+                    && state.unwritten.is_empty(),
             )
         };
-        // 起動の初回は「整っている」で終わるまで走らせ直す（保存済みの接続が無い PC では
-        // 見張りが `refresh` を呼ばないので、ロックの待ち切れで終わった回を再起動まで
-        // 引きずらない）。
-        if only_first && consistent {
+        // 起動の初回は「整っている」かつ書き足しが残っていない状態になるまで走らせ直す
+        // （保存済みの接続が無い PC では見張りが `refresh` を呼ばないので、ロックの待ち切れで
+        // 終わった回や、記録に書けなかった失効を再起動まで引きずらない）。
+        if only_first && settled {
             return;
         }
         let pinned = Arc::clone(pinned);
