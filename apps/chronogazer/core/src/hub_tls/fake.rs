@@ -34,6 +34,8 @@ struct Inner {
     /// 整える手順が結果を読んだ後、返す前に呼ぶ（試験が待たせる・記録を書き換える）。引数は
     /// 何回目の整える手順か（1 始まり）。
     after_reconcile_read: Option<ReconcileHook>,
+    /// 利用者の記録を読んだ後（読んだ値を返す前）に呼ぶ口。引数は何回目の読みか（1 始まり）。
+    after_user_record_read: Option<ReconcileHook>,
     /// 次の整える手順の結果（空なら `reconcile_outcome` で警告なし）。
     scripted: VecDeque<(ReconcileOutcome, bool, Vec<String>)>,
     reconcile_outcome: ReconcileOutcome,
@@ -83,6 +85,7 @@ impl FakePlaces {
             user_revoked: BTreeSet::new(),
             user_record_settled: true,
             after_reconcile_read: None,
+            after_user_record_read: None,
             scripted: VecDeque::new(),
             reconcile_outcome: ReconcileOutcome::Consistent,
             record_fails: false,
@@ -150,6 +153,12 @@ impl FakePlaces {
         self.inner().after_reconcile_read = Some(Arc::new(hook));
     }
 
+    /// 判定が利用者の記録を読んだ**後**、返す前に呼ぶ口（偽物のロックの外で呼ぶ）。試験が
+    /// ここで待たせると、「古い記録を読んだ判定が止まっている」間を作れる。
+    pub(crate) fn after_user_record_read(&self, hook: impl Fn(usize) + Send + Sync + 'static) {
+        self.inner().after_user_record_read = Some(Arc::new(hook));
+    }
+
     pub(crate) fn user_revoked(&self) -> BTreeSet<CertThumbprint> {
         self.inner().user_revoked.clone()
     }
@@ -198,10 +207,19 @@ impl HubTlsPlaces for FakePlaces {
     fn user_revocations(&self) -> UserRecordRead {
         let mut inner = self.inner();
         inner.calls.user_record += 1;
-        UserRecordRead {
+        let read = UserRecordRead {
             revoked: inner.user_revoked.clone(),
             settled: inner.user_record_settled,
+        };
+        let (hook, nth) = (
+            inner.after_user_record_read.clone(),
+            inner.calls.user_record,
+        );
+        drop(inner);
+        if let Some(hook) = hook {
+            hook(nth);
         }
+        read
     }
 
     fn reconcile_user_revocations(&self) -> ReconcileRead {

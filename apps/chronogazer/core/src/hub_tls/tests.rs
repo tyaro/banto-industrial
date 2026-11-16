@@ -1097,3 +1097,64 @@ fn other_systems_cannot_read_the_certificate() {
         assert!(detail.contains("この OS"), "{detail}");
     }
 }
+
+/// 判定は 1 つずつ: 古い（失効の無い）記録を読んで止まっている判定 A の間に、別の判定 B が
+/// 追加された失効を見て pin から外しても、B は A が終わるまで待ち、A の（古い）結果が B の結果を
+/// 上書きしない。直列化が無いと B が先に終わり、後から再開した A が `user_in_use` を戻す。
+#[tokio::test]
+async fn a_stalled_evaluation_does_not_overwrite_a_later_one_that_saw_a_revocation() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+    use std::sync::Mutex as StdMutex;
+
+    let user = cert_pem();
+    let places = FakePlaces::new();
+    places.set_user(usable(&user));
+    let policy = started_desktop(&places).await;
+    assert!(connects(&policy), "the user certificate is in use");
+    let in_use = || match &policy.loopback {
+        Loopback::Pinned(pinned) => pinned.state().user_in_use,
+        Loopback::PlainHttp => unreachable!("a pinned policy"),
+    };
+    assert_eq!(in_use(), Some(thumbprint(&user)));
+
+    // 次の記録の読み（判定 A）で止まる。
+    let stalled_at = places.calls().user_record + 1;
+    let (reached_tx, reached_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = StdMutex::new(release_rx);
+    let reached_tx = StdMutex::new(reached_tx);
+    places.after_user_record_read(move |call| {
+        if call == stalled_at {
+            reached_tx.lock().unwrap().send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        }
+    });
+
+    let b_done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let a = scope.spawn(|| connects(&policy));
+        reached_rx.recv().unwrap();
+        // A は古い記録（失効なし）を読んだところで止まっている。ここで失効が足された。
+        places.revoke_in_user_record(thumbprint(&user));
+        let b = scope.spawn(|| {
+            let detail = refusal(&policy);
+            b_done.store(true, Ordering::SeqCst);
+            detail
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        // 先に A を再開してから確かめる（確かめが落ちても A が止まったままにならない）。
+        let b_finished_early = b_done.load(Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        assert!(
+            !b_finished_early,
+            "B waits until the stalled evaluation has finished"
+        );
+        assert!(a.join().unwrap(), "A saw the old record");
+        assert!(b.join().unwrap().contains("失効"));
+    });
+
+    // 最後に反映されたのは B（失効を見た側）: その証明書は使われていない。
+    assert_eq!(in_use(), None);
+    assert!(refusal(&policy).contains("失効"));
+}

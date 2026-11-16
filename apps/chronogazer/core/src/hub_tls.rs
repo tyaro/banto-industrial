@@ -126,6 +126,11 @@
 //! いないもの、いまの警告。**証明書そのものと目印は覚えない**（別の接続先や失敗の呼び出しで
 //! 上書きされた値と比べないため）。時刻は `Clock` から読む（試験で進められる）。
 //!
+//! 判定（置き場の読み → 状態への反映）は `evaluate_gate` で 1 つずつにする。古い記録を読んで
+//! 止まっていた判定が、後から読んだ判定（追加された失効を見て pin から外した）の結果を、
+//! 古い値で上書きして失効した証明書を返さないため（読む順＝反映の順）。ロックの順序は
+//! 整える手順の `reconcile_gate` → `evaluate_gate` → 状態のロック。
+//!
 //! # 保存済みの loopback の http
 //!
 //! 以前の版で保存した `http://127.0.0.1:8722` などは**書き換えない**（オーナー決定）。
@@ -299,6 +304,10 @@ struct Pinned {
     /// 整える手順と、その結果の状態への反映を直列化するロック（モジュール doc「整える手順を
     /// いつ走らせるか」）。`state` より外。握ったまま `state` を取ってよいが、逆はしない。
     reconcile_gate: Arc<tokio::sync::Mutex<()>>,
+    /// 判定（置き場の読み → 状態への反映）を 1 つずつにする同期のロック。`evaluate` だけが
+    /// 取り、最後まで握る。順序は `reconcile_gate` → `evaluate_gate` → `state`（`state` を
+    /// 握ったまま取らない。`evaluate` の中で `reconcile_gate` を取らない）。
+    evaluate_gate: Mutex<()>,
     clock: Clock,
 }
 
@@ -370,12 +379,14 @@ impl Pinned {
             host,
             state: Mutex::new(State::default()),
             reconcile_gate: Arc::new(tokio::sync::Mutex::new(())),
+            evaluate_gate: Mutex::new(()),
             clock: Clock::default(),
         })
     }
 
-    /// 状態のロック。握ったまま置き場を読まない（読むのは必ずロックの外）。毒は無視する
-    /// （状態は足すだけ・上書きするだけの値で、途中で止まっても閉じる側にしか倒れない）。
+    /// 状態のロック。**このロックを**握ったまま置き場を読まない（読むのは必ずこのロックの
+    /// 外。置き場を読む間は `evaluate_gate` だけを握る）。毒は無視する（状態は足すだけ・
+    /// 上書きするだけの値で、途中で止まっても閉じる側にしか倒れない）。
     fn state(&self) -> MutexGuard<'_, State> {
         self.state
             .lock()
@@ -406,7 +417,16 @@ impl Pinned {
 
     /// 判定の本体。置き場をこの呼び出しで読み直し（ロックを待つ操作はしない）、状態と
     /// 合わせて pin・目印・警告を決める。
+    ///
+    /// **判定は 1 つずつ**: 最初に `evaluate_gate` を取り、置き場の読みから状態への反映まで
+    /// 握る。読んだ順に反映されるので、古い記録を読んで止まっていた判定が、後から読んだ
+    /// 判定（追加された失効を見て pin から外した）の結果を古い値で上書きしない。置き場の
+    /// 読みはロックの待ちを含まないので、握る時間は短い。`reconcile_gate` は取らない。
     fn evaluate(&self) -> Evaluation {
+        let _serial = self
+            .evaluate_gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         // 置き場を読む（状態のロックの外）。
         let service_cert = self.places.service_cert();
         let service_record =
