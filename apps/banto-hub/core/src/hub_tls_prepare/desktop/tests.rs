@@ -17,7 +17,7 @@ static NONCE: AtomicU64 = AtomicU64::new(0);
 const NOW: i64 = 1_795_000_000;
 
 #[derive(Clone)]
-struct Place(PathBuf);
+pub(super) struct Place(PathBuf);
 impl UserTlsPlace for Place {
     fn spec(&self, kind: UserPlaceKind) -> UserPlaceSpec {
         let mut spec = DefaultUserTlsPlace::new(
@@ -34,7 +34,10 @@ impl Place {
         self.spec(UserPlaceKind::Tls).path()
     }
     fn load(&self) -> Result<DefaultHubTls, String> {
-        load_in(&WindowsTlsTrustOps, self, &ReconcileOptions::default(), NOW)
+        self.load_at(NOW)
+    }
+    pub(super) fn load_at(&self, now: i64) -> Result<DefaultHubTls, String> {
+        load_in(&WindowsTlsTrustOps, self, &ReconcileOptions::default(), now)
             .map_err(|error| error.reason)
     }
     fn dir(&self) -> CheckedUserPlace<WinTlsDir> {
@@ -48,9 +51,9 @@ impl Place {
     }
 }
 
-struct Fixture(Place);
+pub(super) struct Fixture(pub(super) Place);
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let exe = std::env::current_exe().unwrap();
         let parent_path = exe.parent().unwrap();
         let parent = WindowsTlsTrustOps.pin_dir(parent_path).unwrap().unwrap();
@@ -334,6 +337,7 @@ fn initial_creation_holds_the_record_lock_until_identity_is_published() {
     assert_eq!(
         stages,
         vec![
+            CreationStage::BeforeIdentityCheck,
             CreationStage::BeforeGeneration,
             CreationStage::BeforePublish,
             CreationStage::AfterPublish
@@ -1385,7 +1389,7 @@ fn creation_child() {
                     signal(&place, "after-publish");
                     wait_for_signal(&place, "finish-creation");
                 }
-                CreationStage::BeforePublish => {}
+                CreationStage::BeforeIdentityCheck | CreationStage::BeforePublish => {}
             },
         )
         .unwrap();
@@ -1567,4 +1571,836 @@ fn desktop_watch_rejects_changed_certificate_even_when_key_is_temporarily_unread
         assert!(!read_user_revocations(&WindowsTlsTrustOps, place).is_revoked(&serving));
         drop((exclusive, range, dir));
     }
+}
+
+#[test]
+fn renewal_swap_failure_preserves_the_current_pair() {
+    let fixture = Fixture::new();
+    let old = fixture.0.load().unwrap();
+    let mut pending = std::collections::BTreeSet::new();
+    let result = renewal::recreate(
+        &fixture.0,
+        &mut pending,
+        Some(thumb(&old)),
+        NOW,
+        |_| Err("injected swap failure".into()),
+        |_| Ok(()),
+    );
+    assert!(result.is_err());
+    for name in [KEY_TEMP, CERT_TEMP, CREATING] {
+        assert!(
+            !fixture.0.tls().join(name).exists(),
+            "swap failure must remove {name}"
+        );
+    }
+    assert_eq!(thumb(&fixture.0.load().unwrap()), thumb(&old));
+}
+
+#[test]
+fn renewal_partial_publish_restores_both_old_files_and_old_acceptor() {
+    for failed in [
+        renewal::Stage::AfterBackup,
+        renewal::Stage::AfterKeyPublish,
+        renewal::Stage::AfterCertPublish,
+    ] {
+        let fixture = Fixture::new();
+        let old = fixture.0.load().unwrap();
+        let installed = std::cell::Cell::new(Some(thumb(&old)));
+        let mut pending = std::collections::BTreeSet::new();
+        let result = renewal::recreate(
+            &fixture.0,
+            &mut pending,
+            Some(thumb(&old)),
+            NOW,
+            |pair| {
+                installed.set(pair.map(|(cert, _)| CertThumbprint::of_pem(cert).unwrap()));
+                Ok(())
+            },
+            |stage| {
+                if stage == renewal::Stage::AfterSwitch {
+                    assert_ne!(
+                        installed.get(),
+                        Some(thumb(&old)),
+                        "acceptor changes before files"
+                    );
+                    assert_eq!(
+                        CertThumbprint::of_pem(
+                            &std::fs::read(fixture.0.tls().join(CERT_FILE)).unwrap()
+                        )
+                        .unwrap(),
+                        thumb(&old)
+                    );
+                }
+                if stage == failed {
+                    Err(format!("injected {stage:?}"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        let failure = result.unwrap_err().into_unavailable();
+        assert!(!failure.requires_recreation);
+        assert!(failure.reason.contains("旧い組と待ち受けへ戻しました"));
+        assert!(failure.remedy.contains("トレイ"));
+        assert!(!failure.remedy.contains("再起動"));
+        assert!(!failure.remedy.contains("フォルダごと削除"));
+        assert_eq!(installed.get(), Some(thumb(&old)));
+        for name in [
+            KEY_TEMP,
+            CERT_TEMP,
+            CREATING,
+            renewal::KEY_OLD,
+            renewal::CERT_OLD,
+        ] {
+            assert!(
+                !fixture.0.tls().join(name).exists(),
+                "rollback must clean {name}"
+            );
+        }
+        assert_eq!(thumb(&fixture.0.load().unwrap()), thumb(&old));
+    }
+}
+
+#[test]
+fn renewal_restored_listener_reports_backup_cleanup_failure() {
+    let fixture = Fixture::new();
+    let old = fixture.0.load().unwrap();
+    let held = std::cell::RefCell::new(Vec::new());
+    let error = renewal::recreate(
+        &fixture.0,
+        &mut Default::default(),
+        Some(thumb(&old)),
+        NOW,
+        |pair| {
+            if pair.is_some_and(|(cert, _)| CertThumbprint::of_pem(cert).unwrap() == thumb(&old)) {
+                fixture.0.put(KEY_TEMP, b"unused temporary key");
+                for name in [KEY_TEMP, renewal::KEY_OLD] {
+                    held.borrow_mut().push(
+                        checked_auxiliary_file(&WindowsTlsTrustOps, &fixture.0.dir(), name)
+                            .unwrap()
+                            .unwrap(),
+                    );
+                }
+            }
+            Ok(())
+        },
+        |stage| {
+            if stage == renewal::Stage::AfterKeyPublish {
+                Err("injected publication failure".into())
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .unwrap_err();
+    assert!(
+        error.reason.contains("旧い組と待ち受けへ戻しました"),
+        "{}",
+        error.reason
+    );
+    assert!(
+        error.reason.contains("巻き戻し後の片付けに失敗"),
+        "{}",
+        error.reason
+    );
+    assert!(fixture.0.tls().join(renewal::KEY_OLD).exists());
+    assert!(
+        error.reason.contains(KEY_TEMP) && error.reason.contains(renewal::KEY_OLD),
+        "both cleanup failures must be reported: {}",
+        error.reason
+    );
+    drop(held);
+    assert_eq!(thumb(&fixture.0.load().unwrap()), thumb(&old));
+}
+
+#[test]
+fn renewal_failed_rollback_stops_tls_and_startup_restores_nonrevoked_backup() {
+    let fixture = Fixture::new();
+    let old = fixture.0.load().unwrap();
+    let installed = std::cell::Cell::new(Some(thumb(&old)));
+    let result = renewal::recreate(
+        &fixture.0,
+        &mut Default::default(),
+        Some(thumb(&old)),
+        NOW,
+        |pair| {
+            installed.set(pair.map(|(cert, _)| CertThumbprint::of_pem(cert).unwrap()));
+            Ok(())
+        },
+        |stage| {
+            if matches!(
+                stage,
+                renewal::Stage::AfterKeyPublish | renewal::Stage::BeforeRollback
+            ) {
+                Err("injected failure".into())
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(installed.get(), None);
+    assert_eq!(thumb(&fixture.0.load().unwrap()), thumb(&old));
+}
+
+#[test]
+fn renewal_never_rolls_back_to_revoked_old_identity_and_explicit_retry_recovers() {
+    let fixture = Fixture::new();
+    let old = fixture.0.load().unwrap();
+    let report = record_user_revocation(
+        &WindowsTlsTrustOps,
+        &fixture.0,
+        &ReconcileOptions::default(),
+        thumb(&old),
+        RevokedCertPlace::User,
+    );
+    assert!(report.revocations.is_revoked(&thumb(&old)));
+    let installed = std::cell::Cell::new(Some(thumb(&old)));
+    let result = renewal::recreate(
+        &fixture.0,
+        &mut Default::default(),
+        Some(thumb(&old)),
+        NOW,
+        |pair| {
+            installed.set(pair.map(|(cert, _)| CertThumbprint::of_pem(cert).unwrap()));
+            Ok(())
+        },
+        |stage| {
+            if stage == renewal::Stage::AfterKeyPublish {
+                Err("injected partial publish".into())
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(installed.get(), None);
+    assert!(
+        fixture.0.load().is_err(),
+        "startup cannot use revoked backup"
+    );
+    renewal::recreate(
+        &fixture.0,
+        &mut Default::default(),
+        None,
+        NOW,
+        |pair| {
+            installed.set(pair.map(|(cert, _)| CertThumbprint::of_pem(cert).unwrap()));
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(installed.get(), Some(thumb(&fixture.0.load().unwrap())));
+    assert_ne!(installed.get(), Some(thumb(&old)));
+}
+
+#[test]
+fn renewal_committed_cleanup_warning_keeps_new_acceptor_and_startup_prefers_current() {
+    let fixture = Fixture::new();
+    let old = fixture.0.load().unwrap();
+    let installed = std::cell::Cell::new(Some(thumb(&old)));
+    let result = renewal::recreate(
+        &fixture.0,
+        &mut Default::default(),
+        Some(thumb(&old)),
+        NOW,
+        |pair| {
+            installed.set(pair.map(|(cert, _)| CertThumbprint::of_pem(cert).unwrap()));
+            Ok(())
+        },
+        |stage| {
+            if stage == renewal::Stage::AfterCommitBeforeCleanup {
+                Err("injected cleanup failure".into())
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .unwrap();
+    assert!(result.unwrap().contains("完了"));
+    assert_ne!(installed.get(), Some(thumb(&old)));
+    assert_eq!(installed.get(), Some(thumb(&fixture.0.load().unwrap())));
+}
+
+#[test]
+fn renewal_crash_after_pair_publication_retires_backup_on_startup_or_next_recreation() {
+    for recreate_again in [false, true] {
+        let fixture = Fixture::new();
+        let old = fixture.0.load().unwrap();
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            renewal::recreate(
+                &fixture.0,
+                &mut Default::default(),
+                Some(thumb(&old)),
+                NOW,
+                |_| Ok(()),
+                |stage| {
+                    if stage == renewal::Stage::AfterCertPublish {
+                        panic!("injected process interruption");
+                    }
+                    Ok(())
+                },
+            )
+        }));
+        assert!(interrupted.is_err());
+        assert!(!read_user_revocations(&WindowsTlsTrustOps, &fixture.0).is_revoked(&thumb(&old)));
+        let published =
+            CertThumbprint::of_pem(&std::fs::read(fixture.0.tls().join(CERT_FILE)).unwrap())
+                .unwrap();
+        assert_ne!(published, thumb(&old));
+        if recreate_again {
+            renewal::recreate(
+                &fixture.0,
+                &mut Default::default(),
+                Some(published),
+                NOW,
+                |_| Ok(()),
+                |_| Ok(()),
+            )
+            .unwrap();
+        } else {
+            fixture.0.load().unwrap();
+        }
+        assert!(read_user_revocations(&WindowsTlsTrustOps, &fixture.0).is_revoked(&thumb(&old)));
+        assert!(!fixture.0.tls().join(renewal::CERT_OLD).exists());
+    }
+}
+
+#[test]
+fn renewal_crash_recovery_preserves_backup_and_refuses_tls_if_retirement_cannot_be_written() {
+    let fixture = Fixture::new();
+    let old = fixture.0.load().unwrap();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        renewal::recreate(
+            &fixture.0,
+            &mut Default::default(),
+            Some(thumb(&old)),
+            NOW,
+            |_| Ok(()),
+            |stage| {
+                if stage == renewal::Stage::AfterCertPublish {
+                    panic!("injected interruption");
+                }
+                Ok(())
+            },
+        )
+    }));
+    let records_a = fixture.0.spec(UserPlaceKind::RevocationsA).path();
+    let user = WindowsTlsTrustOps.current_user_sid().unwrap();
+    let result = load_in_observed(
+        &WindowsTlsTrustOps,
+        &fixture.0,
+        &ReconcileOptions::default(),
+        NOW,
+        |stage| {
+            if stage == CreationStage::BeforeIdentityCheck {
+                acl(&records_a, &["/deny", &format!("*{user}:(W)")]);
+            }
+        },
+    );
+    acl(&records_a, &["/remove:d", &format!("*{user}")]);
+    assert!(result.is_err());
+    assert!(fixture.0.tls().join(renewal::CERT_OLD).exists());
+    assert!(fixture.0.tls().join(renewal::KEY_OLD).exists());
+    fixture.0.load().unwrap();
+    assert!(read_user_revocations(&WindowsTlsTrustOps, &fixture.0).is_revoked(&thumb(&old)));
+}
+
+#[test]
+fn renewal_unparseable_backup_refuses_tls_and_preserves_files_for_inspection() {
+    let fixture = Fixture::new();
+    let old = fixture.0.load().unwrap();
+    fixture
+        .0
+        .put("hub-cert.pem.old", b"broken unused certificate");
+    fixture.0.put("hub-key.pem.old", b"broken unused key");
+    let failure = load_in(
+        &WindowsTlsTrustOps,
+        &fixture.0,
+        &ReconcileOptions::default(),
+        NOW,
+    )
+    .unwrap_err()
+    .into_unavailable();
+    assert!(failure.reason.contains(renewal::CERT_OLD));
+    assert!(failure.reason.contains("拇印") && failure.reason.contains("失効を記録できません"));
+    assert!(failure.remedy.contains(renewal::CERT_OLD));
+    assert!(failure
+        .remedy
+        .contains("本体の hub-cert.pem・hub-key.pem は削除せず"));
+    assert!(
+        !failure.requires_recreation,
+        "an unreadable backup must not request deletion of the current pair"
+    );
+    let installed = std::cell::Cell::new(Some(thumb(&old)));
+    assert!(renewal::recreate(
+        &fixture.0,
+        &mut Default::default(),
+        Some(thumb(&old)),
+        NOW,
+        |pair| {
+            assert!(
+                pair.is_none(),
+                "cannot install a replacement before retiring the backup"
+            );
+            installed.set(None);
+            Ok(())
+        },
+        |_| Ok(())
+    )
+    .is_err());
+    assert_eq!(installed.get(), None);
+    assert_eq!(
+        std::fs::read(fixture.0.tls().join(renewal::CERT_OLD)).unwrap(),
+        b"broken unused certificate"
+    );
+    assert_eq!(
+        std::fs::read(fixture.0.tls().join(renewal::KEY_OLD)).unwrap(),
+        b"broken unused key"
+    );
+    assert_eq!(
+        CertThumbprint::of_pem(&std::fs::read(fixture.0.tls().join(CERT_FILE)).unwrap()).unwrap(),
+        thumb(&old)
+    );
+    assert!(!read_user_revocations(&WindowsTlsTrustOps, &fixture.0).is_revoked(&thumb(&old)));
+}
+
+#[test]
+fn renewal_explicitly_replaces_a_partial_pair_after_recording_readable_old_certificate() {
+    let fixture = Fixture::new();
+    let old = fixture.0.load().unwrap();
+    cleanup(fixture.0.dir().dir(), &[KEY_FILE]).unwrap();
+    assert!(
+        fixture.0.load().is_err(),
+        "automatic startup cannot recreate a partial pair"
+    );
+    renewal::recreate(
+        &fixture.0,
+        &mut Default::default(),
+        Some(thumb(&old)),
+        NOW,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_ne!(thumb(&fixture.0.load().unwrap()), thumb(&old));
+    assert!(read_user_revocations(&WindowsTlsTrustOps, &fixture.0).is_revoked(&thumb(&old)));
+}
+
+#[test]
+fn renewal_exposure_stops_tls_and_preserves_distinct_serving_thumbprint_for_retry() {
+    let fixture = Fixture::new();
+    let old = fixture.0.load().unwrap();
+    let serving = CertThumbprint::of_der(b"distinct serving identity");
+    acl(
+        &fixture.0.tls().join(KEY_FILE),
+        &["/grant", "*S-1-5-32-545:(R)"],
+    );
+    let stopped = std::cell::Cell::new(false);
+    let mut pending = std::collections::BTreeSet::new();
+    let result = renewal::recreate(
+        &fixture.0,
+        &mut pending,
+        Some(serving),
+        NOW,
+        |pair| {
+            assert!(pair.is_none());
+            stopped.set(true);
+            Ok(())
+        },
+        |_| Ok(()),
+    );
+    assert!(result.is_err());
+    assert!(stopped.get());
+    assert!(pending.contains(&serving));
+    assert!(read_user_revocations(&WindowsTlsTrustOps, &fixture.0).is_revoked(&thumb(&old)));
+}
+
+#[test]
+fn renewal_success_confirms_every_pending_thumbprint_before_returning_empty_pending_set() {
+    let fixture = Fixture::new();
+    let old = fixture.0.load().unwrap();
+    let first = CertThumbprint::of_der(b"first pending exposure");
+    let second = CertThumbprint::of_der(b"second pending exposure");
+    let mut pending = std::collections::BTreeSet::from([first, second]);
+    renewal::recreate(
+        &fixture.0,
+        &mut pending,
+        Some(thumb(&old)),
+        NOW,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert!(pending.is_empty());
+    let records = read_user_revocations(&WindowsTlsTrustOps, &fixture.0);
+    assert!(records.is_revoked(&first));
+    assert!(records.is_revoked(&second));
+    assert!(
+        records.is_revoked(&thumb(&old)),
+        "committed renewal retires the old identity"
+    );
+    let current = fixture.0.load().unwrap();
+    assert_ne!(thumb(&current), thumb(&old));
+    assert!(!records.is_revoked(&thumb(&current)));
+}
+
+#[test]
+fn renewal_committed_retirement_write_failure_keeps_new_identity_and_retries_old_thumbprint() {
+    let fixture = Fixture::new();
+    let now = now_unix();
+    let old = fixture.0.load_at(now).unwrap();
+    let records_a = fixture.0.spec(UserPlaceKind::RevocationsA).path();
+    let user = WindowsTlsTrustOps.current_user_sid().unwrap();
+    let mut pending = std::collections::BTreeSet::new();
+    let installed = std::cell::Cell::new(Some(thumb(&old)));
+    let result = renewal::recreate(
+        &fixture.0,
+        &mut pending,
+        Some(thumb(&old)),
+        now,
+        |pair| {
+            installed.set(pair.map(|(cert, _)| CertThumbprint::of_pem(cert).unwrap()));
+            Ok(())
+        },
+        |stage| {
+            if stage == renewal::Stage::AfterCommitBeforeCleanup {
+                acl(&records_a, &["/deny", &format!("*{user}:(W)")]);
+            }
+            Ok(())
+        },
+    );
+    acl(&records_a, &["/remove:d", &format!("*{user}")]);
+    let warning = result
+        .unwrap()
+        .expect("committed retirement failure is a warning");
+    assert!(
+        warning.contains("失効") && warning.contains("次の周期"),
+        "{warning}"
+    );
+    assert_eq!(pending, std::collections::BTreeSet::from([thumb(&old)]));
+    assert!(
+        fixture.0.tls().join(renewal::CERT_OLD).exists(),
+        "restart must retain the unrecorded retirement evidence"
+    );
+    // Lose the process-local pending set. Startup recovers it from CERT_OLD.
+    pending.clear();
+    let current = fixture.0.load_at(now).unwrap();
+    assert!(read_user_revocations(&WindowsTlsTrustOps, &fixture.0).is_revoked(&thumb(&old)));
+    assert!(!fixture.0.tls().join(renewal::CERT_OLD).exists());
+    assert_eq!(installed.get(), Some(thumb(&current)));
+    assert_ne!(thumb(&current), thumb(&old));
+    let mut watch = watch::Watch::with_unwritten_for_test(pending);
+    assert!(
+        watch
+            .check(&fixture.0, thumb(&current), &ReconcileOptions::default())
+            .allow
+    );
+    assert!(watch.unwritten_for_test().is_empty());
+    let records = read_user_revocations(&WindowsTlsTrustOps, &fixture.0);
+    assert!(records.is_revoked(&thumb(&old)));
+    assert!(!records.is_revoked(&thumb(&current)));
+}
+
+#[test]
+fn renewal_rejects_distinct_serving_identity_before_creating_unrecoverable_retirements() {
+    let fixture = Fixture::new();
+    let old = fixture.0.load().unwrap();
+    let serving = CertThumbprint::of_der(b"different in-memory certificate");
+    let mut pending = std::collections::BTreeSet::new();
+    let failure = renewal::recreate(
+        &fixture.0,
+        &mut pending,
+        Some(serving),
+        NOW,
+        |pair| {
+            assert!(pair.is_none());
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+    .unwrap_err();
+    assert!(matches!(failure.remedy, DesktopRemedy::RetryLater));
+    assert!(failure.reason.contains("一致しない"));
+    assert_eq!(thumb(&fixture.0.load().unwrap()), thumb(&old));
+    assert!(pending.is_empty());
+    assert!(!fixture.0.tls().join(CREATING).exists());
+    assert!(!read_user_revocations(&WindowsTlsTrustOps, &fixture.0).is_revoked(&thumb(&old)));
+}
+
+#[test]
+fn renewal_missing_backup_copy_returns_failure_without_panic_or_changing_current_pair() {
+    for name in [renewal::CERT_OLD, renewal::KEY_OLD] {
+        let fixture = Fixture::new();
+        let old = fixture.0.load().unwrap();
+        let installed = std::cell::Cell::new(Some(thumb(&old)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            renewal::recreate(
+                &fixture.0,
+                &mut Default::default(),
+                Some(thumb(&old)),
+                NOW,
+                |pair| {
+                    installed.set(pair.map(|(cert, _)| CertThumbprint::of_pem(cert).unwrap()));
+                    Ok(())
+                },
+                |stage| {
+                    if stage == renewal::Stage::AfterBackupCopy {
+                        cleanup(fixture.0.dir().dir(), &[name]).unwrap();
+                    }
+                    Ok(())
+                },
+            )
+        }));
+        let failure = result
+            .expect("a missing backup must not panic")
+            .unwrap_err();
+        assert!(
+            failure.reason.contains("写しがありません"),
+            "{}",
+            failure.reason
+        );
+        assert!(matches!(failure.remedy, DesktopRemedy::RetryRecreation));
+        assert_eq!(installed.get(), Some(thumb(&old)));
+        assert_eq!(thumb(&fixture.0.load().unwrap()), thumb(&old));
+    }
+}
+
+#[test]
+fn renewal_current_valid_does_not_hide_unsafe_public_backup_acl() {
+    let fixture = Fixture::new();
+    let old = fixture.0.load().unwrap();
+    fixture.0.put("hub-cert.pem.old", b"unused broken content");
+    fixture.0.put("hub-key.pem.old", b"unused broken key");
+    acl(
+        &fixture.0.tls().join("hub-cert.pem.old"),
+        &["/grant", "*S-1-1-0:(M)"],
+    );
+    assert!(
+        fixture.0.load().is_err(),
+        "unsafe auxiliary place requires explicit handling"
+    );
+    assert!(
+        !read_user_revocations(&WindowsTlsTrustOps, &fixture.0).is_revoked(&thumb(&old)),
+        "public certificate backup alone does not expose the private key"
+    );
+}
+
+#[test]
+fn renewal_incomplete_revocation_lock_stops_existing_tls_before_creating_identity() {
+    let fixture = Fixture::new();
+    let old = fixture.0.load().unwrap();
+    let options = ReconcileOptions::default();
+    let held = lock_user_revocations(&WindowsTlsTrustOps, &fixture.0, &options).unwrap();
+    let installed = std::cell::Cell::new(Some(thumb(&old)));
+    let result = renewal::recreate(
+        &fixture.0,
+        &mut Default::default(),
+        Some(thumb(&old)),
+        NOW,
+        |pair| {
+            assert!(
+                pair.is_none(),
+                "must not create or install a new identity while records are unavailable"
+            );
+            installed.set(None);
+            Ok(())
+        },
+        |_| Ok(()),
+    );
+    assert!(result.is_err());
+    assert_eq!(installed.get(), None);
+    assert!(!fixture.0.tls().join(KEY_TEMP).exists());
+    assert_eq!(
+        CertThumbprint::of_pem(&std::fs::read(fixture.0.tls().join(CERT_FILE)).unwrap()).unwrap(),
+        thumb(&old)
+    );
+    drop(held);
+}
+
+#[test]
+fn renewal_refused_revocation_place_stops_existing_tls_before_creating_identity() {
+    let fixture = Fixture::new();
+    let old = fixture.0.load().unwrap();
+    acl(
+        &fixture.0.spec(UserPlaceKind::RevocationsA).path(),
+        &["/grant", "*S-1-1-0:(OI)(CI)(M)"],
+    );
+    let stopped = std::cell::Cell::new(false);
+    let result = renewal::recreate(
+        &fixture.0,
+        &mut Default::default(),
+        Some(thumb(&old)),
+        NOW,
+        |pair| {
+            assert!(pair.is_none());
+            stopped.set(true);
+            Ok(())
+        },
+        |_| Ok(()),
+    );
+    assert!(result.is_err());
+    assert!(stopped.get());
+    assert!(!fixture.0.tls().join(KEY_TEMP).exists());
+    assert_eq!(
+        CertThumbprint::of_pem(&std::fs::read(fixture.0.tls().join(CERT_FILE)).unwrap()).unwrap(),
+        thumb(&old)
+    );
+}
+
+#[test]
+fn renewal_auxiliary_validation_failure_stops_existing_tls_before_generation() {
+    let fixture = Fixture::new();
+    let old = fixture.0.load().unwrap();
+    fixture.0.put("hub-key.pem.old", b"unused backup");
+    acl(
+        &fixture.0.tls().join("hub-key.pem.old"),
+        &["/grant", "*S-1-5-32-545:(R)"],
+    );
+    let stopped = std::cell::Cell::new(false);
+    let result = renewal::recreate(
+        &fixture.0,
+        &mut Default::default(),
+        Some(thumb(&old)),
+        NOW,
+        |pair| {
+            assert!(pair.is_none());
+            stopped.set(true);
+            Ok(())
+        },
+        |_| Ok(()),
+    );
+    assert!(result.is_err());
+    assert!(stopped.get());
+    assert!(!fixture.0.tls().join(KEY_TEMP).exists());
+}
+
+#[test]
+fn typed_startup_failures_keep_recreation_requirement_without_parsing_reason() {
+    let recreation = DesktopFailure::recreate("same reason").into_unavailable();
+    let retry = DesktopFailure::retry("same reason").into_unavailable();
+    assert!(recreation.status().requires_recreation);
+    assert!(!retry.status().requires_recreation);
+    assert!(!recreation.status().can_resume);
+    assert!(!retry.status().can_resume);
+    assert_eq!(recreation.reason, retry.reason);
+}
+
+#[test]
+fn backup_key_exposure_revokes_current_identity_and_acl_repair_cannot_restore_it() {
+    let fixture = Fixture::new();
+    let current = fixture.0.load().unwrap();
+    fixture.0.put("hub-cert.pem.old", current.cert_pem());
+    fixture.0.put(
+        "hub-key.pem.old",
+        &std::fs::read(fixture.0.tls().join(KEY_FILE)).unwrap(),
+    );
+    let key = fixture.0.tls().join("hub-key.pem.old");
+    acl(&key, &["/grant", "*S-1-5-32-545:(R)"]);
+    let failure = fixture.0.load().unwrap_err();
+    assert!(failure.contains("hub-key.pem.old"), "{failure}");
+    assert!(read_user_revocations(&WindowsTlsTrustOps, &fixture.0).is_revoked(&thumb(&current)));
+    acl(&key, &["/remove:g", "*S-1-5-32-545"]);
+    assert!(
+        fixture.0.load().is_err(),
+        "ACL repair cannot un-revoke a leaked current key"
+    );
+}
+
+#[test]
+fn backup_key_exposure_with_unwritable_records_refuses_tls_for_this_startup() {
+    let fixture = Fixture::new();
+    let current = fixture.0.load().unwrap();
+    fixture.0.put("hub-cert.pem.old", current.cert_pem());
+    fixture.0.put(
+        "hub-key.pem.old",
+        &std::fs::read(fixture.0.tls().join(KEY_FILE)).unwrap(),
+    );
+    acl(
+        &fixture.0.tls().join("hub-key.pem.old"),
+        &["/grant", "*S-1-5-32-545:(R)"],
+    );
+    let records_a = fixture.0.spec(UserPlaceKind::RevocationsA).path();
+    let user = WindowsTlsTrustOps.current_user_sid().unwrap();
+    let result = load_in_observed(
+        &WindowsTlsTrustOps,
+        &fixture.0,
+        &ReconcileOptions::default(),
+        NOW,
+        |stage| {
+            if stage == CreationStage::BeforeIdentityCheck {
+                acl(&records_a, &["/deny", &format!("*{user}:(W)")]);
+            }
+        },
+    );
+    acl(&records_a, &["/remove:d", &format!("*{user}")]);
+    let failure = result.unwrap_err();
+    assert!(failure.reason.contains("今回の起動"), "{}", failure.reason);
+    assert!(failure.reason.contains("書けません"), "{}", failure.reason);
+}
+
+#[test]
+fn backup_key_watch_retains_current_and_old_thumbprints_until_records_can_be_written() {
+    let fixture = Fixture::new();
+    let current = fixture.0.load().unwrap();
+    let old = generate_identity(NOW).unwrap();
+    let old_thumbprint = CertThumbprint::of_pem(old.cert_pem.as_bytes()).unwrap();
+    fixture.0.put("hub-cert.pem.old", old.cert_pem.as_bytes());
+    fixture.0.put("hub-key.pem.old", old.key_pem.as_bytes());
+    let key = fixture.0.tls().join("hub-key.pem.old");
+    acl(&key, &["/grant", "*S-1-5-32-545:(R)"]);
+    let options = ReconcileOptions {
+        lock_wait: Duration::ZERO,
+        ..Default::default()
+    };
+    let held = lock_user_revocations(&WindowsTlsTrustOps, &fixture.0, &options).unwrap();
+    let mut watch = watch::Watch::default();
+    assert!(!watch.check(&fixture.0, thumb(&current), &options).allow);
+    assert_eq!(
+        watch.unwritten_for_test(),
+        std::collections::BTreeSet::from([thumb(&current), old_thumbprint])
+    );
+    acl(&key, &["/remove:g", "*S-1-5-32-545"]);
+    drop(held);
+    assert!(
+        !watch.check(&fixture.0, thumb(&current), &options).allow,
+        "repair must not re-enable current key"
+    );
+    assert!(watch.unwritten_for_test().is_empty());
+    let records = read_user_revocations(&WindowsTlsTrustOps, &fixture.0);
+    assert!(records.is_revoked(&thumb(&current)));
+    assert!(records.is_revoked(&old_thumbprint));
+}
+
+#[test]
+fn renewal_swap_failure_reports_cleanup_failure_without_modifying_current_files() {
+    let fixture = Fixture::new();
+    let current = fixture.0.load().unwrap();
+    let held = std::cell::RefCell::new(None);
+    let failure = renewal::recreate(
+        &fixture.0,
+        &mut Default::default(),
+        Some(thumb(&current)),
+        NOW,
+        |_| {
+            *held.borrow_mut() =
+                checked_auxiliary_file(&WindowsTlsTrustOps, &fixture.0.dir(), KEY_TEMP).unwrap();
+            Err("injected swap failure".into())
+        },
+        |_| Ok(()),
+    )
+    .unwrap_err();
+    assert!(failure.reason.contains("injected swap failure"));
+    assert!(
+        failure.reason.contains("片付け") && failure.reason.contains(KEY_TEMP),
+        "{}",
+        failure.reason
+    );
+    assert!(
+        fixture.0.tls().join(CREATING).exists(),
+        "incomplete cleanup retains recovery marker"
+    );
+    drop(held);
+    assert_eq!(thumb(&fixture.0.load().unwrap()), thumb(&current));
 }

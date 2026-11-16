@@ -216,7 +216,7 @@ use crate::profile_lock::{
 };
 use crate::profile_paths::{resolve_hub_root, resolve_profile_paths, DB_FILE_NAME};
 use crate::rest::{api_router_with_controller, opcua_settings_router, user_auth_state};
-use crate::settings::{HubSettingsExt, SettingsService, DEFAULT_PORT};
+use crate::settings::{HubSettingsExt, SettingsService};
 use crate::subscribe_core::EVAL_TICK_MS;
 pub use crate::tls_listener::RunningTlsListener as RunningTlsServer;
 pub use crate::tls_listener::TlsRevoker;
@@ -364,8 +364,8 @@ pub enum HubStartError {
     #[error("banto-hub: ストア設定の読み取りに失敗しました: {0}")]
     StoreConfig(BantoError),
     /// `banto_server::start`失敗（旧: `"server should start"`で `expect`）。
-    #[error("banto-hub: サーバーの起動に失敗しました: {0}")]
-    ServerStart(BantoError),
+    #[error("banto-hub: サーバーの起動に失敗しました: {source}")]
+    ServerStart { port: u16, source: BantoError },
     /// T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P2）:
     /// `crate::profile_lock::try_acquire_profile_lock`失敗（既に別プロセスが
     /// この profile を保持している、または profile ディレクトリ・lock
@@ -401,6 +401,14 @@ pub enum HubStartError {
 }
 
 impl HubStartError {
+    /// Resolved plain listener port, including persisted settings and wrapped failures.
+    pub fn failed_plain_port(&self) -> Option<u16> {
+        match self {
+            Self::ServerStart { port, .. } => Some(*port),
+            Self::DbLeftOpen(inner) => inner.failed_plain_port(),
+            _ => None,
+        }
+    }
     /// 起動に失敗し、設定 DB も閉じ終えられなかったか（[`Self::DbLeftOpen`]）。`true` なら、
     /// 握りが残っているので呼ぶ側は保護を外さない（サービスは ACL を緩めずに終わる）。
     pub fn db_left_open(&self) -> bool {
@@ -501,7 +509,7 @@ impl HubRuntime {
         // #1121 PR2d: env の検証と profile 排他が済んでから、Windows Shell だけは
         // 利用者の TLS を用意する。明示 env（不完全なら既に失敗）・注入済みの組が優先。
         #[cfg(windows)]
-        let (tls_config, profile_lock) = {
+        let (tls_config, profile_lock, desktop_tls_initial_status) = {
             // start の future が drop されても、blocking pool のファイル操作が終わるまでは
             // closure が排他を保つ。JoinError のときもこちらの握りは残るので TLS 無しで続けられる。
             let profile_lock = Arc::new(profile_lock);
@@ -512,9 +520,11 @@ impl HubRuntime {
                 profile_lock.clone(),
             )
             .await;
+            let mut initial_status = None;
             let tls_config = match loaded {
                 Some(Ok(identity)) => Some(TlsPlan::Desktop(identity)),
                 Some(Err(found)) => {
+                    initial_status = Some(found.status());
                     for line in found.log_lines() {
                         log_err_line(&line);
                     }
@@ -522,7 +532,7 @@ impl HubRuntime {
                 }
                 None => tls_config,
             };
-            (tls_config, profile_lock)
+            (tls_config, profile_lock, initial_status)
         };
 
         #[cfg(not(windows))]
@@ -584,6 +594,8 @@ impl HubRuntime {
             pool: pool.clone(),
             #[cfg(windows)]
             tls_keep_alive: profile_lock.clone(),
+            #[cfg(windows)]
+            desktop_tls_initial_status,
             registry,
             drivers,
             tls_config,
@@ -592,6 +604,7 @@ impl HubRuntime {
             bind_override,
             data_dir_override,
             profile_id,
+            #[cfg(windows)]
             host_kind,
             db_path,
             given_dirs: &given_dirs,
@@ -632,6 +645,8 @@ impl HubRuntime {
             pool,
             #[cfg(windows)]
             tls_keep_alive,
+            #[cfg(windows)]
+            mut desktop_tls_initial_status,
             registry,
             drivers,
             tls_config,
@@ -640,6 +655,7 @@ impl HubRuntime {
             bind_override,
             data_dir_override,
             profile_id,
+            #[cfg(windows)]
             host_kind,
             db_path,
             given_dirs,
@@ -1110,31 +1126,37 @@ impl HubRuntime {
             .merge(opcua_admin)
             .merge(static_router::<FrontendAssets>()),
         );
+        let shell_router = app.clone();
 
-        // #479: デスクトップシェルだけ、既定ポートが埋まっていたら OS 割り当てへ
-        // 退避する（規則は [`port_fallback_applies`]）。退避したときは元のポートを
-        // `port_fallback_from` に持ち、`RunningHub::port_fallback_from` で見せる。
-        let fallback_allowed = port_fallback_applies(host_kind, port_override, port);
-        let (server, port_fallback_from) =
-            match start_with_port_fallback(&bind, port, app.clone(), fallback_allowed).await {
-                Ok(started) => started,
-                Err(err) => {
-                    // ここまでに起こした背景タスクを残さない（`JoinHandle` を捨てても
-                    // タスクは止まらない。#557 のレビュー指摘）。
-                    eval_handle.abort();
-                    prune_handle.abort();
-                    mqtt.shutdown().await;
-                    grpc_server.shutdown().await;
-                    opcua.shutdown().await;
-                    return Err(HubStartError::ServerStart(err));
-                }
-            };
+        // Plain listener keeps the configured port; shell UI uses its own HTTPS origin.
+        let server = match start(
+            ServerConfig {
+                bind: bind.clone(),
+                port,
+            },
+            app.clone(),
+        )
+        .await
+        {
+            Ok(started) => started,
+            Err(err) => {
+                // ここまでに起こした背景タスクを残さない（`JoinHandle` を捨てても
+                // タスクは止まらない。#557 のレビュー指摘）。
+                eval_handle.abort();
+                prune_handle.abort();
+                mqtt.shutdown().await;
+                grpc_server.shutdown().await;
+                opcua.shutdown().await;
+                return Err(HubStartError::ServerStart { port, source: err });
+            }
+        };
         // `Some(line)` は既定の TLS を待ち受けたときの行（ログは下でまとめて出す）。
         let mut default_tls_line: Option<String> = None;
         #[cfg(windows)]
         let mut desktop_tls_monitor = None;
         #[cfg(windows)]
-        let desktop_selected = matches!(&tls_config, Some(TlsPlan::Desktop(_)));
+        let desktop_selected = matches!(&tls_config, Some(TlsPlan::Desktop(_)))
+            || desktop_tls_initial_status.is_some();
         let tls_server = match tls_config {
             Some(TlsPlan::Explicit(config)) => match tls_listener::start(&config, app).await {
                 Ok(listener) => Some(listener),
@@ -1174,7 +1196,7 @@ impl HubRuntime {
                                         config,
                                         app,
                                         serving,
-                                        tls_keep_alive,
+                                        tls_keep_alive.clone(),
                                     ));
                                 // 所有者は monitor。停止時に listener を回収して通常の順序で閉じる。
                                 None
@@ -1208,12 +1230,47 @@ impl HubRuntime {
                         for line in lines {
                             log_err_line(&line);
                         }
+                        #[cfg(windows)]
+                        if host_kind == HubHostKind::Shell && desktop_selected {
+                            let initial = crate::hub_tls_prepare::desktop::watch::DesktopTlsStatus {
+                                remedy: None,
+                                address: None,
+                                reason: Some(format!("127.0.0.1:{} で TLS を待ち受けられません: {err}。ポートを使用しているアプリを確認してください。次の周期で安全性を確認できれば再開します", config.port())),
+                                requires_recreation: false, can_resume: true,
+                            };
+                            desktop_tls_initial_status = Some(initial.clone());
+                            desktop_tls_monitor =
+                                Some(crate::hub_tls_prepare::desktop::watch::spawn_idle(
+                                    shell_router.clone(),
+                                    Some(config),
+                                    initial,
+                                    tls_keep_alive.clone(),
+                                ));
+                        }
                         None
                     }
                 }
             }
             None => None,
         };
+        #[cfg(windows)]
+        if desktop_selected && desktop_tls_monitor.is_none() {
+            let initial = desktop_tls_initial_status.clone().unwrap_or(
+                crate::hub_tls_prepare::desktop::watch::DesktopTlsStatus {
+                    remedy: None,
+                    address: None,
+                    reason: Some("既定 TLS は待ち受けていません".into()),
+                    requires_recreation: false,
+                    can_resume: false,
+                },
+            );
+            desktop_tls_monitor = Some(crate::hub_tls_prepare::desktop::watch::spawn_idle(
+                shell_router.clone(),
+                None,
+                initial,
+                tls_keep_alive,
+            ));
+        }
         // REST が先にポートを確保する。同じポートを OPC UA に指定しても
         // 失敗するのはオプションの OPC UA だけで、Hub 本体は継続する。
         opcua.initialize(&opcua_settings).await;
@@ -1238,12 +1295,6 @@ impl HubRuntime {
 
         log_line(&format!("banto-hub: DB at {db_path}"));
         log_line(&format!("banto-hub: data dir at {}", data_dir.display()));
-        if let Some(wanted) = port_fallback_from {
-            log_err_line(&format!(
-                "[WARN] banto-hub: port {wanted} is in use; started on {} instead (OS-assigned, desktop shell only). External clients that expect {wanted} (Sink, ChronoGazer, etc.) cannot reach this Hub - use the service Hub or set PORT / server.port to a fixed port",
-                server.local_addr()
-            ));
-        }
         log_line("banto-hub: listening at:");
         for url in listening_urls(server.local_addr()) {
             log_line(&format!("  {url}"));
@@ -1282,6 +1333,8 @@ impl HubRuntime {
         log_line("banto-hub: press Ctrl-C to stop");
 
         Ok(RunningHub {
+            shell_router: Some(shell_router),
+            shell_attachment: None,
             mqtt,
             grpc_server,
             opcua,
@@ -1294,7 +1347,8 @@ impl HubRuntime {
             tls_server,
             #[cfg(windows)]
             desktop_tls_monitor,
-            port_fallback_from,
+            #[cfg(windows)]
+            desktop_tls_initial_status,
             eval_handle,
             prune_handle,
             audit_spool_handle,
@@ -1324,6 +1378,8 @@ struct StartOnDb<'a> {
     pool: SqlitePool,
     #[cfg(windows)]
     tls_keep_alive: Arc<Option<ProfileLockGuard>>,
+    #[cfg(windows)]
+    desktop_tls_initial_status: Option<crate::hub_tls_prepare::desktop::watch::DesktopTlsStatus>,
     registry: Arc<banto_driver_api::DriverRegistry>,
     drivers: crate::broker_glue::HubDrivers,
     tls_config: Option<TlsPlan>,
@@ -1332,6 +1388,7 @@ struct StartOnDb<'a> {
     bind_override: Option<String>,
     data_dir_override: Option<PathBuf>,
     profile_id: String,
+    #[cfg(windows)]
     host_kind: HubHostKind,
     db_path: String,
     given_dirs: &'a Option<ProfileDirs>,
@@ -1373,117 +1430,14 @@ async fn close_db_then_release(
     db_closed
 }
 
-/// #479（2026-10-10 オーナー決定「おすすめで」= 案 A'）: デスクトップシェル内の
-/// Hub だけ、既定ポート（[`DEFAULT_PORT`] = 8722）が**使用中**のときに限り、同じ
-/// bind アドレスの OS 割り当てポート（`port: 0`）で 1 回だけ起動し直す。
-///
-/// 退避してよいのは次の 3 つが**すべて**成り立つときだけ（外から設定された
-/// 構成は固定のまま、という約束）:
-/// - ホストがデスクトップシェル（[`HubHostKind::Shell`]）。サービス版・コンソール版
-///   は外のクライアントが 8722 でつなぎに来るので、埋まっていたら今までどおり
-///   起動失敗にする。
-/// - `PORT` 環境変数による上書きが無い（`port_override` が `None`）。
-/// - 設定 `server.port` が既定値のまま。**既定と違う値は利用者が明示的に選んだ
-///   ものとして固定扱い**にする（8722 を明示的に保存していても既定と区別が
-///   付かないので退避してよい側に倒れる。設定画面は既定値を保存するだけで
-///   「選んだ」とは言えない）。
-///
-/// `BANTO_BIND` は退避の可否に影響しない（bind アドレスは変えない）。
-pub fn port_fallback_applies(
-    host_kind: HubHostKind,
-    port_override: Option<u16>,
-    configured_port: u16,
-) -> bool {
-    host_kind == HubHostKind::Shell && port_override.is_none() && configured_port == DEFAULT_PORT
-}
-
-/// #479: bind の失敗の種類が「そのポートは今使えない」にあたるか。
-///
-/// - [`std::io::ErrorKind::AddrInUse`]: 他のプロセスが待ち受け中（Windows の
-///   `WSAEADDRINUSE` 10048、Linux/macOS の `EADDRINUSE`）。
-/// - [`std::io::ErrorKind::PermissionDenied`]: Windows では `WSAEACCES` 10013 で、
-///   (a) 他のプロセスが `SO_EXCLUSIVEADDRUSE` で握っている、(b) Hyper-V / WinNAT の
-///   除外ポート範囲に入っている、のどちらも「そのポートは使えない」であり、
-///   別ポートでなら起動できるので退避の対象にする。Linux/macOS の
-///   `EACCES` は 1024 未満の特権ポートでしか起きず、退避対象は 8722 に限られる
-///   ので実害がない（誤って他の失敗を握り潰さないよう、判定はこの 2 種類だけ）。
-///
-/// それ以外（アドレスが不正・ネットワークが無い等）は、別ポートでも直らないので
-/// 退避せずそのままエラーにする。
-pub fn bind_error_allows_port_fallback(kind: std::io::ErrorKind) -> bool {
-    matches!(
-        kind,
-        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
-    )
-}
-
-/// `banto_server::start` は bind の失敗を文字列の [`BantoError::Other`] に潰して
-/// `io::ErrorKind` を返さないので、失敗した後にもう一度 bind を試して種類を
-/// 取り直す（#479）。**空きを事前に探す処理ではない**: 本番の bind が既に失敗した
-/// 後の分類だけに使い、成功した場合はすぐ閉じて `None`（= 退避しない。すでに
-/// 空いたなら元のエラーをそのまま報告して、起動し直しは呼び出し側に任せる）。
-///
-/// banto 側が `io::ErrorKind` を返す API、または bind 済みの listener を受け取る API を
-/// 持てば、この再 bind は不要になる（上流への課題）。
-async fn classify_bind_failure(bind: &str, port: u16) -> Option<std::io::ErrorKind> {
-    match tokio::net::TcpListener::bind(format!("{bind}:{port}")).await {
-        Ok(_listener) => None,
-        Err(err) => Some(err.kind()),
-    }
-}
-
-/// axum サーバーを `bind:port` で起動する。`fallback_allowed`（[`port_fallback_applies`]）
-/// で、その bind が [`bind_error_allows_port_fallback`] の失敗だったときだけ、同じ
-/// `bind` の `port: 0` で 1 回起動し直す。戻り値の 2 つ目は退避したときの元のポート。
-///
-/// 退避は **サーバーの bind だけのやり直し**で、`HubRuntime::start` 全体は
-/// やり直さない（profile 排他・DB・収集・MQTT・gRPC は 1 回しか作らない）。
-/// 失敗時の後始末（背景タスクの abort など）は呼び出し側の既存の経路のまま。
-async fn start_with_port_fallback(
-    bind: &str,
-    port: u16,
-    app: axum::Router,
-    fallback_allowed: bool,
-) -> Result<(RunningServer, Option<u16>), BantoError> {
-    let first = start(
-        ServerConfig {
-            bind: bind.to_string(),
-            port,
-        },
-        app.clone(),
-    )
-    .await;
-    match first {
-        Ok(server) => Ok((server, None)),
-        Err(err) => {
-            if !fallback_allowed {
-                return Err(err);
-            }
-            let allows = classify_bind_failure(bind, port)
-                .await
-                .is_some_and(bind_error_allows_port_fallback);
-            if !allows {
-                return Err(err);
-            }
-            let server = start(
-                ServerConfig {
-                    bind: bind.to_string(),
-                    port: 0,
-                },
-                app,
-            )
-            .await?;
-            Ok((server, Some(port)))
-        }
-    }
-}
-
 /// [`HubRuntime::start`]が返す、稼働中の banto-hub の1インスタンス。
 /// teardown に必要なものを保持する - [`RunningHub::shutdown`]がそれらを
 /// 使ってこのモジュール doc の「シャットダウン順序」節どおりに畳む。
 /// T14-2 の収集状態機械を保持し、[`Self::controller`] から外部ホストへ
 /// [`CollectionController`] を提供する。
 pub struct RunningHub {
+    shell_router: Option<axum::Router>,
+    shell_attachment: Option<crate::shell_transport::Attachment>,
     mqtt: Arc<MqttPublisher>,
     grpc_server: Arc<GrpcServer>,
     opcua: Arc<crate::opcua::OpcUaPublisher>,
@@ -1495,9 +1449,8 @@ pub struct RunningHub {
     tls_server: Option<RunningTlsServer>,
     #[cfg(windows)]
     desktop_tls_monitor: Option<crate::hub_tls_prepare::desktop::watch::Monitor>,
-    /// #479: デスクトップシェルが既定ポートの競合で OS 割り当てへ退避したとき、
-    /// 本来 bind したかったポート。退避しなかったら `None`。
-    port_fallback_from: Option<u16>,
+    #[cfg(windows)]
+    desktop_tls_initial_status: Option<crate::hub_tls_prepare::desktop::watch::DesktopTlsStatus>,
     /// computed 250ms 評価ループの `JoinHandle`（T14-1 で捕捉。このモジュール
     /// doc の「T14-1 での唯一の挙動変化」節参照）。
     eval_handle: JoinHandle<()>,
@@ -1568,6 +1521,22 @@ pub const CLOCK_SYNC_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DETACHED_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl RunningHub {
+    /// Attach this runtime to the process-owned HTTPS origin. Its attachment is
+    /// detached before shutdown starts, without closing the shell's socket.
+    pub fn attach_shell_transport(
+        &mut self,
+        transport: &Arc<crate::shell_transport::ShellTransport>,
+    ) {
+        self.shell_attachment = Some(
+            transport.attach(
+                self.shell_router
+                    .as_ref()
+                    .expect("running Hub router")
+                    .clone(),
+                self.manager.detached().clone(),
+            ),
+        );
+    }
     /// axum サーバーの実バインドアドレス（`port: 0`で OS にポートを
     /// 選ばせた場合も実際の値が返る）。旧 `hub_run.rs`が `server.local_addr()`
     /// を直接使っていたのと同じ（設計 §3「D1」の `local_addr()`）。
@@ -1605,14 +1574,16 @@ impl RunningHub {
         self.desktop_tls_monitor
             .as_ref()
             .map(|monitor| monitor.status())
+            .or_else(|| self.desktop_tls_initial_status.clone())
     }
 
-    /// #479: 既定ポートが埋まっていて OS 割り当てのポートへ退避して起動したとき、
-    /// 本来 bind したかったポート（[`port_fallback_applies`]）。退避していなければ
-    /// `None`。外のクライアント（Sink など）はこの Hub に届かないので、ホストが
-    /// 状態として見せたいときに使う。
-    pub fn port_fallback_from(&self) -> Option<u16> {
-        self.port_fallback_from
+    #[cfg(windows)]
+    pub fn desktop_tls_recreation(
+        &self,
+    ) -> Option<crate::hub_tls_prepare::desktop::watch::RecreationHandle> {
+        self.desktop_tls_monitor
+            .as_ref()
+            .map(|monitor| monitor.recreation_handle())
     }
 
     /// Obtain the process-wide serialized collection controller.
@@ -1635,6 +1606,17 @@ impl RunningHub {
     /// 閉じ終えてから ACL を緩める）。閉じ終えられなかったら、DB の握りに加えて profile の
     /// 排他と握ったフォルダもプロセスの終わりまで離さない。
     pub async fn shutdown_and_report(mut self) -> HubShutdownReport {
+        // Detach before any collector, transport or DB shutdown.
+        let detached_stop_timeout = if let Some(attachment) = self.shell_attachment.take() {
+            let started = tokio::time::Instant::now();
+            attachment.detach().await;
+            // Share the existing detached-task budget rather than adding
+            // another wait to the desktop host's shutdown deadline.
+            DETACHED_STOP_TIMEOUT.saturating_sub(started.elapsed())
+        } else {
+            DETACHED_STOP_TIMEOUT
+        };
+        self.shell_router.take();
         // 周期の検査/再 bind を先に待ち切り、以後の停止や profile の解放と競合させない。
         #[cfg(windows)]
         if let Some(monitor) = &mut self.desktop_tls_monitor {
@@ -1725,10 +1707,10 @@ impl RunningHub {
         // 含め、切り離したタスク（監査を書く）の終わりを pool を閉じる前に待つ。上限を
         // 過ぎても abort しない（DB を触るタスクを `abort()` で止めない）。
         let detached = self.manager.detached();
-        if !detached.wait(DETACHED_STOP_TIMEOUT).await {
+        if !detached.wait(detached_stop_timeout).await {
             log_err_line(&format!(
                 "banto-hub: [WARN] 切り離した保存・監査のタスクが {} 秒のうちに終わりませんでした（{} 件が残ったまま終了へ進みます）",
-                DETACHED_STOP_TIMEOUT.as_secs(),
+                detached_stop_timeout.as_secs_f64(),
                 detached.pending()
             ));
         }
@@ -2041,6 +2023,61 @@ mod tests {
     ///
     /// `crate::test_support`のモジュール doc: `TempDir::drop`のリトライは
     /// マルチスレッドランタイムを要する。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shell_port_exclusion_uses_resolved_persisted_plain_port() {
+        let dir = crate::test_support::TempDir::new("shell-persisted-port");
+        let mut config = HubConfig {
+            drivers: crate::test_support::test_drivers(),
+            db_path: dir
+                .path()
+                .join("hub.sqlite3")
+                .to_string_lossy()
+                .into_owned(),
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".into()),
+            data_dir_override: Some(dir.path().join("data")),
+            profile_id: "test".into(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: true,
+            default_tls: None,
+        };
+        let hub = HubRuntime::start(config.clone()).await.unwrap();
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let persisted = holder.local_addr().unwrap().port();
+        SettingsService::new(Db::Sqlite(hub.pool.clone()))
+            .set_hub_server_config(&crate::settings::ServerSettings {
+                port: persisted,
+                bind: "127.0.0.1".into(),
+            })
+            .await
+            .unwrap();
+        hub.shutdown().await;
+        drop(holder);
+        config.port_override = None;
+        let hub = HubRuntime::start(config).await.unwrap();
+        assert_eq!(
+            hub.local_addr().port(),
+            persisted,
+            "shell initialization must use this resolved port, not its default probe port"
+        );
+        let transport =
+            crate::shell_transport::ShellTransport::start_avoiding(&[hub.local_addr().port()])
+                .await
+                .unwrap();
+        assert_ne!(
+            transport.local_addr().port(),
+            persisted,
+            "shell origin must exclude the resolved persisted plain port"
+        );
+        assert!(
+            std::net::TcpListener::bind(hub.local_addr()).is_err(),
+            "Hub retains its configured plain listener"
+        );
+        transport.stop_for_test().await;
+        hub.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn start_local_addr_then_shutdown_round_trip() {
         let dir = crate::test_support::TempDir::new("hub-runtime-smoke");
@@ -3537,86 +3574,9 @@ mod tests {
         hub.shutdown().await;
     }
 
-    /// #479: 退避の規則（純関数）。シェル・`PORT` 無し・永続ポートが既定のときだけ。
-    #[test]
-    fn port_fallback_applies_only_to_shell_with_default_unforced_port() {
-        use HubHostKind::{Console, Service, Shell};
-        // 退避する: シェル + PORT 無し + 設定が既定。
-        assert!(port_fallback_applies(Shell, None, DEFAULT_PORT));
-        // PORT 環境変数による明示（既定と同じ値でも、明示は固定）。
-        assert!(!port_fallback_applies(
-            Shell,
-            Some(DEFAULT_PORT),
-            DEFAULT_PORT
-        ));
-        assert!(!port_fallback_applies(Shell, Some(9000), DEFAULT_PORT));
-        assert!(!port_fallback_applies(Shell, Some(0), DEFAULT_PORT));
-        // 永続設定が既定と違う = 利用者が選んだ値は固定。
-        assert!(!port_fallback_applies(Shell, None, DEFAULT_PORT + 1));
-        assert!(!port_fallback_applies(Shell, None, 9000));
-        // サービス版・コンソール版は退避しない（外のクライアントが既定ポートで来る）。
-        assert!(!port_fallback_applies(Service, None, DEFAULT_PORT));
-        assert!(!port_fallback_applies(Console, None, DEFAULT_PORT));
-    }
-
-    /// #479: 退避の対象にする bind 失敗の種類（純関数）。
-    #[test]
-    fn bind_error_allows_port_fallback_only_for_in_use_and_denied() {
-        use std::io::ErrorKind;
-        assert!(bind_error_allows_port_fallback(ErrorKind::AddrInUse));
-        assert!(bind_error_allows_port_fallback(ErrorKind::PermissionDenied));
-        for kind in [
-            ErrorKind::AddrNotAvailable,
-            ErrorKind::InvalidInput,
-            ErrorKind::NotFound,
-            ErrorKind::TimedOut,
-            ErrorKind::Other,
-        ] {
-            assert!(!bind_error_allows_port_fallback(kind), "{kind:?}");
-        }
-    }
-
-    /// #479: ポートが埋まっていて退避が許されていれば、同じ bind アドレスの別
-    /// ポートで起動し、元のポートを返す。許されていなければ今までどおり失敗する。
-    /// 8722 には依存しない（テストが自分で `TcpListener` を握った任意のポートを使う）。
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn start_with_port_fallback_moves_off_a_busy_port_only_when_allowed() {
-        let holder = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
-        let busy = holder.local_addr().unwrap().port();
-        let router = || axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
-
-        // 許可なし: 失敗（従来どおり）。
-        let denied = start_with_port_fallback("127.0.0.1", busy, router(), false).await;
-        assert!(denied.is_err(), "must fail when fallback is not allowed");
-
-        // 許可あり: 別ポートで起動し、元のポートを報告する。
-        let (server, from) = start_with_port_fallback("127.0.0.1", busy, router(), true)
-            .await
-            .expect("should fall back to an OS-assigned port");
-        assert_eq!(from, Some(busy));
-        let addr = server.local_addr();
-        assert_eq!(addr.ip().to_string(), "127.0.0.1");
-        assert_ne!(addr.port(), 0);
-        assert_ne!(addr.port(), busy);
-        server.stop().await;
-
-        // 空いていれば退避しない（許可ありでも元のポートのまま）。
-        drop(holder);
-        let (server, from) = start_with_port_fallback("127.0.0.1", busy, router(), true)
-            .await
-            .expect("free port should bind as asked");
-        assert_eq!(from, None);
-        assert_eq!(server.local_addr().port(), busy);
-        server.stop().await;
-
-        // 退避しても直らない失敗（不正な bind アドレス）はそのままエラー。
-        let bad = start_with_port_fallback("203.0.113.1", 0, router(), true).await;
-        assert!(bad.is_err());
-    }
-
     /// #479: シェルが組むのと同じ `HubConfig`（`HubHostKind::Shell`）でも、`PORT`
     /// 相当の明示（`port_override`）があれば埋まったポートで起動に失敗する
-    /// （退避しない）。退避する側は上のテストと [`port_fallback_applies`] の表で
+    /// （退避しない）。退避せず固定のポートで起動することで
     /// 押さえる（既定の 8722 を埋めることはテストにできない）。失敗後に背景タスク・
     /// ロックが残らず、同じ構成の再起動が通ること（空きが出れば）も確かめる。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3645,13 +3605,17 @@ mod tests {
             Ok(_) => panic!("an explicit busy port must not fall back"),
             Err(err) => err,
         };
-        assert!(matches!(err, HubStartError::ServerStart(_)), "{err:?}");
+        assert!(matches!(err, HubStartError::ServerStart { .. }), "{err:?}");
+        assert_eq!(err.failed_plain_port(), Some(busy));
+        assert_eq!(
+            HubStartError::DbLeftOpen(Box::new(err)).failed_plain_port(),
+            Some(busy)
+        );
 
         // 失敗した起動が何も残していない: 同じ DB・data_dir でもう一度起動できる。
         let hub = HubRuntime::start(make(0))
             .await
             .expect("restart after a failed bind should succeed");
-        assert_eq!(hub.port_fallback_from(), None);
         hub.shutdown().await;
         drop(holder);
     }

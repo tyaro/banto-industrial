@@ -23,7 +23,7 @@
 //! 文字列（`host:port`）の解決は `TcpListener::bind` と同じく `lookup_host` の結果を順に
 //! 試し、最初に bind できたものを使う。失敗は最後のエラーをそのまま返すので、
 //! `io::ErrorKind`（`AddrInUse` / `PermissionDenied` など）を見る
-//! `runtime::bind_error_allows_port_fallback` の判定はそのまま効く。Windows 以外は
+//! 競合は AddrInUse / PermissionDenied で返す。Windows 以外は
 //! `TcpListener::bind` をそのまま使う。
 
 use std::io;
@@ -248,10 +248,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exclusive_bind_reports_addr_in_use_for_the_fallback_check() {
+    async fn exclusive_bind_reports_an_address_conflict() {
         let first = bind_exclusive("127.0.0.1:0").await.unwrap();
         let addr = first.local_addr().unwrap();
         let err = bind_exclusive(addr).await.unwrap_err();
-        assert!(crate::runtime::bind_error_allows_port_fallback(err.kind()));
+        assert!(matches!(
+            err.kind(),
+            std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+        ));
     }
 }

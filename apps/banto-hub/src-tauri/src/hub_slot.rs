@@ -251,6 +251,11 @@ impl<H> HubSlot<H> {
         self.lock().closed
     }
 
+    /// Read a short snapshot without taking ownership of a running Hub.
+    pub(crate) fn inspect<R>(&self, read: impl FnOnce(&H) -> R) -> Option<R> {
+        self.lock().hub.as_ref().map(read)
+    }
+
     /// Hub が置かれておらず、進行中の起動・停止も無い（= このプロセスの
     /// デスクトップの Hub は止まりきっている）。ホスト切替の
     /// `DesktopHostControl::is_stopped` が使う - `None` を見ただけでは、

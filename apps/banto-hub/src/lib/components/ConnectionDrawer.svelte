@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { getClientIngestOrigin } from '#lib/banto/hostSwitchShell.js';
 	/**
 	 * T18-6a（TAG-UX-7/TAG-UX-8、2026-08-27 オーナー決定「PLC接続の作成／
 	 * 再設定を Drawer に寄せる」）: PLC接続の作成・再設定を担う共通部品。
@@ -140,6 +141,7 @@
 		bridgeQueryErrorKey,
 		formatBridgeReferenceDeleteRefusal,
 		ingestEndpoints,
+		ingestUsesLoopback,
 		isSavedPushConnection,
 		resolveSavedConnection,
 		type SavedConnectionRecord,
@@ -683,13 +685,33 @@
 		return () => poller.stop();
 	});
 
+	let ingestOrigin = $state<string | null>(null);
+	let ingestOriginLoading = $state(true);
+	$effect(() => {
+		if (!open || !savedIsPush) {
+			ingestOrigin = null;
+			ingestOriginLoading = true;
+			return;
+		}
+		let cancelled = false;
+		ingestOrigin = null;
+		ingestOriginLoading = true;
+		void getClientIngestOrigin(typeof window === 'undefined' ? '' : window.location.origin).then(
+			(origin) => {
+				if (!cancelled) {
+					ingestOrigin = origin;
+					ingestOriginLoading = false;
+				}
+			}
+		);
+		return () => {
+			cancelled = true;
+		};
+	});
 	/** 送り手向けの URL とスコープ（保存済みの push 接続だけ）。 */
 	const endpoints = $derived(
-		savedConnection && savedIsPush
-			? ingestEndpoints(
-					typeof window === 'undefined' ? '' : window.location.origin,
-					savedConnection.id
-				)
+		savedConnection && savedIsPush && ingestOrigin
+			? ingestEndpoints(ingestOrigin, savedConnection.id)
 			: null
 	);
 
@@ -1290,14 +1312,22 @@
 				<dd><code data-testid="ingest-scope">{endpoints.scope}</code></dd>
 			</dl>
 			<p class="hint">
+				{#if ingestUsesLoopback(ingestOrigin)}
+					この loopback URL は Hub と同じ PC の送り手向けです。別の PC
+					から送る場合は、アクセスできる Hub のアドレスと待ち受け設定を確認してください。
+				{/if}
 				送り手の API キーは「API キー」の画面で、取り込み（この接続）を選んで発行します（スコープ
 				{endpoints.scope}）。URL とスコープは接続の id で決まるので、名前を変えても変わりません。
 				構成パッケージで別の Hub に移すと id が変わり、キーも移りません。
 			</p>
 		{:else}
 			<p class="hint">
-				作成すると、ここに送り手向けの URL（/api/v1/ingest/接続 id/…）と API キーのスコープ
-				ingest:#接続 id が出ます。
+				{#if savedConnection && savedIsPush}
+					{#if ingestOriginLoading}クライアント向けの待ち受け URL を取得中…{:else}クライアント向けの待ち受け
+						URL を確認できません。Hub の待ち受け設定とログを確認してください。{/if}
+				{:else}<span>作成すると、ここに送り手向けの URL</span>（/api/v1/ingest/接続 id/…）と API
+					キーのスコープ ingest:#接続 id が出ます。
+				{/if}
 			</p>
 		{/if}
 	</section>
