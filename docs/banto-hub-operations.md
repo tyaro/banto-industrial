@@ -408,7 +408,9 @@ Windows の Hub が平文の秘密値を DPAPI に封印し直せなかった行
 | **8723**  | 同じ PC 向けの TLS（`127.0.0.1` だけ） | サービス・デスクトップ版とも、証明書が整っていれば有効（§12） |
 | **50051** | gRPC                                   | **既定は無効**（`grpc.enabled=false`。有効化は §8 参照）      |
 
-いずれも管理 UI の設定または環境変数で変更可能です。gRPC の bind
+8722 と 50051 は管理 UI の設定または環境変数で変更可能です。8723 は既定の TLS では
+固定で、変えるには環境変数 `BANTO_HUB_TLS_PORT`・`BANTO_HUB_TLS_CERT`・`BANTO_HUB_TLS_KEY` の
+3 つを設定します（§12「環境変数での上書き」）。gRPC の bind
 アドレスは `BANTO_BIND`（REST/WS/UI 用）とは別の設定キー `grpc.bind`
 で管理します。既定は **127.0.0.1**（2026-08-08 オーナー決定、
 docs/improvement-plan.md H3）で、REST/WS/UI と同じくこの PC からのみ
@@ -2297,8 +2299,9 @@ ChronoGazer はサービスの証明書を pin にしてそちらへ繋がりま
   その利用者の `%LOCALAPPDATA%` に鍵を作るので、元の利用者の ChronoGazer とは繋がりません。
   同じ利用者の昇格なら繋がります。
 - **高速ユーザー切り替え・RDP**: 別の利用者 B のデスクトップ版の Hub が 8723 を握っている間、利用者 A の
-  ChronoGazer は、その証明書を pin に持たないので繋がりません（正しい動きです）。同じ profile の Hub は 1 つしか
-  動かせないので、A の Hub も起動できません。
+  ChronoGazer は、その証明書を pin に持たないので繋がりません（正しい動きです）。Hub の profile は利用者ごとではなく
+  PC 全体の `%ProgramData%\BantoHub\profiles\<profile-id>\` にあり、同じ profile の Hub は PC 全体で 1 つしか
+  動かせないので、A の Hub はそもそも起動できません（8723 だけが取れずに TLS 無しで起動する場合とは違います）。
 - **Sink はデスクトップ版の Hub と組む構成を、手順に載せません**（サポートしません）。Sink は、サービスの Hub と
   上の「Sink の接続（pin）」の手順で組んでください。
 
