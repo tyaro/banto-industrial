@@ -30,6 +30,13 @@ impl fmt::Debug for PinnedHubTls {
 impl PinnedHubTls {
     /// Each PEM entry is one trusted, directly pinned Hub server certificate.
     /// Multiple entries permit a bounded old/new certificate rotation.
+    ///
+    /// The limit of two is also what ChronoGazer needs for the Hub on the same
+    /// PC (#1121, docs/hub-desktop-tls-design.md §4.4): one certificate from the
+    /// Hub service's place plus one from the current user's place (the desktop
+    /// Hub), which uses up both slots. ChronoGazer re-reads the places on every
+    /// operation, so it never holds an old/new pair of the same place, and the
+    /// limit stays at two.
     pub fn from_pem(pems: &[String]) -> Result<Self> {
         if pems.is_empty() || pems.len() > 2 {
             return Err(Error::new(ErrorKind::InvalidEndpoint));

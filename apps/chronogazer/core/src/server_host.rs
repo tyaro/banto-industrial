@@ -565,11 +565,12 @@ pub fn lock_held_with_root(
     }
 }
 
-/// #644: Hub と話すときの TLS の決まり。製品は `production()`（loopback は pin した https
-/// だけ）。
+/// #644・#1121 PR4a: Hub と話すときの TLS の決まり。製品は `service_only()`（loopback は、Hub の
+/// サービスの置き場の証明書を pin した https だけ。LocalSystem には「今の利用者の Hub の
+/// デスクトップ版」が無いので、利用者の置き場と利用者の失効の記録は読まず、書かない）。
 #[cfg(not(debug_assertions))]
 fn hub_tls_policy() -> crate::hub_tls::HubTlsPolicy {
-    crate::hub_tls::HubTlsPolicy::production()
+    crate::hub_tls::HubTlsPolicy::service_only()
 }
 
 /// デバッグビルドだけ、`BANTO_HUB_LOOPBACK_HTTP=1` で loopback の http を pin なしで受ける
@@ -584,7 +585,7 @@ fn hub_tls_policy() -> crate::hub_tls::HubTlsPolicy {
         );
         crate::hub_tls::HubTlsPolicy::plain_loopback_http_for_dev()
     } else {
-        crate::hub_tls::HubTlsPolicy::production()
+        crate::hub_tls::HubTlsPolicy::service_only()
     }
 }
 

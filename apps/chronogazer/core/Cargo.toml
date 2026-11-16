@@ -92,6 +92,13 @@ getrandom = { workspace = true }
 # `crate::server_admin` に移した（デスクトップの `src-tauri` と REST で共有）。
 # `src-tauri` が既に使っている workspace 版なので Cargo.lock にノードは増えない。
 qrcode = { workspace = true }
+# #644 PR3b・#1121 PR4a: 同じ PC の Hub の証明書を、置き場（サービスの
+# `%ProgramData%\BantoHub\tls\` と利用者の `%LOCALAPPDATA%\BantoHub\tls\`）の所有者・DACL を
+# 確かめてから読み、失効の記録と照合する（`crate::hub_tls`）。banto-hub と共有の path crate で、
+# 依存はすべて既に木にあり、Cargo.lock に新しい package は増えない。置き場を読む実装
+# （`win`）は Windows だけだが、拇印・手順の結果の型は判定（全 OS で試験する）が使うので、
+# 依存は OS で分けない（banto-hub-core と同じ）。
+banto-hub-tls-trust = { path = "../../../crates/banto-hub-tls-trust" }
 
 # #392 B1-5: `chronogazer-server`（bin）のコンソールの扱い - Ctrl の受け取り
 # （`SetConsoleCtrlHandler`）と、標準出力・標準エラー出力のログファイルへの
@@ -99,10 +106,6 @@ qrcode = { workspace = true }
 # 0.61 系（banto-safe-root・banto-instance-lock と同じ版）で、feature を足す
 # だけ（Cargo.lock にノードは増えない）。
 [target.'cfg(windows)'.dependencies]
-# #644 PR3b: 同じ PC の Hub の証明書を、置き場（`%ProgramData%\BantoHub\tls\`）の所有者・
-# DACL を確かめてから読み取り専用で読む（`crate::hub_tls`）。banto-hub と共有の path crate で、
-# 依存はすべて既に木にあり、Cargo.lock に新しい package は増えない。非 Windows では読まない。
-banto-hub-tls-trust = { path = "../../../crates/banto-hub-tls-trust" }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",

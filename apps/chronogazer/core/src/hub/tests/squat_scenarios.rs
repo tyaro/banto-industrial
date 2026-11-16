@@ -5,8 +5,13 @@
 //! 別プロセスが先取り・証明書を作り直して再起動・loopback の http）を通るあいだ、
 //! ダミーのキーが「本物の Hub」以外に 1 バイトも届かないことを、同じ `HubService`（見張りと
 //! 世代つき）で確かめる。本物の Hub は TLS を話す模擬（`TlsHub`）で、届いた要求の頭を
-//! すべて記録する。`chronogazer-server` も同じ `HubService`・`HubTlsPolicy::production()` を
-//! 使う（`server_host::hub_tls_policy`）ので、別の通信の経路は無く、ここで併せて固める。
+//! すべて記録する。`chronogazer-server` も同じ `HubService` を使い、決まりだけが
+//! `HubTlsPolicy::service_only()`（サービスの置き場だけを読む。`server_host::hub_tls_policy`）
+//! なので、別の通信の経路は無く、ここで併せて固める。
+//!
+//! #1121 PR4a の場面（d〜f）は、置き場を読む口を偽物（`crate::hub_tls::fake::FakePlaces`）に
+//! して、サービスの置き場と利用者の置き場の 2 つを pin にする決まり
+//! （`HubTlsPolicy::production()` と同じ判定）を通す。
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -26,6 +31,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 use super::*;
+use crate::hub_tls::fake::{thumbprint, usable, FakePlaces};
 
 const DUMMY_KEY: &str = "bh_squatdummy.6f1c2a9e0d4b7381";
 const TAG: &str = "alpha";
@@ -236,6 +242,20 @@ async fn serve(
 /// 保存済みのダミーキーと、`endpoint` を保存済みにした `HubService`（loopback は
 /// `cert` の証明書を pin する本番の決まり）。購読の対象はタグ 1 つ。
 async fn hub_for(endpoint: &str, cert: &Arc<PemCell>) -> HubService {
+    hub_with(
+        endpoint,
+        HubTlsPolicy::with_reader(Arc::clone(cert) as Arc<dyn crate::hub_tls::HubCertReader>),
+    )
+    .await
+}
+
+/// [`hub_for`] の、2 つの置き場（サービス・利用者）を読む決まり版（#1121 PR4a）。置き場を
+/// 読む口は偽物で、判定は `HubTlsPolicy::production()` と同じ。
+async fn hub_on_two_places(endpoint: &str, places: &Arc<FakePlaces>) -> HubService {
+    hub_with(endpoint, places.desktop_policy()).await
+}
+
+async fn hub_with(endpoint: &str, tls: HubTlsPolicy) -> HubService {
     use banto_hub_bootstrap::state::memory::MemoryKeyStore;
 
     let pool = init_db_memory().await.expect("init_db_memory");
@@ -245,7 +265,7 @@ async fn hub_for(endpoint: &str, cert: &Arc<PemCell>) -> HubService {
     let hub = HubService::new(
         settings.clone(),
         Arc::clone(&keys) as Arc<dyn KeyStore>,
-        HubTlsPolicy::with_reader(Arc::clone(cert) as Arc<dyn crate::hub_tls::HubCertReader>),
+        tls,
     )
     .await
     .expect("HubService::new");
@@ -525,4 +545,158 @@ async fn a_loopback_http_endpoint_is_refused_before_any_connection() {
     }
     assert!(port.squat_bytes().is_empty());
     port.assert_secret_absent(DUMMY_KEY);
+}
+
+/// 見張りの 1 周期を手で回したあと、購読が止まる（`live` でなくなる）のを待つ。
+async fn wait_not_live(hub: &HubService, what: &str) {
+    tokio::time::timeout(WAIT, async {
+        while hub.subscription().await.state == "live" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out: {what}"));
+}
+
+/// d. #1121: Hub のデスクトップ版だけの PC（サービスの置き場は無い）。利用者の置き場の
+/// 証明書を pin にして繋がり、別の鍵の先取り役にはキーが届かない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn d_the_user_place_alone_pins_the_desktop_hub() {
+    let desktop_identity = TestIdentity::generate();
+    let squatter = TestIdentity::generate();
+    let desktop_hub = TlsHub::start(&desktop_identity).await;
+    let port = SwitchPort::start().await;
+    let places = FakePlaces::new();
+    places.set_user(usable(&desktop_identity.pem()));
+    let hub = hub_on_two_places(&port.https_url(), &places).await;
+    live_on(&port, &desktop_hub, &hub).await;
+    let view = hub.status().await.expect("status");
+    assert!(
+        view.tls_warnings.is_empty(),
+        "an absent service place is silent: {:?}",
+        view.tls_warnings
+    );
+    let delivered = desktop_hub.requests();
+
+    port.set(Mode::SquatTls(squatter.server_config()));
+    port.wait_finished(ModeKind::SquatTls, 1, WAIT).await;
+    assert_reconnecting_on_transport(&hub).await;
+    refused_status_checks(&hub, &port, ModeKind::SquatTls, 1).await;
+    assert_eq!(
+        port.squat_tls_handshakes(),
+        0,
+        "pin must reject the squatter"
+    );
+    assert_no_http_reached(&port);
+    port.assert_secret_absent(DUMMY_KEY);
+    assert_eq!(desktop_hub.requests(), delivered);
+}
+
+/// e. #1121: サービスと利用者の両方の証明書を pin にする。利用者が Hub をデスクトップ版から
+/// サービスへ切り替えても、同じ接続先のまま、操作なしで繋がり直す。別の鍵の先取り役には
+/// 繋がらない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e_both_places_are_pinned_and_either_hub_connects() {
+    let service_identity = TestIdentity::generate();
+    let desktop_identity = TestIdentity::generate();
+    let squatter = TestIdentity::generate();
+    let service_hub = TlsHub::start(&service_identity).await;
+    let desktop_hub = TlsHub::start(&desktop_identity).await;
+    let port = SwitchPort::start().await;
+    let places = FakePlaces::new();
+    places.set_service(usable(&service_identity.pem()));
+    places.set_user(usable(&desktop_identity.pem()));
+    let hub = hub_on_two_places(&port.https_url(), &places).await;
+
+    // デスクトップ版の Hub が 8723 を待ち受けている。
+    live_on(&port, &desktop_hub, &hub).await;
+    assert_eq!(service_hub.requests(), 0);
+
+    // 別の鍵の先取り役: どちらの pin にも合わないので、握手を断る。
+    port.set(Mode::SquatTls(squatter.server_config()));
+    port.wait_finished(ModeKind::SquatTls, 1, WAIT).await;
+    assert_reconnecting_on_transport(&hub).await;
+    assert_eq!(port.squat_tls_handshakes(), 0);
+    assert_no_http_reached(&port);
+
+    // 利用者がサービスへ切り替えた: 世代自身の再接続が、サービスの証明書の pin で通る
+    // （見張りも操作も要らない。置き場は変わっていないので、張り直しも起きない）。
+    port.set(Mode::Relay(service_hub.addr));
+    wait_for("the stream to reach the service hub", || {
+        service_hub.bearer_requests() >= 1
+    })
+    .await;
+    wait_live_unaided(&hub, WAIT, "live on the service hub").await;
+    let view = hub.status().await.expect("status");
+    assert!(
+        matches!(view.status, HubStatus::Connected { .. }),
+        "{:?}",
+        view.status
+    );
+    assert!(view.tls_warnings.is_empty(), "{:?}", view.tls_warnings);
+    assert_eq!(port.squat_tls_handshakes(), 0);
+    port.assert_secret_absent(DUMMY_KEY);
+}
+
+/// f. #1121: 失効した側の鍵で待ち受ける相手には繋がらない。利用者の証明書で繋がっている間に
+/// その拇印が失効の記録に入ったら（Hub のデスクトップ版が鍵の露出を見た）、次の見張りの
+/// 周期で pin から外して購読を止め、その鍵を持つ相手へは以後キーを送らない。サービスの
+/// 証明書の pin は残り、サービスの Hub には繋がる。警告は接続できていても出す。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f_a_revoked_certificate_no_longer_connects_to_the_holder_of_its_key() {
+    let service_identity = TestIdentity::generate();
+    let desktop_identity = TestIdentity::generate();
+    let service_hub = TlsHub::start(&service_identity).await;
+    // 露出した鍵を持つ相手（コピーされた鍵で同じポートを待ち受ける）。
+    let key_holder = TlsHub::start(&desktop_identity).await;
+    let port = SwitchPort::start().await;
+    let places = FakePlaces::new();
+    places.set_service(usable(&service_identity.pem()));
+    places.set_user(usable(&desktop_identity.pem()));
+    let hub = hub_on_two_places(&port.https_url(), &places).await;
+    live_on(&port, &key_holder, &hub).await;
+
+    // 失効の記録に拇印が足された（PEM も ACL も今は同じ）。繋がったままの世代を、見張りの
+    // 1 周期が止める（周期を待たずに 1 回分を起こす）。
+    places.revoke_in_user_record(thumbprint(&desktop_identity.pem()));
+    hub.supervise_once().await;
+    wait_not_live(&hub, "the revoked pin to be dropped").await;
+    let delivered = key_holder.requests();
+
+    // 以後は、状態の確認も見張りも、その鍵の相手に断られる（キーは届かない）。
+    let view = hub.status().await.expect("status");
+    assert!(
+        matches!(view.status, HubStatus::Unreachable { .. }),
+        "{:?}",
+        view.status
+    );
+    assert!(
+        view.tls_warnings
+            .iter()
+            .any(|warning| warning.contains("失効している")),
+        "{:?}",
+        view.tls_warnings
+    );
+    hub.supervise_once().await;
+    assert_not_live(&hub).await;
+    assert_eq!(
+        key_holder.requests(),
+        delivered,
+        "nothing reaches the holder of the revoked key"
+    );
+
+    // サービスの Hub が待ち受ければ、サービスの証明書の pin で繋がる。警告は残る。
+    port.set(Mode::Relay(service_hub.addr));
+    hub.supervise_once().await;
+    wait_live_unaided(&hub, WAIT, "live on the service hub").await;
+    assert!(service_hub.bearer_requests() >= 2);
+    let view = hub.status().await.expect("status");
+    assert!(
+        view.tls_warnings
+            .iter()
+            .any(|warning| warning.contains("失効している")),
+        "warned while connected: {:?}",
+        view.tls_warnings
+    );
+    assert_eq!(key_holder.requests(), delivered);
 }
