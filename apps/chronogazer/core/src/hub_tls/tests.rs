@@ -517,6 +517,28 @@ async fn an_incomplete_reconcile_keeps_the_user_pin_for_three_cycles() {
     assert!(connects(&policy));
 }
 
+/// 操作の入口の走らせ直し（`ensure_started`）は「できなかった」の連続数を進めない:
+/// 3 周期は見張りの周期だけで数える。
+#[tokio::test]
+async fn operation_entries_do_not_advance_the_incomplete_streak() {
+    let places = FakePlaces::new();
+    places.set_user(usable(&cert_pem()));
+    let policy = started_desktop(&places).await;
+    assert!(connects(&policy));
+
+    places.set_reconcile(ReconcileOutcome::Incomplete);
+    policy.refresh(HUB).await;
+    for _ in 0..5 {
+        policy.ensure_started(HUB).await;
+        assert!(connects(&policy), "operation entries keep the pin");
+    }
+    policy.refresh(HUB).await;
+    assert!(connects(&policy), "second cycle");
+    policy.refresh(HUB).await;
+    let detail = refusal(&policy);
+    assert!(detail.contains("3 周期続けて"), "{detail}");
+}
+
 /// 「この回はできなかった」の間に証明書が作り直されたら、新しい証明書は「使い始める」に
 /// あたるので、整うまで使わない。
 #[tokio::test]

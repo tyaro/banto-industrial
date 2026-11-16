@@ -144,7 +144,7 @@ pub const LOOPBACK_HTTP_REFUSED: &str = "同じ PC の Hub へは http では接
 pub const LOOPBACK_HTTP_REFUSED_SERVICE: &str = "同じ PC の Hub へは http では接続しません（API キーを守るため）。https://127.0.0.1:8723 で接続し直してください（Hub をサービスで動かし、管理者で prepare-hub-tls を済ませてあること）。";
 
 /// 「この回はできなかった」がこの周期数続いたら、pin に使っている利用者の証明書を外す
-/// （設計 §4.4.1。Hub のデスクトップ版の見張りと同じ 3 周期 = 約 90 秒）。
+/// （数えるのは見張りの周期だけ。操作の入口の走らせ直しでは進めない。設計 §4.4.1。Hub のデスクトップ版の見張りと同じ 3 周期 = 約 90 秒）。
 pub(crate) const INCOMPLETE_LIMIT: u8 = 3;
 
 const ELEV_RENEW: &str = "banto-hub-elev.exe prepare-hub-tls --renew";
@@ -591,8 +591,10 @@ impl Pinned {
     }
 
     /// 利用者の記録を整え、露出を見た拇印を書き足す（モジュール doc「いつ読むか」）。記録の
-    /// ロックを上限付きで待つので、blocking のスレッドから呼ぶ。
-    fn refresh_blocking(&self, startup: bool) {
+    /// ロックを上限付きで待つので、blocking のスレッドから呼ぶ。`counts_cycle` は見張りの
+    /// 周期の回か: 「できなかった」の連続数（`INCOMPLETE_LIMIT`）を進めるのは周期の回だけ
+    /// （操作の入口の走らせ直しは増やさず、「できなかった」以外なら 0 に戻す）。
+    fn refresh_blocking(&self, startup: bool, counts_cycle: bool) {
         let mut report = self.places.reconcile_user_revocations();
         let mut warnings = std::mem::take(&mut report.warnings);
         if startup && report.saw_loss {
@@ -602,10 +604,12 @@ impl Pinned {
         }
         {
             let mut state = self.state();
-            state.incomplete_streak = if report.outcome == ReconcileOutcome::Incomplete {
+            state.incomplete_streak = if report.outcome != ReconcileOutcome::Incomplete {
+                0
+            } else if counts_cycle {
                 state.incomplete_streak.saturating_add(1)
             } else {
-                0
+                state.incomplete_streak
             };
             state.reconcile = Some(ReconcileSeen {
                 outcome: report.outcome,
@@ -764,7 +768,8 @@ impl HubTlsPolicy {
 
     /// 起動の初回の整える手順（モジュール doc「いつ読むか」）。`endpoint` が loopback の https
     /// で、利用者の記録を持つ決まりで、まだ 1 回も走らせていないか、最後の結果が「整っている」
-    /// でないときだけ走らせる（「できなかった」「通らない」で終わった回は、次の操作でやり直す）。操作の
+    /// でないときだけ走らせる（「できなかった」「通らない」で終わった回は、次の操作でやり直す。
+    /// やり直しは「できなかった」の連続数を進めない: 3 周期は見張りの周期で数える）。操作の
     /// 入口（`crate::hub` の `begin_operation`・`connect`・`adopt_manual_key`）が、Hub と話す
     /// 前に呼ぶ - 走らせる前の判定は、利用者の証明書を使い始めない。
     pub(crate) async fn ensure_started(&self, endpoint: &str) {
@@ -802,7 +807,9 @@ impl HubTlsPolicy {
         }
         let pinned = Arc::clone(pinned);
         // 記録のロックを最大 5 秒待つので、tokio のワーカーを塞がない。
-        let ran = tokio::task::spawn_blocking(move || pinned.refresh_blocking(!started)).await;
+        let ran =
+            tokio::task::spawn_blocking(move || pinned.refresh_blocking(!started, !only_first))
+                .await;
         if let Err(error) = ran {
             // 状態は書き換わっていない（1 回も走っていなければ、利用者の証明書は使い始めない）。
             eprintln!(
