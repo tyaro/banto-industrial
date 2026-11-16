@@ -313,6 +313,12 @@ pub struct HubSubscriptionView {
     /// 更新の粒度は最大 30 秒 - 理由は `Subscription::observe`。
     pub last_value_at: Option<i64>,
     pub values: Vec<HubValueView>,
+    /// [`HubView::tls_warnings`] と同じ値（#1121 PR4b）。画面は操作のとき以外
+    /// 2 秒ごとにこの購読の状態だけをポーリングするので、**接続できている間に
+    /// 見張りの結果で変わる警告**をポーリングで更新するために載せる。
+    /// [`Hub::subscription`] が埋める（キャッシュした状態を clone するだけで、
+    /// ネットワークは叩かない）。保存済みの接続先が無ければ空。
+    pub tls_warnings: Vec<String>,
 }
 
 impl HubSubscriptionView {
@@ -335,6 +341,7 @@ impl HubSubscriptionView {
             last_error: last_error.map(|kind| kind.as_str().to_owned()),
             last_value_at,
             values: Vec::new(),
+            tls_warnings: Vec::new(),
         }
     }
 }
@@ -1275,6 +1282,7 @@ impl Subscription {
                 .and_then(|snapshot| snapshot.values.as_deref())
                 .map(value_views)
                 .unwrap_or_default(),
+            tls_warnings: Vec::new(),
         }
     }
 
@@ -1861,7 +1869,15 @@ impl HubService {
     /// 購読の状態だけを返す（ポーリング用）。**メモリ上の `watch` を読む
     /// だけ**で、Hub へのリクエストは 1 本も出さない。
     pub async fn subscription(&self) -> HubSubscriptionView {
-        self.inner.subscription.lock().await.view()
+        let mut view = self.inner.subscription.lock().await.view();
+        // `fn view` と同じ考え方: 保存済みの接続先の置き場の警告（キャッシュを読むだけ）。
+        view.tls_warnings = self
+            .inner
+            .mirror
+            .current()
+            .map(|record| self.inner.tls.warnings_for(&record.endpoint))
+            .unwrap_or_default();
+        view
     }
 
     /// 収集が Hub 経由の接続の値を読む口（#383 段階3 P3）。何度呼んでも同じ
@@ -6524,6 +6540,13 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(&view).unwrap()["tlsWarnings"],
+            serde_json::json!(view.tls_warnings)
+        );
+        // ポーリングの応答（ネットワークを叩かない `subscription()`）も同じ警告を持つ。
+        let polled = hub.subscription().await;
+        assert_eq!(polled.tls_warnings, view.tls_warnings);
+        assert_eq!(
+            serde_json::to_value(&polled).unwrap()["tlsWarnings"],
             serde_json::json!(view.tls_warnings)
         );
 
