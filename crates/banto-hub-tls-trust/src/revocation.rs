@@ -18,6 +18,10 @@
 //! - 判定と書き込みは、A・B の外のロックファイルの**排他の open**
 //!   （[`RevocationOps::open_child_file_exclusive`]）を握っている間だけ。上限付きで待つ
 //!   （[`ReconcileOptions`]）。名前付き mutex は使わない。
+//! - Hub が証明書を作るときは、先に `tls\` の排他を取り、[`lock_user_revocations`] が返す
+//!   [`LockedUserRevocations`] で記録の排他も保つ。整える処理（消失修復後の再確認を含む）・
+//!   作成・公開・最後の照合が終わるまで放さない。保持中の失効の書き足しもこの型の口を使い、
+//!   同じロックを取り直さない。通常の口は従来どおり、1 回の処理が終わるとロックを放す。
 //! - 確かめに通らない置き場には書かない。ロックが取れない・通らないなら何も書かない。
 //!
 //! ## 3 周期の扱いは呼ぶ側
@@ -644,7 +648,7 @@ pub struct ReconcileReport {
     pub outcome: ReconcileOutcome,
     /// 警告の理由（無ければ空）。
     pub warnings: Vec<RevocationWarning>,
-    /// 手順の後に、ロック無しで読み直した記録（照合に使う）。
+    /// 手順の後に読み直した記録（通常の口はロック解放後、保持する口は保持中。照合に使う）。
     pub revocations: UserRevocations,
 }
 
@@ -718,7 +722,16 @@ fn run<O: RevocationOps, P: UserTlsPlace + ?Sized>(
 ) -> ReconcileReport {
     let mut warnings = Vec::new();
     let outcome = run_locked(ops, place, options, extra, &mut warnings);
-    // ロックを放した後に読み直す（照合はロック無し）。
+    finish_report(ops, place, outcome, warnings)
+}
+
+fn finish_report<O: UserTlsOps, P: UserTlsPlace + ?Sized>(
+    ops: &O,
+    place: &P,
+    outcome: ReconcileOutcome,
+    mut warnings: Vec<RevocationWarning>,
+) -> ReconcileReport {
+    // 通常の口はロックを放した後、保持する口は同じロックの下で読み直す。
     let revocations = read_user_revocations(ops, place);
     // 「整っている」と返すのは、読み直しても両方が確定で揃っているときだけ（書いた直後に
     // 別の誰かに書き換えられた・書いたものが確かめに通らない、を「整っている」にしない）。
@@ -734,6 +747,87 @@ fn run<O: RevocationOps, P: UserTlsPlace + ?Sized>(
         outcome,
         warnings,
         revocations,
+    }
+}
+
+/// 利用者の失効の記録を排他に保持する（#1121 PR2d、設計 §7 決定4）。
+/// `tls\` も握る呼び手は、必ず `tls\` のロックを先に取る。保持中は通常の
+/// `reconcile_user_revocations` / `record_user_revocation` を呼ばず、この型のメソッドを使う。
+/// drop まで同じ OS のロックとその置き場を保持する。変更するメソッドは `&mut self` で直列化する。
+pub struct LockedUserRevocations<'a, O: RevocationOps, P: UserTlsPlace + ?Sized> {
+    ops: &'a O,
+    place: &'a P,
+    _guard: LockGuard<O>,
+}
+
+impl<O: RevocationOps, P: UserTlsPlace + ?Sized> LockedUserRevocations<'_, O, P> {
+    /// ロックを取り直さず整える。消失を直した回は通常の口と同じく Refused を返すので、
+    /// 起動の呼び手は、直せた場合だけ同じ保持のままもう一度確認できる。
+    pub fn reconcile(&mut self) -> ReconcileReport {
+        self.run(None)
+    }
+
+    /// ロックを取り直さず、拇印を両方の記録へ書き足す。
+    pub fn record(
+        &mut self,
+        thumbprint: CertThumbprint,
+        place: RevokedCertPlace,
+    ) -> ReconcileReport {
+        self.run(Some((thumbprint, place)))
+    }
+
+    /// 同じロックを保持したまま、現在の記録を確かめて読む。
+    pub fn read(&self) -> UserRevocations {
+        read_user_revocations(self.ops, self.place)
+    }
+
+    fn run(&mut self, extra: Option<(CertThumbprint, RevokedCertPlace)>) -> ReconcileReport {
+        let mut warnings = Vec::new();
+        let outcome = run_under_lock(self.ops, self.place, extra, &mut warnings);
+        finish_report(self.ops, self.place, outcome, warnings)
+    }
+}
+
+/// 置き場とロックファイルを確かめ、上限付きで排他に開く。失敗は通常の手順と同じ
+/// Refused / Incomplete の報告（記録を読み直した結果付き）。成功時は、呼び手が明示的に
+/// reconcile して Consistent を確認してから証明書を作る・使い始める。
+pub fn lock_user_revocations<'a, O: RevocationOps, P: UserTlsPlace + ?Sized>(
+    ops: &'a O,
+    place: &'a P,
+    options: &ReconcileOptions,
+) -> Result<LockedUserRevocations<'a, O, P>, Box<ReconcileReport>> {
+    if let Err(error) = check_place_layout(place) {
+        return Err(Box::new(finish_report(
+            ops,
+            place,
+            ReconcileOutcome::Refused,
+            vec![RevocationWarning::Layout(error)],
+        )));
+    }
+    match acquire_lock(ops, place, options) {
+        Ok(guard) => Ok(LockedUserRevocations {
+            ops,
+            place,
+            _guard: guard,
+        }),
+        Err(error) => {
+            let (outcome, warning) = lock_warning(error);
+            Err(Box::new(finish_report(ops, place, outcome, vec![warning])))
+        }
+    }
+}
+
+fn lock_warning(error: LockError) -> (ReconcileOutcome, RevocationWarning) {
+    match error {
+        LockError::Refused(problem) => (
+            ReconcileOutcome::Refused,
+            RevocationWarning::LockRefused(problem),
+        ),
+        LockError::Timeout(waited) => (
+            ReconcileOutcome::Incomplete,
+            RevocationWarning::LockTimeout(waited),
+        ),
+        LockError::Io(error) => (ReconcileOutcome::Incomplete, RevocationWarning::Io(error)),
     }
 }
 
@@ -997,7 +1091,7 @@ fn run_locked<O: RevocationOps, P: UserTlsPlace + ?Sized>(
     extra: Option<(CertThumbprint, RevokedCertPlace)>,
     warnings: &mut Vec<RevocationWarning>,
 ) -> ReconcileOutcome {
-    use ReconcileOutcome::{Consistent, Incomplete, Refused};
+    use ReconcileOutcome::Refused;
 
     // --- 1. 置き場の指定 ----------------------------------------------------------------
     if let Err(error) = check_place_layout(place) {
@@ -1008,20 +1102,23 @@ fn run_locked<O: RevocationOps, P: UserTlsPlace + ?Sized>(
     // --- 2. ロック ----------------------------------------------------------------------
     let _lock = match acquire_lock(ops, place, options) {
         Ok(lock) => lock,
-        Err(LockError::Refused(problem)) => {
-            warnings.push(RevocationWarning::LockRefused(problem));
-            return Refused;
-        }
-        Err(LockError::Timeout(waited)) => {
-            warnings.push(RevocationWarning::LockTimeout(waited));
-            return Incomplete;
-        }
-        Err(LockError::Io(error)) => {
-            warnings.push(RevocationWarning::Io(error));
-            return Incomplete;
+        Err(error) => {
+            let (outcome, warning) = lock_warning(error);
+            warnings.push(warning);
+            return outcome;
         }
     };
 
+    run_under_lock(ops, place, extra, warnings)
+}
+
+fn run_under_lock<O: RevocationOps, P: UserTlsPlace + ?Sized>(
+    ops: &O,
+    place: &P,
+    extra: Option<(CertThumbprint, RevokedCertPlace)>,
+    warnings: &mut Vec<RevocationWarning>,
+) -> ReconcileOutcome {
+    use ReconcileOutcome::{Consistent, Incomplete, Refused};
     // --- 3. 読み直して判定 ----------------------------------------------------------------
     // ロックを握っているので、残った一時ファイルは誰のものでもない。読まずに片付ける。
     let tidy = |dir: &O::Dir| {

@@ -92,6 +92,8 @@ pub(crate) fn observe_profile_mode(profile_dir: &Path) -> ProfileModeObservation
 pub(crate) enum FallbackCause {
     /// 一般（起動の判定でサービスが遷移中・不健康、切り替えの失敗、Hub の起動の失敗）。
     General,
+    /// The process-owned shell listener/permission cannot be recreated in-process.
+    ShellTransportUnavailable,
     /// サービスに接続していたら、サービスが止まった（見張り）。
     ServiceLost,
     /// profile が運用モードの形で、サービスは止まっている。`left_tight` は最後の停止の
@@ -117,6 +119,7 @@ impl FallbackCause {
     pub(crate) fn key(self) -> Option<&'static str> {
         match self {
             Self::General => None,
+            Self::ShellTransportUnavailable => Some("shellTransportUnavailable"),
             Self::ServiceLost => Some("serviceLost"),
             Self::OperationStopped { left_tight: false } => Some("operationStopped"),
             Self::OperationStopped { left_tight: true } => Some("leftTight"),
@@ -128,6 +131,10 @@ impl FallbackCause {
     /// 「設定モードに戻す」 を出すか（profile が締まったまま止まっているときだけ）。
     pub(crate) fn offers_restore(self) -> bool {
         matches!(self, Self::OperationStopped { .. })
+    }
+
+    pub(crate) fn offers_retry(self) -> bool {
+        self != Self::ShellTransportUnavailable
     }
 }
 
@@ -386,11 +393,25 @@ pub(crate) const RESTORE_REPAIRING_MESSAGE: &str =
     "管理者の許可（ユーザーアカウント制御）を求めて、ファイルの権限を直しています…";
 
 /// Fallback の窓の見出しと本文（一般は `None` で、従来の診断の行だけを出す）。
+pub(crate) const SHELL_TRANSPORT_RESTART_MESSAGE: &str = "このプロセスでは管理画面の待ち受けを復旧できません。ログの原因を確認し、アプリを終了してから再起動してください。";
+
+pub(crate) fn require_stopped_local_hub(idle: bool) -> Result<(), &'static str> {
+    if idle {
+        Ok(())
+    } else {
+        Err("このアプリの Hub が稼働中または起動・停止処理中のため、設定モードの復旧は行いません。Hub の停止を確認してから再試行してください")
+    }
+}
+
 pub(crate) fn cause_page(cause: FallbackCause) -> Option<(&'static str, Vec<&'static str>)> {
     let service_log =
         "原因はサービスのログ（profile の logs\\banto-hub-service.log）で確かめられます。";
     match cause {
         FallbackCause::General => None,
+        FallbackCause::ShellTransportUnavailable => Some((
+            "管理画面の待ち受けを使えません",
+            vec![SHELL_TRANSPORT_RESTART_MESSAGE, "サービスが利用できる場合は、サービスを開始して接続できます。"],
+        )),
         FallbackCause::ServiceLost => Some((
             "サービスが止まりました",
             vec![
@@ -524,7 +545,8 @@ pub(crate) const ACTION_RETRY: PageAction = PageAction {
 /// Fallback の窓の操作（純関数。トレイと同じ集合・同じ順）。`start_allowed` は
 /// `tray_status::show_start_service_action` の結果（Operators かつ SCM が Stopped で、health が
 /// あいまいでない）。「設定モードに戻す」 は profile が締まったまま止まっている理由だけ
-/// （戻らなければ管理者の許可で修復するので、Operators でなくても出す）。再試行は常に出す。
+/// （戻らなければ管理者の許可で修復するので、Operators でなくても出す）。
+/// プロセス再起動が必要な shell transport 失敗では再試行を出さない。
 pub(crate) fn fallback_actions(cause: FallbackCause, start_allowed: bool) -> Vec<PageAction> {
     let mut actions = Vec::new();
     if start_allowed {
@@ -533,7 +555,9 @@ pub(crate) fn fallback_actions(cause: FallbackCause, start_allowed: bool) -> Vec
     if cause.offers_restore() {
         actions.push(ACTION_RESTORE_SETTING);
     }
-    actions.push(ACTION_RETRY);
+    if cause.offers_retry() {
+        actions.push(ACTION_RETRY);
+    }
     actions
 }
 
@@ -630,6 +654,33 @@ pub(crate) fn repair_tokens(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_process_transport_requires_restart_but_keeps_service_start() {
+        use super::*;
+        let cause = FallbackCause::ShellTransportUnavailable;
+        assert!(!cause.offers_retry());
+        assert!(!cause.offers_restore());
+        assert_eq!(
+            fallback_actions(cause, true)
+                .iter()
+                .map(|action| action.id)
+                .collect::<Vec<_>>(),
+            ["start_service"]
+        );
+        assert!(fallback_actions(cause, false).is_empty());
+        let (_, lines) = cause_page(cause).unwrap();
+        assert!(lines.join(" ").contains("再起動"));
+        assert_eq!(carry_cause(cause, Some(&ScmState::Stopped)), cause);
+        assert_eq!(
+            on_watch_tick(
+                WatchedView::Fallback(cause),
+                Some(&ScmState::Running),
+                &ProfileModeObservation::NotObserved,
+                None
+            ),
+            WatchStep::Reconnect(cause)
+        );
+    }
     use std::path::PathBuf;
 
     use super::*;

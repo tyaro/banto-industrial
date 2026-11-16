@@ -36,7 +36,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
     task::{Context, Poll},
     time::Duration,
@@ -154,6 +154,16 @@ impl TlsConfig {
 
     pub(crate) fn port(&self) -> u16 {
         self.port
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn thumbprint(&self) -> Option<banto_hub_tls_trust::CertThumbprint> {
+        match &self.identity {
+            TlsIdentity::Memory { cert, .. } => {
+                banto_hub_tls_trust::CertThumbprint::of_pem(cert).ok()
+            }
+            _ => None,
+        }
     }
 
     pub(crate) fn from_env() -> Result<Option<Self>, TlsError> {
@@ -341,7 +351,7 @@ impl AsyncWrite for SeverableTcp {
 
 struct TlsListener {
     tcp: TcpListener,
-    acceptor: TlsAcceptor,
+    acceptor: Arc<RwLock<TlsAcceptor>>,
     severance: Arc<Severance>,
     handshakes: JoinSet<Option<(TlsStream<SeverableTcp>, SocketAddr)>>,
 }
@@ -364,7 +374,7 @@ impl Listener for TlsListener {
                             let Some(stream) = self.severance.wrap(stream) else {
                                 continue;
                             };
-                            let acceptor = self.acceptor.clone();
+                            let acceptor = self.acceptor.read().unwrap_or_else(|p| p.into_inner()).clone();
                             self.handshakes.spawn(async move {
                                 // Idle local peers cannot hold the listener indefinitely.
                                 tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
@@ -384,35 +394,183 @@ impl Listener for TlsListener {
 }
 
 pub struct RunningTlsListener {
+    #[cfg(windows)]
+    acceptor: Option<Arc<RwLock<TlsAcceptor>>>,
     local_addr: SocketAddr,
     shutdown: oneshot::Sender<()>,
     task: JoinHandle<()>,
     severance: Arc<Severance>,
+    // Shell transport keeps its origin reserved even if serve unexpectedly exits.
+    _reservation: Option<std::net::TcpListener>,
 }
 
 /// 失効で 8723 の待ち受けを止め、その証明書で張られた接続をすぐ切る口（#1121 PR2c。
 /// [`RunningTlsListener::revoker`]。複製して別のスレッド・タスクから呼べる）。
 #[derive(Clone)]
 pub struct TlsRevoker {
-    severance: Arc<Severance>,
-    abort: Arc<AbortHandle>,
+    target: RevocationTarget,
+}
+
+#[derive(Clone)]
+enum RevocationTarget {
+    Listener {
+        severance: Arc<Severance>,
+        abort: Arc<AbortHandle>,
+    },
+    #[cfg(windows)]
+    Following(Arc<Mutex<FollowingRevocation>>),
+}
+
+#[cfg(windows)]
+struct FollowingRevocation {
+    external_stop: bool,
+    retired_identity: bool,
+    current: Option<TlsRevoker>,
 }
 
 impl TlsRevoker {
     /// 張られた接続をすべて OS の上で閉じ、serve のタスクを abort する（待ち受けのポートも閉じる）。
     /// 待たない（同期）。何度呼んでもよい。止めた後は再開しない。
+    /// デスクトップ監視の共有ハンドルは、復帰した listener にも同じ停止の印を伝える。
     pub fn revoke(&self) {
-        self.severance.sever();
-        self.abort.abort();
+        match &self.target {
+            RevocationTarget::Listener { severance, abort } => {
+                severance.sever();
+                abort.abort();
+            }
+            #[cfg(windows)]
+            RevocationTarget::Following(shared) => {
+                let mut shared = shared.lock().unwrap_or_else(|p| p.into_inner());
+                shared.external_stop = true;
+                if let Some(current) = &shared.current {
+                    current.revoke();
+                }
+            }
+        }
     }
 
-    /// 失効で止めたか。
+    /// 失効で止めたか（共有ハンドルの印は listener の交換後も消えない）。
     pub fn is_revoked(&self) -> bool {
-        self.severance.is_severed()
+        match &self.target {
+            RevocationTarget::Listener { severance, .. } => severance.is_severed(),
+            #[cfg(windows)]
+            RevocationTarget::Following(shared) => {
+                let shared = shared.lock().unwrap_or_else(|p| p.into_inner());
+                shared.external_stop || shared.retired_identity
+            }
+        }
+    }
+
+    /// 監視の寿命に対応する安定した停止口。current には listener 固有の停止口だけを渡す。
+    #[cfg(windows)]
+    pub(crate) fn following(current: TlsRevoker) -> Self {
+        Self {
+            target: RevocationTarget::Following(Arc::new(Mutex::new(FollowingRevocation {
+                external_stop: false,
+                retired_identity: false,
+                current: Some(current),
+            }))),
+        }
+    }
+
+    /// 失効と登録を同じロックで直列化する。既に失効していれば新 listener も即座に止める。
+    /// 呼び手は、この登録が済むまで新 listener に accept させない。
+    #[cfg(windows)]
+    fn follow(&self, current: TlsRevoker) {
+        let RevocationTarget::Following(shared) = &self.target else {
+            unreachable!("monitor revoker must follow listeners")
+        };
+        let mut shared = shared.lock().unwrap_or_else(|p| p.into_inner());
+        if shared.external_stop || shared.retired_identity {
+            current.revoke();
+        }
+        shared.current = Some(current);
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn idle_following() -> Self {
+        Self {
+            target: RevocationTarget::Following(Arc::new(Mutex::new(FollowingRevocation {
+                external_stop: false,
+                retired_identity: false,
+                current: None,
+            }))),
+        }
+    }
+
+    /// Monitor-only stop for the old certificate; an authorized renewal can
+    /// replace this identity, while public external stops are never cleared.
+    #[cfg(windows)]
+    pub(crate) fn retire_identity(&self) {
+        let RevocationTarget::Following(shared) = &self.target else {
+            unreachable!()
+        };
+        let mut shared = shared.lock().unwrap_or_else(|p| p.into_inner());
+        shared.retired_identity = true;
+        if let Some(current) = &shared.current {
+            current.revoke();
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn externally_stopped(&self) -> bool {
+        let RevocationTarget::Following(shared) = &self.target else {
+            unreachable!()
+        };
+        shared
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .external_stop
+    }
+
+    #[cfg(windows)]
+    fn follow_renewed(&self, current: TlsRevoker) -> bool {
+        let RevocationTarget::Following(shared) = &self.target else {
+            unreachable!()
+        };
+        let mut shared = shared.lock().unwrap_or_else(|p| p.into_inner());
+        if shared.external_stop {
+            current.revoke();
+            return false;
+        }
+        shared.retired_identity = false;
+        shared.current = Some(current);
+        true
     }
 }
 
 impl RunningTlsListener {
+    #[cfg(windows)]
+    pub(crate) fn replace_identity(
+        &self,
+        config: &TlsConfig,
+        following: &TlsRevoker,
+    ) -> Result<(), String> {
+        let next = config.acceptor().map_err(|e| e.to_string())?;
+        let acceptor = self
+            .acceptor
+            .as_ref()
+            .ok_or("TLS acceptor is unavailable")?;
+        let mut acceptor = acceptor.write().unwrap_or_else(|p| p.into_inner());
+        if !self.is_serving() || following.externally_stopped() {
+            return Err("TLS は外部から停止されたため証明書を差し替えられません".into());
+        }
+        *acceptor = next;
+        self.disconnect_clients();
+        if !following.follow_renewed(self.revoker()) || !self.is_serving() {
+            return Err("TLS の外部停止と作り直しが競合しました".into());
+        }
+        Ok(())
+    }
+    pub(crate) fn is_serving(&self) -> bool {
+        !self.task.is_finished()
+    }
+    /// Close current connections (including upgraded WS), retaining the bound socket.
+    pub(crate) fn disconnect_clients(&self) {
+        for (_, socket) in self.severance.sockets().drain() {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+    }
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
@@ -420,8 +578,10 @@ impl RunningTlsListener {
     /// 失効で止める口（モジュール doc「失効による停止」）。
     pub fn revoker(&self) -> TlsRevoker {
         TlsRevoker {
-            severance: self.severance.clone(),
-            abort: Arc::new(self.task.abort_handle()),
+            target: RevocationTarget::Listener {
+                severance: self.severance.clone(),
+                abort: Arc::new(self.task.abort_handle()),
+            },
         }
     }
 
@@ -442,24 +602,134 @@ pub(crate) async fn start(
     config: &TlsConfig,
     app: axum::Router,
 ) -> Result<RunningTlsListener, TlsError> {
-    let acceptor = config.acceptor()?;
-    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, config.port);
-    let tcp = crate::bind_exclusive::bind_exclusive(address)
+    #[cfg(windows)]
+    {
+        start_inner(config, app, None, None).await
+    }
+    #[cfg(not(windows))]
+    {
+        start_inner(config, app, None).await
+    }
+}
+
+/// 再 bind の serve は、永続の失効印を登録してからだけ動かす。
+#[cfg(windows)]
+pub(crate) async fn start_following(
+    config: &TlsConfig,
+    app: axum::Router,
+    follows: &TlsRevoker,
+) -> Result<RunningTlsListener, TlsError> {
+    start_inner(config, app, None, Some((follows, false))).await
+}
+
+#[cfg(windows)]
+pub(crate) async fn start_reserved(
+    config: &TlsConfig,
+    app: axum::Router,
+    excluded_ports: &[u16],
+) -> Result<RunningTlsListener, TlsError> {
+    start_inner(
+        config,
+        app,
+        Some(excluded_ports),
+        #[cfg(windows)]
+        None,
+    )
+    .await
+}
+
+#[cfg(windows)]
+pub(crate) async fn start_renewed(
+    config: &TlsConfig,
+    app: axum::Router,
+    follows: &TlsRevoker,
+) -> Result<RunningTlsListener, TlsError> {
+    start_inner(config, app, None, Some((follows, true))).await
+}
+
+/// Bound OS-selected shell port; never consume the disk identity's 8723 port.
+/// Keep rejected sockets bound until another choice succeeds, so the OS cannot
+/// immediately hand the same excluded port back. Four attempts bound recovery.
+async fn reserved_shell_socket(
+    excluded_ports: &[u16],
+) -> io::Result<(TcpListener, std::net::TcpListener)> {
+    reserve_shell_socket_with(excluded_ports, || {
+        crate::bind_exclusive::bind_exclusive(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+    })
+    .await
+}
+
+async fn reserve_shell_socket_with<F, Fut>(
+    excluded_ports: &[u16],
+    mut bind: F,
+) -> io::Result<(TcpListener, std::net::TcpListener)>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = io::Result<TcpListener>>,
+{
+    let mut rejected = Vec::new();
+    for _ in 0..4 {
+        let socket = bind().await?;
+        if !shell_port_allowed(socket.local_addr()?.port(), excluded_ports) {
+            rejected.push(socket);
+            continue;
+        }
+        let socket = socket.into_std()?;
+        let reservation = socket.try_clone()?;
+        return Ok((TcpListener::from_std(socket)?, reservation));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        "OS did not provide a shell port outside the reserved Hub ports",
+    ))
+}
+
+fn shell_port_allowed(port: u16, excluded_ports: &[u16]) -> bool {
+    port != 0 && port != banto_hub_tls_trust::DEFAULT_TLS_PORT && !excluded_ports.contains(&port)
+}
+
+// WebKit hosts retain their HTTP UI compatibility path with an exact runtime
+// capability and the same process-owned reserved socket; no TLS bypass is added.
+#[cfg(not(windows))]
+pub(crate) async fn start_plain_reserved(
+    app: axum::Router,
+    excluded_ports: &[u16],
+) -> Result<RunningTlsListener, TlsError> {
+    struct Plain {
+        tcp: TcpListener,
+        severance: Arc<Severance>,
+    }
+    impl Listener for Plain {
+        type Io = SeverableTcp;
+        type Addr = SocketAddr;
+        async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+            loop {
+                match self.tcp.accept().await {
+                    Ok((stream, address)) => {
+                        if let Some(stream) = self.severance.wrap(stream) {
+                            return (stream, address);
+                        }
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                }
+            }
+        }
+        fn local_addr(&self) -> io::Result<Self::Addr> {
+            self.tcp.local_addr()
+        }
+    }
+    let (tcp, reservation) = reserved_shell_socket(excluded_ports)
         .await
         .map_err(TlsError::Bind)?;
     let local_addr = tcp.local_addr().map_err(TlsError::Bind)?;
     let severance = Arc::new(Severance::default());
-    let listener = TlsListener {
+    let listener = Plain {
         tcp,
-        acceptor,
         severance: severance.clone(),
-        handshakes: JoinSet::new(),
     };
     let (shutdown, receiver) = oneshot::channel();
     let task = tokio::spawn(async move {
         let _ = axum::serve(
-            // TapIo supplies axum's generic Connected<Addr> implementation
-            // for custom listeners, preserving ConnectInfo<SocketAddr>.
             listener.tap_io(|_| {}),
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
@@ -473,7 +743,82 @@ pub(crate) async fn start(
         shutdown,
         task,
         severance,
+        _reservation: Some(reservation),
     })
+}
+
+async fn start_inner(
+    config: &TlsConfig,
+    app: axum::Router,
+    reserve: Option<&[u16]>,
+    #[cfg(windows)] follows: Option<(&TlsRevoker, bool)>,
+) -> Result<RunningTlsListener, TlsError> {
+    let acceptor = Arc::new(RwLock::new(config.acceptor()?));
+    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, config.port);
+    let (tcp, reservation) = if let Some(excluded_ports) = reserve {
+        let (tcp, reservation) = reserved_shell_socket(excluded_ports)
+            .await
+            .map_err(TlsError::Bind)?;
+        (tcp, Some(reservation))
+    } else {
+        (
+            crate::bind_exclusive::bind_exclusive(address)
+                .await
+                .map_err(TlsError::Bind)?,
+            None,
+        )
+    };
+    let local_addr = tcp.local_addr().map_err(TlsError::Bind)?;
+    let severance = Arc::new(Severance::default());
+    let listener = TlsListener {
+        tcp,
+        acceptor: acceptor.clone(),
+        severance: severance.clone(),
+        handshakes: JoinSet::new(),
+    };
+    let (shutdown, receiver) = oneshot::channel();
+    // spawn と共有停止口への登録の間にも別 worker は動ける。accept は登録後まで待たせる。
+    let (begin, begun) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        if begun.await.is_err() {
+            return;
+        }
+        let _ = axum::serve(
+            // TapIo supplies axum's generic Connected<Addr> implementation
+            // for custom listeners, preserving ConnectInfo<SocketAddr>.
+            listener.tap_io(|_| {}),
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async {
+            let _ = receiver.await;
+        })
+        .await;
+    });
+    let running = RunningTlsListener {
+        #[cfg(windows)]
+        acceptor: Some(acceptor),
+        local_addr,
+        shutdown,
+        task,
+        severance,
+        _reservation: reservation,
+    };
+    #[cfg(windows)]
+    if let Some((follows, renewed)) = follows {
+        if renewed {
+            if !follows.follow_renewed(running.revoker()) {
+                running.stop().await;
+                return Err(TlsError::Bind(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "TLS was externally stopped",
+                )));
+            }
+        } else {
+            follows.follow(running.revoker());
+        }
+    }
+    let _ = begin.send(());
+    Ok(running)
 }
 
 #[cfg(test)]
@@ -481,6 +826,97 @@ mod tests {
     use super::*;
     use axum::{routing::get, Router};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn renewal_preserves_external_stop_latch_and_old_revokers_target_new_listener() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let first = crate::hub_tls_prepare::generate_identity(now).unwrap();
+        let second = crate::hub_tls_prepare::generate_identity(now).unwrap();
+        let config = TlsConfig::in_memory(
+            0,
+            first.cert_pem.into_bytes(),
+            Zeroizing::new(first.key_pem.as_bytes().to_vec()),
+        );
+        let listener = start(&config, Router::new()).await.unwrap();
+        let address = listener.local_addr();
+        let following = TlsRevoker::following(listener.revoker());
+        let stale = following.clone();
+        let next = TlsConfig::in_memory(
+            address.port(),
+            second.cert_pem.into_bytes(),
+            Zeroizing::new(second.key_pem.as_bytes().to_vec()),
+        );
+        listener.replace_identity(&next, &following).unwrap();
+        assert_eq!(listener.local_addr(), address);
+        following.retire_identity();
+        assert!(stale.is_revoked());
+        assert!(!stale.externally_stopped());
+        listener.stop().await;
+        let replacement = start_renewed(&next, Router::new(), &following)
+            .await
+            .unwrap();
+        assert!(
+            !stale.is_revoked(),
+            "trusted renewal only clears internal identity retirement"
+        );
+        stale.revoke();
+        assert!(following.externally_stopped());
+        replacement.stop().await;
+        assert!(
+            start_renewed(&next, Router::new(), &following)
+                .await
+                .is_err(),
+            "public external stop is permanent across all renewals"
+        );
+    }
+
+    #[test]
+    fn shell_port_selection_excludes_disk_tls_and_unassigned_ports() {
+        assert!(!shell_port_allowed(0, &[49152]));
+        assert!(!shell_port_allowed(
+            banto_hub_tls_trust::DEFAULT_TLS_PORT,
+            &[49152]
+        ));
+        assert!(!shell_port_allowed(49152, &[49152]));
+        assert!(shell_port_allowed(49153, &[49152]));
+    }
+
+    #[tokio::test]
+    async fn shell_reservation_retries_a_configured_plain_port_before_authorizing_origin() {
+        let first =
+            crate::bind_exclusive::bind_exclusive(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+        let excluded = first.local_addr().unwrap();
+        let next = crate::bind_exclusive::bind_exclusive(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let expected = next.local_addr().unwrap();
+        let mut candidates = std::collections::VecDeque::from([first, next]);
+        let mut calls = 0;
+        let (socket, reservation) = reserve_shell_socket_with(&[excluded.port()], || {
+            calls += 1;
+            if calls == 2 {
+                assert!(
+                    std::net::TcpListener::bind(excluded).is_err(),
+                    "rejected port remains held during retry"
+                );
+            }
+            std::future::ready(Ok(candidates.pop_front().unwrap()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(socket.local_addr().unwrap(), expected);
+        assert!(shell_port_allowed(expected.port(), &[excluded.port()]));
+        let _plain =
+            std::net::TcpListener::bind(excluded).expect("configured plain port released for Hub");
+        drop((socket, reservation));
+    }
 
     #[test]
     fn tls_env_requires_all_three_values_and_a_nonzero_port() {
@@ -541,10 +977,13 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let server = RunningTlsListener {
+            #[cfg(windows)]
+            acceptor: None,
             local_addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
             shutdown,
             task,
             severance: Arc::default(),
+            _reservation: None,
         };
         server.stop().await;
         assert!(held_receiver.await.is_err());
@@ -875,5 +1314,32 @@ mod tests {
             !closes_within(&mut tls, Duration::from_millis(500)).await,
             "通常の停止で接続が切れた（比べの前提が変わった）"
         );
+    }
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn following_revoker_severs_new_listener_when_revoked_before_registration() {
+        let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let config = TlsConfig::in_memory(
+            0,
+            identity.cert.pem().into_bytes(),
+            Zeroizing::new(identity.signing_key.serialize_pem().into_bytes()),
+        );
+        let initial = start(&config, Router::new()).await.unwrap();
+        let stable = TlsRevoker::following(initial.revoker());
+        initial.stop().await;
+        assert!(
+            !stable.is_revoked(),
+            "temporary listener stop must not permanently revoke the monitor"
+        );
+        stable.revoke();
+        let replacement = start_following(&config, Router::new(), &stable)
+            .await
+            .unwrap();
+        // 登録時に既に失効なら、開始ゲートを開ける前に必ず serve と TCP を失効させる。
+        assert!(replacement.revoker().is_revoked());
+        let address = replacement.local_addr();
+        replacement.stop().await;
+        assert!(TcpStream::connect(address).await.is_err());
+        assert!(stable.is_revoked());
     }
 }

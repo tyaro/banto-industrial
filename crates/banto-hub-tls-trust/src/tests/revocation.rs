@@ -398,6 +398,52 @@ fn has_io_warning(report: &ReconcileReport) -> bool {
         .any(|warning| matches!(warning, RevocationWarning::Io(_)))
 }
 
+#[test]
+fn held_api_repairs_rechecks_and_records_without_reacquiring() {
+    let ops = FakeRevOps::fresh();
+    let place = ops.place();
+    let mut held = lock_user_revocations(&ops, &place, &FakeRevOps::options()).unwrap();
+    assert_eq!(held.reconcile().outcome, ReconcileOutcome::Consistent);
+    let current = ops.put_cert();
+    ops.files.borrow_mut().remove(&record_path(A));
+    let repaired = held.reconcile();
+    assert_eq!(repaired.outcome, ReconcileOutcome::Refused);
+    assert!(repaired.saw_loss() && repaired.revocations.is_settled());
+    assert!(repaired.revocations.is_revoked(&current));
+    assert_eq!(held.reconcile().outcome, ReconcileOutcome::Consistent);
+    assert_eq!(
+        held.record(thumb(9), RevokedCertPlace::Service).outcome,
+        ReconcileOutcome::Consistent
+    );
+    assert!(held.read().is_revoked(&thumb(9)));
+    assert_eq!(
+        ops.steps()
+            .iter()
+            .filter(|step| step.as_str() == "lock")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn held_api_lock_failures_match_the_regular_api_without_writing() {
+    for untrusted in [false, true] {
+        let ops = FakeRevOps::settled(&[1]);
+        if untrusted {
+            ops.loosen_dir(&local());
+        } else {
+            ops.lock_busy.set(u32::MAX);
+        }
+        let place = ops.place();
+        let report = match lock_user_revocations(&ops, &place, &FakeRevOps::options()) {
+            Ok(_) => panic!("ロックは取れない"),
+            Err(report) => *report,
+        };
+        assert_eq!(report, ops.reconcile());
+        assert!(ops.writes().is_empty());
+    }
+}
+
 // --- 記録の形 -------------------------------------------------------------------------
 
 #[test]
@@ -723,9 +769,9 @@ fn scene_9_an_exposed_service_certificate_is_recorded_in_the_user_records() {
 }
 
 /// 場面 6・7 の入口: 露出（別のアカウントが鍵を読める・フォルダを書き換えられる）を見た
-/// 読み手は、形だけ読めた証明書の拇印を返す。所有者の違い・壊れは露出ではないので返さない。
+/// 読み手は、形だけ読めた証明書の拇印を返す。所有者の違いも失効に入れ、リンク・壊れ等は入れない。
 #[test]
-fn an_exposed_certificate_yields_its_thumbprint_and_other_faults_do_not() {
+fn exposed_or_foreign_owned_certificates_yield_the_thumbprint_to_revoke() {
     let load = |ops: &FakeRevOps| match load_pinned_user_cert(ops, &ops.place()) {
         UserCertPin::Unusable(found) => found,
         other => panic!("通らないはず: {other:#?}"),
@@ -736,7 +782,7 @@ fn an_exposed_certificate_yields_its_thumbprint_and_other_faults_do_not() {
     ops.loosen_file(&user_tls().join(KEY_FILE));
     let found = load(&ops);
     assert_eq!(found.problem.fault, UserFault::Exposed);
-    assert_eq!(found.exposed_thumbprint(), Some(cert));
+    assert_eq!(found.revocation_thumbprint(), Some(cert));
     assert!(matches!(found.seen, UncheckedUserCert::Seen(_)));
 
     // `tls\` を別のアカウントが書き換えられる（鍵と証明書を差し替えられた恐れ）。
@@ -745,7 +791,7 @@ fn an_exposed_certificate_yields_its_thumbprint_and_other_faults_do_not() {
     ops.loosen_dir(&user_tls());
     let found = load(&ops);
     assert_eq!(found.problem.fault, UserFault::Exposed);
-    assert_eq!(found.exposed_thumbprint(), Some(cert));
+    assert_eq!(found.revocation_thumbprint(), Some(cert));
 
     // null DACL の鍵も露出。
     let ops = FakeRevOps::fresh();
@@ -757,15 +803,19 @@ fn an_exposed_certificate_yields_its_thumbprint_and_other_faults_do_not() {
         .security
         .dacl
         .aces = None;
-    assert_eq!(load(&ops).exposed_thumbprint(), Some(cert));
+    assert_eq!(load(&ops).revocation_thumbprint(), Some(cert));
 
-    // 所有者が違う: 信じないが、露出としては扱わない（形は読める）。
+    // 所有者が違う: 読み取りを足せるので、形が読めれば失効に入れる（PR2 の決定）。
     let ops = FakeRevOps::fresh();
-    ops.put_cert();
+    let cert = ops.put_cert();
     ops.dirs.borrow_mut().get_mut(&user_tls()).unwrap().owner = EVIL.to_string();
     let found = load(&ops);
-    assert_eq!(found.problem.fault, UserFault::Untrusted);
-    assert_eq!(found.exposed_thumbprint(), None);
+    assert_eq!(found.problem.fault, UserFault::ForeignOwner);
+    assert_eq!(found.revocation_thumbprint(), Some(cert));
+    // 非推奨の旧名の互換性だけをここで確かめる。本番の呼び出しは新しい名前を使う。
+    #[allow(deprecated)]
+    let legacy = found.exposed_thumbprint();
+    assert_eq!(legacy, Some(cert));
     assert!(matches!(found.seen, UncheckedUserCert::Seen(_)));
 
     // ハードリンクの鍵: 露出ではない。
@@ -777,7 +827,9 @@ fn an_exposed_certificate_yields_its_thumbprint_and_other_faults_do_not() {
         .unwrap()
         .security
         .links = 2;
-    assert_eq!(load(&ops).problem.fault, UserFault::Untrusted);
+    let found = load(&ops);
+    assert_eq!(found.problem.fault, UserFault::Untrusted);
+    assert_eq!(found.revocation_thumbprint(), None);
 
     // 鍵が無い・証明書が読める形でない: 壊れ。
     let ops = FakeRevOps::fresh();
@@ -785,7 +837,7 @@ fn an_exposed_certificate_yields_its_thumbprint_and_other_faults_do_not() {
     ops.files.borrow_mut().remove(&user_tls().join(KEY_FILE));
     let found = load(&ops);
     assert_eq!(found.problem.fault, UserFault::Broken);
-    assert_eq!(found.exposed_thumbprint(), None);
+    assert_eq!(found.revocation_thumbprint(), None);
     let ops = FakeRevOps::fresh();
     ops.put_cert();
     ops.files
@@ -796,6 +848,7 @@ fn an_exposed_certificate_yields_its_thumbprint_and_other_faults_do_not() {
     let found = load(&ops);
     assert_eq!(found.problem.fault, UserFault::Broken);
     assert_eq!(found.seen, UncheckedUserCert::Malformed);
+    assert_eq!(found.revocation_thumbprint(), None);
 
     // 開けない: 一時的。形も読めない。
     let ops = FakeRevOps::fresh();
@@ -807,6 +860,7 @@ fn an_exposed_certificate_yields_its_thumbprint_and_other_faults_do_not() {
     let found = load(&ops);
     assert_eq!(found.problem.fault, UserFault::Transient);
     assert_eq!(found.seen, UncheckedUserCert::Unreadable);
+    assert_eq!(found.revocation_thumbprint(), None);
 
     // リンクの先は読まない。
     let ops = FakeRevOps::fresh();
@@ -819,6 +873,7 @@ fn an_exposed_certificate_yields_its_thumbprint_and_other_faults_do_not() {
     let found = load(&ops);
     assert_eq!(found.problem.fault, UserFault::Untrusted);
     assert_eq!(found.seen, UncheckedUserCert::Unreadable);
+    assert_eq!(found.revocation_thumbprint(), None);
 }
 
 // --- 整える手順: 和と書き戻し -------------------------------------------------------------
@@ -1389,7 +1444,7 @@ fn scene_27_untrusted_places_or_lock_refuse_and_write_nothing() {
         ),
         (
             |lock| lock.security.dacl.owner = EVIL.to_string(),
-            UserFault::Untrusted,
+            UserFault::ForeignOwner,
         ),
     ];
     for (spoil, fault) in spoils {

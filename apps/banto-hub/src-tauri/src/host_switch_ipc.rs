@@ -33,6 +33,8 @@ pub(crate) static SWITCHING: AtomicBool = AtomicBool::new(false);
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostSwitchStatusDto {
+    pub ingest_origin: Option<String>,
+    pub desktop_tls: Option<crate::desktop_tls_status::Presentation>,
     /// SCM 状態の表示用文字列（未インストール等含む）。照会失敗時は`null`。
     pub scm_state: Option<String>,
     /// 次回 Windows 起動で自動起動するか（Demand のときは`false`）。
@@ -72,6 +74,21 @@ pub(crate) fn try_begin_switch() -> bool {
         .is_ok()
 }
 
+#[cfg(windows)]
+pub(crate) fn try_begin_confirmed_switch(confirmed: bool) -> Result<bool, &'static str> {
+    confirmed_switch(confirmed, &SWITCHING)
+}
+
+#[cfg(any(windows, test))]
+fn confirmed_switch(confirmed: bool, switching: &AtomicBool) -> Result<bool, &'static str> {
+    if !confirmed {
+        return Ok(false);
+    }
+    switching.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .map(|_| true)
+        .map_err(|_| "既に切替処理が進行中のため TLS の証明書を作り直せません。処理の終了を待ってから再試行してください")
+}
+
 /// 切替（「設定モードに戻す」・見張りの適用を含む）が進行中か。
 #[cfg(windows)]
 pub(crate) fn is_switching() -> bool {
@@ -109,20 +126,47 @@ pub(crate) fn begin_switch_or_warn(app: &AppHandle) -> bool {
 
 /// SCM / ビュー / 権限のスナップショットを返す。
 #[tauri::command]
-pub fn host_switch_status(state: State<'_, AppState>) -> HostSwitchStatusDto {
+pub fn host_switch_status(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<HostSwitchStatusDto, String> {
+    crate::shell_tls::require_command_origin(&window)?;
     let (view, fallback_cause) = match &*state.view.lock().expect("view mutex poisoned") {
         ShellView::Desktop => ("desktop".to_string(), None),
         ShellView::Service { .. } => ("service".to_string(), None),
         ShellView::Fallback(info) => ("fallback".to_string(), info.cause.key().map(str::to_string)),
     };
     let (scm_state, auto_start) = query_scm_summary();
-    HostSwitchStatusDto {
+    Ok(HostSwitchStatusDto {
+        ingest_origin: client_ingest_origin(&view, state.hub.inspect(|hub| hub.local_addr())),
+        desktop_tls: crate::desktop_tls_status::current(&state),
         scm_state,
         auto_start,
         can_operate: state.can_operate_service,
         view,
         switching: SWITCHING.load(Ordering::SeqCst),
         fallback_cause,
+    })
+}
+
+fn client_ingest_origin(view: &str, address: Option<std::net::SocketAddr>) -> Option<String> {
+    match view {
+        "desktop" => address.map(|mut address| {
+            if address.ip().is_unspecified() {
+                address.set_ip(match address.ip() {
+                    std::net::IpAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+                    std::net::IpAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+                });
+            }
+            // SocketAddr preserves a specific bind IP and brackets IPv6.
+            format!("http://{address}")
+        }),
+        "service" => Some(
+            crate::service_tls::service_url()
+                .trim_end_matches('/')
+                .into(),
+        ),
+        _ => None,
     }
 }
 
@@ -143,7 +187,12 @@ fn query_scm_summary() -> (Option<String>, bool) {
 
 /// Desktop/Offline → Service。権限なし・進行中は即エラー文字列。
 #[tauri::command]
-pub fn switch_to_service(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+pub fn switch_to_service(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    crate::shell_tls::require_command_origin(&window)?;
     if !state.can_operate_service {
         return Err("サービス操作の権限がありません（BantoHub Operators または管理者）".into());
     }
@@ -174,7 +223,12 @@ pub fn switch_to_service(app: AppHandle, state: State<'_, AppState>) -> Result<(
 
 /// Service → Desktop。
 #[tauri::command]
-pub fn switch_to_desktop(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+pub fn switch_to_desktop(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    crate::shell_tls::require_command_origin(&window)?;
     if !state.can_operate_service {
         return Err("サービス操作の権限がありません（BantoHub Operators または管理者）".into());
     }
@@ -209,13 +263,13 @@ pub fn switch_to_desktop(app: AppHandle, state: State<'_, AppState>) -> Result<(
 /// （Operators でなければ修復の UAC が最後の手段）。このアプリで Hub が動いている間
 /// （設定モード）は断る。
 #[tauri::command]
-pub fn restore_setting_mode(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    if matches!(
-        *state.view.lock().expect("view mutex poisoned"),
-        ShellView::Desktop
-    ) {
-        return Err("既に設定モードです（このアプリで Hub が動いています）".into());
-    }
+pub fn restore_setting_mode(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    crate::shell_tls::require_command_origin(&window)?;
+    crate::launch_gate::require_stopped_local_hub(state.hub.is_idle()).map_err(str::to_string)?;
     if !begin_switch_or_warn(&app) {
         return Err("既に切替処理が進行中です".into());
     }
@@ -235,7 +289,11 @@ pub fn restore_setting_mode(app: AppHandle, state: State<'_, AppState>) -> Resul
 /// 判定し直す（`crate::retry_startup`）。画面を変えるので進行中フラグを取り、判定は別のスレッドで
 /// 走らせる（health の確かめ・Hub の起動で待つため）。
 #[tauri::command]
-pub fn retry_startup(app: AppHandle) -> Result<(), String> {
+pub fn retry_startup(window: tauri::WebviewWindow, app: AppHandle) -> Result<(), String> {
+    crate::shell_tls::require_command_origin(&window)?;
+    if let Some(reason) = crate::startup_retry_error(&app) {
+        return Err(reason.into());
+    }
     if !begin_switch_or_warn(&app) {
         return Err("既に切替処理が進行中です".into());
     }
@@ -248,7 +306,12 @@ pub fn retry_startup(app: AppHandle) -> Result<(), String> {
 
 /// 自動起動の ON/OFF。UAC 経由で `banto-hub-elev.exe` を起動する。
 #[tauri::command]
-pub fn set_service_autostart(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+pub fn set_service_autostart(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    crate::shell_tls::require_command_origin(&window)?;
     if !state.can_operate_service {
         return Err("サービス操作の権限がありません（BantoHub Operators または管理者）".into());
     }
@@ -338,6 +401,54 @@ pub(crate) fn elev_result_message(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn confirmation_acquires_only_after_approval_and_never_releases_another_switch() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let switching = AtomicBool::new(false);
+        assert_eq!(super::confirmed_switch(false, &switching), Ok(false));
+        assert!(!switching.load(Ordering::SeqCst));
+        // Another operation can take the flag while the confirmation is open.
+        assert!(!switching.swap(true, Ordering::SeqCst));
+        assert_eq!(super::confirmed_switch(false, &switching), Ok(false));
+        assert!(
+            switching.load(Ordering::SeqCst),
+            "cancel must not release another operation"
+        );
+        let reason = super::confirmed_switch(true, &switching).unwrap_err();
+        assert!(reason.contains("切替処理が進行中"));
+        assert!(
+            switching.load(Ordering::SeqCst),
+            "rejection must preserve the owner's flag"
+        );
+        switching.store(false, Ordering::SeqCst);
+        assert_eq!(super::confirmed_switch(true, &switching), Ok(true));
+        assert!(switching.load(Ordering::SeqCst));
+    }
+    #[test]
+    fn sender_origin_uses_the_plain_listener_port_and_never_the_shell_socket() {
+        for (address, expected) in [
+            ("192.0.2.42:18722", "http://192.0.2.42:18722"),
+            ("[2001:db8::42]:18722", "http://[2001:db8::42]:18722"),
+            ("[::]:18722", "http://[::1]:18722"),
+            ("127.0.0.1:18722", "http://127.0.0.1:18722"),
+        ] {
+            assert_eq!(
+                super::client_ingest_origin("desktop", Some(address.parse().unwrap())).as_deref(),
+                Some(expected)
+            );
+        }
+        let address = "0.0.0.0:18722".parse().unwrap();
+        assert_eq!(
+            super::client_ingest_origin("desktop", Some(address)).as_deref(),
+            Some("http://127.0.0.1:18722")
+        );
+        assert_eq!(super::client_ingest_origin("desktop", None), None);
+        assert_eq!(super::client_ingest_origin("fallback", Some(address)), None);
+        assert_eq!(
+            super::client_ingest_origin("service", None).as_deref(),
+            Some("https://127.0.0.1:8723")
+        );
+    }
     use super::{elev_or_reinstall, elev_result_message, resolve_elev_exe_next_to, ELEV_NOT_FOUND};
     use banto_service_elev::launch::LaunchError;
     use std::fs;

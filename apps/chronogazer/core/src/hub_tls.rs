@@ -1,29 +1,135 @@
-//! #644 PR3b: ChronoGazer が Hub と話すときの TLS の決まり（[`HubTlsPolicy`]）。
+//! #644 PR3b・#1121 PR4a: ChronoGazer が Hub と話すときの TLS の決まり（[`HubTlsPolicy`]）。
 //!
 //! # 何を塞ぐか
 //!
 //! 同じ PC の Hub が止まっている間に、その loopback のポートを別のプロセスが先に取ると、
 //! 平文の http ではその相手に試運転の発行の要求や API キーが届いてしまう。そこで
-//! **接続先が loopback のときは、Hub のサービスが `%ProgramData%\BantoHub\tls\` に置いた
-//! 証明書を pin した https でだけ話す**（2026-11-13 オーナー決定）。
+//! **接続先が loopback のときは、Hub が自分の置き場に置いた証明書を pin した https でだけ
+//! 話す**（2026-11-13 オーナー決定）。
 //!
-//! | 接続先                                   | 本番（[`HubTlsPolicy::production`]）                     |
+//! | 接続先                                   | 本番（[`HubTlsPolicy::production`]・[`HubTlsPolicy::service_only`]） |
 //! | ---------------------------------------- | -------------------------------------------------------- |
 //! | loopback（127.0.0.0/8・`::1`・`localhost`）の http | 断る（[`LOOPBACK_HTTP_REFUSED`] の案内。何も送らない）   |
-//! | loopback の https                        | 証明書を確かめて読み、その 1 枚だけを信じる              |
+//! | loopback の https                        | 置き場の証明書を確かめて読み、その 1〜2 枚だけを信じる   |
 //! | それ以外（LAN）の http                   | 今までどおり pin なし（#644 の範囲外）                   |
 //! | それ以外の https                         | 今までどおり断る（pin が無いので bootstrap が `InvalidEndpoint`） |
 //!
 //! IPv6 の loopback（`::1`、IPv4-mapped の `::ffff:127.x.x.x`）も loopback として扱う（Hub は `::1` では
 //! 待ち受けないので https は繋がらないだけ）。それ以外の IPv6 は LAN 扱い。
 //!
+//! # 2 つの置き場（#1121 PR4a、docs/hub-desktop-tls-design.md §4.4）
+//!
+//! Hub は動かし方で証明書の置き場が違う。サービスは `%ProgramData%\BantoHub\tls\`、
+//! デスクトップ版は利用者ごとの `%LOCALAPPDATA%\BantoHub\tls\`。どちらも 127.0.0.1:8723 で
+//! 待ち受け、利用者は両者を行き来するので、ChronoGazer デスクトップは**両方の置き場を読み**、
+//! 確かめに通って失効していない証明書（1〜2 枚）を pin にする。相手がどちらかを当てには
+//! しない（別のアカウントのプロセスはどちらの鍵も持たないので、両方を pin にしても通らない）。
+//!
+//! | 置き場の状態             | pin      | 警告                              |
+//! | ------------------------ | -------- | --------------------------------- |
+//! | 無い                     | 外す     | 出さない（片方だけの PC は普通）  |
+//! | あるが確かめに通らない   | 入れない | **接続できても**出す              |
+//! | 失効の記録にある・露出を見た | 入れない | **接続できても**出す          |
+//! | 通って失効していない     | 入れる   | 出さない                          |
+//!
+//! 両方とも使えなければ [`BootstrapErrorKind::HubTls`] で断る（何も送らない）。警告は
+//! [`HubTlsPolicy::warnings_for`] で取り、`crate::hub` が `HubView::tls_warnings` に載せる。
+//!
+//! **失効の照合**（設計 §4.4.1「照合する時点」）: サービスの証明書は、サービスの記録と利用者の
+//! 記録（A・B の和。形が読めた分）の両方と、利用者の証明書は利用者の記録と照合する。露出・
+//! 所有者の違いを見た証明書は、ACL が直っても二度と使わない: 拇印を利用者の記録に書き足し
+//! （サービスの証明書の露出も利用者の記録に書く。サービスの記録には書かない）、書けなければ
+//! プロセスの中に覚えて使わず、周期ごとに書き直しを試みる。
+//!
+//! **利用者の記録を整える手順の結果**で、利用者の証明書を使ってよいかが決まる（§4.4.1
+//! 「手順の結果は 3 つ」）:
+//!
+//! | 最後の結果                 | まだ pin に使っていない利用者の証明書 | すでに pin に使っている利用者の証明書 |
+//! | -------------------------- | ------------------------------------- | ------------------------------------- |
+//! | 整っている                 | 使い始める                            | 使い続ける                            |
+//! | 通らない                   | 使わない                              | すぐ外す                              |
+//! | この回はできなかった       | 使わない                              | 保つ（警告）。`INCOMPLETE_LIMIT`（3）周期続いたら外す |
+//! | まだ 1 回も走らせていない  | 使わない                              | （起きない）                          |
+//!
+//! サービスの証明書は、この結果で止めない（利用者の記録を失っても、サービスの証明書は
+//! 使い続けて警告を出す）。
+//!
+//! `chronogazer-server`（[`HubTlsPolicy::service_only`]）は LocalSystem で動き、利用者の置き場を
+//! 持たない。サービスの置き場とサービスの記録だけを読み、利用者の記録は読まず書かない。露出を
+//! 見た拇印はプロセスの間だけ覚えて使わない（§4.4.2 の場面 10）。
+//!
 //! # いつ読むか
 //!
-//! `banto_hub_bootstrap::HubTlsSource` として 1 回の操作ごとに 1 回聞かれる。証明書は
-//! そのたびに置き場を確かめて読み直すので、管理者が `prepare-hub-tls --renew` で作り直しても
-//! ChronoGazer の再起動は要らない（購読は [`HubTlsPolicy::marker_for`] の目印が変わったときに
-//! 張り直す。`crate::hub` の `reconcile_generation` と、再接続中の世代を見張りが確かめる
-//! `supervise_once`）。
+//! - **1 回の操作ごと**（`banto_hub_bootstrap::HubTlsSource::pins_for` と、購読の世代の目印
+//!   [`HubTlsPolicy::marker_for`]）: 置き場の確かめ（所有者・ACL・露出）と証明書の読み直し、
+//!   失効の記録のロック無しの読みを、**そのたびに**やり直す。管理者が `prepare-hub-tls --renew`
+//!   で作り直しても、Hub のデスクトップ版がトレイで作り直しても、ChronoGazer の再起動は
+//!   要らない。前の呼び出しで読んだ証明書は覚えない。
+//! - **見張りの周期と操作の入口**（[`HubTlsPolicy::refresh`]・[`HubTlsPolicy::ensure_started`]。
+//!   `crate::hub` の `supervise_once` と操作の入口が呼ぶ）: 利用者の記録を整える手順と、露出を
+//!   見た拇印の書き足し。記録のロックを上限付き（5 秒）で待つので、操作ごとの判定からは
+//!   呼ばず、blocking のスレッドで走らせる。保存済み・入力された接続先が loopback の https の
+//!   ときだけ走らせる（Hub を使わない利用者の `%LOCALAPPDATA%` に記録を作らない）。
+//!
+//! # 整える手順をいつ走らせるか（2026-11-16 に場面を並べて組み直した）
+//!
+//! 「前に 1 回整っていた」を、いつまでも信じない。信じてよいのは**新しい結果**だけにする。
+//!
+//! | 呼び手                         | 走らせるか                                 | 「できなかった」の連続数 |
+//! | ------------------------------ | ------------------------------------------ | ------------------------ |
+//! | 見張りの周期（`refresh`）      | 必ず走らせる                               | 進める                   |
+//! | 操作の入口（`ensure_started`） | 下の「省いてよい」を満たさなければ走らせる | 進めない                 |
+//!
+//! **入口が省いてよい**のは、最後の整える手順が次をすべて満たすときだけ:
+//!
+//! 1. 結果が「整っている」。
+//! 2. 露出を見た拇印の書き足しが残っていない。
+//! 3. 走らせ始めてから見張りの周期（[`RECONCILE_FRESH_FOR`]、30 秒）が過ぎていない。
+//! 4. その後のロック無しの読み（操作ごとの判定）が、記録の「整っていない」を見ていない。
+//!
+//! 保存済みの接続があれば見張りが周期ごとに新しくするので、入口はほぼ省かれる。保存済みの
+//! 接続が無い PC（見張りは何もしない）では、入口が 30 秒に 1 回まで走らせる。どちらでも、
+//! 判定が使う結果は 30 秒より古くならない（設計 §4.4.1 の保証の範囲と同じ粒度）。
+//!
+//! **直列化**: 整える手順と、その結果の状態への反映は、決まりが持つ 1 つの非同期のロックの
+//! 中で行う（ロックは blocking のスレッドへ持ち込み、反映が済むまで握る。待つ側の future が
+//! 捨てられても、順序は崩れない）。記録を読んだ順 = 状態へ書く順なので、先に読んだ古い
+//! 「整っている」が、後から読んだ「通らない」を上書きすることは無い。入口がロックを待つ間に
+//! 別の呼び出しが新しい結果を作っていたら、入口はそれを使って走らせない（待ち始めた後に
+//! 読んだ結果なので新しい。「できなかった」が続く間に入口が並んで 5 秒ずつ待つのも防ぐ）。
+//! 見張りの周期は、待った後も必ず自分で走らせる（連続数を周期ごとに数えるため）。
+//!
+//! **ロック無しの読みが「整っていない」を見たとき**（A・B のどちらかが無い・壊れた・読めない・
+//! 中身が揃っていない。操作ごとの判定が見る）: 最後の結果が「整っている」でも、利用者の証明書を
+//! **使い始めない**（記録を消された直後に、失効していた証明書を空の記録と古い「整っている」で
+//! 通さない）。すでに pin に使っている証明書は、次の整える手順まで保つ（ロック無しの読みは
+//! 「確かに見た」ではなく、ほかのプロセスが書いている途中にも起きる。失効していない証明書
+//! なので、確かめと確かめの間の窓と同じ扱い）。どちらの場合も、次の入口は 30 秒を待たずに
+//! 走らせ直し、その結果（消失なら「通らない」）で決める。
+//!
+//! 最初の回（まだ 1 回も走らせていない）にその回で消失を直したら、続けてもう 1 回走らせる
+//! （直した回の結果は「通らない」で、次の回に「整っている」になるため。設計 §7「PR2 で
+//! 決めたこと」2）。
+//!
+//! 購読は目印が変わったときに張り直す（`crate::hub` の `reconcile_generation` と、pin した
+//! 世代の目印を毎周期確かめる `supervise_once`）。目印は**置き場ごとの値の組**（サービス・
+//! 利用者それぞれ: 無い／使える証明書の拇印／通らない／失効）の hash で、PEM の連結の hash に
+//! しない（順序や有無の変化を取り違えないため）。失効の記録だけが足された・ACL だけが
+//! 変わったときも、PEM が同じまま目印が変わる。
+//!
+//! # 覚えるもの
+//!
+//! 決まりは `Clone` の間で 1 つの状態を共有する（`State`）: 最後の整える手順の結果と
+//! 走らせ始めた時刻、走らせた回数（ロックを待つ間に新しい結果ができたかを見る）、その後の
+//! ロック無しの読みが「整っていない」を見たか、「この回はできなかった」の連続数、いま pin に
+//! 使っている利用者の証明書の拇印、露出を見た拇印（使わない）と、そのうち記録に書けて
+//! いないもの、いまの警告。**証明書そのものと目印は覚えない**（別の接続先や失敗の呼び出しで
+//! 上書きされた値と比べないため）。時刻は `Clock` から読む（試験で進められる）。
+//!
+//! 判定（置き場の読み → 状態への反映）は `evaluate_gate` で 1 つずつにする。古い記録を読んで
+//! 止まっていた判定が、後から読んだ判定（追加された失効を見て pin から外した）の結果を、
+//! 古い値で上書きして失効した証明書を返さないため（読む順＝反映の順）。ロックの順序は
+//! 整える手順の `reconcile_gate` → `evaluate_gate` → 状態のロック。
 //!
 //! # 保存済みの loopback の http
 //!
@@ -32,104 +138,706 @@
 //! 出る。https は port も違うので keyring の口座が別になり、接続し直すと新しいキーが
 //! 発行される（それでよい）。
 //!
+//! # 案内の文言
+//!
+//! 直し方は Hub の動かし方ごとに分ける。利用者の置き場は「Hub のデスクトップ版を起動する／
+//! トレイの『TLS の証明書を作り直す』」、サービスの置き場は「管理者の PowerShell で
+//! `banto-hub-elev.exe prepare-hub-tls`（`--renew`）」。置き場がどちらも無いときは、ChronoGazer
+//! デスクトップではデスクトップ版を主に案内する。ChronoGazer デスクトップだけがサービスの
+//! 証明書の露出を見たときは、管理者に `prepare-hub-tls --renew` を頼むよう案内する（サービスと
+//! ほかの利用者へは伝わらないため。設計 §4.4.1「保証の範囲」）。
+//!
 //! # テストと開発用
 //!
 //! [`HubTlsPolicy::plain_loopback_http_for_dev`] は loopback の http を pin なしで受ける。
 //! 模擬 Hub（127.0.0.1 の http）を相手にするテスト・実機確認のハーネス・開発用の
 //! `banto-serve`（配布しない。E2E が `BANTO_HUB_LOOPBACK_HTTP=1` で選ぶ）だけが使う。
-//! 製品の host（デスクトップ・`chronogazer-server`）は [`HubTlsPolicy::production`] を
-//! 固定で渡し、設定や環境変数で切り替える口を持たない。
+//! 製品の host は固定の決まりを渡し（デスクトップは [`HubTlsPolicy::production`]、
+//! `chronogazer-server` は [`HubTlsPolicy::service_only`]）、設定や環境変数で切り替える口を
+//! 持たない。置き場を読む口（`places::HubTlsPlaces`）はテストで偽物に差し替える。
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use banto_hub_bootstrap::{
     Error as BootstrapError, ErrorKind as BootstrapErrorKind, HubTlsSource, Url,
 };
+use banto_hub_tls_trust::{CertThumbprint, ReconcileOutcome, RevokedCertPlace};
 use banto_tagclient::PinnedHubTls;
 
-/// 同じ PC の Hub（サービス）の接続先。画面の例と案内に使う。
+#[cfg(test)]
+pub(crate) mod fake;
+mod places;
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+pub(crate) use places::HubCertReader;
+use places::{CertRead, HubTlsPlaces, ServiceRecordRead, UserRecordRead};
+
+/// 同じ PC の Hub の接続先。画面の例と案内に使う。
 pub const LOOPBACK_HUB_ENDPOINT: &str = "https://127.0.0.1:8723";
 
-/// 保存済み・入力された loopback の http を断るときの案内（キーや秘密は含まない）。
-pub const LOOPBACK_HTTP_REFUSED: &str = "同じ PC の Hub へは http では接続しません（API キーを守るため）。https://127.0.0.1:8723 で接続し直してください（Hub をサービスで動かし、管理者で prepare-hub-tls を済ませてあること）。";
+/// 保存済み・入力された loopback の http を断るときの案内（ChronoGazer デスクトップ。キーや
+/// 秘密は含まない）。
+pub const LOOPBACK_HTTP_REFUSED: &str = "同じ PC の Hub へは http では接続しません（API キーを守るため）。https://127.0.0.1:8723 で接続し直してください（Hub のデスクトップ版を起動してあるか、Hub をサービスで動かして管理者で prepare-hub-tls を済ませてあること）。";
 
-/// Hub の証明書（PEM）を読む口。本番は置き場を確かめてから読む
-/// （`banto_hub_tls_trust::load_pinned_hub_cert`）。テストは差し替える。
-///
-/// `Err` は画面にそのまま出す理由（鍵の中身は含めない）。
-pub(crate) trait HubCertReader: Send + Sync {
-    fn read_cert_pem(&self) -> Result<Vec<u8>, String>;
+/// [`LOOPBACK_HTTP_REFUSED`] の `chronogazer-server` 向け（サービスの Hub だけが相手）。
+pub const LOOPBACK_HTTP_REFUSED_SERVICE: &str = "同じ PC の Hub へは http では接続しません（API キーを守るため）。https://127.0.0.1:8723 で接続し直してください（Hub をサービスで動かし、管理者で prepare-hub-tls を済ませてあること）。";
+
+/// 「この回はできなかった」がこの周期数続いたら、pin に使っている利用者の証明書を外す
+/// （数えるのは見張りの周期だけ。操作の入口の走らせ直しでは進めない。設計 §4.4.1。Hub のデスクトップ版の見張りと同じ 3 周期 = 約 90 秒）。
+pub(crate) const INCOMPLETE_LIMIT: u8 = 3;
+
+/// 操作の入口が、最後の整える手順の「整っている」を信じてよい長さ（モジュール doc「整える
+/// 手順をいつ走らせるか」）。見張りの周期と同じにする: 保存済みの接続があれば見張りが周期
+/// ごとに新しくし、無ければ入口がこの長さに 1 回まで走らせる。
+pub(crate) const RECONCILE_FRESH_FOR: Duration = crate::hub::SUPERVISOR_INTERVAL;
+
+const ELEV_RENEW: &str = "banto-hub-elev.exe prepare-hub-tls --renew";
+
+/// 案内の文言の向き（モジュール doc「案内の文言」）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Host {
+    /// ChronoGazer デスクトップ（Hub のデスクトップ版を主に案内する）。
+    Desktop,
+    /// `chronogazer-server`（Hub のサービスだけを案内する）。
+    Service,
 }
 
-/// 本番の読み方: `%ProgramData%\BantoHub\tls\` の所有者・DACL を確かめ、証明書だけを
-/// 読み取り専用で開く（一般利用者で動く）。
-struct SystemHubCert;
+/// 目印に入れる、置き場ごとの値（モジュール doc「いつ読むか」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Slot {
+    /// この決まりでは読まない置き場（`chronogazer-server` の利用者の置き場）。
+    NotRead,
+    /// 無い。
+    Absent,
+    /// 確かめに通って失効しておらず、pin に使う証明書。
+    Usable(CertThumbprint),
+    /// あるが使わない（確かめに通らない・記録を確かめられない・整える手順の結果で止めている）。
+    Unusable,
+    /// 失効した（記録にある・露出を見た）。
+    Revoked,
+}
 
-impl HubCertReader for SystemHubCert {
-    #[cfg(windows)]
-    fn read_cert_pem(&self) -> Result<Vec<u8>, String> {
-        banto_hub_tls_trust::load_pinned_hub_cert(&banto_hub_tls_trust::win::WindowsTlsTrustOps)
-            .map(|pin| pin.cert_pem)
-            .map_err(|found| {
+/// 最後に走らせた、利用者の記録を整える手順。
+struct ReconcileSeen {
+    outcome: ReconcileOutcome,
+    /// 走らせ始めた時刻（記録を読んだのはこれより後。新しさはここから数える）。
+    started_at: Instant,
+    /// その回の警告（起動のときに 2 回走らせたら、両方の分）。
+    warnings: Vec<String>,
+}
+
+/// `Clone` の間で共有する状態（モジュール doc「覚えるもの」）。
+#[derive(Default)]
+struct State {
+    /// 最後の整える手順（まだ走らせていなければ `None`）。
+    reconcile: Option<ReconcileSeen>,
+    /// 整える手順を走らせて状態へ反映した回数（入口がロックを待つ間に、新しい結果が
+    /// できたかを見る）。
+    runs: u64,
+    /// 最後の整える手順の後に、ロック無しの読みが記録の「整っていない」を見た（次の入口は
+    /// 新しさに依らず走らせ直す）。
+    recheck: bool,
+    /// 「この回はできなかった」の連続数。
+    incomplete_streak: u8,
+    /// いま pin に使っている利用者の証明書。
+    user_in_use: Option<CertThumbprint>,
+    /// 露出・所有者の違いを見た証明書（プロセスの間は使わない）。
+    remembered: BTreeSet<CertThumbprint>,
+    /// そのうち、まだ利用者の記録に書けていないもの（周期ごとに書き直しを試みる）。
+    unwritten: BTreeMap<CertThumbprint, RevokedCertPlace>,
+    /// いまの警告（最後の判定のもの）。
+    warnings: Vec<String>,
+    /// ログに出した警告（同じ理由が続く間は繰り返さない）。
+    logged: BTreeSet<String>,
+}
+
+impl State {
+    /// 操作の入口が整える手順を省いてよいか（モジュール doc「整える手順をいつ走らせるか」の
+    /// 1〜4）。
+    fn entry_may_skip(&self, now: Instant) -> bool {
+        self.reconcile.as_ref().is_some_and(|seen| {
+            seen.outcome == ReconcileOutcome::Consistent
+                && now.saturating_duration_since(seen.started_at) < RECONCILE_FRESH_FOR
+        }) && self.unwritten.is_empty()
+            && !self.recheck
+    }
+}
+
+/// 時刻を読む口。本番は `Instant::now()` そのまま。試験は進められる。
+#[derive(Default)]
+struct Clock {
+    #[cfg(test)]
+    ahead: Mutex<Duration>,
+}
+
+impl Clock {
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        {
+            Instant::now() + *self.ahead.lock().unwrap()
+        }
+        #[cfg(not(test))]
+        {
+            Instant::now()
+        }
+    }
+
+    #[cfg(test)]
+    fn advance(&self, by: Duration) {
+        *self.ahead.lock().unwrap() += by;
+    }
+}
+
+/// loopback を pin した https だけにする決まりの中身。
+struct Pinned {
+    places: Arc<dyn HubTlsPlaces>,
+    /// 利用者の置き場と利用者の記録を読み書きするか（`chronogazer-server` はしない）。
+    reads_user: bool,
+    host: Host,
+    state: Mutex<State>,
+    /// 整える手順と、その結果の状態への反映を直列化するロック（モジュール doc「整える手順を
+    /// いつ走らせるか」）。`state` より外。握ったまま `state` を取ってよいが、逆はしない。
+    reconcile_gate: Arc<tokio::sync::Mutex<()>>,
+    /// 判定（置き場の読み → 状態への反映）を 1 つずつにする同期のロック。`evaluate` だけが
+    /// 取り、最後まで握る。順序は `reconcile_gate` → `evaluate_gate` → `state`（`state` を
+    /// 握ったまま取らない。`evaluate` の中で `reconcile_gate` を取らない）。
+    evaluate_gate: Mutex<()>,
+    clock: Clock,
+}
+
+/// 1 回の判定の結果。
+struct Evaluation {
+    /// pin にする証明書の PEM（0〜2 枚）。
+    pems: Vec<String>,
+    /// 置き場ごとの値の組。
+    slots: (Slot, Slot),
+    /// 使える証明書が無いときに断る理由。
+    refusal: Option<String>,
+}
+
+impl Evaluation {
+    fn marker(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.slots.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+/// 置き場 1 つの判定の途中経過。
+struct Judged {
+    slot: Slot,
+    pem: Option<String>,
+    warning: Option<String>,
+}
+
+impl Judged {
+    fn absent() -> Self {
+        Self {
+            slot: Slot::Absent,
+            pem: None,
+            warning: None,
+        }
+    }
+
+    fn unused(slot: Slot, warning: String) -> Self {
+        Self {
+            slot,
+            pem: None,
+            warning: Some(warning),
+        }
+    }
+}
+
+fn sentence(reason: &str, remedy: &str) -> String {
+    if remedy.is_empty() {
+        reason.to_owned()
+    } else {
+        format!("{reason}。{remedy}")
+    }
+}
+
+/// 確かめに通った PEM を、pin にできる形（UTF-8・証明書がちょうど 1 つ・秘密鍵なし）かまで
+/// 見て、拇印を付けて返す。
+fn pinnable(pem: Vec<u8>) -> Option<(String, CertThumbprint)> {
+    let thumbprint = CertThumbprint::of_pem(&pem).ok()?;
+    let text = String::from_utf8(pem).ok()?;
+    PinnedHubTls::from_pem(std::slice::from_ref(&text)).ok()?;
+    Some((text, thumbprint))
+}
+
+impl Pinned {
+    fn new(places: Arc<dyn HubTlsPlaces>, reads_user: bool, host: Host) -> Arc<Self> {
+        Arc::new(Self {
+            places,
+            reads_user,
+            host,
+            state: Mutex::new(State::default()),
+            reconcile_gate: Arc::new(tokio::sync::Mutex::new(())),
+            evaluate_gate: Mutex::new(()),
+            clock: Clock::default(),
+        })
+    }
+
+    /// 状態のロック。**このロックを**握ったまま置き場を読まない（読むのは必ずこのロックの
+    /// 外。置き場を読む間は `evaluate_gate` だけを握る）。毒は無視する（状態は足すだけ・
+    /// 上書きするだけの値で、途中で止まっても閉じる側にしか倒れない）。
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn http_refused(&self) -> &'static str {
+        match self.host {
+            Host::Desktop => LOOPBACK_HTTP_REFUSED,
+            Host::Service => LOOPBACK_HTTP_REFUSED_SERVICE,
+        }
+    }
+
+    /// 露出・所有者の違いを見た拇印を覚える。利用者の記録を持つ決まりでは、まだ記録に無ければ
+    /// 書き足しの待ちにも入れる。
+    fn remember(
+        &self,
+        state: &mut State,
+        thumbprint: CertThumbprint,
+        place: RevokedCertPlace,
+        recorded: &BTreeSet<CertThumbprint>,
+    ) {
+        state.remembered.insert(thumbprint);
+        if self.reads_user && !recorded.contains(&thumbprint) {
+            state.unwritten.entry(thumbprint).or_insert(place);
+        }
+    }
+
+    /// 判定の本体。置き場をこの呼び出しで読み直し（ロックを待つ操作はしない）、状態と
+    /// 合わせて pin・目印・警告を決める。
+    ///
+    /// **判定は 1 つずつ**: 最初に `evaluate_gate` を取り、置き場の読みから状態への反映まで
+    /// 握る。読んだ順に反映されるので、古い記録を読んで止まっていた判定が、後から読んだ
+    /// 判定（追加された失効を見て pin から外した）の結果を古い値で上書きしない。置き場の
+    /// 読みはロックの待ちを含まないので、握る時間は短い。`reconcile_gate` は取らない。
+    fn evaluate(&self) -> Evaluation {
+        let _serial = self
+            .evaluate_gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        // 置き場を読む（状態のロックの外）。
+        let service_cert = self.places.service_cert();
+        let service_record =
+            matches!(service_cert, CertRead::Usable(_)).then(|| self.places.service_revocations());
+        let (user_cert, user_record) = if self.reads_user {
+            (
+                Some(self.places.user_cert()),
+                self.places.user_revocations(),
+            )
+        } else {
+            (
+                None,
+                UserRecordRead {
+                    revoked: BTreeSet::new(),
+                    settled: true,
+                },
+            )
+        };
+        let UserRecordRead {
+            revoked: user_record,
+            settled: user_record_settled,
+        } = user_record;
+
+        let mut state = self.state();
+        // ロック無しの読みが「整っていない」を見たら、次の入口は新しさに依らず整え直す。
+        if !user_record_settled {
+            state.recheck = true;
+        }
+        // 記録に書けていた拇印は、書き足しの待ちから外す（ほかのプロセスが書いた場合を含む）。
+        state
+            .unwritten
+            .retain(|thumbprint, _| !user_record.contains(thumbprint));
+
+        let service = self.judge_service(&mut state, service_cert, service_record, &user_record);
+        let user = match user_cert {
+            Some(cert) => self.judge_user(&mut state, cert, (&user_record, user_record_settled)),
+            None => Judged {
+                slot: Slot::NotRead,
+                pem: None,
+                warning: None,
+            },
+        };
+
+        let mut warnings: Vec<String> = [&service, &user]
+            .into_iter()
+            .filter_map(|judged| judged.warning.clone())
+            .collect();
+        if self.reads_user {
+            warnings.extend(reconcile_warnings(&state));
+            if !state.unwritten.is_empty() {
+                warnings.push(format!(
+                    "露出・所有者の異常を見た証明書（拇印 {}）を、失効の記録に書けていません。この ChronoGazer が動いている間は使いませんが、アクセス許可を直すだけでは漏れた鍵は無効になりません。その証明書の Hub を止め、鍵と証明書を作り直してください",
+                    state
+                        .unwritten
+                        .keys()
+                        .map(CertThumbprint::to_string)
+                        .collect::<Vec<_>>()
+                        .join("・")
+                ));
+            }
+        }
+
+        // 同じ証明書が両方の置き場にあっても 1 枚（pin の枠は 2）。
+        let mut pems: Vec<String> = Vec::new();
+        for pem in [&service.pem, &user.pem].into_iter().flatten() {
+            if !pems.contains(pem) {
+                pems.push(pem.clone());
+            }
+        }
+        let refusal = pems
+            .is_empty()
+            .then(|| self.refusal_text(service.slot, user.slot, &warnings));
+
+        // 警告はログにも出す（同じ理由が続く間は繰り返さない）。
+        for warning in &warnings {
+            if !state.logged.contains(warning) {
+                eprintln!("banto: Hub の TLS: {warning}");
+            }
+        }
+        state.logged = warnings.iter().cloned().collect();
+        state.warnings = warnings;
+
+        Evaluation {
+            pems,
+            slots: (service.slot, user.slot),
+            refusal,
+        }
+    }
+
+    fn judge_service(
+        &self,
+        state: &mut State,
+        cert: CertRead,
+        record: Option<ServiceRecordRead>,
+        user_record: &BTreeSet<CertThumbprint>,
+    ) -> Judged {
+        const PLACE: &str = "Hub のサービスの証明書";
+        let pem = match cert {
+            CertRead::Absent => return Judged::absent(),
+            CertRead::Unusable(found) => {
+                let Some(thumbprint) = found.revoke else {
+                    return Judged::unused(
+                        Slot::Unusable,
+                        format!(
+                            "{PLACE}を使っていません: {}",
+                            sentence(&found.reason, &found.remedy)
+                        ),
+                    );
+                };
+                self.remember(state, thumbprint, RevokedCertPlace::Service, user_record);
+                return Judged::unused(
+                    Slot::Revoked,
+                    format!(
+                        "{PLACE}（拇印 {thumbprint}）に露出・所有者の異常を見たため、今後は使いません: {}。{}",
+                        found.reason,
+                        self.service_exposure_remedy()
+                    ),
+                );
+            }
+            CertRead::Usable(pem) => pem,
+        };
+        let Some((text, thumbprint)) = pinnable(pem) else {
+            return Judged::unused(
+                Slot::Unusable,
                 format!(
-                    "同じ PC の Hub の証明書を使えないため接続しません: {}。{}",
-                    found.reason,
-                    remedy_text(&found.remedy)
-                )
-            })
+                    "{PLACE}（PEM）を pin にできないため使っていません。管理者の PowerShell で {ELEV_RENEW} を実行して作り直し、Hub のサービスを再起動してください"
+                ),
+            );
+        };
+        let (in_service_record, record_problem) = match record {
+            Some(ServiceRecordRead::Revoked(revoked)) => (revoked.contains(&thumbprint), None),
+            Some(ServiceRecordRead::Unusable { reason, salvaged }) => {
+                (salvaged.contains(&thumbprint), Some(reason))
+            }
+            // 使える証明書があるときは必ず記録を読んでいる。読んでいなければ閉じる側。
+            None => (
+                false,
+                Some("サービスの失効の記録を読んでいません".to_owned()),
+            ),
+        };
+        if in_service_record {
+            return Judged::unused(
+                Slot::Revoked,
+                format!(
+                    "{PLACE}（拇印 {thumbprint}）はサービスの失効の記録にあるため使いません。管理者の PowerShell で {ELEV_RENEW} を実行して作り直し、Hub のサービスを再起動してください"
+                ),
+            );
+        }
+        if state.remembered.contains(&thumbprint) || user_record.contains(&thumbprint) {
+            return Judged::unused(
+                Slot::Revoked,
+                format!(
+                    "{PLACE}（拇印 {thumbprint}）は、露出・所有者の異常を見た証明書なので使いません。{}",
+                    self.service_exposure_remedy()
+                ),
+            );
+        }
+        if let Some(reason) = record_problem {
+            return Judged::unused(
+                Slot::Unusable,
+                format!(
+                    "サービスの失効の記録を確かめられないため、{PLACE}を使っていません: {reason}。続くときは、管理者が置き場の所有者・アクセス許可を直してから、管理者の PowerShell で {ELEV_RENEW} を実行して記録と証明書を作り直し、Hub のサービスを再起動してください"
+                ),
+            );
+        }
+        Judged {
+            slot: Slot::Usable(thumbprint),
+            pem: Some(text),
+            warning: None,
+        }
     }
 
-    #[cfg(not(windows))]
-    fn read_cert_pem(&self) -> Result<Vec<u8>, String> {
-        Err("この OS では同じ PC の Hub の証明書を読めないため、https の loopback には接続できません（Hub のサービスは Windows 専用です）".to_owned())
+    /// サービスの証明書の露出を、サービスより先に ChronoGazer が見たときの案内。ChronoGazer
+    /// デスクトップの記録は、サービスとほかの利用者へ伝わらない（設計 §4.4.1「保証の範囲」）。
+    fn service_exposure_remedy(&self) -> String {
+        match self.host {
+            Host::Desktop => format!(
+                "アクセス許可を直すだけでは漏れた鍵は無効になりません。この PC の管理者に、管理者の PowerShell で {ELEV_RENEW} を実行して作り直し、Hub のサービスを再起動するよう頼んでください"
+            ),
+            Host::Service => format!(
+                "アクセス許可を直すだけでは漏れた鍵は無効になりません。管理者の PowerShell で {ELEV_RENEW} を実行して作り直し、Hub のサービスを再起動してください"
+            ),
+        }
+    }
+
+    fn judge_user(
+        &self,
+        state: &mut State,
+        cert: CertRead,
+        user_record: (&BTreeSet<CertThumbprint>, bool),
+    ) -> Judged {
+        const PLACE: &str = "Hub のデスクトップ版の証明書";
+        const RENEW: &str = "Hub のデスクトップ版で、TLS フォルダと鍵・証明書の所有者・アクセス許可を確かめ、異常があれば直してから、トレイの「TLS の証明書を作り直す」で作り直してください（失効の記録は消さないでください）";
+        let judged = self.judge_user_cert(state, cert, user_record, PLACE, RENEW);
+        // pin に使わなかった回は「使っている証明書」を忘れる。戻すときは「使い始める」の
+        // 条件（整える手順の結果が「整っている」）をもう一度通す。
+        state.user_in_use = match judged.slot {
+            Slot::Usable(thumbprint) => Some(thumbprint),
+            _ => None,
+        };
+        judged
+    }
+
+    fn judge_user_cert(
+        &self,
+        state: &mut State,
+        cert: CertRead,
+        (user_record, user_record_settled): (&BTreeSet<CertThumbprint>, bool),
+        place: &str,
+        renew: &str,
+    ) -> Judged {
+        let pem = match cert {
+            CertRead::Absent => return Judged::absent(),
+            CertRead::Unusable(found) => {
+                let Some(thumbprint) = found.revoke else {
+                    return Judged::unused(
+                        Slot::Unusable,
+                        format!(
+                            "{place}を使っていません: {}",
+                            sentence(&found.reason, &found.remedy)
+                        ),
+                    );
+                };
+                self.remember(state, thumbprint, RevokedCertPlace::User, user_record);
+                return Judged::unused(
+                    Slot::Revoked,
+                    format!(
+                        "{place}（拇印 {thumbprint}）に露出・所有者の異常を見たため、今後は使いません: {}。アクセス許可を直すだけでは漏れた鍵は無効になりません。{renew}",
+                        found.reason
+                    ),
+                );
+            }
+            CertRead::Usable(pem) => pem,
+        };
+        let Some((text, thumbprint)) = pinnable(pem) else {
+            return Judged::unused(
+                Slot::Unusable,
+                format!("{place}（PEM）を pin にできないため使っていません。{renew}"),
+            );
+        };
+        if state.remembered.contains(&thumbprint) || user_record.contains(&thumbprint) {
+            return Judged::unused(
+                Slot::Revoked,
+                format!("{place}（拇印 {thumbprint}）は失効しているため使いません。{renew}"),
+            );
+        }
+        let held = state.user_in_use == Some(thumbprint);
+        let withheld = |why: &str| {
+            Judged::unused(
+                Slot::Unusable,
+                format!("利用者の失効の記録{why}ため、{place}を使っていません"),
+            )
+        };
+        match state.reconcile.as_ref().map(|seen| seen.outcome) {
+            // 記録を消された直後に、古い「整っている」と空の記録で使い始めない。使っている
+            // 証明書は次の整える手順まで保つ（モジュール doc「ロック無しの読みが…」）。
+            Some(ReconcileOutcome::Consistent) if !user_record_settled && !held => {
+                return withheld(
+                    "が、いま読むと整っていない（消された・壊れた・書いている途中。次の操作で確かめ直すまで使い始めません）",
+                )
+            }
+            Some(ReconcileOutcome::Consistent) => {}
+            Some(ReconcileOutcome::Incomplete)
+                if held && state.incomplete_streak < INCOMPLETE_LIMIT => {}
+            Some(ReconcileOutcome::Incomplete) if state.incomplete_streak >= INCOMPLETE_LIMIT => {
+                return withheld(&format!(
+                    "を {INCOMPLETE_LIMIT} 周期続けて確かめられなかった"
+                ))
+            }
+            Some(ReconcileOutcome::Incomplete) => {
+                return withheld("をまだ確かめられていない（整うまで使い始めません）")
+            }
+            Some(ReconcileOutcome::Refused) => {
+                return withheld("が確かめに通らない（消された・壊れた・置き場が通らない）")
+            }
+            None => return withheld("をまだ確かめていない（確かめが済むまで使い始めません）"),
+        }
+        Judged {
+            slot: Slot::Usable(thumbprint),
+            pem: Some(text),
+            warning: None,
+        }
+    }
+
+    /// 使える証明書が無いときの理由と直し方。
+    fn refusal_text(&self, service: Slot, user: Slot, warnings: &[String]) -> String {
+        let service_absent = service == Slot::Absent;
+        let user_absent = matches!(user, Slot::Absent | Slot::NotRead);
+        if service_absent && user_absent {
+            return match self.host {
+                Host::Desktop => "同じ PC の Hub の証明書がまだ無いため接続しません。Hub のデスクトップ版を起動してください（起動のときに証明書が作られます）。Hub をサービスで動かしている PC では、管理者の PowerShell で banto-hub-elev.exe prepare-hub-tls を実行してから、Hub のサービスを再起動してください".to_owned(),
+                Host::Service => "同じ PC の Hub の証明書がまだ無いため接続しません。Hub をサービスで動かし、管理者の PowerShell で banto-hub-elev.exe prepare-hub-tls を実行してから、Hub のサービスを再起動してください".to_owned(),
+            };
+        }
+        format!(
+            "同じ PC の Hub の証明書を使えないため接続しません: {}",
+            warnings.join(" / ")
+        )
+    }
+
+    /// 利用者の記録を整え、露出を見た拇印を書き足す（モジュール doc「整える手順をいつ
+    /// 走らせるか」）。**`reconcile_gate` を握っている呼び手だけが呼ぶ**（読んだ順に状態へ
+    /// 書くため）。記録のロックを上限付きで待つので、blocking のスレッドから呼ぶ。
+    /// `counts_cycle` は見張りの周期の回か: 「できなかった」の連続数（`INCOMPLETE_LIMIT`）を
+    /// 進めるのは周期の回だけ（操作の入口の走らせ直しは増やさず、「できなかった」以外なら
+    /// 0 に戻す）。
+    fn refresh_blocking(&self, counts_cycle: bool) {
+        // 最初の回か（直列化の中なので、ここで読んでよい）。
+        let startup = self.state().reconcile.is_none();
+        let started_at = self.clock.now();
+        let mut report = self.places.reconcile_user_revocations();
+        let mut warnings = std::mem::take(&mut report.warnings);
+        if startup && report.saw_loss {
+            // 消失を直した回の結果は「通らない」。直っていれば、次の回が「整っている」になる。
+            report = self.places.reconcile_user_revocations();
+            warnings.append(&mut report.warnings);
+        }
+        {
+            let mut state = self.state();
+            state.incomplete_streak = if report.outcome != ReconcileOutcome::Incomplete {
+                0
+            } else if counts_cycle {
+                state.incomplete_streak.saturating_add(1)
+            } else {
+                state.incomplete_streak
+            };
+            state.reconcile = Some(ReconcileSeen {
+                outcome: report.outcome,
+                started_at,
+                warnings,
+            });
+            state.runs = state.runs.wrapping_add(1);
+            // この回が記録を読み直した。整っていなければ、下の判定がもう一度立てる。
+            state.recheck = false;
+        }
+        // 置き場の確かめ → 記録との照合（露出を見た拇印はここで待ちに入る）。
+        self.evaluate();
+        let pending = self.state().unwritten.clone();
+        if pending.is_empty() {
+            return;
+        }
+        for (thumbprint, place) in pending {
+            let written = self
+                .places
+                .record_user_revocation(thumbprint, place)
+                .revoked
+                .contains(&thumbprint);
+            if written {
+                self.state().unwritten.remove(&thumbprint);
+            }
+        }
+        // 書けた・書けなかったを警告に反映する。
+        self.evaluate();
     }
 }
 
-/// 置き場の確かめの失敗の対処（文言は ChronoGazer 向け。ChronoGazer は毎回読み直すので、
-/// pin を書き換える手順は要らない）。
-#[cfg(windows)]
-fn remedy_text(remedy: &banto_hub_tls_trust::Remedy) -> String {
-    use banto_hub_tls_trust::Remedy;
-    const PREPARE: &str = "banto-hub-elev.exe prepare-hub-tls";
-    match remedy {
-        Remedy::Retry => "原因を取り除いてからやり直してください。続くときは、管理者の PowerShell で banto-hub-elev.exe prepare-hub-tls を実行して置き場を確かめてください".to_owned(),
-        Remedy::Prepare => format!(
-            "Hub をサービスで動かし、管理者の PowerShell で {PREPARE} を実行してから、Hub のサービスを再起動してください"
+/// 整える手順の結果から出す警告（結果が「整っている」で警告も無ければ空）。
+fn reconcile_warnings(state: &State) -> Vec<String> {
+    let Some(seen) = &state.reconcile else {
+        return Vec::new();
+    };
+    let mut warnings = Vec::new();
+    match seen.outcome {
+        ReconcileOutcome::Consistent => {}
+        ReconcileOutcome::Refused => warnings.push(
+            "利用者の失効の記録が確かめに通りません（消された・壊れた・置き場が通らない）。直るまで、Hub のデスクトップ版の証明書は使いません（Hub のサービスの証明書の照合は続けます）".to_owned(),
         ),
-        Remedy::FixRoot => "Hub の置き場の所有者を Administrators にし、SYSTEM・Administrators 以外への書き込み・削除・ACL と所有者の変更の許可を外してください".to_owned(),
-        Remedy::RecreateDir(tls_path) => format!(
-            "{} の中身を確かめてこのフォルダを消し、管理者の PowerShell で {PREPARE} を実行してから、Hub のサービスを再起動してください",
-            tls_path.display()
-        ),
-        Remedy::Renew => format!(
-            "管理者の PowerShell で {PREPARE} --renew を実行して作り直し、Hub のサービスを再起動してください"
-        ),
+        ReconcileOutcome::Incomplete if state.incomplete_streak < INCOMPLETE_LIMIT => {
+            warnings.push(format!(
+                "利用者の失効の記録の確かめが終わりませんでした（{} 周期続いています。{INCOMPLETE_LIMIT} 周期続くと、Hub のデスクトップ版の証明書を pin から外します）",
+                state.incomplete_streak
+            ))
+        }
+        // 続く間は同じ文言にする（周期ごとにログへ繰り返さない）。
+        ReconcileOutcome::Incomplete => warnings.push(format!(
+            "利用者の失効の記録の確かめが、{INCOMPLETE_LIMIT} 周期以上続けて終わっていません（終わるまで、Hub のデスクトップ版の証明書は使いません）"
+        )),
     }
+    warnings.extend(seen.warnings.iter().cloned());
+    warnings
 }
 
 #[derive(Clone)]
 enum Loopback {
     /// 本番: loopback は pin した https だけ。
-    Pinned(Arc<dyn HubCertReader>),
+    Pinned(Arc<Pinned>),
     /// テスト・開発用: loopback の http を pin なしで受ける（https の loopback は pin が
     /// 無いので bootstrap の規則で断られる）。
     PlainHttp,
 }
 
-/// ChronoGazer の Hub 接続の TLS の決まり（モジュール doc）。状態を持たない（`Clone` は
-/// 同じ決まり）。
+/// ChronoGazer の Hub 接続の TLS の決まり（モジュール doc）。`Clone` は同じ決まりで、状態
+/// （モジュール doc「覚えるもの」）を共有する。
 #[derive(Clone)]
 pub struct HubTlsPolicy {
     loopback: Loopback,
 }
 
 impl HubTlsPolicy {
-    /// 製品の決まり: loopback は `%ProgramData%\BantoHub\tls\` の証明書を pin した https
-    /// だけ、それ以外は今までどおり。
+    /// ChronoGazer デスクトップの決まり: loopback は、Hub のサービスの置き場
+    /// （`%ProgramData%\BantoHub\tls\`）と今の利用者の置き場（`%LOCALAPPDATA%\BantoHub\tls\`）の
+    /// 証明書を pin した https だけ、それ以外は今までどおり。
     pub fn production() -> Self {
-        Self::with_reader(Arc::new(SystemHubCert))
+        Self::pinned(Arc::new(places::SystemPlaces), true, Host::Desktop)
+    }
+
+    /// `chronogazer-server` の決まり: loopback は、Hub のサービスの置き場の証明書を pin した
+    /// https だけ。利用者の置き場と利用者の失効の記録は読まず、書かない（LocalSystem には
+    /// 「今の利用者の Hub のデスクトップ版」が無い。設計 §4.4.1「照合する時点」）。
+    pub fn service_only() -> Self {
+        Self::pinned(Arc::new(places::SystemPlaces), false, Host::Service)
     }
 
     /// **テスト・開発用**（モジュール doc「テストと開発用」）: loopback の http も pin なしで
@@ -140,20 +848,50 @@ impl HubTlsPolicy {
         }
     }
 
-    /// 本番と同じ決まりで、証明書の読み方だけを差し替える（テスト用）。
+    /// サービスの置き場の証明書の読み方だけを差し替える（テスト用。#644 PR3b の形）。
+    /// 利用者の置き場は読まず、失効の記録は空。
+    #[cfg(test)]
     pub(crate) fn with_reader(reader: Arc<dyn HubCertReader>) -> Self {
+        Self::pinned(Arc::new(places::ReaderPlaces(reader)), false, Host::Desktop)
+    }
+
+    /// [`Self::production`] と同じ決まりで、置き場を読む口だけを差し替える（テスト用）。
+    #[cfg(test)]
+    pub(crate) fn two_places_with(places: Arc<dyn HubTlsPlaces>) -> Self {
+        Self::pinned(places, true, Host::Desktop)
+    }
+
+    /// [`Self::service_only`] と同じ決まりで、置き場を読む口だけを差し替える（テスト用）。
+    #[cfg(test)]
+    pub(crate) fn service_only_with(places: Arc<dyn HubTlsPlaces>) -> Self {
+        Self::pinned(places, false, Host::Service)
+    }
+
+    fn pinned(places: Arc<dyn HubTlsPlaces>, reads_user: bool, host: Host) -> Self {
         Self {
-            loopback: Loopback::Pinned(reader),
+            loopback: Loopback::Pinned(Pinned::new(places, reads_user, host)),
         }
     }
 
-    /// `endpoint` に今使う pin の目印（証明書の PEM のハッシュ）を、**この呼び出しで
-    /// 証明書を読んで**返す。pin を使わない接続先（LAN の http・開発用の決まり）は
-    /// `Ok(None)`、断る接続先・読めない証明書は [`HubTlsSource::pins_for`] と同じ `Err`。
+    /// `endpoint` が、置き場の証明書を pin にする接続先（loopback の https）なら、その決まりの
+    /// 中身。
+    fn pinned_for(&self, endpoint: &str) -> Option<&Arc<Pinned>> {
+        let Loopback::Pinned(pinned) = &self.loopback else {
+            return None;
+        };
+        let base = Url::parse(endpoint.trim()).ok()?;
+        (is_loopback(&base) && base.scheme() == "https").then_some(pinned)
+    }
+
+    /// `endpoint` に今使う pin の目印（置き場ごとの値の組の hash。モジュール doc「いつ
+    /// 読むか」）を、**この呼び出しで置き場を確かめ直して**返す。pin を使わない接続先（LAN の
+    /// http・開発用の決まり）は `Ok(None)`、断る接続先・使える証明書が無いときは
+    /// [`HubTlsSource::pins_for`] と同じ `Err`。
     ///
-    /// 購読の世代の同一性に混ぜ、証明書が作り直されたら張り直す（`crate::hub` の
-    /// `reconcile_generation`・`supervise_once`）。前の呼び出しの結果を覚えて共有する
-    /// 作りにはしない - 別の接続先や失敗の呼び出しで上書きされた値と比べてしまうため。
+    /// 購読の世代の同一性に混ぜ、証明書が作り直された・失効した・確かめに通らなくなったら
+    /// 張り直す（`crate::hub` の `reconcile_generation`・`supervise_once`）。前の呼び出しの
+    /// 結果を覚えて共有する作りにはしない - 別の接続先や失敗の呼び出しで上書きされた値と
+    /// 比べてしまうため。
     ///
     /// 解釈できない綴りは `Ok(None)`（その接続先は bootstrap が `InvalidEndpoint` で断る）。
     pub(crate) fn marker_for(&self, endpoint: &str) -> Result<Option<u64>, BootstrapError> {
@@ -163,30 +901,102 @@ impl HubTlsPolicy {
         Ok(self.decide(&base)?.map(|(_, marker)| marker))
     }
 
-    /// 判定の本体（純関数に近い形。証明書を読むのは loopback の https のときだけ）。
+    /// `endpoint` への接続について、いま出ている警告（片方の置き場が通らない・失効した・
+    /// 失効の記録が消された・直された・確かめが終わらない）。**接続できている間も**出す
+    /// （片方が良いとき、もう片方の問題が誰にも見えなくなるのを防ぐ。設計 §4.4）。最後の
+    /// 判定（操作・見張りの周期）のもので、この呼び出しでは置き場を読まない。置き場の証明書を
+    /// pin にしない接続先では空。
+    pub(crate) fn warnings_for(&self, endpoint: &str) -> Vec<String> {
+        self.pinned_for(endpoint)
+            .map(|pinned| pinned.state().warnings.clone())
+            .unwrap_or_default()
+    }
+
+    /// 操作の入口の整える手順（モジュール doc「整える手順をいつ走らせるか」）。`endpoint` が
+    /// loopback の https で、利用者の記録を持つ決まりのとき、最後の整える手順が「整っている」・
+    /// 書き足しの残り無し・30 秒以内・その後のロック無しの読みも整っている、のすべてを
+    /// 満たさなければ走らせる（「できなかった」の連続数は進めない: 3 周期は見張りの周期で
+    /// 数える）。操作の入口（`crate::hub` の `begin_operation`・`connect`・`adopt_manual_key`）が、
+    /// Hub と話す前に呼ぶ - 走らせる前の判定は、利用者の証明書を使い始めない。
+    pub(crate) async fn ensure_started(&self, endpoint: &str) {
+        self.run_refresh(endpoint, true).await;
+    }
+
+    /// 見張りの周期の整える手順と、露出を見た拇印の書き足し（`crate::hub` の
+    /// `supervise_once`）。必ず走らせる。
+    pub(crate) async fn refresh(&self, endpoint: &str) {
+        self.run_refresh(endpoint, false).await;
+    }
+
+    /// 試験用: 時刻を `by` だけ進める（整える手順の新しさの確かめ）。
+    #[cfg(test)]
+    pub(crate) fn advance_clock(&self, by: Duration) {
+        if let Loopback::Pinned(pinned) = &self.loopback {
+            pinned.clock.advance(by);
+        }
+    }
+
+    async fn run_refresh(&self, endpoint: &str, entry: bool) {
+        let Some(pinned) = self.pinned_for(endpoint) else {
+            return;
+        };
+        if !pinned.reads_user {
+            return;
+        }
+        let runs_before = {
+            let state = pinned.state();
+            if entry && state.entry_may_skip(pinned.clock.now()) {
+                return;
+            }
+            state.runs
+        };
+        // 直列化: 整える手順とその結果の反映は 1 つずつ（読んだ順 = 状態へ書く順）。
+        let gate = Arc::clone(&pinned.reconcile_gate).lock_owned().await;
+        // 待つ間に別の呼び出しが新しい結果を作っていたら、入口はそれを使う（待ち始めた後に
+        // 読んだ結果。結果が「整っている」でなければ、次の入口がまた走らせる）。見張りの
+        // 周期は、連続数を数えるので必ず自分で走らせる。
+        if entry && pinned.state().runs != runs_before {
+            return;
+        }
+        let pinned = Arc::clone(pinned);
+        // 記録のロックを最大 5 秒待つので、tokio のワーカーを塞がない。直列化のロックは
+        // blocking のスレッドへ持ち込み、状態への反映が済むまで握る（この future が途中で
+        // 捨てられても、走っている手順が終わるまで次を始めない）。
+        let ran = tokio::task::spawn_blocking(move || {
+            let _gate = gate;
+            pinned.refresh_blocking(!entry);
+        })
+        .await;
+        if let Err(error) = ran {
+            // 状態は書き換わっていない（1 回も走っていなければ、利用者の証明書は使い始めない）。
+            eprintln!(
+                "banto: Hub の TLS: 利用者の失効の記録の確かめが途中で止まりました（次の周期でやり直します）: {error}"
+            );
+        }
+    }
+
+    /// 判定の入口（置き場を読むのは loopback の https のときだけ）。
     fn decide(&self, base: &Url) -> Result<Option<(PinnedHubTls, u64)>, BootstrapError> {
         if !is_loopback(base) {
             // LAN: http は pin なし（範囲外）。https は pin が無いので bootstrap が断る。
             return Ok(None);
         }
-        let reader = match &self.loopback {
+        let pinned = match &self.loopback {
             Loopback::PlainHttp => return Ok(None),
-            Loopback::Pinned(reader) => reader,
+            Loopback::Pinned(pinned) => pinned,
         };
         if base.scheme() != "https" {
-            return Err(refused(LOOPBACK_HTTP_REFUSED));
+            return Err(refused(pinned.http_refused()));
         }
-        let pem = reader.read_cert_pem().map_err(refused)?;
-        let unreadable = || {
-            refused(
-                "同じ PC の Hub の証明書（PEM）を pin にできなかったため接続しません。管理者の PowerShell で banto-hub-elev.exe prepare-hub-tls --renew を実行して作り直し、Hub のサービスを再起動してください",
-            )
-        };
-        let text = String::from_utf8(pem).map_err(|_| unreadable())?;
-        let pins = PinnedHubTls::from_pem(std::slice::from_ref(&text)).map_err(|_| unreadable())?;
-        let mut hasher = DefaultHasher::new();
-        text.hash(&mut hasher);
-        Ok(Some((pins, hasher.finish())))
+        let evaluation = pinned.evaluate();
+        if let Some(reason) = evaluation.refusal.clone() {
+            return Err(refused(reason));
+        }
+        // 1 枚ずつは pin にできると確かめてある（`pinnable`）。
+        let pins = PinnedHubTls::from_pem(&evaluation.pems).map_err(|_| {
+            refused("同じ PC の Hub の証明書（PEM）を pin にできなかったため接続しません")
+        })?;
+        Ok(Some((pins, evaluation.marker())))
     }
 }
 
@@ -218,185 +1028,4 @@ fn is_loopback(base: &Url) -> bool {
     }
     let name = host.trim_end_matches('.').to_ascii_lowercase();
     name == "localhost" || name.ends_with(".localhost")
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use super::*;
-
-    /// 読んだ回数を数え、決まった答えを返す証明書の読み口。
-    struct FakeCert {
-        answer: Result<Vec<u8>, String>,
-        reads: AtomicUsize,
-    }
-
-    impl FakeCert {
-        fn new(answer: Result<Vec<u8>, String>) -> Arc<Self> {
-            Arc::new(Self {
-                answer,
-                reads: AtomicUsize::new(0),
-            })
-        }
-
-        fn reads(&self) -> usize {
-            self.reads.load(Ordering::SeqCst)
-        }
-    }
-
-    impl HubCertReader for FakeCert {
-        fn read_cert_pem(&self) -> Result<Vec<u8>, String> {
-            self.reads.fetch_add(1, Ordering::SeqCst);
-            self.answer.clone()
-        }
-    }
-
-    fn cert_pem() -> String {
-        rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
-            .unwrap()
-            .cert
-            .pem()
-    }
-
-    fn url(raw: &str) -> Url {
-        Url::parse(raw).unwrap()
-    }
-
-    fn production_with(cert: &Arc<FakeCert>) -> HubTlsPolicy {
-        HubTlsPolicy::with_reader(Arc::clone(cert) as Arc<dyn HubCertReader>)
-    }
-
-    fn refusal_of(
-        result: banto_hub_bootstrap::Result<Option<PinnedHubTls>>,
-    ) -> (BootstrapErrorKind, String) {
-        let error = result.expect_err("refused");
-        (error.kind(), error.detail().unwrap_or_default().to_owned())
-    }
-
-    #[test]
-    fn loopback_http_is_refused_with_the_guidance_and_reads_nothing() {
-        let cert = FakeCert::new(Ok(cert_pem().into_bytes()));
-        let policy = production_with(&cert);
-        for raw in [
-            "http://127.0.0.1:8722/",
-            "http://127.0.0.2:8722/",
-            "http://127.1:8722/",
-            "http://localhost:8722/",
-            "http://LOCALHOST./",
-            "http://hub.localhost:8722/",
-            "http://[::1]:8722/",
-            "http://[::ffff:127.0.0.1]:8722/",
-        ] {
-            assert_eq!(
-                refusal_of(policy.pins_for(&url(raw))),
-                (BootstrapErrorKind::HubTls, LOOPBACK_HTTP_REFUSED.to_owned()),
-                "{raw}"
-            );
-        }
-        assert_eq!(
-            cert.reads(),
-            0,
-            "http is refused without reading the certificate"
-        );
-        assert_eq!(
-            policy
-                .marker_for("http://127.0.0.1:8722")
-                .unwrap_err()
-                .kind(),
-            BootstrapErrorKind::HubTls
-        );
-        assert_eq!(cert.reads(), 0);
-    }
-
-    #[test]
-    fn loopback_https_reads_the_certificate_every_time_and_pins_it() {
-        let cert = FakeCert::new(Ok(cert_pem().into_bytes()));
-        let policy = production_with(&cert);
-
-        assert!(policy
-            .pins_for(&url("https://127.0.0.1:8723/"))
-            .unwrap()
-            .is_some());
-        assert_eq!(cert.reads(), 1);
-        let marker = policy.marker_for("https://127.0.0.1:8723").unwrap();
-        assert!(marker.is_some());
-        assert_eq!(cert.reads(), 2, "the marker reads the certificate itself");
-        assert!(policy
-            .pins_for(&url("https://localhost:8723/"))
-            .unwrap()
-            .is_some());
-        assert_eq!(cert.reads(), 3, "read again on every operation (renew)");
-        assert_eq!(
-            policy.marker_for("https://localhost:8723").unwrap(),
-            marker,
-            "the same certificate"
-        );
-        // pin を使わない接続先は目印なし（証明書も読まない）。
-        assert_eq!(policy.marker_for("http://192.168.11.5:8722").unwrap(), None);
-        assert_eq!(cert.reads(), 4);
-    }
-
-    #[test]
-    fn a_renewed_certificate_changes_the_marker() {
-        let first = production_with(&FakeCert::new(Ok(cert_pem().into_bytes())));
-        let second = production_with(&FakeCert::new(Ok(cert_pem().into_bytes())));
-        let base = "https://127.0.0.1:8723";
-        assert_ne!(
-            first.marker_for(base).unwrap(),
-            second.marker_for(base).unwrap()
-        );
-    }
-
-    #[test]
-    fn an_unreadable_certificate_refuses_with_its_reason() {
-        let cert = FakeCert::new(Err("置き場がありません".to_owned()));
-        let policy = production_with(&cert);
-        assert_eq!(
-            refusal_of(policy.pins_for(&url("https://127.0.0.1:8723/"))),
-            (BootstrapErrorKind::HubTls, "置き場がありません".to_owned())
-        );
-
-        // PEM でないもの・秘密鍵入りは pin にしない。
-        for broken in [b"not a pem".to_vec(), vec![0xff, 0xfe]] {
-            let policy = production_with(&FakeCert::new(Ok(broken)));
-            let (kind, detail) = refusal_of(policy.pins_for(&url("https://127.0.0.1:8723/")));
-            assert_eq!(kind, BootstrapErrorKind::HubTls);
-            assert!(detail.contains("prepare-hub-tls --renew"), "{detail}");
-        }
-    }
-
-    #[test]
-    fn the_lan_keeps_todays_rules_and_reads_nothing() {
-        let cert = FakeCert::new(Ok(cert_pem().into_bytes()));
-        let policy = production_with(&cert);
-        // http: pin なしで受ける。https: pin なし（= bootstrap の規則で InvalidEndpoint）。
-        for raw in [
-            "http://192.168.11.5:8722/",
-            "https://192.168.11.5:8723/",
-            "http://hub.example:8722/",
-            "http://[fe80::1]:8722/",
-            "http://[2001:db8::1]:8722/",
-        ] {
-            assert!(policy.pins_for(&url(raw)).unwrap().is_none(), "{raw}");
-        }
-        assert_eq!(cert.reads(), 0);
-    }
-
-    #[test]
-    fn the_dev_policy_takes_loopback_http_without_a_pin() {
-        let policy = HubTlsPolicy::plain_loopback_http_for_dev();
-        for raw in ["http://127.0.0.1:8722/", "https://127.0.0.1:8723/"] {
-            assert!(policy.pins_for(&url(raw)).unwrap().is_none(), "{raw}");
-        }
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn other_systems_cannot_read_the_certificate() {
-        let (kind, detail) =
-            refusal_of(HubTlsPolicy::production().pins_for(&url("https://127.0.0.1:8723/")));
-        assert_eq!(kind, BootstrapErrorKind::HubTls);
-        assert!(detail.contains("この OS"), "{detail}");
-    }
 }

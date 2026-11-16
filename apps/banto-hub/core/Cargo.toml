@@ -20,6 +20,7 @@ default = []
 embed-ui = ["dep:rust-embed"]
 
 [dependencies]
+tower = { workspace = true, features = ["util"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 banto-opcua-server = { workspace = true }
 banto-core = { workspace = true }
@@ -223,7 +224,6 @@ tokio = { workspace = true, features = ["rt", "macros", "time", "net", "io-util"
 # #644 受入条件 4 の場面試験（`src/pinned_hub_health/squat_scenarios.rs`）: 1 つのポートが Hub 停止中の
 # 先取り・入れ替え・証明書の作り直しを通す。先取り役・中継・記録の部品で、公開しない dev 専用の crate。
 banto-hub-squat-harness = { path = "../../../crates/banto-hub-squat-harness" }
-tower = { workspace = true, features = ["util"] }
 tempfile = { workspace = true }
 # #344（2026-09-15）: `broker_glue::BrokerReadClient::connect` は broker の
 # `status_watch` を見て Connected/Reconnecting/Stopped を返し分けるように

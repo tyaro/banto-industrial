@@ -61,6 +61,7 @@
 		hubPollStaleNote,
 		hubRemainderNote,
 		hubStatusDisplay,
+		currentHubHost,
 		hubSubscriptionDetail,
 		hubSubscriptionHeadline,
 		hubTimeLabel,
@@ -119,6 +120,12 @@
 	let keyName = $state<string | null>(null);
 	/** 保存済みの接続先を TLS の決まりで使わなかった理由（#644、`HubView.endpointProblem`）。 */
 	let endpointProblem = $state<string | null>(null);
+	/**
+	 * 同じ PC の Hub の証明書の置き場についての警告（#1121 PR4b、`HubView.tlsWarnings`）。
+	 * 接続できている間も、見張りの結果で変わる。操作の応答（`applyView`）と、ポーリングの
+	 * 応答（`HubSubscription.tlsWarnings`）で更新する。ポーリングの失敗では変えない。
+	 */
+	let tlsWarnings = $state<string[]>([]);
 	let subscription = $state<HubSubscription | null>(null);
 	/**
 	 * 購読状態のポーリングが連続で失敗した回数（成功で 0 に戻る）と、最後に
@@ -146,7 +153,8 @@
 			statusSnapshot.status,
 			statusSnapshot.observedWith,
 			subscription,
-			statusSnapshot.recheck
+			statusSnapshot.recheck,
+			currentHubHost()
 		)
 	);
 	/** APIキーの入力欄（手動採用）を出すか。未保存の判定もこれに合わせる。 */
@@ -268,6 +276,7 @@
 		configured = view.endpoint !== null;
 		keyName = view.keyName;
 		endpointProblem = view.endpointProblem ?? null;
+		tlsWarnings = view.tlsWarnings ?? [];
 		serverEndpoint = view.endpoint;
 		legacySelection = [...view.selectedTags];
 		// `null`（この往復では catalog を読めていない）と `[]`（読めた結果
@@ -569,7 +578,10 @@
 			// 優先して捨てる場合でも、購読状態は取得できている）。
 			markSubscriptionFresh();
 			// 待っている間に明示操作の結果が入っていたら、こちらは古い。
-			if (isPollResultFresh(sentAt, appliedSeq)) subscription = outcome.value;
+			if (isPollResultFresh(sentAt, appliedSeq)) {
+				subscription = outcome.value;
+				tlsWarnings = outcome.value.tlsWarnings ?? [];
+			}
 			return;
 		}
 		// 失敗・打ち切りはどちらも「今の状態を取得できていない」。トーストは
@@ -672,6 +684,17 @@
 			{#if endpointProblem}
 				<p class="error" role="status">{endpointProblem}</p>
 			{/if}
+			<!-- ライブ領域は常に描き、中身だけを出し入れする（初回描画の role="status" は読み上げられないことがある。#1149 のレビュー P2） -->
+			<div class="tls-warnings-region" role="status">
+				{#if tlsWarnings.length > 0}
+					<p class="tls-warnings-lead">同じ PC の Hub の証明書について:</p>
+					<ul class="tls-warnings">
+						{#each tlsWarnings as warning, i (i)}
+							<li>{warning}</li>
+						{/each}
+					</ul>
+				{/if}
+			</div>
 			{#if showStatusRecheckButton(statusDisplay, status, configured)}
 				<!--
 					#449 再レビュー P2 / 3 回目のレビュー: 取り直しに失敗した、または
@@ -906,8 +929,19 @@
 	*/
 	.poll-stale,
 	.legacy-selection,
-	.status-unconfirmed {
+	.status-unconfirmed,
+	.tls-warnings-lead,
+	.tls-warnings {
 		color: var(--banto-text);
+	}
+
+	.tls-warnings-lead {
+		margin: 0.5rem 0 0;
+	}
+
+	.tls-warnings {
+		margin: 0.25rem 0 0;
+		padding-left: 1.25rem;
 	}
 
 	.hub-subheading {

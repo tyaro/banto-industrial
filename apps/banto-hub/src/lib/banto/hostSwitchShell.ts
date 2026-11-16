@@ -14,6 +14,8 @@ import { invoke } from '@tauri-apps/api/core';
 
 /** `host_switch_status` の戻り値。 */
 export type HostSwitchStatus = {
+	ingestOrigin?: string | null;
+	desktopTls?: { label: string; reason: string | null; remedy: string } | null;
 	scmState: string | null;
 	autoStart: boolean;
 	canOperate: boolean;
@@ -65,6 +67,19 @@ export function isLocalShell(): boolean {
 /** SCM / ビュー / 権限のスナップショット。 */
 export async function getHostSwitchStatus(): Promise<HostSwitchStatus> {
 	return (await invoke('host_switch_status')) as HostSwitchStatus;
+}
+
+/** Shell UI origin is process-private; never advertise it to senders. */
+export async function getClientIngestOrigin(
+	browserOrigin: string,
+	shell = isLocalShell()
+): Promise<string | null> {
+	if (!shell) return browserOrigin || null;
+	try {
+		return (await getHostSwitchStatus()).ingestOrigin ?? null;
+	} catch {
+		return null;
+	}
 }
 
 /** Desktop/Offline → Service。 */

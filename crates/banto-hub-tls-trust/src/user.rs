@@ -242,11 +242,20 @@ pub enum UserFault {
     /// 数える。鍵なら読まれた恐れ、フォルダ・証明書なら差し替えられた恐れがあり、ACL が直っても
     /// その証明書は二度と使わない（設計 §4.4「露出を見た証明書は二度と使わない」）。
     Exposed,
-    /// 露出ではないが信じられない（所有者が違う・リンク・ハードリンク・種類や場所の食い違い・
+    /// 所有者が違う。所有者は読み取りを足せるので、Hub は失効に入れる（PR2）。
+    ForeignOwner,
+    /// 露出ではないが信じられない（リンク・ハードリンク・種類や場所の食い違い・
     /// ドライブの種類・置き場の指定）。
     Untrusted,
     /// 壊れている（証明書はあるが鍵が無い・証明書が読める形でない）。
     Broken,
+}
+
+impl UserFault {
+    /// 失効に入れる種類（PR2 の決定）。所有者は鍵の読み取りを自分に足せるので露出と同じ扱い。
+    pub fn revokes(self) -> bool {
+        matches!(self, Self::Exposed | Self::ForeignOwner)
+    }
 }
 
 /// 「あるが通らない」の理由（表示用の日本語の文。鍵の中身は含めない）と対処の種類。
@@ -280,7 +289,7 @@ fn problem_with(reason: String, remedy: UserRemedy, fault: UserFault) -> UserPla
 }
 
 /// [`user_place_problems`] の結果の種類: 許可（ACL）に由来する理由が 1 つでもあれば露出、
-/// 無ければ「信じられない」（所有者・リンク・ハードリンクだけ）。
+/// 無ければ所有者の違い、残りは「信じられない」（リンク・ハードリンクだけ）。
 pub(crate) fn fault_of(found: &[Exposure]) -> UserFault {
     let open_to_others = found.iter().any(|found| {
         matches!(
@@ -293,6 +302,11 @@ pub(crate) fn fault_of(found: &[Exposure]) -> UserFault {
     });
     if open_to_others {
         UserFault::Exposed
+    } else if found
+        .iter()
+        .any(|item| matches!(item, Exposure::ForeignOwner(_)))
+    {
+        UserFault::ForeignOwner
     } else {
         UserFault::Untrusted
     }
@@ -859,14 +873,21 @@ pub struct UnusableUserCert {
 }
 
 impl UnusableUserCert {
-    /// 露出を見た証明書の拇印（失効の記録に書き足すもの。§4.4.2 の場面 6・7）。露出
-    /// （[`UserFault::Exposed`]）で、証明書の形が読めたときだけ `Some`。所有者の違い・リンク・
+    /// 失効の記録に書き足す拇印（PR2 の決定、§4.4.2 の場面 6・7）。露出・所有者の違い
+    /// （[`UserFault::revokes`]）で証明書の形が読めたときだけ `Some`。リンク・ハードリンク・
     /// 壊れ・一時的な失敗は `None`（pin に入れないのは同じだが、失効には入れない）。
-    pub fn exposed_thumbprint(&self) -> Option<CertThumbprint> {
-        match (&self.problem.fault, &self.seen) {
-            (UserFault::Exposed, UncheckedUserCert::Seen(seen)) => Some(seen.thumbprint),
+    pub fn revocation_thumbprint(&self) -> Option<CertThumbprint> {
+        match &self.seen {
+            UncheckedUserCert::Seen(seen) if self.problem.fault.revokes() => Some(seen.thumbprint),
             _ => None,
         }
+    }
+
+    /// [`Self::revocation_thumbprint`] の互換の別名。名前は露出だが、PR2 以降は所有者の違いも
+    /// 失効に入れる。新しい呼び出し側は意味を表す `revocation_thumbprint` を使う。
+    #[deprecated(note = "use revocation_thumbprint")]
+    pub fn exposed_thumbprint(&self) -> Option<CertThumbprint> {
+        self.revocation_thumbprint()
     }
 }
 
@@ -989,8 +1010,8 @@ pub fn peek_user_cert<O: UserTlsOps, P: UserTlsPlace + ?Sized>(
 /// 「あるが通らない」（鍵の無い証明書を pin にしない）。
 ///
 /// 「あるが通らない」ときは、理由の種類（[`UserFault`]）と、形だけ読めた証明書
-/// （[`UnusableUserCert::seen`]）を付けて返す。露出なら、呼ぶ側がその拇印
-/// （[`UnusableUserCert::exposed_thumbprint`]）を失効の記録に書き足す
+/// （[`UnusableUserCert::seen`]）を付けて返す。露出か所有者の違いなら、呼ぶ側がその拇印
+/// （[`UnusableUserCert::revocation_thumbprint`]）を失効の記録に書き足す
 /// （[`crate::record_user_revocation`]）。
 pub fn load_pinned_user_cert<O: UserTlsOps, P: UserTlsPlace + ?Sized>(
     ops: &O,

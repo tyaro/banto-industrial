@@ -122,6 +122,20 @@ describe('hubStatusDetail', () => {
 	it('連携が必要の説明はロックダウン済みで自動発行しないことを述べる', () => {
 		expect(hubStatusDetail({ state: 'needsPairing' })).toContain('ロックダウン');
 	});
+
+	it('未設定の案内は動かし方ごとに分かれる（desktop は Hub のデスクトップ版も案内する）', () => {
+		const notConfigured = { state: 'notConfigured' } as const;
+		const desktop = hubStatusDetail(notConfigured, 'desktop');
+		const service = hubStatusDetail(notConfigured, 'service');
+		expect(desktop).toContain('Hubのデスクトップ版を起動しておくか');
+		expect(desktop).toContain('prepare-hub-tls');
+		expect(service).not.toContain('デスクトップ版');
+		expect(service).toContain('Hubをサービスで動かし、管理者で prepare-hub-tls');
+		expect(hubStatusDetail(notConfigured)).toBe(service);
+		expect(hubStatusDisplay(notConfigured, null, null, { phase: 'idle' }, 'desktop').detail).toBe(
+			desktop
+		);
+	});
 });
 
 describe('hubUnreachableCauseLabel', () => {

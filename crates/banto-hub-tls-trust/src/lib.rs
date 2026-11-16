@@ -131,8 +131,8 @@
 //!   見た」と「操作が終わらなかった」を分ける。警告の理由（[`RevocationWarning`]）も返す。
 //!   「この回はできなかった」が何周期続いたら止めるかは、呼ぶ側が数える。
 //! - **失効を書き足す口**（[`record_user_revocation`]）は同じ手順で、和に拇印を足して両方に
-//!   書く。露出を見た証明書の拇印は [`load_pinned_user_cert`] の「あるが通らない」
-//!   （[`UnusableUserCert::exposed_thumbprint`]）から取る。
+//!   書く。露出・所有者の違いを見た証明書の拇印は [`load_pinned_user_cert`] の「あるが通らない」
+//!   （[`UnusableUserCert::revocation_thumbprint`]）から取る。
 //! - **書き方**（[`RevocationOps`]。Windows の実装は `win::WindowsTlsTrustOps`、部品は
 //!   `banto_safe_root`）: 置き場を [`open_user_place`] の確かめに通した直後に、**握ったフォルダの
 //!   ハンドル基準**でだけ書く（パスで開き直さない）。記録は「同じフォルダの一時ファイル →
@@ -142,6 +142,10 @@
 //!   [`DEFAULT_LOCK_WAIT`]）。名前付き mutex は使わない（別のアカウントが先に作って握れる）。
 //!   ロックファイルも、置き場のフォルダと、開いた後のハンドルで確かめる。取れない・通らない
 //!   ときは何も書かない。握ったプロセスが落ちれば OS がハンドルを閉じるので、残らない。
+//! - **証明書の作成中も保持する口**（[`lock_user_revocations`]・[`LockedUserRevocations`]）:
+//!   Hub は先に `tls\` の排他を取り、記録の初期化・消失修復後の再確認から鍵と証明書の作成・
+//!   公開・最後の照合まで記録の排他も保つ。保持中の書き足しも同じ型で行い、取り直さない。
+//!   通常の整える口・書き足す口の契約は変えない。
 //!
 //! ## サービスの失効の記録（#1121 PR2b、2026-11-14 オーナー決定）
 //!
@@ -162,7 +166,9 @@
 //!   は、失効に入れる種類（露出・所有者の違い）を [`PlaceFault`] で持つ。サービスの Hub はそれを
 //!   見たら、ディスク上の証明書を形だけ読み（[`peek_service_cert`]）、拇印を
 //!   [`record_service_revocations`] で書き足す（健全なら和で置き換え、無ければ置き換えずに作る。
-//!   壊れた記録・通らない置き場には書かない）。クライアントは [`PlaceFault`] を見ない。
+//!   壊れた記録・通らない置き場には書かない）。クライアントはサービスの記録には書かない
+//!   （#1121 PR4a: ChronoGazer デスクトップは [`PlaceFault`] を見て、[`peek_service_cert`] の
+//!   拇印を利用者の記録に書き足す。chronogazer-server はプロセスの間だけ覚える）。
 //!
 //! ## テスト
 //!
@@ -191,11 +197,12 @@ pub use place::{
     Unavailable,
 };
 pub use revocation::{
-    read_user_revocations, reconcile_user_revocations, record_user_revocation, CertThumbprint,
-    ReconcileOptions, ReconcileOutcome, ReconcileReport, RecordState, RevocationOps,
-    RevocationRecord, RevocationSide, RevocationWarning, RevokedCert, RevokedCertPlace,
-    SideContent, UserRevocations, DEFAULT_LOCK_POLL, DEFAULT_LOCK_WAIT, MAX_REVOCATIONS_BYTES,
-    REVOCATIONS_FILE, REVOCATIONS_HEADER,
+    lock_user_revocations, read_user_revocations, reconcile_user_revocations,
+    record_user_revocation, CertThumbprint, LockedUserRevocations, ReconcileOptions,
+    ReconcileOutcome, ReconcileReport, RecordState, RevocationOps, RevocationRecord,
+    RevocationSide, RevocationWarning, RevokedCert, RevokedCertPlace, SideContent, UserRevocations,
+    DEFAULT_LOCK_POLL, DEFAULT_LOCK_WAIT, MAX_REVOCATIONS_BYTES, REVOCATIONS_FILE,
+    REVOCATIONS_HEADER,
 };
 pub use service_revocation::{
     create_service_revocations_if_absent, ensure_service_revocations,

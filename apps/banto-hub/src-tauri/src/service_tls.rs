@@ -58,7 +58,10 @@
 //! 決定 A・B）。そのときシェルは平文の 8722 へ navigate せず、Fallback の窓に理由と対処
 //! （[`TLS_REMEDY`]、`tray_status::describe_health_outcome`）を出す。
 //!
-//! Desktop モード（このプロセスが握る自分の Hub）は今の main では平文のまま（#1121 で TLS 化）。
+//! Desktop の Windows WebView2 は、プロセス所有の専用 origin でだけメモリ上の証明書を
+//! pin にする（[`crate::shell_tls`]）。サービスの pin は従来どおりディスクから読む。
+//! 非 Windows の Desktop はプロセスの間だけ同じ socket を保持する HTTP origin を使用する
+//! （ポートは起動ごとに OS が選ぶ。設計 §4.5）。
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -165,31 +168,57 @@ pub(crate) fn allowance_is_stale(
 /// 断る（`CANCEL`、理由はログにだけ出す）。
 ///
 /// 確かめる順: URI → エラーの種類 → 相手の証明書 → pin（pin はここまで通ったときだけ読む）。
-/// - `request_uri`: `https`（WebSocket は `wss`）・ホスト `127.0.0.1`・ポート [`SERVICE_TLS_PORT`] だけ。
+/// - `request_uri`: service の固定 HTTPS origin または許可済み Desktop origin（WebSocket は `wss`）。
 /// - `untrusted_authority`: エラーの種類が「信頼できない証明書」（`CERTIFICATE_IS_INVALID`）か。
 ///   名前の不一致・期限切れ・失効などは、pin と一致しても断る（probe の rustls も断る）。
 /// - `server_pem`: 相手の証明書（`ToPemEncoding`。取れなければ `Err`）。
-/// - `read_pin`: その場で `tls\` を確かめて読む（[`read_hub_cert_pem`]）。
+/// - `read_pin`: URI から一度だけ選んだ [`PinSource`] を渡す。呼び出し側で URI/port を再判定しない。
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PinSource {
+    Service,
+    Desktop,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn certificate_pin_source(
+    uri: &tauri::Url,
+    desktop_origin: impl FnOnce(&tauri::Url) -> bool,
+) -> Result<PinSource, String> {
+    if !uri.username().is_empty() || uri.password().is_some() {
+        return Err("資格情報を含む URI の証明書は許可しません".into());
+    }
+    if matches!(uri.scheme(), "https" | "wss")
+        && uri.host_str() == Some(SERVICE_TLS_HOST)
+        && uri.port_or_known_default() == Some(SERVICE_TLS_PORT)
+    {
+        return Ok(PinSource::Service);
+    }
+    let mut desktop = uri.clone();
+    if desktop.scheme() == "wss" {
+        let _ = desktop.set_scheme("https");
+    }
+    if desktop_origin(&desktop) {
+        return Ok(PinSource::Desktop);
+    }
+    Err(format!(
+        "許可した Hub の TLS origin ではありません（{}://{}）",
+        uri.scheme(),
+        uri.host_str().unwrap_or("")
+    ))
+}
+
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn certificate_error_action(
     request_uri: &str,
     untrusted_authority: bool,
     server_pem: Result<String, String>,
-    read_pin: impl FnOnce() -> Result<Vec<u8>, String>,
+    read_pin: impl FnOnce(PinSource) -> Result<Vec<u8>, String>,
 ) -> Result<Vec<u8>, String> {
     let uri =
         tauri::Url::parse(request_uri).map_err(|_| "要求の URI を解釈できません".to_string())?;
     // WebSocket（`wss`）も同じ口・同じ pin（イベントは WebSocket を含むすべての資源で来る）。
-    let is_hub_tls = matches!(uri.scheme(), "https" | "wss")
-        && uri.host_str() == Some(SERVICE_TLS_HOST)
-        && uri.port_or_known_default() == Some(SERVICE_TLS_PORT);
-    if !is_hub_tls {
-        return Err(format!(
-            "Hub の TLS の口（https://{SERVICE_TLS_HOST}:{SERVICE_TLS_PORT}）ではない相手の証明書の誤りです（{}://{}）",
-            uri.scheme(),
-            uri.host_str().unwrap_or("")
-        ));
-    }
+    let source = certificate_pin_source(&uri, crate::shell_tls::desktop_origin)?;
     if !untrusted_authority {
         return Err(
             "想定外の種類の証明書の誤りです（信頼できない証明書だけを pin で確かめます）"
@@ -199,7 +228,7 @@ pub(crate) fn certificate_error_action(
     let server_pem = server_pem?;
     let server_der = banto_hub_tls_trust::parse_single_certificate(server_pem.as_bytes())
         .map_err(|why| format!("相手の証明書を読めません: {why}"))?;
-    let pin_pem = read_pin()?;
+    let pin_pem = read_pin(source)?;
     let pin_der = banto_hub_tls_trust::parse_single_certificate(&pin_pem)
         .map_err(|why| format!("Hub の証明書（pin）を読めません: {why}"))?;
     if server_der != pin_der {
@@ -209,7 +238,7 @@ pub(crate) fn certificate_error_action(
 }
 
 /// メインの窓の WebView2 に `ServerCertificateErrorDetected` のハンドラを 1 回だけ付ける（窓を
-/// 作った直後の `setup` から呼ぶ。Desktop モードの平文の http では来ないので害は無い）。付けられ
+/// 作った直後の `setup` から呼ぶ。Desktop の pin は同じプロセスのメモリから取る）。付けられ
 /// なければログに残すだけ - そのときは WebView2 の既定（証明書の誤りのページ）になり、Service の
 /// 画面は開かない（安全側）。
 #[cfg(windows)]
@@ -386,12 +415,13 @@ unsafe fn decide_and_set(
             unsafe { cert.ToPemEncoding(&mut pem) }.map(|()| webview2_com::take_pwstr(pem))
         })
         .map_err(|err| format!("相手の証明書を取れません: {err}"));
-    let decision = certificate_error_action(
-        &request_uri,
-        untrusted_authority,
-        server_pem,
-        read_hub_cert_pem,
-    );
+    let decision =
+        certificate_error_action(&request_uri, untrusted_authority, server_pem, |source| {
+            match source {
+                PinSource::Service => read_hub_cert_pem(),
+                PinSource::Desktop => crate::shell_tls::read_pin(&request_uri),
+            }
+        });
     let action = match decision {
         Ok(der) => {
             log_line(&format!(
@@ -419,6 +449,62 @@ unsafe fn decide_and_set(
 
 #[cfg(test)]
 mod tests {
+    fn certificate_error_action(
+        request_uri: &str,
+        untrusted_authority: bool,
+        server_pem: Result<String, String>,
+        read_pin: impl FnOnce() -> Result<Vec<u8>, String>,
+    ) -> Result<Vec<u8>, String> {
+        super::certificate_error_action(request_uri, untrusted_authority, server_pem, |_| {
+            read_pin()
+        })
+    }
+
+    #[test]
+    fn pin_source_uses_the_complete_origin_and_preserves_websocket_mapping() {
+        use super::*;
+        let desktop = tauri::Url::parse("https://127.0.0.1:49152/").unwrap();
+        for (uri, expected) in [
+            ("https://127.0.0.1:8723/", PinSource::Service),
+            ("wss://127.0.0.1:8723/api/stream", PinSource::Service),
+            ("https://127.0.0.1:49152/", PinSource::Desktop),
+            ("wss://127.0.0.1:49152/api/stream", PinSource::Desktop),
+        ] {
+            assert_eq!(
+                certificate_pin_source(&tauri::Url::parse(uri).unwrap(), |uri| {
+                    crate::shell_tls::is_origin(uri, &desktop)
+                }),
+                Ok(expected)
+            );
+        }
+        for uri in [
+            "https://evil.example:8723/",
+            "http://127.0.0.1:49152/",
+            "https://127.0.0.1:49153/",
+            "https://user@127.0.0.1:8723/",
+        ] {
+            assert!(
+                certificate_pin_source(&tauri::Url::parse(uri).unwrap(), |uri| {
+                    crate::shell_tls::is_origin(uri, &desktop)
+                })
+                .is_err(),
+                "{uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn certificate_verification_passes_its_selected_source_to_the_pin_reader_once() {
+        let (hub, _) = two_certs();
+        let called = std::cell::Cell::new(0);
+        super::certificate_error_action(HUB_URI, true, Ok(hub.clone()), |source| {
+            assert_eq!(source, super::PinSource::Service);
+            called.set(called.get() + 1);
+            Ok(hub.into_bytes())
+        })
+        .unwrap();
+        assert_eq!(called.get(), 1);
+    }
     use super::*;
 
     const HUB_URI: &str = "https://127.0.0.1:8723/api/v1/openapi.json";

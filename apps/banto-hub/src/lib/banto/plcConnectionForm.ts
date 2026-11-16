@@ -706,7 +706,7 @@ export interface IngestEndpoints {
 }
 
 /**
- * `origin`（`window.location.origin`。管理画面を開いている Hub）と接続 id から、
+ * クライアント向け listener の `origin` と接続 id から、
  * 送り手向けの URL とスコープを組み立てる。WS は `http` → `ws`・`https` → `wss`。
  */
 export function ingestEndpoints(origin: string, connectionId: number): IngestEndpoints {
@@ -716,6 +716,17 @@ export function ingestEndpoints(origin: string, connectionId: number): IngestEnd
 		wsUrl: `${base.replace(/^http/, 'ws')}/api/v1/ingest/${connectionId}/stream`,
 		scope: `ingest:#${connectionId}`
 	};
+}
+
+/** Only these literal loopback hosts need the same-PC sender notice. */
+export function ingestUsesLoopback(origin: string | null): boolean {
+	if (!origin) return false;
+	try {
+		const hostname = new URL(origin).hostname;
+		return hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '::1';
+	} catch {
+		return false;
+	}
 }
 
 /**
