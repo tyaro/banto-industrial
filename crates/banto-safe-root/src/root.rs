@@ -944,11 +944,27 @@ impl SafeRoot {
         specs: &[ManagedSpec],
         create_access: Option<&DirAccess>,
     ) -> std::result::Result<ManagedSet, ManagedStop> {
+        self.open_managed_under(&self.dir, specs, create_access)
+    }
+
+    /// [`SafeRoot::open_managed`] と同じ確かめで、`parent` が `None` の spec を**ルートの代わりに
+    /// `base` の直下**に開いて握る（#623 PR6）。`base` は、このルートから
+    /// [`SafeRoot::open_managed`] などで握った管理するフォルダ（例: profile の `data`）を渡す。
+    /// 既に握っている `base` を親にするので、同じフォルダを 2 回握らない（`data\opcua\pki\…`
+    /// のように、別の持ち主が後から足す木を、起動のたびに開いて握るため）。所有者の確かめは
+    /// このルートの [`RootSpec::owners`] を使う。`base` が別のルートの物でも開けるが、確かめの
+    /// 相手が食い違うので渡さない。
+    pub fn open_managed_under(
+        &self,
+        base: &ManagedDir,
+        specs: &[ManagedSpec],
+        create_access: Option<&DirAccess>,
+    ) -> std::result::Result<ManagedSet, ManagedStop> {
         check_specs(specs)?;
         let mut dirs: Vec<(&'static str, ManagedDir)> = Vec::with_capacity(specs.len());
         for spec in specs {
             let parent = match spec.parent {
-                None => &self.dir,
+                None => base,
                 Some(key) => {
                     &dirs
                         .iter()

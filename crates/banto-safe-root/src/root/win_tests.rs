@@ -1838,3 +1838,57 @@ fn rename_no_replace_checked_refuses_when_the_dir_does_not_match() {
     assert!(d.rename_no_replace_checked("f", "g", &access).unwrap());
     assert!(d.final_path().join("g").exists());
 }
+
+/// #623 PR6: [`SafeRoot::open_managed_under`] は、握った管理するフォルダを親にして、その下を
+/// 1 段ずつ握る（作るときは `create_access` を付ける）。握っている間は途中の段の名前を変え
+/// られず、途中の段がリンクなら止まって外に何も作らない。
+#[test]
+fn open_managed_under_holds_the_tree_below_a_held_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let access = DirAccess::with_install_user(me());
+    let root = open_root(&guarded(dir.path().join("root"))).unwrap();
+    // `data` は親から継承（ジャンクションを利用者のまま作って開けるように）。
+    let mut set = root
+        .open_managed(&[spec("data", None, "data")], None)
+        .unwrap();
+    let data = set.take("data").unwrap();
+    let below = root
+        .open_managed_under(
+            &data,
+            &[spec("a", None, "a"), spec("b", Some("a"), "b")],
+            Some(&access),
+        )
+        .unwrap();
+    let b = below.get("b").unwrap();
+    assert!(b.is_guarded());
+    assert!(guard::paths_match(
+        b.final_path(),
+        &data.final_path().join("a").join("b")
+    ));
+    let dacl = crate::acl::read_dir_dacl(b.final_path()).unwrap();
+    crate::acl::check_dacl(&dacl, &access).unwrap();
+    std::fs::rename(data.final_path().join("a"), data.final_path().join("a2"))
+        .expect_err("握っている間に途中の段の名前を変えられた");
+    drop(below);
+    std::fs::rename(data.final_path().join("a"), data.final_path().join("a2")).unwrap();
+
+    // 途中の段がジャンクションなら止まり、外に何も作らない。
+    let (outside, _victim) = outside_with_victim();
+    junction(&data.final_path().join("j"), outside.path());
+    let before = snapshot(outside.path());
+    let stop = root
+        .open_managed_under(
+            &data,
+            &[spec("j", None, "j"), spec("k", Some("j"), "k")],
+            Some(&access),
+        )
+        .unwrap_err();
+    assert_eq!(stop.key, "j");
+    assert_eq!(
+        stop.reason,
+        ManagedRefusal::Refused(Refusal::ReparsePoint {
+            tag: TAG_MOUNT_POINT
+        })
+    );
+    assert_eq!(snapshot(outside.path()), before);
+}
