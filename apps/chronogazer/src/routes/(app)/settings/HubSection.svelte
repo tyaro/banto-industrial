@@ -684,14 +684,17 @@
 			{#if endpointProblem}
 				<p class="error" role="status">{endpointProblem}</p>
 			{/if}
-			{#if tlsWarnings.length > 0}
-				<p class="tls-warnings-lead">同じ PC の Hub の証明書について:</p>
-				<ul class="tls-warnings" role="status">
-					{#each tlsWarnings as warning, i (i)}
-						<li>{warning}</li>
-					{/each}
-				</ul>
-			{/if}
+			<!-- ライブ領域は常に描き、中身だけを出し入れする（初回描画の role="status" は読み上げられないことがある。#1149 のレビュー P2） -->
+			<div class="tls-warnings-region" role="status">
+				{#if tlsWarnings.length > 0}
+					<p class="tls-warnings-lead">同じ PC の Hub の証明書について:</p>
+					<ul class="tls-warnings">
+						{#each tlsWarnings as warning, i (i)}
+							<li>{warning}</li>
+						{/each}
+					</ul>
+				{/if}
+			</div>
 			{#if showStatusRecheckButton(statusDisplay, status, configured)}
 				<!--
 					#449 再レビュー P2 / 3 回目のレビュー: 取り直しに失敗した、または
