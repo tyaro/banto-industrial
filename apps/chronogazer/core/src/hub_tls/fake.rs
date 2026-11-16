@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use banto_hub_tls_trust::{CertThumbprint, ReconcileOutcome, RevokedCertPlace};
 
-use super::places::{CertRead, HubTlsPlaces, ReconcileRead, ServiceRecordRead, UnusableCert};
+use super::places::{
+    CertRead, HubTlsPlaces, ReconcileRead, ServiceRecordRead, UnusableCert, UserRecordRead,
+};
 use super::HubTlsPolicy;
 
 /// 口ごとの呼ばれた回数。
@@ -27,12 +29,19 @@ struct Inner {
     service_record: ServiceRecordRead,
     user: CertRead,
     user_revoked: BTreeSet<CertThumbprint>,
+    /// ロック無しの読みで、記録 A・B が整って見えるか。
+    user_record_settled: bool,
+    /// 整える手順が結果を読んだ後、返す前に呼ぶ（試験が待たせる・記録を書き換える）。引数は
+    /// 何回目の整える手順か（1 始まり）。
+    after_reconcile_read: Option<ReconcileHook>,
     /// 次の整える手順の結果（空なら `reconcile_outcome` で警告なし）。
     scripted: VecDeque<(ReconcileOutcome, bool, Vec<String>)>,
     reconcile_outcome: ReconcileOutcome,
     record_fails: bool,
     calls: Calls,
 }
+
+type ReconcileHook = Arc<dyn Fn(usize) + Send + Sync>;
 
 pub(crate) struct FakePlaces(Mutex<Inner>);
 
@@ -72,6 +81,8 @@ impl FakePlaces {
             service_record: ServiceRecordRead::Revoked(BTreeSet::new()),
             user: CertRead::Absent,
             user_revoked: BTreeSet::new(),
+            user_record_settled: true,
+            after_reconcile_read: None,
             scripted: VecDeque::new(),
             reconcile_outcome: ReconcileOutcome::Consistent,
             record_fails: false,
@@ -121,6 +132,24 @@ impl FakePlaces {
         self.inner().user_revoked.insert(thumbprint);
     }
 
+    /// 利用者の記録 A・B を消す（拇印が無くなり、ロック無しの読みでは「整っていない」）。
+    pub(crate) fn wipe_user_record(&self) {
+        let mut inner = self.inner();
+        inner.user_revoked.clear();
+        inner.user_record_settled = false;
+    }
+
+    /// ロック無しの読みで、記録 A・B が整って見えるか（既定は見える）。
+    pub(crate) fn set_user_record_settled(&self, settled: bool) {
+        self.inner().user_record_settled = settled;
+    }
+
+    /// 整える手順が結果を読んだ**後**、返す前に呼ぶ口（偽物のロックの外で呼ぶ）。試験が
+    /// ここで待たせると、「先に読んだ結果を後から返す」回を作れる。引数は何回目か（1 始まり）。
+    pub(crate) fn after_reconcile_read(&self, hook: impl Fn(usize) + Send + Sync + 'static) {
+        self.inner().after_reconcile_read = Some(Arc::new(hook));
+    }
+
     pub(crate) fn user_revoked(&self) -> BTreeSet<CertThumbprint> {
         self.inner().user_revoked.clone()
     }
@@ -166,10 +195,13 @@ impl HubTlsPlaces for FakePlaces {
         inner.user.clone()
     }
 
-    fn user_revocations(&self) -> BTreeSet<CertThumbprint> {
+    fn user_revocations(&self) -> UserRecordRead {
         let mut inner = self.inner();
         inner.calls.user_record += 1;
-        inner.user_revoked.clone()
+        UserRecordRead {
+            revoked: inner.user_revoked.clone(),
+            settled: inner.user_record_settled,
+        }
     }
 
     fn reconcile_user_revocations(&self) -> ReconcileRead {
@@ -180,12 +212,18 @@ impl HubTlsPlaces for FakePlaces {
                 .scripted
                 .pop_front()
                 .unwrap_or((inner.reconcile_outcome, false, Vec::new()));
-        ReconcileRead {
+        let read = ReconcileRead {
             outcome,
             saw_loss,
             warnings,
             revoked: inner.user_revoked.clone(),
+        };
+        let (hook, nth) = (inner.after_reconcile_read.clone(), inner.calls.reconcile);
+        drop(inner);
+        if let Some(hook) = hook {
+            hook(nth);
         }
+        read
     }
 
     fn record_user_revocation(

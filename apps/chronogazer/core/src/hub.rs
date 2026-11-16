@@ -1468,7 +1468,7 @@ enum Trigger {
 /// `GET /api/v1/tags` を叩き続けても Hub の負荷にならない粒度。画面を
 /// 開いているときの 2 秒ポーリングは**メモリしか読まない**別物なので、
 /// こちらだけが実際のネットワーク再試行の頻度になる。
-const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Hub への 1 往復（ネットワークを伴う bootstrapper 呼び出し）に許す最大
 /// 時間（#394 のレビュー P1-1）。
@@ -2546,7 +2546,7 @@ impl HubService {
         // **Hub 側にキーを発行させる唯一の経路**なので上限は
         // [`HUB_MUTATING_TIMEOUT`]（#395 のレビュー B）。打ち切りは Hub 側の
         // 発行を取り消せないので、その可能性を理由に載せる。
-        // #1121 PR4a: 入力された接続先についても、起動の初回の整える手順を先に済ませる
+        // #1121 PR4a: 入力された接続先についても、操作の入口の整える手順を先に済ませる
         // （`begin_operation` が見たのは保存済みの接続先）。
         self.inner.tls.ensure_started(endpoint).await;
         let call = with_timeout(
@@ -2954,8 +2954,8 @@ impl HubService {
         }
         self.hydrate_keeping_pending().await?;
         // #1121 PR4a: 保存済みの接続先が同じ PC の Hub なら、Hub と話す前に、利用者の失効の
-        // 記録を整える手順の起動の初回を済ませる（済んでいれば何もしない。以後は見張りの
-        // 周期が走らせる）。済むまでは、利用者の置き場の証明書を pin に使い始めない。
+        // 記録を整える（[`HubTlsPolicy::ensure_started`]。見張りの周期の間に「整っている」と分かって
+        // いれば何もしない）。整うまでは、利用者の置き場の証明書を pin に使い始めない。
         if let Some(record) = self.inner.mirror.current() {
             self.inner.tls.ensure_started(&record.endpoint).await;
         }

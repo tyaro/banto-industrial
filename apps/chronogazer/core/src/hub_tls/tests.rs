@@ -456,7 +456,7 @@ async fn the_user_certificate_is_first_used_only_after_a_consistent_reconcile() 
 
 /// 起動の初回の整える手順が「できなかった」で終わっても、次の `ensure_started` で走らせ直す
 /// （保存済みの接続が無い PC では見張りが `refresh` を呼ばない）。「整っている」になれば、
-/// それ以後は走らせない。
+/// 新しい間（30 秒）は走らせない。
 #[tokio::test]
 async fn ensure_started_reruns_until_the_reconcile_is_consistent() {
     let places = FakePlaces::new();
@@ -475,6 +475,215 @@ async fn ensure_started_reruns_until_the_reconcile_is_consistent() {
 
     policy.ensure_started(HUB).await;
     assert_eq!(places.calls().reconcile, 2, "consistent: not run again");
+}
+
+/// 消失を見た整える手順の代わり: `nth` 回目の整える手順が、今ある利用者の証明書を失効に入れて
+/// 記録を作り直す（設計 §4.4.1「記録を新しく作るときの決まり」）。結果は試験が別に決める。
+fn repair_on_reconcile(places: &Arc<FakePlaces>, nth: usize, existing: CertThumbprint) {
+    let weak = Arc::downgrade(places);
+    places.after_reconcile_read(move |call| {
+        if call == nth {
+            let places = weak.upgrade().expect("the places");
+            places.revoke_in_user_record(existing);
+            places.set_user_record_settled(true);
+        }
+    });
+}
+
+/// 入口は、古い「整っている」を信じない: 保存済みの接続が無い PC（見張りが `refresh` を
+/// 呼ばない）で、「整っている」の後に記録を消されても、見張りの周期（30 秒）を過ぎた入口が
+/// 整え直すので、失効していた利用者の証明書を空の記録で使い始めない。30 秒以内は省く。
+#[tokio::test]
+async fn an_entry_reconciles_again_once_the_last_result_is_older_than_a_cycle() {
+    let user = cert_pem();
+    let places = FakePlaces::new();
+    places.set_user(usable(&user));
+    places.revoke_in_user_record(thumbprint(&user));
+    let policy = started_desktop(&places).await;
+    assert!(refusal(&policy).contains("失効"));
+    assert_eq!(places.calls().reconcile, 1);
+
+    // 30 秒以内の入口（状態の取得のポーリングなど）は走らせない。
+    policy.advance_clock(RECONCILE_FRESH_FOR - Duration::from_secs(1));
+    policy.ensure_started(HUB).await;
+    assert_eq!(places.calls().reconcile, 1, "fresh: not run again");
+
+    // 記録が消された。次の入口は 30 秒を過ぎているので、Hub と話す前に整え直す。
+    places.wipe_user_record();
+    places.push_reconcile(ReconcileOutcome::Refused, true, "記録が消された");
+    repair_on_reconcile(&places, 2, thumbprint(&user));
+    policy.advance_clock(Duration::from_secs(1));
+    policy.ensure_started(HUB).await;
+    assert_eq!(places.calls().reconcile, 2, "stale: run again at the entry");
+    assert!(refusal(&policy).contains("失効"));
+    assert!(warnings(&policy)
+        .iter()
+        .any(|warning| warning.contains("記録が消された")));
+}
+
+/// 30 秒以内でも、ロック無しの読みが記録の「整っていない」（消された・壊れた）を見たら、
+/// 最後の結果が「整っている」のままでも利用者の証明書を使い始めない。次の入口は 30 秒を
+/// 待たずに整え直す。
+#[tokio::test]
+async fn a_wiped_record_keeps_a_revoked_user_certificate_out_even_while_fresh() {
+    let user = cert_pem();
+    let places = FakePlaces::new();
+    places.set_user(usable(&user));
+    places.revoke_in_user_record(thumbprint(&user));
+    let policy = started_desktop(&places).await;
+    assert!(refusal(&policy).contains("失効"));
+
+    // 記録が消された直後の操作: 入口は省かれる（新しい「整っている」）が、判定のロック無しの
+    // 読みが見る。
+    places.wipe_user_record();
+    policy.ensure_started(HUB).await;
+    assert_eq!(places.calls().reconcile, 1);
+    let detail = refusal(&policy);
+    assert!(detail.contains("整っていない"), "{detail}");
+
+    // サービスの証明書は止めない（利用者の証明書は入らないまま）。
+    places.set_service(usable(&cert_pem()));
+    assert!(connects(&policy));
+    assert!(warnings(&policy)
+        .iter()
+        .any(|warning| warning.contains("整っていない")));
+
+    // 次の入口は、30 秒を待たずに整え直す（消失の直しで、今ある証明書が失効に入る）。
+    places.push_reconcile(ReconcileOutcome::Refused, true, "記録が消された");
+    repair_on_reconcile(&places, 2, thumbprint(&user));
+    policy.ensure_started(HUB).await;
+    assert_eq!(places.calls().reconcile, 2);
+    assert!(connects(&policy));
+    assert!(warnings(&policy)
+        .iter()
+        .any(|warning| warning.contains("失効")));
+}
+
+/// すでに pin に使っている利用者の証明書は、ロック無しの読みが「整っていない」を見ても、次の
+/// 整える手順まで保つ（ほかのプロセスが書いている途中にも起きる）。次の入口がすぐ整え直し、
+/// その結果が「通らない」なら外す。
+#[tokio::test]
+async fn a_user_certificate_in_use_is_kept_until_the_next_reconcile_decides() {
+    let places = FakePlaces::new();
+    places.set_user(usable(&cert_pem()));
+    let policy = started_desktop(&places).await;
+    assert!(connects(&policy));
+
+    places.set_user_record_settled(false);
+    assert!(connects(&policy), "kept until the reconcile has looked");
+
+    // 書いている途中だっただけ: 整え直して「整っている」。
+    places.set_user_record_settled(true);
+    policy.ensure_started(HUB).await;
+    assert_eq!(places.calls().reconcile, 2, "run again although fresh");
+    assert!(connects(&policy));
+    policy.ensure_started(HUB).await;
+    assert_eq!(places.calls().reconcile, 2);
+
+    // 本当に消されていた: 整え直した結果が「通らない」なので、すぐ外す。
+    places.set_user_record_settled(false);
+    assert!(connects(&policy));
+    places.set_reconcile(ReconcileOutcome::Refused);
+    policy.ensure_started(HUB).await;
+    assert_eq!(places.calls().reconcile, 3);
+    assert!(refusal(&policy).contains("確かめに通らない"));
+}
+
+/// 整える手順を待たせる口: `nth` 回目が結果を読んだ後で止まり、止まったことを知らせる。
+/// 返した送り口に送る（か捨てる）と進む。
+fn hold_reconcile(
+    places: &Arc<FakePlaces>,
+    nth: usize,
+    then: ReconcileOutcome,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let (entered_tx, release_rx) = (Mutex::new(entered_tx), Mutex::new(release_rx));
+    let weak = Arc::downgrade(places);
+    places.after_reconcile_read(move |call| {
+        if call == nth {
+            // この回が読んだ後に、記録の状態が変わる（以後の整える手順の結果）。
+            weak.upgrade().expect("the places").set_reconcile(then);
+            entered_tx.lock().unwrap().send(()).unwrap();
+            let _ = release_rx.lock().unwrap().recv();
+        }
+    });
+    (entered_rx, release_tx)
+}
+
+async fn wait_for(entered: std::sync::mpsc::Receiver<()>) {
+    tokio::task::spawn_blocking(move || {
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the reconcile started")
+    })
+    .await
+    .unwrap();
+}
+
+/// 整える手順は 1 つずつ走り、読んだ順に状態へ書く: 先に読んだ「整っている」を持ったまま
+/// 遅れた回が、後から読んだ「通らない」を上書きして、利用者の証明書を使える状態に戻さない。
+#[tokio::test]
+async fn concurrent_reconciles_are_applied_in_the_order_they_read() {
+    let places = FakePlaces::new();
+    places.set_user(usable(&cert_pem()));
+    let policy = started_desktop(&places).await;
+    assert!(connects(&policy));
+
+    // 2 回目は「整っている」を読んでから止まる。その後、記録は「通らない」になる。
+    let (entered, release) = hold_reconcile(&places, 2, ReconcileOutcome::Refused);
+    let first = tokio::spawn({
+        let policy = policy.clone();
+        async move { policy.refresh(HUB).await }
+    });
+    wait_for(entered).await;
+    let second = tokio::spawn({
+        let policy = policy.clone();
+        async move { policy.refresh(HUB).await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        places.calls().reconcile,
+        2,
+        "the later reconcile waits for the earlier one"
+    );
+
+    release.send(()).unwrap();
+    first.await.unwrap();
+    second.await.unwrap();
+    assert_eq!(places.calls().reconcile, 3);
+    assert!(
+        refusal(&policy).contains("確かめに通らない"),
+        "the result read last stays"
+    );
+}
+
+/// 入口が直列化のロックを待つ間に、別の呼び出しが新しい結果を作っていたら、入口はそれを
+/// 使って走らせない（「できなかった」が続く間に、入口が並んで待ち続けない）。
+#[tokio::test]
+async fn an_entry_that_waited_uses_the_result_made_meanwhile() {
+    let places = FakePlaces::new();
+    places.set_user(usable(&cert_pem()));
+    let policy = started_desktop(&places).await;
+    // 入口が走らせたい状態（30 秒を過ぎた）。
+    policy.advance_clock(RECONCILE_FRESH_FOR);
+
+    let (entered, release) = hold_reconcile(&places, 2, ReconcileOutcome::Incomplete);
+    let cycle = tokio::spawn({
+        let policy = policy.clone();
+        async move { policy.refresh(HUB).await }
+    });
+    wait_for(entered).await;
+    let entry = tokio::spawn({
+        let policy = policy.clone();
+        async move { policy.ensure_started(HUB).await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    release.send(()).unwrap();
+    cycle.await.unwrap();
+    entry.await.unwrap();
+    assert_eq!(places.calls().reconcile, 2, "the entry did not run its own");
+    assert!(connects(&policy));
 }
 
 /// すでに pin に使っている利用者の証明書: 「この回はできなかった」は 3 周期続くまで保ち

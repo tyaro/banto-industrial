@@ -65,14 +65,51 @@
 //!   失効の記録のロック無しの読みを、**そのたびに**やり直す。管理者が `prepare-hub-tls --renew`
 //!   で作り直しても、Hub のデスクトップ版がトレイで作り直しても、ChronoGazer の再起動は
 //!   要らない。前の呼び出しで読んだ証明書は覚えない。
-//! - **見張りの周期と起動の初回**（[`HubTlsPolicy::refresh`]・[`HubTlsPolicy::ensure_started`]。
+//! - **見張りの周期と操作の入口**（[`HubTlsPolicy::refresh`]・[`HubTlsPolicy::ensure_started`]。
 //!   `crate::hub` の `supervise_once` と操作の入口が呼ぶ）: 利用者の記録を整える手順と、露出を
-//!   見た拇印の書き足し。起動の初回は、最後の結果が「整っている」になるまで、操作の入口ごとに
-//!   走らせ直す。どちらも記録のロックを上限付き（5 秒）で待つので、操作ごとの判定
-//!   からは呼ばず、blocking のスレッドで走らせる。起動の初回にその回で消失を直したら、続けて
-//!   もう 1 回走らせる（直した回の結果は「通らない」で、次の回に「整っている」になるため。
-//!   設計 §7「PR2 で決めたこと」2）。保存済み・入力された接続先が loopback の https のときだけ
-//!   走らせる（Hub を使わない利用者の `%LOCALAPPDATA%` に記録を作らない）。
+//!   見た拇印の書き足し。記録のロックを上限付き（5 秒）で待つので、操作ごとの判定からは
+//!   呼ばず、blocking のスレッドで走らせる。保存済み・入力された接続先が loopback の https の
+//!   ときだけ走らせる（Hub を使わない利用者の `%LOCALAPPDATA%` に記録を作らない）。
+//!
+//! # 整える手順をいつ走らせるか（2026-11-16 に場面を並べて組み直した）
+//!
+//! 「前に 1 回整っていた」を、いつまでも信じない。信じてよいのは**新しい結果**だけにする。
+//!
+//! | 呼び手                         | 走らせるか                                 | 「できなかった」の連続数 |
+//! | ------------------------------ | ------------------------------------------ | ------------------------ |
+//! | 見張りの周期（`refresh`）      | 必ず走らせる                               | 進める                   |
+//! | 操作の入口（`ensure_started`） | 下の「省いてよい」を満たさなければ走らせる | 進めない                 |
+//!
+//! **入口が省いてよい**のは、最後の整える手順が次をすべて満たすときだけ:
+//!
+//! 1. 結果が「整っている」。
+//! 2. 露出を見た拇印の書き足しが残っていない。
+//! 3. 走らせ始めてから見張りの周期（[`RECONCILE_FRESH_FOR`]、30 秒）が過ぎていない。
+//! 4. その後のロック無しの読み（操作ごとの判定）が、記録の「整っていない」を見ていない。
+//!
+//! 保存済みの接続があれば見張りが周期ごとに新しくするので、入口はほぼ省かれる。保存済みの
+//! 接続が無い PC（見張りは何もしない）では、入口が 30 秒に 1 回まで走らせる。どちらでも、
+//! 判定が使う結果は 30 秒より古くならない（設計 §4.4.1 の保証の範囲と同じ粒度）。
+//!
+//! **直列化**: 整える手順と、その結果の状態への反映は、決まりが持つ 1 つの非同期のロックの
+//! 中で行う（ロックは blocking のスレッドへ持ち込み、反映が済むまで握る。待つ側の future が
+//! 捨てられても、順序は崩れない）。記録を読んだ順 = 状態へ書く順なので、先に読んだ古い
+//! 「整っている」が、後から読んだ「通らない」を上書きすることは無い。入口がロックを待つ間に
+//! 別の呼び出しが新しい結果を作っていたら、入口はそれを使って走らせない（待ち始めた後に
+//! 読んだ結果なので新しい。「できなかった」が続く間に入口が並んで 5 秒ずつ待つのも防ぐ）。
+//! 見張りの周期は、待った後も必ず自分で走らせる（連続数を周期ごとに数えるため）。
+//!
+//! **ロック無しの読みが「整っていない」を見たとき**（A・B のどちらかが無い・壊れた・読めない・
+//! 中身が揃っていない。操作ごとの判定が見る）: 最後の結果が「整っている」でも、利用者の証明書を
+//! **使い始めない**（記録を消された直後に、失効していた証明書を空の記録と古い「整っている」で
+//! 通さない）。すでに pin に使っている証明書は、次の整える手順まで保つ（ロック無しの読みは
+//! 「確かに見た」ではなく、ほかのプロセスが書いている途中にも起きる。失効していない証明書
+//! なので、確かめと確かめの間の窓と同じ扱い）。どちらの場合も、次の入口は 30 秒を待たずに
+//! 走らせ直し、その結果（消失なら「通らない」）で決める。
+//!
+//! 最初の回（まだ 1 回も走らせていない）にその回で消失を直したら、続けてもう 1 回走らせる
+//! （直した回の結果は「通らない」で、次の回に「整っている」になるため。設計 §7「PR2 で
+//! 決めたこと」2）。
 //!
 //! 購読は目印が変わったときに張り直す（`crate::hub` の `reconcile_generation` と、pin した
 //! 世代の目印を毎周期確かめる `supervise_once`）。目印は**置き場ごとの値の組**（サービス・
@@ -82,10 +119,12 @@
 //!
 //! # 覚えるもの
 //!
-//! 決まりは `Clone` の間で 1 つの状態を共有する（`State`）: 最後の整える手順の結果、
-//! 「この回はできなかった」の連続数、いま pin に使っている利用者の証明書の拇印、露出を見た
-//! 拇印（使わない）と、そのうち記録に書けていないもの、いまの警告。**証明書そのものと
-//! 目印は覚えない**（別の接続先や失敗の呼び出しで上書きされた値と比べないため）。
+//! 決まりは `Clone` の間で 1 つの状態を共有する（`State`）: 最後の整える手順の結果と
+//! 走らせ始めた時刻、走らせた回数（ロックを待つ間に新しい結果ができたかを見る）、その後の
+//! ロック無しの読みが「整っていない」を見たか、「この回はできなかった」の連続数、いま pin に
+//! 使っている利用者の証明書の拇印、露出を見た拇印（使わない）と、そのうち記録に書けて
+//! いないもの、いまの警告。**証明書そのものと目印は覚えない**（別の接続先や失敗の呼び出しで
+//! 上書きされた値と比べないため）。時刻は `Clock` から読む（試験で進められる）。
 //!
 //! # 保存済みの loopback の http
 //!
@@ -116,6 +155,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use banto_hub_bootstrap::{
     Error as BootstrapError, ErrorKind as BootstrapErrorKind, HubTlsSource, Url,
@@ -131,7 +171,7 @@ mod tests;
 
 #[cfg(test)]
 pub(crate) use places::HubCertReader;
-use places::{CertRead, HubTlsPlaces, ServiceRecordRead};
+use places::{CertRead, HubTlsPlaces, ServiceRecordRead, UserRecordRead};
 
 /// 同じ PC の Hub の接続先。画面の例と案内に使う。
 pub const LOOPBACK_HUB_ENDPOINT: &str = "https://127.0.0.1:8723";
@@ -146,6 +186,11 @@ pub const LOOPBACK_HTTP_REFUSED_SERVICE: &str = "同じ PC の Hub へは http �
 /// 「この回はできなかった」がこの周期数続いたら、pin に使っている利用者の証明書を外す
 /// （数えるのは見張りの周期だけ。操作の入口の走らせ直しでは進めない。設計 §4.4.1。Hub のデスクトップ版の見張りと同じ 3 周期 = 約 90 秒）。
 pub(crate) const INCOMPLETE_LIMIT: u8 = 3;
+
+/// 操作の入口が、最後の整える手順の「整っている」を信じてよい長さ（モジュール doc「整える
+/// 手順をいつ走らせるか」）。見張りの周期と同じにする: 保存済みの接続があれば見張りが周期
+/// ごとに新しくし、無ければ入口がこの長さに 1 回まで走らせる。
+pub(crate) const RECONCILE_FRESH_FOR: Duration = crate::hub::SUPERVISOR_INTERVAL;
 
 const ELEV_RENEW: &str = "banto-hub-elev.exe prepare-hub-tls --renew";
 
@@ -176,6 +221,8 @@ enum Slot {
 /// 最後に走らせた、利用者の記録を整える手順。
 struct ReconcileSeen {
     outcome: ReconcileOutcome,
+    /// 走らせ始めた時刻（記録を読んだのはこれより後。新しさはここから数える）。
+    started_at: Instant,
     /// その回の警告（起動のときに 2 回走らせたら、両方の分）。
     warnings: Vec<String>,
 }
@@ -185,6 +232,12 @@ struct ReconcileSeen {
 struct State {
     /// 最後の整える手順（まだ走らせていなければ `None`）。
     reconcile: Option<ReconcileSeen>,
+    /// 整える手順を走らせて状態へ反映した回数（入口がロックを待つ間に、新しい結果が
+    /// できたかを見る）。
+    runs: u64,
+    /// 最後の整える手順の後に、ロック無しの読みが記録の「整っていない」を見た（次の入口は
+    /// 新しさに依らず走らせ直す）。
+    recheck: bool,
     /// 「この回はできなかった」の連続数。
     incomplete_streak: u8,
     /// いま pin に使っている利用者の証明書。
@@ -199,6 +252,43 @@ struct State {
     logged: BTreeSet<String>,
 }
 
+impl State {
+    /// 操作の入口が整える手順を省いてよいか（モジュール doc「整える手順をいつ走らせるか」の
+    /// 1〜4）。
+    fn entry_may_skip(&self, now: Instant) -> bool {
+        self.reconcile.as_ref().is_some_and(|seen| {
+            seen.outcome == ReconcileOutcome::Consistent
+                && now.saturating_duration_since(seen.started_at) < RECONCILE_FRESH_FOR
+        }) && self.unwritten.is_empty()
+            && !self.recheck
+    }
+}
+
+/// 時刻を読む口。本番は `Instant::now()` そのまま。試験は進められる。
+#[derive(Default)]
+struct Clock {
+    #[cfg(test)]
+    ahead: Mutex<Duration>,
+}
+
+impl Clock {
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        {
+            Instant::now() + *self.ahead.lock().unwrap()
+        }
+        #[cfg(not(test))]
+        {
+            Instant::now()
+        }
+    }
+
+    #[cfg(test)]
+    fn advance(&self, by: Duration) {
+        *self.ahead.lock().unwrap() += by;
+    }
+}
+
 /// loopback を pin した https だけにする決まりの中身。
 struct Pinned {
     places: Arc<dyn HubTlsPlaces>,
@@ -206,6 +296,10 @@ struct Pinned {
     reads_user: bool,
     host: Host,
     state: Mutex<State>,
+    /// 整える手順と、その結果の状態への反映を直列化するロック（モジュール doc「整える手順を
+    /// いつ走らせるか」）。`state` より外。握ったまま `state` を取ってよいが、逆はしない。
+    reconcile_gate: Arc<tokio::sync::Mutex<()>>,
+    clock: Clock,
 }
 
 /// 1 回の判定の結果。
@@ -275,6 +369,8 @@ impl Pinned {
             reads_user,
             host,
             state: Mutex::new(State::default()),
+            reconcile_gate: Arc::new(tokio::sync::Mutex::new(())),
+            clock: Clock::default(),
         })
     }
 
@@ -321,10 +417,24 @@ impl Pinned {
                 self.places.user_revocations(),
             )
         } else {
-            (None, BTreeSet::new())
+            (
+                None,
+                UserRecordRead {
+                    revoked: BTreeSet::new(),
+                    settled: true,
+                },
+            )
         };
+        let UserRecordRead {
+            revoked: user_record,
+            settled: user_record_settled,
+        } = user_record;
 
         let mut state = self.state();
+        // ロック無しの読みが「整っていない」を見たら、次の入口は新しさに依らず整え直す。
+        if !user_record_settled {
+            state.recheck = true;
+        }
         // 記録に書けていた拇印は、書き足しの待ちから外す（ほかのプロセスが書いた場合を含む）。
         state
             .unwritten
@@ -332,7 +442,7 @@ impl Pinned {
 
         let service = self.judge_service(&mut state, service_cert, service_record, &user_record);
         let user = match user_cert {
-            Some(cert) => self.judge_user(&mut state, cert, &user_record),
+            Some(cert) => self.judge_user(&mut state, cert, (&user_record, user_record_settled)),
             None => Judged {
                 slot: Slot::NotRead,
                 pem: None,
@@ -486,7 +596,7 @@ impl Pinned {
         &self,
         state: &mut State,
         cert: CertRead,
-        user_record: &BTreeSet<CertThumbprint>,
+        user_record: (&BTreeSet<CertThumbprint>, bool),
     ) -> Judged {
         const PLACE: &str = "Hub のデスクトップ版の証明書";
         const RENEW: &str = "Hub のデスクトップ版で、TLS フォルダと鍵・証明書の所有者・アクセス許可を確かめ、異常があれば直してから、トレイの「TLS の証明書を作り直す」で作り直してください（失効の記録は消さないでください）";
@@ -504,7 +614,7 @@ impl Pinned {
         &self,
         state: &mut State,
         cert: CertRead,
-        user_record: &BTreeSet<CertThumbprint>,
+        (user_record, user_record_settled): (&BTreeSet<CertThumbprint>, bool),
         place: &str,
         renew: &str,
     ) -> Judged {
@@ -551,6 +661,13 @@ impl Pinned {
             )
         };
         match state.reconcile.as_ref().map(|seen| seen.outcome) {
+            // 記録を消された直後に、古い「整っている」と空の記録で使い始めない。使っている
+            // 証明書は次の整える手順まで保つ（モジュール doc「ロック無しの読みが…」）。
+            Some(ReconcileOutcome::Consistent) if !user_record_settled && !held => {
+                return withheld(
+                    "が、いま読むと整っていない（消された・壊れた・書いている途中。次の操作で確かめ直すまで使い始めません）",
+                )
+            }
             Some(ReconcileOutcome::Consistent) => {}
             Some(ReconcileOutcome::Incomplete)
                 if held && state.incomplete_streak < INCOMPLETE_LIMIT => {}
@@ -590,11 +707,16 @@ impl Pinned {
         )
     }
 
-    /// 利用者の記録を整え、露出を見た拇印を書き足す（モジュール doc「いつ読むか」）。記録の
-    /// ロックを上限付きで待つので、blocking のスレッドから呼ぶ。`counts_cycle` は見張りの
-    /// 周期の回か: 「できなかった」の連続数（`INCOMPLETE_LIMIT`）を進めるのは周期の回だけ
-    /// （操作の入口の走らせ直しは増やさず、「できなかった」以外なら 0 に戻す）。
-    fn refresh_blocking(&self, startup: bool, counts_cycle: bool) {
+    /// 利用者の記録を整え、露出を見た拇印を書き足す（モジュール doc「整える手順をいつ
+    /// 走らせるか」）。**`reconcile_gate` を握っている呼び手だけが呼ぶ**（読んだ順に状態へ
+    /// 書くため）。記録のロックを上限付きで待つので、blocking のスレッドから呼ぶ。
+    /// `counts_cycle` は見張りの周期の回か: 「できなかった」の連続数（`INCOMPLETE_LIMIT`）を
+    /// 進めるのは周期の回だけ（操作の入口の走らせ直しは増やさず、「できなかった」以外なら
+    /// 0 に戻す）。
+    fn refresh_blocking(&self, counts_cycle: bool) {
+        // 最初の回か（直列化の中なので、ここで読んでよい）。
+        let startup = self.state().reconcile.is_none();
+        let started_at = self.clock.now();
         let mut report = self.places.reconcile_user_revocations();
         let mut warnings = std::mem::take(&mut report.warnings);
         if startup && report.saw_loss {
@@ -613,8 +735,12 @@ impl Pinned {
             };
             state.reconcile = Some(ReconcileSeen {
                 outcome: report.outcome,
+                started_at,
                 warnings,
             });
+            state.runs = state.runs.wrapping_add(1);
+            // この回が記録を読み直した。整っていなければ、下の判定がもう一度立てる。
+            state.recheck = false;
         }
         // 置き場の確かめ → 記録との照合（露出を見た拇印はここで待ちに入る）。
         self.evaluate();
@@ -766,52 +892,61 @@ impl HubTlsPolicy {
             .unwrap_or_default()
     }
 
-    /// 起動の初回の整える手順（モジュール doc「いつ読むか」）。`endpoint` が loopback の https
-    /// で、利用者の記録を持つ決まりで、まだ 1 回も走らせていないか、最後の結果が「整っている」
-    /// でないか、露出を見た拇印の書き足しが残っている（`unwritten`）ときだけ走らせる
-    /// （「できなかった」「通らない」で終わった回・書けなかった失効は、次の操作でやり直す。
-    /// やり直しは「できなかった」の連続数を進めない: 3 周期は見張りの周期で数える）。操作の
-    /// 入口（`crate::hub` の `begin_operation`・`connect`・`adopt_manual_key`）が、Hub と話す
-    /// 前に呼ぶ - 走らせる前の判定は、利用者の証明書を使い始めない。
+    /// 操作の入口の整える手順（モジュール doc「整える手順をいつ走らせるか」）。`endpoint` が
+    /// loopback の https で、利用者の記録を持つ決まりのとき、最後の整える手順が「整っている」・
+    /// 書き足しの残り無し・30 秒以内・その後のロック無しの読みも整っている、のすべてを
+    /// 満たさなければ走らせる（「できなかった」の連続数は進めない: 3 周期は見張りの周期で
+    /// 数える）。操作の入口（`crate::hub` の `begin_operation`・`connect`・`adopt_manual_key`）が、
+    /// Hub と話す前に呼ぶ - 走らせる前の判定は、利用者の証明書を使い始めない。
     pub(crate) async fn ensure_started(&self, endpoint: &str) {
         self.run_refresh(endpoint, true).await;
     }
 
     /// 見張りの周期の整える手順と、露出を見た拇印の書き足し（`crate::hub` の
-    /// `supervise_once`）。まだ 1 回も走らせていなければ、起動の初回として走らせる。
+    /// `supervise_once`）。必ず走らせる。
     pub(crate) async fn refresh(&self, endpoint: &str) {
         self.run_refresh(endpoint, false).await;
     }
 
-    async fn run_refresh(&self, endpoint: &str, only_first: bool) {
+    /// 試験用: 時刻を `by` だけ進める（整える手順の新しさの確かめ）。
+    #[cfg(test)]
+    pub(crate) fn advance_clock(&self, by: Duration) {
+        if let Loopback::Pinned(pinned) = &self.loopback {
+            pinned.clock.advance(by);
+        }
+    }
+
+    async fn run_refresh(&self, endpoint: &str, entry: bool) {
         let Some(pinned) = self.pinned_for(endpoint) else {
             return;
         };
         if !pinned.reads_user {
             return;
         }
-        let (started, settled) = {
+        let runs_before = {
             let state = pinned.state();
-            (
-                state.reconcile.is_some(),
-                state
-                    .reconcile
-                    .as_ref()
-                    .is_some_and(|seen| seen.outcome == ReconcileOutcome::Consistent)
-                    && state.unwritten.is_empty(),
-            )
+            if entry && state.entry_may_skip(pinned.clock.now()) {
+                return;
+            }
+            state.runs
         };
-        // 起動の初回は「整っている」かつ書き足しが残っていない状態になるまで走らせ直す
-        // （保存済みの接続が無い PC では見張りが `refresh` を呼ばないので、ロックの待ち切れで
-        // 終わった回や、記録に書けなかった失効を再起動まで引きずらない）。
-        if only_first && settled {
+        // 直列化: 整える手順とその結果の反映は 1 つずつ（読んだ順 = 状態へ書く順）。
+        let gate = Arc::clone(&pinned.reconcile_gate).lock_owned().await;
+        // 待つ間に別の呼び出しが新しい結果を作っていたら、入口はそれを使う（待ち始めた後に
+        // 読んだ結果。結果が「整っている」でなければ、次の入口がまた走らせる）。見張りの
+        // 周期は、連続数を数えるので必ず自分で走らせる。
+        if entry && pinned.state().runs != runs_before {
             return;
         }
         let pinned = Arc::clone(pinned);
-        // 記録のロックを最大 5 秒待つので、tokio のワーカーを塞がない。
-        let ran =
-            tokio::task::spawn_blocking(move || pinned.refresh_blocking(!started, !only_first))
-                .await;
+        // 記録のロックを最大 5 秒待つので、tokio のワーカーを塞がない。直列化のロックは
+        // blocking のスレッドへ持ち込み、状態への反映が済むまで握る（この future が途中で
+        // 捨てられても、走っている手順が終わるまで次を始めない）。
+        let ran = tokio::task::spawn_blocking(move || {
+            let _gate = gate;
+            pinned.refresh_blocking(!entry);
+        })
+        .await;
         if let Err(error) = ran {
             // 状態は書き換わっていない（1 回も走っていなければ、利用者の証明書は使い始めない）。
             eprintln!(

@@ -10,12 +10,13 @@
 //! | [`HubTlsPlaces::service_cert`]  | サービスの `tls\` の証明書                 | 書かない                 |
 //! | [`HubTlsPlaces::service_revocations`] | サービスの失効の記録                 | 書かない                 |
 //! | [`HubTlsPlaces::user_cert`]     | 利用者の `tls\` の証明書（鍵の露出も見る） | 書かない                 |
-//! | [`HubTlsPlaces::user_revocations`] | 利用者の失効の記録 A・B の和（ロック無し） | 書かない              |
+//! | [`HubTlsPlaces::user_revocations`] | 利用者の失効の記録 A・B の和と、整っているか（ロック無し） | 書かない |
 //! | [`HubTlsPlaces::reconcile_user_revocations`] | 利用者の記録を整える（ロックを待つ） | 記録だけ書く |
 //! | [`HubTlsPlaces::record_user_revocation`] | 利用者の記録に拇印を足す（ロックを待つ） | 記録だけ書く |
 //!
 //! 下の 2 つはロックを上限付き（既定 5 秒）で待つので、1 回の操作ごとの判定からは呼ばない
-//! （呼ぶのは見張りの周期と起動の初回だけ。`super` のモジュール doc「いつ読むか」）。
+//! （呼ぶのは見張りの周期と操作の入口の整える手順だけ。`super` のモジュール doc「整える手順を
+//! いつ走らせるか」）。
 //! `chronogazer-server` の決まり（`HubTlsPolicy::service_only`）は上の 2 つしか呼ばない。
 
 use std::collections::BTreeSet;
@@ -62,6 +63,17 @@ pub(crate) enum ServiceRecordRead {
     },
 }
 
+/// 利用者の失効の記録 A・B をロック無しで読んだ結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UserRecordRead {
+    /// A・B の和（確かめに通らない置き場のものも、形が読めた分は入る）。
+    pub revoked: BTreeSet<CertThumbprint>,
+    /// 両方とも確かめに通って `確定` で、同じ中身か（整える手順の「整っている」の形）。
+    /// `false` は、どちらかが無い・壊れた・読めない・揃っていない（消された直後や、ほかの
+    /// プロセスが書いている途中）。その間は、利用者の証明書を使い始めない。
+    pub settled: bool,
+}
+
 /// 利用者の記録を整える・書き足す手順の結果（`banto_hub_tls_trust::ReconcileReport` の、判定に
 /// 要る分）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,9 +96,8 @@ pub(crate) trait HubTlsPlaces: Send + Sync {
     fn service_revocations(&self) -> ServiceRecordRead;
     /// 利用者の置き場の証明書。
     fn user_cert(&self) -> CertRead;
-    /// 利用者の失効の記録 A・B の和（ロック無し。確かめに通らない置き場のものも、形が読めた分は
-    /// 入る）。
-    fn user_revocations(&self) -> BTreeSet<CertThumbprint>;
+    /// 利用者の失効の記録 A・B（ロック無し）。
+    fn user_revocations(&self) -> UserRecordRead;
     /// 利用者の記録を整える（ロックを上限付きで待つ）。
     fn reconcile_user_revocations(&self) -> ReconcileRead;
     /// 利用者の記録に `thumbprint` を足す（ロックを上限付きで待つ）。書けたかどうかは、返った
@@ -130,8 +141,11 @@ impl HubTlsPlaces for ReaderPlaces {
         CertRead::Absent
     }
 
-    fn user_revocations(&self) -> BTreeSet<CertThumbprint> {
-        BTreeSet::new()
+    fn user_revocations(&self) -> UserRecordRead {
+        UserRecordRead {
+            revoked: BTreeSet::new(),
+            settled: true,
+        }
     }
 
     fn reconcile_user_revocations(&self) -> ReconcileRead {
@@ -336,16 +350,20 @@ mod system {
             }
         }
 
-        fn user_revocations(&self) -> BTreeSet<CertThumbprint> {
-            // 場所を決められない回は空（利用者の証明書もその回は「通らない」なので使わない。
-            // サービスの証明書の照合はサービスの記録で続く）。
+        fn user_revocations(&self) -> UserRecordRead {
+            // 場所を決められない回は空で「整っていない」（利用者の証明書もその回は「通らない」
+            // なので使わない。サービスの証明書の照合はサービスの記録で続く）。
             let Ok(place) = user_place() else {
-                return BTreeSet::new();
+                return UserRecordRead {
+                    revoked: BTreeSet::new(),
+                    settled: false,
+                };
             };
-            banto_hub_tls_trust::read_user_revocations(&WindowsTlsTrustOps, &place)
-                .entries()
-                .map(|entry| entry.thumbprint)
-                .collect()
+            let read = banto_hub_tls_trust::read_user_revocations(&WindowsTlsTrustOps, &place);
+            UserRecordRead {
+                revoked: read.entries().map(|entry| entry.thumbprint).collect(),
+                settled: read.is_settled(),
+            }
         }
 
         fn reconcile_user_revocations(&self) -> ReconcileRead {
@@ -398,8 +416,11 @@ impl HubTlsPlaces for SystemPlaces {
         CertRead::Absent
     }
 
-    fn user_revocations(&self) -> BTreeSet<CertThumbprint> {
-        BTreeSet::new()
+    fn user_revocations(&self) -> UserRecordRead {
+        UserRecordRead {
+            revoked: BTreeSet::new(),
+            settled: true,
+        }
     }
 
     fn reconcile_user_revocations(&self) -> ReconcileRead {
