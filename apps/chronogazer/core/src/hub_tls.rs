@@ -67,7 +67,8 @@
 //!   要らない。前の呼び出しで読んだ証明書は覚えない。
 //! - **見張りの周期と起動の初回**（[`HubTlsPolicy::refresh`]・[`HubTlsPolicy::ensure_started`]。
 //!   `crate::hub` の `supervise_once` と操作の入口が呼ぶ）: 利用者の記録を整える手順と、露出を
-//!   見た拇印の書き足し。どちらも記録のロックを上限付き（5 秒）で待つので、操作ごとの判定
+//!   見た拇印の書き足し。起動の初回は、最後の結果が「整っている」になるまで、操作の入口ごとに
+//!   走らせ直す。どちらも記録のロックを上限付き（5 秒）で待つので、操作ごとの判定
 //!   からは呼ばず、blocking のスレッドで走らせる。起動の初回にその回で消失を直したら、続けて
 //!   もう 1 回走らせる（直した回の結果は「通らない」で、次の回に「整っている」になるため。
 //!   設計 §7「PR2 で決めたこと」2）。保存済み・入力された接続先が loopback の https のときだけ
@@ -762,7 +763,8 @@ impl HubTlsPolicy {
     }
 
     /// 起動の初回の整える手順（モジュール doc「いつ読むか」）。`endpoint` が loopback の https
-    /// で、利用者の記録を持つ決まりで、まだ 1 回も走らせていないときだけ走らせる。操作の
+    /// で、利用者の記録を持つ決まりで、まだ 1 回も走らせていないか、最後の結果が「整っている」
+    /// でないときだけ走らせる（「できなかった」「通らない」で終わった回は、次の操作でやり直す）。操作の
     /// 入口（`crate::hub` の `begin_operation`・`connect`・`adopt_manual_key`）が、Hub と話す
     /// 前に呼ぶ - 走らせる前の判定は、利用者の証明書を使い始めない。
     pub(crate) async fn ensure_started(&self, endpoint: &str) {
@@ -782,8 +784,20 @@ impl HubTlsPolicy {
         if !pinned.reads_user {
             return;
         }
-        let started = pinned.state().reconcile.is_some();
-        if only_first && started {
+        let (started, consistent) = {
+            let state = pinned.state();
+            (
+                state.reconcile.is_some(),
+                state
+                    .reconcile
+                    .as_ref()
+                    .is_some_and(|seen| seen.outcome == ReconcileOutcome::Consistent),
+            )
+        };
+        // 起動の初回は「整っている」で終わるまで走らせ直す（保存済みの接続が無い PC では
+        // 見張りが `refresh` を呼ばないので、ロックの待ち切れで終わった回を再起動まで
+        // 引きずらない）。
+        if only_first && consistent {
             return;
         }
         let pinned = Arc::clone(pinned);

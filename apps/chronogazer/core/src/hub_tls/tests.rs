@@ -454,6 +454,29 @@ async fn the_user_certificate_is_first_used_only_after_a_consistent_reconcile() 
     );
 }
 
+/// 起動の初回の整える手順が「できなかった」で終わっても、次の `ensure_started` で走らせ直す
+/// （保存済みの接続が無い PC では見張りが `refresh` を呼ばない）。「整っている」になれば、
+/// それ以後は走らせない。
+#[tokio::test]
+async fn ensure_started_reruns_until_the_reconcile_is_consistent() {
+    let places = FakePlaces::new();
+    places.set_user(usable(&cert_pem()));
+    places.set_reconcile(ReconcileOutcome::Incomplete);
+    let policy = desktop(&places);
+
+    policy.ensure_started(HUB).await;
+    assert_eq!(places.calls().reconcile, 1);
+    assert!(refusal(&policy).contains("利用者の失効の記録"));
+
+    places.set_reconcile(ReconcileOutcome::Consistent);
+    policy.ensure_started(HUB).await;
+    assert_eq!(places.calls().reconcile, 2);
+    assert!(connects(&policy));
+
+    policy.ensure_started(HUB).await;
+    assert_eq!(places.calls().reconcile, 2, "consistent: not run again");
+}
+
 /// すでに pin に使っている利用者の証明書: 「この回はできなかった」は 3 周期続くまで保ち
 /// （警告）、続いたら外す。「整っている」に戻れば再び使う（場面 23）。
 #[tokio::test]
