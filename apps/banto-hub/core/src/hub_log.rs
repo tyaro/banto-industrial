@@ -68,9 +68,28 @@ pub fn enable_service_log_file_from(file: File) {
 /// [`SERVICE_LOG_FILE_NAME`] を、そのハンドルを基準に追記で開いて（無ければ作る）
 /// [`enable_service_log_file_from`] に渡す（#661 661-1。サービスから呼ぶのは 661-2）。
 /// `Mode::Guarded` の `dir` なら、名前がリンク・フォルダのときは開かずに断る。
+/// 多層防御（#623 PR5）: `dir` が `Mode::Guarded` でなければ、ファイルを作る前に断る
+/// （Plain への落ち込みで辿らない確かめが抜けるのを防ぐ。ChronoGazer の `ServerLog::open_in`
+/// と同じ）。Plain のルートで動くユニットテストだけは通す（`cfg!(test)`）。
 pub fn enable_service_log_file_in(
     dir: &banto_safe_root::ManagedDir,
 ) -> banto_safe_root::Result<()> {
+    enable_service_log_file_checked(dir, cfg!(test))
+}
+
+/// [`enable_service_log_file_in`] の内側。`allow_plain` が `false` なら Guarded でない `dir` を
+/// 断る（テストで断る側を確かめるため、`cfg!(test)` から切り離してある）。
+fn enable_service_log_file_checked(
+    dir: &banto_safe_root::ManagedDir,
+    allow_plain: bool,
+) -> banto_safe_root::Result<()> {
+    if !allow_plain && !dir.is_guarded() {
+        return Err(banto_safe_root::SafeRootError::Io {
+            op: banto_safe_root::IoOp::OpenFile,
+            kind: std::io::ErrorKind::PermissionDenied,
+            os_error: None,
+        });
+    }
     let file = dir.open_append(SERVICE_LOG_FILE_NAME, true)?;
     enable_service_log_file_from(file);
     Ok(())
@@ -274,6 +293,9 @@ mod tests {
             mode: banto_safe_root::Mode::Plain,
         })
         .expect("Plain のルート");
+        // #623 PR5: Guarded でない（Plain の）フォルダは、本番の確かめでは断る。
+        assert!(enable_service_log_file_checked(root.as_dir(), false).is_err());
+        assert!(!held.join(SERVICE_LOG_FILE_NAME).exists());
         assert!(enable_service_log_file_in(root.as_dir()).is_ok());
         log_line("test line three");
         let held_contents =

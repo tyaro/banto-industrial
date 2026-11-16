@@ -135,7 +135,7 @@ use banto_hub_core::hub_tls_prepare::watch::{
 };
 use banto_hub_core::profile_lock::{
     open_profile_dirs_checked, try_acquire_profile_exclusive, HubHostKind, ProfileLockError,
-    DIR_AUDIT_SPOOL, DIR_CONFIG, DIR_DATA, DIR_LOGS,
+    DIR_AUDIT_QUARANTINE, DIR_AUDIT_SPOOL, DIR_CONFIG, DIR_DATA, DIR_LOGS,
 };
 use banto_hub_core::profile_mode::{
     acl_changed_line, after_close_abort, after_marker_error, check_stored_owners, close_abort_line,
@@ -651,7 +651,7 @@ pub(crate) struct ProgramParts {
 /// 運用中に見張る物（握った profile と、運用モードの形で開いた管理するフォルダ）。
 struct WatchedDirs {
     root: Arc<SafeRoot>,
-    dirs: [(&'static str, Arc<ManagedDir>); 4],
+    dirs: [(&'static str, Arc<ManagedDir>); 5],
 }
 
 /// 締めた後の Hub が動いている間に持つ物。
@@ -1111,11 +1111,17 @@ impl HubProgram {
             .audit_spool
             .clone()
             .expect("open_profile_dirs_checked は監査の保留を必ず開く");
-        let marked: [(&str, &ManagedDir); 4] = [
+        // #623 PR5: 監査の保留の退避先（audit-spool\quarantine）も印と見張りの対象にする。
+        let quarantine = dirs
+            .audit_quarantine
+            .clone()
+            .expect("open_profile_dirs_checked は監査の保留の退避先を必ず開く");
+        let marked: [(&str, &ManagedDir); 5] = [
             (DIR_CONFIG, dirs.config.as_ref()),
             (DIR_DATA, dirs.data.as_ref()),
             (DIR_LOGS, dirs.logs.as_ref()),
             (DIR_AUDIT_SPOOL, spool.as_ref()),
+            (DIR_AUDIT_QUARANTINE, quarantine.as_ref()),
         ];
         for (key, dir) in marked {
             if let Err(error) = self.acl.ensure_marker(dir) {
@@ -1161,6 +1167,7 @@ impl HubProgram {
                 (DIR_DATA, dirs.data.clone()),
                 (DIR_LOGS, dirs.logs.clone()),
                 (DIR_AUDIT_SPOOL, spool.clone()),
+                (DIR_AUDIT_QUARANTINE, quarantine.clone()),
             ],
         };
         let tamper = Arc::new(Tamper::default());
