@@ -127,7 +127,30 @@
 //! - Windows で `pin_dir`（ハンドルを握って相対で作る）を使わないのは、それが
 //!   `WRITE_DAC | WRITE_OWNER` を求めるため（設定モードの profile では、デスクトップの利用者は
 //!   「変更」しか持たず開けない）。代わりに、読むだけの権利で辿らずに開く `inspect_file` で
-//!   各段を確かめる。確かめから使うまでの間のすり替えは、下の競合と同じく防がない。
+//!   各段を確かめる。確かめから使うまでの間のすり替えは、デスクトップでは下の競合と同じく
+//!   防がない（サービスは次の節で握って防ぐ）。
+//!
+//! ### サービスでは置き場の木を握る（#623 PR6）
+//!
+//! LocalSystem のサービスは、利用者が「変更」できた profile の木を扱う。置き場の確かめ
+//! （[`prepare`]）はパスのまま確かめて手放すので、その後で `own`・`private` などをジャンクション
+//! に替えられると、LocalSystem が `cert.der`・`private.pem` を任意の場所に書く・消す
+//! （banto-opcua の片割れの削除）・利用者が仕込んだ鍵を読む。そこで profile を運用モードで
+//! 握っているとき（`crate::profile_lock::ProfileDirs::checked_access` が `Some`。[`PkiProfile::pin`]）
+//! だけ、`crate::opcua` の起動の前に [`pin`] で、握った `data` を親にして `opcua`・`pki`・`own`・
+//! `private`・`trusted`・`rejected` を 1 段ずつ辿らずに開いて握る（`SafeRoot::open_managed_under`。
+//! 無ければ運用モードの形で作る。リンク・フォルダでない・所有者が想定外なら断る）。握った
+//! ハンドルは名前の変更・削除を許さないので、握っている間はどの段も退かせない・リンクに替え
+//! られない。banto-opcua には握った `pki` の本当のパスを渡し、その後で [`prepare`] の ACL の
+//! 確かめもそのまま行う。握った木は listener が動いている間持ち、止めたら離す（無効の間は
+//! 握らない）。デスクトップ・コンソールは今まで通りパスのまま（握らない）。
+//!
+//! **守れないこと**: 鍵・証明書の**ファイル**（`own\cert.der`・`private\private.pem`、
+//! `trusted`・`rejected` の中の証明書）は握らない。無いときに握ると空のファイルを作り、
+//! banto-opcua の初回の生成（片割れの判定）が壊れるため。ファイル単位のリンク（シンボリック
+//! リンク・ハードリンク）は、既にある物は [`prepare`] が断るが、確かめてから banto-opcua が
+//! 開くまでの間に作られた物は防がない（フォルダを握っているので、作れるのはそのフォルダに
+//! 書ける相手 - 運用モードでは SYSTEM・Administrators だけ - に限られる）。
 //!
 //! 断ったとき・banto-opcua の `Error::Pki` のときは、理由をログと状態の API
 //! （`GET /api/opcua-status` の `failed`）に出す（`crate::opcua`）。原因を直したあと、
@@ -140,6 +163,9 @@
 //! 読むが、途中の要素は辿る（profile は起動時に握って確かめてある）。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use banto_safe_root::{DirAccess, ManagedDir, ManagedSet, ManagedSpec, SafeRoot};
 
 /// 置き場の、データのフォルダからの相対（`opcua/pki`）。
 const PKI_SUBDIRS: [&str; 2] = ["opcua", "pki"];
@@ -203,6 +229,81 @@ pub struct PkiProfile {
     pub dir: PathBuf,
     /// profile の id（HKLM の戻す相手の記録 `Owners`、`crate::profile_owners` を読む鍵）。
     pub id: String,
+    /// サービス（運用モード、`crate::profile_lock::ProfileDirs::checked_access` が `Some`）の
+    /// ときだけ `Some`: 起動の前に置き場の木を握る材料（[`pin`]。#623 PR6）。デスクトップ・
+    /// コンソールは `None`（今まで通りパスのまま）。
+    pub pin: Option<PkiPinBase>,
+}
+
+/// 置き場の木を握る材料（#623 PR6。モジュール doc「サービスでは置き場の木を握る」）。
+#[derive(Debug, Clone)]
+pub struct PkiPinBase {
+    /// 握った profile（所有者の確かめの相手を持つ）。
+    pub profile: Arc<SafeRoot>,
+    /// 握った profile の `data`（ここを親にする。2 回握らない）。
+    pub data: Arc<ManagedDir>,
+    /// 無いフォルダを作るときの形（運用モードの形。`ProfileDirs::checked_access`）。
+    pub access: DirAccess,
+}
+
+/// 握る置き場の木（`data` の下。[`PKI_SUBDIRS`] と、async-opcua の証明書の置き場が使う
+/// 4 つのフォルダ）。親から 1 段ずつ、無ければ作る。
+const PKI_PIN_SPECS: [ManagedSpec; 6] = [
+    pin_spec("opcua", None),
+    pin_spec("pki", Some("opcua")),
+    pin_spec("own", Some("pki")),
+    pin_spec("private", Some("pki")),
+    pin_spec("trusted", Some("pki")),
+    pin_spec("rejected", Some("pki")),
+];
+
+const fn pin_spec(name: &'static str, parent: Option<&'static str>) -> ManagedSpec {
+    ManagedSpec {
+        key: name,
+        parent,
+        name,
+        create: true,
+    }
+}
+
+/// 握った置き場の木（#623 PR6）。OPC UA サーバーが動いている間 `crate::opcua` が持ち、
+/// 止めたら drop で離す。
+#[derive(Debug)]
+pub(crate) struct PkiPin {
+    /// 握ったフォルダの組（持っているだけで、途中の段を名前の変更で退かせない・消せない）。
+    _held: ManagedSet,
+    /// 置き場 `pki` の本当のパス（握ったハンドルの本当のパス）。
+    dir: PathBuf,
+}
+
+impl PkiPin {
+    /// 置き場 `pki` の本当のパス。banto-opcua の `with_pki_dir` にはこれを渡す。
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+}
+
+/// サービスの起動の前に、置き場の木 `data\opcua\pki\{own,private,trusted,rejected}` を、
+/// 握った `data` から 1 段ずつ辿らずに開いて握る（無ければ `access` の形で作る）。どれかが
+/// リンク（ジャンクション・シンボリックリンク）・フォルダでない・所有者が想定外なら、鍵を
+/// 作らず・読まずに断る（理由はログと状態の API に出す）。同期の I/O なので、blocking 用の
+/// スレッドで呼ぶ。
+pub(crate) fn pin(base: &PkiPinBase) -> Result<PkiPin, String> {
+    let held = base
+        .profile
+        .open_managed_under(&base.data, &PKI_PIN_SPECS, Some(&base.access))
+        .map_err(|stop| {
+            format!(
+                "OPC UA の鍵と証明書の置き場（{}）を握れないため、鍵を作らず（読まず）に止めました: {stop}。リンク（ジャンクション・シンボリックリンク）やファイルに置き換わっていれば、それを消してから、同じ設定でもう一度保存すると再試行します",
+                pki_dir(base.data.path()).display()
+            )
+        })?;
+    let dir = held
+        .get("pki")
+        .expect("PKI_PIN_SPECS に並べた key は開いてある")
+        .final_path()
+        .to_path_buf();
+    Ok(PkiPin { _held: held, dir })
 }
 
 /// 鍵と証明書の置き場 `dir` を用意し、許されていない利用者が鍵を読めない（書けない）
@@ -1778,5 +1879,41 @@ mod tests {
         prepare(&dir, None).expect("own pki dir");
         let uid = std::fs::symlink_metadata(&dir).unwrap().uid();
         assert_eq!(imp::owner_refusal(&dir, uid, uid, false), None);
+    }
+
+    /// #623 PR6: サービスの置き場の木（`Mode::Guarded` で握った profile の `data` の下）を握ると、
+    /// `opcua`・`pki`・`own`・`private`・`trusted`・`rejected` が作られ、握っている間は名前を
+    /// 変えられない。離したら変えられる。渡すパスは握った `pki` の本当のパス。
+    #[cfg(windows)]
+    #[test]
+    fn a_service_pin_holds_the_pki_tree_against_renames() {
+        let root = crate::test_support::TempDir::new("opcua-pki-service-pin");
+        let paths = crate::profile_paths::resolve_profile_paths(root.path(), "pin")
+            .expect("valid profile id");
+        std::fs::create_dir_all(paths.profile_dir.parent().expect("profiles")).unwrap();
+        let mut spec = crate::profile_lock::plain_profile_root_spec(&paths);
+        spec.mode = banto_safe_root::Mode::Guarded;
+        let me = banto_safe_root::acl::current_user_sid().expect("今の利用者の SID");
+        spec.owners = vec![me.clone()];
+        let dirs = crate::profile_lock::open_profile_dirs(&spec, None).expect("open dirs");
+        let base = PkiPinBase {
+            profile: dirs.profile.clone(),
+            data: dirs.data.clone(),
+            access: DirAccess::with_install_user(me),
+        };
+        let pin = pin(&base).expect("pin");
+        let pki = dirs.data.final_path().join("opcua").join("pki");
+        assert_eq!(pin.dir(), pki.as_path());
+        for name in ["own", "private", "trusted", "rejected"] {
+            assert!(pki.join(name).is_dir(), "{name}");
+        }
+        for name in ["own", "private", "trusted", "rejected"] {
+            std::fs::rename(pki.join(name), pki.join(format!("{name}-moved")))
+                .expect_err("握っている間に名前を変えられた");
+        }
+        std::fs::rename(&pki, pki.with_file_name("pki-moved"))
+            .expect_err("握っている間に置き場の名前を変えられた");
+        drop(pin);
+        std::fs::rename(pki.join("own"), pki.join("own-moved")).expect("離したら変えられる");
     }
 }

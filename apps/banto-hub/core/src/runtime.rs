@@ -757,6 +757,15 @@ impl HubRuntime {
             .map(|dirs| crate::opcua_pki::PkiProfile {
                 dir: dirs.profile.final_path().to_path_buf(),
                 id: profile_id.clone(),
+                // #623 PR6: サービス（運用モード）だけ、起動の前に置き場の木を握る。
+                pin: dirs
+                    .checked_access
+                    .clone()
+                    .map(|access| crate::opcua_pki::PkiPinBase {
+                        profile: dirs.profile.clone(),
+                        data: dirs.data.clone(),
+                        access,
+                    }),
             });
 
         // #437（banto ADR-0019）: 監査は保留つきで組む - DB に書けない・

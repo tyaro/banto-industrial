@@ -49,6 +49,12 @@
 //!   （`apply` は `failed` のときの同じ設定を再試行として扱う）。
 //! - 同じ置き場への起動は重ならない: 置き場は profile ごと（profile は 1 プロセスだけが
 //!   握る）で、このプロセスの中では上の「停止と起動が重ならない」の鎖で起動が 1 つずつ走る。
+//! - **サービスでは置き場の木を握る**（#623 PR6）: profile を運用モードで握っているとき
+//!   （`crate::profile_lock::ProfileDirs::checked_access` が `Some`）だけ、起動の前に
+//!   [`crate::opcua_pki::pin`] で `data\opcua\pki\{own,private,trusted,rejected}` を握り、
+//!   banto-opcua には握ったハンドルの本当のパスを渡す。握った木は listener が動いている間
+//!   持ち、止めたら（無効化・再設定・終了・古い起動の後始末）listener を止めてから離す。
+//!   無効の間は握らない。デスクトップ・コンソールは今まで通りパスのまま。
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -139,7 +145,14 @@ impl OpcUaStatus {
 /// listener を起動する関数。本番は `OpcUaServer::start`、テストは起動の
 /// 遅い・失敗する偽物に差し替える。
 type Starter =
-    Arc<dyn Fn(ServerConfig) -> BoxFuture<'static, Result<RunningServer, String>> + Send + Sync>;
+    Arc<dyn Fn(ServerConfig) -> BoxFuture<'static, Result<Started, String>> + Send + Sync>;
+
+/// 起動できた listener と、サービスで握った鍵と証明書の置き場の木（#623 PR6。
+/// [`crate::opcua_pki::pin`]）。置き場の木は listener と一緒に持ち、止めたら離す。
+struct Started {
+    server: RunningServer,
+    pki_pin: Option<crate::opcua_pki::PkiPin>,
+}
 
 /// 本番の starter。`OpcUaServer::start` の同期の処理（`builder.build`・
 /// 鍵の生成）を blocking 用のスレッドで行い、async の worker を塞がない
@@ -164,21 +177,34 @@ fn real_starter(profile: Option<crate::opcua_pki::PkiProfile>) -> Starter {
     })
 }
 
-/// blocking 用のスレッドで行う起動の本体（置き場の確かめ → `OpcUaServer::start`）。
+/// blocking 用のスレッドで行う起動の本体（置き場を握る（サービスだけ）→ 置き場の確かめ →
+/// `OpcUaServer::start`）。
+///
+/// サービス（`profile.pin` が `Some`）では、鍵を作る・読む前に置き場の木を握り
+/// （[`crate::opcua_pki::pin`]。#623 PR6）、banto-opcua には握ったハンドルの本当のパスを渡す。
+/// 握った木は返す [`Started`] に入れて、listener が動いている間持つ。
 fn start_blocking(
     handle: &tokio::runtime::Handle,
-    config: ServerConfig,
+    mut config: ServerConfig,
     profile: Option<&crate::opcua_pki::PkiProfile>,
-) -> Result<RunningServer, String> {
+) -> Result<Started, String> {
     #[cfg(test)]
     start_gate::wait(config.port);
+    let pki_pin = match (&config.pki_dir, profile.and_then(|p| p.pin.as_ref())) {
+        (Some(_), Some(base)) => Some(crate::opcua_pki::pin(base)?),
+        _ => None,
+    };
+    if let Some(pin) = &pki_pin {
+        config.pki_dir = Some(pin.dir().to_path_buf());
+    }
     let pki_dir = config.pki_dir.clone();
     if let Some(dir) = &pki_dir {
         crate::opcua_pki::prepare(dir, profile)?;
     }
-    handle
+    let server = handle
         .block_on(OpcUaServer::start(config))
-        .map_err(|err| describe_start_error(&err, pki_dir.as_deref()))
+        .map_err(|err| describe_start_error(&err, pki_dir.as_deref()))?;
+    Ok(Started { server, pki_pin })
 }
 
 /// 起動の失敗の文言。`Error::Pki`（置き場・鍵と証明書の組を用意できない）には、
@@ -267,6 +293,9 @@ struct PublishedTag {
 
 struct Inner {
     server: Option<RunningServer>,
+    /// `server` と一緒に持つ、握った置き場の木（サービスだけ。#623 PR6）。`server` を止めて
+    /// から離す。
+    pki_pin: Option<crate::opcua_pki::PkiPin>,
     tags: HashMap<String, PublishedTag>,
     settings: Option<OpcUaSettings>,
     worker: Option<JoinHandle<()>>,
@@ -314,6 +343,7 @@ impl OpcUaPublisher {
             manager,
             inner: Mutex::new(Inner {
                 server: None,
+                pki_pin: None,
                 tags: HashMap::new(),
                 settings: None,
                 worker: None,
@@ -464,15 +494,17 @@ impl OpcUaPublisher {
             // 書かず、起動できた listener は止める（ロックは外して止める。
             // 次の起動タスクはこのタスクの終わりを待つので重ならない）。
             drop(inner);
-            if let Ok(server) = result {
-                if let Err(err) = server.shutdown().await {
+            if let Ok(started) = result {
+                if let Err(err) = started.server.shutdown().await {
                     log_err_line(&format!("banto-hub: OPC UA の停止に失敗しました: {err}"));
                 }
+                // 握った置き場の木は、listener を止めてから離す。
+                drop(started.pki_pin);
             }
             return;
         }
-        let server = match result {
-            Ok(server) => server,
+        let Started { server, pki_pin } = match result {
+            Ok(started) => started,
             Err(err) => {
                 log_err_line(&format!("banto-hub: OPC UA の起動に失敗しました: {err}"));
                 self.status
@@ -489,6 +521,7 @@ impl OpcUaPublisher {
             server.endpoint().to_owned(),
         ));
         inner.server = Some(server);
+        inner.pki_pin = pki_pin;
         self.reconcile(&mut inner);
         let publisher = self.clone();
         inner.worker = Some(tokio::spawn(async move {
@@ -514,6 +547,8 @@ impl OpcUaPublisher {
                 log_err_line(&format!("banto-hub: OPC UA の停止に失敗しました: {err}"));
             }
         }
+        // 握った置き場の木は、listener を止めてから離す（#623 PR6）。
+        inner.pki_pin = None;
         inner.tags.clear();
         inner.last_errors.clear();
     }
@@ -1207,5 +1242,165 @@ mod tests {
         assert_eq!(reading.timestamps.source, system_time(175));
         assert_eq!(reading.quality, UaQuality::Stale);
         assert_eq!(reading.value, Some(1.0));
+    }
+
+    // ---- #623 PR6: サービスでは起動の前に置き場の木を握る ----
+
+    #[cfg(windows)]
+    fn junction(link: &std::path::Path, target: &std::path::Path) {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("mklink");
+        assert!(status.success(), "mklink /J に失敗した");
+    }
+
+    /// `Mode::Guarded` で握った profile（今の利用者を所有者として許す）の組と、その `pki` の
+    /// 置き場。`service` なら [`crate::opcua_pki::PkiProfile::pin`] を `Some` にする。
+    #[cfg(windows)]
+    fn held_profile(
+        root: &std::path::Path,
+        service: bool,
+    ) -> (
+        crate::profile_lock::ProfileDirs,
+        crate::opcua_pki::PkiProfile,
+    ) {
+        let paths =
+            crate::profile_paths::resolve_profile_paths(root, "pin").expect("valid profile id");
+        std::fs::create_dir_all(paths.profile_dir.parent().expect("profiles")).unwrap();
+        let mut spec = crate::profile_lock::plain_profile_root_spec(&paths);
+        spec.mode = banto_safe_root::Mode::Guarded;
+        let me = banto_safe_root::acl::current_user_sid().expect("今の利用者の SID");
+        spec.owners = vec![me.clone()];
+        let dirs = crate::profile_lock::open_profile_dirs(&spec, None).expect("open dirs");
+        let profile = crate::opcua_pki::PkiProfile {
+            dir: dirs.profile.final_path().to_path_buf(),
+            id: "pin".to_owned(),
+            pin: service.then(|| crate::opcua_pki::PkiPinBase {
+                profile: dirs.profile.clone(),
+                data: dirs.data.clone(),
+                access: banto_safe_root::DirAccess::with_install_user(me),
+            }),
+        };
+        (dirs, profile)
+    }
+
+    #[cfg(windows)]
+    async fn start_with(
+        pki: PathBuf,
+        profile: crate::opcua_pki::PkiProfile,
+    ) -> Result<Started, String> {
+        let config = server_config(&enabled(free_port()), Some(&pki)).expect("config");
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || start_blocking(&handle, config, Some(&profile)))
+            .await
+            .expect("start_blocking")
+    }
+
+    /// サービスの経路では、`pki` か `own` がジャンクションなら、置き場の木を握る段で
+    /// （鍵を作る・読む前に）断り、ジャンクションの先に何も作らない。
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_junction_in_the_pki_tree_stops_the_service_start() {
+        for linked in [&["pki"][..], &["pki", "own"][..]] {
+            let root = crate::test_support::TempDir::new("opcua-service-pin-junction");
+            let outside = crate::test_support::TempDir::new("opcua-service-pin-outside");
+            let (dirs, profile) = held_profile(root.path(), true);
+            let pki = crate::opcua_pki::pki_dir(dirs.data.final_path());
+            let link = linked
+                .iter()
+                .fold(pki.parent().expect("opcua").to_path_buf(), |dir, name| {
+                    dir.join(name)
+                });
+            std::fs::create_dir_all(link.parent().expect("parent")).unwrap();
+            junction(&link, outside.path());
+
+            let reason = match start_with(pki, profile).await {
+                Ok(_) => panic!("{linked:?}: ジャンクションの置き場で起動した"),
+                Err(reason) => reason,
+            };
+            assert!(reason.contains("握れない"), "{linked:?}: {reason}");
+            assert!(
+                std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+                "{linked:?}: ジャンクションの先に作った"
+            );
+        }
+    }
+
+    /// サービスの経路で握ったまま起動でき、握った木の中に鍵と証明書ができる。起動中は
+    /// `own` を改名できず、止めて握りを放すと改名できる。2 回目（既存の鍵を読む経路）も成功する。
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_service_pin_starts_and_writes_keys_inside_the_held_tree() {
+        let root = crate::test_support::TempDir::new("opcua-service-pin-start");
+        let (dirs, profile) = held_profile(root.path(), true);
+        let pki = crate::opcua_pki::pki_dir(dirs.data.final_path());
+        let own = pki.join("own");
+        let moved = pki.join("own-moved");
+
+        let Started { server, pki_pin } = start_with(pki.clone(), profile.clone())
+            .await
+            .expect("first start under the pin");
+        let pki_pin = pki_pin.expect("service start holds the pki tree");
+        let cert = own.join("cert.der");
+        let key = pki.join("private").join("private.pem");
+        let first = (std::fs::read(&cert).unwrap(), std::fs::read(&key).unwrap());
+        assert!(!first.0.is_empty() && !first.1.is_empty());
+        assert!(
+            std::fs::rename(&own, &moved).is_err(),
+            "own は起動中に改名できない"
+        );
+        server.shutdown().await.expect("shutdown");
+        drop(pki_pin);
+
+        std::fs::rename(&own, &moved).expect("握りを放すと改名できる");
+        std::fs::rename(&moved, &own).unwrap();
+        // 本番のサービスは SYSTEM（フルコントロール）で再び開く。ここでは非昇格の利用者が
+        // 作った木なので、開き直しに要る WRITE_OWNER を持つよう、利用者にフルを足す。
+        let opcua = pki.parent().expect("opcua");
+        let who = format!(
+            r"{}\{}",
+            std::env::var("USERDOMAIN").expect("USERDOMAIN"),
+            std::env::var("USERNAME").expect("USERNAME")
+        );
+        let granted = std::process::Command::new("icacls")
+            .arg(opcua)
+            .args(["/grant", &format!("{who}:(OI)(CI)(F)"), "/T", "/Q"])
+            .output()
+            .expect("icacls");
+        assert!(granted.status.success(), "icacls: {granted:?}");
+        let Started { server, pki_pin } = start_with(pki.clone(), profile)
+            .await
+            .expect("second start reads the existing key");
+        assert!(pki_pin.is_some());
+        assert_eq!(std::fs::read(&cert).unwrap(), first.0);
+        assert_eq!(std::fs::read(&key).unwrap(), first.1);
+        server.shutdown().await.expect("shutdown");
+        drop(pki_pin);
+    }
+
+    /// デスクトップの経路（`pin` が `None`）は今まで通り握らず、パスのままの確かめ
+    /// （[`crate::opcua_pki::prepare`]）で断る（`own` がジャンクションのとき）。
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_desktop_start_does_not_pin_and_keeps_the_path_checks() {
+        let root = crate::test_support::TempDir::new("opcua-desktop-no-pin");
+        let outside = crate::test_support::TempDir::new("opcua-desktop-no-pin-outside");
+        let (dirs, profile) = held_profile(root.path(), false);
+        assert!(profile.pin.is_none());
+        let pki = crate::opcua_pki::pki_dir(dirs.data.final_path());
+        std::fs::create_dir_all(&pki).unwrap();
+        junction(&pki.join("own"), outside.path());
+
+        let reason = match start_with(pki, profile).await {
+            Ok(_) => panic!("ジャンクションの own で起動した"),
+            Err(reason) => reason,
+        };
+        assert!(!reason.contains("握れない"), "{reason}");
+        assert!(reason.contains("使えないため"), "{reason}");
+        assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
     }
 }
