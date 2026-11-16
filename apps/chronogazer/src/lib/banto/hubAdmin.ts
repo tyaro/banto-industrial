@@ -148,6 +148,13 @@ export interface HubSubscription {
 	lastError: string | null;
 	lastValueAt: number | null;
 	values: HubValue[];
+	/**
+	 * 同じ PC の Hub の証明書の置き場についての警告（#1121 PR4b、
+	 * `chronogazer_core::hub::HubSubscriptionView::tls_warnings`）。`HubView.tlsWarnings`
+	 * と同じ値で、操作のとき以外のポーリングで警告を更新するためにある。無ければ空
+	 * （古い応答では欠ける）。
+	 */
+	tlsWarnings?: string[];
 }
 
 export const DEMO_MODE_MESSAGE = 'デモモードでは利用できません';
@@ -405,11 +412,25 @@ export function hubStatusLabel(status: HubStatus): string {
 	}
 }
 
+/**
+ * この画面を動かしている側。`desktop` = ChronoGazer のデスクトップ版（Tauri。同じ PC の
+ * Hub はデスクトップ版でもサービスでもよい）、`service` = `chronogazer-server`（Web。
+ * 相手はサービスの Hub だけ）。core の `LOOPBACK_HTTP_REFUSED(_SERVICE)` の分け方に合わせる。
+ */
+export type HubHost = 'desktop' | 'service';
+
+/** 今の画面の動かし方。Tauri なら desktop、それ以外（chronogazer-server の Web）は service。 */
+export function currentHubHost(): HubHost {
+	return getBantoMode() === 'tauri' ? 'desktop' : 'service';
+}
+
 /** 状態ごとの補足説明（次に何をすればよいか）。純関数。 */
-export function hubStatusDetail(status: HubStatus): string {
+export function hubStatusDetail(status: HubStatus, host: HubHost = 'service'): string {
 	switch (status.state) {
 		case 'notConfigured':
-			return '接続先のURLを入力して「接続」を押してください（同じPCのHubには https://127.0.0.1:8723 を使います。Hubをサービスで動かし、管理者で prepare-hub-tls を済ませておいてください）。';
+			return host === 'desktop'
+				? '接続先のURLを入力して「接続」を押してください（同じPCのHubには https://127.0.0.1:8723 を使います。Hubのデスクトップ版を起動しておくか、Hubをサービスで動かし、管理者で prepare-hub-tls を済ませておいてください）。'
+				: '接続先のURLを入力して「接続」を押してください（同じPCのHubには https://127.0.0.1:8723 を使います。Hubをサービスで動かし、管理者で prepare-hub-tls を済ませておいてください）。';
 		case 'connected':
 			return status.tagCount === 0
 				? 'Hubにはまだタグが登録されていません。Hub側でタグを登録すると、ここに表示されます。'
@@ -885,7 +906,8 @@ export function hubStatusDisplay(
 	status: HubStatus,
 	observedWith: HubSubscription | null,
 	current: HubSubscription | null,
-	recheck: StaleRecheck = { phase: 'idle' }
+	recheck: StaleRecheck = { phase: 'idle' },
+	host: HubHost = 'service'
 ): {
 	label: string;
 	detail: string;
@@ -901,7 +923,7 @@ export function hubStatusDisplay(
 			// 出しつつ、試し直すことを添える。
 			return {
 				label: hubStatusLabel(status),
-				detail: `${hubStatusDetail(status)} ${HUB_STATUS_RECHECK_ANSWERED_NOTE}`,
+				detail: `${hubStatusDetail(status, host)} ${HUB_STATUS_RECHECK_ANSWERED_NOTE}`,
 				guidance: null,
 				stale: true,
 				recheckFailed: true
@@ -918,7 +940,7 @@ export function hubStatusDisplay(
 	}
 	return {
 		label: hubStatusLabel(status),
-		detail: hubStatusDetail(status),
+		detail: hubStatusDetail(status, host),
 		guidance: status,
 		stale: false,
 		recheckFailed: false
