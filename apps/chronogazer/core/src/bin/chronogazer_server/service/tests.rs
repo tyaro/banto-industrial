@@ -560,6 +560,32 @@ fn assert_relaxed_last_and_silent(lines: &[String]) {
     assert_eq!(relax, lines.len() - 1, "緩め始めた後に行がある: {lines:#?}");
 }
 
+/// 握る保留の退避先（#623 PR5）は、ChronoGazer の保留の置き場（`audit_spool_dir()`）の下の
+/// `quarantine`（banto が退避する先）と同じ場所になる。親を取り違えると別の場所を握る。
+#[test]
+fn managed_quarantine_is_under_the_audit_spool_dir() {
+    let layout = DataLayout::new(PathBuf::from("root"));
+    let spec = MANAGED_SPECS
+        .iter()
+        .find(|s| s.key == "audit-spool-quarantine")
+        .expect("spec がある");
+    let mut parts = vec![spec.name];
+    let mut parent = spec.parent;
+    while let Some(key) = parent {
+        let up = MANAGED_SPECS
+            .iter()
+            .find(|s| s.key == key)
+            .expect("親の spec がある");
+        parts.push(up.name);
+        parent = up.parent;
+    }
+    let mut path = layout.root().to_path_buf();
+    for part in parts.iter().rev() {
+        path.push(part);
+    }
+    assert_eq!(path, layout.audit_spool_dir().join("quarantine"));
+}
+
 /// `close_log` は**向け直しを流しきってから**日次ログを閉じる（Codex の指摘 P2）。閉じる前に
 /// パイプに残っていた出力（`flush` のコールバックが `StdioRedirect::finish` で流す分）がログに
 /// 残り、閉じた後の `write_line` は行を足さない。順を戻す（閉じてから流す）とこのテストが落ちる。

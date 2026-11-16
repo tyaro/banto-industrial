@@ -218,13 +218,13 @@ const MANAGED_SPECS: [ManagedSpec; 9] = [
         name: DB_FILE_NAME,
         create: true,
     },
-    // #623 PR5: banto の保留は読めないファイルを `audit-spool/quarantine` へ**パスで**
-    // 移す（`create_dir_all` → `rename`）。リンクにすり替えられないよう握っておく
+    // #623 PR5: banto の保留は読めないファイルを `audit-spool\<DB のファイル名>\quarantine`
+    // へ**パスで**移す（`create_dir_all` → `rename`）。リンクにすり替えられないよう握っておく
     // （握っている間は改名・削除不可。リンクなら開かずに断る）。名前は banto の
     // `banto-admin-services` の `audit::spool::QUARANTINE_DIR` と同じ。
     ManagedSpec {
         key: "audit-spool-quarantine",
-        parent: Some("audit-spool"),
+        parent: Some("audit-spool-db"),
         name: "quarantine",
         create: true,
     },
