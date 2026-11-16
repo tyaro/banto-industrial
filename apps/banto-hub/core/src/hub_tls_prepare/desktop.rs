@@ -209,7 +209,7 @@ pub fn load_desktop_identity() -> Result<DefaultHubTls, DesktopTlsUnavailable> {
 pub fn bind_failure_lines(port: u16, error: &str) -> Vec<String> {
     vec![
         format!("[WARN] banto-hub: デスクトップ版の既定の TLS（https://127.0.0.1:{port}）を待ち受けられないので、TLS 無しで起動します: {error}"),
-        format!("[WARN] banto-hub: 対処: 127.0.0.1:{port} を使っている別のプロセス・Hub のサービス・別のプロファイルを確かめてから、Hub のデスクトップ版を再起動してください。それまで、証明書を pin したクライアントは繋がりません"),
+        format!("[WARN] banto-hub: 対処: 127.0.0.1:{port} を使っている別のプロセス・Hub のサービス・別のプロファイルを確かめて止めてください。ポートが空けば、次の周期（30 秒まで）で安全を確かめてから自動で待ち受けを再開します（再起動は要りません）。それまで、このデスクトップ版の Hub には証明書を pin したクライアントは繋がりません"),
     ]
 }
 
