@@ -1264,8 +1264,10 @@ dependencies = [
 name = "banto-tsquery"
 version = "0.3.0-alpha.2"
 dependencies = [
+ "banto-safe-root",
  "banto-tstore",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
 ]

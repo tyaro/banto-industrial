@@ -5,7 +5,7 @@
 //! principle.
 //!
 //! Unlike the other three query methods, this one is not range-scoped -
-//! every recognized file in `data_dir` is opened (bounded by the retention
+//! every recognized file in the data directory is opened (bounded by the retention
 //! window, default 90 days: cheap, and this is an init-time call, not a hot
 //! path). For each group/tag, later files (ascending `(date, seq)` order)
 //! overwrite earlier ones' name/unit/decimals, so the reported metadata
@@ -21,114 +21,27 @@
 //! groups/tags/range, same as if it were not listed at all.
 
 use std::collections::HashMap;
-use std::path::Path;
 
-use banto_tstore::list_data_files;
-use sqlx::Row;
+use banto_tstore::{DataFileInfo, DataPlace};
+use sqlx::{Row, SqlitePool};
 
 use crate::error::TsQueryError;
 use crate::plan::{
-    incompatible, is_safe_column_name, is_safe_table_name, is_uninitialized, open_readonly,
+    incompatible, is_safe_column_name, is_safe_table_name, is_uninitialized, open_file,
 };
 use crate::types::{Catalog, GroupCatalogEntry, TagCatalogEntry};
 
-pub(crate) async fn catalog(data_dir: &Path) -> Result<Catalog, TsQueryError> {
-    let files = list_data_files(data_dir)?;
+pub(crate) async fn catalog(place: &DataPlace) -> Result<Catalog, TsQueryError> {
+    let files = place.list_data_files()?;
     let mut groups: HashMap<String, GroupCatalogEntry> = HashMap::new();
 
     for file in &files {
-        let pool = open_readonly(&file.path).await?;
-
-        if is_uninitialized(&pool)
-            .await
-            .map_err(|e| incompatible(&file.path, e))?
-        {
-            // Writer has not yet committed this file's schema-creation
-            // transaction (raced) - skip it like any other file that
-            // contributes nothing, not a hard error (see
-            // `plan.rs::is_uninitialized`).
-            pool.close().await;
-            continue;
-        }
-
-        let group_rows = sqlx::query("SELECT group_key, group_name, table_name FROM tstore_groups")
-            .fetch_all(&pool)
-            .await
-            .map_err(|e| incompatible(&file.path, e))?;
-
-        for group_row in group_rows {
-            let group_key: String = group_row.try_get("group_key")?;
-            let group_name: String = group_row.try_get("group_name")?;
-            let table_name: String = group_row.try_get("table_name")?;
-            if !is_safe_table_name(&table_name) {
-                return Err(TsQueryError::UnsafeIdentifier {
-                    path: file.path.clone(),
-                    identifier: table_name,
-                });
-            }
-
-            let column_rows = sqlx::query(
-                "SELECT column_name, tag_key, tag_name, unit, decimals \
-                 FROM tstore_columns WHERE group_key = ? ORDER BY column_index ASC",
-            )
-            .bind(&group_key)
-            .fetch_all(&pool)
-            .await
-            .map_err(|e| incompatible(&file.path, e))?;
-
-            let range_sql = format!("SELECT MIN(ptime), MAX(ptime) FROM {table_name}");
-            // AssertSqlSafe: table_name はこの直前の is_safe_table_name で
-            // 検証済み（samples_<n> 形式のみ許可、それ以外は既に早期リターン
-            // 済み）。
-            let range_row = sqlx::query(sqlx::AssertSqlSafe(range_sql))
-                .fetch_one(&pool)
-                .await
-                .map_err(|e| incompatible(&file.path, e))?;
-            let min_ptime: Option<i64> = range_row.try_get(0)?;
-            let max_ptime: Option<i64> = range_row.try_get(1)?;
-
-            let entry = groups
-                .entry(group_key.clone())
-                .or_insert_with(|| GroupCatalogEntry {
-                    group_key: group_key.clone(),
-                    group_name: group_name.clone(),
-                    tags: Vec::new(),
-                    earliest_ms: None,
-                    latest_ms: None,
-                });
-            // `files` is ascending by (date, seq) - later iterations always
-            // win, so this ends up holding the most recent file's name.
-            entry.group_name = group_name;
-
-            for column_row in column_rows {
-                let column_name: String = column_row.try_get("column_name")?;
-                if !is_safe_column_name(&column_name) {
-                    return Err(TsQueryError::UnsafeIdentifier {
-                        path: file.path.clone(),
-                        identifier: column_name,
-                    });
-                }
-                let tag_key: String = column_row.try_get("tag_key")?;
-                let decimals: i64 = column_row.try_get("decimals")?;
-                let tag_entry = TagCatalogEntry {
-                    tag_key: tag_key.clone(),
-                    tag_name: column_row.try_get("tag_name")?,
-                    unit: column_row.try_get("unit")?,
-                    decimals: decimals as u8,
-                };
-                match entry.tags.iter_mut().find(|t| t.tag_key == tag_key) {
-                    Some(existing) => *existing = tag_entry,
-                    None => entry.tags.push(tag_entry),
-                }
-            }
-
-            if let Some(min_ptime) = min_ptime {
-                entry.earliest_ms = Some(entry.earliest_ms.map_or(min_ptime, |e| e.min(min_ptime)));
-            }
-            if let Some(max_ptime) = max_ptime {
-                entry.latest_ms = Some(entry.latest_ms.map_or(max_ptime, |l| l.max(max_ptime)));
-            }
-        }
+        // Pinned on a `DataPlace::Managed` (#623 PR7 - `plan::open_file`);
+        // closed (pool, then pins) before the next file either way.
+        let opened = open_file(place, file).await?;
+        let result = catalog_file(opened.pool(), file, &mut groups).await;
+        opened.close().await;
+        result?;
     }
 
     let mut groups: Vec<GroupCatalogEntry> = groups.into_values().collect();
@@ -138,4 +51,103 @@ pub(crate) async fn catalog(data_dir: &Path) -> Result<Catalog, TsQueryError> {
     }
 
     Ok(Catalog { groups })
+}
+
+/// One file's contribution to [`catalog`] (an uninitialized file contributes
+/// nothing).
+async fn catalog_file(
+    pool: &SqlitePool,
+    file: &DataFileInfo,
+    groups: &mut HashMap<String, GroupCatalogEntry>,
+) -> Result<(), TsQueryError> {
+    if is_uninitialized(pool)
+        .await
+        .map_err(|e| incompatible(&file.path, e))?
+    {
+        // Writer has not yet committed this file's schema-creation
+        // transaction (raced) - skip it like any other file that
+        // contributes nothing, not a hard error (see
+        // `plan.rs::is_uninitialized`).
+        return Ok(());
+    }
+
+    let group_rows = sqlx::query("SELECT group_key, group_name, table_name FROM tstore_groups")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| incompatible(&file.path, e))?;
+
+    for group_row in group_rows {
+        let group_key: String = group_row.try_get("group_key")?;
+        let group_name: String = group_row.try_get("group_name")?;
+        let table_name: String = group_row.try_get("table_name")?;
+        if !is_safe_table_name(&table_name) {
+            return Err(TsQueryError::UnsafeIdentifier {
+                path: file.path.clone(),
+                identifier: table_name,
+            });
+        }
+
+        let column_rows = sqlx::query(
+            "SELECT column_name, tag_key, tag_name, unit, decimals \
+             FROM tstore_columns WHERE group_key = ? ORDER BY column_index ASC",
+        )
+        .bind(&group_key)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| incompatible(&file.path, e))?;
+
+        let range_sql = format!("SELECT MIN(ptime), MAX(ptime) FROM {table_name}");
+        // AssertSqlSafe: table_name はこの直前の is_safe_table_name で
+        // 検証済み（samples_<n> 形式のみ許可、それ以外は既に早期リターン
+        // 済み）。
+        let range_row = sqlx::query(sqlx::AssertSqlSafe(range_sql))
+            .fetch_one(pool)
+            .await
+            .map_err(|e| incompatible(&file.path, e))?;
+        let min_ptime: Option<i64> = range_row.try_get(0)?;
+        let max_ptime: Option<i64> = range_row.try_get(1)?;
+
+        let entry = groups
+            .entry(group_key.clone())
+            .or_insert_with(|| GroupCatalogEntry {
+                group_key: group_key.clone(),
+                group_name: group_name.clone(),
+                tags: Vec::new(),
+                earliest_ms: None,
+                latest_ms: None,
+            });
+        // `files` is ascending by (date, seq) - later iterations always
+        // win, so this ends up holding the most recent file's name.
+        entry.group_name = group_name;
+
+        for column_row in column_rows {
+            let column_name: String = column_row.try_get("column_name")?;
+            if !is_safe_column_name(&column_name) {
+                return Err(TsQueryError::UnsafeIdentifier {
+                    path: file.path.clone(),
+                    identifier: column_name,
+                });
+            }
+            let tag_key: String = column_row.try_get("tag_key")?;
+            let decimals: i64 = column_row.try_get("decimals")?;
+            let tag_entry = TagCatalogEntry {
+                tag_key: tag_key.clone(),
+                tag_name: column_row.try_get("tag_name")?,
+                unit: column_row.try_get("unit")?,
+                decimals: decimals as u8,
+            };
+            match entry.tags.iter_mut().find(|t| t.tag_key == tag_key) {
+                Some(existing) => *existing = tag_entry,
+                None => entry.tags.push(tag_entry),
+            }
+        }
+
+        if let Some(min_ptime) = min_ptime {
+            entry.earliest_ms = Some(entry.earliest_ms.map_or(min_ptime, |e| e.min(min_ptime)));
+        }
+        if let Some(max_ptime) = max_ptime {
+            entry.latest_ms = Some(entry.latest_ms.map_or(max_ptime, |l| l.max(max_ptime)));
+        }
+    }
+    Ok(())
 }

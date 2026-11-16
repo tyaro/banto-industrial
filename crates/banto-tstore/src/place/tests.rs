@@ -499,3 +499,157 @@ async fn a_checked_place_opens_files_that_inherit_the_folder_acl() {
         writer.close().await.unwrap();
     }
 }
+
+// --- 読み手（#623 PR7） ---------------------------------------------------
+
+async fn count_rows(reader: &TsReader) -> usize {
+    reader
+        .read_range("g1", DAY1_START_MS, DAY1_START_MS + 10_000)
+        .await
+        .unwrap()
+        .len()
+}
+
+/// 握った置き場の読み手（[`TsReader::open_in`]）: 書き手が握って開いている当日のファイルを
+/// 重ねて握って読め、読んでいる間も書き手は書け、閉じた後も読める。無い名前は作らずに断る。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_reader_reads_the_writers_open_file_without_disturbing_it() {
+    for mode in modes() {
+        let held = held(mode);
+        let place = held.place();
+        let writer = open(place.clone(), clock_at(DAY1_START_MS)).await;
+        for i in 0..3 {
+            writer
+                .append("g1", DAY1_START_MS + i * 1_000, &[Some(i as f64)])
+                .await
+                .unwrap();
+        }
+        writer.flush().await.unwrap();
+
+        // 書き手が握っている当日のファイルを、読み手も握って開ける。
+        let reader = TsReader::open_in(&place, &day1_name()).await.unwrap();
+        assert_eq!(count_rows(&reader).await, 3, "{mode:?}");
+        // 読み手が開いている間も書き手は書ける。
+        writer
+            .append("g1", DAY1_START_MS + 3_000, &[Some(3.0)])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        assert_eq!(count_rows(&reader).await, 4, "{mode:?}");
+        reader.close().await;
+
+        // 閉じた後も書ける・読み手がもう一度開ける。
+        writer
+            .append("g1", DAY1_START_MS + 4_000, &[Some(4.0)])
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+        let reader = TsReader::open_in(&place, &day1_name()).await.unwrap();
+        assert_eq!(count_rows(&reader).await, 5, "{mode:?}");
+        reader.close().await;
+        // 書き手を開き直して足せる（読み手の握りは離れている）。
+        let writer = open(place.clone(), clock_at(DAY1_START_MS + 5_000)).await;
+        writer
+            .append("g1", DAY1_START_MS + 5_000, &[Some(5.0)])
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+        assert_eq!(
+            tsquery_style_count(&held.data_path.join(day1_name())).await,
+            6
+        );
+
+        // 無い名前は作らずに断る（付随も作らない）。
+        let before = held.names();
+        let err = TsReader::open_in(&place, &day2_name())
+            .await
+            .expect_err("a missing file is an error for a reader");
+        assert!(matches!(err, TstoreError::Storage(_)), "{err:?}");
+        assert_eq!(held.names(), before, "{mode:?}: nothing is created");
+    }
+}
+
+/// Guarded: 読み手が握っている間は、その日付ファイルの名前を他者が変えられない。
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_reader_pins_the_three_names_until_close() {
+    let held = held(Mode::Guarded);
+    let place = held.place();
+    let writer = open(place.clone(), clock_at(DAY1_START_MS)).await;
+    writer
+        .append("g1", DAY1_START_MS, &[Some(1.0)])
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    let reader = TsReader::open_in(&place, &day1_name()).await.unwrap();
+    for suffix in ["", "-wal", "-shm"] {
+        let from = held.data_path.join(format!("{}{suffix}", day1_name()));
+        let to = held.outside.join(format!("moved{suffix}"));
+        assert!(
+            std::fs::rename(&from, &to).is_err(),
+            "{suffix}: a pinned name cannot be renamed"
+        );
+    }
+    reader.close().await;
+    let from = held.data_path.join(format!("{}-shm", day1_name()));
+    std::fs::rename(&from, held.outside.join("moved-shm")).expect("released after close");
+}
+
+/// Guarded: `-shm`・`-wal`・本体が外のファイルへのハードリンクなら、読み手は開かずに断る
+/// （外は変わらない）。Path の読み手は今までどおりパスで開く（ここでは確かめない）。
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_reader_refuses_a_sidecar_hard_linked_outside() {
+    for suffix in ["-shm", "-wal", ""] {
+        let held = held(Mode::Guarded);
+        let place = held.place();
+        let writer = open(place.clone(), clock_at(DAY1_START_MS)).await;
+        writer
+            .append("g1", DAY1_START_MS, &[Some(1.0)])
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        let name = format!("{}{suffix}", day1_name());
+        let victim = held.outside.join("victim");
+        std::fs::write(&victim, b"outside").unwrap();
+        // 本体は外へ逃がしてから、外のファイルへのハードリンクを同じ名前で置く。
+        std::fs::rename(held.data_path.join(&name), held.outside.join("original")).unwrap();
+        std::fs::hard_link(&victim, held.data_path.join(&name)).unwrap();
+
+        let err = TsReader::open_in(&place, &day1_name())
+            .await
+            .expect_err("a hard-linked name must be refused");
+        assert!(matches!(err, TstoreError::Storage(_)), "{suffix}: {err:?}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"outside", "{suffix}");
+    }
+}
+
+/// Guarded: 読み手が開いている日付は保持期間の削除で消せず `Err`（本体は残る）、閉じた後の
+/// 削除で消える（モジュールの doc の「保持期間の削除との重なり」）。
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prune_waits_for_a_held_reader_to_close() {
+    let held = held(Mode::Guarded);
+    let place = held.place();
+    let writer = open(place.clone(), clock_at(DAY1_START_MS)).await;
+    writer
+        .append("g1", DAY1_START_MS, &[Some(1.0)])
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+    let today = LocalDate::from_epoch_ms(DAY1_START_MS + 10 * DAY_MS, OFFSET_MS);
+
+    let reader = TsReader::open_in(&place, &day1_name()).await.unwrap();
+    let err = place
+        .prune_files(1, today, &[])
+        .expect_err("a file a reader holds cannot be removed");
+    assert!(matches!(err, TstoreError::Storage(_)), "{err:?}");
+    assert!(held.names().contains(&day1_name()), "{:?}", held.names());
+    reader.close().await;
+
+    let report = place.prune_files(1, today, &[]).unwrap();
+    assert_eq!(report.deleted.len(), 1);
+    assert!(held.names().is_empty(), "{:?}", held.names());
+}

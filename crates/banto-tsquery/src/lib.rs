@@ -59,20 +59,31 @@ pub use types::{
 
 use std::path::{Path, PathBuf};
 
+use banto_tstore::DataPlace;
+
 /// A read-only handle on one `banto-tstore` data directory. Cheap to
-/// construct/hold (just a `PathBuf` - no connections are opened until a
+/// construct/hold (just a [`DataPlace`] - no connections are opened until a
 /// query method is called, and none are kept open between calls, unlike
 /// `banto-tstore::TsWriter`'s long-lived pool).
 #[derive(Debug, Clone)]
 pub struct TsQuery {
-    data_dir: PathBuf,
+    place: DataPlace,
 }
 
 impl TsQuery {
+    /// Read the directory at `data_dir` by path ([`DataPlace::Path`] -
+    /// desktop, Hub, tests).
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            data_dir: data_dir.into(),
-        }
+        Self::with_place(DataPlace::Path(data_dir.into()))
+    }
+
+    /// 書き手と同じ置き場で読む（#623 PR7）。[`DataPlace::Managed`]（LocalSystem のサービスの
+    /// 握った `data.dir`）なら、一覧は握ったハンドルから、各ファイルは本体・`-wal`・`-shm` を
+    /// 握ってから読み取り専用で開き（[`DataPlace::open_readonly`]）、リンクにされた名前は
+    /// 開かずに断る。握りは問い合わせごとに、pool を閉じ終えた後に離す。
+    /// [`DataPlace::Path`] は [`TsQuery::new`] と同じ。
+    pub fn with_place(place: DataPlace) -> Self {
+        Self { place }
     }
 
     /// Every sample for `group_key`/`tag_keys` with `from_ms <= ptime_ms <=
@@ -92,15 +103,7 @@ impl TsQuery {
         to_ms: i64,
         max_rows: Option<usize>,
     ) -> Result<RawRange, TsQueryError> {
-        raw::read_range(
-            &self.data_dir,
-            group_key,
-            tag_keys,
-            from_ms,
-            to_ms,
-            max_rows,
-        )
-        .await
+        raw::read_range(&self.place, group_key, tag_keys, from_ms, to_ms, max_rows).await
     }
 
     /// Server-side min/max-decimated bins across `[from_ms, to_ms]`, sized
@@ -125,7 +128,7 @@ impl TsQuery {
         target_bins: usize,
     ) -> Result<DecimatedRange, TsQueryError> {
         decimate::read_decimated(
-            &self.data_dir,
+            &self.place,
             group_key,
             tag_keys,
             from_ms,
@@ -146,7 +149,7 @@ impl TsQuery {
         from_ms: i64,
         to_ms: i64,
     ) -> Result<Vec<TagAggregate>, TsQueryError> {
-        aggregate::aggregate(&self.data_dir, group_key, tag_keys, from_ms, to_ms).await
+        aggregate::aggregate(&self.place, group_key, tag_keys, from_ms, to_ms).await
     }
 
     /// Every group/tag this data directory's files describe, with the
@@ -155,11 +158,12 @@ impl TsQuery {
     /// not a hot path (opens every recognized file in the directory; see
     /// [`mod@catalog`]'s module doc).
     pub async fn catalog(&self) -> Result<Catalog, TsQueryError> {
-        catalog::catalog(&self.data_dir).await
+        catalog::catalog(&self.place).await
     }
 
-    /// The data directory this handle reads from.
+    /// The data directory this handle reads from (a `Managed` place's
+    /// pinned handle's real path - for display, not for reopening).
     pub fn data_dir(&self) -> &Path {
-        &self.data_dir
+        self.place.path()
     }
 }

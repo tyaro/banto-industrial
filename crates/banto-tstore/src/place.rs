@@ -27,10 +27,35 @@
 //! 切り詰めるため）。ファイルの中身（スキーマ・WAL）は同じで、読み手（`TsReader`・
 //! banto-tsquery の読み取り専用の open）はどちらで書いたファイルも同じに読む。
 //!
+//! # 読み手（#623 PR7）
+//!
+//! WAL の SQLite は読み取り専用の接続でも `-shm` を書き込みで開き、切り詰めることがある。
+//! パスのまま開くと、利用者が `-shm` などを木の外のファイルへのリンクにしていれば、その先へ
+//! 書きうる。[`DataPlace::open_readonly`] の Managed は、書き手と同じく本体・`-wal`・`-shm` を
+//! 握ってから開く（本体は作らない。[`ManagedDir::pin_existing_sqlite`]）。握った名前は開いた
+//! 後のハンドルでリンク数 1・reparse point でないことを確かめているので、ハードリンクや
+//! シンボリックリンクにされていれば開かずに断る。握りは [`ReadOnlyFile`] が pool と一緒に持ち、
+//! pool を閉じ終えた後に離す。
+//!
+//! **書き手との重なり**: 握りは読み取りの権利・読み書きの共有（削除なし）なので、書き手が
+//! 握って書いている当日のファイルも重ねて握れ、書き手の書き込みも妨げない。読み手・書き手の
+//! 接続には PERSIST_WAL を立てるので、どちらが最後に閉じても握った `-wal`・`-shm` を消しに
+//! 行かない。
+//!
+//! **保持期間の削除との重なり（既知の制限）**: 読み手が握っている間（と SQLite が開いている
+//! 間）は、その日付の付随・本体を消せない（削除の権利で開けない）。削除は「削除の途中の
+//! 失敗」のとおり `Err` で止まり、本体は残る。ChronoGazer の掃除は失敗をログに出してその日の
+//! 掃除を済んだことにし、次の掃除（次の日付の変わり目・再起動）でやり直す。読み手は履歴の
+//! 読み出しの間（時間の上限つき）しか開かないので、重なるのはまれ。逆に、削除が付随を消した
+//! 後・本体を消す前に読み手が握ると、読み手は `-wal`・`-shm` を空で作り直し、削除は本体で
+//! 共有違反になって止まる（本体と付随は揃って残る）。
+//!
 //! # 守れないこと
 //!
 //! - **握っていない名前**: `-journal`（WAL では使わない。在ればリンクでないかを握る時点で
 //!   確かめるだけ）と SQLite の一時ファイル。
+//! - **読み手の握り**: 読み手は開いている間だけ握る（[`ReadOnlyFile`]）。Path の読み手
+//!   （デスクトップ・Hub・`data.dir` が外のとき）はパスのまま。
 //! - **握る前・閉じた後**: 開いていない日付のファイルは握らない（保持期間の削除は消す直前に
 //!   開いたハンドルで確かめ直す）。
 //! - **書き手を `close` せずに drop したとき**: pool は閉じ終えを待たずに捨てられ、握りも
@@ -189,6 +214,73 @@ impl DataPlace {
                 })
             }
         }
+    }
+}
+
+impl DataPlace {
+    /// 読み取り専用で開く（#623 PR7。[`crate::reader::TsReader::open_in`]・banto-tsquery の読み手）。
+    /// `name` は [`DataPlace::list_data_files`] が返した名前（ファイル名の 1 要素）。
+    ///
+    /// Path は今までどおり `schema::connect_readonly`（無ければ `Err`、作らない）。Managed は
+    /// [`ManagedDir::pin_existing_sqlite`] で本体を**作らずに**握り（無ければ `Err`）、`-wal`・
+    /// `-shm` は無ければ空で作って握ってから、[`PinnedSqlite::read_only_options`] で開く
+    /// （握っているときは接続ごとに PERSIST_WAL）。本体・`-wal`・`-shm` のどれかがリンク
+    /// （ハードリンクを含む）・reparse point・フォルダなら、開かずに `Err`（`expected` があれば
+    /// 記述子も確かめる）。書き手が握っている当日のファイルも重ねて握れる（握りの共有は
+    /// 読み書きで、どちらも削除の権利を求めない）。
+    pub async fn open_readonly(&self, name: &str) -> Result<ReadOnlyFile, TstoreError> {
+        match self {
+            DataPlace::Path(path) => Ok(ReadOnlyFile {
+                pool: schema::connect_readonly(&path.join(name)).await?,
+                pin: None,
+            }),
+            DataPlace::Managed { dir, expected } => {
+                let shown = || dir.final_path().join(name);
+                let pin = dir
+                    .pin_existing_sqlite(name, expected.as_ref())
+                    .map_err(|error| {
+                        TstoreError::Storage(format!(
+                            "データファイルを握れません（{}）: {error}",
+                            shown().display()
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        TstoreError::Storage(format!(
+                            "ファイルが見つかりません: {}",
+                            shown().display()
+                        ))
+                    })?;
+                // 失敗したら pool は無く、握りはここで離れる。
+                let pool = pin.connect_with(pin.read_only_options()).await?;
+                Ok(ReadOnlyFile {
+                    pool,
+                    pin: Some(pin),
+                })
+            }
+        }
+    }
+}
+
+/// 読み取り専用で開いたデータファイル（[`DataPlace::open_readonly`]）: pool と、Managed なら
+/// その握り。握りは pool を閉じ終えるまで生かす（[`ReadOnlyFile::close`]。`close` せずに drop
+/// すると、フィールドの順で pool が先に捨てられ（閉じ終えを待たない）、握りが続けて離れる。
+/// 捨てた pool は新しい接続を開かず、残りの接続は自身のハンドルが名前を守る）。
+#[derive(Debug)]
+pub struct ReadOnlyFile {
+    pool: SqlitePool,
+    pin: Option<PinnedSqlite>,
+}
+
+impl ReadOnlyFile {
+    /// 読み取り専用の pool。
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
+    /// pool を閉じ終えてから握りを離す。
+    pub async fn close(self) {
+        self.pool.close().await;
+        drop(self.pin);
     }
 }
 

@@ -27,17 +27,16 @@
 //! what this module selects cannot drift apart (pinned by
 //! `tests::candidate_files_agree_with_the_write_side_predicate`). Do not
 //! compute the range here in any other way.
-use std::path::Path;
-
-use banto_tstore::{candidate_date_range, list_data_files, DataFileInfo};
+use banto_tstore::{candidate_date_range, DataFileInfo, DataPlace};
 
 use crate::error::TsQueryError;
 
-/// Every recognized data file in `data_dir`, ascending by `(date, seq)`
-/// (`list_data_files`'s own order), filtered to those whose local date could
+/// Every recognized data file in `place`, ascending by `(date, seq)`
+/// ([`DataPlace::list_data_files`]'s own order - a `Managed` place lists
+/// through its pinned handle, #623 PR7), filtered to those whose local date could
 /// possibly overlap `[from_ms, to_ms]` under any real-world UTC offset.
 pub(crate) fn candidate_files(
-    data_dir: &Path,
+    place: &DataPlace,
     from_ms: i64,
     to_ms: i64,
 ) -> Result<Vec<DataFileInfo>, TsQueryError> {
@@ -46,7 +45,8 @@ pub(crate) fn candidate_files(
     // `candidate_date_range` saturates rather than overflowing at the
     // extremes (#423; see its doc).
     let (from_date, to_date) = candidate_date_range(from_ms, to_ms);
-    Ok(list_data_files(data_dir)?
+    Ok(place
+        .list_data_files()?
         .into_iter()
         .filter(|f| f.date >= from_date && f.date <= to_date)
         .collect())
@@ -72,8 +72,8 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
             Self(dir)
         }
-        fn path(&self) -> &Path {
-            &self.0
+        fn path(&self) -> DataPlace {
+            DataPlace::Path(self.0.clone())
         }
         fn touch(&self, name: &str) {
             fs::write(self.0.join(name), b"").unwrap();
@@ -94,7 +94,7 @@ mod tests {
         // 2026-07-12T00:00:00Z .. 2026-07-12T01:00:00Z
         let from_ms = 20_646 * 86_400_000;
         let to_ms = from_ms + 3_600_000;
-        let files = candidate_files(dir.path(), from_ms, to_ms).unwrap();
+        let files = candidate_files(&dir.path(), from_ms, to_ms).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].date, LocalDate::new(2026, 7, 12));
     }
@@ -112,7 +112,7 @@ mod tests {
         // decide precisely.
         let from_ms = 20_646 * 86_400_000; // 2026-07-12T00:00:00Z
         let to_ms = from_ms;
-        let files = candidate_files(dir.path(), from_ms, to_ms).unwrap();
+        let files = candidate_files(&dir.path(), from_ms, to_ms).unwrap();
         assert_eq!(files.len(), 3);
     }
 
@@ -171,7 +171,7 @@ mod tests {
         let mut accepted = 0;
         let mut rejected = 0;
         for p in ptimes {
-            let selected: Vec<LocalDate> = candidate_files(dir.path(), p, p)
+            let selected: Vec<LocalDate> = candidate_files(&dir.path(), p, p)
                 .unwrap()
                 .into_iter()
                 .map(|f| f.date)
@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn empty_dir_yields_no_candidates() {
         let dir = TempDir::new("empty");
-        let files = candidate_files(dir.path(), 0, 1_000).unwrap();
+        let files = candidate_files(&dir.path(), 0, 1_000).unwrap();
         assert!(files.is_empty());
     }
 }

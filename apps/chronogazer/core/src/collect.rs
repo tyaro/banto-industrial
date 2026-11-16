@@ -1825,7 +1825,7 @@ struct Published {
 }
 
 impl CollectorContext {
-    /// tstore の書き手の置き場（#623 PR4）。サービスは握った `data.dir`、ほかはパス。
+    /// tstore の置き場（書き手 #623 PR4・読み手の履歴 #623 PR7）。サービスは握った `data.dir`、ほかはパス。
     fn data_place(&self) -> banto_tstore::DataPlace {
         match &self.service_data_dir {
             Some(dir) => banto_tstore::DataPlace::Managed {

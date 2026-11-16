@@ -12,6 +12,7 @@ use sqlx::{Row, SqlitePool};
 
 use crate::error::TstoreError;
 use crate::meta::GroupMeta;
+use crate::place::{DataPlace, ReadOnlyFile};
 use crate::schema;
 
 /// One row from a `samples_<n>` table: the UTC epoch-ms `ptime` key plus one
@@ -32,6 +33,9 @@ pub struct Sample {
 pub struct TsReader {
     pool: SqlitePool,
     groups: Vec<GroupMeta>,
+    /// [`TsReader::open_in`] の Managed の握り（[`ReadOnlyFile`]。`pool` と同じ pool を持つ）。
+    /// フィールドの順で `pool` より後に捨てる。
+    file: Option<ReadOnlyFile>,
 }
 
 impl TsReader {
@@ -49,7 +53,36 @@ impl TsReader {
         Ok(Self {
             pool,
             groups: file_meta.groups,
+            file: None,
         })
+    }
+
+    /// [`TsReader::open`] の、置き場の中の名前 `name` で開く版（#623 PR7）。Managed は本体・
+    /// `-wal`・`-shm` を握ってから読み取り専用で開く（[`DataPlace::open_readonly`]）。握りは
+    /// [`TsReader::close`] で pool を閉じ終えた後に離す。失敗の種類は [`TsReader::open`] と同じ。
+    pub async fn open_in(place: &DataPlace, name: &str) -> Result<Self, TstoreError> {
+        let file = place.open_readonly(name).await?;
+        let file_meta = match schema::read_file_meta(file.pool()).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                file.close().await;
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            pool: file.pool().clone(),
+            groups: file_meta.groups,
+            file: Some(file),
+        })
+    }
+
+    /// pool を閉じ終えてから（[`TsReader::open_in`] なら）握りを離す。drop でも閉じるが、
+    /// 閉じ終えを待たない。
+    pub async fn close(self) {
+        match self.file {
+            Some(file) => file.close().await,
+            None => self.pool.close().await,
+        }
     }
 
     /// Every group this file describes, in the same order its `samples_<n>`

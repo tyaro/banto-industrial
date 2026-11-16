@@ -11,13 +11,13 @@
 //! average of already-rounded per-file averages, avoiding a second layer of
 //! floating-point error.
 
-use std::path::{Path, PathBuf};
+use banto_tstore::DataPlace;
 
 use sqlx::Row;
 
 use crate::error::TsQueryError;
 use crate::files::candidate_files;
-use crate::plan::plan_files;
+use crate::plan::{close_plans, plan_files, FilePlan};
 use crate::types::TagAggregate;
 
 /// One tag's accumulated `(min, max, sum, valid_sample_count)` across every
@@ -25,7 +25,7 @@ use crate::types::TagAggregate;
 type Accumulator = Option<(f64, f64, f64, i64)>;
 
 pub(crate) async fn aggregate(
-    data_dir: &Path,
+    place: &DataPlace,
     group_key: &str,
     tag_keys: &[String],
     from_ms: i64,
@@ -40,13 +40,24 @@ pub(crate) async fn aggregate(
         return Ok(Vec::new());
     }
 
-    let files = candidate_files(data_dir, from_ms, to_ms)?;
-    let paths: Vec<PathBuf> = files.into_iter().map(|f| f.path).collect();
-    let plans = plan_files(&paths, group_key, tag_keys).await?;
+    let files = candidate_files(place, from_ms, to_ms)?;
+    let plans = plan_files(place, &files, group_key, tag_keys).await?;
+    let result = aggregate_plans(&plans, tag_keys, from_ms, to_ms).await;
+    close_plans(plans).await;
+    result
+}
 
+/// The query over already-opened `plans` (closed by the caller afterwards -
+/// #623 PR7: pool first, then a `Managed` place's pins).
+async fn aggregate_plans(
+    plans: &[FilePlan],
+    tag_keys: &[String],
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<Vec<TagAggregate>, TsQueryError> {
     let mut acc: Vec<Accumulator> = vec![None; tag_keys.len()];
 
-    for plan in &plans {
+    for plan in plans {
         let present: Vec<(usize, &str)> = plan
             .columns
             .iter()
@@ -77,7 +88,7 @@ pub(crate) async fn aggregate(
         let row = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(from_ms)
             .bind(to_ms)
-            .fetch_one(&plan.pool)
+            .fetch_one(plan.pool())
             .await?;
 
         for (result_col, (tag_index, _)) in present.iter().enumerate() {

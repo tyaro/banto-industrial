@@ -523,7 +523,10 @@ impl CollectorService {
     /// キューにも触らない（このモジュールの doc「収集の操作キューを通らない」）。
     pub async fn history(&self, request: &HistoryRequest) -> Readout<CollectHistory> {
         let ctx = &self.inner.ctx;
-        let query = TsQuery::new(ctx.data_dir.clone());
+        // 書き手と同じ置き場で読む（#623 PR7）: サービスは握った `data.dir` の中で、日付ファイルの
+        // 本体・`-wal`・`-shm` を握ってから読み取り専用で開く（リンクにされた名前は断る）。
+        // デスクトップ・`data.dir` が外のときはパス（[`super::CollectorContext::data_place`]）。
+        let query = TsQuery::with_place(ctx.data_place());
         match tokio::time::timeout(
             HISTORY_READ_TIMEOUT,
             read_history(&ctx.pool, &query, request),

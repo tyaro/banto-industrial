@@ -64,13 +64,13 @@
 //! "show me the raw data" that missing points already read visually as a
 //! wider gap between plotted points, without needing an explicit marker.
 
-use std::path::{Path, PathBuf};
+use banto_tstore::DataPlace;
 
 use sqlx::Row;
 
 use crate::error::TsQueryError;
 use crate::files::candidate_files;
-use crate::plan::{plan_files, FilePlan};
+use crate::plan::{close_plans, plan_files, FilePlan};
 use crate::types::{Bin, BinValue, DecimatedRange};
 
 /// Upper bound on `target_bins`, guarding the `Vec` allocation in
@@ -82,7 +82,7 @@ use crate::types::{Bin, BinValue, DecimatedRange};
 pub const MAX_TARGET_BINS: usize = 200_000;
 
 pub(crate) async fn read_decimated(
-    data_dir: &Path,
+    place: &DataPlace,
     group_key: &str,
     tag_keys: &[String],
     from_ms: i64,
@@ -113,10 +113,22 @@ pub(crate) async fn read_decimated(
     // of the range, the bin width/count and each row's bin index - is done
     // in `i128` on the Rust side (`raw_bin_ms`/`bin_starts`) or with an
     // overflow-free decomposition inside SQLite (`binned_sql`).
-    let files = candidate_files(data_dir, from_ms, to_ms)?;
-    let paths: Vec<PathBuf> = files.into_iter().map(|f| f.path).collect();
-    let plans = plan_files(&paths, group_key, tag_keys).await?;
+    let files = candidate_files(place, from_ms, to_ms)?;
+    let plans = plan_files(place, &files, group_key, tag_keys).await?;
+    let result = decimate_plans(&plans, tag_keys, from_ms, to_ms, target_bins).await;
+    close_plans(plans).await;
+    result
+}
 
+/// The query over already-opened `plans` (closed by the caller afterwards -
+/// #623 PR7: pool first, then a `Managed` place's pins).
+async fn decimate_plans(
+    plans: &[FilePlan],
+    tag_keys: &[String],
+    from_ms: i64,
+    to_ms: i64,
+    target_bins: usize,
+) -> Result<DecimatedRange, TsQueryError> {
     let raw_bin_ms = raw_bin_ms(from_ms, to_ms, target_bins);
 
     if plans.is_empty() {
@@ -150,7 +162,7 @@ pub(crate) async fn read_decimated(
     let mut use_raw_passthrough = false;
     if bin_ms == period_ms_used {
         let mut total_rows: i64 = 0;
-        for plan in &plans {
+        for plan in plans {
             let sql = format!(
                 "SELECT COUNT(*) FROM {} WHERE ptime >= ? AND ptime <= ?",
                 plan.table_name
@@ -160,7 +172,7 @@ pub(crate) async fn read_decimated(
             let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
                 .bind(from_ms)
                 .bind(to_ms)
-                .fetch_one(&plan.pool)
+                .fetch_one(plan.pool())
                 .await?;
             total_rows += count;
         }
@@ -168,9 +180,9 @@ pub(crate) async fn read_decimated(
     }
 
     let bins = if use_raw_passthrough {
-        fetch_raw_passthrough(&plans, tag_keys.len(), from_ms, to_ms).await?
+        fetch_raw_passthrough(plans, tag_keys.len(), from_ms, to_ms).await?
     } else {
-        fetch_binned(&plans, tag_keys.len(), from_ms, to_ms, bin_ms).await?
+        fetch_binned(plans, tag_keys.len(), from_ms, to_ms, bin_ms).await?
     };
 
     Ok(DecimatedRange {
@@ -365,7 +377,7 @@ async fn fetch_binned(
         }
 
         let rows = fetch_bin_rows(
-            &plan.pool,
+            plan.pool(),
             &plan.table_name,
             &present,
             from_ms,
@@ -456,7 +468,7 @@ async fn fetch_raw_passthrough(
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(from_ms)
             .bind(to_ms)
-            .fetch_all(&plan.pool)
+            .fetch_all(plan.pool())
             .await?;
 
         for row in rows {
