@@ -87,6 +87,13 @@ export interface HubView {
 	 * `unreachable`（`hub_tls`）。それ以外は `null`（古い応答では欠ける）。
 	 */
 	endpointProblem?: string | null;
+	/**
+	 * 同じ PC の Hub の証明書の置き場についての警告（#1121 PR4a、
+	 * `chronogazer_core::hub::HubView::tls_warnings`）。片方の置き場が確かめに通らない・
+	 * 失効した、失効の記録が消された・直された、など。**接続できている間も**入る。
+	 * 無ければ空（古い応答では欠ける）。
+	 */
+	tlsWarnings?: string[];
 }
 
 /** `banto_tagclient::TagClientConnectionState` の綴りそのまま。 */

@@ -81,7 +81,9 @@ pub struct Unavailable {
     pub reason: String,
     /// 対処の種類。
     pub remedy: Remedy,
-    /// 失効に入れる種類か（#1121 PR2c。サービスの Hub が使う。クライアントは見ない）。
+    /// 失効に入れる種類か（#1121 PR2c。サービスの Hub はサービスの記録に書き足す。#1121 PR4a:
+    /// ChronoGazer デスクトップは利用者の記録に書き足し、chronogazer-server はプロセスの間だけ
+    /// 覚える。設計 §4.4.2 の場面 8〜10）。
     pub fault: PlaceFault,
 }
 

@@ -283,7 +283,8 @@ pub struct EngineConfig {
     /// Hub の API キーの置き場（`HubService::new` に渡す）。
     pub key_store: Arc<dyn KeyStore>,
     /// Hub と話すときの TLS の決まり（#644、`HubService::new` に渡す）。製品の host
-    /// （デスクトップ・`chronogazer-server`）は `HubTlsPolicy::production()` を固定で渡す。
+    /// は固定の決まりを渡す（デスクトップは `HubTlsPolicy::production()`、`chronogazer-server` は
+    /// `HubTlsPolicy::service_only()`。#1121 PR4a）。
     pub hub_tls: crate::hub_tls::HubTlsPolicy,
     /// 収集に Hub を繋ぐか（`CollectorService::attach_hub`）。キーを保存できる
     /// host だけ `true`（繋いでもキーが無ければ hub 接続は購読できない）。

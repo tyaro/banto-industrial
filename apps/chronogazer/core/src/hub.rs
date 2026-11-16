@@ -223,6 +223,11 @@ pub struct HubView {
     /// 次の一手。このとき `status` は `Unreachable { cause: hub_tls }` で、何も送って
     /// いない。それ以外は `None`。
     pub endpoint_problem: Option<String>,
+    /// 同じ PC の Hub の証明書の置き場についての警告（#1121 PR4a、
+    /// [`HubTlsPolicy::warnings_for`]）: 片方の置き場が確かめに通らない・失効した、失効の
+    /// 記録が消された・直された、確かめが終わらない。**接続できている間も**出る（片方が
+    /// 良いとき、もう片方の問題が誰にも見えなくなるのを防ぐ）。無ければ空。
+    pub tls_warnings: Vec<String>,
 }
 
 impl HubView {
@@ -232,6 +237,7 @@ impl HubView {
         tags: Option<Vec<HubTagView>>,
         subscription: HubSubscriptionView,
         endpoint_problem: Option<String>,
+        tls_warnings: Vec<String>,
     ) -> Self {
         Self {
             status,
@@ -243,6 +249,7 @@ impl HubView {
             tags,
             subscription,
             endpoint_problem,
+            tls_warnings,
         }
     }
 }
@@ -777,15 +784,6 @@ fn needs_rebuild(health: GenerationHealth) -> bool {
     is_terminal(health) || waits_on_metadata_mismatch(health)
 }
 
-/// 通信の失敗で再接続を続けている（`Live` でなく、直近の失敗が `Transport`）世代か
-/// （#644）。pin した https の世代がこうなっているときだけ、見張りが証明書の作り直しを
-/// 確かめる（[`Subscription::pin_to_recheck`]）。TLS の検証の失敗も `banto-tagclient` では
-/// `Transport` になる。
-fn fails_on_transport(health: GenerationHealth) -> bool {
-    health.state != TagClientConnectionState::Live
-        && health.last_error == Some(TagErrorKind::Transport)
-}
-
 /// 資格情報が変わったか、現世代が再作成を要するときだけ、同じ要求でも張り直す。
 fn must_restart_despite_same_fingerprint(
     trigger: Trigger,
@@ -1220,15 +1218,14 @@ impl Subscription {
         takes_this_tick(pace, &mut self.slow_retry_ticks)
     }
 
-    /// 見張りが証明書の作り直しを確かめるべき世代なら、その世代の pin の目印（#644）。
-    /// pin した https の世代が通信の失敗で再接続を続けているときだけ
-    /// （[`fails_on_transport`]）。`Live` の世代・pin を使わない世代では証明書を読まない。
+    /// 見張りが pin を確かめ直すべき世代なら、その世代の pin の目印（#644・#1121 PR4a）。
+    /// pin した https の世代なら、**`Live` でも毎周期**確かめる: 証明書の作り直しだけでなく、
+    /// 置き場が確かめに通らなくなった（ACL だけが変わった）・失効の記録に拇印が足された
+    /// ときも、その証明書を pin から外して張り直す必要があり、それは繋がったままの世代でも
+    /// 起きる（docs/hub-desktop-tls-design.md §4.4「毎周期、確かめ直す」）。pin を使わない
+    /// 世代では置き場を読まない。
     fn pin_to_recheck(&self) -> Option<u64> {
-        let generation = self.generation.as_ref()?;
-        let marker = generation.pin_marker?;
-        self.health()
-            .is_some_and(fails_on_transport)
-            .then_some(marker)
+        self.generation.as_ref()?.pin_marker
     }
 
     /// これからの購読の同一性を渡し、覚えている最終受信時刻を残すか捨てるかを
@@ -1471,7 +1468,7 @@ enum Trigger {
 /// `GET /api/v1/tags` を叩き続けても Hub の負荷にならない粒度。画面を
 /// 開いているときの 2 秒ポーリングは**メモリしか読まない**別物なので、
 /// こちらだけが実際のネットワーク再試行の頻度になる。
-const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Hub への 1 往復（ネットワークを伴う bootstrapper 呼び出し）に許す最大
 /// 時間（#394 のレビュー P1-1）。
@@ -2326,7 +2323,7 @@ impl HubService {
     /// | `Connecting` / `Handshaking` | × | 進行中。割り込むと無駄に張り直す |
     /// | `Reconnecting`（メタデータ不一致） | ○ | 再バインドの回数を使い切った世代を張り直す |
     /// | `Reconnecting`（それ以外） | × | **`banto-tagclient` 側の backoff の仕事**。ここで `stop → start` すると backoff と喧嘩し、再接続を遅らせるか Hub を叩く回数を増やすだけ |
-    /// | pin した https の世代が `Live` でなく直近の失敗が `Transport`、かつ証明書の目印が世代のものと違う | ○ | #644。管理者が `prepare-hub-tls --renew` で証明書を作り直して Hub を再起動すると、古い pin のまま検証に失敗し続け、backoff では戻らない。上の門とは別に、この世代に限って 1 周期に 1 回証明書を読み直して確かめる（[`Subscription::pin_to_recheck`]）。目印が同じ・読めないときは起こさない |
+    /// | pin した https の世代（`Live` を含む）で、pin の目印が世代のものと違う・使える証明書が無くなった | ○ | #644・#1121 PR4a。管理者が `prepare-hub-tls --renew` で証明書を作り直して Hub を再起動すると、古い pin のまま検証に失敗し続け、backoff では戻らない。繋がったままの世代も、pin にした証明書が失効した・置き場が確かめに通らなくなったら、その pin を外す。上の門とは別に、pin した世代は 1 周期に 1 回置き場を確かめ直す（[`Subscription::pin_to_recheck`]）。目印が同じなら起こさない |
     ///
     /// 起こす（[`needs_retry`]）と実際に張り直す
     /// （[`must_restart_despite_same_fingerprint`]）は同じ述語
@@ -2440,9 +2437,14 @@ impl HubService {
             );
             return;
         }
-        if self.inner.mirror.current().is_none() {
+        let Some(record) = self.inner.mirror.current() else {
             return;
-        }
+        };
+        // #1121 PR4a: 同じ PC の Hub が相手なら、毎周期、利用者の失効の記録を整え、露出を
+        // 見た拇印を書き足す（[`HubTlsPolicy::refresh`]。記録のロックを待つので blocking の
+        // スレッドで走る。相手が LAN・`chronogazer-server` の決まりなら何もしない）。結果は
+        // 下の pin の確かめ（`pin_moved_from`）と、起こした先の往復が使う。
+        self.inner.tls.refresh(&record.endpoint).await;
         // 保存中の資格情報（keyring を読むだけ）。`connect` が新しいキーを
         // 保存した後で打ち切られた／失敗した場合は突き合わせが走っていない
         // ので、古いキーの理由が残っている - ここで捨てないと、保存済みの
@@ -2469,8 +2471,10 @@ impl HubService {
                 // #644: 上の門は「再接続中」の世代を `banto-tagclient` の backoff に
                 // 任せて起こさない。ところが pin した https の世代は、管理者が
                 // `prepare-hub-tls --renew` で証明書を作り直して Hub を再起動すると、
-                // 古い pin のまま検証に失敗し続け、自力では戻らない。そこで門とは別に、
-                // その世代（[`Subscription::pin_to_recheck`]）に限って証明書を読み直す。
+                // 古い pin のまま検証に失敗し続け、自力では戻らない。#1121 PR4a: 繋がった
+                // ままの世代も、pin にした証明書が失効した・置き場が確かめに通らなく
+                // なったら、その pin を外して張り直す。そこで門とは別に、pin した世代
+                // （[`Subscription::pin_to_recheck`]）は毎周期、置き場を確かめ直す。
                 // 確かめるのは購読ロックを離してから（ファイルを読むため）。
                 match slot.pin_to_recheck() {
                     Some(marker) => Some(marker),
@@ -2491,10 +2495,11 @@ impl HubService {
     /// 保存済みの接続先に今使う pin の目印が、世代の目印 `marker` と違うか（#644）。
     /// 証明書は**この呼び出しで読む**（[`HubTlsPolicy::marker_for`]。覚えた値に頼らない）。
     ///
-    /// 読めない（置き場の確かめに失敗した等）ときは `false` - 今の世代を壊さず、理由を
-    /// ログに出して次の周期で確かめ直す。世代は古い pin のままなので、別の相手へは
-    /// 何も送らない。利用者が設定画面を開けば、同じ理由が状態の確認の案内に出る
-    /// （`HubCall::refused_by_tls`）。
+    /// 使える証明書が無くなった（どの置き場も確かめに通らない・失効した）ときは `true`
+    /// （#1121 PR4a）。世代が pin にしている証明書は、露出を見た・失効したものかもしれない
+    /// ので、古い pin のまま繋ぎ続けない: 起こした先の往復が TLS の決まりで断られ
+    /// （`HubCall::refused_by_tls`）、突き合わせが世代を止めて理由を出す。置き場が直れば、
+    /// 世代の無い周期の再試行が張り直す。
     fn pin_moved_from(&self, marker: u64) -> bool {
         let Some(record) = self.inner.mirror.current() else {
             return false;
@@ -2503,10 +2508,10 @@ impl HubService {
             Ok(now) => now != Some(marker),
             Err(err) => {
                 eprintln!(
-                    "banto: Hubの証明書を確かめられませんでした（購読はそのまま、次の周期で確かめ直します）: {}",
+                    "banto: Hubの証明書を使えなくなりました（購読を止めます。次の周期で確かめ直します）: {}",
                     err.detail().unwrap_or(err.kind().as_str())
                 );
-                false
+                true
             }
         }
     }
@@ -2541,6 +2546,9 @@ impl HubService {
         // **Hub 側にキーを発行させる唯一の経路**なので上限は
         // [`HUB_MUTATING_TIMEOUT`]（#395 のレビュー B）。打ち切りは Hub 側の
         // 発行を取り消せないので、その可能性を理由に載せる。
+        // #1121 PR4a: 入力された接続先についても、操作の入口の整える手順を先に済ませる
+        // （`begin_operation` が見たのは保存済みの接続先）。
+        self.inner.tls.ensure_started(endpoint).await;
         let call = with_timeout(
             HUB_MUTATING_TIMEOUT,
             || hub_mutating_timeout_reason(&self.inner.installation_id),
@@ -2567,6 +2575,7 @@ impl HubService {
         // キーリングと設定というローカル 2 つ。Hub 側のキーを発行も失効も
         // しない（`previous_for` は保存済みの記録を読むだけ）ので、`connect`
         // のような「打ち切ったら Hub にキーが残るかもしれない」窓が無い。
+        self.inner.tls.ensure_started(endpoint).await;
         let call = with_hub_timeout(
             self.inner
                 .bootstrapper
@@ -2628,6 +2637,7 @@ impl HubService {
             None,
             self.subscription().await,
             None,
+            Vec::new(),
         )
     }
 
@@ -2641,12 +2651,18 @@ impl HubService {
             .catalog
             .as_ref()
             .map(|catalog| catalog.tags.iter().map(HubTagView::from).collect());
+        // 警告は、この操作の判定（上の往復と突き合わせ）が置き場を読んだ結果。
+        let tls_warnings = record
+            .as_ref()
+            .map(|record| self.inner.tls.warnings_for(&record.endpoint))
+            .unwrap_or_default();
         HubView::new(
             call.connection.status,
             record.as_ref(),
             tags,
             self.subscription().await,
             call.endpoint_problem,
+            tls_warnings,
         )
     }
 
@@ -2937,6 +2953,12 @@ impl HubService {
             return Err(Self::shutting_down_error());
         }
         self.hydrate_keeping_pending().await?;
+        // #1121 PR4a: 保存済みの接続先が同じ PC の Hub なら、Hub と話す前に、利用者の失効の
+        // 記録を整える（[`HubTlsPolicy::ensure_started`]。見張りの周期の間に「整っている」と分かって
+        // いれば何もしない）。整うまでは、利用者の置き場の証明書を pin に使い始めない。
+        if let Some(record) = self.inner.mirror.current() {
+            self.inner.tls.ensure_started(&record.endpoint).await;
+        }
         Ok(guard)
     }
 
@@ -6385,13 +6407,24 @@ mod tests {
     /// 続けるところまで待つ。
     async fn pinned_generation_failing_on_transport(
     ) -> (SettingsService, HubService, Arc<SwappableCert>) {
+        let cert = SwappableCert::new();
+        let (settings, hub) = pinned_generation_failing_on_transport_with(
+            HubTlsPolicy::with_reader(Arc::clone(&cert) as Arc<dyn crate::hub_tls::HubCertReader>),
+        )
+        .await;
+        (settings, hub, cert)
+    }
+
+    /// [`pinned_generation_failing_on_transport`] の、TLS の決まりを渡す版。
+    async fn pinned_generation_failing_on_transport_with(
+        tls: HubTlsPolicy,
+    ) -> (SettingsService, HubService) {
         use banto_hub_bootstrap::state::memory::MemoryKeyStore;
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("https://{}", listener.local_addr().unwrap());
         drop(listener);
 
-        let cert = SwappableCert::new();
         let pool = init_db_memory().await.expect("init_db_memory");
         let settings = SettingsService::new(crate::db::Db::Sqlite(pool));
         let keys = Arc::new(MemoryKeyStore::new());
@@ -6400,7 +6433,7 @@ mod tests {
         let hub = HubService::new(
             settings.clone(),
             Arc::clone(&keys) as Arc<dyn KeyStore>,
-            HubTlsPolicy::with_reader(Arc::clone(&cert) as Arc<dyn crate::hub_tls::HubCertReader>),
+            tls,
         )
         .await
         .expect("HubService::new");
@@ -6409,8 +6442,10 @@ mod tests {
             .set(KEY_HUB_RECORD, &serde_json::to_string(&record).unwrap())
             .await
             .unwrap();
-        hub.inner.mirror.reset(Some(record));
+        hub.inner.mirror.reset(Some(record.clone()));
         register_for_test(&hub, &["a"]).await;
+        // 製品では操作の入口（`begin_operation`）が済ませる、起動の初回の整える手順。
+        hub.inner.tls.ensure_started(&record.endpoint).await;
 
         hub.reconcile_with(&HubStatus::Connected { tag_count: 1 }, Trigger::Observe)
             .await;
@@ -6436,7 +6471,70 @@ mod tests {
         })
         .await
         .expect("閉じたポートなので Transport で再接続を続ける");
-        (settings, hub, cert)
+        (settings, hub)
+    }
+
+    /// #1121 PR4a: 見張りは毎周期、利用者の失効の記録を整える手順を走らせ、pin にした
+    /// 証明書が使えなくなったら（失効の記録に拇印が足された。PEM も置き場も同じまま）、
+    /// 古い pin の世代を止めて理由を出す。置き場が直れば（作り直し）、次の周期で張りに行く。
+    ///
+    /// 反証: `pin_moved_from` が「使える証明書が無い」を `false` にすると、失効した証明書を
+    /// pin にした世代が残る。
+    #[tokio::test]
+    async fn the_supervisor_drops_a_generation_whose_only_pin_was_revoked() {
+        use crate::hub_tls::fake::{thumbprint, usable, FakePlaces};
+
+        let pem = SwappableCert::fresh_pem();
+        let places = FakePlaces::new();
+        places.set_user(usable(&pem));
+        let (_settings, hub) =
+            pinned_generation_failing_on_transport_with(places.desktop_policy()).await;
+        assert_eq!(places.calls().reconcile, 1, "起動の初回");
+
+        // 何も変わっていない周期: 整える手順は走るが、張り直さない。
+        hub.supervise_once().await;
+        assert_eq!(places.calls().reconcile, 2, "周期ごとに走らせる");
+        assert_eq!(
+            generation_sequence(&hub).await,
+            Some(1),
+            "同じ pin なら据え置く"
+        );
+
+        // Hub のデスクトップ版が露出を見て、失効の記録に書いた。
+        places.revoke_in_user_record(thumbprint(&pem));
+        hub.supervise_once().await;
+        assert_eq!(
+            generation_sequence(&hub).await,
+            None,
+            "失効した証明書を pin にした世代は残さない"
+        );
+        let reason = hub.subscription().await.reason.unwrap_or_default();
+        assert!(reason.contains("失効している"), "{reason}");
+        let view = hub.status().await.expect("status");
+        assert_eq!(
+            view.status,
+            HubStatus::Unreachable {
+                cause: UnreachableCause::HubTls
+            }
+        );
+        assert!(
+            view.tls_warnings.iter().any(|w| w.contains("失効している")),
+            "{:?}",
+            view.tls_warnings
+        );
+        assert_eq!(
+            serde_json::to_value(&view).unwrap()["tlsWarnings"],
+            serde_json::json!(view.tls_warnings)
+        );
+
+        // 作り直した証明書は記録に無い: 次の周期で、新しい pin で Hub へ掛けにいく（この
+        // 試験の Hub は閉じたポートなので、理由は「未接続」になる）。
+        places.set_user(usable(&SwappableCert::fresh_pem()));
+        hub.supervise_once().await;
+        assert_eq!(
+            hub.subscription().await.reason.as_deref(),
+            Some(REASON_NOT_CONNECTED)
+        );
     }
 
     async fn generation_pin_marker(hub: &HubService) -> Option<u64> {
@@ -6525,29 +6623,12 @@ mod tests {
         assert_ne!(first, second);
     }
 
-    /// #644: 見張りが証明書を読み直すのは、pin した世代が `Live` でなく直近の失敗が
-    /// `Transport` のときだけ。
-    #[test]
-    fn only_a_generation_failing_on_transport_is_rechecked() {
-        use TagClientConnectionState as State;
-        let health = |state, last_error| GenerationHealth { state, last_error };
-        assert!(fails_on_transport(health(
-            State::Reconnecting,
-            Some(TagErrorKind::Transport)
-        )));
-        assert!(fails_on_transport(health(
-            State::Connecting,
-            Some(TagErrorKind::Transport)
-        )));
-        assert!(!fails_on_transport(health(
-            State::Live,
-            Some(TagErrorKind::Transport)
-        )));
-        assert!(!fails_on_transport(health(State::Reconnecting, None)));
-        assert!(!fails_on_transport(health(
-            State::Reconnecting,
-            Some(TagErrorKind::RevisionMismatch)
-        )));
+    /// 通信の失敗で再接続を続けている（`Live` でなく、直近の失敗が `Transport`）世代か。
+    /// TLS の検証の失敗も `banto-tagclient` では `Transport` になる。試験が「閉じたポートへ
+    /// 再接続を続けている」ところまで待つのに使う。
+    fn fails_on_transport(health: GenerationHealth) -> bool {
+        health.state != TagClientConnectionState::Live
+            && health.last_error == Some(TagErrorKind::Transport)
     }
 
     async fn generation_sequence(hub: &HubService) -> Option<usize> {
