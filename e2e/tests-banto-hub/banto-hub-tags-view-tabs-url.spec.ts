@@ -266,4 +266,66 @@ test.describe.serial('banto-hub タグ登録: 中央のタブと URL の状態 (
 		await expect(page).toHaveURL(connSettingsUrl());
 		await expect(pane).toBeHidden();
 	});
+
+	test('7. 狭幅でツリーを開いたまま同じ対象を「再設定」しても、設定フォームへフォーカスが移る', async () => {
+		await page.setViewportSize({ width: 880, height: 800 });
+		try {
+			const treePane = page.locator('aside[aria-label="接続とグループ"]');
+			const treeToggle = page.locator('button[aria-label="接続とグループ"]');
+			const expectFocusInSettings = async (): Promise<void> => {
+				await expect(treePane).toBeHidden();
+				await expect
+					.poll(() =>
+						page.evaluate(() => {
+							const host = document.querySelector('[data-testid="tag-settings-pane"]');
+							const active = document.activeElement;
+							return !!host && !!active && host.contains(active);
+						})
+					)
+					.toBe(true);
+			};
+
+			// グループ
+			await page.goto(`/tags?target=group:${groupId}&tab=settings`);
+			await expect(settingsPane()).toBeVisible();
+			await treeToggle.click();
+			await expect(treePane).toBeVisible();
+			await groupNodeByName(page, GROUP).click({ button: 'right' });
+			await page.getByRole('menuitem', { name: '収集グループを再設定', exact: true }).click();
+			await expectFocusInSettings();
+			await expect(page.getByRole('dialog')).toHaveCount(0);
+
+			// 接続先
+			await page.goto(`/tags?target=connection:${connId}&tab=settings`);
+			await expect(settingsPane()).toBeVisible();
+			await treeToggle.click();
+			await expect(treePane).toBeVisible();
+			await connNode().click({ button: 'right' });
+			await page.getByRole('menuitem', { name: '接続を再設定', exact: true }).click();
+			await expectFocusInSettings();
+			await expect(page.getByRole('dialog')).toHaveCount(0);
+		} finally {
+			await page.setViewportSize({ width: 1280, height: 720 });
+		}
+	});
+
+	test('8. 予約の仮想接続（calc）の設定タブは接続先のフォームだけ読み取り専用で、グループの追加は出る', async () => {
+		const res = await page.request.get('/api/plc-connections', { headers });
+		expect(res.ok()).toBe(true);
+		const calc = ((await res.json()) as { id: number; name: string }[]).find(
+			(c) => c.name === 'calc'
+		);
+		expect(calc).toBeTruthy();
+
+		await page.goto(`/tags?target=connection:${calc!.id}&tab=settings`);
+		const pane = settingsPane();
+		await expect(pane).toBeVisible();
+		await expect(pane.getByRole('button', { name: '収集グループを追加' })).toBeVisible();
+		await expect(pane.getByRole('button', { name: /^(保存|削除)/ })).toHaveCount(0);
+		const inputs = pane.locator('input:not([type="hidden"]), select, textarea');
+		expect(await inputs.count()).toBeGreaterThan(0);
+		for (const input of await inputs.all()) {
+			await expect(input).toBeDisabled();
+		}
+	});
 });

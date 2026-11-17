@@ -3380,9 +3380,25 @@
 	 */
 	function focusSettingsFormFor(kind: 'connection' | 'group', id: number): boolean {
 		if (!isSettingsFormFor(kind, id)) return false;
-		const host = document.querySelector<HTMLElement>('[data-testid="tag-settings-pane"]');
-		const first = host ? focusablesIn(host)[0] : undefined;
-		first?.focus();
+		const focusForm = () => {
+			const host = document.querySelector<HTMLElement>('[data-testid="tag-settings-pane"]');
+			const first = host ? focusablesIn(host)[0] : undefined;
+			first?.focus();
+		};
+		if (layoutNarrow && treeOpen) {
+			// 狭幅でツリーのドロワーが開いている間、部品は中央を `inert` にしている
+			// のでフォーカスが入らない。ドロワーを閉じ、(1) 部品が `inert` を外す
+			// DOM 更新、(2) 部品の `tick()` 後の `restoreFocus`（開く前の要素かトグル
+			// へ戻す）、(3) メニューを閉じた直後の `restoreFocus`（ツリーのノードへ
+			// 戻そうとする）がすべて終わった**後**に移す。先に移すと後続の戻し処理に
+			// 奪われる。2 回の `tick()` ＋ `requestAnimationFrame` で最後に走らせる。
+			treeOpen = false;
+			void tick()
+				.then(() => tick())
+				.then(() => requestAnimationFrame(focusForm));
+			return true;
+		}
+		focusForm();
 		return true;
 	}
 
