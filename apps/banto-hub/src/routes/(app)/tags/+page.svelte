@@ -98,7 +98,8 @@
 		type BatchTagFieldError,
 		type ParseAddressItem,
 		type ParsedAddress,
-		parseTagAddresses
+		parseTagAddresses,
+		isVirtualConnection
 	} from '#lib/banto/tagRegistryAdmin.js';
 	import {
 		buildBulkEnableRows,
@@ -7599,6 +7600,11 @@
 	「収集グループを追加」（既存の作成のモーダル）を付ける。グループの公開の
 	トグル（§外部公開）はまだ無い。
 -->
+<!--
+	予約の仮想接続（`calc`/`mem`、`protocol === 'virtual'`）は、編集者でも接続先の
+	設定を読み取り専用にする（右クリックのメニューが再設定・削除を出さないのと同じ。
+	サーバーも予約の接続の更新・削除を断る）。配下の収集グループの一覧と追加は残す。
+-->
 {#snippet settingsPane()}
 	<div class="settings-pane" data-testid="tag-settings-pane">
 		{#if settingsConnection}
@@ -7612,7 +7618,7 @@
 				{connections}
 				{groups}
 				{tags}
-				readOnly={!canWrite}
+				readOnly={!canWrite || isVirtualConnection(settingsConnection)}
 				onClose={() => {}}
 				onSaved={handleConnectionDrawerSaved}
 				onDeleted={handleConnectionDrawerDeleted}
