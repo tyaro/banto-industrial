@@ -161,3 +161,5 @@ ChronoGazer も、HUB と同じく AI エージェントから設定できるよ
 - **OpenAPI**: HUB と同じく REST に付ける（エージェントが REST を直接使う場合のため）。
 
 ChronoGazer は PLC への書き込みを持たないので、エージェントが変えられるのは ChronoGazer 自身の設定（接続先・記録項目・表示グループなど）に限る。
+
+設計は [ChronoGazer の AI エージェント向け API](chronogazer-agent-api-design.md)（#1161、2026-11-17）。REST は今の `/api/*` でキーを受け、スコープは `read` と `config`、MCP からのキーの発行は許さない。
