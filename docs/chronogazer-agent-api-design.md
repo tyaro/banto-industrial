@@ -1,7 +1,7 @@
 # ChronoGazer の AI エージェント向け API（API キー・MCP・OpenAPI）設計
 
 作成日: 2026-11-17
-状態: **実装中**（2026-11-17）。PR2（#1167）・PR3（#1168）・PR4（#1169・#1170、ChronoGazer の API キー）・PR5a（#1171、処理の切り出し、§5.4）はマージ済み、PR5b（MCP、§5.3）を実装中。§2 の決定は 2026-11-17 のオーナー決定。実装は §9 の PR の順に進め、各 PR でこの行と §9 の表を更新する。
+状態: **実装中**（2026-11-17）。PR2〜PR5（#1167〜#1173、HUB の共有 crate・ChronoGazer の API キー・MCP）はマージ済み、PR6（OpenAPI、§6）を実装中。§2 の決定は 2026-11-17 のオーナー決定。実装は §9 の PR の順に進め、各 PR でこの行と §9 の表を更新する。
 
 関連: [ChronoGazer 画面改善案](chronogazer-ui-improvement-proposal.md) §8（AI エージェントからの設定）・§5.2（LAN の通信）、[HUB の MCP リファレンス](banto-hub-mcp-reference.md)、[HUB の構成補助 MCP（T21）](banto-hub-t21-design.md)、Issue #1161。
 
@@ -180,6 +180,13 @@ HUB の `apps/banto-hub/core/src/mcp.rs` から骨組みを移す。
 - 公開: `GET /api/openapi.json`（認証なし、HUB と同じく文書は秘密ではない）。Swagger UI は載せない（ChronoGazer の画面の容量を増やさないため。要るなら後で足す）。
 - `openapi.json` のスナップショットのテストと、ルート一覧のスナップショット（ChronoGazer に無ければ足す）で、ルートの追加と文書のずれを止める。
 
+実装（PR6、`apps/chronogazer/core/src/rest/openapi.rs`）で決めた細部:
+
+- スキーマ: `banto-tags` に optional の `openapi` feature を足し（既定は off。HUB など他の利用者の依存・挙動は変わらない）、`Tag`・`CollectionGroup`・`DriverListItem` に `ToSchema` を付ける。ChronoGazer 側の `Cargo.toml` でだけ有効にする。外部 crate の型・JSON の自由な形（`settings`・`attributes`・ドライバの `capabilities`・`settingsSchema`）は `value_type = Object` 等で逃がす。型の rustdoc は内部向けなので、スキーマの `description` は出力から取り除く（読み手向けの説明は `info` と各操作の `summary`・`description`）。
+- 対象は `api_router` の `api_key_routes`（キーを通す 4 つのルーターの合成）。PR6 でこれを関数に切り出し、テストがその Router の「METHOD path」と `ApiDoc` の paths×methods を完全一致で突き合わせる（キーを通すルートを足して文書を忘れると落ちる）。
+- `GET /api/openapi.json` は `/mcp` と同じく、認証・CSRF・キーの照合の層の外に merge する。テストが「認証なしで 200」「誤った `cg_` の bearer 付きでも 200（同じ bearer で `/api/tags` は 401）」を固定する。
+- スナップショットは `apps/chronogazer/core/tests/snapshots/openapi.json`（`UPDATE_OPENAPI_SNAPSHOT=1 cargo test -p chronogazer-core openapi_snapshot` で更新）と `routes.txt`（`api_router` 全体のルート一覧。`UPDATE_ROUTES_SNAPSHOT=1 cargo test -p chronogazer-core routes_snapshot` で更新）。
+
 ## 7. 通信と公開範囲
 
 - キーは要求ごとに平文の bearer で送られる。LAN に HTTP で出している ChronoGazer では、キーが平文で LAN を流れる。改善案 §5.2 の HUB 接続と同じ問題で、LAN の HTTPS が決まるまでは次のとおりにする。
@@ -197,14 +204,14 @@ HUB の `apps/banto-hub/core/src/mcp.rs` から骨組みを移す。
 
 ## 9. PR の分け方と状況
 
-| PR  | 中身                                                                             | 状況                                                         |
-| --- | -------------------------------------------------------------------------------- | ------------------------------------------------------------ |
-| 1   | この設計書                                                                       | マージ済み（#1166）                                          |
-| 2   | `crates/banto-mcp` と HUB の移行（先に `tools/list` のスナップショット）         | マージ済み（#1167）                                          |
-| 3   | `crates/banto-api-keys` と HUB の移行                                            | マージ済み（#1168）                                          |
-| 4   | ChronoGazer の API キー（表・REST・画面）と `/api/*` での受け付け・`Actor`・監査 | マージ済み（#1169・#1170）                                   |
-| 5   | ChronoGazer の MCP のツールと処理の切り出し（§5.4）                              | PR5a（処理の切り出し）マージ済み（#1171）／PR5b（MCP）実装中 |
-| 6   | ChronoGazer の OpenAPI                                                           | 未着手                                                       |
+| PR  | 中身                                                                             | 状況                       |
+| --- | -------------------------------------------------------------------------------- | -------------------------- |
+| 1   | この設計書                                                                       | マージ済み（#1166）        |
+| 2   | `crates/banto-mcp` と HUB の移行（先に `tools/list` のスナップショット）         | マージ済み（#1167）        |
+| 3   | `crates/banto-api-keys` と HUB の移行                                            | マージ済み（#1168）        |
+| 4   | ChronoGazer の API キー（表・REST・画面）と `/api/*` での受け付け・`Actor`・監査 | マージ済み（#1169・#1170） |
+| 5   | ChronoGazer の MCP のツールと処理の切り出し（§5.4）                              | マージ済み（#1171・#1173） |
+| 6   | ChronoGazer の OpenAPI                                                           | 実装中                     |
 
 2 と 3 は互いに依存しない。4 は 3 の後、5 は 2 と 4 の後、6 は 4 の後に入れる。
 

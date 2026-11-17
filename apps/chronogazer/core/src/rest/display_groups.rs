@@ -40,20 +40,66 @@ use crate::ops::{DisplayGroupOps, Via};
 /// メソッドで、MCP のツールも同じものを呼ぶ。
 type DisplayGroupsState = DisplayGroupOps;
 
-async fn list(
+#[utoipa::path(
+    get,
+    path = "/api/display-groups",
+    tag = "display-groups",
+    operation_id = "display_groups_list",
+    summary = "表示グループの一覧",
+    description = "表示グループの一覧（並び順）。読み取り（`read` キーで足りる）。",
+    responses(
+        (status = 200, description = "表示グループの一覧", body = Vec<DisplayGroup>),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "ロールが足りない"),
+    ),
+    security(("api_key" = [])),
+)]
+pub(super) async fn list(
     State(state): State<DisplayGroupsState>,
 ) -> Result<Json<Vec<DisplayGroup>>, ApiError> {
     Ok(Json(state.display_groups.list().await?))
 }
 
-async fn get_one(
+#[utoipa::path(
+    get,
+    path = "/api/display-groups/{id}",
+    tag = "display-groups",
+    operation_id = "display_groups_get",
+    summary = "表示グループの取得",
+    description = "表示グループを 1 件返す。読み取り（`read` キーで足りる）。",
+    params(("id" = i64, Path, description = "対象の id")),
+    responses(
+        (status = 200, description = "表示グループ", body = DisplayGroup),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "ロールが足りない"),
+        (status = 404, description = "指定の id が無い"),
+    ),
+    security(("api_key" = [])),
+)]
+pub(super) async fn get_one(
     State(state): State<DisplayGroupsState>,
     Path(id): Path<i64>,
 ) -> Result<Json<DisplayGroup>, ApiError> {
     Ok(Json(state.display_groups.get(id).await?))
 }
 
-async fn create(
+#[utoipa::path(
+    post,
+    path = "/api/display-groups",
+    tag = "display-groups",
+    operation_id = "display_groups_create",
+    summary = "表示グループの作成",
+    description = "表示グループを作る。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。",
+    request_body = DisplayGroupPayload,
+    responses(
+        (status = 200, description = "作成した表示グループ", body = DisplayGroup),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "`read` キー（`config` スコープが無い）、または editor 未満のロール"),
+        (status = 422, description = "入力の検証エラー（`field_errors` に項目ごとの理由）"),
+    ),
+    security(("api_key" = [])),
+)]
+pub(super) async fn create(
     State(state): State<DisplayGroupsState>,
     actor: Actor,
     Json(payload): Json<DisplayGroupPayload>,
@@ -71,7 +117,26 @@ async fn create(
     Ok(Json(created))
 }
 
-async fn update(
+#[utoipa::path(
+    put,
+    path = "/api/display-groups/{id}",
+    tag = "display-groups",
+    operation_id = "display_groups_update",
+    summary = "表示グループの更新",
+    description = "表示グループを更新する（全項目を送る。本文の `sortOrder` は無視され、並びは `/api/display-groups/order` だけで変える）。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。",
+    params(("id" = i64, Path, description = "対象の id")),
+    request_body = DisplayGroupPayload,
+    responses(
+        (status = 200, description = "更新後の表示グループ", body = DisplayGroup),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "`read` キー（`config` スコープが無い）、または editor 未満のロール"),
+        (status = 404, description = "指定の id が無い"),
+        (status = 422, description = "入力の検証エラー（`field_errors` に項目ごとの理由）"),
+        (status = 409, description = "`expectedRevision` が古い（他で先に更新された。本文は `kind: validation`、`field_errors` の `expectedRevision`）"),
+    ),
+    security(("api_key" = [])),
+)]
+pub(super) async fn update(
     State(state): State<DisplayGroupsState>,
     actor: Actor,
     Path(id): Path<i64>,
@@ -91,7 +156,23 @@ async fn update(
     Ok(Json(updated))
 }
 
-async fn delete(
+#[utoipa::path(
+    delete,
+    path = "/api/display-groups/{id}",
+    tag = "display-groups",
+    operation_id = "display_groups_delete",
+    summary = "表示グループの削除",
+    description = "表示グループを削除する。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。",
+    params(("id" = i64, Path, description = "対象の id")),
+    responses(
+        (status = 204, description = "削除した"),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "`read` キー（`config` スコープが無い）、または editor 未満のロール"),
+        (status = 404, description = "指定の id が無い"),
+    ),
+    security(("api_key" = [])),
+)]
+pub(super) async fn delete(
     State(state): State<DisplayGroupsState>,
     actor: Actor,
     Path(id): Path<i64>,
@@ -109,7 +190,23 @@ async fn delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn reorder(
+#[utoipa::path(
+    put,
+    path = "/api/display-groups/order",
+    tag = "display-groups",
+    operation_id = "display_groups_reorder",
+    summary = "表示グループの並べ替え",
+    description = "表示グループの並びを `ids` の順に変える。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。",
+    request_body = ReorderPayload,
+    responses(
+        (status = 200, description = "並べ替え後の表示グループ", body = Vec<DisplayGroup>),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "`read` キー（`config` スコープが無い）、または editor 未満のロール"),
+        (status = 422, description = "入力の検証エラー（`field_errors` に項目ごとの理由）"),
+    ),
+    security(("api_key" = [])),
+)]
+pub(super) async fn reorder(
     State(state): State<DisplayGroupsState>,
     actor: Actor,
     Json(payload): Json<ReorderPayload>,

@@ -71,6 +71,7 @@ fn default_writable_true() -> bool {
 /// A row of the `collection_groups` table, wire-shaped (camelCase) for a
 /// future settings grid (recorder-requirements.md §6 "グループ設定" screen).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct CollectionGroup {
     pub id: i64,

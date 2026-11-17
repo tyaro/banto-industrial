@@ -115,6 +115,7 @@ pub const TAG_REFERENCED_FIELD: &str = "displayGroups";
 /// 表示種別（§3.2 の 4 種固定）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(utoipa::ToSchema)]
 pub enum DisplayKind {
     Trend,
     Digital,
@@ -168,6 +169,7 @@ impl DisplayKind {
 /// で、JSON には出ない。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub struct DisplayAttributes {
     /// トレンドの既定時間窓（秒）。トレンドだけ。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,6 +179,7 @@ pub struct DisplayAttributes {
 /// ペン（検証済み）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub struct Pen {
     /// banto-tags の `tags.id`。
     pub tag_id: i64,
@@ -187,6 +190,7 @@ pub struct Pen {
 /// 表示グループ（読み取りの応答）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub struct DisplayGroup {
     pub id: i64,
     pub name: String,
@@ -202,6 +206,7 @@ pub struct DisplayGroup {
 /// [`validate_display_group`] の人間可読な `field_errors` で返すため。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub struct DisplayGroupPayload {
     pub name: String,
     /// 作成のときだけ使う（省略で末尾）。**更新では無視する**（モジュール doc）。
@@ -209,6 +214,7 @@ pub struct DisplayGroupPayload {
     pub sort_order: Option<i64>,
     pub kind: String,
     #[serde(default)]
+    #[schema(value_type = Object)]
     pub attributes: Map<String, Value>,
     #[serde(default)]
     pub pens: Vec<PenPayload>,
@@ -220,6 +226,7 @@ pub struct DisplayGroupPayload {
 /// ペンの本文。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub struct PenPayload {
     pub tag_id: i64,
     #[serde(default)]
@@ -229,6 +236,7 @@ pub struct PenPayload {
 /// 並べ替えの本文: 全グループの ID を、新しい並び順で 1 回ずつ。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub struct ReorderPayload {
     pub ids: Vec<i64>,
 }
