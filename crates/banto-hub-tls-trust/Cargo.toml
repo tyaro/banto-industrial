@@ -14,7 +14,7 @@ banto-safe-root = { path = "../banto-safe-root" }
 # 新しい package は増えない。
 rustls-pki-types = { version = "1.15.1", default-features = false, features = ["std"] }
 # 証明書（DER）が解析できるかの確かめ。banto-hub-core と同じ版で、新しい package は増えない。
-x509-cert = { version = "0.2.5" }
+x509-cert = { version = "0.3.0" }
 # 証明書の拇印（DER の SHA-256。失効の記録、#1121 PR1b）。banto-hub-core と同じ workspace の版で、
 # Cargo.lock に新しい package は増えない。
 sha2 = { workspace = true }
