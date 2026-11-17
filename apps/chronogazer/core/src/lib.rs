@@ -50,6 +50,8 @@ pub mod mode_switch;
 // B2-4 で寄せる）。
 pub mod paths;
 // #1161 PR5a: 設定を変える操作の本体（REST と MCP が同じ関数を呼ぶ、§5.4）。
+// #1161 PR5b: `POST /mcp`（MCP のツール）。
+mod mcp;
 mod ops;
 pub mod rest;
 // #392 B2-1: LAN の公開設定と認証の設定（デスクトップの Tauri のコマンドと REST の

@@ -16,6 +16,10 @@
 //! 3. それ以外 → 何もしない（今のとおり、各ルーターの `require_auth` がセッション
 //!    を確かめる）。
 //!
+//! `POST /mcp`（#1161 PR5b、`crate::mcp`）は `api_router` の層の外にあり、
+//! [`require_mcp_api_key`] が `cg_…` のキーだけを受ける（セッションは 401）。
+//! キーの照合は 1. と同じ [`verify_own_key`] を通る。
+//!
 //! CSRF の確認（[`require_csrf_unless_api_key`]）は、キーで通った要求には
 //! `X-Banto-Client` を求めない。CSRF はブラウザが資格情報を勝手に付ける場合の脅威
 //! で、キーはブラウザが勝手に付けないため（HUB の `/api/v1/*` と同じ考え）。
@@ -71,7 +75,7 @@ use crate::api_keys::{
 };
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::collect::COLLECT_OPERATION_ROLE;
-use crate::ops::Via;
+use crate::ops::{Via, ORIGIN_MCP, ORIGIN_REST};
 use crate::users::Role;
 
 /// キーの主体の監査の `actor_role`（§4.2）。
@@ -90,7 +94,8 @@ pub(crate) enum Actor {
     Session { username: String, role: String },
     /// API キー。`label` は監査に載せる `名前（prefix）`。
     ApiKey {
-        // 表 `api_keys` の id。REST では使わず、MCP（#1161 PR5）が使う予定。
+        // 表 `api_keys` の id。REST も MCP（#1161 PR5b）も監査には `label` を
+        // 使うので、今は読む所が無い（テストと Debug の表示だけ）。
         #[allow(dead_code)]
         id: i64,
         label: String,
@@ -270,7 +275,7 @@ pub(crate) async fn api_key_gate(
     next: Next,
 ) -> Response {
     // 外から extensions に主体が入ってくることは無いが、念のため消してから決める
-    // （この層だけがキーの主体を載せる）。
+    // （この層と `/mcp` の層だけがキーの主体を載せる）。
     req.extensions_mut().remove::<Actor>();
     let Some(token) = bearer_token(req.headers()).map(str::to_owned) else {
         return next.run(req).await;
@@ -279,51 +284,106 @@ pub(crate) async fn api_key_gate(
         BearerKind::Other => next.run(req).await,
         BearerKind::ForeignKey => unauthorized_response(),
         BearerKind::OwnKey => {
-            let now_ms = now_ms();
-            match api_key_verdict(gate.api_keys.check(&token, now_ms).await) {
-                Ok(ctx) => {
-                    if let Err(err) = gate
-                        .api_keys
-                        .touch_last_used(ctx.id, now_ms, ctx.last_used_at_ms)
-                        .await
-                    {
-                        eprintln!("chronogazer: API キーの最終使用の更新に失敗しました: {err}");
-                    }
-                    req.extensions_mut().insert(Actor::ApiKey {
-                        id: ctx.id,
-                        label: ctx.actor_label(),
-                        scopes: KeyScopes::from_strings(&ctx.scopes),
-                    });
+            match verify_own_key(&gate, &token, request_target(&req), ORIGIN_REST).await {
+                Ok(actor) => {
+                    req.extensions_mut().insert(actor);
                     next.run(req).await
                 }
-                Err((rejection, denied)) => {
-                    if let Some(denied) = denied {
-                        let method = req.method().as_str().to_string();
-                        let path = req.uri().path().to_string();
-                        gate.audit
-                            .record(AuditEntry {
-                                actor_username: None,
-                                actor_role: None,
-                                action: "denied",
-                                resource: API_KEYS_RESOURCE,
-                                entity_id: Some(&denied.id.to_string()),
-                                detail: Some(json!({
-                                    "reason": denied.reason,
-                                    "name": denied.name,
-                                    "method": method,
-                                    "path": path,
-                                })),
-                                origin: "rest",
-                                result: "denied",
-                            })
-                            .await;
-                    }
-                    if let ApiKeyRejection::Unavailable(err) = &rejection {
-                        eprintln!("chronogazer: API キーを照合できませんでした: {err}");
-                    }
-                    api_key_rejection_response(rejection)
-                }
+                Err(response) => response,
             }
+        }
+    }
+}
+
+/// `POST /mcp` の認証の層（#1161 PR5b、設計書 §5.3）。受けるのは `cg_…` のキー
+/// だけで、bearer が無い・セッションのトークン（閲覧公開・この PC からの接続の
+/// grant も含む）・ほかのアプリのキーは 401（記録しない）。`cg_…` の照合は REST の
+/// [`api_key_gate`] と**同じ関数**（[`verify_own_key`]）を通るので、失効・期限切れ
+/// = 401 と `denied` の記録、無い・形の誤り = 401 で記録なし、照合できない = 500 が
+/// REST とずれない（`denied` の `origin` だけ `"mcp"`）。
+pub(crate) async fn require_mcp_api_key(
+    State(gate): State<ApiKeyGate>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    req.extensions_mut().remove::<Actor>();
+    let Some(token) = bearer_token(req.headers()).map(str::to_owned) else {
+        return unauthorized_response();
+    };
+    if classify_bearer(&token) != BearerKind::OwnKey {
+        return unauthorized_response();
+    }
+    match verify_own_key(&gate, &token, request_target(&req), ORIGIN_MCP).await {
+        Ok(actor) => {
+            req.extensions_mut().insert(actor);
+            next.run(req).await
+        }
+        Err(response) => response,
+    }
+}
+
+/// `denied` の `detail` に載せる `(method, path)`（`&Request` を await の向こうへ
+/// 持ち越さないよう、先に写す）。
+fn request_target(req: &Request) -> (String, String) {
+    (
+        req.method().as_str().to_string(),
+        req.uri().path().to_string(),
+    )
+}
+
+/// `cg_…` のキーを照合して主体を作る（REST の [`api_key_gate`] と MCP の
+/// [`require_mcp_api_key`] の共通部分）。通れば最終使用を更新して
+/// [`Actor::ApiKey`]。通らなければ共有 crate の応答（失効・期限切れ・無い = 401、
+/// 照合できない = 500）で、失効・期限切れだけ `resource: "api_keys"` の `denied`
+/// を `origin` で記録する。`Err` の `Response` は呼び出し元がそのまま返すだけで、
+/// 箱に入れても得が無いので `result_large_err` は許す。
+#[allow(clippy::result_large_err)]
+async fn verify_own_key(
+    gate: &ApiKeyGate,
+    token: &str,
+    (method, path): (String, String),
+    origin: &'static str,
+) -> Result<Actor, Response> {
+    let now_ms = now_ms();
+    match api_key_verdict(gate.api_keys.check(token, now_ms).await) {
+        Ok(ctx) => {
+            if let Err(err) = gate
+                .api_keys
+                .touch_last_used(ctx.id, now_ms, ctx.last_used_at_ms)
+                .await
+            {
+                eprintln!("chronogazer: API キーの最終使用の更新に失敗しました: {err}");
+            }
+            Ok(Actor::ApiKey {
+                id: ctx.id,
+                label: ctx.actor_label(),
+                scopes: KeyScopes::from_strings(&ctx.scopes),
+            })
+        }
+        Err((rejection, denied)) => {
+            if let Some(denied) = denied {
+                gate.audit
+                    .record(AuditEntry {
+                        actor_username: None,
+                        actor_role: None,
+                        action: "denied",
+                        resource: API_KEYS_RESOURCE,
+                        entity_id: Some(&denied.id.to_string()),
+                        detail: Some(json!({
+                            "reason": denied.reason,
+                            "name": denied.name,
+                            "method": method,
+                            "path": path,
+                        })),
+                        origin,
+                        result: "denied",
+                    })
+                    .await;
+            }
+            if let ApiKeyRejection::Unavailable(err) = &rejection {
+                eprintln!("chronogazer: API キーを照合できませんでした: {err}");
+            }
+            Err(api_key_rejection_response(rejection))
         }
     }
 }

@@ -12,3 +12,8 @@ apps/banto-hub/core/tests/snapshots/openapi.json
 # -p banto-hub-host --test mcp tools_list_snapshot` in serde_json's pretty
 # format (same reason as the OpenAPI snapshot above).
 apps/banto-hub/host/tests/snapshots/mcp_tools_list.json
+
+# ChronoGazer の MCP の tools/list のスナップショット - `UPDATE_MCP_TOOLS_SNAPSHOT=1
+# cargo test -p chronogazer-core mcp_tools_list_snapshot` が serde_json の整形で
+# 作る（HUB の物と同じ理由）。
+apps/chronogazer/core/tests/snapshots/mcp_tools_list.json

@@ -27,6 +27,9 @@ banto-admin-services = { workspace = true }
 # 共有する crate を使う。接頭辞 `cg` とスコープ（`read`・`config`）は
 # `src/api_keys.rs` が決める（docs/chronogazer-agent-api-design.md §3）。
 banto-api-keys = { path = "../../../crates/banto-api-keys" }
+# #1161 PR5b: `POST /mcp` の JSON-RPC の骨組みとツール表は HUB と共有する crate
+# を使う（`src/mcp.rs`、設計書 §5.1）。
+banto-mcp = { path = "../../../crates/banto-mcp" }
 # I-series crates (docs/r1-plan.md R1-A): not wired into any Tauri command or
 # REST route yet - that lands in R1-B (registry CRUD)/R1-C (collector
 # runtime)/R1-D (monitor screens). Added now as path deps so the workspace
