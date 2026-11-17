@@ -1,7 +1,7 @@
 # ChronoGazer の AI エージェント向け API（API キー・MCP・OpenAPI）設計
 
 作成日: 2026-11-17
-状態: **実装中**（2026-11-17）。PR2（#1167）・PR3（#1168）・PR4（#1169・#1170、ChronoGazer の API キー）はマージ済み、PR5a（処理の切り出し、§5.4）を実装中、PR5b（MCP）は未着手。§2 の決定は 2026-11-17 のオーナー決定。実装は §9 の PR の順に進め、各 PR でこの行と §9 の表を更新する。
+状態: **実装中**（2026-11-17）。PR2（#1167）・PR3（#1168）・PR4（#1169・#1170、ChronoGazer の API キー）・PR5a（#1171、処理の切り出し、§5.4）はマージ済み、PR5b（MCP、§5.3）を実装中。§2 の決定は 2026-11-17 のオーナー決定。実装は §9 の PR の順に進め、各 PR でこの行と §9 の表を更新する。
 
 関連: [ChronoGazer 画面改善案](chronogazer-ui-improvement-proposal.md) §8（AI エージェントからの設定）・§5.2（LAN の通信）、[HUB の MCP リファレンス](banto-hub-mcp-reference.md)、[HUB の構成補助 MCP（T21）](banto-hub-t21-design.md)、Issue #1161。
 
@@ -158,6 +158,14 @@ HUB の `apps/banto-hub/core/src/mcp.rs` から骨組みを移す。
 - 履歴（`/api/collect/history`）・イベントは初めは入れない（量が大きく、エージェントの設定の用途から外れる）。要るようになったら足す。
 - 改善案 §4 の一括保存を作るときは、同じ処理を呼ぶツールを足す。
 
+実装（PR5b、`apps/chronogazer/core/src/mcp.rs`）で決めた細部:
+
+- ツールは上の表の 30 個（読み取り 13・設定の変更 14・収集の操作 3）。
+- `/mcp` は `api_router` の層（キーとセッションの振り分け・CSRF・この PC からの接続の確認）の外に merge し、`api_router` を載せる listener すべてに出る（REST の `/api/*` と同じ公開範囲）。キーの照合は `/api/*` と同じ関数を通る。失効・期限切れの `denied`（`resource: "api_keys"`）の `origin` は `mcp`。
+- 読み取りのツールは §5.4 の関数を通らないので、表に載せる口（`read_tool!`）で `Actor::can_read` を確かめる。読み取りの処理の関数は主体を受け取らない形にし、確かめずに中身を呼ぶ道を無くした。足りなければ `denied`（`{tool}`・`mcp`）を記録してツールのエラーにする。
+- 結果の形は HUB に倣う: 一覧は `{connections}`・`{groups}`・`{tags}`・`{displayGroups}`・`{thresholds}`、1 件は `{connection}`・`{group}`・`{tag}`・`{displayGroup}`・`{threshold}`、作成は `{created}`、更新は `{updated}`、削除は `{deleted: true, id}`、並べ替えは `{displayGroups}`。`get_status`・`read_values`・収集の操作は REST の応答そのまま。`restartRequired: true` は表の設定を変えるツール（接続先・収集グループ・記録項目・表示グループ・しきい値）の結果すべてに付け、収集の操作には付けない。
+- 入力は REST の payload と同じ型で読み、必須の項目も REST と同じ（更新は REST の `PUT` と同じ置き換えで、省略した項目は既定値）。HUB の `require_all_fields` のような「更新は全項目必須」は足していない。`set_threshold` は `tagId` と `TagThresholdsPayload`。
+
 ### 5.4 処理を一つにする
 
 今の REST のハンドラは「権限の確かめ → 前検査（接続のプロトコルの制限、アドレスの検査など）→ サービスの呼び出し → 監査 → `hub.registry_changed()`」を手で並べている。MCP から同じことをするため、前検査からサービスの呼び出し・`registry_changed` までを `Actor` を受ける関数に切り出し、REST のハンドラと MCP のツールの両方がそれを呼ぶ。監査もその関数の中で書く（`origin` は呼び出し元が渡す）。これで「REST だけ前検査がある」「MCP だけ `registry_changed` を忘れる」ことを防ぐ。
@@ -189,14 +197,14 @@ HUB の `apps/banto-hub/core/src/mcp.rs` から骨組みを移す。
 
 ## 9. PR の分け方と状況
 
-| PR  | 中身                                                                             | 状況                                            |
-| --- | -------------------------------------------------------------------------------- | ----------------------------------------------- |
-| 1   | この設計書                                                                       | マージ済み（#1166）                             |
-| 2   | `crates/banto-mcp` と HUB の移行（先に `tools/list` のスナップショット）         | マージ済み（#1167）                             |
-| 3   | `crates/banto-api-keys` と HUB の移行                                            | マージ済み（#1168）                             |
-| 4   | ChronoGazer の API キー（表・REST・画面）と `/api/*` での受け付け・`Actor`・監査 | マージ済み（#1169・#1170）                      |
-| 5   | ChronoGazer の MCP のツールと処理の切り出し（§5.4）                              | PR5a（処理の切り出し）実装中／PR5b（MCP）未着手 |
-| 6   | ChronoGazer の OpenAPI                                                           | 未着手                                          |
+| PR  | 中身                                                                             | 状況                                                         |
+| --- | -------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| 1   | この設計書                                                                       | マージ済み（#1166）                                          |
+| 2   | `crates/banto-mcp` と HUB の移行（先に `tools/list` のスナップショット）         | マージ済み（#1167）                                          |
+| 3   | `crates/banto-api-keys` と HUB の移行                                            | マージ済み（#1168）                                          |
+| 4   | ChronoGazer の API キー（表・REST・画面）と `/api/*` での受け付け・`Actor`・監査 | マージ済み（#1169・#1170）                                   |
+| 5   | ChronoGazer の MCP のツールと処理の切り出し（§5.4）                              | PR5a（処理の切り出し）マージ済み（#1171）／PR5b（MCP）実装中 |
+| 6   | ChronoGazer の OpenAPI                                                           | 未着手                                                       |
 
 2 と 3 は互いに依存しない。4 は 3 の後、5 は 2 と 4 の後、6 は 4 の後に入れる。
 

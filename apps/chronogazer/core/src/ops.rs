@@ -81,8 +81,7 @@ pub(crate) const ORIGIN_MCP: &str = "mcp";
 pub(crate) enum Via<'a> {
     /// REST。`path` はルートの型（`/api/tags/{id}` など）か、要求の path。
     Rest { method: &'a str, path: &'a str },
-    /// MCP（#1161 PR5b）。`tool` はツール名。
-    #[allow(dead_code)] // PR5b の MCP のツールが使う（今はテストだけ）。
+    /// MCP（#1161 PR5b、`crate::mcp`）。`tool` はツール名。
     Mcp { tool: &'a str },
 }
 

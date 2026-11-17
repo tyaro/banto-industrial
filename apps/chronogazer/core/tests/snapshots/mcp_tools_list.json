@@ -1,0 +1,769 @@
+{
+  "tools": [
+    {
+      "description": "収集の状態を返す（REST の GET /api/collect と同じ）。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "get_status"
+    },
+    {
+      "description": "接続先の一覧を返す（秘密の値は返さない）。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "list_connections"
+    },
+    {
+      "description": "接続先を 1 件返す（秘密の値は返さない）。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "接続先の id。",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "get_connection"
+    },
+    {
+      "description": "使えるドライバ（接続先の protocol）と設定のスキーマを返す。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "list_drivers"
+    },
+    {
+      "description": "収集グループの一覧を返す。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "list_groups"
+    },
+    {
+      "description": "収集グループを 1 件返す。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "収集グループの id。",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "get_group"
+    },
+    {
+      "description": "記録項目の一覧を返す。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "list_tags"
+    },
+    {
+      "description": "記録項目を 1 件返す（revision は update_tag の expectedRevision に使う）。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "記録項目の id。",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "get_tag"
+    },
+    {
+      "description": "表示グループの一覧を返す（並び順）。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "list_display_groups"
+    },
+    {
+      "description": "表示グループを 1 件返す。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "表示グループの id。",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "get_display_group"
+    },
+    {
+      "description": "しきい値の設定がある記録項目のしきい値を返す。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "list_thresholds"
+    },
+    {
+      "description": "記録項目 1 つのしきい値を返す（設定が無ければ 4 つとも null・revision 0）。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "tagId": {
+            "description": "記録項目の id。",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "tagId"
+        ],
+        "type": "object"
+      },
+      "name": "get_threshold"
+    },
+    {
+      "description": "記録項目ごとの現在値を返す（REST の GET /api/collect/values と同じ。品質と時刻つき）。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "read_values"
+    },
+    {
+      "description": "接続先を作る（config スコープ）。収集へは restart_collection で反映する。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "description": "有効にするか。省略は true。",
+            "type": "boolean"
+          },
+          "name": {
+            "description": "接続先の名前（一意）。",
+            "type": "string"
+          },
+          "protocol": {
+            "description": "list_drivers で得られるドライバの id（slmp・modbus-tcp など）。",
+            "type": "string"
+          },
+          "settings": {
+            "description": "接続の設定（REST の /api/plc-connections と同じ形。キーはドライバのスキーマ、list_drivers を参照）。丸ごと置き換え。",
+            "type": "object"
+          },
+          "simulation": {
+            "description": "true でシミュレータ接続にする。省略は false。",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "protocol"
+        ],
+        "type": "object"
+      },
+      "name": "create_connection"
+    },
+    {
+      "description": "接続先を更新する（config スコープ。REST の PUT と同じ置き換え）。収集へは restart_collection で反映する。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "description": "有効にするか。省略は true。",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "更新する接続先の id。",
+            "type": "integer"
+          },
+          "name": {
+            "description": "接続先の名前（一意）。",
+            "type": "string"
+          },
+          "protocol": {
+            "description": "list_drivers で得られるドライバの id（slmp・modbus-tcp など）。",
+            "type": "string"
+          },
+          "settings": {
+            "description": "接続の設定（REST の /api/plc-connections と同じ形。キーはドライバのスキーマ、list_drivers を参照）。丸ごと置き換え。",
+            "type": "object"
+          },
+          "simulation": {
+            "description": "true でシミュレータ接続にする。省略すると保存済みの値を保つ。",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "protocol"
+        ],
+        "type": "object"
+      },
+      "name": "update_connection"
+    },
+    {
+      "description": "接続先を削除する（config スコープ）。不可逆のため confirm:true が必須。収集へは restart_collection で反映する。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "confirm": {
+            "description": "不可逆操作の確認。true が必須。",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "削除する接続先の id。",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "confirm"
+        ],
+        "type": "object"
+      },
+      "name": "delete_connection"
+    },
+    {
+      "description": "収集グループを作る（config スコープ）。収集へは restart_collection で反映する。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "description": "有効にするか。省略は true。",
+            "type": "boolean"
+          },
+          "name": {
+            "description": "収集グループの名前。",
+            "type": "string"
+          },
+          "periodMs": {
+            "description": "収集の周期（ミリ秒）。",
+            "type": "integer"
+          },
+          "plcConnectionId": {
+            "description": "接続先の id。",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "plcConnectionId",
+          "periodMs"
+        ],
+        "type": "object"
+      },
+      "name": "create_group"
+    },
+    {
+      "description": "収集グループを更新する（config スコープ。REST の PUT と同じ置き換え）。収集へは restart_collection で反映する。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "description": "有効にするか。省略は true。",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "更新する収集グループの id。",
+            "type": "integer"
+          },
+          "name": {
+            "description": "収集グループの名前。",
+            "type": "string"
+          },
+          "periodMs": {
+            "description": "収集の周期（ミリ秒）。",
+            "type": "integer"
+          },
+          "plcConnectionId": {
+            "description": "接続先の id。",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "plcConnectionId",
+          "periodMs"
+        ],
+        "type": "object"
+      },
+      "name": "update_group"
+    },
+    {
+      "description": "収集グループを削除する（config スコープ）。不可逆のため confirm:true が必須。収集へは restart_collection で反映する。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "confirm": {
+            "description": "不可逆操作の確認。true が必須。",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "削除する収集グループの id。",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "confirm"
+        ],
+        "type": "object"
+      },
+      "name": "delete_group"
+    },
+    {
+      "description": "記録項目を作る（config スコープ。しきい値は set_threshold で設定する）。収集へは restart_collection で反映する。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "address": {
+            "description": "機器のアドレス（D100 など）。",
+            "type": "string"
+          },
+          "collectionGroupId": {
+            "description": "収集グループの id。",
+            "type": "integer"
+          },
+          "dataType": {
+            "description": "データ型（int16・float32 など）。",
+            "type": "string"
+          },
+          "decimals": {
+            "description": "小数の桁数。",
+            "type": "integer"
+          },
+          "enabled": {
+            "description": "有効にするか。省略は true。",
+            "type": "boolean"
+          },
+          "engHi": {
+            "description": "スケーリングの工学値の上限。",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "engLo": {
+            "description": "スケーリングの工学値の下限。",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "記録項目の名前。",
+            "type": "string"
+          },
+          "rawHi": {
+            "description": "スケーリングの生の値の上限。",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "rawLo": {
+            "description": "スケーリングの生の値の下限。",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "unit": {
+            "description": "単位。",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "collectionGroupId",
+          "address",
+          "dataType"
+        ],
+        "type": "object"
+      },
+      "name": "create_tag"
+    },
+    {
+      "description": "記録項目を更新する（config スコープ。REST の PUT と同じ全項目の置き換えで、省略した項目は既定値になる。get_tag の値を全項目送り返す）。収集へは restart_collection で反映する。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "address": {
+            "description": "機器のアドレス（D100 など）。",
+            "type": "string"
+          },
+          "collectionGroupId": {
+            "description": "収集グループの id。",
+            "type": "integer"
+          },
+          "dataType": {
+            "description": "データ型（int16・float32 など）。",
+            "type": "string"
+          },
+          "decimals": {
+            "description": "小数の桁数。",
+            "type": "integer"
+          },
+          "enabled": {
+            "description": "有効にするか。省略は true。",
+            "type": "boolean"
+          },
+          "engHi": {
+            "description": "スケーリングの工学値の上限。",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "engLo": {
+            "description": "スケーリングの工学値の下限。",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "expectedRevision": {
+            "description": "楽観ロック: get_tag で読んだ revision。省略すると版を確かめない。",
+            "type": "integer"
+          },
+          "id": {
+            "description": "更新する記録項目の id。",
+            "type": "integer"
+          },
+          "name": {
+            "description": "記録項目の名前。",
+            "type": "string"
+          },
+          "rawHi": {
+            "description": "スケーリングの生の値の上限。",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "rawLo": {
+            "description": "スケーリングの生の値の下限。",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "unit": {
+            "description": "単位。",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "collectionGroupId",
+          "address",
+          "dataType"
+        ],
+        "type": "object"
+      },
+      "name": "update_tag"
+    },
+    {
+      "description": "記録項目を削除する（config スコープ。表示グループのペンに使われていれば断る）。不可逆のため confirm:true が必須。収集へは restart_collection で反映する。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "confirm": {
+            "description": "不可逆操作の確認。true が必須。",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "削除する記録項目の id。",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "confirm"
+        ],
+        "type": "object"
+      },
+      "name": "delete_tag"
+    },
+    {
+      "description": "表示グループを作る（config スコープ）。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "attributes": {
+            "description": "種別ごとの属性（trend の timeWindowSec など）。",
+            "type": "object"
+          },
+          "kind": {
+            "description": "表示の種別。",
+            "enum": [
+              "trend",
+              "digital",
+              "bar",
+              "gauge"
+            ],
+            "type": "string"
+          },
+          "name": {
+            "description": "表示グループの名前。",
+            "type": "string"
+          },
+          "pens": {
+            "description": "ペン（表示する記録項目）の並び。",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "colorSlot": {
+                  "description": "系列色の枠（1〜8）。省略は既定。",
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "tagId": {
+                  "description": "記録項目の id。",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "tagId"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "sortOrder": {
+            "description": "並び順。省略は末尾。",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "name": "create_display_group"
+    },
+    {
+      "description": "表示グループを更新する（config スコープ。REST の PUT と同じ置き換え。並び順は reorder_display_groups で変える）。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "attributes": {
+            "description": "種別ごとの属性（trend の timeWindowSec など）。",
+            "type": "object"
+          },
+          "expectedRevision": {
+            "description": "楽観ロック: get_display_group で読んだ revision。省略すると版を確かめない。",
+            "type": "integer"
+          },
+          "id": {
+            "description": "更新する表示グループの id。",
+            "type": "integer"
+          },
+          "kind": {
+            "description": "表示の種別。",
+            "enum": [
+              "trend",
+              "digital",
+              "bar",
+              "gauge"
+            ],
+            "type": "string"
+          },
+          "name": {
+            "description": "表示グループの名前。",
+            "type": "string"
+          },
+          "pens": {
+            "description": "ペン（表示する記録項目）の並び。",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "colorSlot": {
+                  "description": "系列色の枠（1〜8）。省略は既定。",
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "tagId": {
+                  "description": "記録項目の id。",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "tagId"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "name": "update_display_group"
+    },
+    {
+      "description": "表示グループを削除する（config スコープ）。不可逆のため confirm:true が必須。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "confirm": {
+            "description": "不可逆操作の確認。true が必須。",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "削除する表示グループの id。",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "confirm"
+        ],
+        "type": "object"
+      },
+      "name": "delete_display_group"
+    },
+    {
+      "description": "表示グループを並べ替える（config スコープ）。ids はすべての表示グループの id を新しい順に並べたもの。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "ids": {
+            "description": "すべての表示グループの id（新しい順）。",
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "ids"
+        ],
+        "type": "object"
+      },
+      "name": "reorder_display_groups"
+    },
+    {
+      "description": "記録項目 1 つのしきい値を全項目置き換える（config スコープ。省略した欄は設定なし）。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedRevision": {
+            "description": "楽観ロック: get_threshold で読んだ revision。省略すると版を確かめない。",
+            "type": "integer"
+          },
+          "tagId": {
+            "description": "記録項目の id。",
+            "type": "integer"
+          },
+          "thresholdH": {
+            "description": "上限。null は設定なし。",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "thresholdHh": {
+            "description": "上上限。null は設定なし。",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "thresholdL": {
+            "description": "下限。null は設定なし。",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "thresholdLl": {
+            "description": "下下限。null は設定なし。",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tagId"
+        ],
+        "type": "object"
+      },
+      "name": "set_threshold"
+    },
+    {
+      "description": "収集を開始する（config スコープ）。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "start_collection"
+    },
+    {
+      "description": "収集を停止する（config スコープ）。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "stop_collection"
+    },
+    {
+      "description": "収集を再起動する（config スコープ）。接続先・収集グループ・記録項目の変更を収集へ反映する唯一の口。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "restart_collection"
+    }
+  ]
+}

@@ -258,7 +258,10 @@ use actor::{
 // #1161 PR4: API キーの発行・一覧・失効・削除（ログインした管理者だけ）。
 #[cfg(test)]
 mod api_key_tests;
+// #1161 PR5b: `POST /mcp`（`crate::mcp`）を本物の `api_router` に通すテスト。
 mod api_keys;
+#[cfg(test)]
+mod mcp_tests;
 // #393: 表示グループ。ルーターは子モジュール（`rest/display_groups.rs`）に置く。
 use crate::display_groups::DisplayGroupService;
 mod display_groups;
@@ -1699,6 +1702,33 @@ pub fn api_router(
         api_keys: api_keys.clone(),
         audit: audit.clone(),
     };
+    // #1161 PR5b: `POST /mcp` のツールは REST と同じ ops を同じサービスから作る
+    // （`crate::mcp` のモジュール doc）。
+    let mcp_state = crate::mcp::McpState {
+        registry: RegistryOps {
+            plc_connections: plc_connections.clone(),
+            collection_groups: collection_groups.clone(),
+            tags: tags.clone(),
+            display_groups: display_groups.clone(),
+            hub: hub.clone(),
+            audit: audit.clone(),
+            drivers: collect_drivers.clone(),
+        },
+        display_groups: crate::ops::DisplayGroupOps {
+            display_groups: display_groups.clone(),
+            audit: audit.clone(),
+        },
+        thresholds: crate::ops::ThresholdOps {
+            tag_thresholds: TagThresholdService::new(display_groups.pool().clone()),
+            audit: audit.clone(),
+        },
+        collect: CollectOps {
+            collect: collect.clone(),
+            audit: audit.clone(),
+        },
+        audit: audit.clone(),
+    };
+    let mcp = crate::mcp::mcp_router(mcp_state, gate.clone());
 
     // #1161 PR4（docs/chronogazer-agent-api-design.md §3.3・§4.1）: キーを
     // **通さない**集まり。ユーザー管理・サーバー設定・HUB 連携・バックアップ・
@@ -1799,6 +1829,11 @@ pub fn api_router(
         // #1161 PR4: いちばん外で `Authorization: Bearer cg_…` をキーとして照合する。
         // 通らなければここで止め、セッションには落とさない（`rest/actor.rs`）。
         .layer(middleware::from_fn_with_state(gate, api_key_gate))
+        // #1161 PR5b: `POST /mcp` は上の層（キーとセッションの振り分け・CSRF・
+        // この PC からの接続の確認）の外に置く。`cg_…` のキーだけを受ける層は
+        // `crate::mcp::mcp_router` が自分で持つ。`api_router` を載せる listener
+        // すべてに出る（REST の `/api/*` と同じ公開範囲）。
+        .merge(mcp)
 }
 
 /// [`api_router`] に渡す、listener ごとの host の扱い（#392 B2-1）。

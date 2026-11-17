@@ -1694,6 +1694,7 @@ dependencies = [
  "banto-hub-squat-harness",
  "banto-hub-tls-trust",
  "banto-instance-lock",
+ "banto-mcp",
  "banto-plc",
  "banto-safe-root",
  "banto-secret-store",
