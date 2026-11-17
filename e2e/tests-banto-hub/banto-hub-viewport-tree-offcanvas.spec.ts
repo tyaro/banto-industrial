@@ -822,10 +822,20 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(menu).toBeVisible();
 
 		// フォーカスをメニューの外へ飛ばす（「見えているのにフォーカスは外」と
-		// いう状態を作らせない）。
-		await page.evaluate((selector) => {
-			document.querySelector<HTMLElement>(selector)?.focus();
-		}, TREE_TOGGLE_SELECTOR);
+		// いう状態を作らせない）。飛ばし先は開いているツリーのペインの中で、
+		// メニューの外の要素にする（帯のトグルは中央にあり、ドロワーを開いている
+		// あいだ中央は `inert` なので `.focus()` が効かない）。
+		const movedOut = await page.evaluate((selector) => {
+			const pane = document.querySelector<HTMLElement>(selector);
+			const target = Array.from(
+				pane?.querySelectorAll<HTMLElement>(
+					'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"]), [role="treeitem"]'
+				) ?? []
+			).find((el) => !el.closest('[role="menu"]'));
+			target?.focus();
+			return !!target && document.activeElement === target;
+		}, TREE_PANE_SELECTOR);
+		expect(movedOut).toBe(true);
 		await expect(menu).toHaveCount(0);
 
 		// メニューが残っていないので、Esc は下の層（退避ツリー）へ届く。
