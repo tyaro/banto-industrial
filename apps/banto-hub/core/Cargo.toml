@@ -48,6 +48,9 @@ banto-db-source = { path = "../../../crates/banto-db-source" }
 # 同 crate 側へ移動（このパッケージの他のコードは使っていない）。
 banto-instance-lock = { path = "../../../crates/banto-instance-lock" }
 banto-service-control = { path = "../../../crates/banto-service-control" }
+# #1161 PR2: MCP の骨組み（JSON-RPC の受け付け・ツール表・結果の形）は共有 crate。
+# ChronoGazer も同じ crate を使う予定（`src/mcp.rs` 冒頭）。
+banto-mcp = { path = "../../../crates/banto-mcp" }
 # #392 B3-3a: `banto-hub-elev`（`service_elevated.rs`）と`service_operators.rs`の
 # Win32 の部分（ローカルグループの作成・メンバーの追加、サービス DACL への
 # Operators の ACE、トークンのメンバーシップ、`LookupAccountNameW`）を
