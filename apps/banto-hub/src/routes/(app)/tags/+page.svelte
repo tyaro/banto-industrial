@@ -2028,12 +2028,12 @@
 	 * なのでモーダルの `<Drawer>` のまま。
 	 *
 	 * 狭幅では 480/640px のペインを並べる余地が無いので、従来どおり
-	 * オーバーレイの Drawer へフォールバックする。#1179 PR2b から狭幅の判定は
-	 * 枠（`ThreePaneLayout`）自身の幅（≤900px）で、部品が書き出す `narrow`
-	 * （`layoutNarrow`）をそのまま使う。ビューポート（`mobileNavStore.isNarrow`）
-	 * で決めると、ビューポートは広いが枠は狭いとき（サイドバーを出した 1000px
-	 * 前後）に部品は右ペインをドロワーにし、ページはペインを渡す、という食い
-	 * 違いで編集フォームが閉じたドロワーの中に隠れる。
+	 * オーバーレイの Drawer へフォールバックする。狭幅の判定は従来どおり
+	 * ビューポート（`mobileNavStore.isNarrow`、サイドバーのオフキャンバスと
+	 * 同じ境界）。部品は枠の幅で判定するので、`narrowBreakpoint` を 0 / 最大値に
+	 * 切り替えてビューポート基準にしている（2026-11-18 オーナー決定、#1182。
+	 * 1366×768・125% でツリーと編集ペインを横並びに保つため）。部品が書き出す
+	 * `narrow`（`layoutNarrow`）はその結果で、ページはこれを見る。
 	 *
 	 * 広幅では右ペインを `ThreePaneLayout` の `right` に渡す（非モーダルの
 	 * まま - 部品は広幅の右ペインにフォーカスを移さず、Esc も受けない）。
@@ -3144,8 +3144,9 @@
 
 	/**
 	 * #378（2026-09-16 オーナー決定）: 狭幅で左ツリーを退避したときの開閉状態
-	 * （`ThreePaneLayout` の `leftDrawerOpen`）。#1179 PR2b から狭幅の判定は枠
-	 * 自身の幅（`layoutNarrow`）で、広幅へ戻ると部品が `false` へ戻す。
+	 * （`ThreePaneLayout` の `leftDrawerOpen`）。狭幅の判定はビューポート基準
+	 * （`layoutNarrow`、`narrowBreakpoint` で切り替え）で、広幅へ戻ると部品が
+	 * `false` へ戻す。
 	 */
 	let treeOpen = $state(false);
 
@@ -6299,7 +6300,7 @@
 
 <!--
 	#375（2026-09-15 オーナー決定）: 「編集」「連続登録」のフォーム本体。
-	広幅では非モーダルの右ペイン（`.edit-pane`）、狭幅（枠の幅が ≤900px、
+	広幅では非モーダルの右ペイン（`.edit-pane`）、狭幅（ビューポートが ≤900px、
 	`layoutNarrow`）では従来どおりオーバーレイの `<Drawer>` から
 	同じものを呼ぶため snippet に切り出した。**中身は移動しただけで無変更**
 	- 保存・検証・エラー表示・式チェックの経路は一切変えていない。
@@ -6624,12 +6625,14 @@
 		<!--
 			#378（2026-09-16 オーナー決定）: 狭幅では左ツリーをドロワーへ退避する
 			（#1179 PR2b から `@banto/ui` の `ThreePaneLayout`。タグモニタと同じ部品）。
-			狭幅の判定は枠自身の幅（既定の 900px 以下）で、部品が `layoutNarrow` へ
-			書き出す。退避・トグル・Esc・スクリム・フォーカスの出入りは部品が持つ
+			狭幅の判定は従来どおりビューポート（`mobileNavStore.isNarrow`）。部品は
+			枠の幅で判定するので `narrowBreakpoint` を 0 / 最大値に切り替えて
+			ビューポート基準にし（2026-11-18 オーナー決定、#1182）、`layoutNarrow` へ書き出す。退避・トグル・Esc・スクリム・フォーカスの出入りは部品が持つ
 			（部品の冒頭コメントの約束）。帯のトグルの隣には、閉じていても何で
 			絞り込まれているかが分かるよう、現在のツリー選択名を出す。
 		-->
 		<ThreePaneLayout
+			narrowBreakpoint={mobileNavStore.isNarrow ? Number.MAX_SAFE_INTEGER : 0}
 			bind:leftDrawerOpen={treeOpen}
 			bind:narrow={layoutNarrow}
 			bind:rightCollapsed={editPaneCollapsed}
