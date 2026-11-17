@@ -12,6 +12,14 @@
  *   login via `syncFromProvider()` (called from the `(app)` route guard
  *   once the SessionController confirmed the session), so a value saved from another
  *   client/session wins over this tab's stale localStorage.
+ *
+ * #1159（banto v7.2.0 のメニューバー、nav-menubar-plan.md §3）: admin-template の
+ * `navLayout`（サイドバー / ドック / メニューバー）と `launcherPosition`（ドックの
+ * 画面の端）を写した（banto-hub と同じ）。保存先のキーは admin-template と同じ
+ * （localStorage `banto.navLayout`・`banto.launcherPosition`、プロバイダ
+ * `shell.navLayout`・`shell.launcherPosition`）。**ChronoGazer の既定はメニューバー**
+ * （admin-template はサイドバー）。不正な保存値は `isNavLayout()` /
+ * `isLauncherPosition()` が既定へ戻す。
  */
 import {
 	applyPreset,
@@ -23,13 +31,29 @@ import {
 	type ThemePreset
 } from '@banto/theme';
 import { getUiSettings } from './banto/setup';
+import {
+	isLauncherPosition,
+	isNavLayout,
+	LAUNCHER_POSITION_DEFAULT,
+	NAV_LAYOUT_DEFAULT,
+	parseLauncherPosition,
+	parseNavLayout,
+	type LauncherPosition,
+	type NavLayout
+} from './navLayout';
+
+export type { LauncherPosition, NavLayout };
 
 const THEME_KEY = 'banto.theme';
 const PRESET_KEY = 'banto.preset';
+const NAV_LAYOUT_KEY = 'banto.navLayout';
+const LAUNCHER_POSITION_KEY = 'banto.launcherPosition';
 
 /** `UiSettingsProvider` keys (wire contract, spec M12). */
 const MODE_SETTING = 'theme.mode';
 const PRESET_SETTING = 'theme.preset';
+const NAV_LAYOUT_SETTING = 'shell.navLayout';
+const LAUNCHER_POSITION_SETTING = 'shell.launcherPosition';
 
 function loadThemeMode(): ThemeMode {
 	if (typeof localStorage === 'undefined') return 'system';
@@ -43,6 +67,16 @@ function loadThemePreset(): ThemePreset {
 	return isThemePreset(stored) ? stored : 'standard';
 }
 
+function loadNavLayout(): NavLayout {
+	if (typeof localStorage === 'undefined') return NAV_LAYOUT_DEFAULT;
+	return parseNavLayout(localStorage.getItem(NAV_LAYOUT_KEY));
+}
+
+function loadLauncherPosition(): LauncherPosition {
+	if (typeof localStorage === 'undefined') return LAUNCHER_POSITION_DEFAULT;
+	return parseLauncherPosition(localStorage.getItem(LAUNCHER_POSITION_KEY));
+}
+
 /** Best-effort provider write: an unauthenticated/offline failure is expected and ignored (localStorage already holds the value). */
 function persistRemote(key: string, value: string): void {
 	void getUiSettings()
@@ -54,6 +88,9 @@ class Settings {
 	themeMode: ThemeMode = $state(loadThemeMode());
 	themePreset: ThemePreset = $state(loadThemePreset());
 	sidebarCollapsed = $state(false);
+	navLayout: NavLayout = $state(loadNavLayout());
+	/** ドックの画面の端（`navLayout === 'launcher'` のときだけ使う）。 */
+	launcherPosition: LauncherPosition = $state(loadLauncherPosition());
 
 	#unwatchSystem: (() => void) | undefined;
 
@@ -76,6 +113,17 @@ class Settings {
 		applyPreset(preset);
 	}
 
+	/** ローカルへ適用 + キャッシュ（プロバイダへは書かない）。 */
+	#applyNavLayout(layout: NavLayout) {
+		this.navLayout = layout;
+		localStorage.setItem(NAV_LAYOUT_KEY, layout);
+	}
+
+	#applyLauncherPosition(position: LauncherPosition) {
+		this.launcherPosition = position;
+		localStorage.setItem(LAUNCHER_POSITION_KEY, position);
+	}
+
 	setThemeMode(mode: ThemeMode) {
 		this.#applyThemeMode(mode);
 		persistRemote(MODE_SETTING, mode);
@@ -86,10 +134,22 @@ class Settings {
 		persistRemote(PRESET_SETTING, preset);
 	}
 
+	setNavLayout(layout: NavLayout) {
+		this.#applyNavLayout(layout);
+		persistRemote(NAV_LAYOUT_SETTING, layout);
+	}
+
+	setLauncherPosition(position: LauncherPosition) {
+		this.#applyLauncherPosition(position);
+		persistRemote(LAUNCHER_POSITION_SETTING, position);
+	}
+
 	/** Call once on app mount to sync the DOM and start OS-theme watching. No provider write - nothing changed yet. */
 	init() {
 		this.#applyThemeMode(this.themeMode);
 		this.#applyThemePreset(this.themePreset);
+		this.#applyNavLayout(this.navLayout);
+		this.#applyLauncherPosition(this.launcherPosition);
 	}
 
 	/**
@@ -103,9 +163,16 @@ class Settings {
 	async syncFromProvider(): Promise<void> {
 		const ui = getUiSettings();
 		try {
-			const [mode, preset] = await Promise.all([ui.get(MODE_SETTING), ui.get(PRESET_SETTING)]);
+			const [mode, preset, navLayout, launcherPosition] = await Promise.all([
+				ui.get(MODE_SETTING),
+				ui.get(PRESET_SETTING),
+				ui.get(NAV_LAYOUT_SETTING),
+				ui.get(LAUNCHER_POSITION_SETTING)
+			]);
 			if (isThemeMode(mode)) this.#applyThemeMode(mode);
 			if (isThemePreset(preset)) this.#applyThemePreset(preset);
+			if (isNavLayout(navLayout)) this.#applyNavLayout(navLayout);
+			if (isLauncherPosition(launcherPosition)) this.#applyLauncherPosition(launcherPosition);
 		} catch {
 			// Best-effort: offline/unauthenticated reads keep the local values.
 		}

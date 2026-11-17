@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
-	import { goto, refreshAll } from '$app/navigation';
+	import { afterNavigate, goto, refreshAll } from '$app/navigation';
 	import { getSessionController, notify } from '@banto/admin-core';
 	import { isLeavingForLogin, leaveForLogin } from '#lib/banto/logout.svelte.js';
 	import { OWNER_CHANGE_POLICY, watchOwnerChanges } from '#lib/banto/ownerChange.js';
@@ -9,6 +9,10 @@
 	import Header from '#lib/components/Header.svelte';
 	import SetupBanner from '#lib/components/SetupBanner.svelte';
 	import Sidebar from '#lib/components/Sidebar.svelte';
+	import ShellLauncher from '#lib/components/ShellLauncher.svelte';
+	import { settings } from '#lib/settings.svelte.js';
+	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
+	import { hasVisibleLayerAbove, LAYER_MARKER_ATTR } from '@banto/ui';
 	import CommandPalette from '#lib/components/CommandPalette.svelte';
 	import { commandPaletteStore } from '#lib/commandPalette.svelte.js';
 
@@ -19,8 +23,9 @@
 	// `routes/(app)/+layout.svelte` (v2 移行 PR1c). ChronoGazer 固有の差:
 	// the notices are Japanese strings (no i18n here), there is no `base`
 	// path, and the template's other shell features (unsaved-changes window
-	// guard, command history owner, nav badges, sidebar overlay) are not part
-	// of this copy.
+	// guard, command history owner, nav badges) are not part of this copy.
+	// The narrow-width sidebar drawer was added with the menubar (#1159) and is
+	// used only as the menubar's fallback (see `resolveShellNav`).
 	//
 	// A page belongs to the session it was built for. The page is shown only
 	// while the session generation its loads confirmed
@@ -102,13 +107,95 @@
 			event.preventDefault();
 			commandPaletteStore.toggle();
 		}
+
+		// #1159: ドロワー（メニューバーの戻り先）が開いていれば Escape で閉じる（banto-hub の
+		// `(app)/+layout.svelte` と同じ、`@banto/ui` の `layering.ts` の層の約束）。開いている
+		// ドロワー自身も層（`data-esc-layer`、z-index 710）として数えられるので、**自分を
+		// 「上位層」と誤認して永遠に譲らないよう** `except` に渡す（Drawer 900・パレット 1000 には
+		// 譲り、それより下の層には譲らない）。要素は `Sidebar` から受け渡さず、マーカーで引く。
+		if (event.key === 'Escape') {
+			const sidebarEl = document.querySelector(`[${LAYER_MARKER_ATTR}='sidebar']`);
+			if (event.defaultPrevented || hasVisibleLayerAbove({ except: sidebarEl })) return;
+			if (mobileNavStore.open) {
+				event.preventDefault();
+				mobileNavStore.closeNav();
+			}
+		}
 	}
+
+	// ビューポート幅の監視を開始する（`watchViewport` の中の `untrack` が必須な理由は
+	// `mobileNav.svelte.ts` のコメント参照）。
+	$effect(() => {
+		return mobileNavStore.watchViewport();
+	});
+
+	// #1159（banto v7.2.0 のメニューバー、nav-menubar-plan.md §4.9・D10-a）: ナビの置き場所
+	// ごとにシェルが出すものは `mobileNavStore.view`（`resolveShellNav`）が決める。
+	// メニューバーでは >900px にサイドバーは無く（ヘッダーがナビを持つ）、≤900px、または
+	// ヘッダーのナビが「その他」にも入らないときだけサイドバーがドロワーになる
+	// （`menubarInsufficient` は `Header` が `HeaderNav` から受けて store に置く）。ヘッダーが
+	// バーを外す ≤900px・置き場所の切り替えではフラグを落とす（新しいバーが測り直して報告する）。
+	const view = $derived(mobileNavStore.view);
+	const launcher = $derived(settings.navLayout === 'launcher');
+	const launcherPosition = $derived(settings.launcherPosition);
+	$effect(() => {
+		if (settings.navLayout !== 'menubar' || mobileNavStore.isNarrow) {
+			mobileNavStore.setMenubarInsufficient(false);
+		}
+	});
+	// ドロワーでなくなった（バーが戻った・ドックにした・広幅になった）ら、開いたままにしない。
+	$effect(() => {
+		if (!view.drawerMode) mobileNavStore.closeNav();
+	});
+
+	// トーストの積み位置はこのシェルの外（ルートの兄弟）にあるので、ドックのあいだだけルートに
+	// 印を付け、banto.css がトーストをバーから避ける（nav-launcher-plan.md §4.1）。外れたら消す。
+	$effect(() => {
+		if (!launcher) return;
+		const root = document.documentElement;
+		root.setAttribute('data-banto-shell-nav', 'launcher');
+		root.setAttribute('data-banto-shell-launcher-position', launcherPosition);
+		return () => {
+			root.removeAttribute('data-banto-shell-nav');
+			root.removeAttribute('data-banto-shell-launcher-position');
+		};
+	});
+
+	// ルート変更時はドロワーを必ず閉じる。
+	afterNavigate(({ shallow }) => {
+		if (shallow) return;
+
+		mobileNavStore.closeNav();
+	});
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
 
-<div class="shell">
-	<Sidebar />
+<div
+	class="shell"
+	class:with-launcher={launcher}
+	class:launcher-top={launcher && launcherPosition === 'top'}
+	class:launcher-left={launcher && launcherPosition === 'left'}
+	class:launcher-right={launcher && launcherPosition === 'right'}
+>
+	{#if mobileNavStore.drawerMode && mobileNavStore.open}
+		<!--
+			ドロワー（メニューバーの戻り先）のバックドロップ。z-index は Drawer/Modal(900)・
+			CommandPalette/ToastHost 等(1000) より下の 700 に固定する - サイドバーは常設ナビであり、
+			それらの一時的な最前面 UI の「下」にとどまるべきなので（banto-hub と同じ）。
+		-->
+		<button
+			type="button"
+			class="nav-backdrop"
+			onclick={() => mobileNavStore.closeNavFromBackdrop()}
+			aria-label="背景をクリックしてメニューを閉じる"
+		></button>
+	{/if}
+	{#if launcher}
+		<ShellLauncher />
+	{:else if view.showSidebar}
+		<Sidebar />
+	{/if}
 	<div class="main">
 		<Header />
 		<SetupBanner />
@@ -142,5 +229,57 @@
 	main {
 		flex: 1;
 		padding: 1.25rem;
+	}
+
+	/* ドック（nav-launcher-plan.md §4.1）: 固定のバーが本文の端を覆わないよう、置いた辺に
+	   バーの分の余白を取る。上のバーはヘッダーの下に置く（バーをヘッダーの高さだけ下げる）。 */
+	.shell.with-launcher main {
+		padding-bottom: calc(1.25rem + var(--banto-shell-launcher-reserve));
+	}
+
+	.shell.launcher-top main,
+	.shell.launcher-left main,
+	.shell.launcher-right main {
+		padding-bottom: 1.25rem;
+	}
+
+	.shell.launcher-top {
+		--banto-shell-launcher-inset-top: var(--banto-shell-header-height);
+	}
+
+	.shell.launcher-top main {
+		padding-top: calc(1.25rem + var(--banto-shell-launcher-reserve));
+	}
+
+	.shell.launcher-left main {
+		padding-left: calc(1.25rem + var(--banto-shell-launcher-reserve));
+	}
+
+	.shell.launcher-right main {
+		padding-right: calc(1.25rem + var(--banto-shell-launcher-reserve));
+	}
+
+	/* ≤900px はどの位置でも下の全幅タブバー（§4.6, D5）。 */
+	@media (max-width: 900px) {
+		.shell.with-launcher main,
+		.shell.launcher-top main,
+		.shell.launcher-left main,
+		.shell.launcher-right main {
+			padding: 1.25rem 1.25rem calc(1.25rem + var(--banto-shell-launcher-tabbar-reserve));
+		}
+	}
+
+	/* ドロワーのバックドロップ。z-index は Drawer/Modal(900) より下の 700（サイドバー本体は 710）。 */
+	.nav-backdrop {
+		position: fixed;
+		inset: 0;
+		z-index: 700;
+		display: block;
+		width: 100%;
+		border: none;
+		margin: 0;
+		padding: 0;
+		background: rgba(0, 0, 0, 0.35);
+		cursor: pointer;
 	}
 </style>

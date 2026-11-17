@@ -4,9 +4,13 @@
 	 * 元 `+page.svelte` の該当セクションから markup・state・関数を無改変で
 	 * 移した。常に表示（テーマ/プリセット自体にガード無し。ウィンドウ効果は
 	 * `tauri && isAdmin && vibrancyStatus?.supported` のときだけ内部で描画）。
+	 *
+	 * #1159（banto v7.2.0 のメニューバー）: 「ナビゲーション」（メニューバー / サイドバー /
+	 * ドック、nav-launcher-plan.md §3・nav-menubar-plan.md §3）を足した。保存先は
+	 * admin-template・Hub と同じキー。ドックを選んだときだけ位置（上下左右）を出す。
 	 */
 	import type { ThemeMode, ThemePreset } from '@banto/theme';
-	import { settings } from '#lib/settings.svelte.js';
+	import { settings, type LauncherPosition, type NavLayout } from '#lib/settings.svelte.js';
 	import { isTauri } from '#lib/banto/setup.js';
 	import { applyVibrancy, getVibrancyStatus, type VibrancyStatus } from '#lib/banto/vibrancy.js';
 	import { toastStore } from '#lib/toast.svelte.js';
@@ -24,6 +28,20 @@
 	const presets: { value: ThemePreset; label: string }[] = [
 		{ value: 'standard', label: 'スタンダード' },
 		{ value: 'glass', label: 'ガラス' }
+	];
+
+	const navLayouts: { value: NavLayout; label: string }[] = [
+		{ value: 'menubar', label: 'メニューバー' },
+		{ value: 'sidebar', label: 'サイドバー' },
+		{ value: 'launcher', label: 'ドック' }
+	];
+
+	// ドックの画面の端。900px 以下は常に下のタブバー。
+	const launcherPositions: { value: LauncherPosition; label: string }[] = [
+		{ value: 'top', label: '上' },
+		{ value: 'bottom', label: '下' },
+		{ value: 'left', label: '左' },
+		{ value: 'right', label: '右' }
 	];
 
 	// M6 Phase B (spec §11.4): the server controls only exist inside the Tauri
@@ -99,6 +117,45 @@
 			</label>
 		{/each}
 	</div>
+
+	<h3>ナビゲーション</h3>
+	<p class="note">
+		ページへのリンクを、ヘッダーのメニューバー・左のサイドバー・画面の端のドックのどれで表示するか選びます。
+	</p>
+	<div class="options" role="radiogroup" aria-label="ナビゲーションの表示">
+		{#each navLayouts as layout (layout.value)}
+			<label class:selected={settings.navLayout === layout.value}>
+				<input
+					type="radio"
+					name="nav-layout"
+					value={layout.value}
+					checked={settings.navLayout === layout.value}
+					onchange={() => settings.setNavLayout(layout.value)}
+				/>
+				{layout.label}
+			</label>
+		{/each}
+	</div>
+
+	{#if settings.navLayout === 'launcher'}
+		<h3>ドックの位置</h3>
+		<div class="options" role="radiogroup" aria-label="ドックの位置">
+			{#each launcherPositions as position (position.value)}
+				<label class:selected={settings.launcherPosition === position.value}>
+					<input
+						type="radio"
+						name="launcher-position"
+						value={position.value}
+						checked={settings.launcherPosition === position.value}
+						onchange={() => settings.setLauncherPosition(position.value)}
+					/>
+					{position.label}
+				</label>
+			{/each}
+		</div>
+		<p class="note">900px 以下の幅では、位置にかかわらず下のタブバーになります。</p>
+	{/if}
+
 	<p class="note">
 		設定はこの端末に即時保存され、ログイン中は設定DB（Tauri/LANサーバ）にも保存されて他クライアントと共有されます（仕様
 		§12.1 / M12）。
