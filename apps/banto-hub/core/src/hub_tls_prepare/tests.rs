@@ -677,23 +677,23 @@ fn generated_identity_passes_its_own_inspection() {
     use x509_cert::ext::pkix::name::GeneralName;
     use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, SubjectAltName};
     let cert = x509_cert::Certificate::from_pem(identity.cert_pem.as_bytes()).unwrap();
-    let tbs = &cert.tbs_certificate;
-    assert_eq!(tbs.subject.to_string(), format!("CN={COMMON_NAME}"));
-    let (_, basic) = tbs.get::<BasicConstraints>().unwrap().unwrap();
+    let tbs = cert.tbs_certificate();
+    assert_eq!(tbs.subject().to_string(), format!("CN={COMMON_NAME}"));
+    let (_, basic) = tbs.get_extension::<BasicConstraints>().unwrap().unwrap();
     assert!(!basic.ca);
-    let (_, san) = tbs.get::<SubjectAltName>().unwrap().unwrap();
+    let (_, san) = tbs.get_extension::<SubjectAltName>().unwrap().unwrap();
     assert_eq!(san.0.len(), 1);
     assert!(matches!(&san.0[0], GeneralName::IpAddress(ip) if ip.as_bytes() == [127, 0, 0, 1]));
-    let (_, eku) = tbs.get::<ExtendedKeyUsage>().unwrap().unwrap();
+    let (_, eku) = tbs.get_extension::<ExtendedKeyUsage>().unwrap().unwrap();
     assert_eq!(eku.0.len(), 1);
     assert_eq!(eku.0[0].to_string(), "1.3.6.1.5.5.7.3.1");
     assert_eq!(
-        tbs.validity.not_before.to_unix_duration().as_secs() as i64,
+        tbs.validity().not_before.to_unix_duration().as_secs() as i64,
         NOW - BACKDATE_SECS
     );
     // 署名は ECDSA with SHA-256。
     assert_eq!(
-        cert.signature_algorithm.oid.to_string(),
+        cert.signature_algorithm().oid.to_string(),
         "1.2.840.10045.4.3.2"
     );
     // 2 回作ると別の鍵。
@@ -829,10 +829,22 @@ fn inspection_refuses_a_certificate_whose_signature_does_not_verify() {
     assert!(error.contains("自己署名"), "{error}");
 
     // 中身（tbs）の 1 バイトを変えても断る（notAfter などの書き換え）。署名は元のまま。
+    // x509-cert 0.3 は tbs のフィールドが private なので、DER の上でシリアル番号の最後の 1 バイト
+    // だけを変える（長さ・構造は同じ。署名は元のまま）。
     let cert = x509_cert::Certificate::from_pem(identity.cert_pem.as_bytes()).unwrap();
-    let mut changed = cert.clone();
-    changed.tbs_certificate.serial_number =
-        x509_cert::serial_number::SerialNumber::new(&[0x01, 0x02, 0x03]).unwrap();
+    let serial = cert.tbs_certificate().serial_number().as_bytes().to_vec();
+    let mut der = cert.to_der().unwrap();
+    let at = der
+        .windows(serial.len())
+        .position(|window| window == serial.as_slice())
+        .expect("シリアル番号が DER の中にある");
+    der[at + serial.len() - 1] ^= 0x01;
+    let changed = x509_cert::Certificate::from_der(&der).unwrap();
+    assert_ne!(
+        changed.tbs_certificate().serial_number().as_bytes(),
+        serial.as_slice()
+    );
+    assert_eq!(changed.signature(), cert.signature());
     let changed = changed.to_pem(x509_cert::der::pem::LineEnding::LF).unwrap();
     let error = inspect_identity(changed.as_bytes(), key, NOW).unwrap_err();
     assert!(error.contains("自己署名"), "{error}");

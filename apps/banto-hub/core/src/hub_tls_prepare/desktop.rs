@@ -573,8 +573,8 @@ fn pair_matches(cert: &[u8], key: &[u8]) -> bool {
         .and_then(|der| x509_cert::Certificate::from_der(&der).ok())
         .and_then(|cert| {
             i64::try_from(
-                cert.tbs_certificate
-                    .validity
+                cert.tbs_certificate()
+                    .validity()
                     .not_before
                     .to_unix_duration()
                     .as_secs(),

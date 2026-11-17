@@ -304,33 +304,34 @@ pub fn inspect_identity(
     }
     let cert = x509_cert::Certificate::from_der(cert_der.as_ref())
         .map_err(|_| "証明書（DER）を読めません".to_string())?;
-    let tbs = &cert.tbs_certificate;
-    if tbs.subject_public_key_info.subject_public_key.raw_bytes() != pair.public_key_raw() {
+    let tbs = cert.tbs_certificate();
+    if tbs.subject_public_key_info().subject_public_key.raw_bytes() != pair.public_key_raw() {
         return Err("秘密鍵と証明書が対になっていません".to_string());
     }
     // 署名（#644 PR1a のレビュー）: アルゴリズムが ECDSA with SHA-256 で、自己署名を証明書の
     // 公開鍵（＝秘密鍵の対）で検証できること。中身を書き換えた証明書を pin の根にしない。
     let ecdsa_sha256 = x509_cert::der::asn1::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
-    if cert.signature_algorithm.oid != ecdsa_sha256 || tbs.signature.oid != ecdsa_sha256 {
+    if cert.signature_algorithm().oid != ecdsa_sha256 || tbs.signature().oid != ecdsa_sha256 {
         return Err("証明書の署名のアルゴリズムが ECDSA with SHA-256 ではありません".to_string());
     }
     let tbs_der = tbs
         .to_der()
         .map_err(|_| "証明書（DER）を読めません".to_string())?;
     let signature = cert
-        .signature
+        .signature()
         .as_bytes()
         .ok_or_else(|| "証明書の署名を読めません".to_string())?;
     ring::signature::UnparsedPublicKey::new(
         &ring::signature::ECDSA_P256_SHA256_ASN1,
-        tbs.subject_public_key_info.subject_public_key.raw_bytes(),
+        tbs.subject_public_key_info().subject_public_key.raw_bytes(),
     )
     .verify(&tbs_der, signature)
     .map_err(|_| "証明書の自己署名を証明書の公開鍵で検証できません".to_string())?;
     let secs = |at: x509_cert::time::Time| i64::try_from(at.to_unix_duration().as_secs());
-    let (Ok(not_before), Ok(not_after)) =
-        (secs(tbs.validity.not_before), secs(tbs.validity.not_after))
-    else {
+    let (Ok(not_before), Ok(not_after)) = (
+        secs(tbs.validity().not_before),
+        secs(tbs.validity().not_after),
+    ) else {
         return Err("証明書の有効期間を読めません".to_string());
     };
     if now_unix < not_before {
@@ -345,13 +346,13 @@ pub fn inspect_identity(
             utc_text(not_after)
         ));
     }
-    match tbs.get::<BasicConstraints>() {
+    match tbs.get_extension::<BasicConstraints>() {
         Ok(Some((_, constraints))) if !constraints.ca => {}
         Ok(Some(_)) => return Err("証明書が CA の証明書です（CA:TRUE）".to_string()),
         Ok(None) => return Err("証明書に Basic Constraints（CA:FALSE）がありません".to_string()),
         Err(_) => return Err("証明書の Basic Constraints を読めません".to_string()),
     }
-    let loopback = match tbs.get::<SubjectAltName>() {
+    let loopback = match tbs.get_extension::<SubjectAltName>() {
         Ok(Some((_, names))) => names.0.iter().any(
             |name| matches!(name, GeneralName::IpAddress(ip) if ip.as_bytes() == [127, 0, 0, 1]),
         ),
@@ -362,7 +363,7 @@ pub fn inspect_identity(
         return Err("証明書の SAN に IP 127.0.0.1 がありません".to_string());
     }
     let server_auth = x509_cert::der::asn1::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.1");
-    match tbs.get::<ExtendedKeyUsage>() {
+    match tbs.get_extension::<ExtendedKeyUsage>() {
         Ok(Some((_, usage))) if !usage.0.contains(&server_auth) => {
             return Err("証明書の用途（EKU）に serverAuth がありません".to_string())
         }
@@ -371,7 +372,7 @@ pub fn inspect_identity(
     }
     // Key Usage（#644 PR1a のレビュー）: あれば digitalSignature を要る（TLS 1.3 の
     // CertificateVerify の署名）。無ければ用途を絞っていないので通す。
-    match tbs.get::<KeyUsage>() {
+    match tbs.get_extension::<KeyUsage>() {
         Ok(Some((_, usage))) if !usage.digital_signature() => {
             return Err("証明書の Key Usage に digitalSignature がありません".to_string())
         }
