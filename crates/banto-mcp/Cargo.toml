@@ -1,0 +1,18 @@
+[package]
+name = "banto-mcp"
+description = "MCP (Model Context Protocol) server skeleton shared by banto-hub and ChronoGazer: JSON-RPC 2.0 envelope, initialize/ping/tools list/call, tool registry and result helpers"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+serde_json = { workspace = true }
+# `BantoError::Validation` / `FieldError` を `field: message; …` に直す
+# （`banto_error_tool_error`）。banto-hub-core と同じ git 依存。
+banto-core = { workspace = true }
+
+[dev-dependencies]
+# 単体テストの非同期ツールと応答本文の読み出し。
+tokio = { workspace = true, features = ["rt", "macros"] }

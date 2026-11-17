@@ -1,6 +1,12 @@
 //! MCP（Model Context Protocol）サーバー(T19 S5、docs/banto-hub-t19-design.md
 //! §3.7・UX-41)。
 //!
+//! JSON-RPC の受け付け・`initialize`/`ping`/`tools/list`/`tools/call`・ツール表・
+//! 結果の形（`tool_ok`/`tool_error` ほか）の骨組みは共有 crate `banto-mcp` に移した
+//! （#1161 PR2、ChronoGazer と共有）。ここに残るのは認証（`require_mcp_auth`）・
+//! HUB の状態 `McpState`・ツールの中身と、定義と処理を並べたツール表（`tool_registry`）。
+//! 以下の「なぜ自前 JSON-RPC か」は骨組みの経緯として残してある。
+//!
 //! ## なぜ自前 JSON-RPC か（オーナー決定 2026-09-04）
 //!
 //! `rmcp` 等の MCP SDK は導入しない。この crate の他の外部 IF（REST/gRPC/
@@ -68,19 +74,22 @@
 //! 個別に行う。
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use axum::body::Bytes;
 use axum::extract::{Extension, State};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use axum::routing::post;
-use axum::{middleware, Json, Router};
+use axum::{middleware, Router};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tokio::sync::Mutex as AsyncMutex;
 
-use banto_core::{BantoError, FieldError, ListParams};
+use banto_core::ListParams;
+use banto_mcp::{
+    banto_error_tool_error, field_errors_tool_error, require_all_fields, tool_error, tool_ok,
+    RpcError, ToolRegistry,
+};
 use banto_tags::{CollectionGroupService, PlcConnectionService, TagService, TagUpdateError};
 
 use crate::api_keys::{api_key_verdict, parse_ingest_scope, ApiKeyContext, ApiKeysService};
@@ -111,43 +120,6 @@ use crate::write_control::{WriteControl, WriteControlChange};
 use crate::write_path::{execute_write, execute_write_batch, WriteDeps};
 use crate::write_rate::WriteRateLimiter;
 use banto_server::ServerEvent;
-
-/// クライアントが `initialize` で `protocolVersion` を送ってこなかった場合の
-/// 既定値。仕様は固定していないので、実装時点の MCP 仕様の一版を素直に
-/// 選んだだけ - クライアントが値を送ってくればそれをそのまま echo する
-/// ([`handle_initialize`])。
-const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
-
-// --- JSON-RPC エラーコード（JSON-RPC 2.0 仕様の予約範囲） -------------------
-
-const PARSE_ERROR: i64 = -32700;
-const INVALID_REQUEST: i64 = -32600;
-const METHOD_NOT_FOUND: i64 = -32601;
-const INVALID_PARAMS: i64 = -32602;
-
-/// `tools/call` のドメイン上の失敗（スコープ不足・タグ不明・ゲート拒否・
-/// ロックダウン時の書き込み）ではなく、JSON-RPC そのものが壊れている場合の
-/// エラー - このモジュールの doc comment「認証」節参照。
-struct RpcError {
-    code: i64,
-    message: String,
-}
-
-impl RpcError {
-    fn invalid_params(message: impl Into<String>) -> Self {
-        Self {
-            code: INVALID_PARAMS,
-            message: message.into(),
-        }
-    }
-
-    fn method_not_found(message: impl Into<String>) -> Self {
-        Self {
-            code: METHOD_NOT_FOUND,
-            message: message.into(),
-        }
-    }
-}
 
 // --- 状態 --------------------------------------------------------------
 
@@ -383,1036 +355,997 @@ async fn require_mcp_auth(
 
 // --- JSON-RPC envelope ---------------------------------------------------
 
-fn json_rpc_success(id: Value, result: Value) -> Response {
-    (
-        StatusCode::OK,
-        Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })),
-    )
-        .into_response()
-}
-
-fn json_rpc_error(id: Value, code: i64, message: &str) -> Response {
-    (
-        StatusCode::OK,
-        Json(json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": { "code": code, "message": message },
-        })),
-    )
-        .into_response()
-}
-
-/// `POST /mcp`ハンドラ本体。JSON-RPC の壊れ方に応じて自前でエンベロープを
-/// 判定する（`axum::Json`エクストラクタを使わない理由: 不正な JSON でも
-/// `-32700`を JSON-RPC の形で返したいため、生バイト列を自分で
-/// `serde_json::from_slice`する）。
+/// `POST /mcp` ハンドラ。認証は [`require_mcp_auth`]（ミドルウェア）が済ませて
+/// いて、ここでは JSON-RPC の受け付けを共有 crate `banto-mcp` に任せるだけ
+/// （骨組みの設計意図は `banto_mcp` の crate doc）。
 async fn mcp_handler(
     State(state): State<McpState>,
     Extension(ctx): Extension<ApiKeyContext>,
     body: Bytes,
 ) -> Response {
-    let raw: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(_) => return json_rpc_error(Value::Null, PARSE_ERROR, "Parse error"),
-    };
-
-    let id = raw.get("id").cloned();
-    let jsonrpc_ok = raw.get("jsonrpc").and_then(Value::as_str) == Some("2.0");
-    let method = raw
-        .get("method")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-
-    let Some(method) = method.filter(|_| jsonrpc_ok) else {
-        return json_rpc_error(
-            id.unwrap_or(Value::Null),
-            INVALID_REQUEST,
-            "Invalid Request",
-        );
-    };
-    let params = raw.get("params").cloned();
-
-    // JSON-RPC 2.0: `id`メンバが無ければ通知 - 応答を一切返さない
-    // (`notifications/initialized`/`notifications/*`、実装指示 A 参照)。
-    let Some(id) = id else {
-        return StatusCode::ACCEPTED.into_response();
-    };
-
-    match dispatch_method(&state, &ctx, &method, params).await {
-        Ok(result) => json_rpc_success(id, result),
-        Err(err) => json_rpc_error(id, err.code, &err.message),
-    }
+    banto_mcp::handle_request(&TOOLS, &state, &ctx, &body).await
 }
 
-async fn dispatch_method(
-    state: &McpState,
-    ctx: &ApiKeyContext,
-    method: &str,
-    params: Option<Value>,
-) -> Result<Value, RpcError> {
-    match method {
-        "initialize" => Ok(handle_initialize(params)),
-        "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tool_definitions() })),
-        "tools/call" => handle_tools_call(state, ctx, params).await,
-        other => Err(RpcError::method_not_found(format!(
-            "unknown method: {other}"
-        ))),
-    }
+/// ツール表。`tools/list`・`tools/call` の両方がここから作られる（1 回だけ
+/// 作る）。
+static TOOLS: LazyLock<ToolRegistry<McpState, ApiKeyContext>> = LazyLock::new(tool_registry);
+
+// ツールの処理の形がツールごとに違う（同期/非同期、`arguments` の有無、
+// `Value` か `Result<Value, RpcError>` か）ので、表に載せる形
+// （`banto_mcp::ToolHandler`）へ揃える小さなマクロ。引数の型を書かない
+// クロージャにして、期待される fn ポインタ型から高階の寿命を推論させる。
+macro_rules! sync0 {
+    ($f:path) => {
+        |s, c, _args| Box::pin(std::future::ready(Ok($f(s, c))))
+    };
+}
+macro_rules! async0 {
+    ($f:path) => {
+        |s, c, _args| Box::pin(async move { Ok($f(s, c).await) })
+    };
+}
+macro_rules! sync1 {
+    ($f:path) => {
+        |s, c, args| Box::pin(std::future::ready($f(s, c, args)))
+    };
+}
+macro_rules! async1 {
+    ($f:path) => {
+        |s, c, args| Box::pin($f(s, c, args))
+    };
 }
 
-fn handle_initialize(params: Option<Value>) -> Value {
-    let protocol_version = params
-        .as_ref()
-        .and_then(|p| p.get("protocolVersion"))
-        .and_then(Value::as_str)
-        .unwrap_or(DEFAULT_PROTOCOL_VERSION);
-    json!({
-        "protocolVersion": protocol_version,
-        "capabilities": { "tools": {} },
-        "serverInfo": {
-            "name": "banto-hub",
-            "version": env!("CARGO_PKG_VERSION"),
-        },
-    })
-}
-
-fn tool_definitions() -> Vec<Value> {
-    vec![
-        json!({
-            "name": "list_tags",
-            "description": "タグ catalog を返す。呼び出しキーが読み取り可能なタグのみを含む(read/read:{name}/read:{connection}.{group}.* スコープ)。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "read_tag_values",
-            "description": "現在値を返す。tags を省略すると全タグ(呼び出しキーが読み取り可能なものに絞られる)。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "tags": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "外部名 {connection}.{group}.{tag} のリスト。省略時は全タグ。",
-                    },
+/// ツール表を組み立てる。各ツールの定義（`tools/list` にそのまま載る JSON）の
+/// 直後に処理を置く。並びが `tools/list` の順になる
+/// （`tests/snapshots/mcp_tools_list.json` で固定）。
+fn tool_registry() -> ToolRegistry<McpState, ApiKeyContext> {
+    ToolRegistry::new("banto-hub", env!("CARGO_PKG_VERSION"))
+        .tool(
+            json!({
+                "name": "list_tags",
+                "description": "タグ catalog を返す。呼び出しキーが読み取り可能なタグのみを含む(read/read:{name}/read:{connection}.{group}.* スコープ)。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
                 },
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "read_tag_now",
-            "description": "指定した1タグを PLC からその場で直接読む(収集キャッシュ current_values/tstore を経由しない)。収集パイプラインから除外されている文字列タグを読める唯一の手段(T20 ①b)。数値タグは通常の読み取り値と同じスケール済みの工学値を返す。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "tag": {
-                        "type": "string",
-                        "description": "外部名 {connection}.{group}.{tag}",
-                    },
-                },
-                "required": ["tag"],
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "get_server_status",
-            "description": "サーバー状態(収集状態・接続一覧・書き込み受付・ロックダウン有無等)を返す。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "write_tag_value",
-            "description": "タグへ書き込む。ロックダウン後(本番稼働中)は実際には書き込まず、何を書き込むべきかの助言のみを返す - 実行は管理 UI から人が行うこと。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "tag": {
-                        "type": "string",
-                        "description": "外部名 {connection}.{group}.{tag}",
-                    },
-                    "value": {
-                        "description": "書き込む工学値。数値タグには数値、bit タグには真偽値。",
-                    },
-                },
-                "required": ["tag", "value"],
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "write_recipe",
-            "description": "複数タグへ設定値一式(レシピ)を一括書き込みする。ロックダウン後(本番稼働中)は実際には書き込まず、何を書き込むべきかの助言のみを返す - 実行は管理 UI から人が行うこと。1 回の writes は 1000 件まで。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "writes": {
-                        "type": "array",
-                        "maxItems": 1000,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "tag": {
-                                    "type": "string",
-                                    "description": "外部名 {connection}.{group}.{tag}",
-                                },
-                                "value": {
-                                    "description": "書き込む工学値。数値タグには数値、bit タグには真偽値。",
-                                },
-                            },
-                            "required": ["tag", "value"],
-                            "additionalProperties": false,
+            }),
+            sync0!(tool_list_tags),
+        )
+        .tool(
+            json!({
+                "name": "read_tag_values",
+                "description": "現在値を返す。tags を省略すると全タグ(呼び出しキーが読み取り可能なものに絞られる)。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tags": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "外部名 {connection}.{group}.{tag} のリスト。省略時は全タグ。",
                         },
-                        "description": "書き込むタグ/値の組のリスト。",
                     },
+                    "additionalProperties": false,
                 },
-                "required": ["writes"],
-                "additionalProperties": false,
-            },
-        }),
-        // --- T21 S1-b（docs/banto-hub-t21-design.md §4）: 構成補助ツール
-        // （接続 CRUD の第一弾）。いずれも `admin` スコープ必須 - ロック
-        // ダウンの前後を問わず常時可（設計 §3.2「有効化ガードは不採用」）。
-        json!({
-            "name": "list_connections",
-            "description": "PLC 接続の一覧を返す(admin スコープ必須)。各接続は { id, name, protocol, enabled, simulation, settings }(REST の /api/plc-connections と同じ形)。秘密の値は返さず、秘密のキー(postgres の password)は {\"$secret\": \"set\" | \"unreadable\"}(unreadable: 参照はあるが Hub が読めない - 別の PC へ DB を移した等。update_connection で入れ直す)、値が無いキーは載らない。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false,
-            },
-        }),
-        // H2（tyaro/banto-industrial#1053）: PLC の時計合わせは見るだけ。実行と
-        // 設定の変更は MCP に出さない（REST の editor の操作だけ）。
-        json!({
-            "name": "get_clock_sync",
-            "description": "PLC 接続の時計合わせの設定と直近の結果を返す(admin スコープ必須。REST の GET /api/plc-connections/{id}/clock-sync と同じ形 { settings: { enabled, schedule }, last })。schedule は毎時 m 分 {kind:\"hourly\",minute} か毎日 hh:mm {kind:\"daily\",hour,minute}(Hub の PC の現地時刻。過ぎた回は追いつかない)。last は直近の結果(メモリだけ。result は ok・unsupported・rejected・device・verificationFailed・unavailable・unknown・notOffered・busy)で、無ければ null。実行と設定の変更はこのツールでは出せない。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "description": "PLC 接続の id" },
+            }),
+            sync1!(tool_read_tag_values),
+        )
+        .tool(
+            json!({
+                "name": "read_tag_now",
+                "description": "指定した1タグを PLC からその場で直接読む(収集キャッシュ current_values/tstore を経由しない)。収集パイプラインから除外されている文字列タグを読める唯一の手段(T20 ①b)。数値タグは通常の読み取り値と同じスケール済みの工学値を返す。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tag": {
+                            "type": "string",
+                            "description": "外部名 {connection}.{group}.{tag}",
+                        },
+                    },
+                    "required": ["tag"],
+                    "additionalProperties": false,
                 },
-                "required": ["id"],
-                "additionalProperties": false,
-            },
-        }),
-        // H3（同 #1053）: PLC の時計の読取り。PLC に何も書かない。REST の
-        // GET /api/plc-connections/{id}/clock と同じサービス・使い回しを通る。
-        json!({
-            "name": "read_plc_clock",
-            "description": "PLC 接続の今の PLC の時計を読む(admin スコープ必須。REST の GET /api/plc-connections/{id}/clock と同じ形 { at, result, code, message, plcTime, pcTime, offsetSeconds, cached })。plcTime は PLC の現地時刻、pcTime は Hub の PC の現地時刻(応答を受けた直後、秒に切り捨て)、offsetSeconds は plcTime − pcTime(PLC が進んでいれば正、±1 秒の誤差。どちらも ok のときだけ)。result は ok・unsupported・rejected・device・verificationFailed・unavailable・unknown・notOffered。PLC に何も書かない。PLC のプログラムで SM213 を ON にしておく必要がある(OFF なら rejected)。iQ-R 系と標準 Q・L だけ(他は unsupported)。直近の結果を接続ごとに 5 秒使い回す(cached: true)。時計合わせの設定(enabled)は問わない。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "description": "PLC 接続の id" },
+            }),
+            async1!(tool_read_tag_now),
+        )
+        .tool(
+            json!({
+                "name": "get_server_status",
+                "description": "サーバー状態(収集状態・接続一覧・書き込み受付・ロックダウン有無等)を返す。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
                 },
-                "required": ["id"],
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "list_drivers",
-            "description": "機器のドライバの一覧を返す(admin スコープ必須。REST の GET /api/drivers と同じ中身)。各ドライバの id(create_connection の protocol)、settingsSchema(settings のキー・型・既定値・選択肢)、supportedKinds、addressHelp など。postgres・push・virtual のホストの接続は載らない。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "create_connection",
-            "description": "PLC 接続を新規作成する(admin スコープ必須)。入力は { name, protocol, enabled, simulation, settings }(REST の POST /api/plc-connections と同じ形。平らな host・port・unitId などは受けない)。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string", "description": "接続名(一意)。" },
-                    "protocol": {
-                        "type": "string",
-                        "description": "list_drivers で得られる機器のドライバの id(modbus-tcp・slmp など)、または postgres / push。",
+            }),
+            async0!(tool_get_server_status),
+        )
+        .tool(
+            json!({
+                "name": "write_tag_value",
+                "description": "タグへ書き込む。ロックダウン後(本番稼働中)は実際には書き込まず、何を書き込むべきかの助言のみを返す - 実行は管理 UI から人が行うこと。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tag": {
+                            "type": "string",
+                            "description": "外部名 {connection}.{group}.{tag}",
+                        },
+                        "value": {
+                            "description": "書き込む工学値。数値タグには数値、bit タグには真偽値。",
+                        },
                     },
-                    "enabled": { "type": "boolean", "description": "接続を有効にするか。省略は true。" },
-                    "simulation": {
-                        "type": "boolean",
-                        "description": "true でシミュレータ接続にする。省略は false。",
-                    },
-                    "settings": {
-                        "type": "object",
-                        "description": "接続の設定(REST の /api/plc-connections と同じ形)。機器のドライバ(modbus-tcp・slmp など)は list_drivers の settingsSchema のキー(snake_case。host・port・unit_id・cpu_type など。省いたキーはスキーマの既定値)。postgres は host・port・database・username・password。push は stale_timeout_ms と bridge(DB ブリッジ。未知のキーはどの階層でも拒否)。virtual は空。秘密のキー(postgres の password)は平文で入れると Hub が封印して保存する(Windows は DPAPI(machine スコープ)、Windows 以外は plain-v1。未適用キューにも封印した値だけを置く)。応答には値を返さず {\"$secret\": \"set\" | \"unreadable\"} だけを返す。",
-                    },
+                    "required": ["tag", "value"],
+                    "additionalProperties": false,
                 },
-                "required": ["name", "protocol", "settings"],
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "delete_connection",
-            "description": "PLC 接続を削除する(admin スコープ必須)。配下のグループ・タグも一括削除するが、収集済み履歴データは残る。不可逆操作のため confirm:true が必須。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "description": "削除する接続の id。" },
-                    "confirm": {
-                        "type": "boolean",
-                        "description": "true を明示しないと拒否される(不可逆操作の確認)。",
+            }),
+            async1!(tool_write_tag_value),
+        )
+        .tool(
+            json!({
+                "name": "write_recipe",
+                "description": "複数タグへ設定値一式(レシピ)を一括書き込みする。ロックダウン後(本番稼働中)は実際には書き込まず、何を書き込むべきかの助言のみを返す - 実行は管理 UI から人が行うこと。1 回の writes は 1000 件まで。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "writes": {
+                            "type": "array",
+                            "maxItems": 1000,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "tag": {
+                                        "type": "string",
+                                        "description": "外部名 {connection}.{group}.{tag}",
+                                    },
+                                    "value": {
+                                        "description": "書き込む工学値。数値タグには数値、bit タグには真偽値。",
+                                    },
+                                },
+                                "required": ["tag", "value"],
+                                "additionalProperties": false,
+                            },
+                            "description": "書き込むタグ/値の組のリスト。",
+                        },
                     },
+                    "required": ["writes"],
+                    "additionalProperties": false,
                 },
-                "required": ["id", "confirm"],
-                "additionalProperties": false,
-            },
-        }),
-        // --- T21 S1-c（docs/banto-hub-t21-design.md §4・§5）: 構成補助ツール
-        // 第二弾(接続 update/test・グループ CRUD)。S1-b と同じゲート
-        // (admin スコープ必須・有効化ガードなし)。
-        json!({
-            "name": "update_connection",
-            "description": "既存の PLC 接続を更新する(admin スコープ必須)。入力は { id, name, protocol, enabled, simulation, settings }(REST の PUT /api/plc-connections/{id} と同じ形)で全項目指定が必須(PUT 置換)。settings は丸ごと置き換え(省いたキーはスキーマの既定値)で、省略が「保つ」になるのは秘密のキーだけ。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "description": "更新する接続の id。" },
-                    "name": { "type": "string", "description": "接続名(一意)。" },
-                    "protocol": {
-                        "type": "string",
-                        "description": "list_drivers で得られる機器のドライバの id(modbus-tcp・slmp など)、または postgres / push。",
-                    },
-                    "enabled": { "type": "boolean", "description": "接続を有効にするか。省略は true。" },
-                    "simulation": {
-                        "type": "boolean",
-                        "description": "true でシミュレータ接続にする。省略は false。",
-                    },
-                    "settings": {
-                        "type": "object",
-                        "description": "接続の設定(REST の /api/plc-connections と同じ形)。丸ごと置き換え: 省いたキーはスキーマの既定値に戻る(list_connections で今の settings を読んでから全体を送る)。キーの意味は create_connection と同じ。秘密のキー(postgres の password)だけは、省略 = 保存済みを保つ、null または空文字列 = 消す、文字列 = 置き換え。保存済みパスワードのある postgres で host / port / database / username を変える場合は、password を明示して置き換えるか消去する必要があり、省略での保持はできません。応答では {\"$secret\": \"set\" | \"unreadable\"}(unreadable は参照はあるがこの PC で読めない - 入れ直すと直る)。",
-                    },
+            }),
+            async1!(tool_write_recipe),
+        )
+            // --- T21 S1-b（docs/banto-hub-t21-design.md §4）: 構成補助ツール
+            // （接続 CRUD の第一弾）。いずれも `admin` スコープ必須 - ロック
+            // ダウンの前後を問わず常時可（設計 §3.2「有効化ガードは不採用」）。
+        .tool(
+            json!({
+                "name": "list_connections",
+                "description": "PLC 接続の一覧を返す(admin スコープ必須)。各接続は { id, name, protocol, enabled, simulation, settings }(REST の /api/plc-connections と同じ形)。秘密の値は返さず、秘密のキー(postgres の password)は {\"$secret\": \"set\" | \"unreadable\"}(unreadable: 参照はあるが Hub が読めない - 別の PC へ DB を移した等。update_connection で入れ直す)、値が無いキーは載らない。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
                 },
-                "required": ["id", "name", "protocol", "enabled", "simulation", "settings"],
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "test_connection",
-            "description": "保存前に PLC/PostgreSQL 接続の疎通を確認する(admin スコープ必須)。入力は { protocol, simulation, settings, connectionId? }(REST の POST /api/plc-connections/test と同じ形)。機器は実プロトコルで軽い読み出しを1回試み、postgres は SELECT version() を5秒以内で試す。レジストリへの保存は行わない副作用の無い操作。virtual/シミュレーション接続はテスト対象外(即座に ok:false)。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "protocol": {
-                        "type": "string",
-                        "description": "list_drivers で得られる機器のドライバの id(modbus-tcp・slmp など)、または postgres。virtual は常に ok:false(テスト対象外)。",
+            }),
+            async0!(tool_list_connections),
+        )
+            // H2（tyaro/banto-industrial#1053）: PLC の時計合わせは見るだけ。実行と
+            // 設定の変更は MCP に出さない（REST の editor の操作だけ）。
+        .tool(
+            json!({
+                "name": "get_clock_sync",
+                "description": "PLC 接続の時計合わせの設定と直近の結果を返す(admin スコープ必須。REST の GET /api/plc-connections/{id}/clock-sync と同じ形 { settings: { enabled, schedule }, last })。schedule は毎時 m 分 {kind:\"hourly\",minute} か毎日 hh:mm {kind:\"daily\",hour,minute}(Hub の PC の現地時刻。過ぎた回は追いつかない)。last は直近の結果(メモリだけ。result は ok・unsupported・rejected・device・verificationFailed・unavailable・unknown・notOffered・busy)で、無ければ null。実行と設定の変更はこのツールでは出せない。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "description": "PLC 接続の id" },
                     },
-                    "simulation": {
-                        "type": "boolean",
-                        "description": "true の場合は常に ok:false(内蔵シミュレータは常に成功するためテスト不要)。既定値 false。",
-                    },
-                    "settings": {
-                        "type": "object",
-                        "description": "接続の設定(create_connection と同じ形。省いたキーはスキーマの既定値)。秘密のキーは明示した文字列だけを直接接続に使う(保存しない)。保存済み秘密値は開かない。必須の秘密値の欠け、または保存済み秘密値の省略は直接接続前に断る。任意の秘密値を値無しで試す場合は null・空文字列を明示する。postgres は connectionId 指定時に password の文字列が必須。id 無しの省略/null・空文字列はパスワード無し。",
-                    },
-                    "connectionId": {
-                        "type": "integer",
-                        "description": "保存済み接続を編集中にテストする場合のみ指定。機器の収集中の broker セッションがあればそれを再利用し、2本目をダイヤルしない。settings がそのセッションの設定と違えば試さず「保存してからテスト」と返す。保存済み設定の指紋照合用にだけ使い、秘密値の読み出しには使わない。postgres では保存済み接続を参照しない。保存済み PostgreSQL は test_saved_connection を使う。",
-                    },
+                    "required": ["id"],
+                    "additionalProperties": false,
                 },
-                "required": ["protocol", "settings"],
-                "additionalProperties": false,
-            },
-        }),
-        // S1a（docs/banto-hub-external-db-design.md §4.6）: 保存済み接続の
-        // 接続テスト - 上の`test_connection`（保存前のフォーム値）
-        // とは別ツール。
-        json!({
-            "name": "test_saved_connection",
-            "description": "保存済みの PLC/DB 接続 id に対して接続テストを行う(admin スコープ必須)。S1a では protocol: postgres のみ対応(SELECT version() を1回実行)。レジストリへの保存は行わない副作用の無い操作。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "description": "テストする接続の id。" },
+            }),
+            async1!(tool_get_clock_sync),
+        )
+            // H3（同 #1053）: PLC の時計の読取り。PLC に何も書かない。REST の
+            // GET /api/plc-connections/{id}/clock と同じサービス・使い回しを通る。
+        .tool(
+            json!({
+                "name": "read_plc_clock",
+                "description": "PLC 接続の今の PLC の時計を読む(admin スコープ必須。REST の GET /api/plc-connections/{id}/clock と同じ形 { at, result, code, message, plcTime, pcTime, offsetSeconds, cached })。plcTime は PLC の現地時刻、pcTime は Hub の PC の現地時刻(応答を受けた直後、秒に切り捨て)、offsetSeconds は plcTime − pcTime(PLC が進んでいれば正、±1 秒の誤差。どちらも ok のときだけ)。result は ok・unsupported・rejected・device・verificationFailed・unavailable・unknown・notOffered。PLC に何も書かない。PLC のプログラムで SM213 を ON にしておく必要がある(OFF なら rejected)。iQ-R 系と標準 Q・L だけ(他は unsupported)。直近の結果を接続ごとに 5 秒使い回す(cached: true)。時計合わせの設定(enabled)は問わない。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "description": "PLC 接続の id" },
+                    },
+                    "required": ["id"],
+                    "additionalProperties": false,
                 },
-                "required": ["id"],
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "list_groups",
-            "description": "収集グループの一覧を返す(admin スコープ必須)。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "create_group",
-            "description": "収集グループを新規作成する(admin スコープ必須)。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string", "description": "グループ名(接続内で一意)。" },
-                    "plcConnectionId": { "type": "integer", "description": "所属する接続の id。" },
-                    "periodMs": { "type": "integer", "description": "収集周期(ミリ秒)。" },
-                    "enabled": { "type": "boolean", "description": "既定値 true。" },
-                    "defaultWritable": {
-                        "type": "boolean",
-                        "description": "このグループへ新規登録するタグの writable 既定値。既定値 true。",
-                    },
-                    "querySql": {
-                        "type": ["string", "null"],
-                        "description": "postgres 接続配下のグループが1周期ごとに実行する SELECT 文(1グループ = 1 SELECT = N タグ)。先頭が SELECT または WITH の単文のみ。PLC 接続配下のグループでは指定できない(null)。",
-                    },
+            }),
+            async1!(tool_read_plc_clock),
+        )
+        .tool(
+            json!({
+                "name": "list_drivers",
+                "description": "機器のドライバの一覧を返す(admin スコープ必須。REST の GET /api/drivers と同じ中身)。各ドライバの id(create_connection の protocol)、settingsSchema(settings のキー・型・既定値・選択肢)、supportedKinds、addressHelp など。postgres・push・virtual のホストの接続は載らない。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
                 },
-                "required": ["name", "plcConnectionId", "periodMs"],
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "update_group",
-            "description": "既存の収集グループを更新する(admin スコープ必須)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない)。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "description": "更新するグループの id。" },
-                    "name": { "type": "string", "description": "グループ名(接続内で一意)。" },
-                    "plcConnectionId": { "type": "integer", "description": "所属する接続の id。" },
-                    "periodMs": { "type": "integer", "description": "収集周期(ミリ秒)。" },
-                    "enabled": { "type": "boolean", "description": "グループを有効にするか。" },
-                    "defaultWritable": {
-                        "type": "boolean",
-                        "description": "このグループへ新規登録するタグの writable 既定値。",
+            }),
+            sync0!(tool_list_drivers),
+        )
+        .tool(
+            json!({
+                "name": "create_connection",
+                "description": "PLC 接続を新規作成する(admin スコープ必須)。入力は { name, protocol, enabled, simulation, settings }(REST の POST /api/plc-connections と同じ形。平らな host・port・unitId などは受けない)。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "接続名(一意)。" },
+                        "protocol": {
+                            "type": "string",
+                            "description": "list_drivers で得られる機器のドライバの id(modbus-tcp・slmp など)、または postgres / push。",
+                        },
+                        "enabled": { "type": "boolean", "description": "接続を有効にするか。省略は true。" },
+                        "simulation": {
+                            "type": "boolean",
+                            "description": "true でシミュレータ接続にする。省略は false。",
+                        },
+                        "settings": {
+                            "type": "object",
+                            "description": "接続の設定(REST の /api/plc-connections と同じ形)。機器のドライバ(modbus-tcp・slmp など)は list_drivers の settingsSchema のキー(snake_case。host・port・unit_id・cpu_type など。省いたキーはスキーマの既定値)。postgres は host・port・database・username・password。push は stale_timeout_ms と bridge(DB ブリッジ。未知のキーはどの階層でも拒否)。virtual は空。秘密のキー(postgres の password)は平文で入れると Hub が封印して保存する(Windows は DPAPI(machine スコープ)、Windows 以外は plain-v1。未適用キューにも封印した値だけを置く)。応答には値を返さず {\"$secret\": \"set\" | \"unreadable\"} だけを返す。",
+                        },
                     },
-                    "querySql": {
-                        "type": ["string", "null"],
-                        "description": "postgres 接続配下のグループが1周期ごとに実行する SELECT 文(1グループ = 1 SELECT = N タグ)。先頭が SELECT または WITH の単文のみ。PLC 接続配下のグループでは指定できない(null)。",
-                    },
+                    "required": ["name", "protocol", "settings"],
+                    "additionalProperties": false,
                 },
-                "required": [
-                    "id",
-                    "name",
-                    "plcConnectionId",
-                    "periodMs",
-                    "enabled",
-                    "defaultWritable",
-                    "querySql",
-                ],
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "delete_group",
-            "description": "収集グループを削除する(admin スコープ必須)。配下のタグも一括削除するが、収集済み履歴データは残る。不可逆操作のため confirm:true が必須。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "description": "削除するグループの id。" },
-                    "confirm": {
-                        "type": "boolean",
-                        "description": "true を明示しないと拒否される(不可逆操作の確認)。",
+            }),
+            async1!(tool_create_connection),
+        )
+        .tool(
+            json!({
+                "name": "delete_connection",
+                "description": "PLC 接続を削除する(admin スコープ必須)。配下のグループ・タグも一括削除するが、収集済み履歴データは残る。不可逆操作のため confirm:true が必須。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "description": "削除する接続の id。" },
+                        "confirm": {
+                            "type": "boolean",
+                            "description": "true を明示しないと拒否される(不可逆操作の確認)。",
+                        },
                     },
+                    "required": ["id", "confirm"],
+                    "additionalProperties": false,
                 },
-                "required": ["id", "confirm"],
-                "additionalProperties": false,
-            },
-        }),
-        // --- T21 S1-d（docs/banto-hub-t21-design.md §4・§5）: 構成補助ツール
-        // 第三弾（タグ CRUD）。S1-b/S1-c と同じゲート(admin スコープ必須・
-        // 有効化ガードなし)。`create_tag`/`update_tag`/`delete_tag`の
-        // properties は REST の `TagPayload`（`crate::rest`）と同じ wire
-        // フィールド一式。
-        json!({
-            "name": "get_tag",
-            "description": "指定した1タグの全フィールド(revision 含む)を返す(admin スコープ必須)。update_tag は全項目指定の PUT 置換のため、事前にこれで現在値を読んでから必要な項目だけ変更して送り返す read-modify-write に使う。副作用なし・監査対象外。list_tags(read スコープの一覧・サブセット)とは別物。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "description": "取得するタグの id。" },
+            }),
+            async1!(tool_delete_connection),
+        )
+            // --- T21 S1-c（docs/banto-hub-t21-design.md §4・§5）: 構成補助ツール
+            // 第二弾(接続 update/test・グループ CRUD)。S1-b と同じゲート
+            // (admin スコープ必須・有効化ガードなし)。
+        .tool(
+            json!({
+                "name": "update_connection",
+                "description": "既存の PLC 接続を更新する(admin スコープ必須)。入力は { id, name, protocol, enabled, simulation, settings }(REST の PUT /api/plc-connections/{id} と同じ形)で全項目指定が必須(PUT 置換)。settings は丸ごと置き換え(省いたキーはスキーマの既定値)で、省略が「保つ」になるのは秘密のキーだけ。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "description": "更新する接続の id。" },
+                        "name": { "type": "string", "description": "接続名(一意)。" },
+                        "protocol": {
+                            "type": "string",
+                            "description": "list_drivers で得られる機器のドライバの id(modbus-tcp・slmp など)、または postgres / push。",
+                        },
+                        "enabled": { "type": "boolean", "description": "接続を有効にするか。省略は true。" },
+                        "simulation": {
+                            "type": "boolean",
+                            "description": "true でシミュレータ接続にする。省略は false。",
+                        },
+                        "settings": {
+                            "type": "object",
+                            "description": "接続の設定(REST の /api/plc-connections と同じ形)。丸ごと置き換え: 省いたキーはスキーマの既定値に戻る(list_connections で今の settings を読んでから全体を送る)。キーの意味は create_connection と同じ。秘密のキー(postgres の password)だけは、省略 = 保存済みを保つ、null または空文字列 = 消す、文字列 = 置き換え。保存済みパスワードのある postgres で host / port / database / username を変える場合は、password を明示して置き換えるか消去する必要があり、省略での保持はできません。応答では {\"$secret\": \"set\" | \"unreadable\"}(unreadable は参照はあるがこの PC で読めない - 入れ直すと直る)。",
+                        },
+                    },
+                    "required": ["id", "name", "protocol", "enabled", "simulation", "settings"],
+                    "additionalProperties": false,
                 },
-                "required": ["id"],
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "create_tag",
-            "description": "タグを新規作成する(admin スコープ必須)。しきい値(H/HH/L/LL)は Hub では持たない(記録計・SCADA の側の設定) - thresholdH などを値付きで送ると入力エラーになる。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string", "description": "タグ名(グループ内で一意)。" },
-                    "collectionGroupId": { "type": "integer", "description": "所属する収集グループの id。" },
-                    "address": { "type": "string", "description": "PLC アドレス(tagKind=db では結果列名)。保存時にドライバで解析して正規形にする(Modbus は 6 桁の 400001、SLMP は大文字の D100)。応答は正規形。" },
-                    "dataType": { "type": "string", "description": "データ型。" },
-                    "comment": { "type": "string", "maxLength": 500, "description": "任意のタグコメント。省略すると既存値を保持し、空文字でクリア。" },
-                    "stringLength": {
-                        "type": ["integer", "null"],
-                        "description": "dataType が string のとき必須(1-128、16bit ワード数)。未使用時は null。",
+            }),
+            async1!(tool_update_connection),
+        )
+        .tool(
+            json!({
+                "name": "test_connection",
+                "description": "保存前に PLC/PostgreSQL 接続の疎通を確認する(admin スコープ必須)。入力は { protocol, simulation, settings, connectionId? }(REST の POST /api/plc-connections/test と同じ形)。機器は実プロトコルで軽い読み出しを1回試み、postgres は SELECT version() を5秒以内で試す。レジストリへの保存は行わない副作用の無い操作。virtual/シミュレーション接続はテスト対象外(即座に ok:false)。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "protocol": {
+                            "type": "string",
+                            "description": "list_drivers で得られる機器のドライバの id(modbus-tcp・slmp など)、または postgres。virtual は常に ok:false(テスト対象外)。",
+                        },
+                        "simulation": {
+                            "type": "boolean",
+                            "description": "true の場合は常に ok:false(内蔵シミュレータは常に成功するためテスト不要)。既定値 false。",
+                        },
+                        "settings": {
+                            "type": "object",
+                            "description": "接続の設定(create_connection と同じ形。省いたキーはスキーマの既定値)。秘密のキーは明示した文字列だけを直接接続に使う(保存しない)。保存済み秘密値は開かない。必須の秘密値の欠け、または保存済み秘密値の省略は直接接続前に断る。任意の秘密値を値無しで試す場合は null・空文字列を明示する。postgres は connectionId 指定時に password の文字列が必須。id 無しの省略/null・空文字列はパスワード無し。",
+                        },
+                        "connectionId": {
+                            "type": "integer",
+                            "description": "保存済み接続を編集中にテストする場合のみ指定。機器の収集中の broker セッションがあればそれを再利用し、2本目をダイヤルしない。settings がそのセッションの設定と違えば試さず「保存してからテスト」と返す。保存済み設定の指紋照合用にだけ使い、秘密値の読み出しには使わない。postgres では保存済み接続を参照しない。保存済み PostgreSQL は test_saved_connection を使う。",
+                        },
                     },
-                    "stringEncoding": {
-                        "type": "string",
-                        "description": "string タグの文字コード。既定値 utf8。",
-                    },
-                    "rawLo": { "type": ["number", "null"], "description": "スケーリング入力下限。未使用時は null。" },
-                    "rawHi": { "type": ["number", "null"], "description": "スケーリング入力上限。未使用時は null。" },
-                    "engLo": { "type": ["number", "null"], "description": "スケーリング後工学値下限。未使用時は null。" },
-                    "engHi": { "type": ["number", "null"], "description": "スケーリング後工学値上限。未使用時は null。" },
-                    "unit": { "type": ["string", "null"], "description": "工学単位。未使用時は null。" },
-                    "decimals": { "type": "integer", "description": "表示小数桁数。既定値 0。" },
-                    "enabled": { "type": "boolean", "description": "既定値 false。" },
-                    "writable": { "type": "boolean", "description": "書き込み許可。既定値 false。" },
-                    "tagKind": {
-                        "type": "string",
-                        "description": "plc/computed/internal/db のいずれか。既定値 plc。db は postgres 接続配下専用で、address には結果列名を入れる(読み取り専用・数値/bool/timestamp のみ)。",
-                    },
-                    "expression": { "type": ["string", "null"], "description": "computed タグの計算式。未使用時は null。" },
-                    "retain": { "type": "boolean", "description": "internal タグの再起動時復元。既定値 false。" },
+                    "required": ["protocol", "settings"],
+                    "additionalProperties": false,
                 },
-                "required": ["name", "collectionGroupId", "address", "dataType"],
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "update_tag",
-            "description": "既存のタグを更新する(admin スコープ必須)。しきい値(H/HH/L/LL)は Hub では持たない(記録計・SCADA の側の設定)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない) - get_tag で現在値を取得してから全項目を送り返すこと。expectedRevision を付けると楽観ロックになり、他者が先に更新していた場合は revision_conflict エラーで拒否される(get_tag で最新の revision を取り直して再試行)。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "description": "更新するタグの id。" },
-                    "name": { "type": "string", "description": "タグ名(グループ内で一意)。" },
-                    "collectionGroupId": { "type": "integer", "description": "所属する収集グループの id。" },
-                    "address": { "type": "string", "description": "PLC アドレス。保存時にドライバで解析して正規形にする(Modbus は 6 桁の 400001、SLMP は大文字の D100)。応答は正規形。" },
-                    "dataType": { "type": "string", "description": "データ型。" },
-                    "comment": { "type": "string", "maxLength": 500, "description": "任意のタグコメント。省略すると既存値を保持し、空文字でクリア。" },
-                    "stringLength": {
-                        "type": ["integer", "null"],
-                        "description": "dataType が string のとき必須(1-128、16bit ワード数)。未使用時は null。",
+            }),
+            async1!(tool_test_connection),
+        )
+            // S1a（docs/banto-hub-external-db-design.md §4.6）: 保存済み接続の
+            // 接続テスト - 上の`test_connection`（保存前のフォーム値）
+            // とは別ツール。
+        .tool(
+            json!({
+                "name": "test_saved_connection",
+                "description": "保存済みの PLC/DB 接続 id に対して接続テストを行う(admin スコープ必須)。S1a では protocol: postgres のみ対応(SELECT version() を1回実行)。レジストリへの保存は行わない副作用の無い操作。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "description": "テストする接続の id。" },
                     },
-                    "stringEncoding": { "type": "string", "description": "string タグの文字コード。" },
-                    "rawLo": { "type": ["number", "null"], "description": "スケーリング入力下限。未使用時は null。" },
-                    "rawHi": { "type": ["number", "null"], "description": "スケーリング入力上限。未使用時は null。" },
-                    "engLo": { "type": ["number", "null"], "description": "スケーリング後工学値下限。未使用時は null。" },
-                    "engHi": { "type": ["number", "null"], "description": "スケーリング後工学値上限。未使用時は null。" },
-                    "unit": { "type": ["string", "null"], "description": "工学単位。未使用時は null。" },
-                    "decimals": { "type": "integer", "description": "表示小数桁数。" },
-                    "enabled": { "type": "boolean", "description": "タグを有効にするか。" },
-                    "writable": { "type": "boolean", "description": "書き込み許可。" },
-                    "tagKind": { "type": "string", "description": "plc/computed/internal/db のいずれか。" },
-                    "expression": { "type": ["string", "null"], "description": "computed タグの計算式。未使用時は null。" },
-                    "retain": { "type": "boolean", "description": "internal タグの再起動時復元。" },
-                    "expectedRevision": {
-                        "type": ["integer", "null"],
-                        "description": "楽観ロック用(get_tag で取得した現在の revision)。省略するか null にするとロック無しで上書きする。",
-                    },
+                    "required": ["id"],
+                    "additionalProperties": false,
                 },
-                "required": [
-                    "id",
-                    "name",
-                    "collectionGroupId",
-                    "address",
-                    "dataType",
-                    "stringLength",
-                    "stringEncoding",
-                    "rawLo",
-                    "rawHi",
-                    "engLo",
-                    "engHi",
-                    "unit",
-                    "decimals",
-                    "enabled",
-                    "writable",
-                    "tagKind",
-                    "expression",
-                    "retain",
-                ],
-                "additionalProperties": false,
-            },
-        }),
-        // #342 段階A（オーナー決定 2026-09-15）: MCP 管理面にも REST
-        // `POST /api/tags/expression/check` と同じ検証を追加する。保存は
-        // しない - 演算タグを作る前にこれで式を確かめられる。ロジックは
-        // `crate::rest::evaluate_expression_check` を呼ぶだけで REST と
-        // 共有する（二重実装しない）。
-        json!({
-            "name": "check_expression",
-            "description": "演算タグの式を保存せず検証する(admin スコープ必須)。構文・型検査、参照タグの存在確認と型解決、循環参照判定(externalName 指定時)、現在値による試算を行い常に成功で返す(式が不正でも ok:false でエラー内容を返すだけで、ツール呼び出し自体は失敗にしない)。create_tag/update_tag で expression 付きの演算タグを作る前にこれで確かめられる。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "expression": { "type": "string", "description": "検証する式のソース。" },
-                    "externalName": {
-                        "type": ["string", "null"],
-                        "description": "この式を保存する予定のタグの完全名(省略可)。循環参照の判定にのみ使う - 既存の演算タグの依存グラフの中で、このノードだけ今回の式の参照先に置き換えて検査する。",
-                    },
+            }),
+            async1!(tool_test_saved_connection),
+        )
+        .tool(
+            json!({
+                "name": "list_groups",
+                "description": "収集グループの一覧を返す(admin スコープ必須)。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
                 },
-                "required": ["expression"],
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "delete_tag",
-            "description": "タグを削除する(admin スコープ必須)。タグは末端リソースのため配下は無い(cascade ではない)が、収集済み履歴データは残る。不可逆操作のため confirm:true が必須。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "description": "削除するタグの id。" },
-                    "confirm": {
-                        "type": "boolean",
-                        "description": "true を明示しないと拒否される(不可逆操作の確認)。",
+            }),
+            async0!(tool_list_groups),
+        )
+        .tool(
+            json!({
+                "name": "create_group",
+                "description": "収集グループを新規作成する(admin スコープ必須)。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "グループ名(接続内で一意)。" },
+                        "plcConnectionId": { "type": "integer", "description": "所属する接続の id。" },
+                        "periodMs": { "type": "integer", "description": "収集周期(ミリ秒)。" },
+                        "enabled": { "type": "boolean", "description": "既定値 true。" },
+                        "defaultWritable": {
+                            "type": "boolean",
+                            "description": "このグループへ新規登録するタグの writable 既定値。既定値 true。",
+                        },
+                        "querySql": {
+                            "type": ["string", "null"],
+                            "description": "postgres 接続配下のグループが1周期ごとに実行する SELECT 文(1グループ = 1 SELECT = N タグ)。先頭が SELECT または WITH の単文のみ。PLC 接続配下のグループでは指定できない(null)。",
+                        },
                     },
+                    "required": ["name", "plcConnectionId", "periodMs"],
+                    "additionalProperties": false,
                 },
-                "required": ["id", "confirm"],
-                "additionalProperties": false,
-            },
-        }),
-        // --- T21 S2-a（docs/tag-server-design.md §8想定の可逆ランタイム
-        // 制御。ここまでの構成 CRUD 系ツールと違い、レジストリ mutation
-        // ではなく collection controller / write_control を直接叩く
-        // ランタイム制御 - pending queue も preflight も通らない
-        // （[`tool_set_collection`]/[`tool_set_write_control`]のdoc comment
-        // 参照）。可逆操作のため confirm は不要（設計の confirm 必須は
-        // delete 系の不可逆操作限定）。
-        json!({
-            "name": "set_collection",
-            "description": "収集を開始/停止する(admin スコープ必須)。start は実機収集(configured モード)を開始する。書き込み受付(write_enabled)は既定で有効で、収集の開始/停止では変わらない(#340)。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["start", "stop"],
-                        "description": "start で収集開始(configured モード)、stop で収集停止。",
+            }),
+            async1!(tool_create_group),
+        )
+        .tool(
+            json!({
+                "name": "update_group",
+                "description": "既存の収集グループを更新する(admin スコープ必須)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない)。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "description": "更新するグループの id。" },
+                        "name": { "type": "string", "description": "グループ名(接続内で一意)。" },
+                        "plcConnectionId": { "type": "integer", "description": "所属する接続の id。" },
+                        "periodMs": { "type": "integer", "description": "収集周期(ミリ秒)。" },
+                        "enabled": { "type": "boolean", "description": "グループを有効にするか。" },
+                        "defaultWritable": {
+                            "type": "boolean",
+                            "description": "このグループへ新規登録するタグの writable 既定値。",
+                        },
+                        "querySql": {
+                            "type": ["string", "null"],
+                            "description": "postgres 接続配下のグループが1周期ごとに実行する SELECT 文(1グループ = 1 SELECT = N タグ)。先頭が SELECT または WITH の単文のみ。PLC 接続配下のグループでは指定できない(null)。",
+                        },
                     },
+                    "required": [
+                        "id",
+                        "name",
+                        "plcConnectionId",
+                        "periodMs",
+                        "enabled",
+                        "defaultWritable",
+                        "querySql",
+                    ],
+                    "additionalProperties": false,
                 },
-                "required": ["action"],
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "set_write_control",
-            "description": "書き込み受付の有効/無効を切り替える(admin スコープ必須)。write_enabled は既定で有効で、プロセス再起動や収集の開始/停止では変わらない(#340)。無効化は運用者が書き込みを止めるための非常停止用で、無効なら enabled:true で再度有効化する。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "enabled": {
-                        "type": "boolean",
-                        "description": "true で書き込み受付を有効化、false で無効化。",
+            }),
+            async1!(tool_update_group),
+        )
+        .tool(
+            json!({
+                "name": "delete_group",
+                "description": "収集グループを削除する(admin スコープ必須)。配下のタグも一括削除するが、収集済み履歴データは残る。不可逆操作のため confirm:true が必須。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "description": "削除するグループの id。" },
+                        "confirm": {
+                            "type": "boolean",
+                            "description": "true を明示しないと拒否される(不可逆操作の確認)。",
+                        },
                     },
+                    "required": ["id", "confirm"],
+                    "additionalProperties": false,
                 },
-                "required": ["enabled"],
-                "additionalProperties": false,
-            },
-        }),
-        // --- T21 S2-b（docs/tag-server-design.md §5.3/§5.4、docs/banto-hub-t19-design.md
-        // §5.1想定の設定 get/set）: gRPC/MQTT/データストア保持の構成補助
-        // ツール。ここまでの接続/グループ/タグ系ツールと違い、設定は
-        // レジストリ mutation ではなく key-value（`crate::settings::SettingsService`）
-        // なので pending queue も preflight/commit_catalog も通らない
-        // （[`tool_set_grpc_settings`]/[`tool_set_mqtt_settings`]/
-        // [`tool_set_retention`]のdoc comment参照）。可逆操作のため confirm
-        // は不要（設計の confirm 必須は delete 系の不可逆操作限定、
-        // [`tool_set_collection`]のdoc comment と同じ規律）。
-        json!({
-            "name": "get_grpc_settings",
-            "description": "gRPC サーバー設定(enabled/bind/port)を返す(admin スコープ必須)。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "get_mqtt_settings",
-            "description": "MQTT publish 設定を返す(admin スコープ必須)。password は含まれない。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "get_retention",
-            "description": "データストア(tstore)の保持期間設定を返す(admin スコープ必須)。retentionDays が null の場合は無制限。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "set_grpc_settings",
-            "description": "gRPC サーバー設定を更新し即時適用する(admin スコープ必須)。bind を省略すると現在値を維持する。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "enabled": {
-                        "type": "boolean",
-                        "description": "gRPC サーバーを有効にするか。",
+            }),
+            async1!(tool_delete_group),
+        )
+            // --- T21 S1-d（docs/banto-hub-t21-design.md §4・§5）: 構成補助ツール
+            // 第三弾（タグ CRUD）。S1-b/S1-c と同じゲート(admin スコープ必須・
+            // 有効化ガードなし)。`create_tag`/`update_tag`/`delete_tag`の
+            // properties は REST の `TagPayload`（`crate::rest`）と同じ wire
+            // フィールド一式。
+        .tool(
+            json!({
+                "name": "get_tag",
+                "description": "指定した1タグの全フィールド(revision 含む)を返す(admin スコープ必須)。update_tag は全項目指定の PUT 置換のため、事前にこれで現在値を読んでから必要な項目だけ変更して送り返す read-modify-write に使う。副作用なし・監査対象外。list_tags(read スコープの一覧・サブセット)とは別物。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "description": "取得するタグの id。" },
                     },
-                    "bind": {
-                        "type": "string",
-                        "description": "bind する IP アドレス(例: 127.0.0.1、0.0.0.0)。省略すると現在値を維持する。",
-                    },
-                    "port": {
-                        "type": "integer",
-                        "description": "1〜65535。",
-                    },
+                    "required": ["id"],
+                    "additionalProperties": false,
                 },
-                "required": ["enabled", "port"],
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "set_mqtt_settings",
-            "description": "MQTT publish 設定を更新し即時適用する(admin スコープ必須)。password は空文字または省略で現在値を維持する。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "enabled": { "type": "boolean" },
-                    "host": { "type": "string" },
-                    "port": { "type": "integer" },
-                    "clientId": { "type": "string" },
-                    "username": { "type": "string", "description": "省略可。" },
-                    "password": {
-                        "type": "string",
-                        "description": "空文字または省略で現在値を維持。",
+            }),
+            async1!(tool_get_tag),
+        )
+        .tool(
+            json!({
+                "name": "create_tag",
+                "description": "タグを新規作成する(admin スコープ必須)。しきい値(H/HH/L/LL)は Hub では持たない(記録計・SCADA の側の設定) - thresholdH などを値付きで送ると入力エラーになる。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "タグ名(グループ内で一意)。" },
+                        "collectionGroupId": { "type": "integer", "description": "所属する収集グループの id。" },
+                        "address": { "type": "string", "description": "PLC アドレス(tagKind=db では結果列名)。保存時にドライバで解析して正規形にする(Modbus は 6 桁の 400001、SLMP は大文字の D100)。応答は正規形。" },
+                        "dataType": { "type": "string", "description": "データ型。" },
+                        "comment": { "type": "string", "maxLength": 500, "description": "任意のタグコメント。省略すると既存値を保持し、空文字でクリア。" },
+                        "stringLength": {
+                            "type": ["integer", "null"],
+                            "description": "dataType が string のとき必須(1-128、16bit ワード数)。未使用時は null。",
+                        },
+                        "stringEncoding": {
+                            "type": "string",
+                            "description": "string タグの文字コード。既定値 utf8。",
+                        },
+                        "rawLo": { "type": ["number", "null"], "description": "スケーリング入力下限。未使用時は null。" },
+                        "rawHi": { "type": ["number", "null"], "description": "スケーリング入力上限。未使用時は null。" },
+                        "engLo": { "type": ["number", "null"], "description": "スケーリング後工学値下限。未使用時は null。" },
+                        "engHi": { "type": ["number", "null"], "description": "スケーリング後工学値上限。未使用時は null。" },
+                        "unit": { "type": ["string", "null"], "description": "工学単位。未使用時は null。" },
+                        "decimals": { "type": "integer", "description": "表示小数桁数。既定値 0。" },
+                        "enabled": { "type": "boolean", "description": "既定値 false。" },
+                        "writable": { "type": "boolean", "description": "書き込み許可。既定値 false。" },
+                        "tagKind": {
+                            "type": "string",
+                            "description": "plc/computed/internal/db のいずれか。既定値 plc。db は postgres 接続配下専用で、address には結果列名を入れる(読み取り専用・数値/bool/timestamp のみ)。",
+                        },
+                        "expression": { "type": ["string", "null"], "description": "computed タグの計算式。未使用時は null。" },
+                        "retain": { "type": "boolean", "description": "internal タグの再起動時復元。既定値 false。" },
                     },
-                    "prefix": { "type": "string" },
-                    "qos": { "type": "integer", "description": "0 または 1。" },
-                    "minIntervalMs": { "type": "integer", "description": "0 以上。" },
+                    "required": ["name", "collectionGroupId", "address", "dataType"],
+                    "additionalProperties": false,
                 },
-                "required": [
-                    "enabled",
-                    "host",
-                    "port",
-                    "clientId",
-                    "prefix",
-                    "qos",
-                    "minIntervalMs",
-                ],
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "set_retention",
-            "description": "データストア(tstore)の保持期間設定を更新する(admin スコープ必須)。永続化のみで即時剪定は行わない。retentionDays を省略/null にすると無制限。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "retentionDays": {
-                        "type": ["integer", "null"],
-                        "description": "1〜3650、または無制限は null。",
+            }),
+            async1!(tool_create_tag),
+        )
+        .tool(
+            json!({
+                "name": "update_tag",
+                "description": "既存のタグを更新する(admin スコープ必須)。しきい値(H/HH/L/LL)は Hub では持たない(記録計・SCADA の側の設定)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない) - get_tag で現在値を取得してから全項目を送り返すこと。expectedRevision を付けると楽観ロックになり、他者が先に更新していた場合は revision_conflict エラーで拒否される(get_tag で最新の revision を取り直して再試行)。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "description": "更新するタグの id。" },
+                        "name": { "type": "string", "description": "タグ名(グループ内で一意)。" },
+                        "collectionGroupId": { "type": "integer", "description": "所属する収集グループの id。" },
+                        "address": { "type": "string", "description": "PLC アドレス。保存時にドライバで解析して正規形にする(Modbus は 6 桁の 400001、SLMP は大文字の D100)。応答は正規形。" },
+                        "dataType": { "type": "string", "description": "データ型。" },
+                        "comment": { "type": "string", "maxLength": 500, "description": "任意のタグコメント。省略すると既存値を保持し、空文字でクリア。" },
+                        "stringLength": {
+                            "type": ["integer", "null"],
+                            "description": "dataType が string のとき必須(1-128、16bit ワード数)。未使用時は null。",
+                        },
+                        "stringEncoding": { "type": "string", "description": "string タグの文字コード。" },
+                        "rawLo": { "type": ["number", "null"], "description": "スケーリング入力下限。未使用時は null。" },
+                        "rawHi": { "type": ["number", "null"], "description": "スケーリング入力上限。未使用時は null。" },
+                        "engLo": { "type": ["number", "null"], "description": "スケーリング後工学値下限。未使用時は null。" },
+                        "engHi": { "type": ["number", "null"], "description": "スケーリング後工学値上限。未使用時は null。" },
+                        "unit": { "type": ["string", "null"], "description": "工学単位。未使用時は null。" },
+                        "decimals": { "type": "integer", "description": "表示小数桁数。" },
+                        "enabled": { "type": "boolean", "description": "タグを有効にするか。" },
+                        "writable": { "type": "boolean", "description": "書き込み許可。" },
+                        "tagKind": { "type": "string", "description": "plc/computed/internal/db のいずれか。" },
+                        "expression": { "type": ["string", "null"], "description": "computed タグの計算式。未使用時は null。" },
+                        "retain": { "type": "boolean", "description": "internal タグの再起動時復元。" },
+                        "expectedRevision": {
+                            "type": ["integer", "null"],
+                            "description": "楽観ロック用(get_tag で取得した現在の revision)。省略するか null にするとロック無しで上書きする。",
+                        },
                     },
+                    "required": [
+                        "id",
+                        "name",
+                        "collectionGroupId",
+                        "address",
+                        "dataType",
+                        "stringLength",
+                        "stringEncoding",
+                        "rawLo",
+                        "rawHi",
+                        "engLo",
+                        "engHi",
+                        "unit",
+                        "decimals",
+                        "enabled",
+                        "writable",
+                        "tagKind",
+                        "expression",
+                        "retain",
+                    ],
+                    "additionalProperties": false,
                 },
-                "additionalProperties": false,
-            },
-        }),
-        // --- T21 S3（docs/banto-hub-t21-design.md、構成補助 MCP の最終
-        // スライス）: API キー発行/一覧/失効・ロックダウン。ここまでの
-        // ツールと同じ admin スコープ必須。`revoke_api_key`/`lock_down`は
-        // 不可逆操作のため confirm:true が必須(delete 系ツールと同じ規律)。
-        json!({
-            "name": "create_api_key",
-            "description": "API キーを新規発行する(admin スコープ必須)。admin を含む任意のスコープを制限なく発行できる(発行できるスコープに上限は無い)。平文 key はこの応答限りでしか取得できないため必ず控えておくこと。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string", "description": "キー名(一意)。" },
-                    "scopes": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "少なくとも1つ必須。例: [\"read\", \"write:line1.fast.temp01\", \"admin\"]。push 接続へ値を送る取り込みのキーは \"ingest:#{接続 id}\"(例 \"ingest:#12\"。id は list_connections の id、接続名では指定できない。read/write/admin とは直交で、admin も送れない)。",
+            }),
+            async1!(tool_update_tag),
+        )
+            // #342 段階A（オーナー決定 2026-09-15）: MCP 管理面にも REST
+            // `POST /api/tags/expression/check` と同じ検証を追加する。保存は
+            // しない - 演算タグを作る前にこれで式を確かめられる。ロジックは
+            // `crate::rest::evaluate_expression_check` を呼ぶだけで REST と
+            // 共有する（二重実装しない）。
+        .tool(
+            json!({
+                "name": "check_expression",
+                "description": "演算タグの式を保存せず検証する(admin スコープ必須)。構文・型検査、参照タグの存在確認と型解決、循環参照判定(externalName 指定時)、現在値による試算を行い常に成功で返す(式が不正でも ok:false でエラー内容を返すだけで、ツール呼び出し自体は失敗にしない)。create_tag/update_tag で expression 付きの演算タグを作る前にこれで確かめられる。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "expression": { "type": "string", "description": "検証する式のソース。" },
+                        "externalName": {
+                            "type": ["string", "null"],
+                            "description": "この式を保存する予定のタグの完全名(省略可)。循環参照の判定にのみ使う - 既存の演算タグの依存グラフの中で、このノードだけ今回の式の参照先に置き換えて検査する。",
+                        },
                     },
-                    "expiresAt": {
-                        "type": "integer",
-                        "description": "任意の有効期限(epoch ミリ秒)。省略/null で無期限。指定する場合は現在時刻より後である必要がある。",
-                    },
+                    "required": ["expression"],
+                    "additionalProperties": false,
                 },
-                "required": ["name", "scopes"],
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "list_api_keys",
-            "description": "発行済み API キーの一覧を返す(admin スコープ必須)。平文 key・key_hash は含まれない。各キーの ingestTargets に、ingest:#{id} のスコープが指す接続の今の名前(改名に追従)を出す。接続が無ければ state=deleted・label「取り込み: （削除済み #12）」(そのキーは送れない)。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "revoke_api_key",
-            "description": "API キーを失効させる(admin スコープ必須)。失効は取消不可のため confirm:true が必須 - 自分自身が使用中のキーを失効すると締め出されうる点に注意。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "description": "失効させる API キーの id。" },
-                    "confirm": {
-                        "type": "boolean",
-                        "description": "true を明示しないと拒否される(不可逆操作の確認)。",
+            }),
+            sync1!(tool_check_expression),
+        )
+        .tool(
+            json!({
+                "name": "delete_tag",
+                "description": "タグを削除する(admin スコープ必須)。タグは末端リソースのため配下は無い(cascade ではない)が、収集済み履歴データは残る。不可逆操作のため confirm:true が必須。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "description": "削除するタグの id。" },
+                        "confirm": {
+                            "type": "boolean",
+                            "description": "true を明示しないと拒否される(不可逆操作の確認)。",
+                        },
                     },
+                    "required": ["id", "confirm"],
+                    "additionalProperties": false,
                 },
-                "required": ["id", "confirm"],
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "lock_down",
-            "description": "試運転モードから本番(ロックダウン済み)へ切り替える(admin スコープ必須・不可逆)。confirm:true が必須。ロックダウン後は write_tag_value/write_recipe が実際の書き込みを行わずアドバイザリのみを返すようになる - 構成補助ツール自体は admin スコープさえあれば引き続き利用できる。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "confirm": {
-                        "type": "boolean",
-                        "description": "true を明示しないと拒否される(不可逆操作の確認)。",
+            }),
+            async1!(tool_delete_tag),
+        )
+            // --- T21 S2-a（docs/tag-server-design.md §8想定の可逆ランタイム
+            // 制御。ここまでの構成 CRUD 系ツールと違い、レジストリ mutation
+            // ではなく collection controller / write_control を直接叩く
+            // ランタイム制御 - pending queue も preflight も通らない
+            // （[`tool_set_collection`]/[`tool_set_write_control`]のdoc comment
+            // 参照）。可逆操作のため confirm は不要（設計の confirm 必須は
+            // delete 系の不可逆操作限定）。
+        .tool(
+            json!({
+                "name": "set_collection",
+                "description": "収集を開始/停止する(admin スコープ必須)。start は実機収集(configured モード)を開始する。書き込み受付(write_enabled)は既定で有効で、収集の開始/停止では変わらない(#340)。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["start", "stop"],
+                            "description": "start で収集開始(configured モード)、stop で収集停止。",
+                        },
                     },
+                    "required": ["action"],
+                    "additionalProperties": false,
                 },
-                "required": ["confirm"],
-                "additionalProperties": false,
-            },
-        }),
-        // --- 外部 DB 連携 S4（docs/banto-hub-external-db-design.md §5.2）:
-        // DB Sink の Hub 側構成補助ツール。他の構成 CRUD ツールと同じゲート
-        // (admin スコープ必須)・同じ監査だが、pending queue には載らない
-        // （`crate::rest::sink_groups_router`のdoc comment参照 - sink group
-        // は PLC 収集パイプラインに一切関わらないため常に即時適用）。
-        json!({
-            "name": "list_sink_groups",
-            "description": "DB Sink（外部 DB への記録）の sink group 一覧を返す(admin スコープ必須)。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "get_sink_group",
-            "description": "DB Sink の sink group を1件取得する(admin スコープ必須)。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "description": "取得する sink group の id。" },
+            }),
+            async1!(tool_set_collection),
+        )
+        .tool(
+            json!({
+                "name": "set_write_control",
+                "description": "書き込み受付の有効/無効を切り替える(admin スコープ必須)。write_enabled は既定で有効で、プロセス再起動や収集の開始/停止では変わらない(#340)。無効化は運用者が書き込みを止めるための非常停止用で、無効なら enabled:true で再度有効化する。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "description": "true で書き込み受付を有効化、false で無効化。",
+                        },
+                    },
+                    "required": ["enabled"],
+                    "additionalProperties": false,
                 },
-                "required": ["id"],
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "create_sink_group",
-            "description": "DB Sink の sink group を新規作成する(admin スコープ必須)。即時適用(pending queue には載らない)。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string", "description": "sink group 名(一意、64文字以内)。" },
-                    "dbConnectionId": {
-                        "type": "integer",
-                        "description": "保存先 DB を指す plc_connections の id(protocol: postgres のみ許可)。",
-                    },
-                    "mode": {
-                        "type": "string",
-                        "enum": ["interval", "on_change"],
-                        "description": "interval は定周期記録、on_change は変化時記録(intervalMs は最短発行間隔)。",
-                    },
-                    "intervalMs": {
-                        "type": "integer",
-                        "description": "interval モードの周期、または on_change モードの最短発行間隔(ミリ秒、100〜3600000)。",
-                    },
-                    "tableName": {
-                        "type": "string",
-                        "description": "保存先テーブル名。schema.table のスキーマ修飾を1回まで許可。引用符付き識別子は不可。",
-                    },
-                    "storeBad": {
-                        "type": "boolean",
-                        "description": "Bad/Stale の行も保存するか。既定値 false(Good のみ)。",
-                    },
-                    "enabled": { "type": "boolean", "description": "既定値 true。" },
-                    "tagIds": {
-                        "type": "array",
-                        "items": { "type": "integer" },
-                        "description": "対象タグの id 一覧(1件以上、重複不可、いずれも実在するタグであること)。",
-                    },
+            }),
+            async1!(tool_set_write_control),
+        )
+            // --- T21 S2-b（docs/tag-server-design.md §5.3/§5.4、docs/banto-hub-t19-design.md
+            // §5.1想定の設定 get/set）: gRPC/MQTT/データストア保持の構成補助
+            // ツール。ここまでの接続/グループ/タグ系ツールと違い、設定は
+            // レジストリ mutation ではなく key-value（`crate::settings::SettingsService`）
+            // なので pending queue も preflight/commit_catalog も通らない
+            // （[`tool_set_grpc_settings`]/[`tool_set_mqtt_settings`]/
+            // [`tool_set_retention`]のdoc comment参照）。可逆操作のため confirm
+            // は不要（設計の confirm 必須は delete 系の不可逆操作限定、
+            // [`tool_set_collection`]のdoc comment と同じ規律）。
+        .tool(
+            json!({
+                "name": "get_grpc_settings",
+                "description": "gRPC サーバー設定(enabled/bind/port)を返す(admin スコープ必須)。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
                 },
-                "required": ["name", "dbConnectionId", "mode", "intervalMs", "tableName", "tagIds"],
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "update_sink_group",
-            "description": "既存の sink group を更新する(admin スコープ必須)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない)。即時適用(pending queue には載らない)。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "description": "更新する sink group の id。" },
-                    "name": { "type": "string", "description": "sink group 名(一意、64文字以内)。" },
-                    "dbConnectionId": {
-                        "type": "integer",
-                        "description": "保存先 DB を指す plc_connections の id(protocol: postgres のみ許可)。",
-                    },
-                    "mode": {
-                        "type": "string",
-                        "enum": ["interval", "on_change"],
-                        "description": "interval は定周期記録、on_change は変化時記録。",
-                    },
-                    "intervalMs": {
-                        "type": "integer",
-                        "description": "周期または最短発行間隔(ミリ秒、100〜3600000)。",
-                    },
-                    "tableName": {
-                        "type": "string",
-                        "description": "保存先テーブル名。schema.table のスキーマ修飾を1回まで許可。",
-                    },
-                    "storeBad": { "type": "boolean", "description": "Bad/Stale の行も保存するか。" },
-                    "enabled": { "type": "boolean", "description": "sink group を有効にするか。" },
-                    "tagIds": {
-                        "type": "array",
-                        "items": { "type": "integer" },
-                        "description": "対象タグの id 一覧(1件以上、重複不可)。既存の集合を丸ごと置き換える。",
-                    },
+            }),
+            async0!(tool_get_grpc_settings),
+        )
+        .tool(
+            json!({
+                "name": "get_mqtt_settings",
+                "description": "MQTT publish 設定を返す(admin スコープ必須)。password は含まれない。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
                 },
-                "required": [
-                    "id",
-                    "name",
-                    "dbConnectionId",
-                    "mode",
-                    "intervalMs",
-                    "tableName",
-                    "storeBad",
-                    "enabled",
-                    "tagIds",
-                ],
-                "additionalProperties": false,
-            },
-        }),
-        json!({
-            "name": "delete_sink_group",
-            "description": "sink group を削除する(admin スコープ必須)。不可逆操作のため confirm:true が必須。即時適用(pending queue には載らない)。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "description": "削除する sink group の id。" },
-                    "confirm": {
-                        "type": "boolean",
-                        "description": "true を明示しないと拒否される(不可逆操作の確認)。",
-                    },
+            }),
+            async0!(tool_get_mqtt_settings),
+        )
+        .tool(
+            json!({
+                "name": "get_retention",
+                "description": "データストア(tstore)の保持期間設定を返す(admin スコープ必須)。retentionDays が null の場合は無制限。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
                 },
-                "required": ["id", "confirm"],
-                "additionalProperties": false,
-            },
-        }),
-    ]
-}
-
-async fn handle_tools_call(
-    state: &McpState,
-    ctx: &ApiKeyContext,
-    params: Option<Value>,
-) -> Result<Value, RpcError> {
-    let params = params.ok_or_else(|| RpcError::invalid_params("params is required"))?;
-    let name = params
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| RpcError::invalid_params("params.name (string) is required"))?;
-    let arguments = params.get("arguments").cloned();
-
-    let result = match name {
-        "list_tags" => tool_list_tags(state, ctx),
-        "read_tag_values" => tool_read_tag_values(state, ctx, arguments)?,
-        "read_tag_now" => tool_read_tag_now(state, ctx, arguments).await?,
-        "get_server_status" => tool_get_server_status(state, ctx).await,
-        "write_tag_value" => tool_write_tag_value(state, ctx, arguments).await?,
-        "write_recipe" => tool_write_recipe(state, ctx, arguments).await?,
-        "list_connections" => tool_list_connections(state, ctx).await,
-        "list_drivers" => tool_list_drivers(state, ctx),
-        "get_clock_sync" => tool_get_clock_sync(state, ctx, arguments).await?,
-        "read_plc_clock" => tool_read_plc_clock(state, ctx, arguments).await?,
-        "create_connection" => tool_create_connection(state, ctx, arguments).await?,
-        "delete_connection" => tool_delete_connection(state, ctx, arguments).await?,
-        "update_connection" => tool_update_connection(state, ctx, arguments).await?,
-        "test_connection" => tool_test_connection(state, ctx, arguments).await?,
-        "test_saved_connection" => tool_test_saved_connection(state, ctx, arguments).await?,
-        "list_groups" => tool_list_groups(state, ctx).await,
-        "create_group" => tool_create_group(state, ctx, arguments).await?,
-        "update_group" => tool_update_group(state, ctx, arguments).await?,
-        "delete_group" => tool_delete_group(state, ctx, arguments).await?,
-        "get_tag" => tool_get_tag(state, ctx, arguments).await?,
-        "create_tag" => tool_create_tag(state, ctx, arguments).await?,
-        "update_tag" => tool_update_tag(state, ctx, arguments).await?,
-        "check_expression" => tool_check_expression(state, ctx, arguments)?,
-        "delete_tag" => tool_delete_tag(state, ctx, arguments).await?,
-        "set_collection" => tool_set_collection(state, ctx, arguments).await?,
-        "set_write_control" => tool_set_write_control(state, ctx, arguments).await?,
-        "get_grpc_settings" => tool_get_grpc_settings(state, ctx).await,
-        "get_mqtt_settings" => tool_get_mqtt_settings(state, ctx).await,
-        "get_retention" => tool_get_retention(state, ctx).await,
-        "set_grpc_settings" => tool_set_grpc_settings(state, ctx, arguments).await?,
-        "set_mqtt_settings" => tool_set_mqtt_settings(state, ctx, arguments).await?,
-        "set_retention" => tool_set_retention(state, ctx, arguments).await?,
-        "create_api_key" => tool_create_api_key(state, ctx, arguments).await?,
-        "list_api_keys" => tool_list_api_keys(state, ctx).await,
-        "revoke_api_key" => tool_revoke_api_key(state, ctx, arguments).await?,
-        "lock_down" => tool_lock_down(state, ctx, arguments).await?,
-        "list_sink_groups" => tool_list_sink_groups(state, ctx).await,
-        "get_sink_group" => tool_get_sink_group(state, ctx, arguments).await?,
-        "create_sink_group" => tool_create_sink_group(state, ctx, arguments).await?,
-        "update_sink_group" => tool_update_sink_group(state, ctx, arguments).await?,
-        "delete_sink_group" => tool_delete_sink_group(state, ctx, arguments).await?,
-        other => {
-            return Err(RpcError::invalid_params(format!("unknown tool: {other}")));
-        }
-    };
-    Ok(result)
+            }),
+            async0!(tool_get_retention),
+        )
+        .tool(
+            json!({
+                "name": "set_grpc_settings",
+                "description": "gRPC サーバー設定を更新し即時適用する(admin スコープ必須)。bind を省略すると現在値を維持する。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "description": "gRPC サーバーを有効にするか。",
+                        },
+                        "bind": {
+                            "type": "string",
+                            "description": "bind する IP アドレス(例: 127.0.0.1、0.0.0.0)。省略すると現在値を維持する。",
+                        },
+                        "port": {
+                            "type": "integer",
+                            "description": "1〜65535。",
+                        },
+                    },
+                    "required": ["enabled", "port"],
+                    "additionalProperties": false,
+                },
+            }),
+            async1!(tool_set_grpc_settings),
+        )
+        .tool(
+            json!({
+                "name": "set_mqtt_settings",
+                "description": "MQTT publish 設定を更新し即時適用する(admin スコープ必須)。password は空文字または省略で現在値を維持する。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": { "type": "boolean" },
+                        "host": { "type": "string" },
+                        "port": { "type": "integer" },
+                        "clientId": { "type": "string" },
+                        "username": { "type": "string", "description": "省略可。" },
+                        "password": {
+                            "type": "string",
+                            "description": "空文字または省略で現在値を維持。",
+                        },
+                        "prefix": { "type": "string" },
+                        "qos": { "type": "integer", "description": "0 または 1。" },
+                        "minIntervalMs": { "type": "integer", "description": "0 以上。" },
+                    },
+                    "required": [
+                        "enabled",
+                        "host",
+                        "port",
+                        "clientId",
+                        "prefix",
+                        "qos",
+                        "minIntervalMs",
+                    ],
+                    "additionalProperties": false,
+                },
+            }),
+            async1!(tool_set_mqtt_settings),
+        )
+        .tool(
+            json!({
+                "name": "set_retention",
+                "description": "データストア(tstore)の保持期間設定を更新する(admin スコープ必須)。永続化のみで即時剪定は行わない。retentionDays を省略/null にすると無制限。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "retentionDays": {
+                            "type": ["integer", "null"],
+                            "description": "1〜3650、または無制限は null。",
+                        },
+                    },
+                    "additionalProperties": false,
+                },
+            }),
+            async1!(tool_set_retention),
+        )
+            // --- T21 S3（docs/banto-hub-t21-design.md、構成補助 MCP の最終
+            // スライス）: API キー発行/一覧/失効・ロックダウン。ここまでの
+            // ツールと同じ admin スコープ必須。`revoke_api_key`/`lock_down`は
+            // 不可逆操作のため confirm:true が必須(delete 系ツールと同じ規律)。
+        .tool(
+            json!({
+                "name": "create_api_key",
+                "description": "API キーを新規発行する(admin スコープ必須)。admin を含む任意のスコープを制限なく発行できる(発行できるスコープに上限は無い)。平文 key はこの応答限りでしか取得できないため必ず控えておくこと。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "キー名(一意)。" },
+                        "scopes": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "少なくとも1つ必須。例: [\"read\", \"write:line1.fast.temp01\", \"admin\"]。push 接続へ値を送る取り込みのキーは \"ingest:#{接続 id}\"(例 \"ingest:#12\"。id は list_connections の id、接続名では指定できない。read/write/admin とは直交で、admin も送れない)。",
+                        },
+                        "expiresAt": {
+                            "type": "integer",
+                            "description": "任意の有効期限(epoch ミリ秒)。省略/null で無期限。指定する場合は現在時刻より後である必要がある。",
+                        },
+                    },
+                    "required": ["name", "scopes"],
+                    "additionalProperties": false,
+                },
+            }),
+            async1!(tool_create_api_key),
+        )
+        .tool(
+            json!({
+                "name": "list_api_keys",
+                "description": "発行済み API キーの一覧を返す(admin スコープ必須)。平文 key・key_hash は含まれない。各キーの ingestTargets に、ingest:#{id} のスコープが指す接続の今の名前(改名に追従)を出す。接続が無ければ state=deleted・label「取り込み: （削除済み #12）」(そのキーは送れない)。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                },
+            }),
+            async0!(tool_list_api_keys),
+        )
+        .tool(
+            json!({
+                "name": "revoke_api_key",
+                "description": "API キーを失効させる(admin スコープ必須)。失効は取消不可のため confirm:true が必須 - 自分自身が使用中のキーを失効すると締め出されうる点に注意。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "description": "失効させる API キーの id。" },
+                        "confirm": {
+                            "type": "boolean",
+                            "description": "true を明示しないと拒否される(不可逆操作の確認)。",
+                        },
+                    },
+                    "required": ["id", "confirm"],
+                    "additionalProperties": false,
+                },
+            }),
+            async1!(tool_revoke_api_key),
+        )
+        .tool(
+            json!({
+                "name": "lock_down",
+                "description": "試運転モードから本番(ロックダウン済み)へ切り替える(admin スコープ必須・不可逆)。confirm:true が必須。ロックダウン後は write_tag_value/write_recipe が実際の書き込みを行わずアドバイザリのみを返すようになる - 構成補助ツール自体は admin スコープさえあれば引き続き利用できる。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "confirm": {
+                            "type": "boolean",
+                            "description": "true を明示しないと拒否される(不可逆操作の確認)。",
+                        },
+                    },
+                    "required": ["confirm"],
+                    "additionalProperties": false,
+                },
+            }),
+            async1!(tool_lock_down),
+        )
+            // --- 外部 DB 連携 S4（docs/banto-hub-external-db-design.md §5.2）:
+            // DB Sink の Hub 側構成補助ツール。他の構成 CRUD ツールと同じゲート
+            // (admin スコープ必須)・同じ監査だが、pending queue には載らない
+            // （`crate::rest::sink_groups_router`のdoc comment参照 - sink group
+            // は PLC 収集パイプラインに一切関わらないため常に即時適用）。
+        .tool(
+            json!({
+                "name": "list_sink_groups",
+                "description": "DB Sink（外部 DB への記録）の sink group 一覧を返す(admin スコープ必須)。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                },
+            }),
+            async0!(tool_list_sink_groups),
+        )
+        .tool(
+            json!({
+                "name": "get_sink_group",
+                "description": "DB Sink の sink group を1件取得する(admin スコープ必須)。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "description": "取得する sink group の id。" },
+                    },
+                    "required": ["id"],
+                    "additionalProperties": false,
+                },
+            }),
+            async1!(tool_get_sink_group),
+        )
+        .tool(
+            json!({
+                "name": "create_sink_group",
+                "description": "DB Sink の sink group を新規作成する(admin スコープ必須)。即時適用(pending queue には載らない)。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "sink group 名(一意、64文字以内)。" },
+                        "dbConnectionId": {
+                            "type": "integer",
+                            "description": "保存先 DB を指す plc_connections の id(protocol: postgres のみ許可)。",
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["interval", "on_change"],
+                            "description": "interval は定周期記録、on_change は変化時記録(intervalMs は最短発行間隔)。",
+                        },
+                        "intervalMs": {
+                            "type": "integer",
+                            "description": "interval モードの周期、または on_change モードの最短発行間隔(ミリ秒、100〜3600000)。",
+                        },
+                        "tableName": {
+                            "type": "string",
+                            "description": "保存先テーブル名。schema.table のスキーマ修飾を1回まで許可。引用符付き識別子は不可。",
+                        },
+                        "storeBad": {
+                            "type": "boolean",
+                            "description": "Bad/Stale の行も保存するか。既定値 false(Good のみ)。",
+                        },
+                        "enabled": { "type": "boolean", "description": "既定値 true。" },
+                        "tagIds": {
+                            "type": "array",
+                            "items": { "type": "integer" },
+                            "description": "対象タグの id 一覧(1件以上、重複不可、いずれも実在するタグであること)。",
+                        },
+                    },
+                    "required": ["name", "dbConnectionId", "mode", "intervalMs", "tableName", "tagIds"],
+                    "additionalProperties": false,
+                },
+            }),
+            async1!(tool_create_sink_group),
+        )
+        .tool(
+            json!({
+                "name": "update_sink_group",
+                "description": "既存の sink group を更新する(admin スコープ必須)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない)。即時適用(pending queue には載らない)。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "description": "更新する sink group の id。" },
+                        "name": { "type": "string", "description": "sink group 名(一意、64文字以内)。" },
+                        "dbConnectionId": {
+                            "type": "integer",
+                            "description": "保存先 DB を指す plc_connections の id(protocol: postgres のみ許可)。",
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["interval", "on_change"],
+                            "description": "interval は定周期記録、on_change は変化時記録。",
+                        },
+                        "intervalMs": {
+                            "type": "integer",
+                            "description": "周期または最短発行間隔(ミリ秒、100〜3600000)。",
+                        },
+                        "tableName": {
+                            "type": "string",
+                            "description": "保存先テーブル名。schema.table のスキーマ修飾を1回まで許可。",
+                        },
+                        "storeBad": { "type": "boolean", "description": "Bad/Stale の行も保存するか。" },
+                        "enabled": { "type": "boolean", "description": "sink group を有効にするか。" },
+                        "tagIds": {
+                            "type": "array",
+                            "items": { "type": "integer" },
+                            "description": "対象タグの id 一覧(1件以上、重複不可)。既存の集合を丸ごと置き換える。",
+                        },
+                    },
+                    "required": [
+                        "id",
+                        "name",
+                        "dbConnectionId",
+                        "mode",
+                        "intervalMs",
+                        "tableName",
+                        "storeBad",
+                        "enabled",
+                        "tagIds",
+                    ],
+                    "additionalProperties": false,
+                },
+            }),
+            async1!(tool_update_sink_group),
+        )
+        .tool(
+            json!({
+                "name": "delete_sink_group",
+                "description": "sink group を削除する(admin スコープ必須)。不可逆操作のため confirm:true が必須。即時適用(pending queue には載らない)。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "description": "削除する sink group の id。" },
+                        "confirm": {
+                            "type": "boolean",
+                            "description": "true を明示しないと拒否される(不可逆操作の確認)。",
+                        },
+                    },
+                    "required": ["id", "confirm"],
+                    "additionalProperties": false,
+                },
+            }),
+            async1!(tool_delete_sink_group),
+        )
 }
 
 // --- tools/call 結果の組み立て ---------------------------------------------
-
-/// `{ content: [{type:"text", text}], isError }` - ドメイン上の失敗
-/// （スコープ不足・タグ不明・ゲート拒否・ロックダウン時の書き込み）は
-/// すべてこの形（JSON-RPC エラーにしない、実装指示 A 参照）。
-fn tool_result(text: String, is_error: bool) -> Value {
-    json!({
-        "content": [{ "type": "text", "text": text }],
-        "isError": is_error,
-    })
-}
-
-fn tool_ok(payload: Value) -> Value {
-    tool_result(payload.to_string(), false)
-}
-
-fn tool_error(message: impl Into<String>) -> Value {
-    tool_result(message.into(), true)
-}
-
-/// REST の各 `validate_*` (`crate::rest::validate_mqtt_settings_request`等)
-/// が返す `Vec<FieldError>` を単一の `tool_error` テキストへ整形する -
-/// REST は複数件の `FieldError` を `ApiError`(`BantoError::Validation`)の
-/// 配列として返せるが、MCP の `tool_error` は単一メッセージなので
-/// `field: message` を `; ` で連結して1本にまとめる（元は T21 S2-b の設定
-/// set 系ツール専用だったが、[`banto_error_tool_error`]経由で構成 CRUD 系
-/// ツールの `BantoError::Validation` にも共用する - T21 小改善、実機検証
-/// 2026-09-06 の指摘）。
-fn field_errors_tool_error(errors: Vec<FieldError>) -> Value {
-    let joined = errors
-        .into_iter()
-        .map(|err| format!("{}: {}", err.field, err.message))
-        .collect::<Vec<_>>()
-        .join("; ");
-    tool_error(format!("入力が不正です: {joined}"))
-}
-
-/// サービス層の `BantoError` を `tool_error` に変換する - `Validation`
-/// なら[`field_errors_tool_error`]と同じ整形で field 詳細を展開し、それ
-/// 以外のバリアントは従来通り `Display` をそのまま使う（T21 小改善:
-/// 構成 CRUD 系ツールの mutation エラーが `BantoError::Validation` の
-/// `Display`（"validation failed"）だけになり、どの項目がなぜ不正かが
-/// 落ちていた実機検証 2026-09-06 の指摘への対応）。
-fn banto_error_tool_error(err: &BantoError) -> Value {
-    match err {
-        BantoError::Validation { field_errors } => field_errors_tool_error(field_errors.clone()),
-        other => tool_error(format!("{other}")),
-    }
-}
 
 const MISSING_READ_SCOPE: &str =
     "read スコープを持つ API キーが必要です(read または read:{name}/read:{connection}.{group}.*)。";
@@ -2238,35 +2171,6 @@ async fn tool_delete_connection(
 // queue）のどちらも
 // 二重実装しない。
 // ---------------------------------------------------------------------------
-
-/// Copilot 指摘（PR #268）対応: `update_connection`/`update_group`は
-/// フォームと同じ「全項目指定(PUT 置換)」の設計だが、`PlcConnectionPayload`/
-/// `CollectionGroupPayload`は`#[serde(default = ...)]`を持つため、
-/// `serde_json::from_value`に直接通すと省略フィールドが黙って既定値に
-/// 上書きされてしまう（例: `update_group`で`enabled`省略→既定 true に
-/// 戻る）。inputSchema の`required`だけでは MCP クライアントが無視した
-/// 場合に防げないため、デシリアライズ前に`arguments`（JSON object）へ
-/// この関数で必須キーの充足を確認し、1つでも欠けていれば拒否する。
-fn require_all_fields(arguments: &Value, required: &[&str]) -> Option<Value> {
-    let Some(obj) = arguments.as_object() else {
-        return Some(tool_error(
-            "missing_fields: arguments はオブジェクトである必要があります。",
-        ));
-    };
-    let missing: Vec<&str> = required
-        .iter()
-        .filter(|key| !obj.contains_key(**key))
-        .copied()
-        .collect();
-    if missing.is_empty() {
-        None
-    } else {
-        Some(tool_error(format!(
-            "missing_fields: update は全項目指定が必要です(省略項目の既定値上書きを防ぐため)。不足: {}",
-            missing.join(", ")
-        )))
-    }
-}
 
 /// [`tool_update_connection`]の必須キー一覧 - `PlcConnectionPayload`の wire フィールド
 /// （camelCase）全部 + `id`。inputSchema の `update_connection.required` と同期させること。

@@ -90,6 +90,7 @@ members = [
     "crates/banto-exit-once",
     "crates/banto-safe-root",
     "crates/banto-secret-store",
+    "crates/banto-mcp",
     "crates/banto-service-control",
     "crates/banto-service-elev",
     "apps/chronogazer/core",
