@@ -35,6 +35,10 @@ banto-admin-services = { workspace = true }
 # I1: tag registry (PlcConnection/CollectionGroup/Tag) - hub's own SQLite
 # DB doubles as the registry DB (docs/tag-server-design.md §3.2 table).
 banto-tags = { path = "../../../crates/banto-tags" }
+# #1161 PR3: API キーのアプリに依らない部分（キーの形式・SHA-256・照合の順・表
+# `api_keys` への SQL・拒否の HTTP 応答）は ChronoGazer と共有する crate に置く
+# （`src/api_keys.rs` はスコープの書式と判定だけを持ち、接頭辞 `bh` を渡す）。
+banto-api-keys = { path = "../../../crates/banto-api-keys" }
 # R2a-3a: 列→f64 の変換・列の解決・品質の梯子・PostgreSQL の接続オプションとエラー文言は
 # DB ブリッジ（banto-hub-sink、R2a-3b）と共有する crate に置く（`db_source` はそれを使う）。
 banto-db-source = { path = "../../../crates/banto-db-source" }

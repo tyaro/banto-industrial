@@ -714,6 +714,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "banto-api-keys"
+version = "0.1.0"
+dependencies = [
+ "axum 0.8.9",
+ "banto-core",
+ "banto-server",
+ "banto-storage",
+ "base64 0.23.1",
+ "getrandom 0.4.3",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "banto-broker"
 version = "0.3.0-alpha.2"
 dependencies = [
@@ -903,6 +921,7 @@ dependencies = [
  "async-opcua",
  "axum 0.8.9",
  "banto-admin-services",
+ "banto-api-keys",
  "banto-broker",
  "banto-collect",
  "banto-core",

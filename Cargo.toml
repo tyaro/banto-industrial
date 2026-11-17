@@ -93,6 +93,7 @@ members = [
     "crates/banto-mcp",
     "crates/banto-service-control",
     "crates/banto-service-elev",
+    "crates/banto-api-keys",
     "apps/chronogazer/core",
     "apps/chronogazer/elev",
     "apps/chronogazer/src-tauri",

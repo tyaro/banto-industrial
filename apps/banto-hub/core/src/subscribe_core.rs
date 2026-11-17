@@ -53,7 +53,7 @@ use std::collections::{HashMap, HashSet};
 
 use banto_collect::{CurrentValuesHandle, Quality};
 
-use crate::api_keys::ApiKeyContext;
+use crate::api_keys::{ApiKeyContext, HubScopeChecks};
 use crate::computed::ServerTagStore;
 use crate::hub::{read_current, TagEntry, TagMap};
 

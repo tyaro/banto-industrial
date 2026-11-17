@@ -55,7 +55,7 @@ use super::{
     get, ApiError, ApiKeysService, Arc, AuthState, CollectorManager, HeaderMap, IntoResponse, Json,
     PlcConnectionService, Response, Router, Serialize, State,
 };
-use crate::api_keys::ApiKeyContext;
+use crate::api_keys::{ApiKeyContext, HubScopeChecks};
 use banto_tags::{
     validate_push_settings, PlcConnection, BRIDGE_KIND_DB, POSTGRES_PROTOCOL, PUSH_PROTOCOL,
 };

@@ -92,7 +92,9 @@ use banto_mcp::{
 };
 use banto_tags::{CollectionGroupService, PlcConnectionService, TagService, TagUpdateError};
 
-use crate::api_keys::{api_key_verdict, parse_ingest_scope, ApiKeyContext, ApiKeysService};
+use crate::api_keys::{
+    api_key_verdict, parse_ingest_scope, ApiKeyContext, ApiKeysService, HubScopeChecks,
+};
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::commissioning::{CommissioningService, CommissioningState};
 use crate::controller::{CollectionController, RunMode};

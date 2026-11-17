@@ -12,6 +12,7 @@ use super::{
     CollectorManager, Deserialize, Extension, IntoResponse, Json, Path, Response, Serialize,
     ServerEvent, State, StatusCode, ToSchema, WriteAuditService, WriteControl, WriteRateLimiter,
 };
+use crate::api_keys::HubScopeChecks;
 
 // --- 書き込みエンドポイント (T2-4、設計 §5.1「POST /api/v1/values/{tag}」・
 // §6 全体) -------------------------------------------------------------
