@@ -27,6 +27,10 @@
 //! | GET    | `/api/audit-log/config` | -            | `AuditSettings` (admin) |
 //! | PUT    | `/api/audit-log/config` | `AuditSettings` | `AuditSettings` (admin) |
 //! | GET    | `/api/audit-log/spool` | -            | `AuditSpoolStatus` (`pendingCount`/`pendingOldestTs`/`droppedCount`/`failedCount`, admin; #437) |
+//! | GET    | `/api/api-keys`       | -              | `ApiKeySummary[]` (admin session only, #1161 PR4) |
+//! | POST   | `/api/api-keys`       | `{name,scopes,expiresAt?}` | 201 `{id,name,prefix,scopes,key}` (admin session only; `scopes` ⊆ `read`/`config`; `expiresAt` must be in the future) |
+//! | POST   | `/api/api-keys/{id}/revoke` | -        | `ApiKeySummary` (admin session only) |
+//! | DELETE | `/api/api-keys/{id}`  | -              | 204; 409 while not revoked (admin session only) |
 //! | POST   | `/api/backups`        | -              | `BackupInfo` (admin, spec M17) |
 //! | GET    | `/api/backups`        | -              | `BackupInfo[]` (admin)  |
 //! | GET    | `/api/backups/{fileName}` | -          | raw bytes, `Content-Disposition: attachment` (admin) |
@@ -84,6 +88,16 @@
 //! Every `/api/*` route requires the `X-Banto-Client: banto` header
 //! (`banto_server::csrf`) and, except for the auth routes themselves, a
 //! valid bearer token (`banto_server::auth::require_auth`).
+//!
+//! ## API キー（#1161 PR4、docs/chronogazer-agent-api-design.md §3・§4）
+//!
+//! `Authorization: Bearer cg_…` は API キーとして照合し、通れば主体
+//! （`rest/actor.rs` の `Actor::ApiKey`）を載せる。キーで通った要求には CSRF の
+//! ヘッダーを求めない。キーが使えるのは [`api_router`] が「キーを通す集まり」に
+//! 明示して入れたルーターだけ（収集・接続先・収集グループ・記録項目・表示グループ・
+//! しきい値・ドライバ。`read` で読み取り、`config` で変更と収集の操作）。ほかは
+//! 403（キーを通さない集まり）か、banto の `require_auth` の 401（どちらにも入れて
+//! いないルーター）。詳しくは `rest/actor.rs` のモジュール doc。
 //!
 //! ## RBAC (spec M10, `docs/roadmap.md`)
 //!
@@ -211,12 +225,11 @@ use axum::{Json, Router};
 use banto_core::{BantoError, FieldError, ListParams};
 use banto_server::routes::{
     actor_identity, audit_log_router, audit_logout_middleware, backups_router, extra_auth_router,
-    record_write, require_role_at_least, ui_settings_router, users_router, LogoutAuditState,
-    RoleGuard,
+    require_role_at_least, ui_settings_router, users_router, LogoutAuditState, RoleGuard,
 };
 use banto_server::{
-    auth_routes, require_auth, require_banto_client_header, sse_route, ApiError, AuthState,
-    GrantRegistry, GrantSpec, ServerEvent,
+    auth_routes, require_auth, sse_route, ApiError, AuthState, GrantRegistry, GrantSpec,
+    ServerEvent,
 };
 use banto_tags::{
     CollectionGroup, CollectionGroupInput, CollectionGroupService, ConnectionSettingsInput,
@@ -225,16 +238,27 @@ use banto_tags::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
+use crate::api_keys::ApiKeysService;
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::backup::BackupService;
 use crate::local_grant::{
     local_access_middleware, local_desktop_grant_spec, LocalAccess, LocalAccessState,
 };
 use crate::server_admin::{settings_admin_router, LanControl, SettingsAdminState};
+// #1161 PR4: `/api/*` の主体（セッション / API キー）と、キーの受け付け・
+// キーを通す集まりと通さない集まりの層（モジュール doc 参照）。
+mod actor;
+use actor::{
+    api_key_gate, reject_api_key, require_actor_at_least, require_csrf_unless_api_key,
+    require_session_or_api_key, Actor, ActorGuard, ApiKeyGate, KeyNeed,
+};
+// #1161 PR4: API キーの発行・一覧・失効・削除（ログインした管理者だけ）。
+#[cfg(test)]
+mod api_key_tests;
+mod api_keys;
 // #393: 表示グループ。ルーターは子モジュール（`rest/display_groups.rs`）に置く。
 use crate::display_groups::DisplayGroupService;
 mod display_groups;
@@ -267,52 +291,36 @@ use crate::users::{Role, UsersService};
 // `chronogazer_core::rest::*` のパスのまま呼べるよう re-export する。
 pub use banto_server::routes::{audited_credential_verifier, user_auth_state, user_session_lookup};
 
-/// Resolve the caller's identity and require role >= `editor` (R0 §3.6:
-/// resources are viewer-read / editor-write). Records a `denied` audit entry
-/// (mirroring [`require_role_at_least`]) when an AUTHENTICATED caller's role
-/// is too low, and returns `BantoError::Forbidden`; no valid session at all
-/// returns `BantoError::Unauthorized` (deliberately NOT audited, same
-/// reasoning as the RBAC middleware: nothing resembling a real user to
-/// attribute a denial to). Used inline by [`tag_registry_router`]'s write
-/// handlers, which - unlike the admin-only routers above - cannot use a
-/// single-floor `RoleGuard` middleware because their GET routes are only
-/// `require_auth` (viewer+), so read and write share a path but need
-/// different floors. This is the REST twin of `src-tauri`'s `require_role`,
-/// and the same helper relay-wright's `rest.rs` uses for its own R1-B
-/// registry router.
+/// Require the caller to be able to change the configuration (R0 §3.6:
+/// resources are viewer-read / editor-write; #1161 PR4: an API key needs the
+/// `config` scope - [`Actor::can_configure`]). Records a `denied` audit entry
+/// (mirroring `require_role_at_least`) when the caller is known but not
+/// allowed, and returns `BantoError::Forbidden`. A request without a caller
+/// never reaches here: the [`Actor`] extractor answers `401` first
+/// (deliberately NOT audited, same reasoning as the RBAC middleware: nothing
+/// resembling a real user to attribute a denial to). Used inline by
+/// [`tag_registry_router`]'s write handlers, which - unlike the admin-only
+/// routers above - cannot use a single-floor middleware because their GET
+/// routes are viewer+ (`read` for a key), so read and write share a path but
+/// need different floors. This is the REST twin of `src-tauri`'s
+/// `require_role`.
+///
+/// #1161 PR4: the session case gives the same result and the same audit
+/// entry as before (the actor is the `AuthenticatedSession` that
+/// `require_auth` validated for this request); a key is written as
+/// `名前（prefix）` / `api_key` (`rest/actor.rs`).
 async fn require_editor(
-    auth: &AuthState,
+    actor: &Actor,
     audit: &AuditLogService,
-    headers: &HeaderMap,
     resource: &'static str,
     method: &str,
     path: &str,
 ) -> Result<(), BantoError> {
-    match actor_identity(headers, auth) {
-        Some(identity)
-            if Role::from_str(&identity.role)
-                .map(|role| role.at_least(Role::Editor))
-                .unwrap_or(false) =>
-        {
-            Ok(())
-        }
-        Some(identity) => {
-            audit
-                .record(AuditEntry {
-                    actor_username: Some(&identity.id),
-                    actor_role: Some(&identity.role),
-                    action: "denied",
-                    resource,
-                    entity_id: None,
-                    detail: Some(json!({ "method": method, "path": path })),
-                    origin: "rest",
-                    result: "denied",
-                })
-                .await;
-            Err(BantoError::Forbidden)
-        }
-        None => Err(BantoError::Unauthorized),
+    if actor.can_configure() {
+        return Ok(());
     }
+    actor.record_denied(audit, resource, method, path).await;
+    Err(BantoError::Forbidden)
 }
 
 // --- #332: Hub 接続 ----------------------------------------------------------
@@ -491,13 +499,12 @@ fn audit_spool_router(audit: AuditLogService, auth: AuthState) -> Router {
 // --- #383 段階2b / R1-C（C-2）: 収集の操作 -----------------------------------
 
 /// `/api/collect*` のハンドラ用 state（[`HubState`] と同じ構成）: 操作本体の
-/// [`CollectorService`]、監査記録用の [`AuditLogService`]、actor 解決用の
-/// [`AuthState`]。
+/// [`CollectorService`]、監査記録用の [`AuditLogService`]（主体は #1161 PR4 から
+/// ハンドラの引数の [`Actor`]）。
 #[derive(Clone)]
 struct CollectState {
     collect: CollectorService,
     audit: AuditLogService,
-    auth: AuthState,
 }
 
 /// 収集の操作が成功したことを 1 本記録する（`start`/`stop`/`restart` 共通）。
@@ -512,25 +519,18 @@ struct CollectState {
 /// するため - **打ち切りは失敗ではない**ので `result` は `"ok"` のまま。
 async fn record_collect_operation(
     state: &CollectState,
-    headers: &HeaderMap,
+    actor: &Actor,
     action: &'static str,
     outcome: &CollectOutcome,
 ) {
-    let identity = actor_identity(headers, &state.auth);
-    state
-        .audit
-        .record(AuditEntry {
-            actor_username: identity.as_ref().map(|i| i.id.as_str()),
-            actor_role: identity.as_ref().map(|i| i.role.as_str()),
+    actor
+        .record(
+            &state.audit,
             action,
-            resource: COLLECT_AUDIT_RESOURCE,
-            entity_id: None,
-            detail: Some(
-                json!({ "collectState": outcome.status.as_str(), "pending": outcome.pending }),
-            ),
-            origin: "rest",
-            result: "ok",
-        })
+            COLLECT_AUDIT_RESOURCE,
+            None,
+            Some(json!({ "collectState": outcome.status.as_str(), "pending": outcome.pending })),
+        )
         .await;
 }
 
@@ -700,20 +700,20 @@ async fn collect_history_handler(
 /// `POST /api/collect/start`（**`editor` 以上** - [`COLLECT_OPERATION_ROLE`]）。
 async fn collect_start_handler(
     State(state): State<CollectState>,
-    headers: HeaderMap,
+    actor: Actor,
 ) -> Result<Json<CollectOutcome>, ApiError> {
     let outcome = state.collect.start().await?;
-    record_collect_operation(&state, &headers, "start", &outcome).await;
+    record_collect_operation(&state, &actor, "start", &outcome).await;
     Ok(Json(outcome))
 }
 
 /// `POST /api/collect/stop`（**`editor` 以上** - [`COLLECT_OPERATION_ROLE`]）。
 async fn collect_stop_handler(
     State(state): State<CollectState>,
-    headers: HeaderMap,
+    actor: Actor,
 ) -> Result<Json<CollectOutcome>, ApiError> {
     let outcome = state.collect.stop().await?;
-    record_collect_operation(&state, &headers, "stop", &outcome).await;
+    record_collect_operation(&state, &actor, "stop", &outcome).await;
     Ok(Json(outcome))
 }
 
@@ -723,10 +723,10 @@ async fn collect_stop_handler(
 /// 「収集を再起動」だけが反映の口であること」）。
 async fn collect_restart_handler(
     State(state): State<CollectState>,
-    headers: HeaderMap,
+    actor: Actor,
 ) -> Result<Json<CollectOutcome>, ApiError> {
     let outcome = state.collect.restart().await?;
-    record_collect_operation(&state, &headers, "restart", &outcome).await;
+    record_collect_operation(&state, &actor, "restart", &outcome).await;
     Ok(Json(outcome))
 }
 
@@ -763,7 +763,6 @@ fn collect_router(collect: CollectorService, audit: AuditLogService, auth: AuthS
     let state = CollectState {
         collect,
         audit: audit.clone(),
-        auth: auth.clone(),
     };
     // 読み取りの床（`viewer` 以上）。**5 ルートまとめて 1 つの `RoleGuard`**
     // で、ここが「読み取りは誰まで」の唯一の決まり場所（変更側と同じ作法 -
@@ -779,13 +778,16 @@ fn collect_router(collect: CollectorService, audit: AuditLogService, auth: AuthS
         .route("/api/collect/history", get(collect_history_handler))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
-            RoleGuard {
-                auth: auth.clone(),
-                min: COLLECT_READ_ROLE,
-                resource: COLLECT_AUDIT_RESOURCE,
-                audit: audit.clone(),
+            ActorGuard {
+                role: RoleGuard {
+                    auth: auth.clone(),
+                    min: COLLECT_READ_ROLE,
+                    resource: COLLECT_AUDIT_RESOURCE,
+                    audit: audit.clone(),
+                },
+                key_need: KeyNeed::Read,
             },
-            require_role_at_least,
+            require_actor_at_least,
         ));
     // 変更操作の床（`editor` 以上）。**3 ルートまとめて 1 つの
     // `RoleGuard`** に掛ける - 床がルートごとに散ると、次に足した操作が
@@ -796,17 +798,23 @@ fn collect_router(collect: CollectorService, audit: AuditLogService, auth: AuthS
         .route("/api/collect/restart", post(collect_restart_handler))
         .with_state(state)
         .layer(middleware::from_fn_with_state(
-            RoleGuard {
-                auth: auth.clone(),
-                min: COLLECT_OPERATION_ROLE,
-                resource: COLLECT_AUDIT_RESOURCE,
-                audit,
+            ActorGuard {
+                role: RoleGuard {
+                    auth: auth.clone(),
+                    min: COLLECT_OPERATION_ROLE,
+                    resource: COLLECT_AUDIT_RESOURCE,
+                    audit,
+                },
+                key_need: KeyNeed::OperateCollect,
             },
-            require_role_at_least,
+            require_actor_at_least,
         ));
-    reads
-        .merge(writes)
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+    // #1161 PR4: キーを通す集まり（`api_router`）。キーの主体はここを素通りし、
+    // 床は上の `ActorGuard`（`read` / `config`）で決まる。
+    reads.merge(writes).layer(middleware::from_fn_with_state(
+        auth,
+        require_session_or_api_key,
+    ))
 }
 
 // --- #383 段階2a / R1-B: レジストリ CRUD（PLC接続・収集グループ・タグ） ----
@@ -1138,7 +1146,6 @@ struct TagRegistryState {
     // #383 段階3 P4: 書き込みの後に `HubService::registry_changed` を呼ぶ
     // （登録済みの hub タグの集合が変わったら購読に反映する）。
     hub: HubService,
-    auth: AuthState,
     audit: AuditLogService,
     // R2b-3a-3: `/api/config-exclusions` は収集の計画と同じドライバで判定する。
     drivers: Arc<banto_driver_api::DriverRegistry>,
@@ -1176,13 +1183,12 @@ async fn plc_connections_get(
 
 async fn plc_connections_create(
     State(state): State<TagRegistryState>,
-    headers: HeaderMap,
+    actor: Actor,
     Json(input): Json<PlcConnectionPayload>,
 ) -> Result<Json<PlcConnectionResponse>, ApiError> {
     require_editor(
-        &state.auth,
+        &actor,
         &state.audit,
-        &headers,
         "plc_connections",
         "POST",
         "/api/plc-connections",
@@ -1193,16 +1199,15 @@ async fn plc_connections_create(
         .plc_connections
         .create_settings(input.into_create_input())
         .await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "create",
-        "plc_connections",
-        Some(&created.id.to_string()),
-        Some(plc_connection_audit_detail(&created)),
-    )
-    .await;
+    actor
+        .record(
+            &state.audit,
+            "create",
+            "plc_connections",
+            Some(&created.id.to_string()),
+            Some(plc_connection_audit_detail(&created)),
+        )
+        .await;
     // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
     // いなければ何もしない）。
     state.hub.registry_changed().await;
@@ -1211,14 +1216,13 @@ async fn plc_connections_create(
 
 async fn plc_connections_update(
     State(state): State<TagRegistryState>,
-    headers: HeaderMap,
+    actor: Actor,
     Path(id): Path<i64>,
     Json(input): Json<PlcConnectionPayload>,
 ) -> Result<Json<PlcConnectionResponse>, ApiError> {
     require_editor(
-        &state.auth,
+        &actor,
         &state.audit,
-        &headers,
         "plc_connections",
         "PUT",
         "/api/plc-connections/{id}",
@@ -1226,16 +1230,15 @@ async fn plc_connections_update(
     .await?;
     reject_disallowed_connection_protocol(&state.drivers, &input.protocol)?;
     let updated = update_plc_connection(&state.plc_connections, id, input).await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "update",
-        "plc_connections",
-        Some(&id.to_string()),
-        Some(plc_connection_audit_detail(&updated)),
-    )
-    .await;
+    actor
+        .record(
+            &state.audit,
+            "update",
+            "plc_connections",
+            Some(&id.to_string()),
+            Some(plc_connection_audit_detail(&updated)),
+        )
+        .await;
     // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
     // いなければ何もしない）。
     state.hub.registry_changed().await;
@@ -1244,29 +1247,27 @@ async fn plc_connections_update(
 
 async fn plc_connections_delete(
     State(state): State<TagRegistryState>,
-    headers: HeaderMap,
+    actor: Actor,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
     require_editor(
-        &state.auth,
+        &actor,
         &state.audit,
-        &headers,
         "plc_connections",
         "DELETE",
         "/api/plc-connections/{id}",
     )
     .await?;
     state.plc_connections.delete(id).await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "delete",
-        "plc_connections",
-        Some(&id.to_string()),
-        None,
-    )
-    .await;
+    actor
+        .record(
+            &state.audit,
+            "delete",
+            "plc_connections",
+            Some(&id.to_string()),
+            None,
+        )
+        .await;
     // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
     // いなければ何もしない）。
     state.hub.registry_changed().await;
@@ -1313,29 +1314,27 @@ async fn collection_groups_get(
 
 async fn collection_groups_create(
     State(state): State<TagRegistryState>,
-    headers: HeaderMap,
+    actor: Actor,
     Json(input): Json<CollectionGroupPayload>,
 ) -> Result<Json<CollectionGroup>, ApiError> {
     require_editor(
-        &state.auth,
+        &actor,
         &state.audit,
-        &headers,
         "collection_groups",
         "POST",
         "/api/collection-groups",
     )
     .await?;
     let created = state.collection_groups.create(input.into()).await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "create",
-        "collection_groups",
-        Some(&created.id.to_string()),
-        Some(json!({ "name": created.name, "enabled": created.enabled })),
-    )
-    .await;
+    actor
+        .record(
+            &state.audit,
+            "create",
+            "collection_groups",
+            Some(&created.id.to_string()),
+            Some(json!({ "name": created.name, "enabled": created.enabled })),
+        )
+        .await;
     // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
     // いなければ何もしない）。
     state.hub.registry_changed().await;
@@ -1344,30 +1343,28 @@ async fn collection_groups_create(
 
 async fn collection_groups_update(
     State(state): State<TagRegistryState>,
-    headers: HeaderMap,
+    actor: Actor,
     Path(id): Path<i64>,
     Json(input): Json<CollectionGroupPayload>,
 ) -> Result<Json<CollectionGroup>, ApiError> {
     require_editor(
-        &state.auth,
+        &actor,
         &state.audit,
-        &headers,
         "collection_groups",
         "PUT",
         "/api/collection-groups/{id}",
     )
     .await?;
     let updated = state.collection_groups.update(id, input.into()).await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "update",
-        "collection_groups",
-        Some(&id.to_string()),
-        Some(json!({ "name": updated.name, "enabled": updated.enabled })),
-    )
-    .await;
+    actor
+        .record(
+            &state.audit,
+            "update",
+            "collection_groups",
+            Some(&id.to_string()),
+            Some(json!({ "name": updated.name, "enabled": updated.enabled })),
+        )
+        .await;
     // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
     // いなければ何もしない）。
     state.hub.registry_changed().await;
@@ -1376,29 +1373,27 @@ async fn collection_groups_update(
 
 async fn collection_groups_delete(
     State(state): State<TagRegistryState>,
-    headers: HeaderMap,
+    actor: Actor,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
     require_editor(
-        &state.auth,
+        &actor,
         &state.audit,
-        &headers,
         "collection_groups",
         "DELETE",
         "/api/collection-groups/{id}",
     )
     .await?;
     state.collection_groups.delete(id).await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "delete",
-        "collection_groups",
-        Some(&id.to_string()),
-        None,
-    )
-    .await;
+    actor
+        .record(
+            &state.audit,
+            "delete",
+            "collection_groups",
+            Some(&id.to_string()),
+            None,
+        )
+        .await;
     // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
     // いなければ何もしない）。
     state.hub.registry_changed().await;
@@ -1418,30 +1413,21 @@ async fn tags_get(
 
 async fn tags_create(
     State(state): State<TagRegistryState>,
-    headers: HeaderMap,
+    actor: Actor,
     Json(input): Json<TagPayload>,
 ) -> Result<Json<Tag>, ApiError> {
-    require_editor(
-        &state.auth,
-        &state.audit,
-        &headers,
-        "tags",
-        "POST",
-        "/api/tags",
-    )
-    .await?;
+    require_editor(&actor, &state.audit, "tags", "POST", "/api/tags").await?;
     input.reject_thresholds()?;
     let created = state.tags.create(input.into()).await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "create",
-        "tags",
-        Some(&created.id.to_string()),
-        Some(json!({ "name": created.name, "enabled": created.enabled })),
-    )
-    .await;
+    actor
+        .record(
+            &state.audit,
+            "create",
+            "tags",
+            Some(&created.id.to_string()),
+            Some(json!({ "name": created.name, "enabled": created.enabled })),
+        )
+        .await;
     // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
     // いなければ何もしない）。
     state.hub.registry_changed().await;
@@ -1488,31 +1474,22 @@ impl IntoResponse for RevisionConflictRejection {
 
 async fn tags_update(
     State(state): State<TagRegistryState>,
-    headers: HeaderMap,
+    actor: Actor,
     Path(id): Path<i64>,
     Json(input): Json<TagPayload>,
 ) -> Result<Json<Tag>, RevisionConflictRejection> {
-    require_editor(
-        &state.auth,
-        &state.audit,
-        &headers,
-        "tags",
-        "PUT",
-        "/api/tags/{id}",
-    )
-    .await?;
+    require_editor(&actor, &state.audit, "tags", "PUT", "/api/tags/{id}").await?;
     input.reject_thresholds()?;
     let updated = update_tag_checked(&state.tags, id, input.into()).await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "update",
-        "tags",
-        Some(&id.to_string()),
-        Some(json!({ "name": updated.name, "enabled": updated.enabled })),
-    )
-    .await;
+    actor
+        .record(
+            &state.audit,
+            "update",
+            "tags",
+            Some(&id.to_string()),
+            Some(json!({ "name": updated.name, "enabled": updated.enabled })),
+        )
+        .await;
     // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
     // いなければ何もしない）。
     state.hub.registry_changed().await;
@@ -1521,34 +1498,19 @@ async fn tags_update(
 
 async fn tags_delete(
     State(state): State<TagRegistryState>,
-    headers: HeaderMap,
+    actor: Actor,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
-    require_editor(
-        &state.auth,
-        &state.audit,
-        &headers,
-        "tags",
-        "DELETE",
-        "/api/tags/{id}",
-    )
-    .await?;
+    require_editor(&actor, &state.audit, "tags", "DELETE", "/api/tags/{id}").await?;
     // #393（§3.7.9 の 8）: 表示グループのペンに割り当てられたタグは、参照元を
     // 並べて削除を拒否する。Tauri の `tags_delete` も同じ関数を呼ぶ。
     state
         .display_groups
         .delete_tag_unless_referenced(&state.tags, id)
         .await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "delete",
-        "tags",
-        Some(&id.to_string()),
-        None,
-    )
-    .await;
+    actor
+        .record(&state.audit, "delete", "tags", Some(&id.to_string()), None)
+        .await;
     // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
     // いなければ何もしない）。
     state.hub.registry_changed().await;
@@ -1577,17 +1539,9 @@ struct HubRegistrationState {
 /// Hub から読み直す。読み取りなので監査しない。
 async fn hub_catalog_handler(
     State(state): State<HubRegistrationState>,
-    headers: HeaderMap,
+    actor: Actor,
 ) -> Result<Json<crate::hub::HubCatalogView>, ApiError> {
-    require_editor(
-        &state.auth,
-        &state.audit,
-        &headers,
-        "tags",
-        "GET",
-        "/api/hub/catalog",
-    )
-    .await?;
+    require_editor(&actor, &state.audit, "tags", "GET", "/api/hub/catalog").await?;
     Ok(Json(state.hub.catalog_for_registration().await?))
 }
 
@@ -1596,28 +1550,26 @@ async fn hub_catalog_handler(
 /// 「以前の選択を使わない」）。消したときだけ監査する。
 async fn hub_dismiss_legacy_selection_handler(
     State(state): State<HubRegistrationState>,
-    headers: HeaderMap,
+    actor: Actor,
 ) -> Result<StatusCode, ApiError> {
     require_editor(
-        &state.auth,
+        &actor,
         &state.audit,
-        &headers,
         "settings",
         "POST",
         "/api/hub/legacy-selection/dismiss",
     )
     .await?;
     if state.hub.clear_legacy_selection().await? {
-        record_write(
-            &state.audit,
-            &state.auth,
-            &headers,
-            "settings_change",
-            "settings",
-            None,
-            Some(json!({ "hubLegacySelectionCleared": true, "reason": "dismissed" })),
-        )
-        .await;
+        actor
+            .record(
+                &state.audit,
+                "settings_change",
+                "settings",
+                None,
+                Some(json!({ "hubLegacySelectionCleared": true, "reason": "dismissed" })),
+            )
+            .await;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1630,18 +1582,10 @@ async fn hub_dismiss_legacy_selection_handler(
 /// `HubService::schedule_legacy_selection_clear`）。
 async fn tags_from_hub_handler(
     State(state): State<HubRegistrationState>,
-    headers: HeaderMap,
+    actor: Actor,
     Json(body): Json<crate::hub_tags::HubTagRegistration>,
 ) -> Result<Json<crate::hub_tags::HubRegistrationResult>, ApiError> {
-    require_editor(
-        &state.auth,
-        &state.audit,
-        &headers,
-        "tags",
-        "POST",
-        "/api/tags/from-hub",
-    )
-    .await?;
+    require_editor(&actor, &state.audit, "tags", "POST", "/api/tags/from-hub").await?;
     let mut result = crate::hub_tags::register_from_hub(
         &state.pool,
         &state.plc_connections,
@@ -1651,16 +1595,15 @@ async fn tags_from_hub_handler(
     )
     .await?;
     if result.ok {
-        record_write(
-            &state.audit,
-            &state.auth,
-            &headers,
-            "create",
-            "tags",
-            None,
-            Some(crate::hub_tags::registration_audit_detail(&result)),
-        )
-        .await;
+        actor
+            .record(
+                &state.audit,
+                "create",
+                "tags",
+                None,
+                Some(crate::hub_tags::registration_audit_detail(&result)),
+            )
+            .await;
         state.hub.registry_changed().await;
         // 待たない（操作ロックを `connect` が握っていても応答を遅らせない）。
         result.legacy_selection_clear_scheduled = state.hub.schedule_legacy_selection_clear();
@@ -1706,7 +1649,6 @@ fn tag_registry_router(
         tags,
         display_groups,
         hub,
-        auth: auth.clone(),
         audit,
         drivers,
     };
@@ -1739,7 +1681,12 @@ fn tag_registry_router(
         .route("/api/config-exclusions", get(config_exclusions_list))
         .route("/api/drivers", get(drivers_list))
         .with_state(state)
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        // #1161 PR4: キーを通す集まり（`api_router`）。読み取りは `read`・`config`、
+        // 書き込みはハンドラの `require_editor`（`config`）。
+        .layer(middleware::from_fn_with_state(
+            auth,
+            require_session_or_api_key,
+        ))
 }
 
 /// Compose the full `/api/*` router (spec §11.1): auth routes (login/
@@ -1851,7 +1798,19 @@ pub fn api_router(
     });
 
     let collect_drivers = collect.drivers().clone();
-    Router::new()
+    // #1161 PR4: API キーは表示グループと同じ pool（`TagThresholdService` と同じく
+    // 呼び出し元の引数は増やさない。`DisplayGroupService::pool` の doc）。
+    let api_keys = ApiKeysService::new(display_groups.pool().clone());
+    let gate = ApiKeyGate {
+        api_keys: api_keys.clone(),
+        audit: audit.clone(),
+    };
+
+    // #1161 PR4（docs/chronogazer-agent-api-design.md §3.3・§4.1）: キーを
+    // **通さない**集まり。ユーザー管理・サーバー設定・HUB 連携・バックアップ・
+    // 監査ログ・API キー・認証・UI 設定・SSE。集まり全体の `reject_api_key` が
+    // キーの主体を 403（`denied` を記録）で止める。
+    let session_only = Router::new()
         .merge(audited_auth_routes)
         .merge(extra_auth_router(
             users.clone(),
@@ -1879,7 +1838,10 @@ pub fn api_router(
             hub_router(hub.clone(), audit.clone(), auth.clone())
         })
         // #383 段階3 P4: 「Hub から追加」（editor）。レジストリ 3 サービスと同じ
-        // pool（`DisplayGroupService::pool` の doc）。
+        // pool（`DisplayGroupService::pool` の doc）。#1161 PR4: HUB 連携の専用の
+        // URL（`/api/hub/*`・`/api/tags/from-hub`）なのでキーは通さない。汎用の
+        // CRUD（`/api/tags` など）が扱う Hub 由来の登録データは別物で、下の
+        // キーを通す集まりにある。
         .merge(hub_registration_router(HubRegistrationState {
             hub: hub.clone(),
             pool: display_groups.pool().clone(),
@@ -1889,6 +1851,23 @@ pub fn api_router(
             auth: auth.clone(),
             audit: audit.clone(),
         }))
+        .merge(api_keys::api_keys_router(
+            api_keys,
+            audit.clone(),
+            auth.clone(),
+        ))
+        .merge(ui_settings_router(settings, auth.clone()))
+        .merge(settings_admin)
+        .layer(middleware::from_fn_with_state(
+            audit.clone(),
+            reject_api_key,
+        ));
+
+    // #1161 PR4: キーを**通す**集まり（明示して許す）。子ルーターの認証は
+    // `require_session_or_api_key`、床は `ActorGuard` とハンドラの
+    // `require_editor`（`rest/actor.rs` のモジュール doc）。ここに入れずに足した
+    // ルーターは、banto の `require_auth` がキーを 401 で断る（既定は通さない）。
+    let api_key_routes = Router::new()
         .merge(collect_router(collect, audit.clone(), auth.clone()))
         .merge(display_groups::display_groups_router(
             display_groups.clone(),
@@ -1909,18 +1888,23 @@ pub fn api_router(
             display_groups,
             hub,
             audit,
-            auth.clone(),
+            auth,
             collect_drivers,
-        ))
-        .merge(ui_settings_router(settings, auth))
-        .merge(settings_admin)
+        ));
+
+    session_only
+        .merge(api_key_routes)
         // #392 B2-1: Host の確認（status・grant・setup）と、未初期化の間の grant の
         // 扱い（`crate::local_grant::local_access_middleware`）。CSRF の確認の内側。
         .layer(middleware::from_fn_with_state(
             local_access,
             local_access_middleware,
         ))
-        .layer(middleware::from_fn(require_banto_client_header))
+        // #1161 PR4: CSRF の確認。キーで通った要求には求めない（セッションは今どおり）。
+        .layer(middleware::from_fn(require_csrf_unless_api_key))
+        // #1161 PR4: いちばん外で `Authorization: Bearer cg_…` をキーとして照合する。
+        // 通らなければここで止め、セッションには落とさない（`rest/actor.rs`）。
+        .layer(middleware::from_fn_with_state(gate, api_key_gate))
 }
 
 /// [`api_router`] に渡す、listener ごとの host の扱い（#392 B2-1）。

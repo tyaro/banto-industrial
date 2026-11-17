@@ -4,6 +4,9 @@
 //! `tauri::command` adapters in `src-tauri` call into this crate; the same
 //! services back the embedded REST server in M6.
 
+// #1161 PR4: ChronoGazer の API キー（接頭辞 `cg`、スコープ `read`・`config`）。
+// 仕組みは共有 crate `banto-api-keys`、ここはスコープの書式と意味だけ。
+pub mod api_keys;
 pub mod assets;
 // #437: 監査の保留（banto ADR-0019）の配線。`banto-serve` と Tauri の両方が通る。
 pub mod audit_spool;

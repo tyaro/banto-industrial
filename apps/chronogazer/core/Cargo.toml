@@ -23,6 +23,10 @@ banto-server = { workspace = true }
 # `src/settings.rs` に型付きのラッパとして残す）。argon2/password-hash は
 # この crate から直接は使わなくなった（ハッシュは `UsersService` の中）。
 banto-admin-services = { workspace = true }
+# #1161 PR4: API キー（形式・ハッシュ・照合・表への SQL・拒否の応答）は HUB と
+# 共有する crate を使う。接頭辞 `cg` とスコープ（`read`・`config`）は
+# `src/api_keys.rs` が決める（docs/chronogazer-agent-api-design.md §3）。
+banto-api-keys = { path = "../../../crates/banto-api-keys" }
 # I-series crates (docs/r1-plan.md R1-A): not wired into any Tauri command or
 # REST route yet - that lands in R1-B (registry CRUD)/R1-C (collector
 # runtime)/R1-D (monitor screens). Added now as path deps so the workspace

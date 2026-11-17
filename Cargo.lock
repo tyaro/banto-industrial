@@ -1684,6 +1684,7 @@ version = "0.3.0-alpha.2"
 dependencies = [
  "axum 0.8.9",
  "banto-admin-services",
+ "banto-api-keys",
  "banto-collect",
  "banto-core",
  "banto-driver-api",

@@ -7,8 +7,9 @@
 //! | PUT    | `/api/tag-thresholds/{tagId}`   | `TagThresholdsPayload` | `TagThresholds`（editor 以上。全項目置換。版の食い違いは `409`） |
 //!
 //! 作法は表示グループ（`rest::display_groups`）と同じ: 読み取りはルーター全体の
-//! `require_auth`（viewer 以上）、書き込みは [`require_editor`]（拒否は `denied` で
-//! 監査）、成功した書き込みだけ [`record_write`] で監査する
+//! [`require_session_or_api_key`]（viewer 以上 / API キーの `read`・`config`）、
+//! 書き込みは [`require_editor`]（editor 以上 / `config`。拒否は `denied` で
+//! 監査）、成功した書き込みだけ [`Actor::record`] で監査する
 //! （`resource: "tag_thresholds"`、`origin: "rest"`）。検証は
 //! `crate::tag_thresholds::validate_thresholds_for` だけで、Tauri の
 //! `tag_thresholds_*` コマンドも同じサービス・同じ検証を通る。
@@ -20,14 +21,12 @@
 //! タグの行も一緒に消える（`DisplayGroupService::delete_tag_unless_referenced`）。
 
 use axum::extract::{Path, State};
-use axum::http::HeaderMap;
 use axum::middleware;
 use axum::routing::get;
 use axum::{Json, Router};
-use banto_server::routes::record_write;
-use banto_server::{require_auth, ApiError, AuthState};
+use banto_server::{ApiError, AuthState};
 
-use super::{require_editor, RevisionConflictRejection};
+use super::{require_editor, require_session_or_api_key, Actor, RevisionConflictRejection};
 use crate::audit::AuditLogService;
 use crate::tag_thresholds::{
     audit_detail, TagThresholdService, TagThresholds, TagThresholdsPayload, AUDIT_RESOURCE,
@@ -36,7 +35,6 @@ use crate::tag_thresholds::{
 #[derive(Clone)]
 struct TagThresholdsState {
     tag_thresholds: TagThresholdService,
-    auth: AuthState,
     audit: AuditLogService,
 }
 
@@ -55,30 +53,28 @@ async fn get_one(
 
 async fn update(
     State(state): State<TagThresholdsState>,
-    headers: HeaderMap,
+    actor: Actor,
     Path(tag_id): Path<i64>,
     Json(payload): Json<TagThresholdsPayload>,
 ) -> Result<Json<TagThresholds>, RevisionConflictRejection> {
     require_editor(
-        &state.auth,
+        &actor,
         &state.audit,
-        &headers,
         AUDIT_RESOURCE,
         "PUT",
         "/api/tag-thresholds/{tagId}",
     )
     .await?;
     let updated = state.tag_thresholds.update(tag_id, &payload).await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "update",
-        AUDIT_RESOURCE,
-        Some(&tag_id.to_string()),
-        Some(audit_detail(&updated)),
-    )
-    .await;
+    actor
+        .record(
+            &state.audit,
+            "update",
+            AUDIT_RESOURCE,
+            Some(&tag_id.to_string()),
+            Some(audit_detail(&updated)),
+        )
+        .await;
     Ok(Json(updated.thresholds))
 }
 
@@ -90,14 +86,16 @@ pub(super) fn tag_thresholds_router(
 ) -> Router {
     let state = TagThresholdsState {
         tag_thresholds,
-        auth: auth.clone(),
         audit,
     };
     Router::new()
         .route("/api/tag-thresholds", get(list))
         .route("/api/tag-thresholds/{tag_id}", get(get_one).put(update))
         .with_state(state)
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            auth,
+            require_session_or_api_key,
+        ))
 }
 
 #[cfg(test)]
