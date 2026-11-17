@@ -827,13 +827,20 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		// あいだ中央は `inert` なので `.focus()` が効かない）。
 		const movedOut = await page.evaluate((selector) => {
 			const pane = document.querySelector<HTMLElement>(selector);
-			const target = Array.from(
+			// 候補を順に試し、フォーカスがメニューの外へ出たら止める（フォーカスを
+			// 受けない候補もあり、メニューが閉じるときに開いた元へフォーカスを
+			// 戻すこともあるので、移した先との一致ではなく「メニューの外」で見る）。
+			const candidates = Array.from(
 				pane?.querySelectorAll<HTMLElement>(
-					'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"]), [role="treeitem"]'
+					'button, [href], input, select, textarea, [tabindex], [role="treeitem"]'
 				) ?? []
-			).find((el) => !el.closest('[role="menu"]'));
-			target?.focus();
-			return !!target && document.activeElement === target;
+			).filter((el) => !el.closest('[role="menu"]'));
+			for (const el of candidates) {
+				el.focus();
+				const active = document.activeElement;
+				if (active && active !== document.body && !active.closest('[role="menu"]')) return true;
+			}
+			return false;
 		}, TREE_PANE_SELECTOR);
 		expect(movedOut).toBe(true);
 		await expect(menu).toHaveCount(0);
