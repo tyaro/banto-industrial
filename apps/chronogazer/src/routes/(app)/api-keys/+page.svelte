@@ -21,6 +21,7 @@
 		createApiKey,
 		deleteApiKey,
 		listApiKeys,
+		listenerBindForWarning,
 		plaintextOverLan,
 		revokeApiKey,
 		type ApiKeyScope,
@@ -63,7 +64,7 @@
 		}
 	}
 
-	// §7: 待受のアドレス。読めなければ null（常に注意を出す側に倒す）。
+	// §7: 実際の待受のアドレス。読めない・再起動待ちで不明なら null（常に注意を出す側に倒す）。
 	let bind: string | null = $state(null);
 	const plaintextWarning = $derived(
 		plaintextOverLan(window.location.protocol, window.location.hostname, bind)
@@ -73,7 +74,7 @@
 		void reload();
 		if (!available) return;
 		getServerStatus().then(
-			(status) => (bind = status.bind),
+			(status) => (bind = listenerBindForWarning(status)),
 			() => (bind = null)
 		);
 	});

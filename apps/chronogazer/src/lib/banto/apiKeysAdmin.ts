@@ -8,6 +8,7 @@
  * 対象を絞る書式や、レート制限のトリップ（HUB の機能）は持たない。
  */
 import { restJson } from './restJson';
+import type { ServerStatus } from './serverAdmin';
 
 export type ApiKeyScope = 'read' | 'config';
 
@@ -91,4 +92,13 @@ export function plaintextOverLan(
 	if (pageProtocol === 'https:') return false;
 	if (!isLoopbackHost(pageHostname)) return true;
 	return bind === null || !isLoopbackHost(bind);
+}
+
+/**
+ * `plaintextOverLan` に渡す「実際の待受」。`getServerStatus()` の `bind` は保存した設定で、
+ * `restartRequired` の間は実際の待受が前の設定のまま（LAN に出たまま）のことがある。
+ * その間は不明（`null`）として返し、注意を出す側に倒す。
+ */
+export function listenerBindForWarning(status: ServerStatus): string | null {
+	return status.restartRequired ? null : status.bind;
 }

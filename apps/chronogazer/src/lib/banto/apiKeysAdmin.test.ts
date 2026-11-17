@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { apiKeyState, isLoopbackHost, plaintextOverLan, type ApiKeySummary } from './apiKeysAdmin';
+import {
+	apiKeyState,
+	isLoopbackHost,
+	listenerBindForWarning,
+	plaintextOverLan,
+	type ApiKeySummary
+} from './apiKeysAdmin';
+import type { ServerStatus } from './serverAdmin';
 
 const base: ApiKeySummary = {
 	id: 1,
@@ -41,4 +48,22 @@ describe('plaintextOverLan', () => {
 		expect(plaintextOverLan('http:', '192.168.1.5', '127.0.0.1')).toBe(true));
 	it('待受が不明なら安全側で注意', () =>
 		expect(plaintextOverLan('http:', '127.0.0.1', null)).toBe(true));
+});
+
+describe('listenerBindForWarning', () => {
+	const base = { bind: '127.0.0.1' } as ServerStatus;
+	it('再起動待ちなら不明（null）', () =>
+		expect(listenerBindForWarning({ ...base, restartRequired: true })).toBeNull());
+	it('再起動待ちでなければ bind', () => {
+		expect(listenerBindForWarning({ ...base, restartRequired: false })).toBe('127.0.0.1');
+		expect(listenerBindForWarning(base)).toBe('127.0.0.1');
+	});
+	it('再起動待ちの間は localhost でも注意を出す', () =>
+		expect(
+			plaintextOverLan(
+				'http:',
+				'localhost',
+				listenerBindForWarning({ ...base, restartRequired: true })
+			)
+		).toBe(true));
 });
