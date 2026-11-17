@@ -11,8 +11,8 @@
 //!
 //! 作法は親モジュールの `tag_registry_router` と同じ: 読み取りはルーター全体の
 //! [`require_session_or_api_key`]（viewer 以上、API キーは `read`・`config`）、
-//! 書き込みはハンドラごとの [`require_editor`]（editor 以上 / `config`。拒否は
-//! `denied` で監査）、成功した書き込みだけ [`Actor::record`] で監査する
+//! 書き込みは [`DisplayGroupOps`] のメソッド（#1161 PR5a。editor 以上 / `config`。
+//! 拒否は `denied` で監査）、成功した書き込みだけ [`Actor::record`] で監査する
 //! （`resource: "display_groups"`、`origin: "rest"`。#1161 PR4 で banto の
 //! `record_write` から置き換えた - キーの主体も残せるように）。読み取りは監査しない。
 //! 検証は `crate::display_groups::validate_display_group` だけで、Tauri の
@@ -28,20 +28,17 @@ use axum::middleware;
 use axum::routing::{get, put};
 use axum::{Json, Router};
 use banto_server::{ApiError, AuthState};
-use serde_json::json;
 
-use super::{require_editor, require_session_or_api_key, Actor, RevisionConflictRejection};
+use super::{require_session_or_api_key, Actor, RevisionConflictRejection};
 use crate::audit::AuditLogService;
 use crate::display_groups::{
-    audit_detail, DisplayGroup, DisplayGroupPayload, DisplayGroupService, ReorderPayload,
-    AUDIT_RESOURCE,
+    DisplayGroup, DisplayGroupPayload, DisplayGroupService, ReorderPayload,
 };
+use crate::ops::{DisplayGroupOps, Via};
 
-#[derive(Clone)]
-struct DisplayGroupsState {
-    display_groups: DisplayGroupService,
-    audit: AuditLogService,
-}
+/// #1161 PR5a: 書き込みの本体（権限の確かめ・監査）は [`DisplayGroupOps`] の
+/// メソッドで、MCP のツールも同じものを呼ぶ。
+type DisplayGroupsState = DisplayGroupOps;
 
 async fn list(
     State(state): State<DisplayGroupsState>,
@@ -61,24 +58,16 @@ async fn create(
     actor: Actor,
     Json(payload): Json<DisplayGroupPayload>,
 ) -> Result<Json<DisplayGroup>, ApiError> {
-    require_editor(
-        &actor,
-        &state.audit,
-        AUDIT_RESOURCE,
-        "POST",
-        "/api/display-groups",
-    )
-    .await?;
-    let created = state.display_groups.create(&payload).await?;
-    actor
-        .record(
-            &state.audit,
-            "create",
-            AUDIT_RESOURCE,
-            Some(&created.id.to_string()),
-            Some(audit_detail(&created)),
+    let created = state
+        .create(
+            &actor,
+            &Via::Rest {
+                method: "POST",
+                path: "/api/display-groups",
+            },
+            &payload,
         )
-        .await;
+        .await?;
     Ok(Json(created))
 }
 
@@ -88,24 +77,17 @@ async fn update(
     Path(id): Path<i64>,
     Json(payload): Json<DisplayGroupPayload>,
 ) -> Result<Json<DisplayGroup>, RevisionConflictRejection> {
-    require_editor(
-        &actor,
-        &state.audit,
-        AUDIT_RESOURCE,
-        "PUT",
-        "/api/display-groups/{id}",
-    )
-    .await?;
-    let updated = state.display_groups.update(id, &payload).await?;
-    actor
-        .record(
-            &state.audit,
-            "update",
-            AUDIT_RESOURCE,
-            Some(&id.to_string()),
-            Some(audit_detail(&updated)),
+    let updated = state
+        .update(
+            &actor,
+            &Via::Rest {
+                method: "PUT",
+                path: "/api/display-groups/{id}",
+            },
+            id,
+            &payload,
         )
-        .await;
+        .await?;
     Ok(Json(updated))
 }
 
@@ -114,24 +96,16 @@ async fn delete(
     actor: Actor,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
-    require_editor(
-        &actor,
-        &state.audit,
-        AUDIT_RESOURCE,
-        "DELETE",
-        "/api/display-groups/{id}",
-    )
-    .await?;
-    let deleted = state.display_groups.delete(id).await?;
-    actor
-        .record(
-            &state.audit,
-            "delete",
-            AUDIT_RESOURCE,
-            Some(&id.to_string()),
-            Some(json!({ "name": deleted.name })),
+    state
+        .delete(
+            &actor,
+            &Via::Rest {
+                method: "DELETE",
+                path: "/api/display-groups/{id}",
+            },
+            id,
         )
-        .await;
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -140,24 +114,16 @@ async fn reorder(
     actor: Actor,
     Json(payload): Json<ReorderPayload>,
 ) -> Result<Json<Vec<DisplayGroup>>, ApiError> {
-    require_editor(
-        &actor,
-        &state.audit,
-        AUDIT_RESOURCE,
-        "PUT",
-        "/api/display-groups/order",
-    )
-    .await?;
-    let groups = state.display_groups.reorder(&payload.ids).await?;
-    actor
-        .record(
-            &state.audit,
-            "reorder",
-            AUDIT_RESOURCE,
-            None,
-            Some(json!({ "ids": payload.ids })),
+    let groups = state
+        .reorder(
+            &actor,
+            &Via::Rest {
+                method: "PUT",
+                path: "/api/display-groups/order",
+            },
+            &payload.ids,
         )
-        .await;
+        .await?;
     Ok(Json(groups))
 }
 

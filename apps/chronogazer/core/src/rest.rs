@@ -250,7 +250,7 @@ use crate::local_grant::{
 use crate::server_admin::{settings_admin_router, LanControl, SettingsAdminState};
 // #1161 PR4: `/api/*` の主体（セッション / API キー）と、キーの受け付け・
 // キーを通す集まりと通さない集まりの層（モジュール doc 参照）。
-mod actor;
+pub(crate) mod actor;
 use actor::{
     api_key_gate, reject_api_key, require_actor_at_least, require_csrf_unless_api_key,
     require_session_or_api_key, Actor, ActorGuard, ApiKeyGate, KeyNeed,
@@ -279,8 +279,9 @@ use crate::collect::{
     ValuesResponse, COLLECT_AUDIT_RESOURCE, COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
 };
 use crate::hub::{HubService, HubSubscriptionView, HubView};
+use crate::ops::{CollectOperation, CollectOps, RegistryOps, Via, ORIGIN_REST};
 use crate::settings::SettingsService;
-use crate::tag_address::{is_revision_conflict, update_tag_checked};
+use crate::tag_address::is_revision_conflict;
 use crate::users::{Role, UsersService};
 
 // I2a（2026-10-04）: 領域に依らない REST の口（`/api/auth/{status,setup,
@@ -309,6 +310,10 @@ pub use banto_server::routes::{audited_credential_verifier, user_auth_state, use
 /// entry as before (the actor is the `AuthenticatedSession` that
 /// `require_auth` validated for this request); a key is written as
 /// `名前（prefix）` / `api_key` (`rest/actor.rs`).
+///
+/// #1161 PR5a: 接続先・収集グループ・記録項目・表示グループ・しきい値の書き込みは
+/// `crate::ops` の関数の中で同じ確かめ（`crate::ops::require_configure`）をする。
+/// ここに残るのは `crate::ops` に移していない書き込み（Hub から追加など）。
 async fn require_editor(
     actor: &Actor,
     audit: &AuditLogService,
@@ -316,11 +321,7 @@ async fn require_editor(
     method: &str,
     path: &str,
 ) -> Result<(), BantoError> {
-    if actor.can_configure() {
-        return Ok(());
-    }
-    actor.record_denied(audit, resource, method, path).await;
-    Err(BantoError::Forbidden)
+    crate::ops::require_configure(actor, audit, &Via::Rest { method, path }, resource).await
 }
 
 // --- #332: Hub 接続 ----------------------------------------------------------
@@ -498,41 +499,13 @@ fn audit_spool_router(audit: AuditLogService, auth: AuthState) -> Router {
 
 // --- #383 段階2b / R1-C（C-2）: 収集の操作 -----------------------------------
 
-/// `/api/collect*` のハンドラ用 state（[`HubState`] と同じ構成）: 操作本体の
-/// [`CollectorService`]、監査記録用の [`AuditLogService`]（主体は #1161 PR4 から
-/// ハンドラの引数の [`Actor`]）。
-#[derive(Clone)]
-struct CollectState {
-    collect: CollectorService,
-    audit: AuditLogService,
-}
-
-/// 収集の操作が成功したことを 1 本記録する（`start`/`stop`/`restart` 共通）。
-///
-/// `resource` は [`COLLECT_AUDIT_RESOURCE`]、つまり**Tauri 側の `collect_*`
-/// コマンドと同じ定数**（両経路で `resource` が割れないように - その定数の
-/// doc 参照）。`detail` に入れるのは**結果の状態**だけで、接続先・
-/// ファイルパス・[`crate::collect::CollectorState::StartFailed`] の理由と
-/// いった**内部の詳細は入れない**（`CollectorState::as_str` の doc）。
-/// `pending` を載せるのは、
-/// 「操作は受け付けたが、応答を待つのをやめた」を後から読み分けられるように
-/// するため - **打ち切りは失敗ではない**ので `result` は `"ok"` のまま。
-async fn record_collect_operation(
-    state: &CollectState,
-    actor: &Actor,
-    action: &'static str,
-    outcome: &CollectOutcome,
-) {
-    actor
-        .record(
-            &state.audit,
-            action,
-            COLLECT_AUDIT_RESOURCE,
-            None,
-            Some(json!({ "collectState": outcome.status.as_str(), "pending": outcome.pending })),
-        )
-        .await;
-}
+/// `/api/collect*` のハンドラ用 state: 操作本体の [`CollectorService`] と、
+/// 監査記録用の [`AuditLogService`]（主体はハンドラの引数の [`Actor`]）。
+/// #1161 PR5a から変更操作の本体は [`crate::ops::CollectOps::run`]（権限の
+/// 確かめ・監査を含む。MCP も同じ関数を呼ぶ）。監査の `resource` は
+/// [`COLLECT_AUDIT_RESOURCE`]（Tauri 側の `collect_*` コマンドと同じ定数）、
+/// `detail` は結果の状態だけ。
+type CollectState = CollectOps;
 
 /// `GET /api/collect`（**`viewer` 以上** - [`COLLECT_READ_ROLE`]）: 収集の
 /// 現在の状態。
@@ -702,8 +675,16 @@ async fn collect_start_handler(
     State(state): State<CollectState>,
     actor: Actor,
 ) -> Result<Json<CollectOutcome>, ApiError> {
-    let outcome = state.collect.start().await?;
-    record_collect_operation(&state, &actor, "start", &outcome).await;
+    let outcome = state
+        .run(
+            &actor,
+            &Via::Rest {
+                method: "POST",
+                path: "/api/collect/start",
+            },
+            CollectOperation::Start,
+        )
+        .await?;
     Ok(Json(outcome))
 }
 
@@ -712,8 +693,16 @@ async fn collect_stop_handler(
     State(state): State<CollectState>,
     actor: Actor,
 ) -> Result<Json<CollectOutcome>, ApiError> {
-    let outcome = state.collect.stop().await?;
-    record_collect_operation(&state, &actor, "stop", &outcome).await;
+    let outcome = state
+        .run(
+            &actor,
+            &Via::Rest {
+                method: "POST",
+                path: "/api/collect/stop",
+            },
+            CollectOperation::Stop,
+        )
+        .await?;
     Ok(Json(outcome))
 }
 
@@ -725,8 +714,16 @@ async fn collect_restart_handler(
     State(state): State<CollectState>,
     actor: Actor,
 ) -> Result<Json<CollectOutcome>, ApiError> {
-    let outcome = state.collect.restart().await?;
-    record_collect_operation(&state, &actor, "restart", &outcome).await;
+    let outcome = state
+        .run(
+            &actor,
+            &Via::Rest {
+                method: "POST",
+                path: "/api/collect/restart",
+            },
+            CollectOperation::Restart,
+        )
+        .await?;
     Ok(Json(outcome))
 }
 
@@ -1133,23 +1130,10 @@ impl From<TagPayload> for TagInput {
 }
 
 /// State for the `/api/plc-connections/*`, `/api/collection-groups/*` and
-/// `/api/tags/*` handlers: banto-tags の3サービスと、書き込みを editor
-/// ゲート（[`require_editor`]）・監査するための `AuthState`/
-/// `AuditLogService`。
-#[derive(Clone)]
-struct TagRegistryState {
-    plc_connections: PlcConnectionService,
-    collection_groups: CollectionGroupService,
-    tags: TagService,
-    // #393: タグの削除の前に、表示グループのペンからの参照を確かめる。
-    display_groups: DisplayGroupService,
-    // #383 段階3 P4: 書き込みの後に `HubService::registry_changed` を呼ぶ
-    // （登録済みの hub タグの集合が変わったら購読に反映する）。
-    hub: HubService,
-    audit: AuditLogService,
-    // R2b-3a-3: `/api/config-exclusions` は収集の計画と同じドライバで判定する。
-    drivers: Arc<banto_driver_api::DriverRegistry>,
-}
+/// `/api/tags/*` handlers. #1161 PR5a から書き込みの本体（権限の確かめ・
+/// 前検査・監査・`registry_changed`）は [`RegistryOps`] のメソッドで、MCP の
+/// ツールも同じものを呼ぶ。読み取りのハンドラはフィールドのサービスを直接呼ぶ。
+type TagRegistryState = RegistryOps;
 
 async fn drivers_list(
     State(state): State<TagRegistryState>,
@@ -1160,25 +1144,14 @@ async fn drivers_list(
 async fn plc_connections_list(
     State(state): State<TagRegistryState>,
 ) -> Result<Json<Vec<PlcConnectionResponse>>, ApiError> {
-    Ok(Json(
-        state
-            .plc_connections
-            .list(ListParams::default())
-            .await?
-            .rows
-            .into_iter()
-            .map(PlcConnectionResponse::from)
-            .collect(),
-    ))
+    Ok(Json(state.list_connections().await?))
 }
 
 async fn plc_connections_get(
     State(state): State<TagRegistryState>,
     Path(id): Path<i64>,
 ) -> Result<Json<PlcConnectionResponse>, ApiError> {
-    Ok(Json(PlcConnectionResponse::from(
-        state.plc_connections.get(id).await?,
-    )))
+    Ok(Json(state.get_connection(id).await?))
 }
 
 async fn plc_connections_create(
@@ -1186,32 +1159,17 @@ async fn plc_connections_create(
     actor: Actor,
     Json(input): Json<PlcConnectionPayload>,
 ) -> Result<Json<PlcConnectionResponse>, ApiError> {
-    require_editor(
-        &actor,
-        &state.audit,
-        "plc_connections",
-        "POST",
-        "/api/plc-connections",
-    )
-    .await?;
-    reject_disallowed_connection_protocol(&state.drivers, &input.protocol)?;
     let created = state
-        .plc_connections
-        .create_settings(input.into_create_input())
-        .await?;
-    actor
-        .record(
-            &state.audit,
-            "create",
-            "plc_connections",
-            Some(&created.id.to_string()),
-            Some(plc_connection_audit_detail(&created)),
+        .create_connection(
+            &actor,
+            &Via::Rest {
+                method: "POST",
+                path: "/api/plc-connections",
+            },
+            input,
         )
-        .await;
-    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
-    // いなければ何もしない）。
-    state.hub.registry_changed().await;
-    Ok(Json(PlcConnectionResponse::from(created)))
+        .await?;
+    Ok(Json(created))
 }
 
 async fn plc_connections_update(
@@ -1220,29 +1178,18 @@ async fn plc_connections_update(
     Path(id): Path<i64>,
     Json(input): Json<PlcConnectionPayload>,
 ) -> Result<Json<PlcConnectionResponse>, ApiError> {
-    require_editor(
-        &actor,
-        &state.audit,
-        "plc_connections",
-        "PUT",
-        "/api/plc-connections/{id}",
-    )
-    .await?;
-    reject_disallowed_connection_protocol(&state.drivers, &input.protocol)?;
-    let updated = update_plc_connection(&state.plc_connections, id, input).await?;
-    actor
-        .record(
-            &state.audit,
-            "update",
-            "plc_connections",
-            Some(&id.to_string()),
-            Some(plc_connection_audit_detail(&updated)),
+    let updated = state
+        .update_connection(
+            &actor,
+            &Via::Rest {
+                method: "PUT",
+                path: "/api/plc-connections/{id}",
+            },
+            id,
+            input,
         )
-        .await;
-    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
-    // いなければ何もしない）。
-    state.hub.registry_changed().await;
-    Ok(Json(PlcConnectionResponse::from(updated)))
+        .await?;
+    Ok(Json(updated))
 }
 
 async fn plc_connections_delete(
@@ -1250,27 +1197,16 @@ async fn plc_connections_delete(
     actor: Actor,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
-    require_editor(
-        &actor,
-        &state.audit,
-        "plc_connections",
-        "DELETE",
-        "/api/plc-connections/{id}",
-    )
-    .await?;
-    state.plc_connections.delete(id).await?;
-    actor
-        .record(
-            &state.audit,
-            "delete",
-            "plc_connections",
-            Some(&id.to_string()),
-            None,
+    state
+        .delete_connection(
+            &actor,
+            &Via::Rest {
+                method: "DELETE",
+                path: "/api/plc-connections/{id}",
+            },
+            id,
         )
-        .await;
-    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
-    // いなければ何もしない）。
-    state.hub.registry_changed().await;
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1317,27 +1253,16 @@ async fn collection_groups_create(
     actor: Actor,
     Json(input): Json<CollectionGroupPayload>,
 ) -> Result<Json<CollectionGroup>, ApiError> {
-    require_editor(
-        &actor,
-        &state.audit,
-        "collection_groups",
-        "POST",
-        "/api/collection-groups",
-    )
-    .await?;
-    let created = state.collection_groups.create(input.into()).await?;
-    actor
-        .record(
-            &state.audit,
-            "create",
-            "collection_groups",
-            Some(&created.id.to_string()),
-            Some(json!({ "name": created.name, "enabled": created.enabled })),
+    let created = state
+        .create_group(
+            &actor,
+            &Via::Rest {
+                method: "POST",
+                path: "/api/collection-groups",
+            },
+            input,
         )
-        .await;
-    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
-    // いなければ何もしない）。
-    state.hub.registry_changed().await;
+        .await?;
     Ok(Json(created))
 }
 
@@ -1347,27 +1272,17 @@ async fn collection_groups_update(
     Path(id): Path<i64>,
     Json(input): Json<CollectionGroupPayload>,
 ) -> Result<Json<CollectionGroup>, ApiError> {
-    require_editor(
-        &actor,
-        &state.audit,
-        "collection_groups",
-        "PUT",
-        "/api/collection-groups/{id}",
-    )
-    .await?;
-    let updated = state.collection_groups.update(id, input.into()).await?;
-    actor
-        .record(
-            &state.audit,
-            "update",
-            "collection_groups",
-            Some(&id.to_string()),
-            Some(json!({ "name": updated.name, "enabled": updated.enabled })),
+    let updated = state
+        .update_group(
+            &actor,
+            &Via::Rest {
+                method: "PUT",
+                path: "/api/collection-groups/{id}",
+            },
+            id,
+            input,
         )
-        .await;
-    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
-    // いなければ何もしない）。
-    state.hub.registry_changed().await;
+        .await?;
     Ok(Json(updated))
 }
 
@@ -1376,27 +1291,16 @@ async fn collection_groups_delete(
     actor: Actor,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
-    require_editor(
-        &actor,
-        &state.audit,
-        "collection_groups",
-        "DELETE",
-        "/api/collection-groups/{id}",
-    )
-    .await?;
-    state.collection_groups.delete(id).await?;
-    actor
-        .record(
-            &state.audit,
-            "delete",
-            "collection_groups",
-            Some(&id.to_string()),
-            None,
+    state
+        .delete_group(
+            &actor,
+            &Via::Rest {
+                method: "DELETE",
+                path: "/api/collection-groups/{id}",
+            },
+            id,
         )
-        .await;
-    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
-    // いなければ何もしない）。
-    state.hub.registry_changed().await;
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1416,21 +1320,16 @@ async fn tags_create(
     actor: Actor,
     Json(input): Json<TagPayload>,
 ) -> Result<Json<Tag>, ApiError> {
-    require_editor(&actor, &state.audit, "tags", "POST", "/api/tags").await?;
-    input.reject_thresholds()?;
-    let created = state.tags.create(input.into()).await?;
-    actor
-        .record(
-            &state.audit,
-            "create",
-            "tags",
-            Some(&created.id.to_string()),
-            Some(json!({ "name": created.name, "enabled": created.enabled })),
+    let created = state
+        .create_tag(
+            &actor,
+            &Via::Rest {
+                method: "POST",
+                path: "/api/tags",
+            },
+            input,
         )
-        .await;
-    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
-    // いなければ何もしない）。
-    state.hub.registry_changed().await;
+        .await?;
     Ok(Json(created))
 }
 
@@ -1478,21 +1377,17 @@ async fn tags_update(
     Path(id): Path<i64>,
     Json(input): Json<TagPayload>,
 ) -> Result<Json<Tag>, RevisionConflictRejection> {
-    require_editor(&actor, &state.audit, "tags", "PUT", "/api/tags/{id}").await?;
-    input.reject_thresholds()?;
-    let updated = update_tag_checked(&state.tags, id, input.into()).await?;
-    actor
-        .record(
-            &state.audit,
-            "update",
-            "tags",
-            Some(&id.to_string()),
-            Some(json!({ "name": updated.name, "enabled": updated.enabled })),
+    let updated = state
+        .update_tag(
+            &actor,
+            &Via::Rest {
+                method: "PUT",
+                path: "/api/tags/{id}",
+            },
+            id,
+            input,
         )
-        .await;
-    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
-    // いなければ何もしない）。
-    state.hub.registry_changed().await;
+        .await?;
     Ok(Json(updated))
 }
 
@@ -1501,19 +1396,16 @@ async fn tags_delete(
     actor: Actor,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
-    require_editor(&actor, &state.audit, "tags", "DELETE", "/api/tags/{id}").await?;
-    // #393（§3.7.9 の 8）: 表示グループのペンに割り当てられたタグは、参照元を
-    // 並べて削除を拒否する。Tauri の `tags_delete` も同じ関数を呼ぶ。
     state
-        .display_groups
-        .delete_tag_unless_referenced(&state.tags, id)
+        .delete_tag(
+            &actor,
+            &Via::Rest {
+                method: "DELETE",
+                path: "/api/tags/{id}",
+            },
+            id,
+        )
         .await?;
-    actor
-        .record(&state.audit, "delete", "tags", Some(&id.to_string()), None)
-        .await;
-    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
-    // いなければ何もしない）。
-    state.hub.registry_changed().await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1564,6 +1456,7 @@ async fn hub_dismiss_legacy_selection_handler(
         actor
             .record(
                 &state.audit,
+                ORIGIN_REST,
                 "settings_change",
                 "settings",
                 None,
@@ -1598,6 +1491,7 @@ async fn tags_from_hub_handler(
         actor
             .record(
                 &state.audit,
+                ORIGIN_REST,
                 "create",
                 "tags",
                 None,

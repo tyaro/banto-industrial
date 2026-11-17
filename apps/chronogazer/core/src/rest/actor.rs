@@ -47,7 +47,7 @@
 //! [`Actor::record`] で残す。セッションは `record_write` と同じ値
 //! （`actor_username` = アカウントの id、`actor_role` = ロール）、キーは
 //! `actor_username` = `名前（prefix）`、`actor_role` = `"api_key"`、`origin` =
-//! `"rest"`。スコープが足りないときは `denied` を記録する。存在しないキー・形式の
+//! 呼び出し元（REST は `"rest"`、MCP は `"mcp"`。`crate::ops::Via`、#1161 PR5a）。スコープが足りないときは `denied` を記録する。存在しないキー・形式の
 //! 誤りは記録しない（誰か分からないため）。失効・期限切れのキーは
 //! `resource: "api_keys"` の `denied` で記録する（HUB の `/api/v1/*` と同じ形）。
 
@@ -71,6 +71,7 @@ use crate::api_keys::{
 };
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::collect::COLLECT_OPERATION_ROLE;
+use crate::ops::Via;
 use crate::users::Role;
 
 /// キーの主体の監査の `actor_role`（§4.2）。
@@ -136,11 +137,13 @@ impl Actor {
         }
     }
 
-    /// 監査を 1 本残す（`origin: "rest"`）。成功した書き込みは `result: "ok"`
-    /// （banto の `record_write` と同じ値）。
+    /// 監査を 1 本残す。成功した書き込みは `result: "ok"`（banto の
+    /// `record_write` と同じ値）。`origin` は呼び出し元が渡す（REST は
+    /// `"rest"`、MCP は `"mcp"` - [`crate::ops::Via::origin`]。#1161 PR5a）。
     pub(crate) async fn record(
         &self,
         audit: &AuditLogService,
+        origin: &str,
         action: &str,
         resource: &str,
         entity_id: Option<&str>,
@@ -155,20 +158,21 @@ impl Actor {
                 resource,
                 entity_id,
                 detail,
-                origin: "rest",
+                origin,
                 result: "ok",
             })
             .await;
     }
 
-    /// 権限不足の `denied` を残す（banto の `require_role_at_least` と同じ形:
-    /// `detail` は `{method, path}`）。
+    /// 権限不足の `denied` を残す。`origin` と `detail` は [`Via`] から作る:
+    /// REST は banto の `require_role_at_least` と同じ形（`origin: "rest"`、
+    /// `detail` は `{method, path}`）、MCP は `origin: "mcp"`、`detail` は
+    /// `{tool}`（[`Via::denied_detail`]、#1161 PR5a）。
     pub(crate) async fn record_denied(
         &self,
         audit: &AuditLogService,
+        via: &Via<'_>,
         resource: &str,
-        method: &str,
-        path: &str,
     ) {
         let (username, role) = self.audit_actor();
         audit
@@ -178,8 +182,8 @@ impl Actor {
                 action: "denied",
                 resource,
                 entity_id: None,
-                detail: Some(json!({ "method": method, "path": path })),
-                origin: "rest",
+                detail: Some(via.denied_detail()),
+                origin: via.origin(),
                 result: "denied",
             })
             .await;
@@ -345,7 +349,14 @@ pub(crate) async fn reject_api_key(
         let method = req.method().as_str().to_string();
         let path = req.uri().path().to_string();
         actor
-            .record_denied(&audit, API_KEYS_RESOURCE, &method, &path)
+            .record_denied(
+                &audit,
+                &Via::Rest {
+                    method: &method,
+                    path: &path,
+                },
+                API_KEYS_RESOURCE,
+            )
             .await;
         return forbidden_response();
     }
@@ -402,7 +413,14 @@ pub(crate) async fn require_actor_at_least(
         let method = req.method().as_str().to_string();
         let path = req.uri().path().to_string();
         actor
-            .record_denied(&guard.role.audit, guard.role.resource, &method, &path)
+            .record_denied(
+                &guard.role.audit,
+                &Via::Rest {
+                    method: &method,
+                    path: &path,
+                },
+                guard.role.resource,
+            )
             .await;
         return forbidden_response();
     }
