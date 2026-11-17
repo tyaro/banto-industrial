@@ -687,6 +687,288 @@ async fn unknown_method_is_a_json_rpc_error() {
 }
 
 // ---------------------------------------------------------------------------
+// 1b. 骨組みの固定（#1161 PR2: 骨組みを crates/banto-mcp に移す前後で応答が
+//     1 バイトも変わらないことを確かめる）
+// ---------------------------------------------------------------------------
+
+/// `POST /mcp` を生のバイト列で叩く（不正な JSON を送るため）。応答は
+/// 本文を JSON に読めなければ `Value::Null`。
+async fn mcp_post_raw(router: &Router, bearer: &str, body: &'static [u8]) -> (StatusCode, Value) {
+    let response = router
+        .clone()
+        .oneshot(
+            HttpRequest::post("/mcp")
+                .header("content-type", "application/json")
+                .header("Authorization", format!("Bearer {bearer}"))
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// `tools/list` の `result` 全体（ツールの名前・順・説明・inputSchema）を
+/// `tests/snapshots/mcp_tools_list.json` と完全一致で比べる。再生成は
+/// `UPDATE_MCP_TOOLS_SNAPSHOT=1 cargo test -p banto-hub-host --test mcp tools_list_snapshot`。
+/// 比較は `serde_json::Value`（オブジェクトのキー順は問わないが、配列の
+/// ツールの順は問う）、ファイルは整形した JSON。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tools_list_snapshot_matches() {
+    let app = test_app("tools-list-snapshot").await;
+    let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
+
+    let (status, body) = mcp_post(&app.router, Some(&key), rpc("tools/list", json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let actual = body["result"].clone();
+    assert!(actual["tools"].is_array(), "{body:?}");
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("snapshots")
+        .join("mcp_tools_list.json");
+    if matches!(
+        std::env::var("UPDATE_MCP_TOOLS_SNAPSHOT").as_deref(),
+        Ok("1")
+    ) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut text = serde_json::to_string_pretty(&actual).unwrap();
+        text.push('\n');
+        std::fs::write(&path, text).unwrap();
+        return;
+    }
+    let expected: Value = serde_json::from_str(
+        &std::fs::read_to_string(&path)
+            .expect("snapshot missing; run with UPDATE_MCP_TOOLS_SNAPSHOT=1"),
+    )
+    .expect("snapshot parse");
+    assert!(
+        actual == expected,
+        "tools/list differs from tests/snapshots/mcp_tools_list.json; review the diff and regenerate with UPDATE_MCP_TOOLS_SNAPSHOT=1"
+    );
+}
+
+/// `initialize` は `protocolVersion` を送れば echo し、送らなければ既定
+/// （`2025-06-18`）を返す。`serverInfo` は `banto-hub` と HUB の版。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initialize_without_protocol_version_uses_the_default() {
+    let app = test_app("initialize-default").await;
+    let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
+
+    let (status, body) = mcp_post(&app.router, Some(&key), rpc("initialize", json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(body["result"]["capabilities"], json!({ "tools": {} }));
+    assert_eq!(body["result"]["serverInfo"]["name"], "banto-hub");
+    assert_eq!(
+        body["result"]["serverInfo"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
+
+    // params 自体が無い initialize も既定になる。
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        json!({ "jsonrpc": "2.0", "id": 7, "method": "initialize" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["id"], 7);
+    assert_eq!(body["result"]["protocolVersion"], "2025-06-18");
+
+    // 別の版を送ればそのまま echo する。
+    let (_, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        rpc("initialize", json!({ "protocolVersion": "2024-11-05" })),
+    )
+    .await;
+    assert_eq!(body["result"]["protocolVersion"], "2024-11-05");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ping_returns_an_empty_object() {
+    let app = test_app("ping-result").await;
+    let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
+
+    let (status, body) = mcp_post(&app.router, Some(&key), rpc("ping", json!({}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({ "jsonrpc": "2.0", "id": 1, "result": {} }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_method_message_names_the_method() {
+    let app = test_app("unknown-method-msg").await;
+    let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
+
+    let (_, body) = mcp_post(&app.router, Some(&key), rpc("bogus/method", json!({}))).await;
+    assert_eq!(
+        body,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": { "code": -32601, "message": "unknown method: bogus/method" },
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tools_call_envelope_errors_are_invalid_params() {
+    let app = test_app("tools-call-envelope").await;
+    let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
+
+    // 未知のツール。
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call("no_such_tool", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": { "code": -32602, "message": "unknown tool: no_such_tool" },
+        })
+    );
+
+    // params 無し。
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": { "code": -32602, "message": "params is required" },
+        })
+    );
+
+    // params.name 無し。
+    let (_, body) = mcp_post(&app.router, Some(&key), rpc("tools/call", json!({}))).await;
+    assert_eq!(
+        body,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": { "code": -32602, "message": "params.name (string) is required" },
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_json_is_a_parse_error_with_http_200() {
+    let app = test_app("parse-error").await;
+    let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
+
+    let (status, body) = mcp_post_raw(&app.router, &key, b"{ not json").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": { "code": -32700, "message": "Parse error" },
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_envelopes_are_invalid_request_with_http_200() {
+    let app = test_app("invalid-request").await;
+    let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
+
+    // jsonrpc が "2.0" でない（id は応答に引き継ぐ）。
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        json!({ "jsonrpc": "1.0", "id": 5, "method": "ping" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "error": { "code": -32600, "message": "Invalid Request" },
+        })
+    );
+
+    // method が無い。
+    let (_, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        json!({ "jsonrpc": "2.0", "id": 6 }),
+    )
+    .await;
+    assert_eq!(body["id"], 6);
+    assert_eq!(body["error"]["code"], -32600);
+
+    // method が文字列でない。
+    let (_, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        json!({ "jsonrpc": "2.0", "id": 8, "method": 3 }),
+    )
+    .await;
+    assert_eq!(body["id"], 8);
+    assert_eq!(body["error"]["code"], -32600);
+
+    // 不正な封筒で id も無ければ id は null。
+    let (_, body) = mcp_post(&app.router, Some(&key), json!({ "jsonrpc": "2.0" })).await;
+    assert_eq!(body["id"], Value::Null);
+    assert_eq!(body["error"]["code"], -32600);
+
+    // 配列（バッチ）は受けない。
+    let (_, body) = mcp_post(&app.router, Some(&key), json!([rpc("ping", json!({}))])).await;
+    assert_eq!(body["error"]["code"], -32600);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notifications_without_id_are_accepted_with_an_empty_body() {
+    let app = test_app("notification").await;
+    let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
+
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            HttpRequest::post("/mcp")
+                .header("content-type", "application/json")
+                .header("Authorization", format!("Bearer {key}"))
+                .body(Body::from(
+                    serde_json::to_vec(
+                        &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+                    )
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(bytes.is_empty());
+}
+
+// ---------------------------------------------------------------------------
 // 2. 認証: キー無し/不正/セッション token はいずれも 401
 // ---------------------------------------------------------------------------
 
