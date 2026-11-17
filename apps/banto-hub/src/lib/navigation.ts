@@ -36,10 +36,20 @@
  * 同じ URL になるが、文字列の連結で base を足し引きしない（上流の移行で、
  * 自動移行が `resolve('')` で「base を外す」処理に書き換えてガードが壊れた、
  * #325。SvelteKit 3 の `resolve('')` は `base` ではなく `base + '/'`）。
+ *
+ * #1159（banto v7.2.0 のメニューバー、nav-menubar-plan.md §4.10・§4.11）:
+ * `visibleNavItems()`（RBAC の絞り込みを純粋関数に切り出した）、`navBarEntries()`
+ * （グループを最初のメンバーの位置に集める）、`isNavItemActive()` を足した。
+ * メニューバー（`ShellMenubar.svelte`）とドック（`ShellLauncher.svelte`）が同じ
+ * 関数で並べる。admin-template は管理ナビを別の区画（別の `<nav>`）にするが、Hub は
+ * 「状態 / タグ登録 / タグモニタ / DB Sink / 管理 ▾ / 設定」の並びにしたいので、
+ * `adminOnly` の項目を 1 つの「管理」グループとして**最初の管理項目の位置**に
+ * 集める（`group` の指定は要らない）。
  */
 import { resolve } from '$app/paths';
 import type { Path, ResolvedPathname } from '$app/types';
 import { APP_NAME } from '#lib/appName.js';
+import { isAdmin, type Role } from '#lib/permissions.js';
 
 /**
  * An app route's pathname as written in the nav/category tables: a leading
@@ -74,7 +84,23 @@ export interface NavItem {
 	 * サブパスでも、判定は親パス配下すべてを対象にしたい場合に分ける。
 	 */
 	activeMatch?: AppPath;
+	/**
+	 * この項目が属するグループ（メニューバーでは 1 つのドロップダウンになる、
+	 * nav-menubar-plan.md §4.10）。同じキーの項目は最初のメンバーの位置に集まる。
+	 * `adminOnly` の項目は指定にかかわらず `ADMIN_GROUP_KEY` に入る。未指定 = 単独の項目。
+	 * 今の Hub に管理以外のグループは無い。
+	 */
+	group?: NavGroupKey;
 }
+
+/** グループのキー。表示名は `NAV_GROUP_LABELS` で引く（Hub は i18n を使わず日本語を直書き）。 */
+export type NavGroupKey = string;
+
+/** `adminOnly` の項目をまとめるグループのキー。 */
+export const ADMIN_GROUP_KEY: NavGroupKey = 'admin';
+
+/** グループの表示名（メニューバーのドロップダウンのボタン）。 */
+export const NAV_GROUP_LABELS: Record<NavGroupKey, string> = { [ADMIN_GROUP_KEY]: '管理' };
 
 export const navItems: NavItem[] = [
 	{ path: '/status', label: '状態', icon: '📡' },
@@ -93,6 +119,54 @@ export const navItems: NavItem[] = [
 	{ path: '/write-audit', label: '書き込み監査', icon: '✍️', adminOnly: true },
 	{ path: '/settings/appearance', label: '設定', icon: '⚙️', activeMatch: '/settings' }
 ];
+
+/**
+ * セッションに見せるナビ項目（navItems の順のまま）。管理限定の項目は無効化せず
+ * 隠す（RBAC、画面側のガードと同じ。`Sidebar.svelte` と同じ規則）。純粋関数。
+ */
+export function visibleNavItems(session: { role: Role }): NavItem[] {
+	return navItems.filter((item) => !item.adminOnly || isAdmin(session.role));
+}
+
+/** グループ化したバーの 1 スロット: 単独の項目、または最初のメンバーの位置に集めたグループ。 */
+export type NavBarEntry =
+	{ kind: 'item'; item: NavItem } | { kind: 'group'; key: NavGroupKey; items: NavItem[] };
+
+/**
+ * `items` をバーのスロットに並べる（nav-menubar-plan.md §4.10）。グループは最初の
+ * メンバーの位置に置き、後のメンバーも元の順で集める。`adminOnly` の項目は
+ * `ADMIN_GROUP_KEY` の 1 グループにする。純粋関数 - 絞り込み済みの一覧
+ * （`visibleNavItems()`）に適用する。
+ */
+export function navBarEntries(items: NavItem[]): NavBarEntry[] {
+	const entries: NavBarEntry[] = [];
+	const groups = new Map<NavGroupKey, NavItem[]>();
+	for (const item of items) {
+		const key = item.adminOnly ? ADMIN_GROUP_KEY : item.group;
+		if (!key) {
+			entries.push({ kind: 'item', item });
+			continue;
+		}
+		const members = groups.get(key);
+		if (members) {
+			members.push(item);
+		} else {
+			const created = [item];
+			groups.set(key, created);
+			entries.push({ kind: 'group', key, items: created });
+		}
+	}
+	return entries;
+}
+
+/**
+ * 「現在地」判定（前方一致）。`activeMatch`（無ければ `path`）を base 付きの URL にして
+ * 比べる（`設定` は遷移先が `/settings/appearance` でも `/settings` 配下ならハイライト）。
+ */
+export function isNavItemActive(item: NavItem, pathname: string): boolean {
+	const match = resolveAppPath(item.activeMatch ?? item.path);
+	return pathname === match || pathname.startsWith(match + '/');
+}
 
 export function pageTitle(pathname: string): string {
 	const item = navItems.find((entry) => {

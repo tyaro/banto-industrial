@@ -17,6 +17,8 @@
 	import { OWNER_CHANGE_POLICY, watchOwnerChanges } from '#lib/banto/ownerChange.js';
 	import Header from '#lib/components/Header.svelte';
 	import Sidebar from '#lib/components/Sidebar.svelte';
+	import ShellLauncher from '#lib/components/ShellLauncher.svelte';
+	import { settings } from '#lib/settings.svelte.js';
 	import CommandPalette from '#lib/components/CommandPalette.svelte';
 	import { hasVisibleLayerAbove, hasVisibleMenuLayer, LAYER_MARKER_ATTR } from '@banto/ui';
 	import { listPendingChanges } from '#lib/banto/pendingChangesAdmin.js';
@@ -160,6 +162,39 @@
 		)
 	);
 
+	// #1159（banto v7.2.0 のメニューバー、nav-menubar-plan.md §4.9・D10-a）: ナビの置き場所
+	// ごとにシェルが出すものは `mobileNavStore.view`（`resolveShellNav`）が決める。
+	// メニューバーでは >900px にサイドバーは無く（ヘッダーがナビを持つ）、≤900px、または
+	// ヘッダーのナビが「その他」にも入らないときだけサイドバーがドロワーになる
+	// （`menubarInsufficient`は `Header` が `HeaderNav` から受けて store に置く）。ヘッダーが
+	// バーを外す ≤900px・置き場所の切り替えではフラグを落とす（新しいバーが測り直して報告する）。
+	const view = $derived(mobileNavStore.view);
+	const launcher = $derived(settings.navLayout === 'launcher');
+	const launcherPosition = $derived(settings.launcherPosition);
+	$effect(() => {
+		if (settings.navLayout !== 'menubar' || mobileNavStore.isNarrow) {
+			mobileNavStore.setMenubarInsufficient(false);
+		}
+	});
+	// ドロワーでなくなった（バーが戻った・ドックにした・広幅になった）ら、開いたままにしない。
+	$effect(() => {
+		if (!view.drawerMode) mobileNavStore.closeNav();
+	});
+
+	// トーストの積み位置はこのシェルの外（ルートの兄弟）にあるので、ドックのあいだだけルートに
+	// 印を付け、banto.css がトーストをバーから避ける（nav-launcher-plan.md §4.1）。外れたら消す
+	// （ログイン画面などドックの無い画面のトーストは元の位置のまま）。
+	$effect(() => {
+		if (!launcher) return;
+		const root = document.documentElement;
+		root.setAttribute('data-banto-shell-nav', 'launcher');
+		root.setAttribute('data-banto-shell-launcher-position', launcherPosition);
+		return () => {
+			root.removeAttribute('data-banto-shell-nav');
+			root.removeAttribute('data-banto-shell-launcher-position');
+		};
+	});
+
 	// ルート変更時はオフキャンバスを必ず閉じる（設計の「閉じる契機」の1つ）。
 	afterNavigate(({ shallow }) => {
 		if (shallow) return;
@@ -203,8 +238,14 @@
 
 <svelte:window onkeydown={handleKeydown} />
 
-<div class="shell">
-	{#if mobileNavStore.isNarrow && mobileNavStore.open}
+<div
+	class="shell"
+	class:with-launcher={launcher}
+	class:launcher-top={launcher && launcherPosition === 'top'}
+	class:launcher-left={launcher && launcherPosition === 'left'}
+	class:launcher-right={launcher && launcherPosition === 'right'}
+>
+	{#if mobileNavStore.drawerMode && mobileNavStore.open}
 		<!--
 			T19 S3-a（UX-43）: ≤900px オフキャンバスのバックドロップ。z-index は
 			Drawer/Modal(900)・CommandPalette/ToastHost/TreeContextMenu(1000)
@@ -219,7 +260,11 @@
 			aria-label="背景をクリックしてメニューを閉じる"
 		></button>
 	{/if}
-	<Sidebar {pendingCount} />
+	{#if launcher}
+		<ShellLauncher {pendingCount} />
+	{:else if view.showSidebar}
+		<Sidebar {pendingCount} />
+	{/if}
 	<div class="main">
 		<Header {pendingCount} />
 		<main>
@@ -266,6 +311,44 @@
 		min-height: 0;
 		overflow-y: auto;
 		padding: 1.25rem;
+	}
+
+	/* ドック（nav-launcher-plan.md §4.1）: 固定のバーが本文の端を覆わないよう、置いた辺に
+	   バーの分の余白を取る。上のバーはヘッダーの下に置く（バーをヘッダーの高さだけ下げる）。 */
+	.shell.with-launcher main {
+		padding-bottom: calc(1.25rem + var(--banto-shell-launcher-reserve));
+	}
+
+	.shell.launcher-top main,
+	.shell.launcher-left main,
+	.shell.launcher-right main {
+		padding-bottom: 1.25rem;
+	}
+
+	.shell.launcher-top {
+		--banto-shell-launcher-inset-top: var(--banto-shell-header-height);
+	}
+
+	.shell.launcher-top main {
+		padding-top: calc(1.25rem + var(--banto-shell-launcher-reserve));
+	}
+
+	.shell.launcher-left main {
+		padding-left: calc(1.25rem + var(--banto-shell-launcher-reserve));
+	}
+
+	.shell.launcher-right main {
+		padding-right: calc(1.25rem + var(--banto-shell-launcher-reserve));
+	}
+
+	/* ≤900px はどの位置でも下の全幅タブバー（§4.6, D5）。 */
+	@media (max-width: 900px) {
+		.shell.with-launcher main,
+		.shell.launcher-top main,
+		.shell.launcher-left main,
+		.shell.launcher-right main {
+			padding: 1.25rem 1.25rem calc(1.25rem + var(--banto-shell-launcher-tabbar-reserve));
+		}
 	}
 
 	/*

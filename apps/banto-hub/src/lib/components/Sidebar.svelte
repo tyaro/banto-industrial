@@ -1,13 +1,21 @@
 <script lang="ts">
-	// relay-wright の同名コンポーネントから無改変で複製。
+	// relay-wright の同名コンポーネントから複製。#1159（banto v7.2.0 のメニューバー）:
+	// メニューバー表示のとき、≤900px、またはバーが入りきらないときだけ描かれ（描くかは
+	// `(app)/+layout.svelte`）、ドロワー（オフキャンバス）になる条件は幅そのもの
+	// （`isNarrow`）ではなく `mobileNavStore.drawerMode`（>900px でも入りきらなければ
+	// ドロワー、nav-menubar-plan.md §4.9）。ドロワーは折り畳みを持たない。
 	import { tick, untrack } from 'svelte';
 	import { page } from '$app/state';
-	import { navItems, resolveAppPath, type NavItem } from '#lib/navigation.js';
+	import {
+		isNavItemActive,
+		resolveAppPath,
+		visibleNavItems,
+		type NavItem
+	} from '#lib/navigation.js';
 	import { settings } from '#lib/settings.svelte.js';
 	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
 	import { NAV_TOGGLE_ATTR, SIDEBAR_ID, findVisibleNavToggle } from '#lib/mobileNav.js';
 	import { sessionStore } from '#lib/session.svelte.js';
-	import { isAdmin } from '#lib/permissions.js';
 	import { APP_NAME } from '#lib/appName.js';
 
 	let { pendingCount = 0 }: { pendingCount?: number } = $props();
@@ -18,18 +26,15 @@
 	// 判定する - `navigation.ts` の doc comment参照（`設定` は遷移先が
 	// `/settings/appearance` でも `/settings` 配下ならハイライトさせたい）。
 	function isActive(item: NavItem): boolean {
-		const match = resolveAppPath(item.activeMatch ?? item.path);
-		return page.url.pathname === match || page.url.pathname.startsWith(match + '/');
+		return isNavItemActive(item, page.url.pathname);
 	}
 
 	// RBAC: admin-only 項目は表示自体を隠す（無効化して見せない）。
-	const visibleItems = $derived(
-		navItems.filter((item) => !item.adminOnly || isAdmin(sessionStore.role))
-	);
+	const visibleItems = $derived(visibleNavItems({ role: sessionStore.role }));
 
 	// T19 S3-a（UX-43）: ≤900px では「アイコンのみ折り畳み」に意味が無いので
 	// 適用しない - 狭幅では常にフルラベル表示にする。
-	const collapsed = $derived(!mobileNavStore.isNarrow && settings.sidebarCollapsed);
+	const collapsed = $derived(!mobileNavStore.drawerMode && settings.sidebarCollapsed);
 
 	/**
 	 * #381 レビュー対応12回目（層の約束・項目6、`@banto/ui` の `layering.ts`）: **退避した
@@ -52,12 +57,12 @@
 	 * 変えるときは両方直す）。広幅・閉じている間は付けない。
 	 */
 	const escLayerMarker = $derived(
-		mobileNavStore.isNarrow && mobileNavStore.open ? 'sidebar' : undefined
+		mobileNavStore.drawerMode && mobileNavStore.open ? 'sidebar' : undefined
 	);
 
 	let navHiddenHandled = false;
 	$effect.pre(() => {
-		const hidden = mobileNavStore.isNarrow && !mobileNavStore.open;
+		const hidden = mobileNavStore.drawerMode && !mobileNavStore.open;
 		untrack(() => {
 			if (hidden === navHiddenHandled) return;
 			navHiddenHandled = hidden;
@@ -74,7 +79,7 @@
 	// リンクをクリックしたらオフキャンバスを閉じる（設計の「閉じる契機」の
 	// 1つ）。デスクトップ幅では isNarrow が false なので no-op。
 	function handleNavClick(): void {
-		if (mobileNavStore.isNarrow) mobileNavStore.closeNav();
+		if (mobileNavStore.drawerMode) mobileNavStore.closeNav();
 	}
 </script>
 
@@ -89,9 +94,9 @@
 	id={SIDEBAR_ID}
 	bind:this={asideEl}
 	class:collapsed
-	class:offcanvas={mobileNavStore.isNarrow}
+	class:offcanvas={mobileNavStore.drawerMode}
 	class:open={mobileNavStore.open}
-	inert={mobileNavStore.isNarrow && !mobileNavStore.open}
+	inert={mobileNavStore.drawerMode && !mobileNavStore.open}
 	data-esc-layer={escLayerMarker}
 >
 	<div class="brand">
@@ -103,7 +108,7 @@
 			#714: 広幅・開いている間の折り畳みボタン（ロゴ行）。折り畳み中 / 狭幅は
 			ヘッダー側の ☰ が開く役（`Header.svelte`）。同時に 2 つは出さない。
 		-->
-		{#if !mobileNavStore.isNarrow && !collapsed}
+		{#if !mobileNavStore.drawerMode && !collapsed}
 			<button
 				type="button"
 				class="collapse-toggle"
@@ -171,45 +176,45 @@
 	 * ユーザーが明示的に開いた一時的な最前面 UI の手前に出て隠してはなら
 	 * ない（バックドロップ=700 は `(app)/+layout.svelte` 側）。
 	 */
-	@media (max-width: 900px) {
-		aside.offcanvas {
-			position: fixed;
-			inset-block: 0;
-			left: 0;
-			z-index: 710;
-			width: min(var(--banto-shell-sidebar-width), 85vw);
-			transform: translateX(-100%);
-			/* #381 レビュー対応12回目: `visibility` も落とす（上の markup の
-			   コメント参照 - transform だけだと退避中もフォーカス・判定に残る）。
-			   `visibility` は離散なので、閉じるアニメーションの間は `visible` の
-			   まま最後に切り替わる。 */
-			visibility: hidden;
-			transition:
-				transform 0.2s ease,
-				visibility 0.2s ease;
-			box-shadow: 12px 0 32px rgba(0, 0, 0, 0.25);
-		}
+	/* #1159: ドロワーにする条件は `.offcanvas`（`mobileNavStore.drawerMode`: ≤900px、または
+	   メニューバーが入りきらない >900px）。幅のメディアクエリには頼らない。 */
+	aside.offcanvas {
+		position: fixed;
+		inset-block: 0;
+		left: 0;
+		z-index: 710;
+		width: min(var(--banto-shell-sidebar-width), 85vw);
+		transform: translateX(-100%);
+		/* #381 レビュー対応12回目: `visibility` も落とす（上の markup の
+		   コメント参照 - transform だけだと退避中もフォーカス・判定に残る）。
+		   `visibility` は離散なので、閉じるアニメーションの間は `visible` の
+		   まま最後に切り替わる。 */
+		visibility: hidden;
+		transition:
+			transform 0.2s ease,
+			visibility 0.2s ease;
+		box-shadow: 12px 0 32px rgba(0, 0, 0, 0.25);
+	}
 
-		/*
-		 * #399（2026-09-23）: **開くときは `visibility` を遷移させず即座に
-		 * `visible` にする**（遷移させるのは閉じるときだけ）。`visibility` の
-		 * 補間は「p=0 は始点の値」なので、`hidden → visible` を 0.2s で遷移
-		 * させると**開いた直後、最初のアニメーションフレームが進むまで計算値が
-		 * `hidden` のまま**になる。そのあいだ `@banto/ui` の `layering.ts::isActiveLayer` は
-		 * 開いたサイドバー（`data-esc-layer` 付き）を「層ではない」と判定し、
-		 * 退避ツリー内にフォーカスがある Esc がツリーを先に閉じていた
-		 * （CI の遅いランナーでだけ踏む。E2E テスト31のフレーク）。
-		 * `transition-*` は変化後のスタイルの値が使われるので、`.open` 側だけ
-		 * `visibility 0s` にすれば、閉じるときは従来どおり最後に `hidden` へ
-		 * 切り替わる。
-		 */
-		aside.offcanvas.open {
-			transform: translateX(0);
-			visibility: visible;
-			transition:
-				transform 0.2s ease,
-				visibility 0s;
-		}
+	/*
+	 * #399（2026-09-23）: **開くときは `visibility` を遷移させず即座に
+	 * `visible` にする**（遷移させるのは閉じるときだけ）。`visibility` の
+	 * 補間は「p=0 は始点の値」なので、`hidden → visible` を 0.2s で遷移
+	 * させると**開いた直後、最初のアニメーションフレームが進むまで計算値が
+	 * `hidden` のまま**になる。そのあいだ `@banto/ui` の `layering.ts::isActiveLayer` は
+	 * 開いたサイドバー（`data-esc-layer` 付き）を「層ではない」と判定し、
+	 * 退避ツリー内にフォーカスがある Esc がツリーを先に閉じていた
+	 * （CI の遅いランナーでだけ踏む。E2E テスト31のフレーク）。
+	 * `transition-*` は変化後のスタイルの値が使われるので、`.open` 側だけ
+	 * `visibility 0s` にすれば、閉じるときは従来どおり最後に `hidden` へ
+	 * 切り替わる。
+	 */
+	aside.offcanvas.open {
+		transform: translateX(0);
+		visibility: visible;
+		transition:
+			transform 0.2s ease,
+			visibility 0s;
 	}
 
 	.brand {
