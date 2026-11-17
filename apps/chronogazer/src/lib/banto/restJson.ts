@@ -53,7 +53,7 @@ async function errorFromResponse(response: Response): Promise<ProviderError> {
 }
 
 export interface RestJsonInit {
-	method: 'GET' | 'PUT' | 'POST';
+	method: 'GET' | 'PUT' | 'POST' | 'DELETE';
 	body?: unknown;
 	/** トークンを付けない（`GET /api/host` は認証なしで読める）。 */
 	anonymous?: boolean;
@@ -78,5 +78,7 @@ export async function restJson<T>(path: string, init: RestJsonInit): Promise<T> 
 		throw new ProviderError({ kind: 'other', message: NETWORK_ERROR_MESSAGE });
 	}
 	if (!response.ok) throw await errorFromResponse(response);
+	// 本文の無い成功（`DELETE` の 204）は `undefined`（呼び出し側は `restJson<void>`）。
+	if (response.status === 204) return undefined as T;
 	return (await response.json()) as T;
 }

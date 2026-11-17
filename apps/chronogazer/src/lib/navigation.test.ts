@@ -21,6 +21,7 @@ describe('navItems の並び（改善案の順、#1159）', () => {
 			'グループ設定',
 			'ユーザー管理',
 			'監査ログ',
+			'API キー',
 			'設定'
 		]);
 	});
@@ -69,7 +70,8 @@ describe('navBarEntries', () => {
 		const group = entries.find((entry) => entry.kind === 'group');
 		expect(group?.kind === 'group' && group.items.map((item) => item.label)).toEqual([
 			'ユーザー管理',
-			'監査ログ'
+			'監査ログ',
+			'API キー'
 		]);
 	});
 
