@@ -127,6 +127,7 @@ export const navItems: NavItem[] = [
 	{ path: '/groups', label: 'グループ設定', icon: '🗂️' },
 	{ path: '/users', label: 'ユーザー管理', icon: '👤', adminOnly: true },
 	{ path: '/audit-log', label: '監査ログ', icon: '🧾', adminOnly: true },
+	{ path: '/api-keys', label: 'API キー', icon: '🔑', adminOnly: true },
 	{ path: '/settings/appearance', label: '設定', icon: '⚙️', activeMatch: '/settings' }
 ];
 
