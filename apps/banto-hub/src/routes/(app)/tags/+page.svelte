@@ -3383,7 +3383,9 @@
 		const focusForm = () => {
 			const host = document.querySelector<HTMLElement>('[data-testid="tag-settings-pane"]');
 			const first = host ? focusablesIn(host)[0] : undefined;
-			first?.focus();
+			// 閲覧者の読み取り専用のフォームは入力が disabled で、保存・削除も無いので
+			// `focusablesIn` が空になりうる。そのときはペイン自体（`tabindex="-1"`）へ。
+			(first ?? host)?.focus();
 		};
 		if (layoutNarrow && treeOpen) {
 			// 狭幅でツリーのドロワーが開いている間、部品は中央を `inert` にしている
@@ -7622,7 +7624,7 @@
 	サーバーも予約の接続の更新・削除を断る）。配下の収集グループの一覧と追加は残す。
 -->
 {#snippet settingsPane()}
-	<div class="settings-pane" data-testid="tag-settings-pane">
+	<div class="settings-pane" data-testid="tag-settings-pane" tabindex="-1">
 		{#if settingsConnection}
 			<h3 class="settings-title">接続先「{settingsConnection.name}」の設定</h3>
 			<ConnectionDrawer
