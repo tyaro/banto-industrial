@@ -1095,6 +1095,12 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		// アンマウントされ、戻し先が無くなっていた。#1179 PR2b から、トグルは
 		// `ThreePaneLayout` の帯に広幅でも（畳むトグルとして）残るので、
 		// フォーカスはトグルに留まる。どちらにせよ `<body>` に落ちないことを見る。
+		//
+		// 31c はツリーを開いたまま終わる。開いているあいだトグルは `inert` の中央に
+		// あってフォーカスを受けないので、先に閉じる（Esc で閉じるとフォーカスは
+		// トグルへ戻る）。
+		await page.keyboard.press('Escape');
+		await expect(treePane).toBeHidden();
 		await treeToggle.focus();
 		await expect(treeToggle).toBeFocused();
 
