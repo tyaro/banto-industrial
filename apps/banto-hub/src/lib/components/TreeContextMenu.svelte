@@ -1,7 +1,7 @@
 <script lang="ts">
 	/**
 	 * 汎用部品（T18-2e、docs/banto-hub-t18-design.md「T18-2e T13-3 移管」、
-	 * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A/TAG-UX-G）: `TreeView.svelte`
+	 * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A/TAG-UX-G）: ツリー（`BantoTree`）
 	 * の `oncontextmenu`（マウス右クリック・`Shift+F10`/メニューキーのどちらも
 	 * ここに集約済み）が渡す座標に浮かべる、ARIA `menu` パターンの小さな
 	 * ポップアップ。`CommandPalette.svelte`（ウィンドウ外クリックで閉じる・

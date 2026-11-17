@@ -301,13 +301,18 @@
 		return 'すべて';
 	});
 
-	function handleTreeSelect(data: ConnectionTreeNodeData): void {
+	function handleTreeSelect(
+		data: ConnectionTreeNodeData,
+		{ navigation }: { navigation: boolean }
+	): void {
 		if (data.kind === 'all') treeFilter = { type: 'all' };
 		else if (data.kind === 'connection')
 			treeFilter = { type: 'connection', id: data.connection.id };
 		else treeFilter = { type: 'group', id: data.group.id };
-		// #378: 狭幅では選んだ時点で退避パネルを閉じる（タグ登録ページと同じ）。
-		if (mobileNavStore.isNarrow) treeOpen = false;
+		// #378: 狭幅では「選んだ」時点（クリック・Space・Enter）で退避パネルを
+		// 閉じる（タグ登録ページと同じ）。上下キーなどフォーカス移動に付いてきた
+		// 選択（`navigation`）では閉じない。
+		if (mobileNavStore.isNarrow && !navigation) treeOpen = false;
 	}
 
 	// --- T18-4c: 確認導線のディープリンク受け口 -----------------------------

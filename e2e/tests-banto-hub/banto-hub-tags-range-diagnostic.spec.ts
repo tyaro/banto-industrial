@@ -35,7 +35,7 @@ function report(reason: string) {
 async function openEditor(page: Page, name: string) {
 	await page
 		.getByRole('tree')
-		.getByRole('button', { name: new RegExp(`^${name}`) })
+		.getByRole('treeitem', { name: new RegExp(`^${name}`) })
 		.click({ button: 'right' });
 	await page.getByRole('menuitem', { name: '接続を再設定', exact: true }).click();
 	const drawer = page.getByRole('dialog', { name: `${name} を編集`, exact: true });

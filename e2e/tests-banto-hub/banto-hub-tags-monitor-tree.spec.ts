@@ -136,7 +136,7 @@ test.describe.serial('banto-hub モニタ Tree/検索 + 確認導線ディープ
 		await expect(page.getByText(EXTERNAL_B)).toBeVisible();
 
 		// グループ A ノードを選択（ラベルは「グループ名 (件数)」なので部分一致）。
-		await page.getByRole('tree').getByRole('button', { name: GROUP_A }).click();
+		await page.getByRole('tree').getByRole('treeitem', { name: GROUP_A }).click();
 
 		await expect(page.getByText(EXTERNAL_A)).toBeVisible();
 		await expect(page.getByText(EXTERNAL_B)).toHaveCount(0);

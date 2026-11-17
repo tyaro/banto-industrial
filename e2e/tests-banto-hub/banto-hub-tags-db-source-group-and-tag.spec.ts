@@ -73,7 +73,7 @@ function escapeRegExp(value: string): string {
 function connectionNodeByName(page: Page, name: string): Locator {
 	return page
 		.getByRole('tree')
-		.getByRole('button', { name: new RegExp(`^${escapeRegExp(name)}( |$)`) });
+		.getByRole('treeitem', { name: new RegExp(`^${escapeRegExp(name)}( |$)`) });
 }
 
 async function cleanupFixtures(

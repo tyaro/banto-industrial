@@ -1,32 +1,41 @@
 <script lang="ts">
 	/**
 	 * T13-1（docs/ux-plan.md §4b）: 接続（plc_connections）→ 収集グループの
-	 * 2階層を汎用部品 TreeView.svelte に流し込む、アプリ側コンポーネント。
-	 * banto-hub の型（PlcConnection/CollectionGroup/Tag）に依存する部分は
-	 * すべてここに閉じ込め、TreeView 自体はジェネリックなまま保つ
-	 * （汎用部品を `@banto/*` へ昇格する際、このファイルは banto-hub 側に
-	 * 残る想定 — docs/ux-plan.md §4b「実装の置き場所」参照）。
+	 * 2階層を、banto の `@banto/tree-svelte` の `BantoTree` に流し込む、
+	 * アプリ側コンポーネント。banto-hub の型（PlcConnection/CollectionGroup/
+	 * Tag）に依存する部分はすべてここに閉じ込める。
 	 *
-	 * 選択状態はこのコンポーネントが所有しない（tags ページ側が
-	 * `selectedId` を渡し、選択イベントで通知を受けるだけ）。
+	 * #1179 PR2a（2026-11-18）: 以前は自前の汎用部品 `TreeView.svelte` に
+	 * 流し込んでいたが、「重複実装は banto に寄せる」（オーナー方針）に従い
+	 * banto v7.3.0 の `BantoTree` に置き換えて `TreeView.svelte` を消した。
+	 * 置き換えでの対応:
+	 * - 選択はホスト主導（`selection` prop）。このコンポーネントは選択状態を
+	 *   所有しない（tags/monitor ページが `selectedId` を渡し、選択の通知を
+	 *   受けるだけ）のは以前と同じ。
+	 * - 新しいルートの自動展開と開閉状態の保持は `autoExpandNewRoots`。
+	 * - 右クリック・`Shift+F10`・メニューキーは `onContextMenu` に集約される。
+	 * - 行のアクセシブル名は `TreeNode.label`（`label` スニペットを使うと
+	 *   BantoTree は行の `aria-label` に `node.label` を出す）。以前の「ボタンの
+	 *   中身の文字」と同じ文字列（アイコンを除く名前＋バッジ・件数・周期）を
+	 *   `label` に入れて、E2E・支援技術から見える名前を変えない。
+	 * - 子グループが 0 件の接続の「収集グループ未登録」の案内は、BantoTree に
+	 *   空状態のスロットが無いため、選べない（`disabled`）子ノードとして出す。
+	 *   選択・右クリックはこのコンポーネントで捨てる。
 	 *
-	 * T18-6c（2026-08-27 オーナー決定、TAG-UX-9 見た目刷新）追記: ノード
-	 * 種別アイコン・グループの設定周期表示・空グループ案内行を追加する。
-	 * banto-hub 固有の意匠（アイコン絵文字・periodMs の表示フォーマット・
-	 * 「収集グループ未登録」の文言）はすべてこのファイルに閉じ込め、
-	 * TreeView.svelte はジェネリックな構造（階層別背景・枠線コンテナ・
-	 * 空状態スロット）だけを提供する。階層は「接続→収集グループ」の
-	 * 2階層のまま（タグはツリーに出さない）で変更しない。
+	 * T18-6c（2026-08-27 オーナー決定、TAG-UX-9 見た目刷新）: ノード種別
+	 * アイコン・グループの設定周期表示・空グループ案内行。banto-hub 固有の
+	 * 意匠（アイコン絵文字・periodMs の表示フォーマット・「収集グループ
+	 * 未登録」の文言）はすべてこのファイルに閉じ込める。階層は「接続→収集
+	 * グループ」の 2 階層のまま（タグはツリーに出さない）。
 	 */
-	import TreeView from './TreeView.svelte';
-	import type { TreeNode } from './treeTypes';
+	import { BantoTree, type TreeNode } from '@banto/tree-svelte';
 	import type { ConnectionTreeNodeData } from './connectionTreeTypes';
+	import { isNavigationKey } from './connectionTreeNav';
 	import { buildTagCountsByGroup, buildGroupsByConnection } from './connectionTreeBuild';
 	import {
 		isVirtualConnection,
 		isDbSourceConnection,
 		CALC_CONNECTION_NAME,
-		MEM_CONNECTION_NAME,
 		type PlcConnection,
 		type CollectionGroup,
 		type Tag
@@ -37,21 +46,26 @@
 		groups: CollectionGroup[];
 		tags: Tag[];
 		selectedId?: string | null;
-		onselect?: (data: ConnectionTreeNodeData) => void;
 		/**
-		 * T13-3（2026-08-08 オーナー決定、拡張点のみここで仕込む）:
-		 * TreeView の `oncontextmenu` をそのまま再公開する。tags ページは
-		 * まだ配線しない — 「すべて」ノードで新規接続、接続ノードで新規
-		 * グループ、グループノードで新規タグ、というコンテキストメニューは
-		 * T13-3 の作業。
+		 * ノードの選択の通知。`navigation: true` は、上下・Home・End・左右の
+		 * キーでフォーカスが動いたことに選択が付いてきた場合（BantoTree は単一
+		 * 選択でフォーカスに選択が付く）。クリック・Space・Enter（子の無い行の
+		 * 確定）は `false`。狭幅で退避パネルを閉じるのは `false` のときだけ。
 		 */
-		oncontextmenu?: (
-			node: TreeNode<ConnectionTreeNodeData>,
-			position: { x: number; y: number }
-		) => void;
+		onselect?: (data: ConnectionTreeNodeData, info: { navigation: boolean }) => void;
+		/**
+		 * T13-3 / T18-2e: ノードのコンテキストメニューの要求（マウス右クリック、
+		 * `Shift+F10`、メニューキー）。キー操作では行の左下を位置として渡す
+		 * （BantoTree の `onContextMenu`）。#1179 PR2a からは `onselect` と同じく
+		 * ノードの中身（data）だけを渡す。未指定ならブラウザ標準のメニューを出す。
+		 */
+		oncontextmenu?: (data: ConnectionTreeNodeData, position: { x: number; y: number }) => void;
 	}
 
 	let { connections, groups, tags, selectedId = null, onselect, oncontextmenu }: Props = $props();
+
+	/** ツリーの中だけで使う、「収集グループ未登録」の案内行の data。 */
+	type NodeData = ConnectionTreeNodeData | { kind: 'empty' };
 
 	// T18-5a（docs/banto-hub-t18-design.md「T18-5a 大量タグ性能」第1段）:
 	// tags/groups をそれぞれ1回だけ Map に集計する（O(T)/O(G)）。connections/
@@ -66,20 +80,68 @@
 		return tagCountsByGroup.get(groupId) ?? 0;
 	}
 
-	const nodes = $derived.by((): TreeNode<ConnectionTreeNodeData>[] => {
-		const allNode: TreeNode<ConnectionTreeNodeData> = { id: 'all', data: { kind: 'all' } };
-		const connectionNodes = connections.map((connection): TreeNode<ConnectionTreeNodeData> => {
+	/**
+	 * 行のアクセシブル名（= `TreeNode.label`）。以前の `TreeView` のボタンの
+	 * 中身から計算されていた名前と同じ文字列にする（行頭アイコンは
+	 * `aria-hidden` だったので含めない）。
+	 */
+	function connectionAccessibleName(connection: PlcConnection): string {
+		const badge = connectionBadge(connection);
+		return badge ? `${connection.name} ${badge}` : connection.name;
+	}
+
+	function groupAccessibleName(group: CollectionGroup): string {
+		const base = `${group.name} (${tagCountForGroup(group.id)}) ${formatPeriod(group.periodMs)}`;
+		return group.querySql !== null ? `${base} SQL` : base;
+	}
+
+	const nodes = $derived.by((): TreeNode<NodeData>[] => {
+		const allNode: TreeNode<NodeData> = { id: 'all', label: 'すべて', data: { kind: 'all' } };
+		const connectionNodes = connections.map((connection): TreeNode<NodeData> => {
 			const childGroups = groupsByConnection.get(connection.id) ?? [];
+			const children: TreeNode<NodeData>[] =
+				childGroups.length > 0
+					? childGroups.map((group): TreeNode<NodeData> => ({
+							id: `group:${group.id}`,
+							label: groupAccessibleName(group),
+							data: { kind: 'group', group, connection }
+						}))
+					: [
+							{
+								id: `empty:${connection.id}`,
+								label: '収集グループ未登録',
+								disabled: true,
+								data: { kind: 'empty' }
+							}
+						];
 			return {
 				id: `conn:${connection.id}`,
+				label: connectionAccessibleName(connection),
 				data: { kind: 'connection', connection },
-				children: childGroups.map((group): TreeNode<ConnectionTreeNodeData> => {
-					return { id: `group:${group.id}`, data: { kind: 'group', group, connection } };
-				})
+				children
 			};
 		});
 		return [allNode, ...connectionNodes];
 	});
+
+	/** id → data（選択の通知は id で来るので、data を引き直す）。 */
+	const dataById = $derived.by((): Map<string, NodeData> => {
+		const map = new Map<string, NodeData>();
+		const walk = (list: TreeNode<NodeData>[]): void => {
+			for (const node of list) {
+				if (node.data) map.set(node.id, node.data);
+				if (node.children) walk(node.children);
+			}
+		};
+		walk(nodes);
+		return map;
+	});
+
+	/** 案内行（と data の無いノード）を外して、ページへ渡す data にする。 */
+	function toPageData(data: NodeData | undefined): ConnectionTreeNodeData | null {
+		if (!data || data.kind === 'empty') return null;
+		return data;
+	}
 
 	/**
 	 * T18-6c: ノード種別アイコン（行頭）。実 PLC 接続は 🔌、`calc`/`mem`
@@ -125,61 +187,125 @@
 		return `${periodMs}ms`;
 	}
 
-	// TreeView は選択イベントをノード全体（TreeNode<T>）で通知するが、
-	// ConnectionTree の `onselect` prop は呼び出し側（tags ページ）の
-	// 使い勝手を優先してノードの中身（data）だけを渡す — ここで剥がす。
-	function handleSelect(node: TreeNode<ConnectionTreeNodeData>): void {
-		onselect?.(node.data);
+	// 選択の通知は id の配列で来る（単一選択なので先頭だけ）。既に選択中の
+	// ノードをもう一度選んでも通知する（以前の `TreeView` と同じ。狭幅で
+	// 退避パネルを閉じる契機になる）。案内行（disabled）は選べない。
+	function handleSelectionChange(ids: string[]): void {
+		const id = ids[0];
+		if (id === undefined) return;
+		const data = toPageData(dataById.get(id));
+		if (!data) return;
+		// 直前の入力がナビゲーションのキーなら、フォーカスに付いてきた選択。
+		const navigation = lastInputWasNavigation;
+		lastInputWasNavigation = false;
+		onselect?.(data, { navigation });
+	}
+
+	/**
+	 * 直前の入力が、フォーカスを動かすキーだったか。ツリーを包む要素で
+	 * `keydown`・`pointerdown` を capture で受けて記録する（BantoTree の
+	 * ハンドラより先に走るので、その中で呼ばれる `onSelectionChange` から読める）。
+	 * BantoTree の DOM やクラスには依存しない。
+	 */
+	let lastInputWasNavigation = false;
+
+	function handleKeydownCapture(event: KeyboardEvent): void {
+		lastInputWasNavigation = isNavigationKey(event.key);
+	}
+
+	function handlePointerdownCapture(): void {
+		lastInputWasNavigation = false;
+	}
+
+	/**
+	 * 子の無い行の Enter・ダブルクリック（BantoTree の `onActivate`）。選択済みの
+	 * 行でも「確定した」として通知する（狭幅で退避パネルを閉じる契機）。
+	 */
+	function handleActivate(node: TreeNode<NodeData>): void {
+		const data = toPageData(node.data);
+		if (data) onselect?.(data, { navigation: false });
+	}
+
+	function handleContextMenu(node: TreeNode<NodeData>, position: { x: number; y: number }): void {
+		const data = toPageData(node.data);
+		if (data) oncontextmenu?.(data, position);
 	}
 </script>
 
-<TreeView {nodes} {selectedId} onselect={handleSelect} {oncontextmenu}>
-	{#snippet label(node)}
-		{#if node.data.kind === 'all'}
-			<span class="icon" aria-hidden="true">📁</span>
-			<span class="label">すべて</span>
-		{:else if node.data.kind === 'connection'}
-			<span class="icon" aria-hidden="true">{connectionIcon(node.data.connection)}</span>
-			<span class="label">{node.data.connection.name}</span>
-			{#if connectionBadge(node.data.connection)}
-				<span
-					class="badge"
-					class:sim={node.data.connection.simulation &&
-						!isVirtualConnection(node.data.connection) &&
-						!isDbSourceConnection(node.data.connection)}
-					class:db={isDbSourceConnection(node.data.connection)}
-					title={isDbSourceConnection(node.data.connection)
-						? 'PostgreSQL 接続（DB Source、S1）'
-						: node.data.connection.simulation && !isVirtualConnection(node.data.connection)
-							? 'シミュレーション接続（実機ではありません）'
-							: undefined}>{connectionBadge(node.data.connection)}</span
-				>
-			{/if}
-		{:else if node.data.kind === 'group'}
-			<span class="icon" aria-hidden="true">⏱</span>
-			<span class="label">{node.data.group.name}</span>
-			<span class="count">({tagCountForGroup(node.data.group.id)})</span>
-			<span class="period">{formatPeriod(node.data.group.periodMs)}</span>
-			{#if node.data.group.querySql !== null}
-				<!--
-					S3（docs/banto-hub-external-db-design.md §7 row S3、実装指示5
-					「postgres グループは小さな『SQL』バッジを出す」）:
-					`querySql` が非 `null`（= postgres 接続配下）のグループにだけ
-					出す。接続ノードの「DB」バッジ（上）と同じ位置づけ - グループ
-					一覧の中でどれが DB Source かを一目で区別できるようにする。
-				-->
-				<span class="badge db" title="SQL（query_sql）を持つグループ（DB Source、S2）">SQL</span>
-			{/if}
+{#snippet nodeLabel(node: TreeNode<NodeData>)}
+	{#if node.data?.kind === 'all'}
+		<span class="icon" aria-hidden="true">📁</span>
+		<span class="label">すべて</span>
+	{:else if node.data?.kind === 'connection'}
+		{@const connection = node.data.connection}
+		<span class="icon" aria-hidden="true">{connectionIcon(connection)}</span>
+		<span class="label">{connection.name}</span>
+		{#if connectionBadge(connection)}
+			<span
+				class="badge"
+				class:sim={connection.simulation &&
+					!isVirtualConnection(connection) &&
+					!isDbSourceConnection(connection)}
+				class:db={isDbSourceConnection(connection)}
+				title={isDbSourceConnection(connection)
+					? 'PostgreSQL 接続（DB Source、S1）'
+					: connection.simulation && !isVirtualConnection(connection)
+						? 'シミュレーション接続（実機ではありません）'
+						: undefined}>{connectionBadge(connection)}</span
+			>
 		{/if}
-	{/snippet}
-	{#snippet emptyState(node)}
-		{#if node.data.kind === 'connection'}
-			収集グループ未登録
+	{:else if node.data?.kind === 'group'}
+		<span class="icon" aria-hidden="true">⏱</span>
+		<span class="label">{node.data.group.name}</span>
+		<span class="count">({tagCountForGroup(node.data.group.id)})</span>
+		<span class="period">{formatPeriod(node.data.group.periodMs)}</span>
+		{#if node.data.group.querySql !== null}
+			<!--
+				S3（docs/banto-hub-external-db-design.md §7 row S3、実装指示5
+				「postgres グループは小さな『SQL』バッジを出す」）:
+				`querySql` が非 `null`（= postgres 接続配下）のグループにだけ
+				出す。接続ノードの「DB」バッジ（上）と同じ位置づけ - グループ
+				一覧の中でどれが DB Source かを一目で区別できるようにする。
+			-->
+			<span class="badge db" title="SQL（query_sql）を持つグループ（DB Source、S2）">SQL</span>
 		{/if}
-	{/snippet}
-</TreeView>
+	{:else if node.data?.kind === 'empty'}
+		<!-- T18-6c: 子グループが1つも無い接続の下の淡色の案内行。 -->
+		<span class="empty-label">{node.label}</span>
+	{/if}
+{/snippet}
+
+<!--
+	T18-6c: ツリー全体を枠線＋角丸のコンテナに収め、内側でスクロールさせる
+	（以前は TreeView 側の `.tree-container` が持っていた）。
+-->
+<div
+	class="tree-container"
+	onkeydowncapture={handleKeydownCapture}
+	onpointerdowncapture={handlePointerdownCapture}
+>
+	<BantoTree
+		{nodes}
+		label={nodeLabel}
+		autoExpandNewRoots
+		selection={selectedId ? [selectedId] : []}
+		onSelectionChange={handleSelectionChange}
+		onActivate={handleActivate}
+		onContextMenu={oncontextmenu ? handleContextMenu : undefined}
+	/>
+</div>
 
 <style>
+	.tree-container {
+		height: 100%;
+		box-sizing: border-box;
+		overflow-y: auto;
+		padding: 0.4rem;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
+		background: var(--banto-surface);
+	}
+
 	.icon {
 		display: inline-block;
 		margin-right: 0.3rem;
@@ -217,5 +343,14 @@
 		margin-left: 0.3rem;
 		color: var(--banto-text-muted);
 		font-size: 0.75rem;
+	}
+
+	/*
+	 * 「収集グループ未登録」の案内行。BantoTree は disabled の行を半透明に
+	 * するので、色は既存の --banto-text-muted に落とすだけにする。
+	 */
+	.empty-label {
+		color: var(--banto-text-muted);
+		font-style: italic;
 	}
 </style>

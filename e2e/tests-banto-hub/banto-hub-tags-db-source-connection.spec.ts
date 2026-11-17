@@ -47,15 +47,15 @@ function escapeRegExp(value: string): string {
 /**
  * `banto-hub-auth.ts::groupNodeByName`と同じ理由: ツリーの接続ノードの
  * アクセシブル名は、DB Source 接続では「名前 + DB バッジ」の合成
- * （`ConnectionTree.svelte`の`.label`/`.badge`スパンがどちらもアクセシブル
- * 名に含まれる - アイコンだけ`aria-hidden`で除外される）になるため、
+ * （`ConnectionTree.svelte`が行の`TreeNode.label`に名前とバッジを入れ、それが
+ * `BantoTree`の行（`treeitem`）のアクセシブル名になる - アイコンは含めない）になるため、
  * `exact: true`の完全一致は成立しない。名前の直後が空白または文字列末尾
  * であることまで確認して、他の接続名の前方一致と衝突しないようにする。
  */
 function connectionNodeByName(page: Page, name: string): Locator {
 	return page
 		.getByRole('tree')
-		.getByRole('button', { name: new RegExp(`^${escapeRegExp(name)}( |$)`) });
+		.getByRole('treeitem', { name: new RegExp(`^${escapeRegExp(name)}( |$)`) });
 }
 
 async function cleanupFixtures(

@@ -252,7 +252,9 @@ test.describe.serial('banto-hub Drawer/Modal 誤爆クローズ防止 (2026-09-1
 			// （`ConnectionTree.svelte` の `⚠ SIM` バッジ、`connectionTreeBuild.ts`
 			// 参照）ため、ここは `exact: true` にできない - 部分一致で足りる
 			// （このテスト内で `CONNECTION_NAME` を含む他ノードは無い）。
-			const connectionNode = page.getByRole('tree').getByRole('button', { name: CONNECTION_NAME });
+			const connectionNode = page
+				.getByRole('tree')
+				.getByRole('treeitem', { name: CONNECTION_NAME });
 			await connectionNode.click({ button: 'right' });
 			await page.getByRole('menuitem', { name: '接続を再設定', exact: true }).click();
 			await expect(page.getByRole('dialog', { name: `${CONNECTION_NAME} を編集` })).toBeVisible();

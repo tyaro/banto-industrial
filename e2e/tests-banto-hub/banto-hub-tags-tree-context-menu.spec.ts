@@ -159,7 +159,9 @@ test.describe
 		// おり、非 exact だと部分一致で strict mode violation になる
 		// （実際にこの事故で本テストが1度落ちている - 他 spec が残す
 		// データと衝突しうる前提で名前ベースの取得は必ず exact にする）。
-		const calcNode = adminPage.getByRole('tree').getByRole('button', { name: 'calc', exact: true });
+		const calcNode = adminPage
+			.getByRole('tree')
+			.getByRole('treeitem', { name: 'calc', exact: true });
 		await expect(calcNode).toBeVisible();
 		await calcNode.click({ button: 'right' });
 
@@ -177,7 +179,9 @@ test.describe
 
 	test('2. virtual（calc）配下の収集グループを作成できる', async () => {
 		await adminPage.goto('/tags');
-		const calcNode = adminPage.getByRole('tree').getByRole('button', { name: 'calc', exact: true });
+		const calcNode = adminPage
+			.getByRole('tree')
+			.getByRole('treeitem', { name: 'calc', exact: true });
 		await calcNode.click({ button: 'right' });
 		await adminPage.getByRole('menuitem', { name: '収集グループを作成', exact: true }).click();
 
