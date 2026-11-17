@@ -125,5 +125,5 @@ function escapeRegExp(value: string): string {
 export function groupNodeByName(page: Page, name: string): Locator {
 	return page
 		.getByRole('tree')
-		.getByRole('button', { name: new RegExp(`^${escapeRegExp(name)} \\(`) });
+		.getByRole('treeitem', { name: new RegExp(`^${escapeRegExp(name)} \\(`) });
 }

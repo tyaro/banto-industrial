@@ -1,6 +1,6 @@
 /**
  * ConnectionTree.svelte（T13-1、docs/ux-plan.md §4b）のノードデータ型。
- * TreeView.svelte の `treeTypes.ts` と同じ理由で、.svelte のインスタンス
+ * 共有する型は .svelte のインスタンス
  * スクリプトから export せず素の .ts ファイルに置く（呼び出し側の
  * tags ページがこの型を import できるようにするため）。
  */

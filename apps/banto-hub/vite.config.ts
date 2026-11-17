@@ -29,6 +29,7 @@ export default defineConfig({
 			'@banto/forms',
 			'@banto/grid-svelte',
 			'@banto/theme',
+			'@banto/tree-svelte',
 			'@banto/ui'
 		]
 	},

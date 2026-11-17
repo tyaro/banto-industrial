@@ -133,7 +133,7 @@ test.describe.serial('banto-hub ドライバの接続の作成・再設定（R2b
 		await page.goto('/tags');
 		await page
 			.getByRole('tree')
-			.getByRole('button', { name: new RegExp(`^${CONN}`) })
+			.getByRole('treeitem', { name: new RegExp(`^${CONN}`) })
 			.click({ button: 'right' });
 		await page.getByRole('menuitem', { name: '接続を再設定', exact: true }).click();
 		const drawer = page.getByRole('dialog', { name: `${CONN} を編集`, exact: true });
@@ -177,7 +177,7 @@ test.describe.serial('banto-hub ドライバの接続の作成・再設定（R2b
 		await page.goto('/tags');
 		await page
 			.getByRole('tree')
-			.getByRole('button', { name: new RegExp(`^${CONN}`) })
+			.getByRole('treeitem', { name: new RegExp(`^${CONN}`) })
 			.click({ button: 'right' });
 		await page.getByRole('menuitem', { name: '接続を再設定', exact: true }).click();
 		const drawer = page.getByRole('dialog', { name: `${CONN} を編集`, exact: true });
@@ -218,7 +218,7 @@ test.describe.serial('banto-hub ドライバの接続の作成・再設定（R2b
 			await page.goto('/tags');
 			await page
 				.getByRole('tree')
-				.getByRole('button', { name: new RegExp(`^${CONN}`) })
+				.getByRole('treeitem', { name: new RegExp(`^${CONN}`) })
 				.click({ button: 'right' });
 			await page.getByRole('menuitem', { name: '接続を再設定', exact: true }).click();
 			const drawer = page.getByRole('dialog', { name: `${CONN} を編集`, exact: true });
@@ -339,7 +339,7 @@ test.describe.serial('banto-hub ドライバの接続の作成・再設定（R2b
 			await page.goto('/tags');
 			await page
 				.getByRole('tree')
-				.getByRole('button', { name: new RegExp(`^${CONN}`) })
+				.getByRole('treeitem', { name: new RegExp(`^${CONN}`) })
 				.click({ button: 'right' });
 			await page.getByRole('menuitem', { name: '接続を再設定', exact: true }).click();
 			const drawer = page.getByRole('dialog', { name: `${CONN} を編集`, exact: true });

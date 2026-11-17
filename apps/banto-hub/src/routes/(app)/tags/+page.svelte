@@ -5,8 +5,8 @@
 	 * （一括/連続登録込み）をコピーしない」）。
 	 *
 	 * T13-1（2026-08-08、docs/ux-plan.md §4b）: master-detail レイアウトへ
-	 * 刷新。左は ConnectionTree（接続→収集グループの2階層、汎用部品
-	 * TreeView.svelte を流し込むアプリ側コンポーネント）、右はツールバー
+	 * 刷新。左は ConnectionTree（接続→収集グループの2階層、banto の
+	 * BantoTree を流し込むアプリ側コンポーネント。#1179 PR2a まで自前の TreeView）、右はツールバー
 	 * + 画面全高の BantoGrid。フォームは通常登録・行クリック編集・連続
 	 * 登録・CSVインポートの4フローすべてを Drawer（汎用部品、右スライド
 	 * オーバー）に収める。フォームの状態管理・検証・dry-run フローの
@@ -45,7 +45,6 @@
 	import ConnectionDrawer from '#lib/components/ConnectionDrawer.svelte';
 	import CollectionGroupDrawer from '#lib/components/CollectionGroupDrawer.svelte';
 	import type { ConnectionTreeNodeData } from '#lib/components/connectionTreeTypes.js';
-	import type { TreeNode } from '#lib/components/treeTypes.js';
 	import {
 		listTags,
 		createTag,
@@ -3208,7 +3207,7 @@
 	/**
 	 * T18-2e（docs/banto-hub-t18-design.md「T18-2e T13-3 移管」、
 	 * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A）: ツリーの右クリック
-	 * （`ConnectionTree`/`TreeView` の `oncontextmenu` - マウス右クリックと
+	 * （`ConnectionTree`/`BantoTree` の `oncontextmenu` - マウス右クリックと
 	 * `Shift+F10`/メニューキーの両方がここに集約される）から出す、階層に
 	 * 応じたメニュー。常時表示の「新規登録」等の主操作
 	 * （`openCreateDrawer`/上のツールバー）はそのまま残す - このメニューは
@@ -3260,7 +3259,7 @@
 	 * 返す）- その場合も選択だけは反映してメニューは出さない。
 	 */
 	function handleTreeContextMenu(
-		node: TreeNode<ConnectionTreeNodeData>,
+		data: ConnectionTreeNodeData,
 		position: { x: number; y: number }
 	): void {
 		// #381 レビュー対応C: 選択は反映するが、**狭幅でも退避パネルは閉じない**
@@ -3271,8 +3270,8 @@
 		// メニューはツリーの上に重なって出るので、開いたままで問題ない
 		// （メニューの項目を選んで Drawer 等へ進む経路では、その Drawer が
 		// パネルより手前に出る）。
-		applyTreeSelection(node.data);
-		const items = resolveTreeContextMenuItemsForRole(node.data, canWrite);
+		applyTreeSelection(data);
+		const items = resolveTreeContextMenuItemsForRole(data, canWrite);
 		if (items.length === 0) {
 			treeContextMenu = null;
 			return;
