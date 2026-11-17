@@ -48,9 +48,24 @@ async fn fixture() -> Fixture {
 impl Fixture {
     /// キーを発行して `(平文, 監査の主体の表記)` を返す。
     async fn issue(&self, name: &str, scopes: &[&str]) -> (String, String) {
+        self.issue_with_expiry(name, scopes, None).await
+    }
+
+    /// 期限（エポックミリ秒）つきで発行する。サービスは期限を確かめない
+    /// （「未来に限る」のは REST だけ）ので、過去の期限で期限切れのキーも作れる。
+    async fn issue_with_expiry(
+        &self,
+        name: &str,
+        scopes: &[&str],
+        expires_at_ms: Option<i64>,
+    ) -> (String, String) {
         let issued = self
             .keys
-            .issue(name, scopes.iter().map(|s| s.to_string()).collect(), None)
+            .issue(
+                name,
+                scopes.iter().map(|s| s.to_string()).collect(),
+                expires_at_ms,
+            )
             .await
             .expect("issue");
         let label = format!("{}（{}）", issued.name, issued.prefix);
@@ -809,4 +824,286 @@ async fn mcp_tools_list_snapshot_matches() {
         actual == expected,
         "tools/list differs from tests/snapshots/mcp_tools_list.json; review the diff and regenerate with UPDATE_MCP_TOOLS_SNAPSHOT=1"
     );
+}
+
+/// §8: 期限切れは 401、一時停止（tripped）は 403 `key_tripped`。どちらも
+/// `resource: "api_keys"` の `denied` を `origin: "mcp"` で残す（REST と同じ照合）。
+#[tokio::test]
+async fn expired_and_tripped_keys_are_refused_and_audited_as_mcp() {
+    let fx = fixture().await;
+    let (expired, _) = fx.issue_with_expiry("expired", &["config"], Some(1)).await;
+    let (tripped, _) = fx.issue("tripped", &["config"]).await;
+    let tripped_id = fx
+        .keys
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|k| k.name == "tripped")
+        .unwrap()
+        .id;
+    fx.keys.trip(tripped_id).await.unwrap();
+
+    let (status, _) = fx.rpc(&expired, "ping", json!({})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, body) = fx.rpc(&tripped, "ping", json!({})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body, json!({ "error": "key_tripped" }));
+
+    let rows = fx.audit_rows().await;
+    for (reason, name) in [("expired", "expired"), ("tripped", "tripped")] {
+        let entry = rows
+            .iter()
+            .find(|r| {
+                r.action == "denied" && r.resource == "api_keys" && detail_of(r)["reason"] == reason
+            })
+            .unwrap_or_else(|| panic!("no {reason} entry: {rows:?}"));
+        assert_eq!(entry.origin, "mcp", "{reason}");
+        assert_eq!(entry.result, "denied", "{reason}");
+        let detail = detail_of(entry);
+        assert_eq!(detail["name"], name);
+        assert_eq!(detail["path"], "/mcp");
+    }
+    // ツールも走らない（一時停止のキーで tools/call しても 403）。
+    let (status, body) = fx
+        .rpc(
+            &tripped,
+            "tools/call",
+            json!({ "name": "list_connections", "arguments": {} }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+/// §8: キーを照合できない（DB の障害）ときは 500 で、JSON-RPC の応答もツールも
+/// 無く、`api_keys` の `denied` も残さない（誰か分からない）。直れば同じキーで通る。
+#[tokio::test]
+async fn an_unverifiable_key_is_500_without_running_tools_or_auditing() {
+    let fx = fixture().await;
+    let (key, _) = fx.issue("agent", &["config"]).await;
+    let (status, _) = fx.rpc(&key, "ping", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let before = fx.audit_rows().await.len();
+
+    sqlx::query("ALTER TABLE api_keys RENAME TO api_keys_gone")
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    let (status, body) = fx
+        .rpc(
+            &key,
+            "tools/call",
+            json!({ "name": "create_connection", "arguments": slmp_connection("x") }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(
+        body.get("result").is_none() && body.get("jsonrpc").is_none(),
+        "{body}"
+    );
+    // 監査は読め、api_keys の行は増えず、ツールも走っていない。
+    let rows = fx.audit_rows().await;
+    assert_eq!(rows.len(), before, "{rows:?}");
+    assert!(rows.iter().all(|r| r.resource != "api_keys"), "{rows:?}");
+
+    sqlx::query("ALTER TABLE api_keys_gone RENAME TO api_keys")
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    let listed = fx.call_ok(&key, "list_connections", json!({})).await;
+    assert_eq!(listed["connections"], json!([]));
+}
+
+/// 設定を変えるツール（読み取りの 13 個以外のすべて）に**正しい入力**を作る。
+/// ID は準備で作った実在の物。ここに無いツールがあれば、呼ぶ側のテストが落ちる
+/// （ツールを足したときにスコープの確かめから漏れないように）。
+struct ValidArgs {
+    conn_id: i64,
+    group_id: i64,
+    tag_id: i64,
+    revision: i64,
+    dg_id: i64,
+}
+
+impl ValidArgs {
+    fn for_tool(&self, tool: &str) -> Option<Value> {
+        let mut update_connection = slmp_connection_full("renamed");
+        update_connection["id"] = json!(self.conn_id);
+        Some(match tool {
+            "start_collection" | "stop_collection" | "restart_collection" => json!({}),
+            "create_connection" => slmp_connection("new-conn"),
+            "update_connection" => update_connection,
+            "delete_connection" => json!({ "id": self.conn_id, "confirm": true }),
+            "create_group" => {
+                json!({ "name": "new-g", "plcConnectionId": self.conn_id, "periodMs": 1000 })
+            }
+            "update_group" => json!({
+                "id": self.group_id, "name": "g-renamed", "plcConnectionId": self.conn_id,
+                "periodMs": 2000, "enabled": true
+            }),
+            "delete_group" => json!({ "id": self.group_id, "confirm": true }),
+            "create_tag" => json!({
+                "name": "new-t", "collectionGroupId": self.group_id, "address": "D200",
+                "dataType": "i16"
+            }),
+            "update_tag" => json!({
+                "id": self.tag_id, "name": "t-renamed", "collectionGroupId": self.group_id,
+                "address": "D100", "dataType": "i16", "unit": "℃",
+                "expectedRevision": self.revision, "rawLo": null, "rawHi": null,
+                "engLo": null, "engHi": null, "decimals": 1, "enabled": true
+            }),
+            "delete_tag" => json!({ "id": self.tag_id, "confirm": true }),
+            "set_threshold" => json!({
+                "tagId": self.tag_id, "thresholdLl": null, "thresholdL": null,
+                "thresholdH": 80.0, "thresholdHh": 90.0
+            }),
+            "create_display_group" => json!({ "name": "new-dg", "kind": "gauge" }),
+            "update_display_group" => json!({
+                "id": self.dg_id, "name": "dg-renamed", "kind": "digital",
+                "attributes": {}, "pens": []
+            }),
+            "reorder_display_groups" => json!({ "ids": [self.dg_id] }),
+            "delete_display_group" => json!({ "id": self.dg_id, "confirm": true }),
+            _ => return None,
+        })
+    }
+}
+
+/// 読み取りのツール（スコープ `read` で呼べる物）。
+const READ_TOOLS: [&str; 13] = [
+    "get_status",
+    "list_connections",
+    "get_connection",
+    "list_drivers",
+    "list_groups",
+    "get_group",
+    "list_tags",
+    "get_tag",
+    "list_display_groups",
+    "get_display_group",
+    "list_thresholds",
+    "get_threshold",
+    "read_values",
+];
+
+/// 設定と収集の状態の写し（変わっていないことの比較用）。
+async fn config_snapshot(fx: &Fixture, key: &str) -> Value {
+    let mut out = serde_json::Map::new();
+    for tool in [
+        "list_connections",
+        "list_groups",
+        "list_tags",
+        "list_thresholds",
+        "list_display_groups",
+        "get_status",
+    ] {
+        out.insert(tool.to_string(), fx.call_ok(key, tool, json!({})).await);
+    }
+    Value::Object(out)
+}
+
+/// §8: 設定を変えるツールは、正しい入力でも `read` のキーとスコープの無いキーの
+/// どちらでも `forbidden`（`isError`）で断られ、`denied`（`{tool}`・`mcp`）が残り、
+/// 設定は変わらない。入力の形の誤りで止まらないので、ops の中のスコープの確かめを
+/// 全ツールで直接確かめる。
+#[tokio::test]
+async fn every_changing_tool_is_refused_with_valid_input_for_read_and_scopeless_keys() {
+    let fx = fixture().await;
+    let (config_key, _) = fx.issue("setup", &["config"]).await;
+    let (read_key, read_label) = fx.issue("reader", &["read"]).await;
+    let (none_key, none_label) = fx.issue("nothing", &["read"]).await;
+    sqlx::query("UPDATE api_keys SET scopes = '[]' WHERE name = 'nothing'")
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+
+    // 準備（config のキーで、対象になる物を作っておく）。
+    let conn = fx
+        .call_ok(&config_key, "create_connection", slmp_connection("c1"))
+        .await;
+    let conn_id = conn["created"]["id"].as_i64().unwrap();
+    let group = fx
+        .call_ok(
+            &config_key,
+            "create_group",
+            json!({ "name": "g1", "plcConnectionId": conn_id, "periodMs": 1000 }),
+        )
+        .await;
+    let group_id = group["created"]["id"].as_i64().unwrap();
+    let tag = fx
+        .call_ok(
+            &config_key,
+            "create_tag",
+            json!({
+                "name": "t1", "collectionGroupId": group_id, "address": "D100",
+                "dataType": "i16"
+            }),
+        )
+        .await;
+    let tag_id = tag["created"]["id"].as_i64().unwrap();
+    let revision = tag["created"]["revision"].as_i64().unwrap();
+    let dg = fx
+        .call_ok(
+            &config_key,
+            "create_display_group",
+            json!({ "name": "L1", "kind": "trend" }),
+        )
+        .await;
+    let valid = ValidArgs {
+        conn_id,
+        group_id,
+        tag_id,
+        revision,
+        dg_id: dg["created"]["id"].as_i64().unwrap(),
+    };
+
+    let changing: Vec<String> = fx
+        .tool_names(&config_key)
+        .await
+        .into_iter()
+        .filter(|t| !READ_TOOLS.contains(&t.as_str()))
+        .collect();
+    assert!(changing.len() >= 15, "{changing:?}");
+    let before = config_snapshot(&fx, &config_key).await;
+    let denied_before = fx
+        .audit_rows()
+        .await
+        .iter()
+        .filter(|r| r.action == "denied")
+        .count();
+
+    for tool in &changing {
+        let args = valid
+            .for_tool(tool)
+            .unwrap_or_else(|| panic!("ValidArgs has no input for {tool}: add it"));
+        for key in [&read_key, &none_key] {
+            let result = fx.call(key, tool, args.clone()).await;
+            assert_eq!(result["isError"], true, "{tool}: {result}");
+            assert!(
+                result_text(&result).starts_with("forbidden"),
+                "{tool}: {result}"
+            );
+        }
+        let rows = fx.audit_rows().await;
+        for label in [&read_label, &none_label] {
+            let entry = rows
+                .iter()
+                .find(|r| {
+                    r.action == "denied"
+                        && r.actor_username.as_deref() == Some(label.as_str())
+                        && detail_of(r)["tool"] == tool.as_str()
+                })
+                .unwrap_or_else(|| panic!("no denied for {tool} by {label}"));
+            assert_eq!(entry.origin, "mcp");
+            assert_eq!(detail_of(entry), json!({ "tool": tool }));
+        }
+    }
+    let denied_after = fx
+        .audit_rows()
+        .await
+        .iter()
+        .filter(|r| r.action == "denied")
+        .count();
+    assert_eq!(denied_after - denied_before, changing.len() * 2);
+    assert_eq!(config_snapshot(&fx, &config_key).await, before);
 }
