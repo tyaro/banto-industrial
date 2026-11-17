@@ -47,6 +47,7 @@ const ERROR_KINDS = new Set([
 	'validation',
 	'unauthorized',
 	'forbidden',
+	'conflict',
 	'storage',
 	'other'
 ]);

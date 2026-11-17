@@ -17,6 +17,7 @@ const ERROR_KINDS = new Set([
 	'bad_request',
 	'unauthorized',
 	'forbidden',
+	'conflict',
 	'storage',
 	'other'
 ]);
