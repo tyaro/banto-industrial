@@ -57,6 +57,7 @@ pub const REVISION_CONFLICT_MESSAGE: &str = "他の人（または別の画面�
 /// 無い（一度も設定していない）タグは 0。
 #[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub struct TagThresholds {
     pub tag_id: i64,
     pub threshold_ll: Option<f64>,
@@ -93,6 +94,7 @@ impl TagThresholds {
 /// `expectedRevision` で渡す）。
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub struct TagThresholdsPayload {
     #[serde(default)]
     pub threshold_ll: Option<f64>,

@@ -262,6 +262,10 @@ mod api_key_tests;
 mod api_keys;
 #[cfg(test)]
 mod mcp_tests;
+// #1161 PR6: `GET /api/openapi.json`（API キーを通すルートの OpenAPI）。
+mod openapi;
+#[cfg(test)]
+mod openapi_tests;
 // #393: 表示グループ。ルーターは子モジュール（`rest/display_groups.rs`）に置く。
 use crate::display_groups::DisplayGroupService;
 mod display_groups;
@@ -526,6 +530,20 @@ type CollectState = CollectOps;
 /// `collect_status` も同じものを通る（経路によって公開する情報が割れない）。
 /// 起動失敗の理由が利用者へどこで伝わるかは `crate::collect` のモジュール
 /// doc「理由はどこで利用者に伝わるか」。
+#[utoipa::path(
+    get,
+    path = "/api/collect",
+    tag = "collect",
+    operation_id = "collect_status",
+    summary = "収集の状態",
+    description = "収集の現在の状態（停止・起動中・稼働中・対象なし・起動失敗）。起動失敗の理由は載せない。読み取り（`read` キーで足りる）。",
+    responses(
+        (status = 200, description = "収集の状態", body = CollectorStateView),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "ロールが足りない"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn collect_status_handler(State(state): State<CollectState>) -> Json<CollectorStateView> {
     Json(state.collect.state_view())
 }
@@ -545,6 +563,20 @@ async fn collect_status_handler(State(state): State<CollectState>) -> Json<Colle
 ///
 /// 応答には `serverNowMs`（応答を作った時点のサーバーの時刻、D-3b）が添わる
 /// （[`ValuesResponse`]。トレンドの表示の時計に使う）。
+#[utoipa::path(
+    get,
+    path = "/api/collect/values",
+    tag = "collect",
+    operation_id = "collect_values",
+    summary = "タグの現在値",
+    description = "タグごとの現在値（値・時刻・品質）。収集が走っていなければ `state: notRunning`。読み取り（`read` キーで足りる）。",
+    responses(
+        (status = 200, description = "現在値（`serverNowMs` 付き）", body = ValuesResponse),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "ロールが足りない"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn collect_values_handler(State(state): State<CollectState>) -> Json<ValuesResponse> {
     Json(state.collect.values_response())
 }
@@ -559,6 +591,20 @@ async fn collect_values_handler(State(state): State<CollectState>) -> Json<Value
 /// 各行の `simulation`（#413）は**走っている収集が**その接続をシミュレータ
 /// 相手に動かしているか（レジストリの今の値ではない）-
 /// [`crate::collect::ConnectionView`] の doc に理由と公開範囲の判断。
+#[utoipa::path(
+    get,
+    path = "/api/collect/connections",
+    tag = "collect",
+    operation_id = "collect_connections",
+    summary = "接続ごとの状態",
+    description = "接続ごとの状態（connected・reconnecting・stopped）とシミュレーション中かどうか。読み取り（`read` キーで足りる）。",
+    responses(
+        (status = 200, description = "接続の状態（キーは `conn:<id>`）", body = Readout<HashMap<String, ConnectionView>>),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "ロールが足りない"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn collect_connections_handler(
     State(state): State<CollectState>,
 ) -> Json<Readout<HashMap<String, ConnectionView>>> {
@@ -575,6 +621,8 @@ async fn collect_connections_handler(
 /// 最初の応答で返ってきた値を後続ブロックに渡す。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 struct CollectEventsQuery {
     #[serde(default)]
     offset: Option<u64>,
@@ -600,6 +648,21 @@ struct CollectEventsQuery {
 /// **収集が止まっていても読める**（`Readout::NotRunning` を返さない）- 過去の
 /// 記録であって走っているエンジンの覗き窓ではないため。走っているかどうかは
 /// `GET /api/collect` を併せて読むこと。
+#[utoipa::path(
+    get,
+    path = "/api/collect/events",
+    tag = "collect",
+    operation_id = "collect_events",
+    summary = "収集イベントの一覧",
+    description = "収集のイベント（接続の切断・しきい値の超過など）を新しい順に 1 ページ返す。収集が止まっていても読める。読み取り（`read` キーで足りる）。",
+    params(CollectEventsQuery),
+    responses(
+        (status = 200, description = "イベントの 1 ページ", body = Readout<CollectEventList>),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "ロールが足りない"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn collect_events_handler(
     State(state): State<CollectState>,
     Query(query): Query<CollectEventsQuery>,
@@ -618,14 +681,22 @@ async fn collect_events_handler(
 /// `BantoError::Validation`（422）にする。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 struct CollectHistoryQuery {
+    // #1161 PR6: 4 つとも欠けると 422 なので、文書では必須にする（型が `Option`
+    // なのは欠けたときに 422 の `field_errors` で項目ごとに返すため）。
     #[serde(default)]
+    #[param(required = true)]
     tag_ids: Option<String>,
     #[serde(default)]
+    #[param(required = true)]
     from_ms: Option<i64>,
     #[serde(default)]
+    #[param(required = true)]
     to_ms: Option<i64>,
     #[serde(default)]
+    #[param(required = true)]
     bins: Option<u64>,
 }
 
@@ -665,6 +736,22 @@ fn history_request_from_query(query: &CollectHistoryQuery) -> Result<HistoryRequ
 /// レジストリを読めなかったときは `unavailable` で、理由（ファイルのパスを
 /// 含みうる）は返さない。収集の操作キューは通らない。上限・形・割り切りは
 /// `crate::collect` の `history` モジュールの doc。読み取りなので監査しない。
+#[utoipa::path(
+    get,
+    path = "/api/collect/history",
+    tag = "collect",
+    operation_id = "collect_history",
+    summary = "直近の履歴",
+    description = "タグごとの履歴（間引いた最小・最大）。リアルタイムトレンドの初期窓向け。収集が止まっていても読める。読み取り（`read` キーで足りる）。",
+    params(CollectHistoryQuery),
+    responses(
+        (status = 200, description = "履歴", body = Readout<CollectHistory>),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "ロールが足りない"),
+        (status = 422, description = "入力の検証エラー（`field_errors` に項目ごとの理由）"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn collect_history_handler(
     State(state): State<CollectState>,
     Query(query): Query<CollectHistoryQuery>,
@@ -674,6 +761,20 @@ async fn collect_history_handler(
 }
 
 /// `POST /api/collect/start`（**`editor` 以上** - [`COLLECT_OPERATION_ROLE`]）。
+#[utoipa::path(
+    post,
+    path = "/api/collect/start",
+    tag = "collect",
+    operation_id = "collect_start",
+    summary = "収集の開始",
+    description = "収集を開始する。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。",
+    responses(
+        (status = 200, description = "操作の結果（`pending: true` は上限まで待ったがまだ終わっていない）", body = CollectOutcome),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "`read` キー（`config` スコープが無い）、または editor 未満のロール"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn collect_start_handler(
     State(state): State<CollectState>,
     actor: Actor,
@@ -692,6 +793,20 @@ async fn collect_start_handler(
 }
 
 /// `POST /api/collect/stop`（**`editor` 以上** - [`COLLECT_OPERATION_ROLE`]）。
+#[utoipa::path(
+    post,
+    path = "/api/collect/stop",
+    tag = "collect",
+    operation_id = "collect_stop",
+    summary = "収集の停止",
+    description = "収集を停止する。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。",
+    responses(
+        (status = 200, description = "操作の結果（`pending: true` は上限まで待ったがまだ終わっていない）", body = CollectOutcome),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "`read` キー（`config` スコープが無い）、または editor 未満のロール"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn collect_stop_handler(
     State(state): State<CollectState>,
     actor: Actor,
@@ -713,6 +828,20 @@ async fn collect_stop_handler(
 /// 反映する唯一の口**。接続・グループ・タグの CRUD が自動でこれを呼ぶことは
 /// しない（理由は `crate::collect` のモジュール doc「起動時の自動開始と、
 /// 「収集を再起動」だけが反映の口であること」）。
+#[utoipa::path(
+    post,
+    path = "/api/collect/restart",
+    tag = "collect",
+    operation_id = "collect_restart",
+    summary = "収集の再起動",
+    description = "収集を再起動する。レジストリ（接続・グループ・タグ）の変更を収集へ反映する唯一の操作。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。",
+    responses(
+        (status = 200, description = "操作の結果（`pending: true` は上限まで待ったがまだ終わっていない）", body = CollectOutcome),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "`read` キー（`config` スコープが無い）、または editor 未満のロール"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn collect_restart_handler(
     State(state): State<CollectState>,
     actor: Actor,
@@ -885,6 +1014,7 @@ pub fn reject_disallowed_connection_protocol(
 /// update, omission keeps the stored value at UPDATE time.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(utoipa::ToSchema)]
 pub struct PlcConnectionPayload {
     pub name: String,
     pub protocol: String,
@@ -893,6 +1023,7 @@ pub struct PlcConnectionPayload {
     #[serde(default)]
     pub simulation: Option<bool>,
     #[serde(default)]
+    #[schema(value_type = Object)]
     pub settings: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -937,12 +1068,14 @@ pub async fn update_plc_connection(
 /// Read DTO. Stored secret references are never returned.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub struct PlcConnectionResponse {
     pub id: i64,
     pub name: String,
     pub protocol: String,
     pub enabled: bool,
     pub simulation: bool,
+    #[schema(value_type = Object)]
     pub settings: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -984,6 +1117,7 @@ pub fn plc_connection_audit_detail(conn: &PlcConnection) -> serde_json::Value {
 /// 無い。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub struct CollectionGroupPayload {
     pub name: String,
     pub plc_connection_id: i64,
@@ -1037,6 +1171,7 @@ impl From<CollectionGroupPayload> for CollectionGroupInput {
 /// 版を確かめない後勝ち）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub struct TagPayload {
     pub name: String,
     pub collection_group_id: i64,
@@ -1138,18 +1273,62 @@ impl From<TagPayload> for TagInput {
 /// ツールも同じものを呼ぶ。読み取りのハンドラはフィールドのサービスを直接呼ぶ。
 type TagRegistryState = RegistryOps;
 
+#[utoipa::path(
+    get,
+    path = "/api/drivers",
+    tag = "drivers",
+    operation_id = "drivers_list",
+    summary = "ドライバの一覧",
+    description = "利用できる通信ドライバと設定項目の定義。読み取り（`read` キーで足りる）。",
+    responses(
+        (status = 200, description = "ドライバの一覧", body = Vec<banto_tags::driver_catalog::DriverListItem>),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "ロールが足りない"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn drivers_list(
     State(state): State<TagRegistryState>,
 ) -> Json<Vec<banto_tags::driver_catalog::DriverListItem>> {
     Json(banto_tags::driver_catalog::driver_list(&state.drivers))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/plc-connections",
+    tag = "plc-connections",
+    operation_id = "plc_connections_list",
+    summary = "PLC 接続の一覧",
+    description = "PLC 接続の一覧。読み取り（`read` キーで足りる）。",
+    responses(
+        (status = 200, description = "PLC 接続の一覧", body = Vec<PlcConnectionResponse>),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "ロールが足りない"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn plc_connections_list(
     State(state): State<TagRegistryState>,
 ) -> Result<Json<Vec<PlcConnectionResponse>>, ApiError> {
     Ok(Json(state.list_connections().await?))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/plc-connections/{id}",
+    tag = "plc-connections",
+    operation_id = "plc_connections_get",
+    summary = "PLC 接続の取得",
+    description = "PLC 接続を 1 件返す。読み取り（`read` キーで足りる）。",
+    params(("id" = i64, Path, description = "対象の id")),
+    responses(
+        (status = 200, description = "PLC 接続", body = PlcConnectionResponse),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "ロールが足りない"),
+        (status = 404, description = "指定の id が無い"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn plc_connections_get(
     State(state): State<TagRegistryState>,
     Path(id): Path<i64>,
@@ -1157,6 +1336,22 @@ async fn plc_connections_get(
     Ok(Json(state.get_connection(id).await?))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/plc-connections",
+    tag = "plc-connections",
+    operation_id = "plc_connections_create",
+    summary = "PLC 接続の作成",
+    description = "PLC 接続を作る。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。",
+    request_body = PlcConnectionPayload,
+    responses(
+        (status = 200, description = "作成したPLC 接続", body = PlcConnectionResponse),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "`read` キー（`config` スコープが無い）、または editor 未満のロール"),
+        (status = 422, description = "入力の検証エラー（`field_errors` に項目ごとの理由）"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn plc_connections_create(
     State(state): State<TagRegistryState>,
     actor: Actor,
@@ -1175,6 +1370,24 @@ async fn plc_connections_create(
     Ok(Json(created))
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/plc-connections/{id}",
+    tag = "plc-connections",
+    operation_id = "plc_connections_update",
+    summary = "PLC 接続の更新",
+    description = "PLC 接続を更新する（全項目を送る）。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。",
+    params(("id" = i64, Path, description = "対象の id")),
+    request_body = PlcConnectionPayload,
+    responses(
+        (status = 200, description = "更新後のPLC 接続", body = PlcConnectionResponse),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "`read` キー（`config` スコープが無い）、または editor 未満のロール"),
+        (status = 404, description = "指定の id が無い"),
+        (status = 422, description = "入力の検証エラー（`field_errors` に項目ごとの理由）"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn plc_connections_update(
     State(state): State<TagRegistryState>,
     actor: Actor,
@@ -1195,6 +1408,23 @@ async fn plc_connections_update(
     Ok(Json(updated))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/plc-connections/{id}",
+    tag = "plc-connections",
+    operation_id = "plc_connections_delete",
+    summary = "PLC 接続の削除",
+    description = "PLC 接続を削除する。他から参照されているときは 422。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。",
+    params(("id" = i64, Path, description = "対象の id")),
+    responses(
+        (status = 204, description = "PLC 接続を削除した"),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "`read` キー（`config` スコープが無い）、または editor 未満のロール"),
+        (status = 404, description = "指定の id が無い"),
+        (status = 422, description = "入力の検証エラー（`field_errors` に項目ごとの理由）"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn plc_connections_delete(
     State(state): State<TagRegistryState>,
     actor: Actor,
@@ -1218,6 +1448,20 @@ async fn plc_connections_delete(
 /// の印）。判定は収集の開始と同じ `banto_collect::build_config_lenient_from`
 /// （[`crate::collect::registry_exclusions`] の doc）。Tauri の
 /// `config_exclusions_list` と同じ関数を呼ぶ。
+#[utoipa::path(
+    get,
+    path = "/api/config-exclusions",
+    tag = "config-exclusions",
+    operation_id = "config_exclusions_list",
+    summary = "収集から外れる設定",
+    description = "いまのレジストリで収集を開始したときに外される接続・グループ・タグと理由。読み取り（`read` キーで足りる）。",
+    responses(
+        (status = 200, description = "外される設定の一覧", body = Vec<ExclusionView>),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "ロールが足りない"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn config_exclusions_list(
     State(state): State<TagRegistryState>,
 ) -> Result<Json<Vec<ExclusionView>>, ApiError> {
@@ -1232,6 +1476,20 @@ async fn config_exclusions_list(
     ))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/collection-groups",
+    tag = "collection-groups",
+    operation_id = "collection_groups_list",
+    summary = "収集グループの一覧",
+    description = "収集グループの一覧。読み取り（`read` キーで足りる）。",
+    responses(
+        (status = 200, description = "収集グループの一覧", body = Vec<banto_tags::CollectionGroup>),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "ロールが足りない"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn collection_groups_list(
     State(state): State<TagRegistryState>,
 ) -> Result<Json<Vec<CollectionGroup>>, ApiError> {
@@ -1244,6 +1502,22 @@ async fn collection_groups_list(
     ))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/collection-groups/{id}",
+    tag = "collection-groups",
+    operation_id = "collection_groups_get",
+    summary = "収集グループの取得",
+    description = "収集グループを 1 件返す。読み取り（`read` キーで足りる）。",
+    params(("id" = i64, Path, description = "対象の id")),
+    responses(
+        (status = 200, description = "収集グループ", body = banto_tags::CollectionGroup),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "ロールが足りない"),
+        (status = 404, description = "指定の id が無い"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn collection_groups_get(
     State(state): State<TagRegistryState>,
     Path(id): Path<i64>,
@@ -1251,6 +1525,22 @@ async fn collection_groups_get(
     Ok(Json(state.collection_groups.get(id).await?))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/collection-groups",
+    tag = "collection-groups",
+    operation_id = "collection_groups_create",
+    summary = "収集グループの作成",
+    description = "収集グループを作る。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。",
+    request_body = CollectionGroupPayload,
+    responses(
+        (status = 200, description = "作成した収集グループ", body = banto_tags::CollectionGroup),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "`read` キー（`config` スコープが無い）、または editor 未満のロール"),
+        (status = 422, description = "入力の検証エラー（`field_errors` に項目ごとの理由）"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn collection_groups_create(
     State(state): State<TagRegistryState>,
     actor: Actor,
@@ -1269,6 +1559,24 @@ async fn collection_groups_create(
     Ok(Json(created))
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/collection-groups/{id}",
+    tag = "collection-groups",
+    operation_id = "collection_groups_update",
+    summary = "収集グループの更新",
+    description = "収集グループを更新する（全項目を送る）。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。",
+    params(("id" = i64, Path, description = "対象の id")),
+    request_body = CollectionGroupPayload,
+    responses(
+        (status = 200, description = "更新後の収集グループ", body = banto_tags::CollectionGroup),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "`read` キー（`config` スコープが無い）、または editor 未満のロール"),
+        (status = 404, description = "指定の id が無い"),
+        (status = 422, description = "入力の検証エラー（`field_errors` に項目ごとの理由）"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn collection_groups_update(
     State(state): State<TagRegistryState>,
     actor: Actor,
@@ -1289,6 +1597,23 @@ async fn collection_groups_update(
     Ok(Json(updated))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/collection-groups/{id}",
+    tag = "collection-groups",
+    operation_id = "collection_groups_delete",
+    summary = "収集グループの削除",
+    description = "収集グループを削除する。他から参照されているときは 422。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。",
+    params(("id" = i64, Path, description = "対象の id")),
+    responses(
+        (status = 204, description = "収集グループを削除した"),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "`read` キー（`config` スコープが無い）、または editor 未満のロール"),
+        (status = 404, description = "指定の id が無い"),
+        (status = 422, description = "入力の検証エラー（`field_errors` に項目ごとの理由）"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn collection_groups_delete(
     State(state): State<TagRegistryState>,
     actor: Actor,
@@ -1307,10 +1632,40 @@ async fn collection_groups_delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/tags",
+    tag = "tags",
+    operation_id = "tags_list",
+    summary = "タグの一覧",
+    description = "タグの一覧。読み取り（`read` キーで足りる）。",
+    responses(
+        (status = 200, description = "タグの一覧", body = Vec<banto_tags::Tag>),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "ロールが足りない"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn tags_list(State(state): State<TagRegistryState>) -> Result<Json<Vec<Tag>>, ApiError> {
     Ok(Json(state.tags.list(ListParams::default()).await?.rows))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/tags/{id}",
+    tag = "tags",
+    operation_id = "tags_get",
+    summary = "タグの取得",
+    description = "タグを 1 件返す。読み取り（`read` キーで足りる）。",
+    params(("id" = i64, Path, description = "対象の id")),
+    responses(
+        (status = 200, description = "タグ", body = banto_tags::Tag),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "ロールが足りない"),
+        (status = 404, description = "指定の id が無い"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn tags_get(
     State(state): State<TagRegistryState>,
     Path(id): Path<i64>,
@@ -1318,6 +1673,22 @@ async fn tags_get(
     Ok(Json(state.tags.get(id).await?))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/tags",
+    tag = "tags",
+    operation_id = "tags_create",
+    summary = "タグの作成",
+    description = "タグを作る。タグの `thresholdLl`・`thresholdL`・`thresholdH`・`thresholdHh` は値付きで送ると 422（しきい値は `/api/tag-thresholds/{tag_id}` で設定する）。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。",
+    request_body = TagPayload,
+    responses(
+        (status = 200, description = "作成したタグ", body = banto_tags::Tag),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "`read` キー（`config` スコープが無い）、または editor 未満のロール"),
+        (status = 422, description = "入力の検証エラー（`field_errors` に項目ごとの理由）"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn tags_create(
     State(state): State<TagRegistryState>,
     actor: Actor,
@@ -1374,6 +1745,25 @@ impl IntoResponse for RevisionConflictRejection {
     }
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/tags/{id}",
+    tag = "tags",
+    operation_id = "tags_update",
+    summary = "タグの更新",
+    description = "タグを更新する（全項目を送る）。タグの `thresholdLl`・`thresholdL`・`thresholdH`・`thresholdHh` は値付きで送ると 422（しきい値は `/api/tag-thresholds/{tag_id}` で設定する）。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。",
+    params(("id" = i64, Path, description = "対象の id")),
+    request_body = TagPayload,
+    responses(
+        (status = 200, description = "更新後のタグ", body = banto_tags::Tag),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "`read` キー（`config` スコープが無い）、または editor 未満のロール"),
+        (status = 404, description = "指定の id が無い"),
+        (status = 422, description = "入力の検証エラー（`field_errors` に項目ごとの理由）"),
+        (status = 409, description = "`expectedRevision` が古い（他で先に更新された。本文は `kind: validation`、`field_errors` の `expectedRevision`）"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn tags_update(
     State(state): State<TagRegistryState>,
     actor: Actor,
@@ -1394,6 +1784,23 @@ async fn tags_update(
     Ok(Json(updated))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/tags/{id}",
+    tag = "tags",
+    operation_id = "tags_delete",
+    summary = "タグの削除",
+    description = "タグを削除する。他から参照されているときは 422。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。",
+    params(("id" = i64, Path, description = "対象の id")),
+    responses(
+        (status = 204, description = "タグを削除した"),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "`read` キー（`config` スコープが無い）、または editor 未満のロール"),
+        (status = 404, description = "指定の id が無い"),
+        (status = 422, description = "入力の検証エラー（`field_errors` に項目ごとの理由）"),
+    ),
+    security(("api_key" = [])),
+)]
 async fn tags_delete(
     State(state): State<TagRegistryState>,
     actor: Actor,
@@ -1583,6 +1990,55 @@ fn tag_registry_router(
         .layer(middleware::from_fn_with_state(
             auth,
             require_session_or_api_key,
+        ))
+}
+
+/// #1161 PR4・PR6: API キーを**通す**ルートの集まり（明示して許す）。子ルーターの
+/// 認証は `require_session_or_api_key`、床は `ActorGuard` とハンドラの
+/// `require_editor`（`rest/actor.rs` のモジュール doc）。ここに入れずに足した
+/// ルーターは、banto の `require_auth` がキーを 401 で断る（既定は通さない）。
+///
+/// **`api_router` から関数に切り出したのは PR6（OpenAPI）のため**: `GET
+/// /api/openapi.json`（`rest/openapi.rs` の `ApiDoc`）はこの集まりだけを載せる。
+/// テスト（`rest/openapi_tests.rs`）がこの関数の返す Router の「METHOD path」と
+/// `ApiDoc` の paths を完全一致で突き合わせるので、キーを通すルートを足して
+/// 文書を忘れると落ちる。HUB 連携（`/api/hub*`・`/api/tags/from-hub`）は
+/// キーを通さないのでここに入れない。
+#[allow(clippy::too_many_arguments)]
+fn api_key_routes(
+    collect: CollectorService,
+    plc_connections: PlcConnectionService,
+    collection_groups: CollectionGroupService,
+    tags: TagService,
+    display_groups: DisplayGroupService,
+    hub: HubService,
+    audit: AuditLogService,
+    auth: AuthState,
+    collect_drivers: Arc<banto_driver_api::DriverRegistry>,
+) -> Router {
+    Router::new()
+        .merge(collect_router(collect, audit.clone(), auth.clone()))
+        .merge(display_groups::display_groups_router(
+            display_groups.clone(),
+            audit.clone(),
+            auth.clone(),
+        ))
+        // #532: しきい値は表示グループと同じ pool（呼び出し元の引数は増やさない。
+        // `DisplayGroupService::pool` の doc）。
+        .merge(tag_thresholds::tag_thresholds_router(
+            TagThresholdService::new(display_groups.pool().clone()),
+            audit.clone(),
+            auth.clone(),
+        ))
+        .merge(tag_registry_router(
+            plc_connections,
+            collection_groups,
+            tags,
+            display_groups,
+            hub,
+            audit,
+            auth,
+            collect_drivers,
         ))
 }
 
@@ -1787,37 +2243,21 @@ pub fn api_router(
             reject_api_key,
         ));
 
-    // #1161 PR4: キーを**通す**集まり（明示して許す）。子ルーターの認証は
-    // `require_session_or_api_key`、床は `ActorGuard` とハンドラの
-    // `require_editor`（`rest/actor.rs` のモジュール doc）。ここに入れずに足した
-    // ルーターは、banto の `require_auth` がキーを 401 で断る（既定は通さない）。
-    let api_key_routes = Router::new()
-        .merge(collect_router(collect, audit.clone(), auth.clone()))
-        .merge(display_groups::display_groups_router(
-            display_groups.clone(),
-            audit.clone(),
-            auth.clone(),
-        ))
-        // #532: しきい値は表示グループと同じ pool（呼び出し元の引数は増やさない。
-        // `DisplayGroupService::pool` の doc）。
-        .merge(tag_thresholds::tag_thresholds_router(
-            TagThresholdService::new(display_groups.pool().clone()),
-            audit.clone(),
-            auth.clone(),
-        ))
-        .merge(tag_registry_router(
-            plc_connections,
-            collection_groups,
-            tags,
-            display_groups,
-            hub,
-            audit,
-            auth,
-            collect_drivers,
-        ));
+    // #1161 PR4: キーを**通す**集まり（明示して許す）。合成は [`api_key_routes`]。
+    let key_routes = api_key_routes(
+        collect,
+        plc_connections,
+        collection_groups,
+        tags,
+        display_groups,
+        hub,
+        audit.clone(),
+        auth.clone(),
+        collect_drivers,
+    );
 
     session_only
-        .merge(api_key_routes)
+        .merge(key_routes)
         // #392 B2-1: Host の確認（status・grant・setup）と、未初期化の間の grant の
         // 扱い（`crate::local_grant::local_access_middleware`）。CSRF の確認の内側。
         .layer(middleware::from_fn_with_state(
@@ -1834,6 +2274,9 @@ pub fn api_router(
         // `crate::mcp::mcp_router` が自分で持つ。`api_router` を載せる listener
         // すべてに出る（REST の `/api/*` と同じ公開範囲）。
         .merge(mcp)
+        // #1161 PR6: OpenAPI の文書は秘密ではないので、`/mcp` と同じく層の外（認証・
+        // CSRF・キーの照合のどれも通さない。`rest/openapi.rs` のモジュール doc）。
+        .merge(openapi::openapi_router())
 }
 
 /// [`api_router`] に渡す、listener ごとの host の扱い（#392 B2-1）。
@@ -1926,6 +2369,27 @@ mod tests {
     async fn router_with_role_tokens() -> (Router, String, String, String) {
         let (router, admin, editor, viewer, _pool) = router_with_role_tokens_and_pool().await;
         (router, admin, editor, viewer)
+    }
+
+    /// [`api_key_routes`]（キーを通すルートの集まり）だけを、認証なしの層も付けずに
+    /// 返す（`rest/openapi_tests.rs` がルートの一覧を取る用。要求は流さない）。
+    pub(super) async fn api_key_routes_for_test() -> Router {
+        let pool = migrate_memory().await.expect("migrate_memory");
+        let settings = SettingsService::new(Db::Sqlite(pool.clone()));
+        let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
+        let collect = test_collector_service(pool.clone());
+        let drivers = collect.drivers().clone();
+        api_key_routes(
+            collect,
+            plc_connections,
+            collection_groups,
+            tags,
+            DisplayGroupService::new(pool.clone()),
+            test_hub_service(settings).await,
+            AuditLogService::new(Db::Sqlite(pool)),
+            demo_auth(),
+            drivers,
+        )
     }
 
     /// [`router_with_role_tokens`] plus the router's own pool - for tests

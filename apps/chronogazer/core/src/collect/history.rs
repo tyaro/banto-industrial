@@ -171,6 +171,7 @@ impl HistoryRequest {
 /// （このモジュールの doc「返すもの」）。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub struct HistoryPoint {
     /// 区間の始まり、または素通しのときはサンプルの時刻（UTC epoch ミリ秒）。
     pub t_ms: i64,
@@ -181,6 +182,7 @@ pub struct HistoryPoint {
 /// タグ 1 本の系列。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub struct HistorySeries {
     pub tag_id: i64,
     /// このタグの接続が**レジストリ上**シミュレーションか（記録されない。
@@ -196,6 +198,7 @@ pub struct HistorySeries {
 /// 履歴の読み出し結果（[`Readout::Ready`] の中身）。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub struct CollectHistory {
     /// 要求の期間をそのまま返す（両端を含む）。
     pub from_ms: i64,

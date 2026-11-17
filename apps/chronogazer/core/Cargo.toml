@@ -35,7 +35,10 @@ banto-mcp = { path = "../../../crates/banto-mcp" }
 # runtime)/R1-D (monitor screens). Added now as path deps so the workspace
 # member graph and Cargo.lock settle in R1-A rather than shifting again on
 # every later phase.
-banto-tags = { path = "../../../crates/banto-tags" }
+# #1161 PR6: REST の応答に出る型へ `ToSchema` を付ける `openapi` feature
+# （`GET /api/openapi.json`、`src/rest/openapi.rs`）。
+banto-tags = { path = "../../../crates/banto-tags", features = ["openapi"] }
+utoipa = { workspace = true }
 banto-plc = { path = "../../../crates/banto-plc" }
 banto-tstore = { path = "../../../crates/banto-tstore" }
 banto-collect = { path = "../../../crates/banto-collect" }

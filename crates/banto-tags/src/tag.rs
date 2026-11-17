@@ -301,6 +301,7 @@ pub fn validate_hub_tag_address(address: &str) -> Result<(), String> {
 /// A row of the `tags` table, wire-shaped (camelCase) for a future settings
 /// grid (recorder-requirements.md §6 "タグ設定" screen).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Tag {
     pub id: i64,

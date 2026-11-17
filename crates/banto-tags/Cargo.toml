@@ -6,6 +6,13 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+# #1161 PR6: ChronoGazer の `GET /api/openapi.json` のために、REST の応答に出る型
+# （`Tag`・`CollectionGroup`・`driver_catalog::DriverListItem`）へ `utoipa::ToSchema` を
+# 付ける。既定は off（HUB など他の利用者の依存・挙動は変わらない）。
+openapi = ["dep:utoipa"]
+
 [dependencies]
 banto-core = { workspace = true }
 banto-storage = { workspace = true, features = ["sqlite"] }
@@ -25,6 +32,7 @@ serde = { workspace = true }
 # `upgrade.rs`: the error type of the pre-0025 backup (shared by banto-hub and ChronoGazer).
 thiserror = { workspace = true }
 serde_json = { workspace = true }
+utoipa = { workspace = true, optional = true }
 # #623 PR3b: `upgrade.rs` がサービスの置き場（握ったフォルダ `ManagedDir`）で、0025 の前の
 # 作りかけのバックアップ・予行の写しを辿らず・握って扱う。既定の feature だけ（`sqlite` は
 # 使わない）。本番の依存は thiserror・windows-sys（どちらも既にある版）で、Cargo.lock に新しい

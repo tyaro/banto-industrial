@@ -6,6 +6,7 @@ use serde::Serialize;
 
 /// 一覧の 1 行。
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct DriverListItem {
     id: String,
@@ -13,9 +14,16 @@ pub struct DriverListItem {
     vendor: Option<String>,
     version: String,
     /// `{ "read", "write" }`（`banto-driver-api` の `serde` の形）。
+    #[cfg_attr(feature = "openapi", schema(value_type = Object))]
     capabilities: Capabilities,
+    /// `"tcp"` / `"serial"` / `"serial_over_tcp"` など（snake_case の文字列）。
+    #[cfg_attr(feature = "openapi", schema(value_type = Vec<String>))]
     transports: Vec<Transport>,
+    /// `{ "fields": [...] }`（`banto-driver-api` の `SettingsSchema` の `serde` の形）。
+    #[cfg_attr(feature = "openapi", schema(value_type = Object))]
     settings_schema: SettingsSchema,
+    /// `"bit"` ... `"f64"` / `"string"`（`KindName` は文字列で直列化される）。
+    #[cfg_attr(feature = "openapi", schema(value_type = Vec<String>))]
     supported_kinds: Vec<KindName>,
     address_help: String,
     /// `"frame"` / `"session"`（`"host"` はこの一覧に載らない。設計 §4.1 の語彙）。

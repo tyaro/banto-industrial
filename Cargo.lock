@@ -1287,6 +1287,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "utoipa",
  "zeroize",
 ]
 
@@ -1719,6 +1720,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "tower",
+ "utoipa",
  "windows-sys 0.61.2",
 ]
 

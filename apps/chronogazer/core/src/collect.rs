@@ -735,6 +735,7 @@ pub use history::{
 /// （その時点で走っている構成が無い）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub enum CollectorState {
     Stopped,
     Starting,
@@ -782,6 +783,7 @@ pub enum CollectorState {
 /// 分類と文言）だけ - 根拠は [`ExclusionView`] の doc。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub enum CollectorStateView {
     Stopped,
     Starting,
@@ -824,6 +826,7 @@ impl From<&CollectorState> for CollectorStateView {
 /// （`banto_collect::ExclusionUnit::as_str` と同じ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub enum ExclusionUnitView {
     Connection,
     Group,
@@ -864,6 +867,7 @@ impl From<ExclusionUnit> for ExclusionUnitView {
 /// 「発生源で分ける」）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub struct ExclusionView {
     pub unit: ExclusionUnitView,
     /// レジストリの行 id（`unit` に応じて接続・グループ・タグの id）。
@@ -1038,6 +1042,7 @@ pub const COLLECT_READ_ROLE: Role = Role::Viewer;
 /// 「理由はどこで利用者に伝わるか」）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub struct CollectOutcome {
     pub status: CollectorState,
     pub pending: bool,
@@ -1079,6 +1084,7 @@ impl CollectOutcome {
 /// このアプリの流儀）。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub enum Readout<T> {
     /// 収集が走っていない（停止中 / [`CollectorState::NoTargets`] /
     /// [`CollectorState::StartFailed`]）。**0 件ではない。**
@@ -1138,6 +1144,7 @@ impl<T> Readout<T> {
 /// 読まない」。値は常に `null`（[`CurrentSampleView::invalid`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub enum QualityView {
     Good,
     Bad,
@@ -1168,6 +1175,7 @@ impl From<Quality> for QualityView {
 /// 「非有限の浮動小数点は公開する形で正規化する」（#408 レビュー P2-2）。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub struct CurrentSampleView {
     /// スケーリング済みの値。**読めなかったサンプルは `None`**（`quality` が
     /// `bad`）- ここを 0 に潰さない。
@@ -1249,6 +1257,7 @@ impl From<&CurrentReading> for CurrentSampleView {
 /// 回数を出さない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub enum ConnectionStatusView {
     Connected,
     Reconnecting { attempt: u32 },
@@ -1281,7 +1290,7 @@ impl From<&ConnectionStatus> for ConnectionStatusView {
 /// しかも同じ真偽は `GET /api/plc-connections`（viewer 以上）で既に読める
 /// （こちらはレジストリ側の値）。載せない理由が無く、載せないと viewer が
 /// 「今の値は記録されているのか」を確かめる手段が無い。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct ConnectionView {
     #[serde(flatten)]
     pub status: ConnectionStatusView,
@@ -1336,6 +1345,7 @@ fn simulated_connection_keys(snapshot: &RegistrySnapshot) -> HashSet<String> {
 /// 種類を足すたびにこのアプリが**知らない種類を落とす**か失敗するようになる。
 #[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub struct CollectEventRow {
     pub id: i64,
     /// UTC epoch ミリ秒（`collect_events.ts`）。
@@ -1446,6 +1456,7 @@ impl Default for EventPage {
 ///   （空の世代の後続ブロックも同じ `0` を渡せば、同じ空集合を読む）。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub struct CollectEventList {
     pub rows: Vec<CollectEventRow>,
     pub total_count: u64,
@@ -3199,6 +3210,7 @@ fn hub_external_names(snapshot: &RegistrySnapshot) -> Option<Vec<String>> {
 /// 項目は変えない（`flatten`）。`serverNowMs` は `state` によらず必ず載る。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub struct ValuesResponse {
     #[serde(flatten)]
     pub readout: Readout<HashMap<String, CurrentSampleView>>,
