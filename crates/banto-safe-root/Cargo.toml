@@ -17,7 +17,7 @@ sqlite = ["dep:sqlx", "dep:libsqlite3-sys"]
 thiserror = { workspace = true }
 sqlx = { workspace = true, optional = true, features = ["runtime-tokio", "sqlite"] }
 # `sqlite3_file_control` と `SQLITE_FCNTL_PERSIST_WAL` を型付きで使う（sqlx-sqlite と同じ
-# 0.30 系。同梱の SQLite を入れる feature は sqlx-sqlite の側で決まる）。
+# 0.37 系。同梱の SQLite を入れる feature は sqlx-sqlite の側で決まる）。
 libsqlite3-sys = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]

@@ -21,4 +21,4 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 # テストの証明書を作る（banto-hub-core と同じ版・feature。新しい package は増えない）。
-rcgen = { version = "=0.14.7", default-features = false, features = ["crypto", "pem", "ring"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
