@@ -17,9 +17,8 @@
  *    確認が出る（`selectTag` → `confirmDiscardIfNeeded`、#375 で変えない
  *    と決めた挙動）。
  * 3. **Esc を押してもペインは閉じない。**「閉じる」ボタンで閉じる。
- * 4. 狭幅（`banto-hub-viewport-offcanvas.spec.ts` と同じブレークポイント
- *    `mobileNavStore.isNarrow` = `(max-width: 900px)`）では従来どおり
- *    オーバーレイの Drawer で出る。
+ * 4. 狭幅（#1179 PR2b から、枠（`ThreePaneLayout`）自身の幅が 900px 以下）
+ *    では従来どおりオーバーレイの Drawer で出る。
  *
  * ファイル名は `banto-hub-smoke.spec.ts` より辞書順で後（`banto-hub-auth.ts`
  * の注記参照）。前提データは UI ではなく `page.request` で直接 REST を叩いて
@@ -34,19 +33,19 @@ const TAG_A = 'e2e-edit-pane-tag-a';
 const TAG_B = 'e2e-edit-pane-tag-b';
 
 /**
- * 狭幅フォールバックの判定は `mobileNavStore.isNarrow`
- * （`NARROW_BREAKPOINT_QUERY = '(max-width: 900px)'`）で、
- * `banto-hub-viewport-offcanvas.spec.ts` のオフキャンバス退避と**同じ
- * ブレークポイント**（新しい値は発明していない）。
+ * 狭幅フォールバックの判定は、#1179 PR2b から枠（`@banto/ui` の
+ * `ThreePaneLayout`）自身の幅が 900px 以下か（部品の既定の
+ * `narrowBreakpoint`、ツリーの退避と同じ判定）。880px のビューポートでは
+ * サイドバーがオフキャンバスになり、枠の幅は 880px から余白を引いた分なので
+ * 狭幅に入る。
  *
  * ただしビューポート幅そのものは同スペックの 400px ではなく 880px を使う:
  * 400px だと左ツリーの固定幅 280px を引いた残り ≈120px にグリッドが
  * 押し込まれ、`.content { overflow: hidden }` で clip された行が
  * Playwright の actionability チェックを通らない（実測でクリックが
  * タイムアウトする）。狭幅でのグリッド最適化自体は TAG-UX-G のバックログで、
- * ここで検証したいのは「同じ `(max-width: 900px)` の内側なら Drawer へ
- * フォールバックするか」なので、同じメディアクエリに収まる中でグリッドを
- * 操作できる幅を選ぶ。
+ * ここで検証したいのは「狭幅なら Drawer へフォールバックするか」なので、
+ * 狭幅に収まる中でグリッドを操作できる幅を選ぶ。
  */
 const NARROW_VIEWPORT = { width: 880, height: 800 };
 

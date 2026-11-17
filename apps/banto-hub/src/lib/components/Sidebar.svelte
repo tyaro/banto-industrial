@@ -38,8 +38,8 @@
 
 	/**
 	 * #381 レビュー対応12回目（層の約束・項目6、`@banto/ui` の `layering.ts`）: **退避した
-	 * 瞬間、中にフォーカスが残っていたらいま見えている ☰ トグルへ逃がす**（`SplitPane` の
-	 * `focusFallback` と同じ役割）。オフキャンバスは閉じると `inert` になるので、
+	 * 瞬間、中にフォーカスが残っていたらいま見えている ☰ トグルへ逃がす**（`@banto/ui` の
+	 * `ThreePaneLayout` がペインを畳むときにトグルへ逃がすのと同じ役割）。オフキャンバスは閉じると `inert` になるので、
 	 * 中の項目にフォーカスが残っていると `<body>` へ落ちる - 実際に踏むのは
 	 * 「サイドバーの項目にフォーカス → コマンドパレットのナビ系コマンド →
 	 * `goto()` は待たれないのでパレットは先に閉じてその項目へ戻し、あとから
@@ -50,7 +50,8 @@
 	/**
 	 * #381 レビュー対応15回目: 開いているオフキャンバスを**層として名乗る**
 	 * （`@banto/ui` の `layering.ts::LAYER_MARKER_ATTR` = `data-esc-layer`）。`dialog`/`menu` を
-	 * 名乗らない常設ナビなので、これが無いと下の層（退避ツリー 610）から
+	 * 名乗らない常設ナビなので、これが無いと下の層（退避ツリー = `ThreePaneLayout` の
+	 * ドロワー）から
 	 * 「上に層がある」と見えず、Esc が下から閉じてしまう。z-index は属性ではなく
 	 * CSS の 710 を `effectiveZIndex` が読む。**属性名は定数と同じ文字列を
 	 * マークアップへ直書きしている**（Svelte の属性名に定数を展開できないため -
@@ -88,7 +89,7 @@
 	オフキャンバスは `inert`。`transform: translateX(-100%)` だけだと矩形も
 	`visibility` も残り、**画面外のナビ項目がフォーカスを受けられてしまう**
 	（`@banto/ui` の `layering.ts::canRestoreFocusTo` も「生きている」と判定する）。CSS 側でも
-	`visibility: hidden` を併用する（`SplitPane` の退避ペインと同じ形）。
+	`visibility: hidden` を併用する（`@banto/ui` の `ThreePaneLayout` のドロワーと同じ形）。
 -->
 <aside
 	id={SIDEBAR_ID}

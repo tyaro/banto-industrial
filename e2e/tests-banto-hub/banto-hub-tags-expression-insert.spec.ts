@@ -84,8 +84,8 @@ function waitForExpressionCheck(page: Page) {
 
 /**
  * #379 レビュー対応3: 狭幅フォールバックの確認に使うビューポート。#375 の
- * `banto-hub-tags-edit-pane.spec.ts` と同じ 880x800（`mobileNavStore.isNarrow`
- * = `(max-width: 900px)` の内側で、かつグリッドを操作できる幅。同 spec の
+ * `banto-hub-tags-edit-pane.spec.ts` と同じ 880x800（枠（`ThreePaneLayout`）の
+ * 幅が 900px 以下の狭幅になり、かつグリッドを操作できる幅。同 spec の
  * `NARROW_VIEWPORT` の注記参照）。
  */
 const NARROW_VIEWPORT = { width: 880, height: 800 };
@@ -458,10 +458,12 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 			await narrowPage.goto('/tags');
 
 			// #378（2026-09-16、v0.2.0-alpha.20）: 狭幅では左ツリーがオフキャンバスへ
-			// 退避するようになったので、ノードをクリックする前にツールバーの
-			// 「ツリー」ボタンで開く（選ぶと自動で閉じる）。広幅のケース（このスペックの
-			// 他のテスト）は従来どおりツリーが常時出ているので変更不要。
-			await narrowPage.getByTestId('tag-tree-toggle').click();
+			// 退避するようになったので、ノードをクリックする前に枠の帯の
+			// ツリーのトグル（#1179 PR2b から `ThreePaneLayout` の左ペインのトグル、
+			// 名前はペインと同じ「接続とグループ」）で開く（選ぶと自動で閉じる）。
+			// 広幅のケース（このスペックの他のテスト）は従来どおりツリーが常時
+			// 出ているので変更不要。
+			await narrowPage.locator('button[aria-label="接続とグループ"]').click();
 			await groupNodeByName(narrowPage, CALC_GROUP_NAME).click();
 			await narrowPage.getByRole('button', { name: '新規登録' }).click();
 

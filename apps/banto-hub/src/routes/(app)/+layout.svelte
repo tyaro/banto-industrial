@@ -56,16 +56,17 @@
 		// #381 レビュー対応（層の約束 - **正は `@banto/ui` の `layering.ts` の doc**）:
 		// サイドバー（z-index 710）は、より手前の層（Drawer/Modal 900、
 		// コマンドパレット・コンテキストメニュー 1000）には譲り、自分より下の層
-		// （タグ画面の退避ツリー 610、`SplitPane.svelte`）には**閉じたことを
-		// `preventDefault` で知らせる**。サイドバーは `role="dialog"` 等を
-		// 名乗らない常設ナビで `SplitPane` 側のセレクタからは見えないため
-		// （同部品は banto-hub の DOM を知らないアプリ非依存の規約）、この約束を
-		// 守るのはこちらの責務。
+		// （タグ・モニタ画面の退避ツリー = `@banto/ui` の `ThreePaneLayout` の
+		// ドロワー。枠の中の z-index 2）には**閉じたことを `preventDefault` で
+		// 知らせる**。部品のドロワーは開いているあいだ `data-esc-layer` の
+		// サイドバーを上位層として譲るが（`hasVisibleLayerAbove`）、window の
+		// リスナーの順序に依らず 1 回の Esc で 1 層だけ畳むため、消費を知らせるのは
+		// こちらの責務。
 		if (event.key === 'Escape') {
 			// #381 レビュー対応15回目: オフキャンバスが開いているあいだ、サイドバー
 			// 自身も層（`data-esc-layer`、z-index 710）として数えられるので、
 			// **自分を「上位層」と誤認して永遠に譲らないよう** `except` に渡す
-			// （Drawer 900・パレット 1000 には譲り、退避ツリー 610 には譲らない）。
+			// （Drawer 900・パレット 1000 には譲り、退避ツリー（枠の中の 2）には譲らない）。
 			// 要素は `Sidebar` から受け渡さず、マーカーで引く（`Sidebar` は開いて
 			// いるときだけこの属性を出す）。
 			const sidebarEl = document.querySelector(`[${LAYER_MARKER_ATTR}='sidebar']`);
