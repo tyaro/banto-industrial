@@ -380,6 +380,8 @@ mod tests {
             "display_group_pens",
             // #532: 記録計の側のタグごとの設定（0102_recorder_tag_settings.sql）。
             "recorder_tag_settings",
+            // #1161 PR4: API キー（0103_api_keys.sql）。
+            "api_keys",
         ] {
             let exists: Option<String> = sqlx::query_scalar(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -435,8 +437,8 @@ mod tests {
         .await
         .unwrap();
         // 2〜8 は admin-template のコピー、101 からはこの app 固有（#393 の表示グループ、
-        // #532 の記録計の側のタグごとの設定）。
-        assert_eq!(versions, vec![2, 3, 4, 5, 7, 8, 101, 102]);
+        // #532 の記録計の側のタグごとの設定、#1161 PR4 の API キー）。
+        assert_eq!(versions, vec![2, 3, 4, 5, 7, 8, 101, 102, 103]);
         let has_auth_epoch: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'auth_epoch'",
         )
@@ -515,7 +517,7 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(versions, vec![2, 3, 4, 5, 7, 8, 101, 102]);
+        assert_eq!(versions, vec![2, 3, 4, 5, 7, 8, 101, 102, 103]);
         let after: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pragma_table_info('audit_log') WHERE name = 'pending_id'",
         )
