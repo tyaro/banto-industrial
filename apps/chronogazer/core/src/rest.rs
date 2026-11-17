@@ -684,13 +684,19 @@ async fn collect_events_handler(
 #[derive(utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 struct CollectHistoryQuery {
+    // #1161 PR6: 4 つとも欠けると 422 なので、文書では必須にする（型が `Option`
+    // なのは欠けたときに 422 の `field_errors` で項目ごとに返すため）。
     #[serde(default)]
+    #[param(required = true)]
     tag_ids: Option<String>,
     #[serde(default)]
+    #[param(required = true)]
     from_ms: Option<i64>,
     #[serde(default)]
+    #[param(required = true)]
     to_ms: Option<i64>,
     #[serde(default)]
+    #[param(required = true)]
     bins: Option<u64>,
 }
 

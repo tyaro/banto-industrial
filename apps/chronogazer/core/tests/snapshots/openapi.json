@@ -1642,7 +1642,7 @@
           {
             "in": "query",
             "name": "tagIds",
-            "required": false,
+            "required": true,
             "schema": {
               "type": "string"
             }
@@ -1650,7 +1650,7 @@
           {
             "in": "query",
             "name": "fromMs",
-            "required": false,
+            "required": true,
             "schema": {
               "format": "int64",
               "type": "integer"
@@ -1659,7 +1659,7 @@
           {
             "in": "query",
             "name": "toMs",
-            "required": false,
+            "required": true,
             "schema": {
               "format": "int64",
               "type": "integer"
@@ -1668,7 +1668,7 @@
           {
             "in": "query",
             "name": "bins",
-            "required": false,
+            "required": true,
             "schema": {
               "format": "int64",
               "minimum": 0,
