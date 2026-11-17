@@ -161,6 +161,9 @@
 			transform 0.2s ease,
 			visibility 0.2s ease;
 		box-shadow: 12px 0 32px rgba(0, 0, 0, 0.25);
+		/* 背の低い画面（横向きのスマートフォンなど）でもすべての項目に届くよう、ドロワー自身を
+		   縦にスクロールさせる（banto-hub の `Sidebar.svelte` の `aside` と同じ）。 */
+		overflow-y: auto;
 	}
 
 	/* 開くときは `visibility` を遷移させず即座に `visible` にする（banto-hub #399: 遷移させると
