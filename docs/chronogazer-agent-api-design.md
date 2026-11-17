@@ -1,7 +1,7 @@
 # ChronoGazer の AI エージェント向け API（API キー・MCP・OpenAPI）設計
 
 作成日: 2026-11-17
-状態: **実装中**（2026-11-17）。PR2〜PR5（#1167〜#1173、HUB の共有 crate・ChronoGazer の API キー・MCP）はマージ済み、PR6（OpenAPI、§6）を実装中。§2 の決定は 2026-11-17 のオーナー決定。実装は §9 の PR の順に進め、各 PR でこの行と §9 の表を更新する。
+状態: **実装済み**（2026-11-17）。§9 の PR1〜PR6（#1166〜#1174）はすべてマージ済み。§2 の決定は 2026-11-17 のオーナー決定。残りは §10 の未決事項と、実際の MCP クライアントでの動作確認。
 
 関連: [ChronoGazer 画面改善案](chronogazer-ui-improvement-proposal.md) §8（AI エージェントからの設定）・§5.2（LAN の通信）、[HUB の MCP リファレンス](banto-hub-mcp-reference.md)、[HUB の構成補助 MCP（T21）](banto-hub-t21-design.md)、Issue #1161。
 
@@ -211,7 +211,7 @@ HUB の `apps/banto-hub/core/src/mcp.rs` から骨組みを移す。
 | 3   | `crates/banto-api-keys` と HUB の移行                                            | マージ済み（#1168）        |
 | 4   | ChronoGazer の API キー（表・REST・画面）と `/api/*` での受け付け・`Actor`・監査 | マージ済み（#1169・#1170） |
 | 5   | ChronoGazer の MCP のツールと処理の切り出し（§5.4）                              | マージ済み（#1171・#1173） |
-| 6   | ChronoGazer の OpenAPI                                                           | 実装中                     |
+| 6   | ChronoGazer の OpenAPI                                                           | マージ済み（#1174）        |
 
 2 と 3 は互いに依存しない。4 は 3 の後、5 は 2 と 4 の後、6 は 4 の後に入れる。
 
