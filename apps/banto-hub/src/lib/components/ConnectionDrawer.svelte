@@ -240,6 +240,18 @@
 		 * ころには DOM に居ないため、呼び出し側が代わりの要素を指定できる。
 		 */
 		focusFallback?: () => HTMLElement | null | undefined;
+		/**
+		 * #1179 PR3a（docs/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、
+		 * 2026-11-17 オーナー決定「中央のタブ『設定』」）: `true` なら再設定
+		 * フォーム（`connection` 非 `null`）を `Drawer` の外枠なしで、その場に描く
+		 * （タグページの「設定」タブに埋め込む）。フォーム・dirty 判定（時計の
+		 * 設定を含む）・読み取り専用・保存（Drawer と同じく閉じない）・削除
+		 * （`onDeleted` の完了を待ってから `onClose`）は Drawer と同じ実装を
+		 * そのまま使う。外枠が無いので Esc・オーバーレイでは閉じない。未保存の
+		 * 確認は呼び出し側が {@link requestDiscard} で行う。新規作成
+		 * （`connection === null`）には効かない（作成は従来どおり Modal）。既定 `false`。
+		 */
+		embedded?: boolean;
 	}
 
 	let {
@@ -254,7 +266,8 @@
 		onClose,
 		onSaved,
 		onDeleted,
-		focusFallback
+		focusFallback,
+		embedded = false
 	}: Props = $props();
 
 	const isCreate = $derived(connection === null);
@@ -1031,6 +1044,16 @@
 	function notifyBlockedClose(): void {
 		toastStore.push('info', '未保存の変更があります。閉じるには × を押してください。');
 	}
+
+	/**
+	 * #1179 PR3a: 埋め込み（`embedded`）のフォームを捨ててよいか。タグページが
+	 * タブ・ツリーの対象を変える前に呼ぶ。Drawer の `×` と同じ判定・同じ文言
+	 * （{@link onRequestClose}） - 処理中なら `false`、未保存なら確認して、
+	 * キャンセルなら `false`。
+	 */
+	export function requestDiscard(): boolean {
+		return onRequestClose();
+	}
 </script>
 
 {#snippet nameField()}
@@ -1645,6 +1668,13 @@
 			{/if}
 		</div>
 	</Modal>
+{:else if embedded}
+	{#if open}
+		<!-- #1179 PR3a: タグページの「設定」タブへの埋め込み（外枠なし、`embedded` の doc）。 -->
+		<section class="embedded-form" aria-label={drawerTitle}>
+			{@render editBody()}
+		</section>
+	{/if}
 {:else}
 	<Drawer
 		open={open && !isCreate}
@@ -1656,55 +1686,59 @@
 		onBlockedClose={notifyBlockedClose}
 		{focusFallback}
 	>
-		{@render nameField()}
-		{@render destinationFields()}
-		{#if savedIsPush}
-			{@render ingestInfoBlock()}
-			{@render ingestStatusBlock()}
-		{/if}
-		{#if !readOnly}
-			{#if form.protocol === PUSH_PROTOCOL}
-				<!-- R2a-2e: push は接続テストを持たない（受信の状態を上に出す）。 -->
-			{:else if form.protocol === POSTGRES_PROTOCOL}
-				{@render dbTestConnectionBlock()}
-			{:else if driver}
-				{@render testConnectionBlock()}
-				{@render rangeDiagnosticBlock()}
-			{/if}
-			<!-- 出すかどうかは、フォームの途中のプロトコルでなく保存済みの接続で決める（プロトコルを
-			     一時的に替えても部品を壊さず、時計合わせの未保存の編集を消さない）。ドライバ一覧の
-			     読込み中に消えないよう、`drivers` は見ない。 -->
-			{#if savedConnection && savedConnection.protocol !== PUSH_PROTOCOL && savedConnection.protocol !== POSTGRES_PROTOCOL}
-				<PlcClockSection
-					connectionId={savedConnection.id}
-					connectionName={savedConnection.name}
-					settingsMatch={diagnosticSettingsMatch}
-					savedKey={diagnosticSavedSignature}
-					hostBusy={saving || deleting}
-					bind:dirty={clockDirty}
-					bind:busy={clockBusy}
-				/>
-			{/if}
-			<div class="actions">
-				<button
-					type="button"
-					onclick={handleSave}
-					disabled={saving || deleting || driversBlocking || clockBusy}
-				>
-					保存
-				</button>
-				<button
-					type="button"
-					class="danger"
-					onclick={handleDelete}
-					disabled={saving || deleting || clockBusy}
-				>
-					削除
-				</button>
-			</div>
-		{/if}
+		{@render editBody()}
 	</Drawer>
 {/if}
+
+{#snippet editBody()}
+	{@render nameField()}
+	{@render destinationFields()}
+	{#if savedIsPush}
+		{@render ingestInfoBlock()}
+		{@render ingestStatusBlock()}
+	{/if}
+	{#if !readOnly}
+		{#if form.protocol === PUSH_PROTOCOL}
+			<!-- R2a-2e: push は接続テストを持たない（受信の状態を上に出す）。 -->
+		{:else if form.protocol === POSTGRES_PROTOCOL}
+			{@render dbTestConnectionBlock()}
+		{:else if driver}
+			{@render testConnectionBlock()}
+			{@render rangeDiagnosticBlock()}
+		{/if}
+		<!-- 出すかどうかは、フォームの途中のプロトコルでなく保存済みの接続で決める（プロトコルを
+		     一時的に替えても部品を壊さず、時計合わせの未保存の編集を消さない）。ドライバ一覧の
+		     読込み中に消えないよう、`drivers` は見ない。 -->
+		{#if savedConnection && savedConnection.protocol !== PUSH_PROTOCOL && savedConnection.protocol !== POSTGRES_PROTOCOL}
+			<PlcClockSection
+				connectionId={savedConnection.id}
+				connectionName={savedConnection.name}
+				settingsMatch={diagnosticSettingsMatch}
+				savedKey={diagnosticSavedSignature}
+				hostBusy={saving || deleting}
+				bind:dirty={clockDirty}
+				bind:busy={clockBusy}
+			/>
+		{/if}
+		<div class="actions">
+			<button
+				type="button"
+				onclick={handleSave}
+				disabled={saving || deleting || driversBlocking || clockBusy}
+			>
+				保存
+			</button>
+			<button
+				type="button"
+				class="danger"
+				onclick={handleDelete}
+				disabled={saving || deleting || clockBusy}
+			>
+				削除
+			</button>
+		</div>
+	{/if}
+{/snippet}
 
 <style>
 	.form-grid {
