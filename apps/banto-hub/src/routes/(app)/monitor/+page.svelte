@@ -15,7 +15,8 @@
 	 * T18-4a（docs/banto-hub-t18-design.md「T18-4a モニタの Tree/検索統合」、
 	 * T13-2 移管）: 当初のフラット一覧 + 接続/グループのプルダウン
 	 * フィルタを、タグ登録ページ（`(app)/tags/+page.svelte`）と同じ
-	 * SplitPane + ConnectionTree + 検索ボックスの Tree/検索 UI へ置換した -
+	 * 2 ペインの枠 + ConnectionTree + 検索ボックスの Tree/検索 UI へ置換した
+	 * （枠は #1179 PR2b で自前の `SplitPane` から `@banto/ui` の `ThreePaneLayout` へ） -
 	 * 登録と同じ操作感でモニタ対象を絞り込めるようにする、という目的の
 	 * スライス。ツリー・絞り込みは表示専用（`ConnectionTree` の
 	 * `oncontextmenu` は渡さない - このページに作成系 UI は無い）。ツリーへ
@@ -78,7 +79,7 @@
 		probeSessionAfterReconnectFailures,
 		recheckSessionAfterStreamClose
 	} from '#lib/banto/sessionRecheck.js';
-	import SplitPane from '#lib/components/SplitPane.svelte';
+	import { ThreePaneLayout } from '@banto/ui';
 	import ConnectionTree from '#lib/components/ConnectionTree.svelte';
 	import type { ConnectionTreeNodeData } from '#lib/components/connectionTreeTypes.js';
 	import { isProviderError } from '@banto/admin-core';
@@ -249,19 +250,16 @@
 	});
 
 	/**
-	 * #378（2026-09-16 オーナー決定）: 狭幅（`mobileNavStore.isNarrow` =
-	 * `(max-width: 900px)`、サイドバーのオフキャンバスと同じ境界）で左ツリーを
-	 * 退避したときの開閉状態。タグ登録ページと同じ配線（`SplitPane` の
-	 * `narrow`/`leftOpen`）。
+	 * #378（2026-09-16 オーナー決定）: 狭幅で左ツリーを退避したときの開閉状態
+	 * （`ThreePaneLayout` の `leftDrawerOpen`）。#1179 PR2b から、狭幅の判定は従来どおり
+	 * ビューポート（`mobileNavStore.isNarrow`、サイドバーのオフキャンバスと同じ境界）。
+	 * 部品は枠の幅で判定するので、`narrowBreakpoint` を 0 / 最大値に切り替えて
+	 * ビューポート基準にしている（2026-11-18 オーナー決定、#1182）。結果を
+	 * `layoutNarrow` へ書き出す。広幅へ戻ると部品が `false` へ戻す。
+	 * タグ登録ページと同じ配線。
 	 */
 	let treeOpen = $state(false);
-
-	/**
-	 * #381 レビュー対応7回目: 狭幅のツリートグル本体。ペインが退避して不活性に
-	 * なる瞬間に中へフォーカスが残っていたときの逃がし先（`SplitPane` の
-	 * `focusFallback`）。
-	 */
-	let treeToggleEl: HTMLButtonElement | undefined = $state();
+	let layoutNarrow = $state(false);
 
 	/**
 	 * #381 レビュー対応3回目: 選択中の接続・収集グループが消えたら「すべて」へ
@@ -279,16 +277,23 @@
 	 * #381 レビュー対応8回目（層の約束・項目6、`@banto/ui` の `layering.ts`）: **下位の層を
 	 * 開くなら上位の層を先に畳む。** サイドバー（z-index 710）はモーダルでは
 	 * ないのでフォーカストラップで塞げず、開いたまま Tab でヘッダー経由この
-	 * トグルへ到達できる。そのままツリー（610）を開くと重なりが逆順になり、
+	 * トグルへ到達できる。そのままツリー（枠の中のドロワー）を開くと重なりが逆順になり、
 	 * Esc で下の層から閉じることになる。サイドバーは未保存状態を持たない常設
 	 * ナビなので、閉じて安全（`Sidebar.svelte` のリンククリックでも閉じている）。
+	 *
+	 * #1179 PR2b: トグルは `ThreePaneLayout` の帯にあり、押したことはページから
+	 * 拾えないので、**開いた遷移**（`leftDrawerOpen` が `true` になった）で畳む。
+	 * 依存は `treeOpen` だけ（サイドバーの開閉では再実行しない - ツリーを開いた
+	 * あとでサイドバーを開くのは正しい重なりなので、そこで畳んではいけない）。
 	 */
-	function toggleTree(): void {
-		if (!treeOpen && mobileNavStore.open) mobileNavStore.closeNav();
-		treeOpen = !treeOpen;
-	}
+	$effect(() => {
+		if (!treeOpen) return;
+		untrack(() => {
+			if (mobileNavStore.open) mobileNavStore.closeNav();
+		});
+	});
 
-	/** #378: 閉じていても何で絞られているか分かるよう、トグルの隣に出す選択名。 */
+	/** #378: 閉じていても何で絞られているか分かるよう、枠の帯に出す選択名。 */
 	const treeSelectionLabel = $derived.by((): string => {
 		if (treeFilter.type === 'connection') {
 			const connectionId = treeFilter.id;
@@ -312,7 +317,7 @@
 		// #378: 狭幅では「選んだ」時点（クリック・Space・Enter）で退避パネルを
 		// 閉じる（タグ登録ページと同じ）。上下キーなどフォーカス移動に付いてきた
 		// 選択（`navigation`）では閉じない。
-		if (mobileNavStore.isNarrow && !navigation) treeOpen = false;
+		if (layoutNarrow && !navigation) treeOpen = false;
 	}
 
 	// --- T18-4c: 確認導線のディープリンク受け口 -----------------------------
@@ -512,31 +517,36 @@
 		<p class="note">読み込み中…</p>
 	{:else}
 		<!--
-			T18-4a: タグ登録ページと同じ SplitPane + ConnectionTree + 検索
-			ボックス。左ツリーは接続/グループを選択して絞り込むだけの表示専用
-			（`oncontextmenu` は渡さない - このページに作成系 UI は無い）。
+			T18-4a: タグ登録ページと同じ枠（#1179 PR2b から `@banto/ui` の
+			`ThreePaneLayout`。右ペインは使わないので `right` を渡さない = 右のペインも
+			トグルも出ない）+ ConnectionTree + 検索ボックス。左ツリーは接続/グループを
+			選択して絞り込むだけの表示専用（`oncontextmenu` は渡さない - このページに
+			作成系 UI は無い）。
 
-			#381 レビュー対応6回目: **タグが0件でも `SplitPane` を出す**
-			（以前は「絞り込む対象が無いので SplitPane は出さない」として空状態を
+			#381 レビュー対応6回目: **タグが0件でも枠を出す**
+			（以前は「絞り込む対象が無いので枠は出さない」として空状態を
 			この外に置いていた）。条件マウントだと、ツリーやトグルにフォーカスが
 			ある状態で最後の行が消えたときに**フォーカスの戻り先ごとアンマウント
 			される**（フォーカスが `<body>` に落ちる）。ツリーはタグが0件でも
-			接続・収集グループを出せるので、常時マウントして空状態の案内は右ペイン
-			の中（下の `rows.length === 0` 分岐）に置く - タグ登録ページが
-			`SplitPane` を無条件にマウントしているのと同じ形。
+			接続・収集グループを出せるので、常時マウントして空状態の案内は中央
+			（下の `rows.length === 0` 分岐）に置く - タグ登録ページが枠を
+			無条件にマウントしているのと同じ形。
 		-->
 		<div class="content">
 			<!--
-				#378（2026-09-16 オーナー決定）: 狭幅では左ツリーをオフキャンバスへ
-				退避する（実体は `SplitPane.svelte` - タグ登録ページと共有）。
+				#378（2026-09-16 オーナー決定）: 狭幅では左ツリーをドロワーへ退避する。
+				退避・トグル・Esc・フォーカスの出入りは部品が持つ（冒頭コメントの約束）。
+				狭幅の判定はビューポート基準（`narrowBreakpoint` で切り替え）。帯（トグルの隣）には
+				閉じていても何で絞られているかが分かるよう、現在の選択名を出す。
 			-->
-			<SplitPane
-				leftWidth="280px"
-				narrow={mobileNavStore.isNarrow}
-				bind:leftOpen={treeOpen}
-				leftLabel="接続とグループ"
-				leftId="monitor-tree-pane"
-				focusFallback={() => treeToggleEl ?? null}
+			<ThreePaneLayout
+				narrowBreakpoint={mobileNavStore.isNarrow ? Number.MAX_SAFE_INTEGER : 0}
+				bind:leftDrawerOpen={treeOpen}
+				bind:narrow={layoutNarrow}
+				messages={{
+					threePaneLeft: () => '接続とグループ',
+					threePaneResizeLeft: () => '接続とグループの幅'
+				}}
 			>
 				{#snippet left()}
 					<ConnectionTree
@@ -547,98 +557,83 @@
 						onselect={handleTreeSelect}
 					/>
 				{/snippet}
-				{#snippet right()}
-					<div class="right-pane">
-						<div class="toolbar">
-							<!-- #378: 狭幅でだけ出すツリーのトグルと現在の選択名（タグ登録ページと同じ）。 -->
-							{#if mobileNavStore.isNarrow}
-								<button
-									type="button"
-									class="tree-toggle"
-									data-testid="monitor-tree-toggle"
-									bind:this={treeToggleEl}
-									aria-expanded={treeOpen}
-									aria-controls="monitor-tree-pane"
-									onclick={toggleTree}
-								>
-									📁 ツリー
-								</button>
-								<span class="tree-selection" data-testid="monitor-tree-selection">
-									{treeSelectionLabel}
-								</span>
-							{/if}
-							<input
-								type="search"
-								class="search-box"
-								placeholder="外部名・名前・アドレスで検索"
-								bind:value={searchQuery}
-							/>
-							<span class="count">{filteredRows.length} / {rows.length} 件</span>
-						</div>
-						{#if rows.length === 0}
-							<!--
+				{#snippet titleContent()}
+					<span class="tree-selection" data-testid="monitor-tree-selection">
+						{treeSelectionLabel}
+					</span>
+				{/snippet}
+				<div class="right-pane">
+					<div class="toolbar">
+						<input
+							type="search"
+							class="search-box"
+							placeholder="外部名・名前・アドレスで検索"
+							bind:value={searchQuery}
+						/>
+						<span class="count">{filteredRows.length} / {rows.length} 件</span>
+					</div>
+					{#if rows.length === 0}
+						<!--
 								T18-2d（docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A「空状態を…
 								不足する前工程と移動ボタンを示す」）: タグが1件も無い（フィルタ
 								の問題ではなく真の空）場合は、前工程（タグ登録）へ案内する。
 								文言・CTA は従来のまま、置き場所だけ右ペインの中へ移した
-								（#381 レビュー対応6回目 - 上の SplitPane のコメント参照）。
+								（#381 レビュー対応6回目 - 上の枠のコメント参照）。
 							-->
-							<p class="note">
-								登録されているタグがありません。先に タグの登録画面 からタグを作成してください。
-							</p>
-							<a class="onboarding-cta" href={resolveAppPath('/tags')}>タグの登録画面へ移動</a>
-						{:else if filteredRows.length === 0}
-							<p class="note">条件に一致するタグがありません。</p>
-						{:else}
-							<div class="table-wrap">
-								<table class="values-table">
-									<thead>
-										<tr>
-											<th>外部名</th>
-											<th>接続</th>
-											<th>グループ</th>
-											<th>{columnLabels.value}</th>
-											<th>{columnLabels.quality}</th>
-											<th>時刻</th>
+						<p class="note">
+							登録されているタグがありません。先に タグの登録画面 からタグを作成してください。
+						</p>
+						<a class="onboarding-cta" href={resolveAppPath('/tags')}>タグの登録画面へ移動</a>
+					{:else if filteredRows.length === 0}
+						<p class="note">条件に一致するタグがありません。</p>
+					{:else}
+						<div class="table-wrap">
+							<table class="values-table">
+								<thead>
+									<tr>
+										<th>外部名</th>
+										<th>接続</th>
+										<th>グループ</th>
+										<th>{columnLabels.value}</th>
+										<th>{columnLabels.quality}</th>
+										<th>時刻</th>
+									</tr>
+								</thead>
+								<tbody>
+									{#each filteredRows as row (row.external_name)}
+										{@const cell = monitorCellDisplay(row, displayMode)}
+										<tr
+											class:flash={flashing[row.external_name]}
+											class:confirm-target={focusSet.has(row.external_name)}
+										>
+											<td class="tag-name">{row.external_name}</td>
+											<td>
+												{row.connection}
+												{#if row.simulation}
+													<span class="sim-badge" title="シミュレーション接続（実機ではありません）"
+														>⚠ SIM</span
+													>
+												{/if}
+											</td>
+											<td>{row.group}</td>
+											<td class="value quality-{cell.qualityClass}">{cell.value}</td>
+											<td class="quality quality-{cell.qualityClass}">{cell.qualityLabel}</td>
+											<td>{formatTime(row.t)}</td>
 										</tr>
-									</thead>
-									<tbody>
-										{#each filteredRows as row (row.external_name)}
-											{@const cell = monitorCellDisplay(row, displayMode)}
-											<tr
-												class:flash={flashing[row.external_name]}
-												class:confirm-target={focusSet.has(row.external_name)}
-											>
-												<td class="tag-name">{row.external_name}</td>
-												<td>
-													{row.connection}
-													{#if row.simulation}
-														<span
-															class="sim-badge"
-															title="シミュレーション接続（実機ではありません）">⚠ SIM</span
-														>
-													{/if}
-												</td>
-												<td>{row.group}</td>
-												<td class="value quality-{cell.qualityClass}">{cell.value}</td>
-												<td class="quality quality-{cell.qualityClass}">{cell.qualityLabel}</td>
-												<td>{formatTime(row.t)}</td>
-											</tr>
-										{/each}
-									</tbody>
-								</table>
-							</div>
-						{/if}
-					</div>
-				{/snippet}
-			</SplitPane>
+									{/each}
+								</tbody>
+							</table>
+						</div>
+					{/if}
+				</div>
+			</ThreePaneLayout>
 		</div>
 	{/if}
 </div>
 
 <style>
 	/* T18-4a: tags ページ（`(app)/tags/+page.svelte`）と同じ
-	   page/page-header/content/right-pane/toolbar 構成 - SplitPane が
+	   page/page-header/content/right-pane/toolbar 構成 - 枠（`ThreePaneLayout`）が
 	   `height: 100%` を前提にしているため、画面全体を calc(100vh - ...) の
 	   flex column にして `.content` に残り高さ全部を渡す。 */
 	.page {
@@ -764,28 +759,6 @@
 
 	.count {
 		flex: 0 0 auto;
-		color: var(--banto-text-muted);
-		font-size: 0.75rem;
-	}
-
-	/* #378: 狭幅でだけ出るツリーのトグルと、現在のツリー選択名。 */
-	.tree-toggle {
-		flex: 0 0 auto;
-		padding: 0.35rem 0.6rem;
-		border: 1px solid var(--banto-border);
-		border-radius: var(--banto-radius);
-		background: var(--banto-surface);
-		color: var(--banto-text);
-		font-size: 0.78rem;
-		cursor: pointer;
-	}
-
-	.tree-selection {
-		flex: 0 1 auto;
-		min-width: 0;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
 		color: var(--banto-text-muted);
 		font-size: 0.75rem;
 	}
