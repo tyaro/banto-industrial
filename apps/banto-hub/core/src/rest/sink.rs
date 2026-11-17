@@ -15,6 +15,7 @@ use super::{
     SinkGroup, SinkGroupInput, SinkGroupService, SinkGroupStatusPush, SinkStatusStore, State,
     StatusCode, TagEntry,
 };
+use crate::api_keys::HubScopeChecks;
 
 // --- 外部 DB 連携 S4（docs/banto-hub-external-db-design.md §5.2・§6-13）:
 // `hub_sink_groups` の CRUD ---------------------------------------------------

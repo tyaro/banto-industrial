@@ -1,0 +1,28 @@
+[package]
+name = "banto-api-keys"
+description = "API key issue / list / revoke / trip / lookup (SQLite `api_keys`, SHA-256, fixed-length key parsing) and the HTTP rejection responses, shared by banto-hub and ChronoGazer (scopes are defined by each app)"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# 版と feature は banto-hub-core（移す前の持ち主）と同じ物にそろえる。
+banto-core = { workspace = true }
+# `storage_error`（sqlx のエラー → `BantoError::Storage`）。
+banto-storage = { workspace = true, features = ["sqlite"] }
+# 照合できないとき（500）の応答の形 `ApiError`（セッションの照合失敗と同じ）。
+banto-server = { workspace = true }
+axum = { workspace = true }
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# 照合の上限（`tokio::time::timeout`）だけ。ランタイムはアプリが持つ。
+tokio = { workspace = true, features = ["time"] }
+getrandom = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "time"] }

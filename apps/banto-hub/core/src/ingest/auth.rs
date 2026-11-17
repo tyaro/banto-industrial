@@ -55,6 +55,7 @@ use banto_server::AuthState;
 use banto_tstore::Clock;
 use serde_json::{json, Value};
 
+use crate::api_keys::HubScopeChecks;
 use crate::api_keys::{
     api_key_verdict, parse_canonical_connection_id, ApiKeyContext, ApiKeysService,
 };

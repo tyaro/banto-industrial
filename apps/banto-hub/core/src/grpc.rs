@@ -116,6 +116,7 @@ use tokio_stream::Stream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
+use crate::api_keys::HubScopeChecks;
 use crate::api_keys::{
     api_key_verdict, ApiKeyContext, ApiKeyRejection, ApiKeysService, UnauthenticatedReason,
 };

@@ -20,6 +20,7 @@ use super::{
     SinkStatusSnapshot, SinkStatusStore, State, StatusCode, SystemInfoSampler, SystemInfoSnapshot,
     TagEntry, TagMap, ToSchema, WriteAuditService, WriteControl, WriteRateLimiter, WriteState,
 };
+use crate::api_keys::HubScopeChecks;
 
 // --- /api/v1/* タグ空間 API（設計 §5.1） ------------------------------------
 //

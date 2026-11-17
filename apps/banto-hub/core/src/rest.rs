@@ -301,7 +301,8 @@ use openapi::ApiDoc;
 /// T19 S5: `crate::mcp`'s `POST /mcp` auth middleware reuses this same body
 /// for all of its (simplified, single-status) auth failure branches.
 pub(crate) fn unauthorized_response() -> Response {
-    (StatusCode::UNAUTHORIZED, Json(ErrorBody::Unauthorized)).into_response()
+    // 本文は共有 crate の物と同じ（#1161 PR3。API キーの 401 と 1 か所にする）。
+    banto_api_keys::unauthorized_response()
 }
 
 /// [`require_session`]の`middleware::from_fn_with_state`用 state。従来の
@@ -576,34 +577,23 @@ fn forbidden_response() -> Response {
     (StatusCode::FORBIDDEN, Json(ErrorBody::Forbidden)).into_response()
 }
 
-/// T2-4（設計 §6-4「トリップ」）: トリップ中の API キーでの
-/// `/api/v1/*` アクセス - read/write いずれも 403。#435 で `/api/sink/*` と
-/// MCP も同じ応答にそろえた（[`api_key_rejection_response`] 経由）。
-fn key_tripped_response() -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        Json(json!({ "error": "key_tripped" })),
-    )
-        .into_response()
-}
-
 /// #435: 使えない API キーへの HTTP 応答。REST のタグ空間 `/api/v1/*`・
 /// サイドカー用の `/api/sink/*`・MCP（`crate::mcp::require_mcp_auth`）が共通で
 /// 使う（gRPC は `crate::grpc::api_key_rejection_status`）。どう拒否するかは
 /// [`crate::api_keys::api_key_verdict`] が決める:
 /// - 失効・期限切れ・存在しない → 401（`ErrorBody::Unauthorized`）
-/// - トリップ → 403 `{"error": "key_tripped"}`（認証はできたが今は使えない。
-///   admin が解除すれば同じキーで戻るので、キーを捨てさせない）
+/// - トリップ（T2-4、設計 §6-4）→ 403 `{"error": "key_tripped"}`（認証は
+///   できたが今は使えない。admin が解除すれば同じキーで戻るので、キーを
+///   捨てさせない）
 /// - 照合できない（#434）→ 500（`ApiError`、セッションの照合失敗と同じ形）
+///
+/// 応答の形は共有 crate（`banto_api_keys::api_key_rejection_response`、#1161
+/// PR3）が持ち、ここは照合できなかったときのログだけを足す。
 pub(crate) fn api_key_rejection_response(rejection: ApiKeyRejection) -> Response {
-    match rejection {
-        ApiKeyRejection::Unauthenticated(_) => unauthorized_response(),
-        ApiKeyRejection::Tripped => key_tripped_response(),
-        ApiKeyRejection::Unavailable(err) => {
-            eprintln!("banto-hub: API キー照合に失敗しました: {err}");
-            ApiError(err).into_response()
-        }
+    if let ApiKeyRejection::Unavailable(err) = &rejection {
+        eprintln!("banto-hub: API キー照合に失敗しました: {err}");
     }
+    banto_api_keys::api_key_rejection_response(rejection)
 }
 
 /// Hub の終了中（`crate::detached::DetachedTasks` の受付を閉じた後）の 503。何も保存・
