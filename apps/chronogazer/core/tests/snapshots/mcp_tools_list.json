@@ -192,12 +192,12 @@
       "name": "create_connection"
     },
     {
-      "description": "接続先を更新する（config スコープ。REST の PUT と同じ置き換え）。収集へは restart_collection で反映する。",
+      "description": "接続先を更新する（config スコープ。全項目の置き換えで、省略できない）。収集へは restart_collection で反映する。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
           "enabled": {
-            "description": "有効にするか。省略は true。",
+            "description": "有効にするか。",
             "type": "boolean"
           },
           "id": {
@@ -217,14 +217,17 @@
             "type": "object"
           },
           "simulation": {
-            "description": "true でシミュレータ接続にする。省略すると保存済みの値を保つ。",
+            "description": "true でシミュレータ接続にする。",
             "type": "boolean"
           }
         },
         "required": [
           "id",
           "name",
-          "protocol"
+          "protocol",
+          "enabled",
+          "simulation",
+          "settings"
         ],
         "type": "object"
       },
@@ -284,12 +287,12 @@
       "name": "create_group"
     },
     {
-      "description": "収集グループを更新する（config スコープ。REST の PUT と同じ置き換え）。収集へは restart_collection で反映する。",
+      "description": "収集グループを更新する（config スコープ。全項目の置き換えで、省略できない）。収集へは restart_collection で反映する。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
           "enabled": {
-            "description": "有効にするか。省略は true。",
+            "description": "有効にするか。",
             "type": "boolean"
           },
           "id": {
@@ -313,7 +316,8 @@
           "id",
           "name",
           "plcConnectionId",
-          "periodMs"
+          "periodMs",
+          "enabled"
         ],
         "type": "object"
       },
@@ -359,7 +363,7 @@
             "type": "string"
           },
           "decimals": {
-            "description": "小数の桁数。",
+            "description": "小数の桁数。省略は既定値。",
             "type": "integer"
           },
           "enabled": {
@@ -417,7 +421,7 @@
       "name": "create_tag"
     },
     {
-      "description": "記録項目を更新する（config スコープ。REST の PUT と同じ全項目の置き換えで、省略した項目は既定値になる。get_tag の値を全項目送り返す）。収集へは restart_collection で反映する。",
+      "description": "記録項目を更新する（config スコープ。全項目の置き換えで、expectedRevision 以外は省略できない。get_tag の値を全項目送り返す）。収集へは restart_collection で反映する。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -438,7 +442,7 @@
             "type": "integer"
           },
           "enabled": {
-            "description": "有効にするか。省略は true。",
+            "description": "有効にするか。",
             "type": "boolean"
           },
           "engHi": {
@@ -456,7 +460,7 @@
             ]
           },
           "expectedRevision": {
-            "description": "楽観ロック: get_tag で読んだ revision。省略すると版を確かめない。",
+            "description": "楽観ロック: get_tag で読んだ revision。省略すると版を確かめない（これだけ省略できる）。",
             "type": "integer"
           },
           "id": {
@@ -494,7 +498,14 @@
           "name",
           "collectionGroupId",
           "address",
-          "dataType"
+          "dataType",
+          "rawLo",
+          "rawHi",
+          "engLo",
+          "engHi",
+          "unit",
+          "decimals",
+          "enabled"
         ],
         "type": "object"
       },
@@ -583,7 +594,7 @@
       "name": "create_display_group"
     },
     {
-      "description": "表示グループを更新する（config スコープ。REST の PUT と同じ置き換え。並び順は reorder_display_groups で変える）。",
+      "description": "表示グループを更新する（config スコープ。全項目の置き換えで、expectedRevision 以外は省略できない。並び順は reorder_display_groups で変える。表示のための設定で、収集の再起動は要らない）。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -592,7 +603,7 @@
             "type": "object"
           },
           "expectedRevision": {
-            "description": "楽観ロック: get_display_group で読んだ revision。省略すると版を確かめない。",
+            "description": "楽観ロック: get_display_group で読んだ revision。省略すると版を確かめない（これだけ省略できる）。",
             "type": "integer"
           },
           "id": {
@@ -641,7 +652,9 @@
         "required": [
           "id",
           "name",
-          "kind"
+          "kind",
+          "attributes",
+          "pens"
         ],
         "type": "object"
       },
@@ -690,7 +703,7 @@
       "name": "reorder_display_groups"
     },
     {
-      "description": "記録項目 1 つのしきい値を全項目置き換える（config スコープ。省略した欄は設定なし）。",
+      "description": "記録項目 1 つのしきい値を全項目置き換える（config スコープ。4 つのしきい値は省略できず、設定しない欄は null を送る）。収集へは restart_collection で反映する。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -703,28 +716,28 @@
             "type": "integer"
           },
           "thresholdH": {
-            "description": "上限。null は設定なし。",
+            "description": "上限。null は設定なし。省略できない。",
             "type": [
               "number",
               "null"
             ]
           },
           "thresholdHh": {
-            "description": "上上限。null は設定なし。",
+            "description": "上上限。null は設定なし。省略できない。",
             "type": [
               "number",
               "null"
             ]
           },
           "thresholdL": {
-            "description": "下限。null は設定なし。",
+            "description": "下限。null は設定なし。省略できない。",
             "type": [
               "number",
               "null"
             ]
           },
           "thresholdLl": {
-            "description": "下下限。null は設定なし。",
+            "description": "下下限。null は設定なし。省略できない。",
             "type": [
               "number",
               "null"
@@ -732,7 +745,11 @@
           }
         },
         "required": [
-          "tagId"
+          "tagId",
+          "thresholdLl",
+          "thresholdL",
+          "thresholdH",
+          "thresholdHh"
         ],
         "type": "object"
       },

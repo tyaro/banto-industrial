@@ -37,10 +37,16 @@
 //!
 //! 成功は JSON を文字列にした `text`（共有 crate の `tool_ok`）。作成は
 //! `{created}`、更新は `{updated}`、削除は `{deleted: true, id}`（HUB と同じ）。
-//! 設定を変えるツール（接続先・収集グループ・記録項目・表示グループ・しきい値）の
-//! 結果には `restartRequired: true` を足す: ChronoGazer は設定を変えても収集へ
-//! 自動では反映せず、`restart_collection` で反映するため（§5.3）。収集の操作の
-//! 結果には付けない。削除は `confirm: true` を要する（HUB と同じ）。
+//! 収集が読む設定を変えるツール（接続先・収集グループ・記録項目・しきい値）の
+//! 結果には `restartRequired: true` を足す: ChronoGazer はそれらを変えても収集へ
+//! 自動では反映せず、`restart_collection` で反映するため（§5.3）。表示グループは
+//! 表示のための設定で収集は読まないので付けない。収集の操作の結果にも付けない。
+//! 削除は `confirm: true` を要する（HUB と同じ）。
+//!
+//! 更新のツール（`update_connection`・`update_group`・`update_tag`・
+//! `update_display_group`・`set_threshold`）は入力の全項目を必須にする（HUB と同じ。
+//! 書き忘れた項目が既定値で黙って上書きされるのを防ぐ。楽観ロックの
+//! `expectedRevision` だけは省略できる）。作成は REST と同じ既定値。
 //!
 //! 履歴（`/api/collect/history`）・イベントは入れない（§5.3）。
 
@@ -53,7 +59,9 @@ use axum::response::Response;
 use axum::routing::post;
 use axum::{Extension, Router};
 use banto_core::{BantoError, ListParams};
-use banto_mcp::{banto_error_tool_error, tool_error, tool_ok, RpcError, ToolRegistry};
+use banto_mcp::{
+    banto_error_tool_error, require_all_fields, tool_error, tool_ok, RpcError, ToolRegistry,
+};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
@@ -192,12 +200,69 @@ fn with_id(mut schema: Value, description: &str) -> Value {
     schema
 }
 
+/// 更新のツールの必須の項目（`id`・`tagId` を除く入力の全項目。スキーマの
+/// `required` と [`require_update_fields`] の両方に使う）。
+const UPDATE_CONNECTION_FIELDS: [&str; 6] = [
+    "id",
+    "name",
+    "protocol",
+    "enabled",
+    "simulation",
+    "settings",
+];
+const UPDATE_GROUP_FIELDS: [&str; 5] = ["id", "name", "plcConnectionId", "periodMs", "enabled"];
+const UPDATE_TAG_FIELDS: [&str; 12] = [
+    "id",
+    "name",
+    "collectionGroupId",
+    "address",
+    "dataType",
+    "rawLo",
+    "rawHi",
+    "engLo",
+    "engHi",
+    "unit",
+    "decimals",
+    "enabled",
+];
+const UPDATE_DISPLAY_GROUP_FIELDS: [&str; 5] = ["id", "name", "kind", "attributes", "pens"];
+const SET_THRESHOLD_FIELDS: [&str; 5] = [
+    "tagId",
+    "thresholdLl",
+    "thresholdL",
+    "thresholdH",
+    "thresholdHh",
+];
+
+/// 更新のツールの入力に全項目があるか。足りなければ `missing_fields` のツールの
+/// エラー（ops に触れない・監査しない）。スコープ不足の主体には確かめず素通りさせ、
+/// ops が `denied` を記録して断る（項目の不足より先にスコープで止める）。
+fn require_update_fields(actor: &Actor, args: &Value, required: &[&str]) -> Option<Value> {
+    if actor.can_configure() {
+        require_all_fields(args, required)
+    } else {
+        None
+    }
+}
+
+/// [`with_id`] に加えて、`required` を `fields`（更新のツールの全項目）にする。
+fn with_id_all_required(schema: Value, description: &str, fields: &[&str]) -> Value {
+    let mut schema = with_id(schema, description);
+    schema["required"] = json!(fields);
+    schema
+}
+
 /// 接続先（REST の `PlcConnectionPayload`）。
 fn connection_schema(update: bool) -> Value {
     let simulation = if update {
-        "true でシミュレータ接続にする。省略すると保存済みの値を保つ。"
+        "true でシミュレータ接続にする。"
     } else {
         "true でシミュレータ接続にする。省略は false。"
+    };
+    let enabled = if update {
+        "有効にするか。"
+    } else {
+        "有効にするか。省略は true。"
     };
     let schema = json!({
         "type": "object",
@@ -207,7 +272,7 @@ fn connection_schema(update: bool) -> Value {
                 "type": "string",
                 "description": "list_drivers で得られるドライバの id（slmp・modbus-tcp など）。",
             },
-            "enabled": { "type": "boolean", "description": "有効にするか。省略は true。" },
+            "enabled": { "type": "boolean", "description": enabled },
             "simulation": { "type": "boolean", "description": simulation },
             "settings": {
                 "type": "object",
@@ -218,7 +283,7 @@ fn connection_schema(update: bool) -> Value {
         "additionalProperties": false,
     });
     if update {
-        with_id(schema, "更新する接続先の id。")
+        with_id_all_required(schema, "更新する接続先の id。", &UPDATE_CONNECTION_FIELDS)
     } else {
         schema
     }
@@ -226,19 +291,24 @@ fn connection_schema(update: bool) -> Value {
 
 /// 収集グループ（REST の `CollectionGroupPayload`）。
 fn group_schema(update: bool) -> Value {
+    let enabled = if update {
+        "有効にするか。"
+    } else {
+        "有効にするか。省略は true。"
+    };
     let schema = json!({
         "type": "object",
         "properties": {
             "name": { "type": "string", "description": "収集グループの名前。" },
             "plcConnectionId": { "type": "integer", "description": "接続先の id。" },
             "periodMs": { "type": "integer", "description": "収集の周期（ミリ秒）。" },
-            "enabled": { "type": "boolean", "description": "有効にするか。省略は true。" },
+            "enabled": { "type": "boolean", "description": enabled },
         },
         "required": ["name", "plcConnectionId", "periodMs"],
         "additionalProperties": false,
     });
     if update {
-        with_id(schema, "更新する収集グループの id。")
+        with_id_all_required(schema, "更新する収集グループの id。", &UPDATE_GROUP_FIELDS)
     } else {
         schema
     }
@@ -246,6 +316,16 @@ fn group_schema(update: bool) -> Value {
 
 /// 記録項目（REST の `TagPayload`。しきい値は set_threshold で設定する）。
 fn tag_schema(update: bool) -> Value {
+    let enabled = if update {
+        "有効にするか。"
+    } else {
+        "有効にするか。省略は true。"
+    };
+    let decimals = if update {
+        "小数の桁数。"
+    } else {
+        "小数の桁数。省略は既定値。"
+    };
     let mut schema = json!({
         "type": "object",
         "properties": {
@@ -258,8 +338,8 @@ fn tag_schema(update: bool) -> Value {
             "engLo": { "type": ["number", "null"], "description": "スケーリングの工学値の下限。" },
             "engHi": { "type": ["number", "null"], "description": "スケーリングの工学値の上限。" },
             "unit": { "type": ["string", "null"], "description": "単位。" },
-            "decimals": { "type": "integer", "description": "小数の桁数。" },
-            "enabled": { "type": "boolean", "description": "有効にするか。省略は true。" },
+            "decimals": { "type": "integer", "description": decimals },
+            "enabled": { "type": "boolean", "description": enabled },
         },
         "required": ["name", "collectionGroupId", "address", "dataType"],
         "additionalProperties": false,
@@ -267,9 +347,9 @@ fn tag_schema(update: bool) -> Value {
     if update {
         schema["properties"]["expectedRevision"] = json!({
             "type": "integer",
-            "description": "楽観ロック: get_tag で読んだ revision。省略すると版を確かめない。",
+            "description": "楽観ロック: get_tag で読んだ revision。省略すると版を確かめない（これだけ省略できる）。",
         });
-        with_id(schema, "更新する記録項目の id。")
+        with_id_all_required(schema, "更新する記録項目の id。", &UPDATE_TAG_FIELDS)
     } else {
         schema
     }
@@ -313,9 +393,13 @@ fn display_group_schema(update: bool) -> Value {
     if update {
         schema["properties"]["expectedRevision"] = json!({
             "type": "integer",
-            "description": "楽観ロック: get_display_group で読んだ revision。省略すると版を確かめない。",
+            "description": "楽観ロック: get_display_group で読んだ revision。省略すると版を確かめない（これだけ省略できる）。",
         });
-        with_id(schema, "更新する表示グループの id。")
+        with_id_all_required(
+            schema,
+            "更新する表示グループの id。",
+            &UPDATE_DISPLAY_GROUP_FIELDS,
+        )
     } else {
         schema["properties"]["sortOrder"] = json!({
             "type": "integer",
@@ -330,16 +414,16 @@ fn threshold_schema() -> Value {
         "type": "object",
         "properties": {
             "tagId": { "type": "integer", "description": "記録項目の id。" },
-            "thresholdLl": { "type": ["number", "null"], "description": "下下限。null は設定なし。" },
-            "thresholdL": { "type": ["number", "null"], "description": "下限。null は設定なし。" },
-            "thresholdH": { "type": ["number", "null"], "description": "上限。null は設定なし。" },
-            "thresholdHh": { "type": ["number", "null"], "description": "上上限。null は設定なし。" },
+            "thresholdLl": { "type": ["number", "null"], "description": "下下限。null は設定なし。省略できない。" },
+            "thresholdL": { "type": ["number", "null"], "description": "下限。null は設定なし。省略できない。" },
+            "thresholdH": { "type": ["number", "null"], "description": "上限。null は設定なし。省略できない。" },
+            "thresholdHh": { "type": ["number", "null"], "description": "上上限。null は設定なし。省略できない。" },
             "expectedRevision": {
                 "type": "integer",
                 "description": "楽観ロック: get_threshold で読んだ revision。省略すると版を確かめない。",
             },
         },
-        "required": ["tagId"],
+        "required": SET_THRESHOLD_FIELDS,
         "additionalProperties": false,
     })
 }
@@ -462,7 +546,8 @@ fn tool_registry() -> ToolRegistry<McpState, Actor> {
         tool_read_values
     );
 
-    // 設定の変更（config）。結果に restartRequired: true。
+    // 設定の変更（config）。収集が読む設定（接続先・収集グループ・記録項目・
+    // しきい値）の結果に restartRequired: true。表示グループには付けない。
     let r = config_tool!(
         r,
         "create_connection",
@@ -473,7 +558,7 @@ fn tool_registry() -> ToolRegistry<McpState, Actor> {
     let r = config_tool!(
         r,
         "update_connection",
-        "接続先を更新する（config スコープ。REST の PUT と同じ置き換え）。収集へは restart_collection で反映する。",
+        "接続先を更新する（config スコープ。全項目の置き換えで、省略できない）。収集へは restart_collection で反映する。",
         connection_schema(true),
         tool_update_connection
     );
@@ -494,7 +579,7 @@ fn tool_registry() -> ToolRegistry<McpState, Actor> {
     let r = config_tool!(
         r,
         "update_group",
-        "収集グループを更新する（config スコープ。REST の PUT と同じ置き換え）。収集へは restart_collection で反映する。",
+        "収集グループを更新する（config スコープ。全項目の置き換えで、省略できない）。収集へは restart_collection で反映する。",
         group_schema(true),
         tool_update_group
     );
@@ -515,7 +600,7 @@ fn tool_registry() -> ToolRegistry<McpState, Actor> {
     let r = config_tool!(
         r,
         "update_tag",
-        "記録項目を更新する（config スコープ。REST の PUT と同じ全項目の置き換えで、省略した項目は既定値になる。get_tag の値を全項目送り返す）。収集へは restart_collection で反映する。",
+        "記録項目を更新する（config スコープ。全項目の置き換えで、expectedRevision 以外は省略できない。get_tag の値を全項目送り返す）。収集へは restart_collection で反映する。",
         tag_schema(true),
         tool_update_tag
     );
@@ -536,7 +621,7 @@ fn tool_registry() -> ToolRegistry<McpState, Actor> {
     let r = config_tool!(
         r,
         "update_display_group",
-        "表示グループを更新する（config スコープ。REST の PUT と同じ置き換え。並び順は reorder_display_groups で変える）。",
+        "表示グループを更新する（config スコープ。全項目の置き換えで、expectedRevision 以外は省略できない。並び順は reorder_display_groups で変える。表示のための設定で、収集の再起動は要らない）。",
         display_group_schema(true),
         tool_update_display_group
     );
@@ -568,7 +653,7 @@ fn tool_registry() -> ToolRegistry<McpState, Actor> {
     let r = config_tool!(
         r,
         "set_threshold",
-        "記録項目 1 つのしきい値を全項目置き換える（config スコープ。省略した欄は設定なし）。",
+        "記録項目 1 つのしきい値を全項目置き換える（config スコープ。4 つのしきい値は省略できず、設定しない欄は null を送る）。収集へは restart_collection で反映する。",
         threshold_schema(),
         tool_set_threshold
     );
@@ -616,7 +701,7 @@ fn reply<T>(result: Result<T, BantoError>, wrap: impl FnOnce(T) -> Value) -> Val
     }
 }
 
-/// 設定を変えるツールの結果（`restartRequired: true` を足す）。
+/// 収集が読む設定を変えるツールの結果（`restartRequired: true` を足す）。
 fn changed(mut payload: Value) -> Value {
     payload["restartRequired"] = json!(true);
     payload
@@ -784,6 +869,9 @@ async fn tool_update_connection(
     args: Option<Value>,
 ) -> Result<Value, RpcError> {
     let args = arguments(args)?;
+    if let Some(err) = require_update_fields(actor, &args, &UPDATE_CONNECTION_FIELDS) {
+        return Ok(err);
+    }
     let id = int_arg(&args, "id")?;
     // `PlcConnectionPayload` は `deny_unknown_fields` なので `id` を外してから読む。
     let input: PlcConnectionPayload = payload_without(args, "id", "接続先")?;
@@ -832,6 +920,9 @@ async fn tool_update_group(
     args: Option<Value>,
 ) -> Result<Value, RpcError> {
     let args = arguments(args)?;
+    if let Some(err) = require_update_fields(actor, &args, &UPDATE_GROUP_FIELDS) {
+        return Ok(err);
+    }
     let id = int_arg(&args, "id")?;
     let input: CollectionGroupPayload = payload_without(args, "id", "収集グループ")?;
     Ok(reply(
@@ -876,6 +967,9 @@ async fn tool_update_tag(
     args: Option<Value>,
 ) -> Result<Value, RpcError> {
     let args = arguments(args)?;
+    if let Some(err) = require_update_fields(actor, &args, &UPDATE_TAG_FIELDS) {
+        return Ok(err);
+    }
     let id = int_arg(&args, "id")?;
     let input: TagPayload = payload_without(args, "id", "記録項目")?;
     Ok(reply(
@@ -909,7 +1003,7 @@ async fn tool_create_display_group(
     let input: DisplayGroupPayload = payload(args, "表示グループ")?;
     Ok(reply(
         state.display_groups.create(actor, via, &input).await,
-        |created| changed(json!({ "created": created })),
+        |created| json!({ "created": created }),
     ))
 }
 
@@ -920,11 +1014,14 @@ async fn tool_update_display_group(
     args: Option<Value>,
 ) -> Result<Value, RpcError> {
     let args = arguments(args)?;
+    if let Some(err) = require_update_fields(actor, &args, &UPDATE_DISPLAY_GROUP_FIELDS) {
+        return Ok(err);
+    }
     let id = int_arg(&args, "id")?;
     let input: DisplayGroupPayload = payload_without(args, "id", "表示グループ")?;
     Ok(reply(
         state.display_groups.update(actor, via, id, &input).await,
-        |updated| changed(json!({ "updated": updated })),
+        |updated| json!({ "updated": updated }),
     ))
 }
 
@@ -940,7 +1037,7 @@ async fn tool_delete_display_group(
     };
     Ok(reply(
         state.display_groups.delete(actor, via, id).await,
-        |()| changed(json!({ "deleted": true, "id": id })),
+        |()| json!({ "deleted": true, "id": id }),
     ))
 }
 
@@ -953,7 +1050,7 @@ async fn tool_reorder_display_groups(
     let input: crate::display_groups::ReorderPayload = payload(args, "並べ替え")?;
     Ok(reply(
         state.display_groups.reorder(actor, via, &input.ids).await,
-        |groups| changed(json!({ "displayGroups": groups })),
+        |groups| json!({ "displayGroups": groups }),
     ))
 }
 
@@ -964,6 +1061,9 @@ async fn tool_set_threshold(
     args: Option<Value>,
 ) -> Result<Value, RpcError> {
     let args = arguments(args)?;
+    if let Some(err) = require_update_fields(actor, &args, &SET_THRESHOLD_FIELDS) {
+        return Ok(err);
+    }
     let tag_id = int_arg(&args, "tagId")?;
     let input: TagThresholdsPayload = payload_without(args, "tagId", "しきい値")?;
     Ok(reply(

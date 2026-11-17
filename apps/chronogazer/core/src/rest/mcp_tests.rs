@@ -145,8 +145,16 @@ fn slmp_connection(name: &str) -> Value {
     })
 }
 
-/// 設定を変えるツール（結果に `restartRequired: true` が付く物）。
-const CHANGING_TOOLS: [&str; 14] = [
+/// 更新のツールが求める全項目つきの接続先（`simulation` も書く）。
+fn slmp_connection_full(name: &str) -> Value {
+    let mut value = slmp_connection(name);
+    value["simulation"] = json!(false);
+    value
+}
+
+/// 収集が読む設定を変えるツール（結果に `restartRequired: true` が付く物）。
+/// 表示グループは収集が読まないので付けない。
+const CHANGING_TOOLS: [&str; 10] = [
     "create_connection",
     "update_connection",
     "delete_connection",
@@ -156,10 +164,6 @@ const CHANGING_TOOLS: [&str; 14] = [
     "create_tag",
     "update_tag",
     "delete_tag",
-    "create_display_group",
-    "update_display_group",
-    "delete_display_group",
-    "reorder_display_groups",
     "set_threshold",
 ];
 
@@ -195,7 +199,7 @@ async fn a_config_key_calls_every_tool_and_changes_are_audited_as_mcp() {
     // 接続先。
     let created = ok!("create_connection", slmp_connection("c1"));
     let conn_id = created["created"]["id"].as_i64().expect("id");
-    let mut update = slmp_connection("c1-renamed");
+    let mut update = slmp_connection_full("c1-renamed");
     update["id"] = json!(conn_id);
     let updated = ok!("update_connection", update);
     assert_eq!(updated["updated"]["name"], "c1-renamed");
@@ -212,7 +216,10 @@ async fn a_config_key_calls_every_tool_and_changes_are_audited_as_mcp() {
     let group_id = group["created"]["id"].as_i64().unwrap();
     ok!(
         "update_group",
-        json!({ "id": group_id, "name": "g1b", "plcConnectionId": conn_id, "periodMs": 2000 })
+        json!({
+            "id": group_id, "name": "g1b", "plcConnectionId": conn_id, "periodMs": 2000,
+            "enabled": true
+        })
     );
     let got = ok!("get_group", json!({ "id": group_id }));
     assert_eq!(got["group"]["periodMs"], 2000);
@@ -229,7 +236,9 @@ async fn a_config_key_calls_every_tool_and_changes_are_audited_as_mcp() {
         "update_tag",
         json!({
             "id": tag_id, "name": "t1b", "collectionGroupId": group_id, "address": "D100",
-            "dataType": "i16", "unit": "℃", "expectedRevision": revision
+            "dataType": "i16", "unit": "℃", "expectedRevision": revision,
+            "rawLo": null, "rawHi": null, "engLo": null, "engHi": null,
+            "decimals": 1, "enabled": true
         })
     );
     let got = ok!("get_tag", json!({ "id": tag_id }));
@@ -239,7 +248,10 @@ async fn a_config_key_calls_every_tool_and_changes_are_audited_as_mcp() {
     // しきい値。
     let set = ok!(
         "set_threshold",
-        json!({ "tagId": tag_id, "thresholdH": 80.0, "thresholdHh": 90.0 })
+        json!({
+            "tagId": tag_id, "thresholdLl": null, "thresholdL": null,
+            "thresholdH": 80.0, "thresholdHh": 90.0
+        })
     );
     assert_eq!(set["updated"]["thresholdHh"], 90.0);
     let got = ok!("get_threshold", json!({ "tagId": tag_id }));
@@ -260,7 +272,9 @@ async fn a_config_key_calls_every_tool_and_changes_are_audited_as_mcp() {
     let dg2_id = dg2["created"]["id"].as_i64().unwrap();
     ok!(
         "update_display_group",
-        json!({ "id": dg_id, "name": "L1b", "kind": "digital", "pens": [] })
+        json!({
+            "id": dg_id, "name": "L1b", "kind": "digital", "attributes": {}, "pens": []
+        })
     );
     let got = ok!("get_display_group", json!({ "id": dg_id }));
     assert_eq!(got["displayGroup"]["kind"], "digital");
@@ -290,7 +304,7 @@ async fn a_config_key_calls_every_tool_and_changes_are_audited_as_mcp() {
     let all: BTreeSet<String> = fx.tool_names(&key).await.into_iter().collect();
     assert_eq!(called, all, "every tool is called at least once");
 
-    // restartRequired は設定を変えるツールだけ。
+    // restartRequired は収集が読む設定を変えるツールだけ（表示グループには付けない）。
     for (tool, value) in &results {
         let expected = CHANGING_TOOLS.contains(&tool.as_str());
         assert_eq!(
@@ -385,6 +399,143 @@ async fn a_read_key_cannot_change_anything_and_the_denial_names_the_tool() {
     }
     let listed = fx.call_ok(&key, "list_connections", json!({})).await;
     assert_eq!(listed["connections"], json!([]));
+}
+
+/// 更新のツールは入力の全項目が必須。欠けた更新はフィールドのエラー（`isError`・
+/// `missing_fields`）になり、何も変わらず監査も残らない。`expectedRevision` と
+/// 作成のツールは省略できる。
+#[tokio::test]
+async fn updates_require_every_field_and_a_partial_update_changes_nothing() {
+    let fx = fixture().await;
+    let (key, _) = fx.issue("agent", &["config"]).await;
+    let conn = fx
+        .call_ok(&key, "create_connection", slmp_connection("c1"))
+        .await;
+    let conn_id = conn["created"]["id"].as_i64().unwrap();
+    let group = fx
+        .call_ok(
+            &key,
+            "create_group",
+            json!({ "name": "g1", "plcConnectionId": conn_id, "periodMs": 1000 }),
+        )
+        .await;
+    let group_id = group["created"]["id"].as_i64().unwrap();
+    let tag = fx
+        .call_ok(
+            &key,
+            "create_tag",
+            json!({ "name": "t1", "collectionGroupId": group_id, "address": "D100",
+                    "dataType": "i16", "unit": "℃", "decimals": 2 }),
+        )
+        .await;
+    let tag_id = tag["created"]["id"].as_i64().unwrap();
+    let dg = fx
+        .call_ok(
+            &key,
+            "create_display_group",
+            json!({ "name": "L1", "kind": "trend", "pens": [{ "tagId": tag_id }] }),
+        )
+        .await;
+    let dg_id = dg["created"]["id"].as_i64().unwrap();
+    fx.call_ok(
+        &key,
+        "set_threshold",
+        json!({ "tagId": tag_id, "thresholdLl": null, "thresholdL": null,
+                "thresholdH": 80.0, "thresholdHh": null }),
+    )
+    .await;
+    let before = fx.audit_rows().await.len();
+
+    // 各ツールで、全項目から 1 つずつ外した入力がすべて断られる。
+    let full: [(&str, Value, &[&str]); 5] = [
+        (
+            "update_connection",
+            json!({ "id": conn_id, "name": "c1", "protocol": "slmp", "enabled": true,
+                    "simulation": false, "settings": { "host": "127.0.0.1", "port": 5000, "cpu_type": "Q" } }),
+            &[
+                "id",
+                "name",
+                "protocol",
+                "enabled",
+                "simulation",
+                "settings",
+            ],
+        ),
+        (
+            "update_group",
+            json!({ "id": group_id, "name": "g1", "plcConnectionId": conn_id, "periodMs": 1000,
+                    "enabled": true }),
+            &["id", "name", "plcConnectionId", "periodMs", "enabled"],
+        ),
+        (
+            "update_tag",
+            json!({ "id": tag_id, "name": "t1", "collectionGroupId": group_id, "address": "D100",
+                    "dataType": "i16", "rawLo": null, "rawHi": null, "engLo": null, "engHi": null,
+                    "unit": null, "decimals": 0, "enabled": true }),
+            &[
+                "id",
+                "name",
+                "collectionGroupId",
+                "address",
+                "dataType",
+                "rawLo",
+                "rawHi",
+                "engLo",
+                "engHi",
+                "unit",
+                "decimals",
+                "enabled",
+            ],
+        ),
+        (
+            "update_display_group",
+            json!({ "id": dg_id, "name": "L1", "kind": "trend", "attributes": {}, "pens": [] }),
+            &["id", "name", "kind", "attributes", "pens"],
+        ),
+        (
+            "set_threshold",
+            json!({ "tagId": tag_id, "thresholdLl": null, "thresholdL": null,
+                    "thresholdH": null, "thresholdHh": null }),
+            &[
+                "tagId",
+                "thresholdLl",
+                "thresholdL",
+                "thresholdH",
+                "thresholdHh",
+            ],
+        ),
+    ];
+    for (tool, args, fields) in &full {
+        for field in *fields {
+            let mut partial = args.clone();
+            partial.as_object_mut().unwrap().remove(*field);
+            let result = fx.call(&key, tool, partial).await;
+            assert_eq!(result["isError"], true, "{tool} without {field}: {result}");
+            let text = result_text(&result);
+            assert!(text.starts_with("missing_fields"), "{tool}: {text}");
+            assert!(text.contains(field), "{tool}: {text}");
+        }
+    }
+    assert_eq!(fx.audit_rows().await.len(), before, "nothing is audited");
+
+    // 何も変わっていない。
+    let got = fx.call_ok(&key, "get_tag", json!({ "id": tag_id })).await;
+    assert_eq!(got["tag"]["name"], "t1");
+    assert_eq!(got["tag"]["unit"], "℃");
+    assert_eq!(got["tag"]["decimals"], 2);
+    let got = fx
+        .call_ok(&key, "get_threshold", json!({ "tagId": tag_id }))
+        .await;
+    assert_eq!(got["threshold"]["thresholdH"], 80.0);
+    let got = fx
+        .call_ok(&key, "get_display_group", json!({ "id": dg_id }))
+        .await;
+    assert_eq!(got["displayGroup"]["pens"].as_array().unwrap().len(), 1);
+
+    // 全項目があれば通る（`expectedRevision` は無くてよい）。
+    for (tool, args, _) in &full {
+        fx.call_ok(&key, tool, args.clone()).await;
+    }
 }
 
 /// 読み取りのツールも主体のスコープを確かめる（`read_tool!`）。発行の口では作れない
