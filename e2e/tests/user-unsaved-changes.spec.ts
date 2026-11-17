@@ -35,6 +35,9 @@ test.describe.serial('chronogazer 未保存の入力の確認', () => {
 
 	test.beforeAll(async ({ browser }) => {
 		page = await browser.newPage();
+		// #1159: ChronoGazer の既定はメニューバーなので、サイドバーのナビを前提にするこの spec は
+		// サイドバー表示を選んでおく（保存先は admin-template・Hub と同じ localStorage `banto.navLayout`）。
+		await page.addInitScript(() => localStorage.setItem('banto.navLayout', 'sidebar'));
 		page.on('dialog', (dialog: Dialog) => {
 			dialogs.push(dialog.message());
 			void (answer === 'leave' ? dialog.accept() : dialog.dismiss());

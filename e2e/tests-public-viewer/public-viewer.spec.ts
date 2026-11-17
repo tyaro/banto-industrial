@@ -134,6 +134,9 @@ test.describe.serial('ChronoGazer viewer-public mode', () => {
 
 	test.beforeAll(async ({ browser }) => {
 		page = await browser.newPage();
+		// #1159: ChronoGazer の既定はメニューバーなので、サイドバーのナビを前提にするこの spec は
+		// サイドバー表示を選んでおく（保存先は admin-template・Hub と同じ localStorage `banto.navLayout`）。
+		await page.addInitScript(() => localStorage.setItem('banto.navLayout', 'sidebar'));
 	});
 
 	test.afterAll(async () => {
