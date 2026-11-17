@@ -913,6 +913,7 @@ dependencies = [
  "banto-hub-squat-harness",
  "banto-hub-tls-trust",
  "banto-instance-lock",
+ "banto-mcp",
  "banto-opcua-server",
  "banto-plc",
  "banto-plc-write",
@@ -1087,6 +1088,16 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "banto-mcp"
+version = "0.1.0"
+dependencies = [
+ "axum 0.8.9",
+ "banto-core",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
