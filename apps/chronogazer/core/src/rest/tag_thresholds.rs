@@ -8,8 +8,8 @@
 //!
 //! 作法は表示グループ（`rest::display_groups`）と同じ: 読み取りはルーター全体の
 //! [`require_session_or_api_key`]（viewer 以上 / API キーの `read`・`config`）、
-//! 書き込みは [`require_editor`]（editor 以上 / `config`。拒否は `denied` で
-//! 監査）、成功した書き込みだけ [`Actor::record`] で監査する
+//! 書き込みは [`ThresholdOps::update`]（#1161 PR5a。editor 以上 / `config`。
+//! 拒否は `denied` で監査）、成功した書き込みだけ [`Actor::record`] で監査する
 //! （`resource: "tag_thresholds"`、`origin: "rest"`）。検証は
 //! `crate::tag_thresholds::validate_thresholds_for` だけで、Tauri の
 //! `tag_thresholds_*` コマンドも同じサービス・同じ検証を通る。
@@ -26,17 +26,14 @@ use axum::routing::get;
 use axum::{Json, Router};
 use banto_server::{ApiError, AuthState};
 
-use super::{require_editor, require_session_or_api_key, Actor, RevisionConflictRejection};
+use super::{require_session_or_api_key, Actor, RevisionConflictRejection};
 use crate::audit::AuditLogService;
-use crate::tag_thresholds::{
-    audit_detail, TagThresholdService, TagThresholds, TagThresholdsPayload, AUDIT_RESOURCE,
-};
+use crate::ops::{ThresholdOps, Via};
+use crate::tag_thresholds::{TagThresholdService, TagThresholds, TagThresholdsPayload};
 
-#[derive(Clone)]
-struct TagThresholdsState {
-    tag_thresholds: TagThresholdService,
-    audit: AuditLogService,
-}
+/// #1161 PR5a: 書き込みの本体（権限の確かめ・監査）は [`ThresholdOps::update`]
+/// で、MCP のツールも同じものを呼ぶ。
+type TagThresholdsState = ThresholdOps;
 
 async fn list(
     State(state): State<TagThresholdsState>,
@@ -57,25 +54,18 @@ async fn update(
     Path(tag_id): Path<i64>,
     Json(payload): Json<TagThresholdsPayload>,
 ) -> Result<Json<TagThresholds>, RevisionConflictRejection> {
-    require_editor(
-        &actor,
-        &state.audit,
-        AUDIT_RESOURCE,
-        "PUT",
-        "/api/tag-thresholds/{tagId}",
-    )
-    .await?;
-    let updated = state.tag_thresholds.update(tag_id, &payload).await?;
-    actor
-        .record(
-            &state.audit,
-            "update",
-            AUDIT_RESOURCE,
-            Some(&tag_id.to_string()),
-            Some(audit_detail(&updated)),
+    let updated = state
+        .update(
+            &actor,
+            &Via::Rest {
+                method: "PUT",
+                path: "/api/tag-thresholds/{tagId}",
+            },
+            tag_id,
+            &payload,
         )
-        .await;
-    Ok(Json(updated.thresholds))
+        .await?;
+    Ok(Json(updated))
 }
 
 /// `/api/tag-thresholds/*` のルーター（モジュール doc の表）。

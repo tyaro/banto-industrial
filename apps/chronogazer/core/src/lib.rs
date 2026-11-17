@@ -49,6 +49,8 @@ pub mod mode_switch;
 // その下の配置、旧データの場所。B1-5 の `chronogazer-server` が使う（デスクトップは
 // B2-4 で寄せる）。
 pub mod paths;
+// #1161 PR5a: 設定を変える操作の本体（REST と MCP が同じ関数を呼ぶ、§5.4）。
+mod ops;
 pub mod rest;
 // #392 B2-1: LAN の公開設定と認証の設定（デスクトップの Tauri のコマンドと REST の
 // `/api/settings/*` が同じ適用の関数を使う）。
