@@ -59,3 +59,39 @@ export function findVisibleNavToggle(root: ParentNode = document): HTMLElement |
 	}
 	return null;
 }
+
+/**
+ * #1159（banto v7.2.0 のメニューバー、nav-menubar-plan.md §4.9・D10-a）: ナビの
+ * 置き場所と幅から、シェルが何を出すかを決める純粋関数。
+ *
+ * - サイドバー: 常にサイドバー。≤900px はオフキャンバス（ドロワー）。
+ * - ドック: サイドバーは出さない（≤900px は `LauncherBar` が下のタブバーになる）。
+ * - メニューバー: >900px はヘッダーにバー（サイドバー無し）。≤900px、または
+ *   バーが「その他」にまとめても入りきらない（`insufficient`）ときは、サイドバーを
+ *   ドロワーとして出す。バーは `insufficient` の間も隠してマウントしたまま
+ *   （幅が戻ったことを測れるように）。
+ */
+export type ShellNavLayout = 'sidebar' | 'launcher' | 'menubar';
+
+export interface ShellNavView {
+	/** ヘッダーにメニューバーをマウントするか（>900px のメニューバー）。 */
+	showBar: boolean;
+	/** サイドバー（`<aside>`）を描くか。 */
+	showSidebar: boolean;
+	/** 描いているサイドバーがドロワー（オフキャンバス）か。 */
+	drawerMode: boolean;
+	/** ヘッダーのドロワーのボタンを出すか（サイドバーがドロワーのとき）。 */
+	showDrawerButton: boolean;
+}
+
+export function resolveShellNav(
+	layout: ShellNavLayout,
+	isNarrow: boolean,
+	menubarInsufficient: boolean
+): ShellNavView {
+	const showBar = layout === 'menubar' && !isNarrow;
+	const insufficient = showBar && menubarInsufficient;
+	const showSidebar = layout === 'sidebar' || (layout === 'menubar' && (isNarrow || insufficient));
+	const drawerMode = showSidebar && (isNarrow || insufficient);
+	return { showBar, showSidebar, drawerMode, showDrawerButton: drawerMode };
+}

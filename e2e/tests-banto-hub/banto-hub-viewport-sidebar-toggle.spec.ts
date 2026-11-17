@@ -20,6 +20,9 @@ test.describe.serial('banto-hub sidebar toggle placement (#714)', () => {
 
 	test.beforeAll(async ({ browser }) => {
 		page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+		// #1159: Hub の既定はメニューバー（広幅にサイドバーが無い）なので、サイドバー表示を選んでおく
+		// （保存先は admin-template と同じ localStorage `banto.navLayout`）。
+		await page.addInitScript(() => localStorage.setItem('banto.navLayout', 'sidebar'));
 		await page.goto('/login');
 		await ensureLoggedIn(page);
 		await page.goto('/status');

@@ -14,7 +14,9 @@ import {
 	initialMobileNavState,
 	NAV_TOGGLE_ATTR,
 	resolveHamburgerTarget,
-	type MobileNavState
+	resolveShellNav,
+	type MobileNavState,
+	type ShellNavView
 } from './mobileNav';
 import { watchMediaQuery } from './viewportWatch';
 
@@ -25,7 +27,40 @@ export const NAV_BACKDROP_CLASS = 'nav-backdrop';
 export const NARROW_BREAKPOINT_QUERY = '(max-width: 900px)';
 
 class MobileNavStore {
-	#state: MobileNavState = $state(initialMobileNavState());
+	// #1159: ドロワーの条件が CSS のメディアクエリから `drawerMode`（JS）に移ったので、
+	// 最初の描画から正しい幅で始める（`watchViewport` の購読を待つと、狭幅で開いた瞬間に
+	// サイドバーが列のまま 1 フレーム出る）。matchMedia が無い環境は広幅の既定。
+	#state: MobileNavState = $state(
+		applyNarrowChange(
+			initialMobileNavState(),
+			typeof window !== 'undefined' &&
+				typeof window.matchMedia === 'function' &&
+				window.matchMedia(NARROW_BREAKPOINT_QUERY).matches
+		)
+	);
+	/** メニューバーが「その他」にまとめても入りきらない（#1159、`Header` が `HeaderNav` から受けて渡す）。 */
+	#menubarInsufficient = $state(false);
+
+	get menubarInsufficient(): boolean {
+		return this.#menubarInsufficient;
+	}
+
+	setMenubarInsufficient(insufficient: boolean): void {
+		this.#menubarInsufficient = insufficient;
+	}
+
+	/** ナビの置き場所・幅・入りきらないかから決めるシェルの表示（`resolveShellNav`）。 */
+	get view(): ShellNavView {
+		return resolveShellNav(settings.navLayout, this.#state.isNarrow, this.#menubarInsufficient);
+	}
+
+	/**
+	 * サイドバーがドロワー（オフキャンバス）になっているか。≤900px に加え、メニューバーが
+	 * 入りきらないときの >900px も含む。`isNarrow` はビューポート幅そのもの。
+	 */
+	get drawerMode(): boolean {
+		return this.view.drawerMode;
+	}
 
 	get open(): boolean {
 		return this.#state.open;
@@ -115,7 +150,7 @@ class MobileNavStore {
 	 * 描画後に見えている側のトグルへフォーカスを移す（#714）。
 	 */
 	toggleHamburger(): void {
-		if (resolveHamburgerTarget(this.#state.isNarrow) === 'offcanvas') {
+		if (resolveHamburgerTarget(this.drawerMode) === 'offcanvas') {
 			this.toggleNav();
 		} else {
 			settings.toggleSidebar();
