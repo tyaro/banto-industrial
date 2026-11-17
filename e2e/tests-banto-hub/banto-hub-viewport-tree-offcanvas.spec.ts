@@ -185,6 +185,30 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(page.getByRole('gridcell', { name: TAG_A, exact: true })).toHaveCount(0);
 	});
 
+	test('2b. 上下キーで行を動かしただけでは閉じず、Enter で確定すると閉じる（#1179 PR2a）', async () => {
+		// BantoTree は単一選択でフォーカスに選択が付いてくる。その選択では退避
+		// パネルを閉じない（`ConnectionTree` の `onselect` の `navigation`）。
+		// 前のテストの終わりで GROUP_B が選択中（= ツリーのタブ停止位置）。
+		await treeToggle.click();
+		await expect(treePane).toBeVisible();
+		await groupNodeByName(page, GROUP_B).focus();
+
+		await page.keyboard.press('ArrowUp');
+		await expect(treePane).toBeVisible();
+		await expect(treeSelection).toHaveText(GROUP_A);
+		await expect(treeToggle).toHaveAttribute('aria-expanded', 'true');
+
+		await page.keyboard.press('ArrowDown');
+		await expect(treePane).toBeVisible();
+		await expect(treeSelection).toHaveText(GROUP_B);
+
+		// Enter（子の無い行の確定 = BantoTree の `onActivate`）で閉じる。
+		await page.keyboard.press('Enter');
+		await expect(treePane).toBeHidden();
+		await expect(treeToggle).toHaveAttribute('aria-expanded', 'false');
+		await expect(treeSelection).toHaveText(GROUP_B);
+	});
+
 	test('3. Esc とバックドロップのクリックで閉じ、フォーカスはボタンへ戻る', async () => {
 		await treeToggle.click();
 		await expect(treePane).toBeVisible();

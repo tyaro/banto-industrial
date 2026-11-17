@@ -30,6 +30,7 @@
 	 */
 	import { BantoTree, type TreeNode } from '@banto/tree-svelte';
 	import type { ConnectionTreeNodeData } from './connectionTreeTypes';
+	import { isNavigationKey } from './connectionTreeNav';
 	import { buildTagCountsByGroup, buildGroupsByConnection } from './connectionTreeBuild';
 	import {
 		isVirtualConnection,
@@ -45,7 +46,13 @@
 		groups: CollectionGroup[];
 		tags: Tag[];
 		selectedId?: string | null;
-		onselect?: (data: ConnectionTreeNodeData) => void;
+		/**
+		 * ノードの選択の通知。`navigation: true` は、上下・Home・End・左右の
+		 * キーでフォーカスが動いたことに選択が付いてきた場合（BantoTree は単一
+		 * 選択でフォーカスに選択が付く）。クリック・Space・Enter（子の無い行の
+		 * 確定）は `false`。狭幅で退避パネルを閉じるのは `false` のときだけ。
+		 */
+		onselect?: (data: ConnectionTreeNodeData, info: { navigation: boolean }) => void;
 		/**
 		 * T13-3 / T18-2e: ノードのコンテキストメニューの要求（マウス右クリック、
 		 * `Shift+F10`、メニューキー）。キー操作では行の左下を位置として渡す
@@ -187,7 +194,36 @@
 		const id = ids[0];
 		if (id === undefined) return;
 		const data = toPageData(dataById.get(id));
-		if (data) onselect?.(data);
+		if (!data) return;
+		// 直前の入力がナビゲーションのキーなら、フォーカスに付いてきた選択。
+		const navigation = lastInputWasNavigation;
+		lastInputWasNavigation = false;
+		onselect?.(data, { navigation });
+	}
+
+	/**
+	 * 直前の入力が、フォーカスを動かすキーだったか。ツリーを包む要素で
+	 * `keydown`・`pointerdown` を capture で受けて記録する（BantoTree の
+	 * ハンドラより先に走るので、その中で呼ばれる `onSelectionChange` から読める）。
+	 * BantoTree の DOM やクラスには依存しない。
+	 */
+	let lastInputWasNavigation = false;
+
+	function handleKeydownCapture(event: KeyboardEvent): void {
+		lastInputWasNavigation = isNavigationKey(event.key);
+	}
+
+	function handlePointerdownCapture(): void {
+		lastInputWasNavigation = false;
+	}
+
+	/**
+	 * 子の無い行の Enter・ダブルクリック（BantoTree の `onActivate`）。選択済みの
+	 * 行でも「確定した」として通知する（狭幅で退避パネルを閉じる契機）。
+	 */
+	function handleActivate(node: TreeNode<NodeData>): void {
+		const data = toPageData(node.data);
+		if (data) onselect?.(data, { navigation: false });
 	}
 
 	function handleContextMenu(node: TreeNode<NodeData>, position: { x: number; y: number }): void {
@@ -243,13 +279,18 @@
 	T18-6c: ツリー全体を枠線＋角丸のコンテナに収め、内側でスクロールさせる
 	（以前は TreeView 側の `.tree-container` が持っていた）。
 -->
-<div class="tree-container">
+<div
+	class="tree-container"
+	onkeydowncapture={handleKeydownCapture}
+	onpointerdowncapture={handlePointerdownCapture}
+>
 	<BantoTree
 		{nodes}
 		label={nodeLabel}
 		autoExpandNewRoots
 		selection={selectedId ? [selectedId] : []}
 		onSelectionChange={handleSelectionChange}
+		onActivate={handleActivate}
 		onContextMenu={oncontextmenu ? handleContextMenu : undefined}
 	/>
 </div>

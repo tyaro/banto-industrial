@@ -3180,13 +3180,22 @@
 		else treeFilter = { type: 'group', id: data.group.id };
 	}
 
-	/** `ConnectionTree` の `onselect`（クリック / Enter でのノード選択）。 */
-	function handleTreeSelect(data: ConnectionTreeNodeData): void {
+	/**
+	 * `ConnectionTree` の `onselect`。`navigation` は上下・Home・End・左右の
+	 * キーでフォーカスが動いたことに選択が付いてきた場合（BantoTree は単一
+	 * 選択でフォーカスに選択が付く）。
+	 */
+	function handleTreeSelect(
+		data: ConnectionTreeNodeData,
+		{ navigation }: { navigation: boolean }
+	): void {
 		applyTreeSelection(data);
-		// #378: 狭幅では選んだ時点で退避パネルを閉じる（`Sidebar.svelte` の
-		// リンククリックで `closeNav()` するのと同じ「閉じる契機」）。**閉じるのは
-		// この経路（クリック選択）だけ** - 右クリック経路は下記参照。
-		if (mobileNavStore.isNarrow) treeOpen = false;
+		// #378: 狭幅では「選んだ」時点（クリック・Space・Enter）で退避パネルを
+		// 閉じる（`Sidebar.svelte` のリンククリックで `closeNav()` するのと同じ
+		// 「閉じる契機」）。上下キーなどのフォーカス移動に付いてきた選択
+		// （`navigation`）では閉じない - キーで目的の行まで動かせなくなる。
+		// **閉じるのはこの経路だけ** - 右クリック経路は下記参照。
+		if (mobileNavStore.isNarrow && !navigation) treeOpen = false;
 	}
 
 	/**
