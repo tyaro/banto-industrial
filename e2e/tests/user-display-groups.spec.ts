@@ -282,4 +282,23 @@ test.describe.serial('chronogazer 「表示グループ」ページ（#393）', 
 		const res = await page.request.delete(`/api/tags/${tagAId}`, { headers });
 		expect(res.status(), await res.text()).toBe(204);
 	});
+
+	test('7. 名前が空のまま「ペン」タブから作成すると、エラーのある「設定」タブへ切り替わる', async () => {
+		await addGroupButton(page).click();
+		await expect(page).toHaveURL(/\?group=new&tab=settings$/);
+		await openPensTab(page);
+		await center().getByRole('button', { name: 'ペンを追加' }).click();
+		await penPane(page).getByLabel('ペン 1 のタグ').selectOption({ label: TAG_B });
+
+		await center().getByRole('button', { name: '作成', exact: true }).click();
+		// サーバーが空の名前を拒み、名前の欄のエラーがあるタブへ移る（URL も追従）。
+		await expect(page.getByRole('tab', { name: '設定', exact: true })).toHaveAttribute(
+			'aria-selected',
+			'true'
+		);
+		await expect(page).toHaveURL(/\?group=new&tab=settings$/);
+		await expect(center().getByLabel('名前')).toBeVisible();
+		await expect(center().getByTestId('display-group-error-tabs')).toContainText('設定');
+		await expect(center().locator('.field-error').first()).toBeVisible();
+	});
 });

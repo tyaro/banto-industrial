@@ -109,6 +109,7 @@
 		movedGroupIds,
 		removePen,
 		reloadLatestGroup,
+		fieldErrorTabs,
 		sortFieldErrors,
 		tagsUsedByOtherPens,
 		penThresholdText,
@@ -364,6 +365,7 @@
 		fieldErrors = emptyFieldErrors();
 		latestReloadError = null;
 		const target = selected;
+		let switchTo: GroupsTab | null = null;
 		try {
 			const saved =
 				target === 'new'
@@ -381,12 +383,21 @@
 			if (isProviderError(err) && err.body.kind === 'validation') {
 				fieldErrors = sortFieldErrors(err.body.field_errors);
 				for (const message of fieldErrors.other) toastStore.push('error', message);
+				// 欄のエラーが今見ていないタブにだけあるときは、そのタブへ移す（見えないままにしない）。
+				const tabs = fieldErrorTabs(fieldErrors);
+				if (view.tab === 'settings' && !tabs.settings && tabs.pens) {
+					switchTo = 'pens';
+				} else if (view.tab === 'pens' && !tabs.pens && tabs.settings) {
+					switchTo = 'settings';
+				}
 				if (fieldErrors.revision.length > 0) void reloadGroups();
 			} else {
 				toastStore.push('error', errorMessage(err));
 			}
 		} finally {
 			saving = false;
+			// `saving` を下ろしてから切り替える（`busy` の間は `confirmViewChange` が拒む）。
+			if (switchTo !== null) requestView({ group: view.group, tab: switchTo });
 		}
 	}
 
@@ -644,6 +655,9 @@
 		isDirty: () => leaveGuardMuted === 0 && dirty,
 		isSaving: () => leaveGuardMuted === 0 && (saving || deleting)
 	});
+
+	/** 欄のエラーがあるタブ（保存の帯の要約用。`fieldErrors` から導出する）。 */
+	const errorTabs = $derived(fieldErrorTabs(fieldErrors));
 
 	function setActiveTab(id: string | undefined): void {
 		requestView({ group: view.group, tab: id === 'settings' ? 'settings' : 'pens' });
@@ -913,6 +927,20 @@
 										最新の内容を読み込めませんでした（{latestReloadError}）。入力はそのまま残っています。
 									</p>
 								{/if}
+							{/if}
+
+							{#if errorTabs.settings || errorTabs.pens}
+								<p class="load-error" role="alert" data-testid="display-group-error-tabs">
+									保存できませんでした。
+									{#if errorTabs.settings}
+										<button type="button" onclick={() => setActiveTab('settings')}>設定</button>
+									{/if}
+									{#if errorTabs.settings && errorTabs.pens}と{/if}
+									{#if errorTabs.pens}
+										<button type="button" onclick={() => setActiveTab('pens')}>ペン</button>
+									{/if}
+									タブの入力を確かめてください
+								</p>
 							{/if}
 
 							<div class="actions">

@@ -280,6 +280,17 @@ export function emptyFieldErrors(): SortedFieldErrors {
 	return sortFieldErrors([]);
 }
 
+/**
+ * 欄のエラーがあるタブ。中央は「設定」（名前・種別・時間窓）と「ペン」（ペン全体・各行）の
+ * 2 タブなので、保存の失敗が今見ていないタブにあっても気づけるよう、どちらにあるかを返す。
+ */
+export function fieldErrorTabs(errors: SortedFieldErrors): { settings: boolean; pens: boolean } {
+	return {
+		settings: errors.name.length > 0 || errors.kind.length > 0 || errors.timeWindowSec.length > 0,
+		pens: errors.pens.length > 0 || Object.values(errors.penRows).some((rows) => rows.length > 0)
+	};
+}
+
 // --- 版の食い違いのあとの「最新の内容を読み込む」（#393 オーナーレビュー P2-2・P2-5） ---
 
 /**
