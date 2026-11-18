@@ -778,8 +778,25 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 		await expect(page.getByText('先に更新しました')).toBeVisible();
 		await expect(unit).toHaveValue('ui');
 
-		// 同じ行をもう一度選ぶと、最新の値（API が書いた単位）で作り直される。
-		await recordList(page).getByRole('gridcell', { name: TAG_NAME, exact: true }).click();
+		// 同じ行をもう一度選ぶと、未保存の入力を捨てるかを確かめる。キャンセルなら入力が残る。
+		const recordRow = recordList(page).getByRole('gridcell', { name: TAG_NAME, exact: true });
+		const dismissed: string[] = [];
+		page.once('dialog', (dialog) => {
+			dismissed.push(dialog.message());
+			void dialog.dismiss();
+		});
+		await recordRow.click();
+		await expect.poll(() => dismissed.length).toBe(1);
+		await expect(unit).toHaveValue('ui');
+
+		// 承認すると、最新の値（API が書いた単位）で作り直される。
+		const accepted: string[] = [];
+		page.once('dialog', (dialog) => {
+			accepted.push(dialog.message());
+			void dialog.accept();
+		});
+		await recordRow.click();
+		await expect.poll(() => accepted.length).toBe(1);
 		await expect(unit).toHaveValue('api');
 
 		// 最新の版で保存できる。
