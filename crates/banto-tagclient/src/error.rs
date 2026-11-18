@@ -53,7 +53,8 @@ pub enum ErrorKind {
     /// timing before trying again.
     WriteRejected,
     /// The write may or may not have reached the device (502
-    /// `write_uncertain` or an unknown 502, 500 `internal`, or a failure after
+    /// `write_uncertain` or an unknown 502, 500 `internal`, 504 or any other
+    /// 5xx that cannot guarantee nothing was sent, or a failure after
     /// the request was sent such as a timeout). The caller must check the
     /// physical state before writing again; this crate never retries.
     WriteUncertain,

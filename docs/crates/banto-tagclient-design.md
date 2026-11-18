@@ -370,20 +370,22 @@ log-before-write）と衝突する。監査行をバッチ単位でまとめる�
   出さない。指定しなければ要求のbodyに乗らない。
 - `WriteReceipt`（`#[non_exhaustive]`）は`audit_id() -> Option<i64>`と`correlation_id()`を持つ。
   200は書き込み成功なので、bodyが読めない・形が違っても`Ok`（`audit_id`は`None`）にし、warnログだけ出す。
-- 分類（失敗のbodyの`error`コード。「既定」はコードが読めない・知らないとき）:
+- 分類（失敗のbodyの`error`コード。「既定」はコードが読めない・知らないとき）。基準は「送っていないと保証できるか」で、保証できないサーバーエラーは結果不明（`WriteUncertain`）:
 
-| ステータス          | コード                                                                                  | `ErrorKind`        |
-| ------------------- | --------------------------------------------------------------------------------------- | ------------------ |
-| 401                 | -                                                                                       | `Unauthorized`     |
-| 403                 | `key_tripped`                                                                           | `KeyTripped`       |
-| 403                 | 上記以外・読めない（`not_writable`/`missing_write_scope`/`session_token_cannot_write`） | `WriteForbidden`   |
-| 404/409/422/429/501 | -                                                                                       | `WriteRejected`    |
-| 502                 | `write_failed`（送って失敗が確定）                                                      | `WriteRejected`    |
-| 502                 | `write_uncertain`・既定（リバースプロキシの502など。届いたか不明なので安全側）          | `WriteUncertain`   |
-| 500                 | `audit_write_failed`（送っていない）                                                    | `Transport`        |
-| 500                 | `internal`・既定（送ったか保証できない）                                                | `WriteUncertain`   |
-| 503                 | -                                                                                       | `WriteUnavailable` |
-| リダイレクト        | -                                                                                       | `InvalidEndpoint`  |
+| ステータス               | コード                                                                                  | `ErrorKind`        |
+| ------------------------ | --------------------------------------------------------------------------------------- | ------------------ |
+| 401                      | -                                                                                       | `Unauthorized`     |
+| 403                      | `key_tripped`                                                                           | `KeyTripped`       |
+| 403                      | 上記以外・読めない（`not_writable`/`missing_write_scope`/`session_token_cannot_write`） | `WriteForbidden`   |
+| 404/409/422/429/501      | -                                                                                       | `WriteRejected`    |
+| 502                      | `write_failed`（送って失敗が確定）                                                      | `WriteRejected`    |
+| 502                      | `write_uncertain`・既定（リバースプロキシの502など。届いたか不明なので安全側）          | `WriteUncertain`   |
+| 500                      | `audit_write_failed`（送っていない）                                                    | `Transport`        |
+| 500                      | `internal`・既定（送ったか保証できない）                                                | `WriteUncertain`   |
+| 503                      | `writes_disabled`/`collection_not_running`（Hubのコード。送っていない）                 | `WriteUnavailable` |
+| 503                      | 上記以外・読めない（プロキシの503など。送ったか保証できない）                           | `WriteUncertain`   |
+| 504・上に無いその他の5xx | -（プロキシが転送した後のタイムアウトなど。送ったか保証できない）                       | `WriteUncertain`   |
+| リダイレクト             | -                                                                                       | `InvalidEndpoint`  |
 
 - 送信の失敗（`reqwest::Error`）: `is_connect()`・`is_builder()`（要求を組み立てられず）は送っていないので`Transport`。それ以外
   （送信後のタイムアウト、応答の途中の切断）は要求を送り始めた後なので`WriteUncertain`。

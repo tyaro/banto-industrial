@@ -288,12 +288,19 @@ fn log_write_send_failure(endpoint: &Endpoint, error: &reqwest::Error) -> Error 
 /// arbitrary server text into its public error surface. An unreadable or
 /// unknown code falls to the status's default below.
 ///
+/// The criterion is "can it be guaranteed that nothing was sent": a server
+/// error that cannot guarantee it is [`ErrorKind::WriteUncertain`].
+///
 /// - 403: `key_tripped` -> [`ErrorKind::KeyTripped`], otherwise
 ///   [`ErrorKind::WriteForbidden`] (`not_writable` / `missing_write_scope` /
 ///   `session_token_cannot_write`): a configuration problem that will not go
 ///   away on retry.
-/// - 503 (`writes_disabled` / `collection_not_running`) stays
-///   [`ErrorKind::WriteUnavailable`], a transient state.
+/// - 503 with the Hub's own code (`writes_disabled` / `collection_not_running`)
+///   is [`ErrorKind::WriteUnavailable`], a transient state where nothing was
+///   sent. A 503 without a readable or known code (a proxy's) is
+///   [`ErrorKind::WriteUncertain`].
+/// - 504 and any other 5xx not listed here -> [`ErrorKind::WriteUncertain`]
+///   (a proxy may have forwarded the POST before timing out).
 /// - 502: `write_failed` (the send failed for certain) ->
 ///   [`ErrorKind::WriteRejected`]; `write_uncertain` and anything else
 ///   (for example a reverse proxy's own 502) -> [`ErrorKind::WriteUncertain`],
@@ -313,7 +320,10 @@ fn classify_write_failure(
             Some("key_tripped") => ErrorKind::KeyTripped,
             _ => ErrorKind::WriteForbidden,
         },
-        StatusCode::SERVICE_UNAVAILABLE => ErrorKind::WriteUnavailable,
+        StatusCode::SERVICE_UNAVAILABLE => match code {
+            Some("writes_disabled" | "collection_not_running") => ErrorKind::WriteUnavailable,
+            _ => ErrorKind::WriteUncertain,
+        },
         StatusCode::BAD_GATEWAY => match code {
             Some("write_failed") => ErrorKind::WriteRejected,
             _ => ErrorKind::WriteUncertain,
@@ -328,6 +338,9 @@ fn classify_write_failure(
         | StatusCode::TOO_MANY_REQUESTS
         | StatusCode::NOT_IMPLEMENTED => ErrorKind::WriteRejected,
         status if status.is_redirection() => ErrorKind::InvalidEndpoint,
+        // 504 (a proxy that already forwarded the POST) and any other 5xx:
+        // nothing guarantees the Hub did not send the write.
+        status if status.is_server_error() => ErrorKind::WriteUncertain,
         _ => ErrorKind::Transport,
     };
     tracing::warn!(
@@ -388,9 +401,13 @@ mod tests {
             ErrorKind::WriteForbidden
         );
         assert_eq!(
-            classify_write_failure(&endpoint, StatusCode::SERVICE_UNAVAILABLE, None)
-                .unwrap_err()
-                .kind(),
+            classify_write_failure(
+                &endpoint,
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("writes_disabled")
+            )
+            .unwrap_err()
+            .kind(),
             ErrorKind::WriteUnavailable
         );
     }
@@ -692,7 +709,8 @@ mod tests {
     async fn write_tag_distinguishes_403_forbidden_from_503_unavailable() {
         for (status, expected) in [
             ("403 Forbidden", ErrorKind::WriteForbidden),
-            ("503 Service Unavailable", ErrorKind::WriteUnavailable),
+            // A bodyless 503 is a proxy's, not the Hub's: outcome unknown.
+            ("503 Service Unavailable", ErrorKind::WriteUncertain),
             ("401 Unauthorized", ErrorKind::Unauthorized),
         ] {
             let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -720,7 +738,7 @@ mod tests {
         // Owner decision (2026-09-01): a write is never retried
         // automatically. If `write_tag` retried, `serve_one_write` would see
         // a second connection.
-        let server = tokio::spawn(serve_one_write(listener, "503 Service Unavailable"));
+        let server = tokio::spawn(serve_one_write(listener, "504 Gateway Timeout"));
 
         let client = write_client(address, "test-token");
         let started = Instant::now();
@@ -736,7 +754,7 @@ mod tests {
         // smallest configured backoff step is measured in whole seconds) -
         // an immediate return is itself evidence no retry loop ran.
         assert!(started.elapsed() < Duration::from_millis(500));
-        assert_eq!(error.kind(), ErrorKind::WriteUnavailable);
+        assert_eq!(error.kind(), ErrorKind::WriteUncertain);
         let (_, extra_connection) = server.await.unwrap();
         assert!(
             !extra_connection,
@@ -960,6 +978,30 @@ mod tests {
                 ErrorKind::WriteUncertain,
             ),
             ("500 Internal Server Error", "", ErrorKind::WriteUncertain),
+            (
+                "503 Service Unavailable",
+                r#"{"error":"writes_disabled"}"#,
+                ErrorKind::WriteUnavailable,
+            ),
+            (
+                "503 Service Unavailable",
+                r#"{"error":"collection_not_running"}"#,
+                ErrorKind::WriteUnavailable,
+            ),
+            (
+                "503 Service Unavailable",
+                "<html>proxy</html>",
+                ErrorKind::WriteUncertain,
+            ),
+            ("503 Service Unavailable", "", ErrorKind::WriteUncertain),
+            ("504 Gateway Timeout", "", ErrorKind::WriteUncertain),
+            (
+                "504 Gateway Timeout",
+                "<html>gateway timeout</html>",
+                ErrorKind::WriteUncertain,
+            ),
+            ("507 Insufficient Storage", "", ErrorKind::WriteUncertain),
+            ("599 Custom", "", ErrorKind::WriteUncertain),
         ];
         for (status, body, expected) in cases {
             let (result, _) = write_with_response(
@@ -970,6 +1012,36 @@ mod tests {
             )
             .await;
             assert_eq!(result.unwrap_err().kind(), expected, "{status} {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn write_tag_504_after_post_is_uncertain_and_not_retried() {
+        for body in ["", "<html>gateway timeout</html>"] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let mut received = 0_u32;
+                while let Ok(Ok((mut stream, _))) =
+                    tokio::time::timeout(Duration::from_millis(500), listener.accept()).await
+                {
+                    read_full_request(&mut stream).await;
+                    received += 1;
+                    respond_json(&mut stream, "504 Gateway Timeout", body).await;
+                }
+                received
+            });
+            let client = write_client(address, "test-token");
+            let error = client
+                .write_tag(
+                    "line1.fast.temp01",
+                    RequestedValue::Num(1.0),
+                    WriteOptions::default(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::WriteUncertain, "{body:?}");
+            assert_eq!(server.await.unwrap(), 1, "{body:?}: must not be resent");
         }
     }
 
