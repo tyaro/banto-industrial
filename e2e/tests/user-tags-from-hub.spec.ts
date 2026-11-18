@@ -32,6 +32,15 @@
  * （辞書順が実行順）。`user-tags-*` は `smoke` より後。
  */
 import { expect, test, type APIRequestContext, type Dialog, type Page } from '@playwright/test';
+import {
+	detailPane,
+	openListTab,
+	openSettingsTab,
+	recordList,
+	recordTree,
+	settingsPane,
+	treeNode
+} from './records-page';
 
 const ADMIN_USERNAME = 'e2e-admin';
 const ADMIN_PASSWORD = 'E2eAdminPass1';
@@ -164,6 +173,9 @@ test.describe.serial('chronogazer 記録の「Hub から追加」（#383 段階3
 	});
 
 	const dialog = () => page.getByRole('dialog', { name: 'Hub から追加' });
+	/** ツリーの Hub 経由の接続先（「Hub から追加」が暗黙に作る。名前はサーバーが決める）。 */
+	const hubConnectionNode = () =>
+		recordTree(page).getByRole('treeitem', { name: / Hub 経由( 無効)?$/ });
 	const checkbox = (externalName: string) =>
 		dialog().locator('li').filter({ hasText: externalName }).getByRole('checkbox');
 
@@ -191,10 +203,9 @@ test.describe.serial('chronogazer 記録の「Hub から追加」（#383 段階3
 		await expect(page.getByText('Hub のタグを 2 件登録しました。')).toBeVisible();
 		await expect(dialog()).toHaveCount(0);
 
-		const connections = page.locator('section.registry-section').nth(0).locator('div.list');
-		await expect(connections.getByText('Hub 経由')).toBeVisible();
-		const groups = page.locator('section.registry-section').nth(1).locator('div.list');
-		await expect(groups.getByText(GROUP_NAME)).toBeVisible();
+		// #1179 PR4b: ツリーに Hub 経由の接続先とその下のグループが出る。
+		await expect(hubConnectionNode()).toBeVisible();
+		await expect(treeNode(page, GROUP_NAME)).toBeVisible();
 	});
 
 	test('3. 登録済みは選べず、同じグループで名前が衝突するとその行に理由が出て何も登録されない', async () => {
@@ -237,24 +248,24 @@ test.describe.serial('chronogazer 記録の「Hub から追加」（#383 段階3
 	});
 
 	test('5. Hub 経由のタグの編集にスケーリングの欄が無く、Hub 接続の行は読み取り専用', async () => {
-		const tagsSection = page.locator('section.registry-section').nth(2);
-		await tagsSection.locator('div.list').getByText(TEMP).click();
-		const detail = tagsSection.locator('div.detail');
+		await recordList(page).getByText(TEMP).click();
+		const detail = detailPane(page);
 		await expect(detail.getByText('Hub 経由のタグです')).toBeVisible();
 		await expect(detail.getByLabel('スケーリング: 生値 下限')).toHaveCount(0);
 		await expect(detail.getByLabel('Hub のタグ名（外部名）')).toHaveValue(TEMP);
 
-		const connectionsSection = page.locator('section.registry-section').nth(0);
-		await connectionsSection.locator('div.list').getByText('Hub 経由').click();
-		const connectionDetail = connectionsSection.locator('div.detail');
-		await expect(connectionDetail.getByText('（Hub 経由の接続）')).toBeVisible();
+		// 接続先を選ぶと右ペインは閉じ、「設定」タブに「有効」と削除だけが出る。
+		await hubConnectionNode().click();
+		await expect(detailPane(page)).toHaveCount(0);
+		await openSettingsTab(page);
+		const connectionDetail = settingsPane(page);
+		await expect(connectionDetail.getByText('（Hub 経由の接続先）')).toBeVisible();
 		await expect(connectionDetail.getByLabel('ホスト')).toHaveCount(0);
 		await expect(connectionDetail.getByRole('button', { name: '削除' })).toBeVisible();
 	});
 
 	test('6. Hub 接続の「有効」を切り替えて保存でき、一覧と行に反映される（2026-10-11 オーナー決定）', async () => {
-		const connectionsSection = page.locator('section.registry-section').nth(0);
-		const connectionDetail = connectionsSection.locator('div.detail');
+		const connectionDetail = settingsPane(page);
 		const enabled = connectionDetail.getByLabel('有効（無効にすると');
 		await expect(enabled).toBeChecked();
 		await enabled.uncheck();
@@ -267,6 +278,8 @@ test.describe.serial('chronogazer 記録の「Hub から追加」（#383 段階3
 			await page.request.get('/api/plc-connections', { headers })
 		).json()) as (Row & { enabled: boolean })[];
 		expect(conns.find((c) => c.protocol === 'hub')?.enabled).toBe(false);
+		// ツリーの接続先に「無効」の印が付く。
+		await expect(hubConnectionNode()).toHaveAccessibleName(/ Hub 経由 無効$/);
 
 		await enabled.check();
 		await connectionDetail.getByRole('button', { name: '保存' }).click();
@@ -308,6 +321,8 @@ test.describe.serial('chronogazer 記録の「Hub から追加」（#383 段階3
 			});
 		});
 		try {
+			// 6 は「設定」タブで終わる。「Hub から追加」は「記録項目」タブにある。
+			await openListTab(page);
 			await page.getByRole('button', { name: 'Hub から追加' }).click();
 			await expect(dialog()).toBeVisible();
 			const notice = dialog().getByText('以前の Hub 接続の画面で選んでいたタグを');

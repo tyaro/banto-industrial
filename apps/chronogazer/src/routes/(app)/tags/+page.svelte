@@ -2,32 +2,41 @@
 	/**
 	 * 「記録」ページ（#383 段階2a / R1-B、recorder-requirements.md §6）。
 	 *
-	 * 手本は `routes/(app)/users/+page.svelte`: `BantoGrid`（一覧）+
-	 * `BantoForm`/`createFormStore`（新規作成・編集）+ 行クリックで下に編集
-	 * パネル。独自の Drawer / SplitPane / ツリーは作らない（R1-B の決定）。
-	 * 例外は #383 段階3 P4 の「Hub から追加」（`HubImportDialog.svelte`）だけで、
-	 * 中央モーダルは banto-hub の `Modal.svelte` を写して使う（層の約束・フォーカス
-	 * の閉じ込めと戻しを自作しないため）。
+	 * **3 ペイン（#1179 PR4b、2026-11-18、docs/chronogazer-ui-improvement-proposal.md
+	 * §2.1）**: HUB のタグページ（#1179 PR2a〜PR3c）と同じ banto 系の型にした。
+	 * - 左 = `RecordTree`（`@banto/tree-svelte` の `BantoTree`。すべて / 接続先 /
+	 *   収集グループ。記録項目はツリーに出さない）。上のツールバーに「接続先を追加」
+	 *   「収集グループを追加」。枠は `@banto/ui` の `ThreePaneLayout`（狭幅では左右が
+	 *   ドロワー。狭幅の判定はビューポート = `mobileNavStore.isNarrow`、HUB と同じ）。
+	 * - 中央 = `@banto/ui` の `Tabs`。「記録項目」（ツリーの選択で絞った一覧と
+	 *   「記録項目を追加」「Hub から追加」）と「設定」（接続先・収集グループの
+	 *   編集と削除。接続先かグループを選んでいて、かつ編集者以上のときだけ）。
+	 * - 右 = 記録項目の詳細（編集・しきい値・削除）か、作成フォーム（記録項目・
+	 *   接続先・収集グループ）のどれか 1 つ。作成フォームを右に出すのは、中央の
+	 *   一覧を見ながら作れるようにするため（HUB の右ペインの新規作成と同じ）。
+	 * - 選んだ対象とタブは URL（`?target=…&tab=settings`、`#lib/banto/recordsView.ts`）
+	 *   に持ち、再読み込み・戻る操作で同じ画面に戻る。
+	 * - 記録項目の追加は収集グループを選んでいるときだけ（HUB の 2026-11-18
+	 *   オーナー決定と同じ）。
+	 * - 未保存の確認: 右ペインか「設定」タブのフォームが未保存のまま、対象・タブ・
+	 *   行を変える、右ペインを閉じる、戻る・別ページへ移るときに確かめる。
+	 * 以前は接続 / 収集グループ / タグの 3 セクションを縦に並べていた（タブ部品が
+	 * 無かったため）。`@banto/ui` に `ThreePaneLayout`・`Tabs` が入ったので置き換えた。
+	 * 削除は `window.confirm`（users 画面と同じ出し方）。中央モーダルは「Hub から
+	 * 追加」（`HubImportDialog.svelte`）だけ。
 	 *
 	 * **Hub 経由の接続（#383 段階3 P4）**: Hub 接続（`protocol: 'hub'`）は
 	 * 作成フォームでは作らず、「Hub から追加」がサーバー側で暗黙に作る。一覧では
 	 * 読み取り専用（ホスト・ポートを持たない。接続先と API キーは「設定 > Hub接続」）
-	 * で、行を選ぶと「有効」の切り替えと削除だけを出す（配下にグループがあれば削除は
+	 * で、「設定」タブには「有効」の切り替えと削除だけを出す（配下にグループがあれば削除は
 	 * サーバーが断る）。「有効」は PLC 接続と同じ更新・同じ未保存の確認で、無効にすると
 	 * その接続の Hub のタグは購読も収集もしない（2026-10-11 オーナー決定）。接続の行に
 	 * 版（楽観ロック）は無い - PLC 接続の編集と同じ。Hub 経由のタグの編集フォームはスケーリングの欄を出さない（Hub は
 	 * 工学値を送る。サーバーも断る）。
 	 *
-	 * 構成は PLC接続 / 収集グループ / タグ の3セクションを**縦並び**（タブでは
-	 * ない）で、FK の依存順（接続 → グループ → タグ）に並べる。理由: このアプリ
-	 * に既存のタブ部品が無く新規に作ると部品を増やしてしまうこと、縦並びなら
-	 * 「まず接続を作る→その接続がグループのプルダウンに出る→まずグループを作る
-	 * →そのグループがタグのプルダウンに出る」という作成の自然な流れをそのまま
-	 * 画面の上から下への流れに一致させられること。
-	 *
 	 * viewer は閲覧のみ（`canWriteResources` = editor 以上の判定、
-	 * `#lib/permissions.ts` 既存）: 新規作成フォーム・編集パネル・削除ボタンを
-	 * 出さない。削除は `window.confirm`（users 画面と同じ出し方）。
+	 * `#lib/permissions.ts` 既存）: 追加のボタン・「設定」タブ・右ペイン（行を
+	 * 選んでも開かない）を出さない。
 	 *
 	 * 収集グループの周期は `banto_tags::ALLOWED_PERIOD_MS` と一致する固定選択
 	 * 肢（`tagRegistryAdmin.ts`の`ALLOWED_PERIOD_MS`）。
@@ -36,28 +45,22 @@
 	 * - 256タグ程度なら現実的（R0のv1目標、指示書どおりこのPRではこれで良い。
 	 * サーバーモードのページングはR1-C以降の実データ時に検討）。
 	 *
-	 * **フィールド名の接頭辞について（E2Eで実際に踏んだ事故）**: PLC接続 /
-	 * 収集グループ / タグ の3セクションが常に同時に描画され、かつ各セクション
-	 * は「新規作成フォーム」と「編集パネル」も選択中は同時に描画される -
-	 * つまり最大 6 個の `BantoForm` インスタンスが同一ページに同時に存在しうる。
-	 * `@banto/forms`の各フィールドは `id={def.name}`（例: `"name"`）を持つため、
-	 * スキーマのフィールド名をそのまま使うと6インスタンス全部で `id="name"`
-	 * が重複し、`<label for="name">` の紐付けがブラウザの
-	 * `getElementById`相当の解決で最初の1個にしか行かず、残りの5個は
-	 * ラベル無しになる（実際に E2E で「収集グループの名前欄が見つからない」
-	 * という形で踏んだ - 一覧・保存自体は動くが、フォームのアクセシビリティ
-	 * ラベルが壊れる）。`users`/`plc-connections`（relay-wright）の先例は
-	 * 編集パネルを生 HTML（`<label>`の暗黙紐付け）にすることでこの衝突を
-	 * 避けているが、この画面は3エンティティ×2（作成/編集）が同時に存在する
-	 * ため、それでも接続×グループ×タグの3つの「名前」欄同士は衝突する。
-	 * そこで各エンティティ×モードごとに一意な接頭辞（`plcCreate`/`plcEdit`/
-	 * `groupCreate`/`groupEdit`/`tagCreate`/`tagEdit`）をスキーマのフィールド
-	 * 名自体に付け、`to*Input`/`*FormValues` 側で wire のフィールド名と
-	 * 相互変換する。
+	 * **フィールド名の接頭辞について（E2Eで実際に踏んだ事故）**: 縦並びの
+	 * 3 セクションだった頃は、接続・グループ・タグの「新規作成」と「編集」の
+	 * 最大 6 個の `BantoForm` が同じページに同時に描かれていた。`@banto/forms`の
+	 * 各フィールドは `id={def.name}`（例: `"name"`）を持つため、スキーマの
+	 * フィールド名をそのまま使うと `id="name"` が重複し、`<label for="name">` が
+	 * 最初の1個にしか紐付かず、残りはラベル無しになる（E2E で「収集グループの
+	 * 名前欄が見つからない」という形で踏んだ）。3 ペインにしてからも、「設定」
+	 * タブ（接続先・グループの編集）と右ペイン（記録項目の編集・作成フォーム）は
+	 * 同時に描かれるので、各エンティティ×モードごとに一意な接頭辞（`plcCreate`/
+	 * `plcEdit`/`groupCreate`/`groupEdit`/`tagCreate`/`tagEdit`）をスキーマの
+	 * フィールド名自体に付け、`to*Input`/`*FormValues` 側で wire のフィールド名と
+	 * 相互変換する仕組みは残す。
 	 *
 	 * **接続単位シミュレーション（#413、2026-09-23 オーナー決定）**: 接続の
-	 * フォームに切替、一覧に「動作」列（シミュレーション接続は「値は記録され
-	 * ません」）を出す（R2b-5c: 「値が動かないタグ」の一覧は、シミュレーション
+	 * フォームに切替、ツリーに「シミュレーション」の印、「設定」タブに「動作」
+	 * （シミュレーション接続は「値は記録されません」）を出す（R2b-5c: 「値が動かないタグ」の一覧は、シミュレーション
 	 * が値の層に移って全タグが動くので無くなった）。一覧・フォームはレジストリの
 	 * 値で、**走っている収集への反映は「収集を再起動」**（保存時のトーストで
 	 * 案内する）。走っている収集が実際にシミュレータ相手かは
@@ -73,9 +76,32 @@
 	 * 外れ、その理由は親の名前を指す）。
 	 */
 	import { untrack } from 'svelte';
+	import { page } from '$app/state';
+	import { afterNavigate, goto, type BeforeNavigate } from '$app/navigation';
 	import { BantoGrid, type GridColumn } from '@banto/grid-svelte';
 	import { BantoForm, createFormStore, UnsavedChangesNotice, type FormSchema } from '@banto/forms';
+	import { Tabs, ThreePaneLayout } from '@banto/ui';
 	import { guardUnsavedChanges, UNSAVED_NOTICE } from '#lib/unsavedChanges.js';
+	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
+	import RecordTree from '#lib/components/RecordTree.svelte';
+	import {
+		formatPeriodMs,
+		recordTargetNodeId,
+		recordTargetOf,
+		type RecordTreeNodeData
+	} from '#lib/components/recordTree.js';
+	import {
+		filterRecordsByTarget,
+		MISSING_RECORD_TARGET_MESSAGE,
+		parseRecordsView,
+		recordsViewSearch,
+		resolveRecordsView,
+		sameRecordTarget,
+		sameRecordsView,
+		type RecordTarget,
+		type RecordsTab,
+		type RecordsView
+	} from '#lib/banto/recordsView.js';
 	import { isProviderError } from '@banto/admin-core';
 	import { toastStore } from '#lib/toast.svelte.js';
 	import { sessionStore } from '#lib/session.svelte.js';
@@ -113,11 +139,11 @@
 		defaultDriverState,
 		driverStateFromSettings,
 		mapSettingsFieldErrors,
-		summarizeDriverValues,
 		switchDriverState,
 		validateDriverValues
 	} from '#lib/banto/driverSettingsForm.js';
 	import HubImportDialog from './HubImportDialog.svelte';
+	import NavigationGate from '#lib/components/NavigationGate.svelte';
 	import {
 		getTagThresholds,
 		updateTagThresholds,
@@ -428,64 +454,14 @@
 			createDriverState = defaultDriverState(driver.settingsSchema.fields);
 			createDriverErrors = {};
 			await reloadConnections();
+			// #1179 PR4b: 作った接続先をツリーで選ぶ（右の作成フォームは閉じる）。
+			selectCreated('createConnection', { type: 'connection', id: created.id });
 		} catch (err) {
 			applyConnectionErrors(PLC_CREATE, err, createConnectionStore, driver, true);
 		} finally {
 			creatingConnection = false;
 		}
 	}
-
-	const connectionColumns: GridColumn<PlcConnection>[] = [
-		{ id: 'id', header: 'ID', accessor: 'id', width: 60, align: 'right' },
-		{
-			id: 'name',
-			header: '名前',
-			accessor: 'name',
-			width: 160,
-			filterable: true,
-			filterType: 'text'
-		},
-		{
-			id: 'protocol',
-			header: 'プロトコル',
-			accessor: (row) =>
-				row.protocol === 'hub'
-					? 'Hub 経由'
-					: (driverFor(row.protocol)?.displayName ?? row.protocol),
-			width: 150
-		},
-		{
-			id: 'settings',
-			header: '接続設定',
-			accessor: (row) => {
-				const driver = driverFor(row.protocol);
-				return driver
-					? summarizeDriverValues(
-							driver.settingsSchema.fields,
-							driverStateFromSettings(driver.settingsSchema.fields, row.settings).values
-						)
-							.map(({ label, text }) => `${label}: ${text}`)
-							.join(' / ')
-					: '—';
-			},
-			width: 300
-		},
-		{
-			id: 'enabled',
-			header: '有効',
-			accessor: 'enabled',
-			width: 70,
-			format: (v) => (v ? 'はい' : 'いいえ')
-		},
-		{
-			// #413: レジストリの値。シミュレーション接続は「値は記録されません」。
-			id: 'simulation',
-			header: '動作',
-			accessor: (row) =>
-				row.protocol === 'hub' ? 'Hub から受信' : connectionModeLabel(row.simulation),
-			width: 240
-		}
-	];
 
 	let selectedConnection: PlcConnection | null = $state(null);
 	let editConnectionStore = $state(untrack(() => createFormStore(connectionSchema(PLC_EDIT))));
@@ -496,13 +472,13 @@
 	let deletingConnection = $state(false);
 
 	/**
-	 * #391 レビュー A / #394 追補: 保存中・削除中は選択行を切り替えさせない。
-	 * 1文字だけのガードでは不十分な理由（応答側の照合も不変条件として持つ
-	 * 理由）は`runGuardedSave`/`runGuardedDelete`（`tagsPageLogic.ts`）の
-	 * doc comment参照。
+	 * #1179 PR4b: 「設定」タブの接続先のフォームを `conn` で作り直す（ツリーで
+	 * 接続先を選んだとき、下の `$effect` から呼ぶ）。保存中・削除中に対象を
+	 * 変えさせないのは `confirmViewChange` の役目（#391 レビュー A / #394 追補。
+	 * 応答側の照合も不変条件として持つ理由は `runGuardedSave`/`runGuardedDelete`
+	 * （`tagsPageLogic.ts`）の doc comment 参照）。
 	 */
-	function selectConnection(conn: PlcConnection): void {
-		if (!canWrite || savingConnection || deletingConnection) return;
+	function loadConnectionSettings(conn: PlcConnection): void {
 		selectedConnection = conn;
 		editConnectionStore = createFormStore(
 			connectionSchema(PLC_EDIT),
@@ -706,6 +682,11 @@
 				case 'applied':
 					toastStore.push('success', '削除しました');
 					selectedConnection = null;
+					// #1179 PR4b: 消した接続先の「設定」から「すべて」へ移る。
+					forceView(
+						{ target: { type: 'all' }, tab: 'list' },
+						{ kind: 'connection', id: pending.id }
+					);
 					await reloadConnections();
 					break;
 				case 'stale-success':
@@ -732,7 +713,7 @@
 	const GROUP_EDIT = 'groupEdit';
 
 	const periodOptions = $derived(
-		ALLOWED_PERIOD_MS.map((ms) => ({ value: ms, label: ms >= 1000 ? `${ms / 1000}s` : `${ms}ms` }))
+		ALLOWED_PERIOD_MS.map((ms) => ({ value: ms, label: formatPeriodMs(ms) }))
 	);
 	const connectionOptions = $derived(
 		connectionRows.map((c) => ({ value: c.id, label: connectionOptionLabel(c) }))
@@ -846,10 +827,12 @@
 	async function handleCreateGroup(values: Record<string, unknown>): Promise<void> {
 		creatingGroup = true;
 		try {
-			await createCollectionGroup(toCollectionGroupInput(GROUP_CREATE, values));
+			const created = await createCollectionGroup(toCollectionGroupInput(GROUP_CREATE, values));
 			toastStore.push('success', '作成しました');
 			createGroupStore = createFormStore(groupSchema(GROUP_CREATE));
 			await reloadGroups();
+			// #1179 PR4b: 作った収集グループをツリーで選ぶ（右の作成フォームは閉じる）。
+			selectCreated('createGroup', { type: 'group', id: created.id });
 		} catch (err) {
 			applyServerErrors(GROUP_CREATE, GROUP_WIRE_FIELDS, err, createGroupStore);
 		} finally {
@@ -857,51 +840,13 @@
 		}
 	}
 
-	function connectionName(id: number): string {
-		return connectionRows.find((c) => c.id === id)?.name ?? `#${id}`;
-	}
-
-	const groupColumns: GridColumn<CollectionGroup>[] = [
-		{ id: 'id', header: 'ID', accessor: 'id', width: 60, align: 'right' },
-		{
-			id: 'name',
-			header: '名前',
-			accessor: 'name',
-			width: 160,
-			filterable: true,
-			filterType: 'text'
-		},
-		{
-			id: 'plcConnectionId',
-			header: '接続',
-			accessor: (row) => connectionName(row.plcConnectionId),
-			width: 160
-		},
-		{
-			id: 'periodMs',
-			header: '収集周期',
-			accessor: 'periodMs',
-			width: 100,
-			align: 'right',
-			format: (v) => (typeof v === 'number' && v >= 1000 ? `${v / 1000}s` : `${v}ms`)
-		},
-		{
-			id: 'enabled',
-			header: '有効',
-			accessor: 'enabled',
-			width: 70,
-			format: (v) => (v ? 'はい' : 'いいえ')
-		}
-	];
-
 	let selectedGroup: CollectionGroup | null = $state(null);
 	let editGroupStore = $state(untrack(() => createFormStore(groupSchema(GROUP_EDIT))));
 	let savingGroup = $state(false);
 	let deletingGroup = $state(false);
 
-	/** #391 レビュー A / #394 追補: 保存中・削除中は選択行を切り替えさせない（理由は `selectConnection` 参照）。 */
-	function selectGroup(group: CollectionGroup): void {
-		if (!canWrite || savingGroup || deletingGroup) return;
+	/** #1179 PR4b: 「設定」タブの収集グループのフォームを作り直す（`loadConnectionSettings` と同じ）。 */
+	function loadGroupSettings(group: CollectionGroup): void {
 		selectedGroup = group;
 		editGroupStore = createFormStore(groupSchema(GROUP_EDIT), groupFormValues(GROUP_EDIT, group));
 	}
@@ -958,11 +903,21 @@
 				() => selectedGroup?.id
 			);
 			switch (outcome.kind) {
-				case 'applied':
+				case 'applied': {
 					toastStore.push('success', '削除しました');
+					// #1179 PR4b: 消したグループの「設定」から、親の接続先へ移る。
+					const parent = selectedGroup?.plcConnectionId;
 					selectedGroup = null;
+					forceView(
+						{
+							target: parent === undefined ? { type: 'all' } : { type: 'connection', id: parent },
+							tab: 'list'
+						},
+						{ kind: 'group', id: pending.id }
+					);
 					await reloadGroups();
 					break;
+				}
 				case 'stale-success':
 					await reloadGroups();
 					break;
@@ -1049,8 +1004,6 @@
 	const tagRows = $derived(listRows(tagsState));
 	const tagsView = $derived(listSectionView(tagsState));
 	const tagsRetry = $derived(showsRetry(tagsState));
-	/** タグの作成フォームは収集グループの一覧に依存する（`groupCreateGate` と同じ考え方）。 */
-	const tagCreateGate = $derived(createFormGate(groupsState));
 
 	/** `connectionsGeneration` と同じ（レビュー P2-C）。 */
 	let tagsGeneration = 0;
@@ -1097,6 +1050,8 @@
 			);
 			toastStore.push('success', '作成しました');
 			createTagStore = createFormStore(tagSchema(TAG_CREATE));
+			// #1179 PR4b: 保存に成功したら右ペインを閉じ、一覧を読み直す。
+			if (rightPane === 'createTag') closeRightPane();
 			await reloadTags();
 		} catch (err) {
 			applyServerErrors(TAG_CREATE, TAG_WIRE_FIELDS, err, createTagStore);
@@ -1142,7 +1097,6 @@
 	let savingTag = $state(false);
 	let deletingTag = $state(false);
 
-	/** #391 レビュー A / #394 追補: 保存中・削除中は選択行を切り替えさせない（理由は `selectConnection` 参照）。 */
 	/** #383 段階3 P4: 収集グループが Hub 接続の下にあるか。 */
 	function isHubGroup(groupId: number): boolean {
 		const group = groupRows.find((g) => g.id === groupId);
@@ -1150,12 +1104,37 @@
 		return connectionRows.find((c) => c.id === group.plcConnectionId)?.protocol === 'hub';
 	}
 
+	/**
+	 * 同じ行を選んだとき、最新の版で作り直すか。タグの版が違う（版の衝突の後に一覧を
+	 * 読み直した）か、しきい値の保存が版の衝突で断られたあとのときだけ。
+	 */
+	function shouldReselectTag(
+		current: Tag | null,
+		clicked: Tag,
+		thresholdsConflicted: boolean
+	): boolean {
+		if (current === null || current.id !== clicked.id) return false;
+		return thresholdsConflicted || current.revision !== clicked.revision;
+	}
+
 	/** 編集中のタグが Hub 経由か（スケーリングの欄を出さない）。選んだ時点で決める。 */
 	let selectedTagIsHub = $state(false);
 
+	/**
+	 * 一覧の行を選ぶと、右ペインに記録項目の詳細を出す。#391 レビュー A / #394
+	 * 追補: 保存中・削除中は選択行を切り替えさせない。#1179 PR4b: 右ペインの
+	 * フォームが未保存なら確かめる（キャンセルなら元のまま）。
+	 */
 	function selectTag(tag: Tag): void {
-		if (!canWrite || savingTag || deletingTag || savingThresholds) return;
+		if (!canWrite || rightPaneBusy()) return;
+		if (rightPane === 'tag' && selectedTag?.id === tag.id) {
+			// 同じ行: 版が同じなら何もしない。違えば（版の衝突の後に一覧を読み直した）
+			// 選び直しとして最新の版で作り直す。
+			if (!shouldReselectTag(selectedTag, tag, thresholdsConflict)) return;
+		}
+		if (!confirmDiscardRightPane()) return;
 		selectedTag = tag;
+		openRightPane('tag');
 		selectedTagIsHub = isHubGroup(tag.collectionGroupId);
 		editTagStore = createFormStore(
 			tagSchema(TAG_EDIT, selectedTagIsHub),
@@ -1206,6 +1185,7 @@
 	let selectedThresholds: TagThresholds | null = $state(null);
 	let thresholdsError: string | null = $state(null);
 	let thresholdsGeneration = 0;
+	let thresholdsConflict = false;
 	let editThresholdsStore = $state(untrack(() => createFormStore(thresholdSchema(TAG_THR))));
 	let savingThresholds = $state(false);
 
@@ -1214,6 +1194,7 @@
 		const generation = thresholdsGeneration;
 		selectedThresholds = null;
 		thresholdsError = null;
+		thresholdsConflict = false;
 		try {
 			const loaded = await getTagThresholds(tagId);
 			if (generation !== thresholdsGeneration || selectedTag?.id !== tagId) return;
@@ -1228,6 +1209,9 @@
 		}
 	}
 
+	// しきい値の版（`selectedThresholds.revision`）はタグの版とは別。しきい値だけが
+	// 版の衝突で断られたら `thresholdsConflict` を立て、同じ行の選び直しでも
+	// `selectTag` が読み直す（`loadThresholds` が下ろす）。
 	async function saveThresholds(): Promise<void> {
 		if (!selectedTag || !selectedThresholds || savingThresholds || savingTag || deletingTag) {
 			return;
@@ -1255,6 +1239,7 @@
 					break;
 				case 'error':
 					applyServerErrors(TAG_THR, THRESHOLD_WIRE_FIELDS, outcome.err, editThresholdsStore);
+					if (isRevisionConflict(outcome.err)) thresholdsConflict = true;
 					break;
 				case 'stale-success':
 				case 'stale-error':
@@ -1336,7 +1321,7 @@
 			switch (outcome.kind) {
 				case 'applied':
 					toastStore.push('success', '削除しました');
-					selectedTag = null;
+					closeRightPane();
 					await reloadTags();
 					break;
 				case 'stale-success':
@@ -1353,35 +1338,530 @@
 		}
 	}
 
-	// 未保存の入力の確認（banto #214 の流儀、ChronoGazer #508）: 6 つのフォーム
-	// （接続・グループ・タグの新規作成と編集）のどれかに、読み込み/保存時の値と
-	// 違う入力があれば未保存。編集フォームは行を選んでいる間だけ数える（削除や
-	// 選択解除で消えたフォームの入力は捨てたものなので数えない）。保存の成功は
-	// `markClean()`（編集）か新しいストアへの差し替え（新規作成）で消す。保存・
-	// 作成の最中も「保存が落ちるかもしれない」ので未保存として扱う。
-	guardUnsavedChanges({
-		isDirty: () =>
-			createConnectionStore.isDirty ||
-			Object.values(createDriverState.touched).some(Boolean) ||
-			createGroupStore.isDirty ||
-			createTagStore.isDirty ||
-			(selectedConnection !== null &&
-				(editConnectionStore.isDirty || Object.values(editDriverState.touched).some(Boolean))) ||
-			// #383 段階3 P4: Hub 接続の「有効」（Hub 接続を選んでいる間だけ数える）。
-			(selectedConnection !== null && selectedConnectionIsHub && editHubConnectionStore.isDirty) ||
-			(selectedGroup !== null && editGroupStore.isDirty) ||
-			(selectedTag !== null && editTagStore.isDirty) ||
-			// #532: しきい値のフォームは読めたときだけ出るので、そのときだけ数える。
-			(selectedTag !== null && selectedThresholds !== null && editThresholdsStore.isDirty),
-		isSaving: () =>
-			creatingConnection ||
-			creatingGroup ||
-			creatingTag ||
-			savingConnection ||
-			savingGroup ||
-			savingTag ||
-			savingThresholds
+	// --- #1179 PR4b: 3 ペインの状態（右ペイン・中央のタブ・URL） -----------------
+	//
+	// docs/chronogazer-ui-improvement-proposal.md §2.1（2026-11-18）。HUB のタグ
+	// ページ（`apps/banto-hub/src/routes/(app)/tags/+page.svelte`、#1179 PR3a）の
+	// 作法を写す:
+	// - **画面の操作（ツリー・タブ）は状態を先に同期で変え、URL は後から追う**
+	//   （`requestView`）。BantoTree は `selection` の制御で「呼び出しの直後の値」を
+	//   正とするので、URL から状態を決めるとキー操作のたびに元の行へ引き戻される。
+	// - **URL から状態を決めるのは、戻る・進む・再読み込み・リンク**（下の
+	//   `$effect`）。ページ内の `goto` が終わるまではその `$effect` を止める
+	//   （`viewNavsInFlight`）。
+	// - **未保存の確認**は `confirmViewChange`（対象・タブの切り替え）と
+	//   `confirmDiscardRightPane`（右ペインの中身の切り替え・閉じる）。どちらも
+	//   キャンセルなら何も変えない。確かめて進んだら、捨てたフォームは閉じる・
+	//   作り直す（`discardForView`）。
+	// - **ページの中の移動では汎用の離脱の確認（`guardUnsavedChanges`）を出さない**
+	//   （`leaveGuardMuted`）。ページ内の `goto` は呼ぶ前から、戻る・進むは
+	//   `handleBeforeNavigate` で確かめてからその移動が終わるまで黙らせる。
+	//   削除の後の `forceView` のように右ペインを dirty のまま残す移動もあるので、
+	//   「確かめて捨てたから dirty でない」には頼らない。`handleBeforeNavigate` は
+	//   テンプレートの一番最初の `NavigationGate` から呼び、子の guard より先に走らせる。
+	// - 対象・タブを変えると右ペインは閉じる（右ペインの中身は、前の対象の一覧の
+	//   行か、前の対象への追加だったため）。**例外: 削除に伴う移動（`forceView`）は
+	//   右ペインを閉じない**（無関係な作成フォームの下書きを守る。作成フォームの
+	//   親の選択欄が消したものを指していたら、その欄だけ未選択に戻す）。
+
+	/** 右ペインの中身（どれか 1 つ）。`null` = 閉じている。 */
+	type RightPaneKind = 'tag' | 'createTag' | 'createConnection' | 'createGroup';
+	let rightPane: RightPaneKind | null = $state(null);
+
+	/** 未保存のフォームを捨てて切り替えてよいかの確認文。 */
+	const DISCARD_CONFIRM = '保存していない変更があります。変更を破棄して切り替えますか？';
+
+	function rightPaneDirty(): boolean {
+		switch (rightPane) {
+			case 'tag':
+				return (
+					editTagStore.isDirty ||
+					// #532: しきい値のフォームは読めたときだけ出るので、そのときだけ数える。
+					(selectedThresholds !== null && editThresholdsStore.isDirty)
+				);
+			case 'createTag':
+				return createTagStore.isDirty;
+			case 'createConnection':
+				return (
+					createConnectionStore.isDirty || Object.values(createDriverState.touched).some(Boolean)
+				);
+			case 'createGroup':
+				return createGroupStore.isDirty;
+			default:
+				return false;
+		}
+	}
+
+	function rightPaneBusy(): boolean {
+		switch (rightPane) {
+			case 'tag':
+				return savingTag || deletingTag || savingThresholds;
+			case 'createTag':
+				return creatingTag;
+			case 'createConnection':
+				return creatingConnection;
+			case 'createGroup':
+				return creatingGroup;
+			default:
+				return false;
+		}
+	}
+
+	/** 「設定」タブのフォームが未保存か（タブが「設定」のときだけ数える）。 */
+	function settingsDirty(): boolean {
+		if (activeTab !== 'settings') return false;
+		if (target.type === 'connection' && selectedConnection !== null) {
+			return selectedConnectionIsHub
+				? editHubConnectionStore.isDirty
+				: editConnectionStore.isDirty || Object.values(editDriverState.touched).some(Boolean);
+		}
+		if (target.type === 'group' && selectedGroup !== null) return editGroupStore.isDirty;
+		return false;
+	}
+
+	function settingsBusy(): boolean {
+		return savingConnection || deletingConnection || savingGroup || deletingGroup;
+	}
+
+	/** 右ペインの中身を捨ててよいか（保存中は不可、未保存なら確かめる）。 */
+	function confirmDiscardRightPane(): boolean {
+		if (rightPaneBusy()) return false;
+		return !rightPaneDirty() || window.confirm(DISCARD_CONFIRM);
+	}
+
+	/** 狭幅で右ペイン（ドロワー）が開いているか（`ThreePaneLayout` の `rightDrawerOpen`）。 */
+	let rightDrawerOpen = $state(false);
+	/** 狭幅で左ツリー（ドロワー）が開いているか（`ThreePaneLayout` の `leftDrawerOpen`）。 */
+	let treeOpen = $state(false);
+	/** 枠（`ThreePaneLayout`）が狭幅か（部品の `bind:narrow`、出力専用）。 */
+	let layoutNarrow = $state(false);
+
+	function openRightPane(kind: RightPaneKind): void {
+		rightPane = kind;
+		if (layoutNarrow) {
+			treeOpen = false;
+			rightDrawerOpen = true;
+		}
+	}
+
+	function closeRightPane(): void {
+		rightPane = null;
+		rightDrawerOpen = false;
+		selectedTag = null;
+		// 読み込み中のしきい値の応答は捨てる（`loadThresholds` が世代で照合する）。
+		thresholdsGeneration += 1;
+		selectedThresholds = null;
+		thresholdsError = null;
+	}
+
+	function requestCloseRightPane(): void {
+		if (!confirmDiscardRightPane()) return;
+		closeRightPane();
+	}
+
+	/** 「接続先を追加」（PLC 直結。Hub 経由の接続は「Hub から追加」が作る）。 */
+	function openCreateConnection(): void {
+		if (!canWrite || rightPane === 'createConnection') return;
+		if (!confirmDiscardRightPane()) return;
+		closeRightPane();
+		createConnectionStore = createFormStore(connectionSchema(PLC_CREATE));
+		createDriverState = defaultDriverState([]);
+		createDriverId = '';
+		createDriverErrors = {};
+		openRightPane('createConnection');
+	}
+
+	/** 選んでいる接続先（グループを選んでいればその接続先）。 */
+	const targetConnectionId = $derived.by((): number | null => {
+		if (target.type === 'connection') return target.id;
+		if (target.type === 'group') {
+			const id = target.id;
+			return groupRows.find((g) => g.id === id)?.plcConnectionId ?? null;
+		}
+		return null;
 	});
+
+	/** 「収集グループを追加」。接続は選択中の接続先（グループの接続先）を初期値にする。 */
+	function openCreateGroup(): void {
+		if (!canWrite || rightPane === 'createGroup') return;
+		if (!confirmDiscardRightPane()) return;
+		closeRightPane();
+		const connectionId = targetConnectionId;
+		createGroupStore = createFormStore(
+			groupSchema(GROUP_CREATE),
+			connectionId === null ? {} : { [`${GROUP_CREATE}PlcConnectionId`]: connectionId }
+		);
+		openRightPane('createGroup');
+	}
+
+	/** 記録項目の登録先（収集グループを選んでいるときだけ。HUB の 2026-11-18 オーナー決定と同じ）。 */
+	const registrationGroup = $derived.by((): CollectionGroup | null => {
+		if (target.type !== 'group') return null;
+		const id = target.id;
+		return groupRows.find((g) => g.id === id) ?? null;
+	});
+
+	/** 「記録項目を追加」。収集グループは選択中のグループを初期値にする。 */
+	function openCreateTag(): void {
+		const group = registrationGroup;
+		if (!canWrite || group === null || rightPane === 'createTag') return;
+		if (!confirmDiscardRightPane()) return;
+		closeRightPane();
+		createTagStore = createFormStore(tagSchema(TAG_CREATE, isHubGroup(group.id)), {
+			[`${TAG_CREATE}CollectionGroupId`]: group.id
+		});
+		openRightPane('createTag');
+	}
+
+	/** 右ペインの見出し（と `ThreePaneLayout` の右ペインの名前）。 */
+	const rightPaneTitle = $derived.by((): string => {
+		switch (rightPane) {
+			case 'tag':
+				return selectedTag?.name ?? '記録項目';
+			case 'createTag':
+				return '記録項目を追加';
+			case 'createConnection':
+				return '接続先を追加';
+			case 'createGroup':
+				return '収集グループを追加';
+			default:
+				return '詳細';
+		}
+	});
+
+	/** ツリーで選んでいる対象（URL の `target`）。 */
+	let target: RecordTarget = $state({ type: 'all' });
+	/** 中央のタブ（URL の `tab`）。「すべて」と閲覧者は常に `'list'`。 */
+	let activeTab: RecordsTab = $state('list');
+	/** 接続先と収集グループの一覧を読み終えたか（URL の対象の存在を判定してよいか）。 */
+	const registryLoaded = $derived(connections !== null && groups !== null);
+
+	function currentView(): RecordsView {
+		return { target, tab: activeTab };
+	}
+
+	function applyView(view: RecordsView): void {
+		if (!sameRecordTarget(target, view.target)) target = view.target;
+		if (activeTab !== view.tab) activeTab = view.tab;
+	}
+
+	/**
+	 * 対象・タブの切り替えで捨てるもの: 右ペインを閉じ、「設定」タブのフォームは
+	 * 次に出すときに保存済みの値から作り直す（`selectedConnection`/`selectedGroup`
+	 * を外すと、下の `$effect` が今の対象で作り直す）。
+	 */
+	function discardForView(): void {
+		closeRightPane();
+		selectedConnection = null;
+		selectedGroup = null;
+	}
+
+	/**
+	 * 画面の状態を変えてよいか確かめる（キャンセルなら `false`。そのときは何も
+	 * 変えない）。保存中は変えさせない（#391 レビュー A / #394 追補 - 応答の
+	 * 取り違え対策は `runGuardedSave` 側にもある）。
+	 */
+	function confirmViewChange(next: RecordsView): boolean {
+		const current = currentView();
+		if (sameRecordsView(current, next)) return true;
+		if (rightPaneBusy() || settingsBusy()) return false;
+		if ((rightPaneDirty() || settingsDirty()) && !window.confirm(DISCARD_CONFIRM)) return false;
+		discardForView();
+		return true;
+	}
+
+	/** ページ内の `goto`（`requestView`・URL の正規化）の行き先。`beforeNavigate` は確認を飛ばす。 */
+	const viewNavHrefs = new Set<string>();
+	/** 進行中のページ内の `goto` の数。0 になったら URL から状態を決め直す。 */
+	let viewNavsInFlight = $state(0);
+	/**
+	 * いまの履歴の項目が、ツリーの上下キーなどの移動で積んだものか。続けてキーで
+	 * 動かす間は同じ項目を置き換える（HUB と同じ「1 操作 = 1 歩」。キーの移動は
+	 * まとめて 1 歩）。
+	 */
+	let viewEntryFromKeyNavigation = false;
+
+	/** 画面の状態を `next` にする。未保存の確認でキャンセルされたら `false`。 */
+	function requestView(next: RecordsView, options: { keyNavigation?: boolean } = {}): boolean {
+		if (sameRecordsView(currentView(), next)) return true;
+		if (!confirmViewChange(next)) return false;
+		const keyNavigation = options.keyNavigation === true;
+		const replace = keyNavigation && viewEntryFromKeyNavigation;
+		viewEntryFromKeyNavigation = keyNavigation;
+		applyView(next);
+		void navigateToView(next, { replace });
+		return true;
+	}
+
+	/**
+	 * 作成に成功した接続先・収集グループをツリーで選ぶ（右の作成フォームは閉じる）。
+	 * 「設定」タブに別の対象の未保存の入力があれば、ふつうの切り替えと同じく確かめる
+	 * （キャンセルなら今の対象のまま。作ったものはツリーに出ている）。
+	 */
+	function selectCreated(kind: RightPaneKind, created: RecordTarget): void {
+		if (rightPane === kind) closeRightPane();
+		requestView({ target: created, tab: 'list' });
+	}
+
+	/** 削除した接続先・グループ（作成フォームの親の選択欄が指していたら未選択に戻す）。 */
+	type DeletedParent = { kind: 'connection' | 'group'; id: number };
+
+	function clearDeletedParent(deleted: DeletedParent): void {
+		const points = (store: { values: Record<string, unknown> }, name: string): boolean =>
+			store.values[name] !== '' && Number(store.values[name]) === deleted.id;
+		if (deleted.kind === 'connection') {
+			const name = `${GROUP_CREATE}PlcConnectionId`;
+			if (points(createGroupStore, name)) createGroupStore.setValue(name, '');
+		} else {
+			const name = `${TAG_CREATE}CollectionGroupId`;
+			if (points(createTagStore, name)) createTagStore.setValue(name, '');
+		}
+	}
+
+	/**
+	 * 確かめずに移る（削除の成功の後）。「設定」タブ側の `selectedConnection`/
+	 * `selectedGroup` は捨てるが、右ペインは残す（上記のとおり）。
+	 */
+	function forceView(next: RecordsView, deleted: DeletedParent): void {
+		viewEntryFromKeyNavigation = false;
+		// 削除に伴う移動は、ふつうの切り替え（`requestView`）と違い**右ペインを閉じない**。
+		// 右ペインには消した対象と無関係な作成フォームが開いていることがあり（削除の
+		// 応答待ちの間に開いたものも）、その入力を確認なしに捨てないため。
+		selectedConnection = null;
+		selectedGroup = null;
+		clearDeletedParent(deleted);
+		if (rightPane === 'tag' && selectedTag && tags && !tags.some((t) => t.id === selectedTag?.id)) {
+			closeRightPane();
+		}
+		applyView(next);
+		void navigateToView(next, { replace: false });
+	}
+
+	async function navigateToView(view: RecordsView, options: { replace: boolean }): Promise<void> {
+		const url = new URL(page.url.href);
+		url.search = recordsViewSearch(view);
+		// 先の `goto` がまだ終わっていない間は `page.url` が古いので、同じに見えても省かない。
+		if (url.href === page.url.href && viewNavsInFlight === 0) return;
+		const href = url.href;
+		viewNavHrefs.add(href);
+		viewNavsInFlight += 1;
+		// 離脱の確認は `goto` を呼ぶ**前に**黙らせる（`leaveGuardMuted` の説明）。
+		leaveGuardMuted += 1;
+		try {
+			// `reset: false`: フォーカスとスクロールを動かさない（同じページの中の切り替え）。
+			await goto(url, { replace: options.replace, reset: false });
+		} catch {
+			// 失敗しても、下の `$effect` がその時点の URL へ状態を戻す。
+		} finally {
+			viewNavHrefs.delete(href);
+			viewNavsInFlight -= 1;
+			leaveGuardMuted -= 1;
+		}
+	}
+
+	/**
+	 * URL から画面の状態を決める（戻る・進む・再読み込み・リンク、とページ内の
+	 * `goto` が取り消された場合）。一覧を読み終えたら、読めない値・一覧に無い id は
+	 * 「すべて」へ倒し、URL も正規化した形へ置き換える（`replace`）。案内は URL から
+	 * 来た対象が見つからないときだけ（一度は見つかった対象が消えたときは出さない）。
+	 */
+	let lastFoundTarget: RecordTarget = { type: 'all' };
+	$effect(() => {
+		const search = page.url.search;
+		const loaded = registryLoaded;
+		const currentConnections = connectionRows;
+		const currentGroups = groupRows;
+		const settingsAvailable = canWrite;
+		if (viewNavsInFlight > 0) return;
+		const parsed = parseRecordsView(new URLSearchParams(search));
+		const resolved = resolveRecordsView(parsed, currentConnections, currentGroups, {
+			loaded,
+			settingsAvailable
+		});
+		untrack(() => {
+			if (loaded && !resolved.missingTarget) lastFoundTarget = resolved.view.target;
+			const wasFound = parsed.target !== null && sameRecordTarget(parsed.target, lastFoundTarget);
+			if (loaded && resolved.missingTarget && !wasFound) {
+				toastStore.push('info', MISSING_RECORD_TARGET_MESSAGE);
+			}
+			if (!sameRecordsView(currentView(), resolved.view)) {
+				discardForView();
+				applyView(resolved.view);
+			}
+			if (loaded && search !== recordsViewSearch(resolved.view)) {
+				void navigateToView(resolved.view, { replace: true });
+			}
+		});
+	});
+
+	afterNavigate((nav) => {
+		// 戻る・進むで来た項目は、どの操作で積んだものか分からない。
+		if (nav.type === 'popstate') viewEntryFromKeyNavigation = false;
+	});
+
+	/**
+	 * 進行中の「ページの中の移動」の数。0 より大きい間は、離脱の確認
+	 * （`guardUnsavedChanges`）を黙らせる。ページの中の移動（ページ内の `goto`、
+	 * 戻る・進む・リンクでクエリだけが変わる）は、`confirmViewChange` で確かめ済み
+	 * （`goto` は呼ぶ前に `requestView` が、戻る・進むは `handleBeforeNavigate` が）
+	 * なので、汎用の離脱の確認を二重に出さない。
+	 *
+	 * - ページ内の `goto`: `navigateToView` が `goto` の**前に**上げ、`finally` で下げる。
+	 *   `beforeNavigate` の中で印を立てるのでは、子（`HubImportDialog`）の guard の
+	 *   コールバックが先に走ったときに間に合わない（`NavigationGate.svelte` の冒頭）。
+	 * - 戻る・進むなど: `handleBeforeNavigate` が確かめて進めたときに上げ、その移動の
+	 *   `complete` が決着したら下げる（取り消しでも決着する）。決着しない経路への
+	 *   備えとして、`afterNavigate` でも残りを下げる。
+	 *
+	 * `$state` にしない（`isDirty` を読むのは guard のコールバックだけで、描画は
+	 * 関わらない）。
+	 */
+	let leaveGuardMuted = 0;
+	/** 戻る・進むなどで上げた分を下げる関数（`afterNavigate` の備えのため控える）。 */
+	const pendingLeaveGuardReleases = new Set<() => void>();
+
+	function muteLeaveGuardUntil(complete: Promise<void> | undefined): void {
+		leaveGuardMuted += 1;
+		let released = false;
+		const release = () => {
+			if (released) return;
+			released = true;
+			leaveGuardMuted -= 1;
+			pendingLeaveGuardReleases.delete(release);
+		};
+		pendingLeaveGuardReleases.add(release);
+		if (complete) {
+			complete.then(release, release);
+		} else {
+			queueMicrotask(release);
+		}
+	}
+
+	afterNavigate(() => {
+		for (const release of [...pendingLeaveGuardReleases]) release();
+	});
+
+	/**
+	 * ページの `beforeNavigate`。テンプレートの一番最初の `NavigationGate` から
+	 * 呼ばれるので、このページの中のどの guard よりも先に走る。
+	 */
+	function handleBeforeNavigate(nav: BeforeNavigate): void {
+		const to = nav.to?.url;
+		if (!to) return;
+		// ページ内の `goto`: `navigateToView` が呼ぶ前から黙らせている。
+		if (viewNavHrefs.has(to.href)) return;
+		if (!nav.willUnload && to.pathname === page.url.pathname) {
+			const next = resolveRecordsView(
+				parseRecordsView(to.searchParams),
+				connectionRows,
+				groupRows,
+				{
+					loaded: registryLoaded,
+					settingsAvailable: canWrite
+				}
+			).view;
+			// 取り消すときも黙らせる（後に続く guard のコールバックは、取り消された
+			// 移動にも呼ばれるので、黙らせないと二度目の確認が出る）。`cancel()` で
+			// `complete` は reject されるので、そこで下がる。
+			muteLeaveGuardUntil(nav.complete);
+			if (!confirmViewChange(next)) nav.cancel();
+		}
+		// 別のページ・再読み込みは guard に任せる。
+	}
+
+	// 未保存の入力の確認（banto #214 の流儀、ChronoGazer #508）: 右ペインのフォーム
+	// （記録項目の編集＋しきい値、または作成フォーム）と「設定」タブのフォームの
+	// どちらかに、読み込み/保存時の値と違う入力があれば未保存。出ていないフォームは
+	// 数えない（閉じた・切り替えたときに捨てている）。保存の成功は `markClean()`
+	// （編集）か新しいストアへの差し替え（新規作成）で消す。保存・作成の最中も
+	// 「保存が落ちるかもしれない」ので未保存として扱う。
+	guardUnsavedChanges({
+		isDirty: () => leaveGuardMuted === 0 && (rightPaneDirty() || settingsDirty()),
+		isSaving: () => leaveGuardMuted === 0 && (rightPaneBusy() || settingsBusy())
+	});
+
+	/** 「設定」タブに出す接続先・収集グループ（一覧から引き直す）。 */
+	const settingsConnection = $derived.by((): PlcConnection | null => {
+		if (target.type !== 'connection') return null;
+		const id = target.id;
+		return connectionRows.find((c) => c.id === id) ?? null;
+	});
+	const settingsGroup = $derived.by((): CollectionGroup | null => {
+		if (target.type !== 'group') return null;
+		const id = target.id;
+		return groupRows.find((g) => g.id === id) ?? null;
+	});
+
+	// 対象が変わった（または `discardForView` で外した）ら、「設定」タブのフォームを
+	// 今の対象の保存済みの値で作り直す。一覧の再読み込みで同じ id の行が差し替わった
+	// だけなら作り直さない（入力中の値を消さない）。
+	$effect(() => {
+		const connection = settingsConnection;
+		const loadedId = selectedConnection?.id;
+		if (canWrite && connection !== null && loadedId !== connection.id) {
+			untrack(() => loadConnectionSettings(connection));
+		}
+	});
+	$effect(() => {
+		const group = settingsGroup;
+		const loadedId = selectedGroup?.id;
+		if (canWrite && group !== null && loadedId !== group.id) {
+			untrack(() => loadGroupSettings(group));
+		}
+	});
+
+	/** 中央のタブ。「すべて」と閲覧者には「設定」が無い（タブ列ごと出さない - `hideSingleTab`）。 */
+	const viewTabs = $derived(
+		target.type === 'all' || !canWrite
+			? [{ id: 'list', label: '記録項目' }]
+			: [
+					{ id: 'list', label: '記録項目' },
+					{ id: 'settings', label: '設定' }
+				]
+	);
+
+	/**
+	 * `Tabs` の `value` の関数バインディングの setter。未保存の確認でキャンセル
+	 * されたら `activeTab` は変わらず、getter が元のタブを返す（HUB と同じ）。
+	 */
+	function setActiveTabFromTabs(id: string | undefined): void {
+		requestView({ target, tab: id === 'settings' ? 'settings' : 'list' });
+	}
+
+	const treeSelectedId = $derived(recordTargetNodeId(target));
+
+	function handleTreeSelect(data: RecordTreeNodeData, info: { navigation: boolean }): void {
+		const nextTarget = recordTargetOf(data);
+		const next: RecordsView = {
+			target: nextTarget,
+			tab: nextTarget.type === 'all' ? 'list' : activeTab
+		};
+		const moved = requestView(next, { keyNavigation: info.navigation });
+		// 狭幅では、選んだらドロワーを閉じて中央を見せる（キーの移動では閉じない）。
+		if (moved && layoutNarrow && !info.navigation) treeOpen = false;
+	}
+
+	/** ツリーを閉じていても何で絞っているか分かるよう、枠の帯に出す名前。 */
+	const treeSelectionLabel = $derived.by((): string => {
+		if (target.type === 'connection') return settingsConnection?.name ?? 'すべて';
+		if (target.type === 'group') return settingsGroup?.name ?? 'すべて';
+		return 'すべて';
+	});
+
+	/** 左ペインとそのトグルの名前。 */
+	const TREE_PANE_LABEL = '接続先と収集グループ';
+
+	// 層の約束（`@banto/ui` の `layering.ts`）: 下位の層（枠の中のドロワー）を開くなら
+	// 上位の層（サイドバー）を先に畳む（HUB の tags ページと同じ。開いた遷移で畳む）。
+	$effect(() => {
+		if (!treeOpen) return;
+		untrack(() => {
+			if (mobileNavStore.open) mobileNavStore.closeNav();
+		});
+	});
+
+	/** ツリーの選択で絞った記録項目。 */
+	const visibleTagRows = $derived(filterRecordsByTarget(tagRows, target, groupRows));
 
 	// --- #414 段階2: 収集の開始時に外される設定 --------------------------------
 	//
@@ -1440,9 +1920,10 @@
 	});
 </script>
 
+<NavigationGate onbeforenavigate={handleBeforeNavigate} />
+
 <div class="page">
 	<h2>記録</h2>
-
 	{#if !available}
 		<p class="note">
 			{DEMO_MODE_MESSAGE}。単体ブラウザのデモモードにはレジストリDBが無いため、この機能はTauriアプリまたはLANアクセス（組み込みサーバー）でのみ利用できます。
@@ -1485,305 +1966,84 @@
 			</section>
 		{/if}
 
-		<section class="registry-section">
-			<h3>接続</h3>
-			{#if canWrite}
-				<div class="create">
-					<h4>新規作成</h4>
-					{#if driversError}
-						<p class="load-error" role="alert">
-							ドライバ一覧を読み込めませんでした（{driversError}）。<button
-								type="button"
-								onclick={() => void reloadDrivers()}>再試行</button
-							>
-						</p>
-					{:else if drivers === null}
-						<p class="loading">ドライバ一覧を読み込み中…</p>
-					{:else if protocolOptions.length === 0}
-						<p class="load-error" role="alert">利用できるドライバがありません。</p>
-					{:else}
-						<UnsavedChangesNotice
-							pending={createConnectionStore.isDirty ||
-								Object.values(createDriverState.touched).some(Boolean)}
-							label={UNSAVED_NOTICE}
-						/>
+		<!--
+			#1179 PR4b: 右ペイン。記録項目の詳細（編集・しきい値・削除）か、作成
+			フォーム（記録項目・接続先・収集グループ）のどれか 1 つ。編集者以上の
+			ときだけ開く（閲覧者は行を選んでも開かない）。閉じるのはヘッダーの
+			「閉じる」と、作成・削除の成功の後（未保存なら確かめる）。
+		-->
+		{#snippet rightPaneContent()}
+			<div class="detail-pane" data-testid="record-detail-pane">
+				<div class="detail-pane-header">
+					<h3>{rightPaneTitle}</h3>
+					<button
+						type="button"
+						class="pane-close"
+						onclick={requestCloseRightPane}
+						disabled={rightPaneBusy()}
+						aria-label="閉じる"
+					>
+						×
+					</button>
+				</div>
+				<div class="detail-pane-body">
+					{#if rightPane === 'tag' && selectedTag && canWrite}
+						<UnsavedChangesNotice pending={editTagStore.isDirty} label={UNSAVED_NOTICE} />
+						{#if selectedTagIsHub}
+							<p class="note">
+								Hub 経由のタグです。アドレスは Hub
+								のタグ名（外部名）で、スケーリングは設定できません（Hub は工学値を送ります）。
+							</p>
+						{/if}
 						<BantoForm
-							schema={connectionSchema(PLC_CREATE)}
-							store={createConnectionStore}
-							onSubmit={handleCreateConnection}
-							submitting={creatingConnection}
-							submitLabel="作成"
+							schema={tagSchema(TAG_EDIT, selectedTagIsHub)}
+							store={editTagStore}
+							onSubmit={saveTag}
+							submitting={savingTag || deletingTag}
+							submitLabel="保存"
 						>
-							{#if driverFor(String(createConnectionStore.values[`${PLC_CREATE}Protocol`] ?? ''))}
-								{@const driver = driverFor(
-									String(createConnectionStore.values[`${PLC_CREATE}Protocol`] ?? '')
-								)!}
-								<DriverSettingsForm
-									schema={driver.settingsSchema.fields}
-									bind:value={createDriverState}
-									errors={createDriverErrors}
-									readOnly={creatingConnection}
-									idPrefix="plc-create-driver"
+							<button
+								type="button"
+								class="danger"
+								onclick={handleDeleteTag}
+								disabled={savingTag || deletingTag || savingThresholds}
+							>
+								削除
+							</button>
+						</BantoForm>
+
+						<div class="thresholds-pane">
+							<h4>しきい値（記録計の設定）</h4>
+							<p class="note">
+								タグの定義とは別に保存します。空欄は設定なしです（色・帯・しきい値のイベントを出しません）。収集中なら「収集を再起動」で反映されます。
+							</p>
+							{#if thresholdsError !== null}
+								<p class="load-error" role="alert">
+									しきい値を読めませんでした（{thresholdsError}）。
+									<button
+										type="button"
+										onclick={() => selectedTag && loadThresholds(selectedTag.id)}
+									>
+										再読み込み
+									</button>
+								</p>
+							{:else if selectedThresholds === null}
+								<p class="loading">しきい値を読み込んでいます…</p>
+							{:else}
+								<UnsavedChangesNotice
+									pending={editThresholdsStore.isDirty}
+									label={UNSAVED_NOTICE}
+								/>
+								<BantoForm
+									schema={thresholdSchema(TAG_THR)}
+									store={editThresholdsStore}
+									onSubmit={saveThresholds}
+									submitting={savingThresholds || savingTag || deletingTag}
+									submitLabel="しきい値を保存"
 								/>
 							{/if}
-						</BantoForm>
-					{/if}
-				</div>
-			{/if}
-
-			<div class="list">
-				<p class="note">
-					{canWrite
-						? '行をクリックすると下に編集パネルが表示されます。'
-						: '閲覧のみ（編集には編集者以上の権限が必要です）。'}
-				</p>
-				{#if hasSimulationConnection}
-					<!-- #413: 記録されないことを常に分かるようにする。 -->
-					<p class="note simulation-note" role="note">
-						「動作」がシミュレーションの接続は、実機の代わりに内蔵シミュレータへ接続します。値は現在値・イベントには出ますが、データファイルには記録されません。切替は「収集を再起動」で反映されます（実際の動作は「設定
-						&gt; 収集」の接続ごとの状態で確認できます）。
-					</p>
-				{/if}
-				<!-- #394 レビュー P1-3: 「読めていない」を「0件」として描かない。
-				失敗したら空のグリッドではなく、失敗した旨と再試行の導線を出す。 -->
-				{#if connectionsView === 'loading'}
-					<p class="loading">読み込み中…</p>
-				{:else if connectionsView === 'failed'}
-					<p class="load-error" role="alert">
-						接続の一覧を読み込めませんでした（{connectionsError}）。登録が0件という意味ではありません。
-						<button
-							type="button"
-							onclick={() => void reloadConnections()}
-							disabled={connectionsLoading}
-						>
-							再試行
-						</button>
-					</p>
-				{:else}
-					{#if connectionsRetry}
-						<p class="load-error" role="alert">
-							一覧を更新できませんでした（{connectionsError}）。表示は最後に読み込めた内容です。
-							<button
-								type="button"
-								onclick={() => void reloadConnections()}
-								disabled={connectionsLoading}
-							>
-								再試行
-							</button>
-						</p>
-					{/if}
-					<!-- #391 レビュー A / #394 追補: 保存中・削除中は行の選択を操作
-					できないようにする（`selectConnection`自体のガードに加え、
-					見た目でも伝える）。 -->
-					<div
-						class="grid-wrap"
-						class:saving={savingConnection || deletingConnection}
-						aria-disabled={savingConnection || deletingConnection}
-					>
-						<BantoGrid
-							rows={connectionRows}
-							columns={connectionColumns}
-							getRowId={(c) => c.id}
-							onRowClick={canWrite ? selectConnection : undefined}
-						/>
-					</div>
-				{/if}
-			</div>
-
-			{#if selectedConnection && canWrite && selectedConnectionIsHub}
-				<!-- #383 段階3 P4: Hub 接続は読み取り専用（ホスト・ポートを持たない）。 -->
-				<div class="detail hub-connection-detail">
-					<h4>{selectedConnection.name}（Hub 経由の接続）</h4>
-					<p class="note">
-						Hub から受信するタグの入れ物です。接続先と API キーは「設定 &gt;
-						Hub接続」（管理者）で設定します。タグは下の「タグ」の「Hub
-						から追加」で登録します。配下に収集グループがある間は削除できません。
-					</p>
-					<UnsavedChangesNotice pending={editHubConnectionStore.isDirty} label={UNSAVED_NOTICE} />
-					<BantoForm
-						schema={hubConnectionSchema(HUB_EDIT)}
-						store={editHubConnectionStore}
-						onSubmit={saveHubConnection}
-						submitting={savingConnection || deletingConnection}
-						submitLabel="保存"
-					>
-						<button
-							type="button"
-							class="danger"
-							onclick={handleDeleteConnection}
-							disabled={savingConnection || deletingConnection}
-						>
-							削除
-						</button>
-					</BantoForm>
-				</div>
-			{:else if selectedConnection && canWrite}
-				<div class="detail">
-					<h4>{selectedConnection.name} を編集</h4>
-					<UnsavedChangesNotice
-						pending={editConnectionStore.isDirty ||
-							Object.values(editDriverState.touched).some(Boolean)}
-						label={UNSAVED_NOTICE}
-					/>
-					<BantoForm
-						schema={connectionSchema(PLC_EDIT)}
-						store={editConnectionStore}
-						onSubmit={saveConnection}
-						submitting={savingConnection || deletingConnection}
-						submitLabel="保存"
-					>
-						{#if driverFor(String(editConnectionStore.values[`${PLC_EDIT}Protocol`] ?? ''))}
-							{@const driver = driverFor(
-								String(editConnectionStore.values[`${PLC_EDIT}Protocol`] ?? '')
-							)!}
-							<DriverSettingsForm
-								schema={driver.settingsSchema.fields}
-								bind:value={editDriverState}
-								errors={editDriverErrors}
-								readOnly={savingConnection || deletingConnection}
-								idPrefix="plc-edit-driver"
-							/>
-						{/if}
-						<button
-							type="button"
-							class="danger"
-							onclick={handleDeleteConnection}
-							disabled={savingConnection || deletingConnection}
-						>
-							削除
-						</button>
-					</BantoForm>
-				</div>
-			{/if}
-		</section>
-
-		<section class="registry-section">
-			<h3>収集グループ</h3>
-			{#if canWrite}
-				<div class="create">
-					<h4>新規作成</h4>
-					<!-- #394 レビュー P1-3: 「先に作成してください」は依存先を
-					**読めて0件**のときだけ。読めていないときにこれを出すと、
-					既にある接続を重複登録させてしまう。 -->
-					{#if groupCreateGate === 'needs-prerequisite'}
-						<p class="note">
-							先に接続を1件以上作成してください（Hub 経由の接続は「タグ」の「Hub
-							から追加」で作られます）。
-						</p>
-					{:else if groupCreateGate === 'dependency-loading'}
-						<p class="note">接続の一覧を読み込んでいます…</p>
-					{:else if groupCreateGate === 'dependency-failed'}
-						<p class="load-error" role="alert">
-							接続の一覧を読み込めなかったため、作成フォームを表示できません（{connectionsError}）。
-							<button
-								type="button"
-								onclick={() => void reloadConnections()}
-								disabled={connectionsLoading}
-							>
-								再試行
-							</button>
-						</p>
-					{:else}
-						<UnsavedChangesNotice pending={createGroupStore.isDirty} label={UNSAVED_NOTICE} />
-						<BantoForm
-							schema={groupSchema(GROUP_CREATE)}
-							store={createGroupStore}
-							onSubmit={handleCreateGroup}
-							submitting={creatingGroup}
-							submitLabel="作成"
-						/>
-					{/if}
-				</div>
-			{/if}
-
-			<div class="list">
-				<p class="note">
-					{canWrite
-						? '行をクリックすると下に編集パネルが表示されます。'
-						: '閲覧のみ（編集には編集者以上の権限が必要です）。'}
-				</p>
-				{#if groupsView === 'loading'}
-					<p class="loading">読み込み中…</p>
-				{:else if groupsView === 'failed'}
-					<p class="load-error" role="alert">
-						収集グループの一覧を読み込めませんでした（{groupsError}）。登録が0件という意味ではありません。
-						<button type="button" onclick={() => void reloadGroups()} disabled={groupsLoading}>
-							再試行
-						</button>
-					</p>
-				{:else}
-					{#if groupsRetry}
-						<p class="load-error" role="alert">
-							一覧を更新できませんでした（{groupsError}）。表示は最後に読み込めた内容です。
-							<button type="button" onclick={() => void reloadGroups()} disabled={groupsLoading}>
-								再試行
-							</button>
-						</p>
-					{/if}
-					<div
-						class="grid-wrap"
-						class:saving={savingGroup || deletingGroup}
-						aria-disabled={savingGroup || deletingGroup}
-					>
-						<BantoGrid
-							rows={groupRows}
-							columns={groupColumns}
-							getRowId={(g) => g.id}
-							onRowClick={canWrite ? selectGroup : undefined}
-						/>
-					</div>
-				{/if}
-			</div>
-
-			{#if selectedGroup && canWrite}
-				<div class="detail">
-					<h4>{selectedGroup.name} を編集</h4>
-					<UnsavedChangesNotice pending={editGroupStore.isDirty} label={UNSAVED_NOTICE} />
-					<BantoForm
-						schema={groupSchema(GROUP_EDIT)}
-						store={editGroupStore}
-						onSubmit={saveGroup}
-						submitting={savingGroup || deletingGroup}
-						submitLabel="保存"
-					>
-						<button
-							type="button"
-							class="danger"
-							onclick={handleDeleteGroup}
-							disabled={savingGroup || deletingGroup}
-						>
-							削除
-						</button>
-					</BantoForm>
-				</div>
-			{/if}
-		</section>
-
-		<section class="registry-section">
-			<div class="section-head">
-				<h3>タグ</h3>
-				{#if canWrite}
-					<!-- #383 段階3 P4: Hub のカタログから登録する。 -->
-					<button type="button" class="secondary" onclick={() => (hubDialogOpen = true)}>
-						Hub から追加
-					</button>
-				{/if}
-			</div>
-			{#if canWrite}
-				<div class="create">
-					<h4>新規作成</h4>
-					{#if tagCreateGate === 'needs-prerequisite'}
-						<p class="note">先に収集グループを1件以上作成してください。</p>
-					{:else if tagCreateGate === 'dependency-loading'}
-						<p class="note">収集グループの一覧を読み込んでいます…</p>
-					{:else if tagCreateGate === 'dependency-failed'}
-						<p class="load-error" role="alert">
-							収集グループの一覧を読み込めなかったため、作成フォームを表示できません（{groupsError}）。
-							<button type="button" onclick={() => void reloadGroups()} disabled={groupsLoading}>
-								再試行
-							</button>
-						</p>
-					{:else}
+						</div>
+					{:else if rightPane === 'createTag' && canWrite}
 						<UnsavedChangesNotice pending={createTagStore.isDirty} label={UNSAVED_NOTICE} />
 						{#if createTagIsHub}
 							<p class="note">
@@ -1798,104 +2058,384 @@
 							submitting={creatingTag}
 							submitLabel="作成"
 						/>
-					{/if}
-				</div>
-			{/if}
-
-			<div class="list">
-				<p class="note">
-					{canWrite
-						? '行をクリックすると下に編集パネルが表示されます。'
-						: '閲覧のみ（編集には編集者以上の権限が必要です）。'}
-				</p>
-				{#if tagsView === 'loading'}
-					<p class="loading">読み込み中…</p>
-				{:else if tagsView === 'failed'}
-					<p class="load-error" role="alert">
-						タグの一覧を読み込めませんでした（{tagsError}）。登録が0件という意味ではありません。
-						<button type="button" onclick={() => void reloadTags()} disabled={tagsLoading}>
-							再試行
-						</button>
-					</p>
-				{:else}
-					{#if tagsRetry}
-						<p class="load-error" role="alert">
-							一覧を更新できませんでした（{tagsError}）。表示は最後に読み込めた内容です。
-							<button type="button" onclick={() => void reloadTags()} disabled={tagsLoading}>
-								再試行
-							</button>
-						</p>
-					{/if}
-					<div
-						class="grid-wrap"
-						class:saving={savingTag || deletingTag}
-						aria-disabled={savingTag || deletingTag}
-					>
-						<BantoGrid
-							rows={tagRows}
-							columns={tagColumns}
-							getRowId={(t) => t.id}
-							onRowClick={canWrite ? selectTag : undefined}
-						/>
-					</div>
-				{/if}
-			</div>
-
-			{#if selectedTag && canWrite}
-				<div class="detail">
-					<h4>{selectedTag.name} を編集</h4>
-					<UnsavedChangesNotice pending={editTagStore.isDirty} label={UNSAVED_NOTICE} />
-					{#if selectedTagIsHub}
-						<p class="note">
-							Hub 経由のタグです。アドレスは Hub
-							のタグ名（外部名）で、スケーリングは設定できません（Hub は工学値を送ります）。
-						</p>
-					{/if}
-					<BantoForm
-						schema={tagSchema(TAG_EDIT, selectedTagIsHub)}
-						store={editTagStore}
-						onSubmit={saveTag}
-						submitting={savingTag || deletingTag}
-						submitLabel="保存"
-					>
-						<button
-							type="button"
-							class="danger"
-							onclick={handleDeleteTag}
-							disabled={savingTag || deletingTag || savingThresholds}
-						>
-							削除
-						</button>
-					</BantoForm>
-
-					<div class="thresholds-pane">
-						<h4>しきい値（記録計の設定）</h4>
-						<p class="note">
-							タグの定義とは別に保存します。空欄は設定なしです（色・帯・しきい値のイベントを出しません）。収集中なら「収集を再起動」で反映されます。
-						</p>
-						{#if thresholdsError !== null}
+					{:else if rightPane === 'createConnection' && canWrite}
+						{#if driversError}
 							<p class="load-error" role="alert">
-								しきい値を読めませんでした（{thresholdsError}）。
-								<button type="button" onclick={() => selectedTag && loadThresholds(selectedTag.id)}>
-									再読み込み
+								ドライバ一覧を読み込めませんでした（{driversError}）。<button
+									type="button"
+									onclick={() => void reloadDrivers()}>再試行</button
+								>
+							</p>
+						{:else if drivers === null}
+							<p class="loading">ドライバ一覧を読み込み中…</p>
+						{:else if protocolOptions.length === 0}
+							<p class="load-error" role="alert">利用できるドライバがありません。</p>
+						{:else}
+							<p class="note">
+								PLC に直接つなぐ接続先です。Hub 経由の接続先は「記録項目」の「Hub
+								から追加」で作られます。
+							</p>
+							<UnsavedChangesNotice
+								pending={createConnectionStore.isDirty ||
+									Object.values(createDriverState.touched).some(Boolean)}
+								label={UNSAVED_NOTICE}
+							/>
+							<BantoForm
+								schema={connectionSchema(PLC_CREATE)}
+								store={createConnectionStore}
+								onSubmit={handleCreateConnection}
+								submitting={creatingConnection}
+								submitLabel="作成"
+							>
+								{#if driverFor(String(createConnectionStore.values[`${PLC_CREATE}Protocol`] ?? ''))}
+									{@const driver = driverFor(
+										String(createConnectionStore.values[`${PLC_CREATE}Protocol`] ?? '')
+									)!}
+									<DriverSettingsForm
+										schema={driver.settingsSchema.fields}
+										bind:value={createDriverState}
+										errors={createDriverErrors}
+										readOnly={creatingConnection}
+										idPrefix="plc-create-driver"
+									/>
+								{/if}
+							</BantoForm>
+						{/if}
+					{:else if rightPane === 'createGroup' && canWrite}
+						<!-- #394 レビュー P1-3: 「先に作成してください」は依存先を
+						**読めて0件**のときだけ。読めていないときにこれを出すと、
+						既にある接続を重複登録させてしまう。 -->
+						{#if groupCreateGate === 'needs-prerequisite'}
+							<p class="note">
+								先に接続先を1件以上作成してください（Hub 経由の接続先は「記録項目」の「Hub
+								から追加」で作られます）。
+							</p>
+						{:else if groupCreateGate === 'dependency-loading'}
+							<p class="note">接続先の一覧を読み込んでいます…</p>
+						{:else if groupCreateGate === 'dependency-failed'}
+							<p class="load-error" role="alert">
+								接続先の一覧を読み込めなかったため、作成フォームを表示できません（{connectionsError}）。
+								<button
+									type="button"
+									onclick={() => void reloadConnections()}
+									disabled={connectionsLoading}
+								>
+									再試行
 								</button>
 							</p>
-						{:else if selectedThresholds === null}
-							<p class="loading">しきい値を読み込んでいます…</p>
 						{:else}
-							<UnsavedChangesNotice pending={editThresholdsStore.isDirty} label={UNSAVED_NOTICE} />
+							<UnsavedChangesNotice pending={createGroupStore.isDirty} label={UNSAVED_NOTICE} />
 							<BantoForm
-								schema={thresholdSchema(TAG_THR)}
-								store={editThresholdsStore}
-								onSubmit={saveThresholds}
-								submitting={savingThresholds || savingTag || deletingTag}
-								submitLabel="しきい値を保存"
+								schema={groupSchema(GROUP_CREATE)}
+								store={createGroupStore}
+								onSubmit={handleCreateGroup}
+								submitting={creatingGroup}
+								submitLabel="作成"
+							/>
+						{/if}
+					{/if}
+				</div>
+			</div>
+		{/snippet}
+
+		<!--
+			#1179 PR4b: 左ツリー・中央タブ・右の詳細の 3 ペイン（`@banto/ui` の
+			`ThreePaneLayout`）。狭幅の判定はビューポート（`mobileNavStore.isNarrow`、
+			HUB と同じ）。退避・トグル・Esc・スクリム・フォーカスの出入りは部品が持つ。
+			帯には、ツリーを閉じていても何で絞っているか分かるよう、選択中の名前を出す。
+		-->
+		<div class="records-frame">
+			<ThreePaneLayout
+				narrowOverride={mobileNavStore.isNarrow}
+				bind:leftDrawerOpen={treeOpen}
+				bind:rightDrawerOpen
+				bind:narrow={layoutNarrow}
+				right={rightPane !== null && canWrite ? rightPaneContent : undefined}
+				messages={{
+					threePaneLeft: () => TREE_PANE_LABEL,
+					threePaneResizeLeft: () => `${TREE_PANE_LABEL}の幅`,
+					threePaneRight: () => rightPaneTitle,
+					threePaneResizeRight: () => `${rightPaneTitle}の幅`
+				}}
+			>
+				{#snippet left()}
+					<div class="tree-pane" data-testid="record-tree-pane">
+						{#if canWrite}
+							<div class="tree-toolbar">
+								<button type="button" class="secondary" onclick={openCreateConnection}>
+									接続先を追加
+								</button>
+								<button type="button" class="secondary" onclick={openCreateGroup}>
+									収集グループを追加
+								</button>
+							</div>
+						{/if}
+						<!-- #394 レビュー P1-3: 「読めていない」を「0件」として描かない。 -->
+						{#if connectionsView === 'failed'}
+							<p class="load-error" role="alert">
+								接続先の一覧を読み込めませんでした（{connectionsError}）。登録が0件という意味ではありません。
+								<button
+									type="button"
+									onclick={() => void reloadConnections()}
+									disabled={connectionsLoading}
+								>
+									再試行
+								</button>
+							</p>
+						{/if}
+						{#if groupsView === 'failed'}
+							<p class="load-error" role="alert">
+								収集グループの一覧を読み込めませんでした（{groupsError}）。登録が0件という意味ではありません。
+								<button type="button" onclick={() => void reloadGroups()} disabled={groupsLoading}>
+									再試行
+								</button>
+							</p>
+						{/if}
+						{#if connectionsRetry}
+							<p class="load-error" role="alert">
+								接続先の一覧を更新できませんでした（{connectionsError}）。表示は最後に読み込めた内容です。
+								<button
+									type="button"
+									onclick={() => void reloadConnections()}
+									disabled={connectionsLoading}
+								>
+									再試行
+								</button>
+							</p>
+						{/if}
+						{#if groupsRetry}
+							<p class="load-error" role="alert">
+								収集グループの一覧を更新できませんでした（{groupsError}）。表示は最後に読み込めた内容です。
+								<button type="button" onclick={() => void reloadGroups()} disabled={groupsLoading}>
+									再試行
+								</button>
+							</p>
+						{/if}
+						{#if connectionsView === 'loading' || groupsView === 'loading'}
+							<p class="loading">読み込み中…</p>
+						{:else if connectionsView !== 'failed' && groupsView !== 'failed'}
+							<RecordTree
+								connections={connectionRows}
+								groups={groupRows}
+								records={tagRows}
+								selectedId={treeSelectedId}
+								selectionFollowsFocus={!layoutNarrow}
+								onselect={handleTreeSelect}
 							/>
 						{/if}
 					</div>
+				{/snippet}
+				{#snippet titleContent()}
+					<span class="tree-selection" data-testid="record-tree-selection">
+						{treeSelectionLabel}
+					</span>
+				{/snippet}
+				<div class="center-pane">
+					<!--
+						中央はタブで「記録項目」と「設定」を切り替える。「すべて」と閲覧者には
+						「設定」が無いので、タブ列ごと隠す（`hideSingleTab`）。`value` は関数
+						バインディング: 未保存の確認でキャンセルされたら、getter が元のタブを
+						返す（`setActiveTabFromTabs`、HUB と同じ）。
+					-->
+					<div class="view-tabs" class:single={viewTabs.length === 1}>
+						<Tabs
+							tabs={viewTabs}
+							hideSingleTab
+							bind:value={() => activeTab, setActiveTabFromTabs}
+							label="表示の切り替え"
+						>
+							{#snippet panel(id)}
+								{#if id === 'list'}
+									<div class="list-pane">
+										<div class="toolbar">
+											{#if canWrite}
+												{#if registrationGroup}
+													<button type="button" onclick={openCreateTag}>記録項目を追加</button>
+												{/if}
+												<!-- #383 段階3 P4: Hub のカタログから登録する。 -->
+												<button
+													type="button"
+													class="secondary"
+													onclick={() => (hubDialogOpen = true)}
+												>
+													Hub から追加
+												</button>
+											{/if}
+										</div>
+										{#if canWrite && !registrationGroup}
+											<p class="note" data-testid="record-add-hint">
+												左のツリーで収集グループを選ぶと、記録項目を追加できます。
+											</p>
+										{/if}
+										<p class="note">
+											{canWrite
+												? '行をクリックすると右に詳細が表示されます。'
+												: '閲覧のみ（編集には編集者以上の権限が必要です）。'}
+										</p>
+										{#if hasSimulationConnection}
+											<!-- #413: 記録されないことを常に分かるようにする。 -->
+											<p class="note simulation-note" role="note">
+												ツリーで「シミュレーション」の印が付いた接続先は、実機の代わりに内蔵シミュレータへ接続します。値は現在値・イベントには出ますが、データファイルには記録されません。切替は「収集を再起動」で反映されます（実際の動作は「設定
+												&gt; 収集」の接続ごとの状態で確認できます）。
+											</p>
+										{/if}
+										{#if tagsView === 'loading'}
+											<p class="loading">読み込み中…</p>
+										{:else if tagsView === 'failed'}
+											<p class="load-error" role="alert">
+												記録項目の一覧を読み込めませんでした（{tagsError}）。登録が0件という意味ではありません。
+												<button
+													type="button"
+													onclick={() => void reloadTags()}
+													disabled={tagsLoading}
+												>
+													再試行
+												</button>
+											</p>
+										{:else}
+											{#if tagsRetry}
+												<p class="load-error" role="alert">
+													一覧を更新できませんでした（{tagsError}）。表示は最後に読み込めた内容です。
+													<button
+														type="button"
+														onclick={() => void reloadTags()}
+														disabled={tagsLoading}
+													>
+														再試行
+													</button>
+												</p>
+											{/if}
+											<!-- #391 レビュー A / #394 追補: 保存中・削除中は行の選択を
+											操作できないようにする（`selectTag` 自体のガードに加え、
+											見た目でも伝える）。 -->
+											<div
+												class="grid-wrap"
+												data-testid="record-list"
+												class:saving={savingTag || deletingTag}
+												aria-disabled={savingTag || deletingTag}
+											>
+												<BantoGrid
+													rows={visibleTagRows}
+													columns={tagColumns}
+													getRowId={(t) => t.id}
+													onRowClick={canWrite ? selectTag : undefined}
+												/>
+											</div>
+										{/if}
+									</div>
+								{:else}
+									<div class="settings-pane" data-testid="record-settings">
+										{#if target.type === 'connection' && selectedConnection && canWrite}
+											{#if selectedConnectionIsHub}
+												<!-- #383 段階3 P4: Hub 接続は読み取り専用（ホスト・ポートを持たない）。 -->
+												<h3>{selectedConnection.name}（Hub 経由の接続先）</h3>
+												<p class="note">
+													Hub から受信するタグの入れ物です。接続先と API キーは「設定 &gt;
+													Hub接続」（管理者）で設定します。記録項目は「記録項目」の「Hub
+													から追加」で登録します。配下に収集グループがある間は削除できません。
+												</p>
+												<UnsavedChangesNotice
+													pending={editHubConnectionStore.isDirty}
+													label={UNSAVED_NOTICE}
+												/>
+												<BantoForm
+													schema={hubConnectionSchema(HUB_EDIT)}
+													store={editHubConnectionStore}
+													onSubmit={saveHubConnection}
+													submitting={savingConnection || deletingConnection}
+													submitLabel="保存"
+												>
+													<button
+														type="button"
+														class="danger"
+														onclick={handleDeleteConnection}
+														disabled={savingConnection || deletingConnection}
+													>
+														削除
+													</button>
+												</BantoForm>
+											{:else}
+												<h3>{selectedConnection.name} を編集</h3>
+												<!-- #413: 一覧の「動作」列の代わり（レジストリの値）。 -->
+												<p class="note" data-testid="record-connection-mode">
+													動作: {connectionModeLabel(selectedConnection.simulation)}
+												</p>
+												{#if driversError}
+													<!-- ドライバの欄はドライバ一覧が読めてから出る（保存済みの値は残る）。 -->
+													<p class="load-error" role="alert">
+														ドライバ一覧を読み込めませんでした（{driversError}）。<button
+															type="button"
+															onclick={() => void reloadDrivers()}>再試行</button
+														>
+													</p>
+												{/if}
+												<UnsavedChangesNotice
+													pending={editConnectionStore.isDirty ||
+														Object.values(editDriverState.touched).some(Boolean)}
+													label={UNSAVED_NOTICE}
+												/>
+												<BantoForm
+													schema={connectionSchema(PLC_EDIT)}
+													store={editConnectionStore}
+													onSubmit={saveConnection}
+													submitting={savingConnection || deletingConnection}
+													submitLabel="保存"
+												>
+													{#if driverFor(String(editConnectionStore.values[`${PLC_EDIT}Protocol`] ?? ''))}
+														{@const driver = driverFor(
+															String(editConnectionStore.values[`${PLC_EDIT}Protocol`] ?? '')
+														)!}
+														<DriverSettingsForm
+															schema={driver.settingsSchema.fields}
+															bind:value={editDriverState}
+															errors={editDriverErrors}
+															readOnly={savingConnection || deletingConnection}
+															idPrefix="plc-edit-driver"
+														/>
+													{/if}
+													<button
+														type="button"
+														class="danger"
+														onclick={handleDeleteConnection}
+														disabled={savingConnection || deletingConnection}
+													>
+														削除
+													</button>
+												</BantoForm>
+											{/if}
+										{:else if target.type === 'group' && selectedGroup && canWrite}
+											<h3>{selectedGroup.name} を編集</h3>
+											<UnsavedChangesNotice
+												pending={editGroupStore.isDirty}
+												label={UNSAVED_NOTICE}
+											/>
+											<BantoForm
+												schema={groupSchema(GROUP_EDIT)}
+												store={editGroupStore}
+												onSubmit={saveGroup}
+												submitting={savingGroup || deletingGroup}
+												submitLabel="保存"
+											>
+												<button
+													type="button"
+													class="danger"
+													onclick={handleDeleteGroup}
+													disabled={savingGroup || deletingGroup}
+												>
+													削除
+												</button>
+											</BantoForm>
+										{:else}
+											<p class="loading">読み込み中…</p>
+										{/if}
+									</div>
+								{/if}
+							{/snippet}
+						</Tabs>
+					</div>
 				</div>
-			{/if}
-		</section>
+			</ThreePaneLayout>
+		</div>
 
 		{#if canWrite}
 			<HubImportDialog
@@ -1913,8 +2453,9 @@
 	.page {
 		display: flex;
 		flex-direction: column;
-		gap: 1.25rem;
-		max-width: 860px;
+		gap: 0.75rem;
+		height: calc(100vh - var(--banto-shell-header-height) - 2.5rem);
+		min-height: 0;
 	}
 
 	h2 {
@@ -1922,26 +2463,172 @@
 		font-size: 1.1rem;
 	}
 
-	.registry-section {
-		display: flex;
-		flex-direction: column;
-		gap: 1rem;
-		background: var(--banto-surface);
-		border: 1px solid var(--banto-border);
-		border-radius: calc(var(--banto-radius) * 2);
-		padding: 1rem 1.25rem;
-	}
-
 	h3 {
 		margin: 0;
 		font-size: 0.95rem;
 	}
 
-	.section-head {
+	h4 {
+		margin: 0 0 0.5rem;
+		font-size: 0.85rem;
+		color: var(--banto-text-muted);
+	}
+
+	/* 3 ペインの枠が残りの高さを埋める（グリッド・ツリーの高さの基準）。 */
+	.records-frame {
+		flex: 1;
+		min-height: 360px;
+		display: flex;
+		flex-direction: column;
+		background: var(--banto-surface);
+		border: 1px solid var(--banto-border);
+		border-radius: calc(var(--banto-radius) * 2);
+		overflow: hidden;
+	}
+
+	.tree-pane {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+		height: 100%;
+		min-height: 0;
+		box-sizing: border-box;
+		padding: 0.5rem;
+	}
+
+	.tree-pane > :global(.tree-container) {
+		flex: 1;
+		min-height: 0;
+	}
+
+	.tree-toolbar {
+		flex: 0 0 auto;
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.5rem;
+	}
+
+	.tree-toolbar button {
+		font-size: 0.78rem;
+		padding: 0 0.6rem;
+	}
+
+	.tree-selection {
+		font-weight: 600;
+	}
+
+	.center-pane {
+		display: flex;
+		flex-direction: column;
+		height: 100%;
+		min-height: 0;
+		box-sizing: border-box;
+		padding: 0.75rem 1rem;
+	}
+
+	/* 表示中のタブのパネルが残りの高さを埋める（HUB の tags ページと同じ）。 */
+	.view-tabs {
+		display: flex;
+		flex-direction: column;
+		flex: 1;
+		min-height: 0;
+	}
+
+	.view-tabs > :global(.banto-tabs__panel:not([hidden])) {
+		display: flex;
+		flex-direction: column;
+		flex: 1;
+		min-height: 0;
+	}
+
+	.view-tabs.single > :global(.banto-tabs__panel) {
+		padding-block-start: 0;
+	}
+
+	.list-pane {
+		display: flex;
+		flex-direction: column;
+		flex: 1;
+		min-height: 0;
+		gap: 0.5rem;
+	}
+
+	.toolbar {
+		flex: 0 0 auto;
+		display: flex;
+		align-items: center;
+		gap: 0.6rem;
+		flex-wrap: wrap;
+	}
+
+	.toolbar button:not(.secondary) {
+		height: var(--banto-control-height);
+		box-sizing: border-box;
+		padding: 0 1rem;
+		background: var(--banto-primary);
+		border: 1px solid var(--banto-primary);
+		border-radius: var(--banto-radius-md);
+		color: var(--banto-on-primary, #fff);
+		cursor: pointer;
+	}
+
+	.settings-pane {
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
+		overflow: auto;
+		max-width: 48rem;
+	}
+
+	.detail-pane {
+		display: flex;
+		flex-direction: column;
+		height: 100%;
+		min-height: 0;
+	}
+
+	.detail-pane-header {
+		flex: 0 0 auto;
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
 		gap: 0.75rem;
+		padding: 0.75rem 1rem;
+		border-bottom: 1px solid var(--banto-border);
+	}
+
+	.detail-pane-header h3 {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.pane-close {
+		border: none;
+		background: none;
+		color: var(--banto-text-muted);
+		font-size: 1.25rem;
+		line-height: 1;
+		padding: 0.15rem 0.4rem;
+		cursor: pointer;
+		border-radius: var(--banto-radius);
+	}
+
+	.pane-close:hover {
+		color: var(--banto-text);
+		background: color-mix(in srgb, var(--banto-primary) 8%, transparent);
+	}
+
+	.pane-close:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
+	.detail-pane-body {
+		flex: 1;
+		min-height: 0;
+		overflow-y: auto;
+		padding: 0.75rem 1rem 1.25rem;
 	}
 
 	button.secondary {
@@ -1965,14 +2652,8 @@
 		border-top: 1px solid var(--banto-border);
 	}
 
-	h4 {
-		margin: 0 0 0.5rem;
-		font-size: 0.85rem;
-		color: var(--banto-text-muted);
-	}
-
 	.note {
-		margin: 0 0 0.5rem;
+		margin: 0;
 		color: var(--banto-text-muted);
 		font-size: 0.8rem;
 	}
@@ -1988,7 +2669,7 @@
 		align-items: center;
 		gap: 0.5rem;
 		flex-wrap: wrap;
-		margin: 0 0 0.5rem;
+		margin: 0;
 		color: var(--banto-danger);
 		font-size: 0.8rem;
 	}
@@ -2010,7 +2691,8 @@
 	}
 
 	.grid-wrap {
-		height: 260px;
+		flex: 1;
+		min-height: 200px;
 	}
 
 	/* #413: 「値は記録されません」は見落とすと困るので、薄いグレーの
@@ -2020,8 +2702,12 @@
 	}
 
 	/* #414 段階2: 不正な設定は収集から外れる（黙って欠測する）ので、エラー
-	ほど強くはないが見落とさない色・枠で出す。 */
+	ほど強くはないが見落とさない色・枠で出す。3 ペインの高さを奪いすぎない
+	よう、長いときはこの枠の中でスクロールする。 */
 	.config-exclusions {
+		flex: 0 0 auto;
+		max-height: 30vh;
+		overflow: auto;
 		background: var(--banto-surface);
 		border: 1px solid var(--banto-danger);
 		border-radius: calc(var(--banto-radius) * 2);
@@ -2030,6 +2716,7 @@
 
 	.exclusion-note {
 		color: var(--banto-text);
+		margin-bottom: 0.5rem;
 	}
 
 	.exclusion-marks {
@@ -2042,12 +2729,6 @@
 		display: inline-block;
 		min-width: 6.5em;
 		color: var(--banto-text-muted);
-	}
-
-	.create,
-	.detail {
-		border-top: 1px solid var(--banto-border);
-		padding-top: 0.75rem;
 	}
 
 	button.danger {

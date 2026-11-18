@@ -21,6 +21,7 @@
  * （`user-u...`）に置いてある。
  */
 import { expect, test, type Dialog, type Page } from '@playwright/test';
+import { openCreateConnection } from './records-page';
 
 const ADMIN_USERNAME = 'e2e-admin';
 const ADMIN_PASSWORD = 'E2eAdminPass1';
@@ -92,9 +93,10 @@ test.describe.serial('chronogazer 未保存の入力の確認', () => {
 		expect(dialogs).toEqual([]);
 	});
 
-	test('4. 記録: PLC接続の新規作成に入力 → 別の画面へ → 「留まる」で入力が残り、「離れる」で移動する', async () => {
+	test('4. 記録: 接続先の新規作成に入力 → 別の画面へ → 「留まる」で入力が残り、「離れる」で移動する', async () => {
 		await page.goto('/tags');
-		const form = page.locator('section.registry-section').nth(0).locator('div.create');
+		// #1179 PR4b: 作成フォームは右ペイン（左ツリーの「接続先を追加」）。
+		const form = await openCreateConnection(page);
 		await form.getByLabel('名前').fill('unsaved-plc');
 		await expect(form.locator('.banto-unsaved')).toHaveText('未保存の変更があります');
 

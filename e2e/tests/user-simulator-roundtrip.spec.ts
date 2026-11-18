@@ -118,6 +118,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { RUN_DIR_ENV, RUN_TOKEN_ENV, ownsRunDir } from '../chronogazer-e2e-run-dir';
+import {
+	openCreateConnection,
+	openCreateGroup,
+	openCreateRecord,
+	recordList,
+	treeNode
+} from './records-page';
 
 // smoke.spec.ts が初回セットアップで作成する唯一の管理者アカウント。
 const ADMIN_USERNAME = 'e2e-admin';
@@ -485,32 +492,31 @@ test.describe.serial('chronogazer 開発用 PLC 相手の収集の一巡（R1-C 
 		await page.goto('/tags');
 		await expect(page.getByRole('heading', { level: 2, name: '記録' })).toBeVisible();
 
-		const connSection = page.locator('section.registry-section').nth(0);
-		const connForm = connSection.locator('div.create');
+		// #1179 PR4b: 左ツリーの「接続先を追加」「収集グループを追加」と、
+		// 収集グループを選んだときの「記録項目を追加」（右ペインの作成フォーム）。
+		const connForm = await openCreateConnection(page);
 		await connForm.getByLabel('名前').fill(CONNECTION_NAME);
 		await connForm.getByLabel('プロトコル').selectOption('modbus-tcp');
 		await connForm.getByLabel('ホスト').fill('127.0.0.1');
 		await connForm.getByLabel('ポート').fill(String(DEV_PLC_PORT));
 		await connForm.getByRole('button', { name: '作成' }).click();
-		await expect(connSection.locator('div.list').getByText(CONNECTION_NAME)).toBeVisible();
+		await expect(treeNode(page, CONNECTION_NAME)).toHaveAttribute('aria-selected', 'true');
 
-		const groupSection = page.locator('section.registry-section').nth(1);
-		const groupForm = groupSection.locator('div.create');
+		const groupForm = await openCreateGroup(page);
 		await groupForm.getByLabel('名前').fill(GROUP_NAME);
 		await groupForm.getByLabel('接続').selectOption({ label: `${CONNECTION_NAME}（modbus-tcp）` });
 		await groupForm.getByLabel('収集周期').selectOption({ label: '100ms' });
 		await groupForm.getByRole('button', { name: '作成' }).click();
-		await expect(groupSection.locator('div.list').getByText(GROUP_NAME)).toBeVisible();
+		await expect(treeNode(page, GROUP_NAME)).toHaveAttribute('aria-selected', 'true');
 
-		const tagSection = page.locator('section.registry-section').nth(2);
-		const tagForm = tagSection.locator('div.create');
+		const tagForm = await openCreateRecord(page);
 		await tagForm.getByLabel('名前').fill(TAG_NAME);
 		await tagForm.getByLabel('収集グループ').selectOption({ label: GROUP_NAME });
 		// 保持レジスタ 40001 = dev_plc のランプ波の先頭。
 		await tagForm.getByLabel('デバイスアドレス').fill('40001');
 		await tagForm.getByLabel('データ型').selectOption('u16');
 		await tagForm.getByRole('button', { name: '作成' }).click();
-		await expect(tagSection.locator('div.list').getByText(TAG_NAME)).toBeVisible();
+		await expect(recordList(page).getByText(TAG_NAME)).toBeVisible();
 
 		const created = (
 			await getList<ConnectionRow>(page.request, apiHeaders, '/api/plc-connections')
