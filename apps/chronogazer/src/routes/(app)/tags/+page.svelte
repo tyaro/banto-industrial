@@ -77,7 +77,7 @@
 	 */
 	import { untrack } from 'svelte';
 	import { page } from '$app/state';
-	import { afterNavigate, beforeNavigate, goto } from '$app/navigation';
+	import { afterNavigate, goto, type BeforeNavigate } from '$app/navigation';
 	import { BantoGrid, type GridColumn } from '@banto/grid-svelte';
 	import { BantoForm, createFormStore, UnsavedChangesNotice, type FormSchema } from '@banto/forms';
 	import { Tabs, ThreePaneLayout } from '@banto/ui';
@@ -143,6 +143,7 @@
 		validateDriverValues
 	} from '#lib/banto/driverSettingsForm.js';
 	import HubImportDialog from './HubImportDialog.svelte';
+	import NavigationGate from '#lib/components/NavigationGate.svelte';
 	import {
 		getTagThresholds,
 		updateTagThresholds,
@@ -1351,8 +1352,13 @@
 	// - **未保存の確認**は `confirmViewChange`（対象・タブの切り替え）と
 	//   `confirmDiscardRightPane`（右ペインの中身の切り替え・閉じる）。どちらも
 	//   キャンセルなら何も変えない。確かめて進んだら、捨てたフォームは閉じる・
-	//   作り直す（`discardForView`）ので、続く離脱の確認（`guardUnsavedChanges`）は
-	//   もう出ない。
+	//   作り直す（`discardForView`）。
+	// - **ページの中の移動では汎用の離脱の確認（`guardUnsavedChanges`）を出さない**
+	//   （`leaveGuardMuted`）。ページ内の `goto` は呼ぶ前から、戻る・進むは
+	//   `handleBeforeNavigate` で確かめてからその移動が終わるまで黙らせる。
+	//   削除の後の `forceView` のように右ペインを dirty のまま残す移動もあるので、
+	//   「確かめて捨てたから dirty でない」には頼らない。`handleBeforeNavigate` は
+	//   テンプレートの一番最初の `NavigationGate` から呼び、子の guard より先に走らせる。
 	// - 対象・タブを変えると右ペインは閉じる（右ペインの中身は、前の対象の一覧の
 	//   行か、前の対象への追加だったため）。**例外: 削除に伴う移動（`forceView`）は
 	//   右ペインを閉じない**（無関係な作成フォームの下書きを守る。作成フォームの
@@ -1639,6 +1645,8 @@
 		const href = url.href;
 		viewNavHrefs.add(href);
 		viewNavsInFlight += 1;
+		// 離脱の確認は `goto` を呼ぶ**前に**黙らせる（`leaveGuardMuted` の説明）。
+		leaveGuardMuted += 1;
 		try {
 			// `reset: false`: フォーカスとスクロールを動かさない（同じページの中の切り替え）。
 			await goto(url, { replace: options.replace, reset: false });
@@ -1647,6 +1655,7 @@
 		} finally {
 			viewNavHrefs.delete(href);
 			viewNavsInFlight -= 1;
+			leaveGuardMuted -= 1;
 		}
 	}
 
@@ -1691,28 +1700,56 @@
 	});
 
 	/**
-	 * 離脱の確認（`guardUnsavedChanges`）を、このページの中の移動では出さない印。
-	 * ページの中の移動（ページ内の `goto`、戻る・進むでクエリだけが変わる）は、
-	 * 下の `beforeNavigate` が `confirmViewChange` で確かめ済みなので、二重に
-	 * 確かめない。`beforeNavigate` の呼び出しは同期で続けて走るので、その間だけ
-	 * 立てて次のマイクロタスクで下ろす。
+	 * 進行中の「ページの中の移動」の数。0 より大きい間は、離脱の確認
+	 * （`guardUnsavedChanges`）を黙らせる。ページの中の移動（ページ内の `goto`、
+	 * 戻る・進む・リンクでクエリだけが変わる）は、`confirmViewChange` で確かめ済み
+	 * （`goto` は呼ぶ前に `requestView` が、戻る・進むは `handleBeforeNavigate` が）
+	 * なので、汎用の離脱の確認を二重に出さない。
+	 *
+	 * - ページ内の `goto`: `navigateToView` が `goto` の**前に**上げ、`finally` で下げる。
+	 *   `beforeNavigate` の中で印を立てるのでは、子（`HubImportDialog`）の guard の
+	 *   コールバックが先に走ったときに間に合わない（`NavigationGate.svelte` の冒頭）。
+	 * - 戻る・進むなど: `handleBeforeNavigate` が確かめて進めたときに上げ、その移動の
+	 *   `complete` が決着したら下げる（取り消しでも決着する）。決着しない経路への
+	 *   備えとして、`afterNavigate` でも残りを下げる。
+	 *
+	 * `$state` にしない（`isDirty` を読むのは guard のコールバックだけで、描画は
+	 * 関わらない）。
 	 */
-	let suppressLeaveGuard = false;
+	let leaveGuardMuted = 0;
+	/** 戻る・進むなどで上げた分を下げる関数（`afterNavigate` の備えのため控える）。 */
+	const pendingLeaveGuardReleases = new Set<() => void>();
 
-	function suppressLeaveGuardForThisNavigation(): void {
-		suppressLeaveGuard = true;
-		queueMicrotask(() => {
-			suppressLeaveGuard = false;
-		});
+	function muteLeaveGuardUntil(complete: Promise<void> | undefined): void {
+		leaveGuardMuted += 1;
+		let released = false;
+		const release = () => {
+			if (released) return;
+			released = true;
+			leaveGuardMuted -= 1;
+			pendingLeaveGuardReleases.delete(release);
+		};
+		pendingLeaveGuardReleases.add(release);
+		if (complete) {
+			complete.then(release, release);
+		} else {
+			queueMicrotask(release);
+		}
 	}
 
-	beforeNavigate((nav) => {
+	afterNavigate(() => {
+		for (const release of [...pendingLeaveGuardReleases]) release();
+	});
+
+	/**
+	 * ページの `beforeNavigate`。テンプレートの一番最初の `NavigationGate` から
+	 * 呼ばれるので、このページの中のどの guard よりも先に走る。
+	 */
+	function handleBeforeNavigate(nav: BeforeNavigate): void {
 		const to = nav.to?.url;
 		if (!to) return;
-		if (viewNavHrefs.has(to.href)) {
-			suppressLeaveGuardForThisNavigation();
-			return;
-		}
+		// ページ内の `goto`: `navigateToView` が呼ぶ前から黙らせている。
+		if (viewNavHrefs.has(to.href)) return;
 		if (!nav.willUnload && to.pathname === page.url.pathname) {
 			const next = resolveRecordsView(
 				parseRecordsView(to.searchParams),
@@ -1723,10 +1760,14 @@
 					settingsAvailable: canWrite
 				}
 			).view;
+			// 取り消すときも黙らせる（後に続く guard のコールバックは、取り消された
+			// 移動にも呼ばれるので、黙らせないと二度目の確認が出る）。`cancel()` で
+			// `complete` は reject されるので、そこで下がる。
+			muteLeaveGuardUntil(nav.complete);
 			if (!confirmViewChange(next)) nav.cancel();
-			suppressLeaveGuardForThisNavigation();
 		}
-	});
+		// 別のページ・再読み込みは guard に任せる。
+	}
 
 	// 未保存の入力の確認（banto #214 の流儀、ChronoGazer #508）: 右ペインのフォーム
 	// （記録項目の編集＋しきい値、または作成フォーム）と「設定」タブのフォームの
@@ -1735,8 +1776,8 @@
 	// （編集）か新しいストアへの差し替え（新規作成）で消す。保存・作成の最中も
 	// 「保存が落ちるかもしれない」ので未保存として扱う。
 	guardUnsavedChanges({
-		isDirty: () => !suppressLeaveGuard && (rightPaneDirty() || settingsDirty()),
-		isSaving: () => !suppressLeaveGuard && (rightPaneBusy() || settingsBusy())
+		isDirty: () => leaveGuardMuted === 0 && (rightPaneDirty() || settingsDirty()),
+		isSaving: () => leaveGuardMuted === 0 && (rightPaneBusy() || settingsBusy())
 	});
 
 	/** 「設定」タブに出す接続先・収集グループ（一覧から引き直す）。 */
@@ -1878,6 +1919,8 @@
 		void reloadTags();
 	});
 </script>
+
+<NavigationGate onbeforenavigate={handleBeforeNavigate} />
 
 <div class="page">
 	<h2>記録</h2>

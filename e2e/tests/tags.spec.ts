@@ -80,7 +80,7 @@
  * 「設定」タブ（接続先・収集グループの編集）は同時に描かれ、どちらにも「名前」欄が
  * あるので、ロケータは `records-page.ts` の helper（test id）で必ずスコープする。
  */
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Dialog, type Page } from '@playwright/test';
 import {
 	detailPane,
 	openCreateConnection,
@@ -832,5 +832,45 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 			detailPane(page).getByRole('heading', { level: 3, name: '接続先を追加' })
 		).toBeVisible();
 		await expect(detailPane(page).getByLabel('名前')).toHaveValue(DRAFT_NAME);
+	});
+
+	test('18. 未保存のまま戻ると、確認はページの「切り替えますか」の 1 回だけで、キャンセルなら元のまま（#1179 PR4b）', async () => {
+		const DRAFT_NAME = 'E2E戻る下書き接続先';
+		// 前のテストの下書きが残っていてもよいよう、準備の間の確認は承認する。
+		const asked: string[] = [];
+		let answer: 'accept' | 'dismiss' = 'accept';
+		const onDialog = (dialog: Dialog): void => {
+			if (answer === 'dismiss') asked.push(dialog.message());
+			void (answer === 'accept' ? dialog.accept() : dialog.dismiss());
+		};
+		page.on('dialog', onDialog);
+		try {
+			await page.goto('/tags');
+			await selectTreeNode(page, CONNECTION_NAME);
+			await expect(page).toHaveURL(/\/tags\?target=connection:\d+$/);
+			await selectTreeNode(page, GROUP_NAME);
+			await expect(page).toHaveURL(/\/tags\?target=group:\d+$/);
+			const groupUrl = page.url();
+
+			const draft = await openCreateConnection(page);
+			await draft.getByLabel('名前').fill(DRAFT_NAME);
+
+			// 戻る -> ページの確認だけが 1 回出る -> キャンセルで元のまま。
+			answer = 'dismiss';
+			await page.goBack();
+			await expect.poll(() => asked.length).toBe(1);
+			expect(asked[0]).toContain('変更を破棄して切り替えますか');
+			await expect(page).toHaveURL(groupUrl);
+			await expect(treeNode(page, GROUP_NAME)).toHaveAttribute('aria-selected', 'true');
+			await expect(
+				detailPane(page).getByRole('heading', { level: 3, name: '接続先を追加' })
+			).toBeVisible();
+			await expect(detailPane(page).getByLabel('名前')).toHaveValue(DRAFT_NAME);
+			// 遅れて二度目の確認が出ないこと。
+			await page.waitForTimeout(500);
+			expect(asked).toHaveLength(1);
+		} finally {
+			page.off('dialog', onDialog);
+		}
 	});
 });
