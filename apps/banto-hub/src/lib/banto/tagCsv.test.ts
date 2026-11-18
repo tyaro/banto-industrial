@@ -809,6 +809,7 @@ describe('parseTagsCsv', () => {
 			expect(rows[0]).toEqual({
 				lineNumber: 2,
 				connectionName: 'ConnA',
+				connectionId: CONN_A.id,
 				groupName: 'GroupX',
 				tag: {
 					name: 'Tag1',

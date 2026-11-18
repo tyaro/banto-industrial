@@ -4731,8 +4731,8 @@
 	 * 正規形にした結果（行番号 → 正規形かエラー）。`null` = 未取得・取得中。
 	 * 同じ接続の行をまとめて 1 回呼び、全行を `tagKind` つきで送る
 	 * （`tagCsvDiff.ts::resolveCsvCanonicalAddresses`）。応答は世代番号で守り、
-	 * CSV を差し替えた後に届いた古い応答は捨てる。接続・グループの一覧の付け替えでは
-	 * 再取得しない（`untrack`）。
+	 * CSV を差し替えた後に届いた古い応答は捨てる。接続は読み込み時に解決した id を使う
+	 * （`ParsedCsvTagRow.connectionId`）ので、接続・グループの一覧の付け替えでは再取得しない。
 	 */
 	let csvCanonicalByLine = $state<CanonicalAddressByLine | null>(null);
 	let csvCanonicalSeq = 0;
@@ -4741,17 +4741,7 @@
 		csvCanonicalByLine = null;
 		if (csvMode !== 'update' || !csvParseResult?.ok || csvParseResult.rows.length === 0) return;
 		const rows = csvParseResult.rows;
-		const connectionIdForGroup = untrack(() => {
-			const snapshotGroups = groups;
-			const snapshotConnections = connections;
-			return (groupId: number): number | undefined => {
-				const group = snapshotGroups.find((g) => g.id === groupId);
-				return group
-					? snapshotConnections.find((c) => c.id === group.plcConnectionId)?.id
-					: undefined;
-			};
-		});
-		void resolveCsvCanonicalAddresses(rows, connectionIdForGroup).then((resolved) => {
+		void resolveCsvCanonicalAddresses(rows).then((resolved) => {
 			if (seq === csvCanonicalSeq) csvCanonicalByLine = resolved;
 		});
 	});
