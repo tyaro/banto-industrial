@@ -90,7 +90,7 @@
 
 	const available = isTagRegistryAvailable();
 	const canEdit = $derived(canWriteResources(sessionStore.role) && !sessionStore.publicViewer);
-	/** 閲覧公開のセッションはタグ設定を開けない（ガードが監視へ戻す）ので、リンクを出さない。 */
+	/** 閲覧公開のセッションは記録を開けない（ガードが監視へ戻す）ので、リンクを出さない。 */
 	const tagsHref = $derived(sessionStore.publicViewer ? null : resolveAppPath('/tags'));
 
 	/** localStorage はアクセスそのものが投げることがある（プライベートモード等）。 */
@@ -369,12 +369,12 @@
 			<p class="empty-message">表示グループが未設定です</p>
 			{#if canEdit}
 				<p class="empty-hint">
-					<a href={resolveAppPath('/groups')}>グループ設定</a>
+					<a href={resolveAppPath('/groups')}>表示グループ</a>
 					で表示グループを作成すると、ここにトレンド・デジタル・バー・計器表示が並びます。
 				</p>
 			{:else}
 				<p class="empty-hint">
-					表示グループは編集者以上のアカウントがグループ設定で作成します。作成されると、ここにトレンド・デジタル・バー・計器表示が並びます。
+					表示グループは編集者以上のアカウントが「表示グループ」ページで作成します。作成されると、ここにトレンド・デジタル・バー・計器表示が並びます。
 				</p>
 			{/if}
 		</div>
@@ -429,7 +429,7 @@
 						<p class="empty-message">このグループにはペン（タグ）が割り当てられていません</p>
 						{#if canEdit}
 							<p class="empty-hint">
-								<a href={resolveAppPath('/groups')}>グループ設定</a>でタグを割り当ててください。
+								<a href={resolveAppPath('/groups')}>表示グループ</a>でタグを割り当ててください。
 							</p>
 						{/if}
 					</div>

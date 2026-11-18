@@ -88,7 +88,7 @@ pub const MAX_DISPLAY_GROUPS: usize = 16;
 /// 1 グループのペンの上限（§2「最大 8 ペン」）。
 pub const MAX_PENS_PER_GROUP: usize = 8;
 
-/// 名前の最大文字数（タグ設定の名前欄と同じ 100）。
+/// 名前の最大文字数（記録の名前欄と同じ 100）。
 pub const MAX_NAME_CHARS: usize = 100;
 
 /// `sortOrder` の上限（並べ替えは 0 から詰めるので、16 グループには十分）。
@@ -493,7 +493,7 @@ pub fn tag_referenced_error(referrers: &[DisplayGroupRef]) -> BantoError {
     BantoError::Validation {
         field_errors: vec![field_error(
             TAG_REFERENCED_FIELD,
-            format!("このタグは表示グループ{names}のペンに割り当てられているため削除できません。先にグループ設定でペンから外してください"),
+            format!("このタグは表示グループ{names}のペンに割り当てられているため削除できません。先に「表示グループ」ページでペンから外してください"),
         )],
     }
 }

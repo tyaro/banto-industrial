@@ -18,7 +18,7 @@
  *    先に使う（bit に LL..HH を置いても 0〜1 以外のレンジにはならない）。
  * 3. 無ければしきい値の LL..HH（両方あって LL < HH のとき）。
  * 4. どれも無ければ「レンジ未設定」。棒・計器は描かず、値の文字は出す
- *    （値そのものは読めているので隠さない）。タグ設定へのリンクを添える
+ *    （値そのものは読めているので隠さない）。記録へのリンクを添える
  *    （閲覧公開ではリンクを出さない - パネル側で `tagsHref` が `null`）。
  *
  * タグの情報を読めていないときは「レンジ未設定」と言わない（設定が無いのか
@@ -65,7 +65,7 @@ export type MeterRange =
 	/** タグの情報を読めていない（設定が無いのか分からない）。 */
 	| { kind: 'noTag' };
 
-export const RANGE_UNSET_MESSAGE = 'レンジ未設定（タグ設定で工学値レンジを入れてください）';
+export const RANGE_UNSET_MESSAGE = 'レンジ未設定（「記録」ページで工学値レンジを入れてください）';
 export const RANGE_NO_TAG_MESSAGE = 'タグの情報を読み込めないため、レンジを決められません';
 
 function finite(n: number | null | undefined): n is number {

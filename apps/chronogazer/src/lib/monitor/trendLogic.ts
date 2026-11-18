@@ -89,7 +89,7 @@ import { formatBitValue, formatValue, isBitTag } from './monitorLogic';
 // --- 時間窓 ------------------------------------------------------------------
 
 /**
- * 選べる時間窓（秒）。Rust の `TREND_TIME_WINDOWS_SEC`、グループ設定画面の
+ * 選べる時間窓（秒）。Rust の `TREND_TIME_WINDOWS_SEC`、「表示グループ」ページの
  * `TIME_WINDOW_OPTIONS` と同じ（`trendLogic.test.ts` が突き合わせる）。
  */
 export const TREND_WINDOWS_SEC: readonly number[] = [60, 300, 600, 1800, 3600];

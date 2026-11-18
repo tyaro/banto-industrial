@@ -1,5 +1,5 @@
 /**
- * タグ設定画面（`/tags`）の E2E 固定（#383 段階2a / R1-B）。
+ * 「記録」ページ（`/tags`）の E2E 固定（#383 段階2a / R1-B）。
  *
  * 固定したい受入条件:
  * 1. 管理者で `/tags` を開き、PLC接続 → 収集グループ → タグ の順に作成でき、
@@ -99,7 +99,7 @@ async function login(page: Page, username: string, password: string): Promise<vo
 	await expect(page).toHaveURL(/\/monitor$/);
 }
 
-test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）', () => {
+test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B）', () => {
 	let page: Page;
 
 	test.beforeAll(async ({ browser }) => {
@@ -113,7 +113,7 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 
 	test('1. /tags を開くと見出しと3セクションが出る', async () => {
 		await page.goto('/tags');
-		await expect(page.getByRole('heading', { level: 2, name: 'タグ設定' })).toBeVisible();
+		await expect(page.getByRole('heading', { level: 2, name: '記録' })).toBeVisible();
 		await expect(page.getByRole('heading', { level: 3, name: '接続' })).toBeVisible();
 		await expect(page.getByRole('heading', { level: 3, name: '収集グループ' })).toBeVisible();
 		await expect(page.getByRole('heading', { level: 3, name: 'タグ' })).toBeVisible();
@@ -440,7 +440,7 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 		try {
 			await login(viewerPage, VIEWER_USERNAME, VIEWER_PASSWORD);
 			await viewerPage.goto('/tags');
-			await expect(viewerPage.getByRole('heading', { level: 2, name: 'タグ設定' })).toBeVisible();
+			await expect(viewerPage.getByRole('heading', { level: 2, name: '記録' })).toBeVisible();
 			// 一覧（読み取り）はそのまま見える。収集グループ一覧の「PLC接続」列にも
 			// 接続名がそのまま出るため、PLC接続名は PLC接続セクション（0番目）の
 			// 一覧に絞って探す - 絞らないと2箇所に一致して strict mode 違反になる。

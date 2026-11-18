@@ -1,6 +1,6 @@
 <script lang="ts">
 	/**
-	 * タグ設定画面（#383 段階2a / R1-B、recorder-requirements.md §6）。
+	 * 「記録」ページ（#383 段階2a / R1-B、recorder-requirements.md §6）。
 	 *
 	 * 手本は `routes/(app)/users/+page.svelte`: `BantoGrid`（一覧）+
 	 * `BantoForm`/`createFormStore`（新規作成・編集）+ 行クリックで下に編集
@@ -1441,7 +1441,7 @@
 </script>
 
 <div class="page">
-	<h2>タグ設定</h2>
+	<h2>記録</h2>
 
 	{#if !available}
 		<p class="note">

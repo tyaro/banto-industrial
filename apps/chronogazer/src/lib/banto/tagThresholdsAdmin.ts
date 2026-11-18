@@ -24,7 +24,7 @@ import {
 } from './tagRegistryAdmin';
 import { getBantoMode } from './setup';
 
-/** しきい値の 4 つ（`null` = 設定なし）。監視画面・グループ設定画面の判定の入力。 */
+/** しきい値の 4 つ（`null` = 設定なし）。監視画面・「表示グループ」ページの判定の入力。 */
 export interface ThresholdFields {
 	thresholdLl: number | null;
 	thresholdL: number | null;
@@ -49,7 +49,7 @@ export interface TagThresholdsInput {
 	expectedRevision?: number;
 }
 
-/** タグにしきい値を添えた形（監視画面・グループ設定画面が判定に使う）。 */
+/** タグにしきい値を添えた形（監視画面・「表示グループ」ページが判定に使う）。 */
 export type TagWithThresholds = Tag & ThresholdFields;
 
 /** 設定なし。 */

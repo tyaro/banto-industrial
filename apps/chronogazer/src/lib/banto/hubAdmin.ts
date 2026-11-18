@@ -75,7 +75,7 @@ export interface HubView {
 	keyName: string | null;
 	/**
 	 * P4 より前のこの画面で選んでいたタグ（`hub.record.selected_tags`）。
-	 * **読むだけ**で、購読の対象ではない（#383 段階3 P4）。「タグ設定」の
+	 * **読むだけ**で、購読の対象ではない（#383 段階3 P4）。「記録」の
 	 * 「Hub から追加」が 1 度だけ事前にチェックし、登録すると消える。
 	 */
 	selectedTags: string[];
@@ -130,7 +130,7 @@ export interface HubSubscription {
 	reason: string | null;
 	subscribedCount: number;
 	/**
-	 * 購読の対象として登録されている外部名（#383 段階3 P4: タグ設定の hub 接続の
+	 * 購読の対象として登録されている外部名（#383 段階3 P4: 記録の hub 接続の
 	 * 下のタグ。収集の有無に関わらず購読する）。ソート済み。
 	 */
 	registered: string[];
@@ -435,7 +435,7 @@ export function hubStatusDetail(status: HubStatus, host: HubHost = 'service'): s
 		case 'connected':
 			return status.tagCount === 0
 				? 'Hubにはまだタグが登録されていません。Hub側でタグを登録すると、ここに表示されます。'
-				: '購読するタグは「タグ設定」の「Hub から追加」で登録します。';
+				: '購読するタグは「記録」の「Hub から追加」で登録します。';
 		case 'authFailed':
 			return '保存済みのAPIキーが無効です。「接続」でキーを再発行できます（Hubがロックダウン済みの場合は連携が必要です）。';
 		case 'forbidden':

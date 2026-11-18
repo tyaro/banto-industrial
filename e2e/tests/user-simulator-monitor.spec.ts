@@ -7,7 +7,7 @@
  *    127.0.0.1:8803、40001 からランプ波）相手に収集を始めると、デジタル表示の
  *    値が実際に変わる。単位・しきい値（色だけでなく文字）が出る。
  * 3. 設定が不正で外したタグ（品質 `invalid`）は「—」と「設定不正（収集対象外）」、
- *    タグ設定へのリンクで出る（0 にしない）。
+ *    記録へのリンクで出る（0 にしない）。
  * 4. タブで表示グループを切り替えられ、選択は URL の `?group=` に載る。前の
  *    グループの値を持ち越さない。
  * 5. コマンドパレットの「グループ: ◯◯ を表示」でも切り替えられる。`/monitor` を
@@ -394,10 +394,9 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 
 		await expect(cell(TAG_INVALID).locator('.value')).toHaveText('—');
 		await expect(cell(TAG_INVALID)).toContainText('設定不正（収集対象外）');
-		await expect(cell(TAG_INVALID).getByRole('link', { name: 'タグ設定で直す' })).toHaveAttribute(
-			'href',
-			'/tags'
-		);
+		await expect(
+			cell(TAG_INVALID).getByRole('link', { name: '「記録」ページで直す' })
+		).toHaveAttribute('href', '/tags');
 
 		await expect(cell(TAG_HIGH)).toContainText('H 上限以上');
 		await expect(cell(TAG_HIGH).locator('.value')).toHaveText(/^\d+$/);
@@ -512,13 +511,15 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		await expect(invalidCell.locator('.track')).toHaveCount(1);
 		await expect(invalidCell.locator('.fill')).toHaveCount(0);
 		await expect(invalidCell).toContainText('設定不正（収集対象外）');
-		await expect(invalidCell.getByRole('link', { name: 'タグ設定で直す' })).toBeVisible();
+		await expect(invalidCell.getByRole('link', { name: '「記録」ページで直す' })).toBeVisible();
 
-		// レンジが無いタグ: 棒の代わりに理由とタグ設定へのリンク。値と判定の文字は出す。
+		// レンジが無いタグ: 棒の代わりに理由と記録へのリンク。値と判定の文字は出す。
 		const highCell = cell(TAG_HIGH);
 		await expect(highCell).toHaveAttribute('data-range', 'unset');
-		await expect(highCell).toContainText('レンジ未設定（タグ設定で工学値レンジを入れてください）');
-		await expect(highCell.getByRole('link', { name: 'タグ設定を開く' })).toHaveAttribute(
+		await expect(highCell).toContainText(
+			'レンジ未設定（「記録」ページで工学値レンジを入れてください）'
+		);
+		await expect(highCell.getByRole('link', { name: '「記録」ページを開く' })).toHaveAttribute(
 			'href',
 			'/tags'
 		);

@@ -14,7 +14,7 @@
  * - 非 admin では `Hub接続` が見えず、`/settings/hub` への直接遷移が先頭の
  *   可視カテゴリへ弾かれること（`guardCategory`）。
  * -（#383 段階3 P4、test 8・9）**タグの選択はこの画面から外した**: 購読する
- *   のは「タグ設定」の「Hub から追加」で登録したタグで、この画面はそれを
+ *   のは「記録」の「Hub から追加」で登録したタグで、この画面はそれを
  *   現在値と一緒に**読み取り専用**で出す（チェックボックスも「選択を保存」も
  *   無い）。以前この画面で選んでいたタグは件数の注記だけが出る。切断に
  *   失敗したらエラーが出る（P3 までの test 8〜10 は選択の下書きの扱いを
@@ -255,7 +255,7 @@ test.describe.serial('chronogazer Hub接続の設定カテゴリ', () => {
 			const table = page.getByRole('table', { name: '登録済みのHubタグ' });
 			await expect(table.getByRole('row').filter({ hasText: REGISTERED })).toContainText('21.5');
 			await expect(table.getByText(OTHER)).toHaveCount(0);
-			await expect(page.getByRole('link', { name: 'タグ設定', exact: true })).toBeVisible();
+			await expect(page.getByRole('link', { name: '記録', exact: true })).toBeVisible();
 
 			// 以前の選択は件数の注記だけ（購読していない）。
 			await expect(page.getByText('以前この画面で選んでいたタグが1件あります')).toBeVisible();

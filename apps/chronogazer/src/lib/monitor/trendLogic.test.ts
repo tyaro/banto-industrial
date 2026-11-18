@@ -67,7 +67,7 @@ const values = (buffer: TrendBuffer) => buffer.rows.map((row) => row.values);
 const times = (buffer: TrendBuffer) => buffer.rows.map((row) => row.t);
 
 describe('時間窓の選択肢', () => {
-	it('グループ設定画面（= Rust の TREND_TIME_WINDOWS_SEC）と同じ', () => {
+	it('「表示グループ」ページ（= Rust の TREND_TIME_WINDOWS_SEC）と同じ', () => {
 		expect([...TREND_WINDOWS_SEC]).toEqual(TIME_WINDOW_OPTIONS.map((o) => o.value));
 		expect(TREND_WINDOWS_SEC).toContain(DEFAULT_TREND_WINDOW_SEC);
 	});

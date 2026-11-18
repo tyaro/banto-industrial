@@ -335,7 +335,7 @@ export function joinFieldErrorMessages(fieldErrors: readonly FieldError[]): stri
 // 同じアプリのHub側は既にこの規律を持っている（`hubAdmin.ts`の
 // `HubView.tags: HubTag[] | null`で「この往復では読めていない」と「読めた
 // 結果0件」を別物にし、`HubSection.svelte`が表示に反映する）。ここでは
-// その書き方をタグ設定画面に持ち込み、判断だけを純関数に出して総当たりで
+// その書き方を「記録」ページに持ち込み、判断だけを純関数に出して総当たりで
 // テストする（チェックリスト§5「エラーを『空』に潰さない」「判断は純関数に
 // 出して状態の総当たりを表でテストする」）。
 

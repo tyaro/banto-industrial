@@ -285,7 +285,7 @@ describe('(app) ガード: 閲覧公開（publicViewer grant、I2b）', () => {
 		expect(local.getItem(TOKEN_KEY)).toBeNull();
 	});
 
-	it('許可リストの外（タグ設定・設定・ユーザー管理）は先頭の /monitor へ移す', async () => {
+	it('許可リストの外（記録・設定・ユーザー管理）は先頭の /monitor へ移す', async () => {
 		for (const pathname of ['/tags', '/settings/appearance', '/users', '/audit-log']) {
 			session.clear();
 			httpProviderWith(async () => jsonResponse(200, null), { viewerPublic: true });

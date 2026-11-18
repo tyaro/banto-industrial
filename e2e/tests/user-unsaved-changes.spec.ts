@@ -6,7 +6,7 @@
  * `accept()` が「離れる」。
  *
  * 固定したい受入条件:
- * 1. 入力 → 別の画面へ → 「留まる」を選ぶと、移動せず入力が残る（タグ設定・
+ * 1. 入力 → 別の画面へ → 「留まる」を選ぶと、移動せず入力が残る（記録・
  *    ユーザー管理・アカウントのパスワード欄）。
  * 2. 「離れる」を選ぶと移動する。
  * 3. 入力が無い（きれいな）ときは確認を出さない。
@@ -92,7 +92,7 @@ test.describe.serial('chronogazer 未保存の入力の確認', () => {
 		expect(dialogs).toEqual([]);
 	});
 
-	test('4. タグ設定: PLC接続の新規作成に入力 → 別の画面へ → 「留まる」で入力が残り、「離れる」で移動する', async () => {
+	test('4. 記録: PLC接続の新規作成に入力 → 別の画面へ → 「留まる」で入力が残り、「離れる」で移動する', async () => {
 		await page.goto('/tags');
 		const form = page.locator('section.registry-section').nth(0).locator('div.create');
 		await form.getByLabel('名前').fill('unsaved-plc');

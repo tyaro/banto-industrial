@@ -12,7 +12,7 @@
  *      open as the synthetic viewer, with no redirect loop (the guard in
  *      `apps/chronogazer/src/routes/(app)/+layout.ts`; SvelteKit 3's
  *      `resolve('')` trap, #506);
- *   2. the other screens (タグ設定・ユーザー管理・監査ログ・設定) are not
+ *   2. the other screens (記録・ユーザー管理・監査ログ・設定) are not
  *      opened - the guard sends them to the first allowed screen (監視). They
  *      are not redirected to /login: the viewer session is already confirmed,
  *      and only an unconfirmed session goes to /login;
@@ -43,7 +43,7 @@ const ALLOWED = [
 ] as const;
 
 const RESTRICTED = [
-	{ path: '/tags', label: 'タグ設定' },
+	{ path: '/tags', label: '記録' },
 	{ path: '/users', label: 'ユーザー管理' },
 	{ path: '/audit-log', label: '監査ログ' },
 	{ path: '/settings', label: '設定' }
@@ -121,7 +121,7 @@ function loginButton(page: Page) {
 	return page.getByRole('banner').getByRole('button', { name: 'ログイン' });
 }
 
-/** A sidebar link. Its accessible name is "<icon> <label>", and `設定` is a suffix of `タグ設定` - match the whole name. */
+/** A sidebar link. Its accessible name is "<icon> <label>" - match the whole name. */
 function navLink(page: Page, label: string) {
 	return page
 		.getByRole('navigation')
@@ -184,9 +184,9 @@ test.describe.serial('ChronoGazer viewer-public mode', () => {
 		await expect(page.getByRole('navigation').getByRole('link')).toHaveCount(ALLOWED.length);
 		// R1-D: 監視画面の本体（表示グループの一覧の読み取り）まで閲覧者として届く。
 		// 一覧の取得に失敗すると「読み込めませんでした」になり、この空状態は出ない。
-		// 編集者向けのグループ設定へのリンクは、本文にも（サイドバーと同じく）出さない。
+		// 編集者向けの表示グループへのリンクは、本文にも（サイドバーと同じく）出さない。
 		await expect(page.getByText('表示グループが未設定です')).toBeVisible();
-		await expect(page.getByRole('link', { name: 'グループ設定' })).toHaveCount(0);
+		await expect(page.getByRole('link', { name: '表示グループ' })).toHaveCount(0);
 	});
 
 	test('4. "ログイン" leads to the setup screen; signing in switches to a normal session', async () => {
@@ -253,7 +253,7 @@ test.describe.serial('ChronoGazer viewer-public mode', () => {
 		});
 		const tagBase = { collectionGroupId: cg.id, dataType: 'u16', decimals: 0, enabled: true };
 		// 工学値レンジのあるタグ（バー・計器が描ける）と、レンジの無いタグ（「レンジ未設定」。
-		// 編集者にはタグ設定へのリンクが出るが、閲覧者には出さない）。
+		// 編集者には「記録」ページへのリンクが出るが、閲覧者には出さない）。
 		const scaled = await postJson<NamedRow>(page.request, headers, '/api/tags', {
 			...tagBase,
 			name: PV_TAG_SCALED,
@@ -319,9 +319,9 @@ test.describe.serial('ChronoGazer viewer-public mode', () => {
 					});
 					await expect(cell(PV_TAG_SCALED)).toContainText('正常');
 				}
-				// 読み取り専用: 本文（タブの中）に設定画面（タグ設定・グループ設定・収集の
+				// 読み取り専用: 本文（タブの中）に設定画面（記録・表示グループ・収集の
 				// 設定）へのリンクを 1 つも出さない。編集者ならレンジ未設定のタグに
-				// 「タグ設定を開く」が出る（user-simulator-monitor.spec.ts のテスト 5・6）。
+				// 「記録」ページを開くリンクが出る（user-simulator-monitor.spec.ts のテスト 5・6）。
 				await expect(panel.getByRole('link')).toHaveCount(0);
 			}
 			await expect(viewer.getByRole('button', { name: 'ログアウト' })).toHaveCount(0);
