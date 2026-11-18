@@ -1,4 +1,4 @@
--- T19 S1-b（UX-34、docs/hub/banto-hub-t19-design.md §2「`writable` の既定 —
+-- T19 S1-b（UX-34、docs/banto-hub-t19-design.md §2「`writable` の既定 —
 -- 既定 ON。ただし収集グループ単位で変更可」、2026-09-02 オーナー決定）:
 -- `collection_groups.default_writable` を追加し、そのグループへ新規タグを
 -- 登録するときのフォーム側チェックボックス（`writable`）の初期値を

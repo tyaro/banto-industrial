@@ -1,4 +1,4 @@
--- 外部 DB 連携 S4（docs/hub/banto-hub-external-db-design.md §5.2）: DB Sink の
+-- 外部 DB 連携 S4（docs/banto-hub-external-db-design.md §5.2）: DB Sink の
 -- 設定。Hub 専用の設定なので banto-tags のレジストリには乗せず、この app の
 -- テーブルとして持つ（名前は他の Hub 専用テーブルと同じ `hub_` 接頭辞。
 -- `crate::sink` のモジュール doc 参照）。

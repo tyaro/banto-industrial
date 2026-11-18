@@ -1,4 +1,4 @@
--- Extend `tags` with 4 columns in a single migration (docs/hub/tag-server-design.md
+-- Extend `tags` with 4 columns in a single migration (docs/tag-server-design.md
 -- §10-2, decided 2026-08-04): `writable` (per-tag write opt-in, §6 item 1) and
 -- `tag_kind` / `expression` / `retain` (tag species - plc/computed/internal,
 -- §4.2, needed starting T6). All four ship together even though

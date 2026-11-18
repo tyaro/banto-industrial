@@ -1,4 +1,4 @@
--- T6-2 (docs/hub/tag-server-design.md §4.2「retain フラグで再起動時の最終値
+-- T6-2 (docs/tag-server-design.md §4.2「retain フラグで再起動時の最終値
 -- 復元」): `retain = true` の内部タグの最終値。`tag_id` を主キーにする
 -- （`crate::computed::ServerTagStore` のキー `"tag:{id}"` と同じ id）。
 -- `tags(id)` への FOREIGN KEY は張らない: `tags` は banto-tags の

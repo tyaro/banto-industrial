@@ -1,4 +1,4 @@
--- R2a-2a（docs/hub/banto-hub-ingest-design.md §3.1・§3.3）: `push` 接続の下の `plc`
+-- R2a-2a（docs/banto-hub-ingest-design.md §3.1・§3.3）: `push` 接続の下の `plc`
 -- タグの `address`（送り手が決めるキー）は**接続ごとに**一意。1 つのキーが 2 本の
 -- タグに割れると、送られた値がどちらに入ったか分からない。接続が違えば同じ
 -- キーを使える（`hub` の外部名がレジストリ全体で一意なのとはここが違う）。

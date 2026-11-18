@@ -1,4 +1,4 @@
--- T2-4 (docs/hub/tag-server-design.md §6-6): 書き込み受付フラグの永続値
+-- T2-4 (docs/tag-server-design.md §6-6): 書き込み受付フラグの永続値
 -- （`crate::write_control` のモジュール doc 参照）。id=1 の単一行。
 -- 2026-09-09 オーナー決定 (#340) で既定は「書き込み可」なので seed は
 -- `enabled_persisted = 1`。起動時にライブフラグへそのまま復元される。

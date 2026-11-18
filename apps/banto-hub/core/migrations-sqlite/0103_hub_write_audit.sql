@@ -1,4 +1,4 @@
--- T2-4 (docs/hub/tag-server-design.md §6-3「log-before-write」): 書き込み監査
+-- T2-4 (docs/tag-server-design.md §6-3「log-before-write」): 書き込み監査
 -- ログ。列の意味・2 段挿入のパターンは `crate::write_audit` のモジュール
 -- doc 参照。`action`/`result` の許容値は同モジュールの
 -- `WriteAuditAction`/`WriteAuditResult` と一致させる。

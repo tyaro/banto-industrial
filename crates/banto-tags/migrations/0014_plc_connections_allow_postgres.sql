@@ -1,4 +1,4 @@
--- 外部 DB 連携 S1a（docs/hub/banto-hub-external-db-design.md §4.1・§6-4、
+-- 外部 DB 連携 S1a（docs/banto-hub-external-db-design.md §4.1・§6-4、
 -- 2026-09-06 オーナー決定「案A: 既存 3 階層の流用」）: plc_connections.protocol
 -- の CHECK に 'postgres' を追加し、DB 接続専用の資格情報列
 -- (`database`/`username`/`password`) を新設する。
