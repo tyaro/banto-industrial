@@ -1,6 +1,6 @@
 <script lang="ts">
 	/**
-	 * ライブタグモニタ画面（T10、docs/ux-plan.md §2、2026-08-06 オーナー
+	 * ライブタグモニタ画面（T10、docs/archive/ux-plan.md §2、2026-08-06 オーナー
 	 * 承認）。既存の WS 購読（`/api/v1/stream`）を消費して、登録済み全タグの
 	 * 現在値・品質・時刻を一覧表示する読み取り専用画面。
 	 *
@@ -12,7 +12,7 @@
 	 * セッションを持たないためその制約が存在しない。書き込み UI も一切
 	 * 持たない（ux-plan.md §2「書き込み操作は付けない」）。
 	 *
-	 * T18-4a（docs/banto-hub-t18-design.md「T18-4a モニタの Tree/検索統合」、
+	 * T18-4a（docs/hub/banto-hub-t18-design.md「T18-4a モニタの Tree/検索統合」、
 	 * T13-2 移管）: 当初のフラット一覧 + 接続/グループのプルダウン
 	 * フィルタを、タグ登録ページ（`(app)/tags/+page.svelte`）と同じ
 	 * 2 ペインの枠 + ConnectionTree + 検索ボックスの Tree/検索 UI へ置換した
@@ -25,7 +25,7 @@
 	 * catalog（`rows`）+ WS が正。絞り込みロジックは依存ゼロの純関数
 	 * `filterMonitorRows`（`#lib/banto/monitorFilter.ts`）に切り出してある。
 	 *
-	 * T18-4b（docs/banto-hub-t18-design.md「T18-4b 選択購読と再接続堅牢化」、
+	 * T18-4b（docs/hub/banto-hub-t18-design.md「T18-4b 選択購読と再接続堅牢化」、
 	 * TAG-UX-H の一部）: T18-4a まで WS 購読（`connectTagStream`）は常に
 	 * 全タグ購読（`tags:['*']`）で、ツリー選択は表示絞り込み
 	 * （`filterMonitorRows`）にしか使っていなかった。ここから購読自体も
@@ -44,7 +44,7 @@
 	 * 閲覧できる（ゲートすべき対象が無い）。ツリー・検索も同様に読み取り
 	 * 専用の絞り込みでしかないため、権限ゲートは追加しない。
 	 *
-	 * #1179 PR3b（docs/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、段階 ①）:
+	 * #1179 PR3b（docs/hub/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、段階 ①）:
 	 * ツリーの選択を URL（`?target=`、形はタグ登録と同じ `#lib/banto/tagsView.ts`）に
 	 * 持ち、タグ登録とナビで行き来したときに同じ対象を開く（`#lib/treeSelection.svelte.ts`）。
 	 */
@@ -635,7 +635,7 @@
 					</div>
 					{#if rows.length === 0}
 						<!--
-								T18-2d（docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A「空状態を…
+								T18-2d（docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-A「空状態を…
 								不足する前工程と移動ボタンを示す」）: タグが1件も無い（フィルタ
 								の問題ではなく真の空）場合は、前工程（タグ登録）へ案内する。
 								文言・CTA は従来のまま、置き場所だけ右ペインの中へ移した

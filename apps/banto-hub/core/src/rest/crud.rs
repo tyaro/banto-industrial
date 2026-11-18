@@ -1,7 +1,7 @@
 //! I1 CRUD の共通層（収集構成の反映・pending queue への振り分け・変更系エラーの
 //! 写像）。接続・収集グループ・タグ・pending-changes・sink の各リソースが共有する。
 //!
-//! `rest.rs` から中身を変えずに移したもの（docs/banto-hub-driver-refactor-plan.md §8.1、
+//! `rest.rs` から中身を変えずに移したもの（docs/hub/driver/banto-hub-driver-refactor-plan.md §8.1、
 //! P0-1 の手順 3）。接続専用の部品は `rest/plc_connections.rs` に分けた。共通部品
 //! （認証・ガード・監査の補助）は親の `rest.rs` にあり、`use super::{...}` で使う。
 //! 外から使われるパス（`crate::rest::X`）は親の re-export で保つ。
@@ -24,7 +24,7 @@ pub(super) fn default_payload_enabled() -> bool {
 /// to the running collection if one is in flight, and notify admin-UI SSE
 /// subscribers.
 ///
-/// **#341（オーナー決定 2026-09-09 / 2026-09-14、docs/tag-server-design.md
+/// **#341（オーナー決定 2026-09-09 / 2026-09-14、docs/hub/tag-server-design.md
 /// §4.3）**: the single function every registry-mutation handler in this file,
 /// every `crate::mcp` config tool AND `execute_pending_apply` (the
 /// `/api/pending-changes/{id}/apply` handler's worker) funnel through - see
@@ -47,7 +47,7 @@ pub(super) fn default_payload_enabled() -> bool {
 /// operator never believes a change took effect when it did not. The message
 /// is also recorded in `CollectorManager::last_error`
 /// (`/api/v1/status` の `last_config_error`).
-// T21 S1-b（docs/banto-hub-t21-design.md §5）: `pub(crate)` にして
+// T21 S1-b（docs/hub/banto-hub-t21-design.md §5）: `pub(crate)` にして
 // `crate::mcp` の構成補助ツール（`create_connection`/`delete_connection`）
 // からも同じ経路を呼べるようにする。
 /// #341 レビュー対応（2026-09-14）: 実行構成への反映に失敗したときの
@@ -92,7 +92,7 @@ pub(super) struct TagRegistryState {
     pub(super) pending_changes: PendingChangesService,
 }
 
-/// #341（オーナー決定 2026-09-09、docs/tag-server-design.md §4.3）:
+/// #341（オーナー決定 2026-09-09、docs/hub/tag-server-design.md §4.3）:
 /// 接続・グループ・タグの CRUD を pending queue へ回すかどうかの**唯一の
 /// 判定**。`Some(status)` なら [`queue_pending_registry_change`]（REST）
 /// あるいは `crate::mcp` の同等処理へ、`None` ならその場で DB へ書いて
@@ -135,9 +135,9 @@ pub(super) struct QueuedPendingChangeResponse {
     message: String,
 }
 
-/// S1a レビュー対応（`docs/banto-hub-external-db-design.md`§2.2）: `pending_changes.payload`
+/// S1a レビュー対応（`docs/hub/banto-hub-external-db-design.md`§2.2）: `pending_changes.payload`
 /// 列の `plc_connections.create`/`.update` は接続のパスワードを持ちうる。R2b-1e
-/// （docs/banto-hub-connection-settings-design.md §5.3）から、積む時点で封印した値
+/// （docs/hub/banto-hub-connection-settings-design.md §5.3）から、積む時点で封印した値
 /// （`input.sealedPassword`）に替え、履歴（`applied`/`canceled`）へ移すときに外す
 /// （`crate::pending_changes` のモジュール doc）。この関数は外部へ返す直前の写しにだけ掛け、
 /// **DB の行は変えない**。
@@ -184,7 +184,7 @@ pub(super) fn redact_pending_change_for_response(pending: PendingChange) -> Pend
 /// `TagUpdateError::RevisionConflict` — adding a second guard here would be
 /// redundant).
 ///
-/// T21 S1-b（docs/banto-hub-t21-design.md §5）: made `pub(crate)` and takes
+/// T21 S1-b（docs/hub/banto-hub-t21-design.md §5）: made `pub(crate)` and takes
 /// the two services it actually reads directly (`&PlcConnectionService`/
 /// `&CollectionGroupService`) instead of the full `TagRegistryState` - this
 /// crate's private, admin-REST-only god-struct that also carries `AuthState`
@@ -278,7 +278,7 @@ pub(super) enum RegistryMutationError {
     /// 警告にしないのは、オペレータが「反映された」と誤解したまま次の
     /// 作業へ進むのを防ぐため。
     LiveApplyFailed(String),
-    /// T18-1（docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目）:
+    /// T18-1（docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目）:
     /// [`TagService::update_tx`] が `TagUpdateError::RevisionConflict` を
     /// 返した場合の REST 表現 - `CollectionEditLocked` と同じ `409`
     /// パターンで、現在の（他セッションが先に更新した）`Tag` を丸ごと

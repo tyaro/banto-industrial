@@ -1,7 +1,7 @@
 /**
- * T18-2b（docs/banto-hub-t18-design.md「T18-2b プロトコル別アドレス補助」、
- * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-6 / TAG-UX-B）、R2b-6d-2b
- * （docs/banto-hub-driver-ui-design.md §7）: `tags/+page.svelte` の単票 create/edit
+ * T18-2b（docs/hub/banto-hub-t18-design.md「T18-2b プロトコル別アドレス補助」、
+ * docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-6 / TAG-UX-B）、R2b-6d-2b
+ * （docs/hub/driver/banto-hub-driver-ui-design.md §7）: `tags/+page.svelte` の単票 create/edit
  * フォーム（`tagFields` スニペット）のアドレス欄の補助を作る、依存ゼロの純関数モジュール。
  * `tagFormLayout.ts` と同じ方針 - Svelte 側は選択中の接続のプロトコルと、
  * `GET /api/drivers` の該当ドライバ（{@link DriverInfo}）と `form.dataType` を渡すだけの
@@ -94,7 +94,7 @@ function driverOccupancyHint(kind: OccupancyKind): string {
 const VIRTUAL_BIT_HINT = '該当なし（PLC アドレスを使わないため）。';
 
 /**
- * R2a-2e（docs/banto-hub-ingest-design.md §3.3）: `push` 接続のタグの `address` は
+ * R2a-2e（docs/hub/banto-hub-ingest-design.md §3.3）: `push` 接続のタグの `address` は
  * PLC アドレスではなく、**送り手が決めるキー**（送り手が値に付けて送る文字列）。
  * 規則は `banto_tags::validate_push_key`（前後の空白を除いて保存、1〜256 文字、
  * 制御文字なし、大文字小文字を区別）と、`push_tag_errors`（同じ接続の中で一意、

@@ -2,7 +2,7 @@
 	/**
 	 * バー表示（R1-D の D-2、recorder-requirements.md §3.2「縦バーメータ + 目盛 +
 	 * しきい値色」）。chronogazer 内の軽量コンポーネント（テンプレートに入れない、
-	 * docs/r1-plan.md の R1-D）。
+	 * docs/archive/r1-plan.md の R1-D）。
 	 *
 	 * `DigitalPanel.svelte` と同じく、**表示グループの定義と、ペンごとの表示
 	 * （`MeterView`）を props で受け取るだけ**で、自分ではデータを取りに行かない

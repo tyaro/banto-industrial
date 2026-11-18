@@ -8,7 +8,7 @@
  * （`stringLength`/`rawLo`/`rawHi`/`engLo`/`engHi` 等）を TypeScript 上は
  * `string` と宣言している
  * ため、この `null` 混入は型チェックでは検出できない
- * （docs/banto-hub-desktop-plan.md §16.4「`optNum` の null 取りこぼし」）。
+ * （docs/hub/banto-hub-desktop-plan.md §16.4「`optNum` の null 取りこぼし」）。
  * 旧 `optNum` は `s === '' ? undefined : Number(s)` しか見ておらず、
  * `Number(null) === 0` により「入力欄をクリアしたつもりが 0 として
  * サイレントに保存される」バグを生んでいた。

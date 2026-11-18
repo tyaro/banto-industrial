@@ -284,7 +284,7 @@ pub fn effective_sample(
     (view.value, view.quality, view.timestamp_ms)
 }
 
-/// T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): the single read-path
+/// T6-2 (docs/hub/tag-server-design.md §4.2/§4.3(a)): the single read-path
 /// unification point every IF (REST `values`/`status`, WS, MQTT, gRPC) must
 /// call through instead of reading [`CurrentValuesHandle`] directly - the
 /// T6-2 implementation instructions asked for exactly this ("既存の
@@ -508,7 +508,7 @@ pub struct TagEntry {
     /// Stable `(connection_id, group_id, tag_id)` - the "同じ ID なら
     /// リネームされた/消えたら削除された" signal design §4.1 calls for.
     ///
-    /// `#[schema(value_type = Vec<i64>)]` (T0-2, docs/tag-server-design.md
+    /// `#[schema(value_type = Vec<i64>)]` (T0-2, docs/hub/tag-server-design.md
     /// §10-6 utoipa 採用): utoipa's `ToSchema` derive has no blanket impl for
     /// arbitrary tuples, so the OpenAPI schema for this field is declared as
     /// a 3-element JSON array of integers instead - this is a schema-only
@@ -546,7 +546,7 @@ pub struct TagEntry {
     /// T6-2). Meaningless for `"plc"`/`"computed"` tags (always `false` for
     /// them - mirrors `banto_tags::Tag::retain`).
     pub retain: bool,
-    /// T9-2 (docs/ux-plan.md §1, accident-prevention requirement (b)):
+    /// T9-2 (docs/archive/ux-plan.md §1, accident-prevention requirement (b)):
     /// mirrors the tag's *owning connection's* `simulation` flag
     /// (`banto_tags::PlcConnection::simulation`), not the tag's own row -
     /// tags have no such column of their own. External clients (and the
@@ -555,7 +555,7 @@ pub struct TagEntry {
     /// `banto_driver_engine::sim`/`banto_collect::BrokerSimRegistry`),
     /// not read from a real PLC.
     pub simulation: bool,
-    /// R2a-1c（docs/banto-hub-ingest-design.md §3.3・§12 Q14）: 持ち主の接続が
+    /// R2a-1c（docs/hub/banto-hub-ingest-design.md §3.3・§12 Q14）: 持ち主の接続が
     /// `push`（送り手が値を送り込む接続）か。**wire には出さない**（catalog の形は
     /// 変えない）- `crate::value_source` が `value_source = "push"` を決めるためだけに
     /// 持つ（`push` の値は実機でもシミュレーションでもない）。
@@ -1013,14 +1013,14 @@ pub struct CollectorManager {
     /// [`banto_collect::build_config_from`] gives no tag any limits, so the hub never
     /// judges a threshold.)
     events: EventSink,
-    /// T2-2 (docs/tag-server-design.md §6-5): the broker session directory,
+    /// T2-2 (docs/hub/tag-server-design.md §6-5): the broker session directory,
     /// owned OUTSIDE this manager (`bin/banto-hub.rs` constructs it and holds
     /// its own `Arc` clone for final shutdown) so a broker session (SLMP
     /// since T2-2, Modbus TCP since #131/#337) survives a
     /// `apply_run` - see `crate::broker_glue::HubSessions`'s doc comment for
     /// the full rationale and the session-sync policy `apply_run` follows.
     sessions: Arc<HubSessions>,
-    /// T9-2 (docs/ux-plan.md §1): the broker session simulator registry
+    /// T9-2 (docs/archive/ux-plan.md §1): the broker session simulator registry
     /// (`BrokerSimRegistry`, formerly `SlmpSimRegistry` - see that type's own
     /// doc comment for why the old name said SLMP only even though it has
     /// driven Modbus TCP too since #131, and why #339 renamed it),
@@ -1035,7 +1035,7 @@ pub struct CollectorManager {
     /// mechanism, and this module's doc comment ("接続単位の
     /// シミュレーションモード") for how `apply_run` uses it.
     sim_registry: Arc<BrokerSimRegistry>,
-    /// T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): owned OUTSIDE this
+    /// T6-2 (docs/hub/tag-server-design.md §4.2/§4.3(a)): owned OUTSIDE this
     /// manager for the same reason `sessions` is (`bin/banto-hub.rs`
     /// constructs it and keeps its own `Arc` clone so `ServerTagStore`'s
     /// retained values and the running evaluation loop both outlive any
@@ -1046,7 +1046,7 @@ pub struct CollectorManager {
     /// 影響半径 = 触ったものだけ" - a bad computed-tag expression must leave
     /// the entire rebuild, not just the computed engine, on the old state).
     computed: Arc<ComputedEngine>,
-    /// 外部 DB 連携 S2（docs/banto-hub-external-db-design.md §4.2・§4.5）:
+    /// 外部 DB 連携 S2（docs/hub/banto-hub-external-db-design.md §4.2・§4.5）:
     /// DB Source のポーリングエンジン。`computed` と**全く同じ扱い**で
     /// [`Self::commit_catalog`] が
     /// `crate::db_source::build_plan`（純関数）の結果を catalog/`Collector`/
@@ -1073,7 +1073,7 @@ pub struct CollectorManager {
     /// （設計 §3-3: `read_current` は `tag_kind != "plc"` を全部そこから
     /// 読むので、新しい種別を足しても読み出し側は無改造）。
     db_source: Arc<DbSourceEngine>,
-    /// R2a-1c（docs/banto-hub-ingest-design.md §4.2）: 取り込み口 `push` の受信側。
+    /// R2a-1c（docs/hub/banto-hub-ingest-design.md §4.2）: 取り込み口 `push` の受信側。
     /// `push` 接続の外部ソースとして、この manager が作る `Collector` に
     /// `start_in` で渡す（`apply_config` は作った時の源を使い続ける）。
     /// 計画の commit（`push` 接続・キーの集合・ブリッジの送る集合）は catalog の
@@ -1115,7 +1115,7 @@ pub struct CollectorManager {
     /// が書くファイルを消しうる。ロック順序は `rebuild_lock` → `writer_gate` →
     /// `collector`（`apply_config` 側は `writer_gate` を取らない）。
     writer_gate: AsyncMutex<()>,
-    /// T1 (docs/tag-server-design.md §4.1「構成変更通知」・§5.2の
+    /// T1 (docs/hub/tag-server-design.md §4.1「構成変更通知」・§5.2の
     /// `config_changed`): the current `revision`, mirrored onto a
     /// `watch` channel so `crate::stream`'s per-connection tasks can await
     /// "revision changed" without polling. Sent from inside the same
@@ -1308,13 +1308,13 @@ impl CollectorManager {
         self.pool.clone()
     }
 
-    /// T12(docs/ux-plan.md §4)の接続テストAPIが、broker経由SLMP接続の既存
+    /// T12(docs/archive/ux-plan.md §4)の接続テストAPIが、broker経由SLMP接続の既存
     /// セッションを覗くために使う - `HubSessions::handle_for`参照。
     pub fn sessions(&self) -> &Arc<HubSessions> {
         &self.sessions
     }
 
-    /// R2b-1d（docs/banto-hub-connection-settings-design.md §4.2）: Hub のドライバの
+    /// R2b-1d（docs/hub/banto-hub-connection-settings-design.md §4.2）: Hub のドライバの
     /// レジストリ（`HubConfig.drivers.registry`。`HubSessions` が持つ）。プロトコルの有無・
     /// 設定の検証・秘密のキーの正。
     pub fn registry(&self) -> &Arc<banto_driver_api::DriverRegistry> {
@@ -1329,7 +1329,7 @@ impl CollectorManager {
         PlcConnectionService::with_registry(self.pool.clone(), self.registry().clone())
     }
 
-    /// R2b-2b（docs/banto-hub-driver-address-design.md §3.1）: Hub の入口が使う収集グループの
+    /// R2b-2b（docs/hub/driver/banto-hub-driver-address-design.md §3.1）: Hub の入口が使う収集グループの
     /// サービス。必ずレジストリつき（グループを別のドライバの接続へ移すと配下のタグを
     /// 新しいドライバで解析し直す）。旧規則の `CollectionGroupService::new` を Hub の
     /// 非テストのコードで使わないことは `tests/registry_entrances.rs` が grep で固定する。
@@ -1578,7 +1578,7 @@ impl CollectorManager {
     /// reads* onto that same session too, closing the last gap where the old
     /// SLMP-flavoured name was misleading.
     ///
-    /// T2-2/T7-2/T9-2/#131 (docs/tag-server-design.md §6-5/§4.3, docs/ux-plan.md
+    /// T2-2/T7-2/T9-2/#131 (docs/hub/tag-server-design.md §6-5/§4.3, docs/archive/ux-plan.md
     /// §1): additive `ensure_connection` (unchanged from T2-2) over
     /// `self.sessions`'s broker tasks against the registry's current
     /// enabled-and-broker-managed-protocol connection set (`#131`,
@@ -1716,7 +1716,7 @@ impl CollectorManager {
     /// `ensure_connection` actually succeeded, which is exactly the condition
     /// `banto_collect::broker_client_factory` routes on.
     ///
-    /// **T19 S2-a (UX-48, docs/banto-hub-t19-design.md §3.8)**: a connection
+    /// **T19 S2-a (UX-48, docs/hub/banto-hub-t19-design.md §3.8)**: a connection
     /// with nothing to collect - no *enabled* [`banto_tags::CollectionGroup`]
     /// under it at all - is no longer in the wanted set either, so it gets
     /// no broker session pre-synced here. This mirrors `banto-collect`'s own
@@ -1914,7 +1914,7 @@ impl CollectorManager {
     /// successful `apply_run` commit (both the empty-config early return and
     /// the normal path) so an operator watching hub's stdout is reminded a
     /// simulated connection is live - simulation mode is a dev/test
-    /// convenience (docs/ux-plan.md §1) and must never silently persist into
+    /// convenience (docs/archive/ux-plan.md §1) and must never silently persist into
     /// production use unnoticed. Routed through `self.diag_log` (T9-2
     /// フォローアップ 2026-08-06、`crate::diag_log` モジュール doc 参照) so
     /// this warning reaches `bin/banto_hub`'s `hub_log` service log file
@@ -1970,7 +1970,7 @@ impl CollectorManager {
         }
     }
 
-    /// T2-2/#131 (docs/tag-server-design.md §6-5): the broker's own
+    /// T2-2/#131 (docs/hub/tag-server-design.md §6-5): the broker's own
     /// connection status for a broker-managed connection, or `None` if no
     /// broker session has ever been started for it (never a protocol the
     /// broker manages - `HubSessions::is_broker_managed` - or no
@@ -1990,7 +1990,7 @@ impl CollectorManager {
             .map(|watch| *watch.borrow())
     }
 
-    /// T2-4（docs/tag-server-design.md §6 item 5「読み書き単一セッション」）:
+    /// T2-4（docs/hub/tag-server-design.md §6 item 5「読み書き単一セッション」）:
     /// `conn`（broker が管理するプロトコルの接続 - 現状 slmp と
     /// modbus-tcp）の書き込み可能な [`BrokerHandle`] を取得する。
     /// `crate::rest` の書き込みハンドラの唯一の入口 - `self.sessions`
@@ -2476,7 +2476,7 @@ impl CollectorManager {
             .clone()
     }
 
-    /// T1 (docs/tag-server-design.md §5.2 要件7「イベント中継」): subscribe a
+    /// T1 (docs/hub/tag-server-design.md §5.2 要件7「イベント中継」): subscribe a
     /// live [`CollectEvent`] consumer. Deliberately goes through
     /// `self.events` (the one [`EventSink`] this manager builds once in
     /// [`CollectorManager::new`] and hands to every `Collector::start` call)
@@ -2491,7 +2491,7 @@ impl CollectorManager {
         self.events.subscribe()
     }
 
-    /// T1 (docs/tag-server-design.md §4.1/§5.2「構成変更通知」): subscribe to
+    /// T1 (docs/hub/tag-server-design.md §4.1/§5.2「構成変更通知」): subscribe to
     /// `revision` changes without polling - see [`CollectorManager`]'s
     /// `revision_tx` field doc comment for the coalescing/ordering contract.
     pub fn subscribe_revision(&self) -> watch::Receiver<u64> {
@@ -3911,7 +3911,7 @@ mod tests {
         manager.shutdown().await;
     }
 
-    /// T19 S2-a (UX-48, docs/banto-hub-t19-design.md §3.8): a connection
+    /// T19 S2-a (UX-48, docs/hub/banto-hub-t19-design.md §3.8): a connection
     /// with zero groups at all gets no broker session pre-synced - the same
     /// "reading nothing from a PLC is pointless" rule `banto_collect`
     /// already applied to its own task/socket, now shared with the

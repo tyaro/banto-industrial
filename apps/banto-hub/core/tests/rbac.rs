@@ -141,7 +141,7 @@ async fn test_app(label: &str) -> TestApp {
     let sessions = Arc::new(HubSessions::new(
         banto_broker::BackoffConfig::default(),
         // R2b-0: ドライバ無し（このテストは PLC と通信しない。core は
-        // banto-drivers に依存しない。docs/banto-driver-api-design.md §2.4）。
+        // banto-drivers に依存しない。docs/hub/driver/banto-driver-api-design.md §2.4）。
         common::no_io_drivers(),
     ));
     let sim_registry = Arc::new(BrokerSimRegistry::new());

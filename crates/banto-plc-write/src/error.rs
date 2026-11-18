@@ -129,7 +129,7 @@ pub enum PlcWriteError {
     /// read-only by Modbus wire protocol, permanently, for every
     /// implementation (see `banto-tags::tag`'s `validate_tag_input` doc
     /// comment for the registry-side half of this same 2026-09-01 owner
-    /// decision, docs/tag-server-design.md §6 決定A). Resolved by
+    /// decision, docs/hub/tag-server-design.md §6 決定A). Resolved by
     /// [`crate::modbus::planning::plan_modbus_writes`] before any wire
     /// traffic - a per-request `Bad`, never a whole-batch `Err`, exactly like
     /// [`Self::UnsupportedCombination`]. Kept as its own variant rather than
@@ -151,7 +151,7 @@ pub enum PlcWriteError {
     /// failure above. Getting this backwards would mean every ordinary
     /// device-side refusal (e.g. a write to a protected register) forces a
     /// reconnect instead of just failing that one request - see this crate's
-    /// module-level write-driver doc and docs/tag-server-design.md §6 for why
+    /// module-level write-driver doc and docs/hub/tag-server-design.md §6 for why
     /// the broker relies on this exact line.
     #[error("PLC異常応答: function=0x{function:02x} code=0x{code:02x} ({message})")]
     ModbusException {
@@ -160,7 +160,7 @@ pub enum PlcWriteError {
         message: String,
     },
 
-    /// T8 (docs/tag-server-design.md §6.1): two `BitInWord` requests in the
+    /// T8 (docs/hub/tag-server-design.md §6.1): two `BitInWord` requests in the
     /// same batch target the same bit of the same word with conflicting
     /// values (one `true`, one `false`). RMW cannot satisfy both, and
     /// picking a winner would be a silent, order-dependent behavior (which
@@ -174,7 +174,7 @@ pub enum PlcWriteError {
     )]
     ConflictingBitWrite { area: String, bit: u8 },
 
-    /// T8 (docs/tag-server-design.md §6.1): the RMW confirmation read showed
+    /// T8 (docs/hub/tag-server-design.md §6.1): the RMW confirmation read showed
     /// this bit did not land as written. The read/modify/write cycle itself
     /// succeeded (no wire-level error) - the CPU's own scan wrote the same
     /// word between our read and our write is the most likely explanation,

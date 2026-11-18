@@ -65,7 +65,7 @@
 //!   pin の根に使うので、SYSTEM・Administrators・昇格した本人以外の所有者や広い許可は断る）。
 //!   既にある `tls\` の DACL も書き直さない（確かめて、合わなければ断る）。
 //!
-//! ## サービスの失効の記録（#1121 PR2b。docs/hub-desktop-tls-design.md §4.4.1・場面 11・26）
+//! ## サービスの失効の記録（#1121 PR2b。docs/hub/hub-desktop-tls-design.md §4.4.1・場面 11・26）
 //!
 //! 露出を見たサービスの証明書の拇印は、`<ProgramData>\BantoHub\tls-revocations\`（`tls\` の外。
 //! 共有 crate の `banto_hub_tls_trust::ServiceRevocations`）に残り、サービスの Hub と

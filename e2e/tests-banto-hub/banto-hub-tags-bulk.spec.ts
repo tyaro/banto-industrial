@@ -1,5 +1,5 @@
 /**
- * タグ一括操作（T18-3b、docs/banto-hub-t18-design.md「T18-3b 一括操作」、
+ * タグ一括操作（T18-3b、docs/hub/banto-hub-t18-design.md「T18-3b 一括操作」、
  * TAG-UX-D 中「複数選択＋一括有効/無効・グループ移動、対象件数と差分を
  * 事前表示」）の実 DOM 受け入れテスト。
  *

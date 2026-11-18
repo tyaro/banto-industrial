@@ -21,7 +21,7 @@ import type { MqttSettings } from './mqttSettingsAdmin';
 import type { SinkGroup, SinkGroupMode } from './sinkGroupsAdmin';
 
 /**
- * 版 3（R2b-6b-3、docs/banto-hub-driver-ui-design.md §5・§7.1、Q11 (a)）: 接続を REST と
+ * 版 3（R2b-6b-3、docs/hub/driver/banto-hub-driver-ui-design.md §5・§7.1、Q11 (a)）: 接続を REST と
  * 同じ `{ name, protocol, enabled, simulation, settings }` で持つ（版 2 の平らな `host`・
  * `port`・`unitId`・`wordOrder`・`cpuType`・`database`・`username` は無くなった）。
  * `settings` の中はドライバ・ホストの接続の JSON のまま（snake_case のキー）。
@@ -74,7 +74,7 @@ export const CONFIG_PACKAGE_EXCLUDED_SECRETS = [
 	'sessions',
 	'audit_logs',
 	'history',
-	// S1（docs/banto-hub-external-db-design.md §4.1・§2.2）: 接続の秘密のキー（`postgres` の
+	// S1（docs/hub/banto-hub-external-db-design.md §4.1・§2.2）: 接続の秘密のキー（`postgres` の
 	// パスワードなど、版 3 では `settings` の `{"$secret": …}` の値）- `mqtt.password`と同じ
 	// 理由で export に含めない（`sanitizeConnection`が実際に落とす。ここでの列挙は
 	// 「除外した」ことを export 自体の中に明記するための一覧で、実際の除外動作を担うわけでは
@@ -174,7 +174,7 @@ export type ConfigPackageMqttSettings = Omit<MqttSettings, 'username'>;
 export type ConfigPackageGrpcSettings = GrpcSettings;
 
 /**
- * S6（docs/banto-hub-external-db-design.md §5.2・§6 item 6、実装指示6）: DB
+ * S6（docs/hub/banto-hub-external-db-design.md §5.2・§6 item 6、実装指示6）: DB
  * Sink group 1件分 - `SinkGroup`から`id`/`dbConnectionId`/`tagIds`
  * （数値 id、環境をまたぐと再現できない）を除き、代わりに**名前で**参照する
  * （`ConfigPackageCollectionGroup::plcConnectionName`と同じ考え方 - タグの
@@ -229,7 +229,7 @@ export interface ConfigPackageInspection {
 	mqttSettings: ConfigPackageMqttSettings;
 	grpcSettings: ConfigPackageGrpcSettings;
 	/**
-	 * S1（docs/banto-hub-external-db-design.md §4.1・§2.2、実装指示5）:
+	 * S1（docs/hub/banto-hub-external-db-design.md §4.1・§2.2、実装指示5）:
 	 * このパッケージが含む postgres（DB Source）接続の名前一覧。
 	 * `mqttCredentialsRequired`と同じ立て付け（MQTTのユーザー名・
 	 * パスワードが export に含まれないのと同じ理由で、postgres接続の
@@ -241,7 +241,7 @@ export interface ConfigPackageInspection {
 	 */
 	dbConnectionsPasswordRequired: string[];
 	/**
-	 * R2a-2e（docs/banto-hub-ingest-design.md §5.1）: このパッケージが含む `push`
+	 * R2a-2e（docs/hub/banto-hub-ingest-design.md §5.1）: このパッケージが含む `push`
 	 * 接続の名前。設定パッケージは API キーを持ち運ばず、取り込み先では接続の id
 	 * が変わる（送り手の URL `/api/v1/ingest/{id}/…` とスコープ `ingest:#{id}` も
 	 * 変わる）ので、画面は「取り込みのキーは移りません」と案内する。
@@ -514,7 +514,7 @@ function sanitizeGroup(
 		periodMs: input.periodMs,
 		enabled: input.enabled,
 		defaultWritable: input.defaultWritable,
-		// S3（docs/banto-hub-external-db-design.md §4.1・§4.2）: `database`/
+		// S3（docs/hub/banto-hub-external-db-design.md §4.1・§4.2）: `database`/
 		// `username`（S1）と同じ「postgres 以外では常に null → undefined」
 		// の変換（`CollectionGroupInput::querySql`は`string | undefined`）。
 		// `querySql`自体はパスワードのような秘密情報ではないため
@@ -673,7 +673,7 @@ export function serializeConfigPackage(pkg: ConfigPackage): string {
 }
 
 /**
- * S3（docs/banto-hub-external-db-design.md §4.2）: グループの `querySql` は postgres 接続の
+ * S3（docs/hub/banto-hub-external-db-design.md §4.2）: グループの `querySql` は postgres 接続の
  * 配下でだけ意味を持ち、サーバーは他のプロトコルでの指定を拒否する。このため省略／`null` を
  * 通し、`undefined`にする（項目の性質）。値が存在する場合は文字列であることを検証する
  * （必須の判定はサーバー側のバリデーションに委ねる - configPackage のパースは「形として

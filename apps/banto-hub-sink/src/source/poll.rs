@@ -1,4 +1,4 @@
-//! 1 つの source の DB への問い合わせ（docs/banto-hub-ingest-design.md §10.3 の「読み取り」
+//! 1 つの source の DB への問い合わせ（docs/hub/banto-hub-ingest-design.md §10.3 の「読み取り」
 //! 「品質」）。Hub 内の DB Source（`banto_hub_core::db_source::task`）と**同じ形**で回す:
 //!
 //! 1. `PgPool`（最大 2）を張る（[`banto_db_source::pg_connect_options`]、`sslmode=prefer`）。

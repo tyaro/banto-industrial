@@ -1,6 +1,6 @@
 //! `chronogazer-server` を Windows サービスとして動かす・登録する部分の、OS に
 //! 依存しない判断と文言（#392 B3-2b、2026-10-15。設計は
-//! docs/chronogazer-service-design.md §3.3・§4 の B3-2a と B3-2b の実装メモ）。
+//! docs/chronogazer/chronogazer-service-design.md §3.3・§4 の B3-2a と B3-2b の実装メモ）。
 //!
 //! SCM とのやりとりは共有 crate `banto-service-control`（ランナー・登録と解除・
 //! `Parameters` の読み書き）、サービス本体（`ServerProgram`）と登録の手順は bin

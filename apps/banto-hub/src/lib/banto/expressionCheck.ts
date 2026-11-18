@@ -1,5 +1,5 @@
 /**
- * #342 段階A（docs/tag-server-design.md §4.2「演算タグの式チェック API」）:
+ * #342 段階A（docs/hub/tag-server-design.md §4.2「演算タグの式チェック API」）:
  * `POST /api/tags/expression/check` のクライアントと、呼び出しタイミングを
  * 駆動する純粋なロジック（debounce・IME 変換中の抑止・古い応答の破棄）。
  *

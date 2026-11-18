@@ -1,4 +1,4 @@
-//! R2a-1c の完了の確かめ（docs/banto-hub-ingest-design.md §11 の R2a-1c の行）。
+//! R2a-1c の完了の確かめ（docs/hub/banto-hub-ingest-design.md §11 の R2a-1c の行）。
 //!
 //! 前半は純関数の表（Live の判定・§4.5 の表・commit の表・件ごとの検証）。後半は
 //! `IngestHub::apply` を直接呼ぶ統合テスト: 本物の `CollectorManager` と

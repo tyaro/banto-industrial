@@ -1,5 +1,5 @@
-//! T16-2（docs/banto-hub-t16-design.md §3「T16-2」・
-//! docs/banto-hub-t17-design.md §9「実 HTTP probe は今回入れていない」節）:
+//! T16-2（docs/hub/banto-hub-t16-design.md §3「T16-2」・
+//! docs/hub/banto-hub-t17-design.md §9「実 HTTP probe は今回入れていない」節）:
 //! `crate::hub_health::HubHealthProbe` の実 HTTP 実装。
 //!
 //! `crate::hub_health`（T17-3）は trait・`HealthOutcome`・モックだけを持ち、
@@ -17,7 +17,7 @@
 //! chunked encoding や keep-alive の複雑なハンドリングは不要 - `Connection:
 //! close`を送ってサーバー側に接続を閉じさせ、EOF まで読み切るだけで足りる。
 //!
-//! ## T16-2 第二スライス（docs/banto-hub-t16-design.md §5 既知の gap
+//! ## T16-2 第二スライス（docs/hub/banto-hub-t16-design.md §5 既知の gap
 //! 「navigate 先を`127.0.0.1`固定にしている」）で追加した`host`
 //!
 //! 第一スライスは常に`127.0.0.1`へ接続していた - `BANTO_BIND`をカスタム
@@ -39,7 +39,7 @@
 //!    （「port 競合」- 接続自体は誰かが受けているが banto-hub ではない、
 //!    設計 §「非 JSON / 非 openapi は port 競合」）。
 //! 3. openapi 応答が取れたら `info.version` を抽出する。
-//! 4. profile 確認（T16-2 第三スライス、docs/banto-hub-t16-design.md §5
+//! 4. profile 確認（T16-2 第三スライス、docs/hub/banto-hub-t16-design.md §5
 //!    「HttpHubHealthProbe は openapi 応答から profile-id を検証していない」
 //!    gap への対応 - `crate::rest::openapi_json`のモジュール doc comment
 //!    参照）:

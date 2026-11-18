@@ -1,6 +1,6 @@
 [package]
 name = "chronogazer-installer"
-description = "ChronoGazer 用 Windows インストーラ生成ツール（#392 B3-4、docs/chronogazer-service-design.md §3.3）。banto-hub のインストーラ（apps/banto-hub/installer）と同じ方式で tauri-bundler をライブラリとして単体呼び出しし、リリースビルド済みのシェル・記録エンジン（サービス）・昇格ヘルパーの 3 exe を 1 本の NSIS インストーラに包む。`cargo tauri build` は使わない（シェル以外の 2 exe を同じ $INSTDIR に揃え、サービスの停止と再開をフックで行うため）。"
+description = "ChronoGazer 用 Windows インストーラ生成ツール（#392 B3-4、docs/chronogazer/chronogazer-service-design.md §3.3）。banto-hub のインストーラ（apps/banto-hub/installer）と同じ方式で tauri-bundler をライブラリとして単体呼び出しし、リリースビルド済みのシェル・記録エンジン（サービス）・昇格ヘルパーの 3 exe を 1 本の NSIS インストーラに包む。`cargo tauri build` は使わない（シェル以外の 2 exe を同じ $INSTDIR に揃え、サービスの停止と再開をフックで行うため）。"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"

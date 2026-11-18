@@ -1,5 +1,5 @@
 //! データの置き場所（ルート）の解決と、その下の配置（#392 段階 B の B1-4、
-//! `docs/chronogazer-service-design.md` §3.1(b)・決定 7）。
+//! `docs/chronogazer/chronogazer-service-design.md` §3.1(b)・決定 7）。
 //!
 //! 使うのは B1-5 の `chronogazer-server`（`crate::server_host`）と、B2-4b からの
 //! デスクトップ host（`src-tauri` の `startup::LaunchPaths`。以前の

@@ -1,5 +1,5 @@
 //! ChronoGazer 一体インストーラ生成ツール（#392 B3-4、
-//! docs/chronogazer-service-design.md §3.3「インストーラ」・§4 の B3-4 の実装メモ）。
+//! docs/chronogazer/chronogazer-service-design.md §3.3「インストーラ」・§4 の B3-4 の実装メモ）。
 //!
 //! banto-hub のインストーラ（`apps/banto-hub/installer/src/main.rs`）と同じ方式:
 //! `tauri-bundler` をライブラリとして直接呼び、リリースビルド済みの exe を 1 本の
@@ -106,7 +106,7 @@
 //! でここから移した。写しが byte 単位で同じことの試験もそこ。`Cargo.toml` は `=2.9.4`
 //! で固定）。当て直しの表（何を当てるか）は製品ごとにこのファイルに置く。
 //!
-//! 当てる内容（決定は docs/chronogazer-service-design.md §4 の B3-4 PR-C の実装メモ）:
+//! 当てる内容（決定は docs/chronogazer/chronogazer-service-design.md §4 の B3-4 PR-C の実装メモ）:
 //!
 //! 1. P1: `PageReinstall` の先頭で `Abort`（頁を出さない = 旧い版の
 //!    アンインストーラを走らせず、**常にその場で上書きする**。テンプレートが

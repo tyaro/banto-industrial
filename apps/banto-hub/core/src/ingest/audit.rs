@@ -1,4 +1,4 @@
-//! 送信口の監査（R2a-2c、docs/banto-hub-ingest-design.md §8）。REST と R2a-2d の
+//! 送信口の監査（R2a-2c、docs/hub/banto-hub-ingest-design.md §8）。REST と R2a-2d の
 //! WebSocket（`super::ws`）が同じ関数で記録する。
 //!
 //! `AuditLogService::record`（DB が応答しないときは保留ファイルへ退避、

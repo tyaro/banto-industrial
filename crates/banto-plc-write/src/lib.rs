@@ -38,10 +38,10 @@
 //!   `parse_write_response_pdu`) and [`modbus::planning::plan_modbus_writes`]
 //!   (what is written, what is refused). Since R2b-3c the I/O is
 //!   `banto-driver-modbus`'s frame-type driver over `banto-driver-engine`
-//!   (docs/banto-hub-driver-io-design.md §6.1); the former `ModbusWriteClient`
+//!   (docs/hub/driver/banto-hub-driver-io-design.md §6.1); the former `ModbusWriteClient`
 //!   and `execute_modbus_writes` are gone.
 //!
-//! ## T8: bit-in-word writes (docs/tag-server-design.md §6.1, 2026-08-06)
+//! ## T8: bit-in-word writes (docs/hub/tag-server-design.md §6.1, 2026-08-06)
 //!
 //! [`BatchWriteRequest::BitInWord`] sets or clears a single bit of a *word*
 //! device (`"D100.5"`) without a dedicated SLMP write command for it - SLMP
@@ -70,7 +70,7 @@ pub use types::{BatchWriteRequest, StringWriteRequest, WriteRequest, WriteResult
 
 // Re-exported for callers building requests, so they need only depend on this
 // crate for a basic write. The canonical definitions stay in `banto-plc`.
-// `StringEncoding` moved to `banto-plc` in T20 ①b (docs/banto-hub-t20-design.md
+// `StringEncoding` moved to `banto-plc` in T20 ①b (docs/hub/banto-hub-t20-design.md
 // §3.1, `types.rs`'s module comment on the `StringWriteRequest` section) so
 // `banto_plc::StringReadRequest` can share it too - re-exported here under
 // its original `banto_plc_write::StringEncoding` name so no ①a call site

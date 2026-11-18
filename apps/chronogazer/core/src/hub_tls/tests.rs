@@ -1,5 +1,5 @@
 //! [`HubTlsPolicy`] の単体試験。置き場を読む口は偽物（[`FakePlaces`]）。場面の番号は
-//! docs/hub-desktop-tls-design.md §4.4.2。
+//! docs/hub/hub-desktop-tls-design.md §4.4.2。
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};

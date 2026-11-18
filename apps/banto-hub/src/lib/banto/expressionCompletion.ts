@@ -1,6 +1,6 @@
 /**
- * #342 段階B（docs/tag-server-design.md §4.2「セグメント補完」、
- * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 追補）: 演算タグの式欄で
+ * #342 段階B（docs/hub/tag-server-design.md §4.2「セグメント補完」、
+ * docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-C 追補）: 演算タグの式欄で
  * 「いま何を補完すべきか」を決め、候補を並べる**純関数**群。DOM には一切
  * 触らない（ポップアップの描画は `lib/components/CompletionPopup.svelte`、
  * キャレット座標は段階A の `.expr-mirror` を再利用する - 新しい座標計算を

@@ -2,7 +2,7 @@
 //! [`ReadRequest`]s into the minimal set of wire-level Modbus reads that
 //! covers them, respecting Modbus's per-function quantity limits. Pure
 //! function, no I/O - this is what makes 256-tag/100ms collection cycles
-//! (docs/recorder-requirements.md §3.1) feasible at all: one round trip per
+//! (docs/chronogazer/recorder-requirements.md §3.1) feasible at all: one round trip per
 //! contiguous *group* of tags, not one per tag.
 //!
 //! ## Grouping rule
@@ -68,7 +68,7 @@ fn max_count_for(area: AddressArea) -> u16 {
 /// v1 restriction (docs/plan.md I2 §4): bit tags only address coil/
 /// discrete-input areas; every other data type only addresses register
 /// areas. "Read one bit out of a holding register" is now real (T8,
-/// docs/tag-server-design.md §6.1) but is handled as a *separate* case in
+/// docs/hub/tag-server-design.md §6.1) but is handled as a *separate* case in
 /// [`plan_requests`]'s per-request match, not folded in here - see that
 /// function's comment for why this function's contract stays exactly what
 /// it was pre-T8: `is_compatible(area, data_type)` alone still means "does
@@ -85,7 +85,7 @@ fn is_compatible(area: AddressArea, data_type: DataType) -> bool {
 /// predicate behind [`plan_requests`]'s `UnsupportedCombination` verdict.
 ///
 /// Public so that the Modbus driver's `parse_address` (R2b-2a, design
-/// docs/banto-hub-driver-address-design.md §3.2 Q4) refuses at registration
+/// docs/hub/driver/banto-hub-driver-address-design.md §3.2 Q4) refuses at registration
 /// time exactly the combinations the planner would turn into a per-cycle
 /// Bad, with no second copy of the table to drift.
 pub fn modbus_accepts(area: AddressArea, bit: Option<u8>, data_type: DataType) -> bool {
@@ -173,7 +173,7 @@ impl Building {
 /// the grouping rule and `error.rs` for why area/data-type mismatches are
 /// resolved here rather than surfacing as a Modbus exception later.
 ///
-/// ## T8 bit-in-word requests (docs/tag-server-design.md §6.1)
+/// ## T8 bit-in-word requests (docs/hub/tag-server-design.md §6.1)
 ///
 /// A request whose address carries a bit position (`"40001.3"`,
 /// [`crate::address::Address::as_modbus_ref`]'s third element) is *not* a new
@@ -367,7 +367,7 @@ mod tests {
         }
     }
 
-    /// T8 (docs/tag-server-design.md §6.1): a bit-in-word request at a
+    /// T8 (docs/hub/tag-server-design.md §6.1): a bit-in-word request at a
     /// register area.
     fn bit_in_word_req(area: AddressArea, offset: u16, bit: u8) -> ReadRequest {
         ReadRequest {
@@ -724,7 +724,7 @@ mod tests {
         assert_eq!(outcome.reads[0].count, 3);
     }
 
-    // --- T8, docs/tag-server-design.md §6.1: bit-in-word requests ----------
+    // --- T8, docs/hub/tag-server-design.md §6.1: bit-in-word requests ----------
 
     /// The core §6.1 property: a bit-in-word request folds into the
     /// register's existing word read rather than spending a wire operation

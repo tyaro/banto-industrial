@@ -1,6 +1,6 @@
 //! C1, C2 and C17-C22: the static half of a driver
-//! (docs/banto-driver-api-design.md §7.1; C17-C22 are R2b-6a,
-//! docs/banto-hub-driver-ui-design.md §3.3, §3.4, §3.6). No I/O and no
+//! (docs/hub/driver/banto-driver-api-design.md §7.1; C17-C22 are R2b-6a,
+//! docs/hub/driver/banto-hub-driver-ui-design.md §3.3, §3.4, §3.6). No I/O and no
 //! runtime.
 
 use banto_driver_api::{

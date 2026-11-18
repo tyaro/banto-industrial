@@ -1,7 +1,7 @@
 //! The session-type harness: [`run_all_against`] plays the Hub's host for a
 //! [`SessionDriver`] whose peer is already a TCP server - a device simulator
 //! or a test device - reached through a [`FaultProxy`]
-//! (docs/banto-driver-api-design.md §7.1-§7.3).
+//! (docs/hub/driver/banto-driver-api-design.md §7.1-§7.3).
 //!
 //! The harness connects the driver to the proxy (it overwrites `host` and
 //! `port` of the fixtures' settings with [`FaultProxy::local_addr`]), behaves

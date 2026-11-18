@@ -1,4 +1,4 @@
-// banto-hub タグ空間 gRPC API (T4, docs/tag-server-design.md §5.4)。
+// banto-hub タグ空間 gRPC API (T4, docs/hub/tag-server-design.md §5.4)。
 //
 // 外部クライアント SDK の生成元としてリポジトリ内で版管理する(§5.4「proto は
 // proto/tagserver/v1/ にリポジトリ内で管理し...」)。意味論は §4(タグ空間の
@@ -78,7 +78,7 @@ message TagEntry {
   int64 period_ms = 12;
   bool enabled = 13;
   bool writable = 14;
-  // T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): タグ種別
+  // T6-2 (docs/hub/tag-server-design.md §4.2/§4.3(a)): タグ種別
   // (`"plc"`/`"computed"`/`"internal"`)。REST の `TagEntry.tag_kind`
   // （snake_case）と同一の文字列語彙。後方互換のフィールド追加のみ
   // （既存クライアントは新フィールドを無視するだけで動き続ける）。

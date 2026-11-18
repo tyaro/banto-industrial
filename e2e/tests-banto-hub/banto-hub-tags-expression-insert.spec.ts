@@ -1,6 +1,6 @@
 /**
- * #342 段階C（docs/tag-server-design.md §4.2「一覧から挿入」、
- * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 追補）: 演算タグの式欄の
+ * #342 段階C（docs/hub/tag-server-design.md §4.2「一覧から挿入」、
+ * docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-C 追補）: 演算タグの式欄の
  * 「一覧から挿入」トグルと、新規作成フォームの右ペイン化の実 DOM
  * 受け入れテスト。
  *

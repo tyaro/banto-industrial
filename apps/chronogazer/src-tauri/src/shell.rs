@@ -1,4 +1,4 @@
-//! シェルの配線（#392 段階 B の B2-4c、`docs/chronogazer-service-design.md` §3.2・
+//! シェルの配線（#392 段階 B の B2-4c、`docs/chronogazer/chronogazer-service-design.md` §3.2・
 //! 2026-10-14 オーナー決定 O1〜O10）。
 //!
 //! 起動のたびに、SCM の照会と health の probe の結果から

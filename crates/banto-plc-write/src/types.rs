@@ -66,7 +66,7 @@ impl WriteResult {
 // that wraps the numeric type unchanged.
 
 // `StringEncoding` used to be defined right here (T20 ①a). T20 ①b
-// (docs/banto-hub-t20-design.md §3.1) moved it to `banto-plc` and this crate
+// (docs/hub/banto-hub-t20-design.md §3.1) moved it to `banto-plc` and this crate
 // now re-exports it (`pub use banto_plc::StringEncoding` in this crate's
 // `lib.rs`) instead of defining its own: ①b's `banto_plc::StringReadRequest`
 // needed the identical vocabulary for decoding, and `banto-plc-write` depends
@@ -106,7 +106,7 @@ pub struct StringWriteRequest {
 
 /// One entry of a mixed write batch: an ordinary numeric/bit write (the
 /// existing [`WriteRequest`], unchanged), a string write, or a T8 bit-in-word
-/// RMW write (docs/tag-server-design.md §6.1). The request type for
+/// RMW write (docs/hub/tag-server-design.md §6.1). The request type for
 /// `plan_slmp_write_batch` - and, via
 /// `banto-broker`'s `Job::Write`, the type every broker-mediated write
 /// speaks, unchanged since T2 (adding this variant required no broker code

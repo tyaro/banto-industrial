@@ -1,6 +1,6 @@
 [package]
 name = "banto-hub-sink"
-description = "S5 (docs/banto-hub-external-db-design.md §5): banto-hub DB Sink sidecar - subscribes to the Hub tag space through banto-tagclient and batch-INSERTs into an external PostgreSQL"
+description = "S5 (docs/hub/banto-hub-external-db-design.md §5): banto-hub DB Sink sidecar - subscribes to the Hub tag space through banto-tagclient and batch-INSERTs into an external PostgreSQL"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -68,7 +68,7 @@ time = { version = "0.3", default-features = false, features = ["local-offset"] 
 # サイドカーには複製しない。依存（banto-hub-bootstrap・
 # windows-sys など）はどれも既にこの exe の依存木にある。
 banto-safe-root = { path = "../../crates/banto-safe-root" }
-# R2a-3b（docs/banto-hub-ingest-design.md §10.3）: DB ブリッジ（`source/`）。Hub 内の
+# R2a-3b（docs/hub/banto-hub-ingest-design.md §10.3）: DB ブリッジ（`source/`）。Hub 内の
 # DB Source（`banto_hub_core::db_source`）と同じ「列 → f64 の変換」「列の解決」「品質の
 # 梯子」「失敗の粒度の分類」「接続オプションとエラー文言」を使うための共有 crate（§12 Q12、
 # 依存は `sqlx` の `postgres` だけで、上の sqlx と同じ版）。

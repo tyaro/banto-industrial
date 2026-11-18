@@ -1,5 +1,5 @@
 /**
- * `tagTreeContextMenu.ts`（T18-2e、docs/banto-hub-desktop-plan.md §9.4
+ * `tagTreeContextMenu.ts`（T18-2e、docs/hub/banto-hub-desktop-plan.md §9.4
  * TAG-UX-A）のユニットテスト。`tagOnboarding.test.ts`/`tagFormCarry.test.ts`
  * と同じスタイル（describe/it、依存ゼロの純関数を直接 import）。
  */
@@ -219,7 +219,7 @@ describe('resolveTreeContextMenuItems', () => {
 });
 
 /**
- * T19 S1-a（docs/banto-hub-t19-design.md §7.1「viewer ロールからの接続・
+ * T19 S1-a（docs/hub/banto-hub-t19-design.md §7.1「viewer ロールからの接続・
  * グループ詳細の閲覧」）: viewer（`canWrite` 無し）向けの右クリックメニュー
  * を決める `resolveReadOnlyTreeContextMenuItems` を検証する。書き込み系の
  * `resolveTreeContextMenuItems` とは別関数 - virtual（calc/mem）でも制限

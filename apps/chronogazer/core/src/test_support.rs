@@ -80,7 +80,7 @@ impl Drop for TempDir {
     }
 }
 
-/// R2b-3a-3 (docs/banto-hub-driver-io-design.md §8): the built-in drivers
+/// R2b-3a-3 (docs/hub/driver/banto-hub-driver-io-design.md §8): the built-in drivers
 /// (Modbus TCP and SLMP) the collector plans with and the broker dials, as
 /// the hosts inject them (`EngineConfig::drivers`).
 pub(crate) fn drivers() -> std::sync::Arc<banto_driver_api::DriverRegistry> {

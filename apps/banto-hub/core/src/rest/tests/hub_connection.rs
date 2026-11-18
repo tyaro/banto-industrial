@@ -112,7 +112,7 @@ async fn pending_apply_rejects_a_queued_hub_connection() {
     assert_eq!(rows, 0);
 }
 
-// --- R2a-2a / R2a-1c: `push` 接続（docs/banto-hub-ingest-design.md §3.1・§4.2） ----
+// --- R2a-2a / R2a-1c: `push` 接続（docs/hub/banto-hub-ingest-design.md §3.1・§4.2） ----
 //
 // REST は `push` を `hub` のように入口で断らない（Hub が作る種類、§1.4）。R2a-2a の
 // 時点では受信（`IngestHub`）が収集に繋がっておらず、preflight（厳格版の

@@ -1,4 +1,4 @@
-//! DB ブリッジ（R2a-3b、docs/banto-hub-ingest-design.md §10.3）: Hub のブリッジの `push`
+//! DB ブリッジ（R2a-3b、docs/hub/banto-hub-ingest-design.md §10.3）: Hub のブリッジの `push`
 //! 接続（`settings.bridge.kind == "db"`）ごとに、参照先の PostgreSQL へ問い合わせて、
 //! 取り込み口の WebSocket `GET /api/v1/ingest/{connectionId}/stream` へ値を送る。
 //!
@@ -136,7 +136,7 @@ impl Parked {
     }
 }
 
-/// R2b-1d（docs/banto-hub-connection-settings-design.md §5.4）: Hub が読み先の
+/// R2b-1d（docs/hub/banto-hub-connection-settings-design.md §5.4）: Hub が読み先の
 /// パスワードを読めない source の状態の文言（値は含まない）。
 pub fn unavailable_message(source: &UnavailableSource) -> String {
     format!(

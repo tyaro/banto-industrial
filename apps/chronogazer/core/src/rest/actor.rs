@@ -1,5 +1,5 @@
 //! `/api/*` の主体（[`Actor`]）と、API キーの受け付け（#1161 PR4、
-//! docs/chronogazer-agent-api-design.md §4）。
+//! docs/chronogazer/chronogazer-agent-api-design.md §4）。
 //!
 //! ## 道の分け方（§4.1）
 //!

@@ -1,11 +1,11 @@
 //! [`BrokerSimRegistry`]: the simulation mode of a broker-read connection
-//! (T9-2, docs/ux-plan.md §1, 2026-08-06 オーナー決定) - what its broker
+//! (T9-2, docs/archive/ux-plan.md §1, 2026-08-06 オーナー決定) - what its broker
 //! session should actually be: the real driver dialing the connection's own
 //! settings, or (`simulation = true`) the value layer's in-process
-//! [`SimDevice`] (R2b-5b, docs/banto-hub-driver-sim-design.md §4).
+//! [`SimDevice`] (R2b-5b, docs/hub/driver/banto-hub-driver-sim-design.md §4).
 //!
 //! Moved here from banto-hub's `broker_glue.rs` in R2b-3a-3
-//! (docs/banto-hub-driver-io-design.md §8): ChronoGazer reads through the
+//! (docs/hub/driver/banto-hub-driver-io-design.md §8): ChronoGazer reads through the
 //! broker too since then, and the registry has no banto-hub-specific
 //! dependency (it needs the connection row and the driver registry's secret
 //! keys for the fingerprint), so both apps share this one implementation.
@@ -119,7 +119,7 @@ impl BrokerSimRegistry {
     }
 
     /// `conn`(broker が読む接続)の broker セッションの対象（[`DialTarget`]）を
-    /// 解決する（R2b-3a-2、docs/banto-hub-driver-io-design.md §4.4。R2b-5b で
+    /// 解決する（R2b-3a-2、docs/hub/driver/banto-hub-driver-io-design.md §4.4。R2b-5b で
     /// 値の層へ）。土台は接続の `settings` を `banto_tags::settings_to_api` で
     /// 直したもの（秘密の参照は入らない - 秘密は broker がダイヤルの直前に
     /// だけ開く）。

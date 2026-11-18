@@ -1,4 +1,4 @@
-//! T4（docs/tag-server-design.md §5.4）: `proto/tagserver/v1/tagserver.proto`
+//! T4（docs/hub/tag-server-design.md §5.4）: `proto/tagserver/v1/tagserver.proto`
 //! をビルド時に Rust へコード生成する。生成先は `OUT_DIR`（`tonic-prost-build`
 //! の既定）で、生成コードはリポジトリへコミットしない（実装指示「生成コード
 //! は OUT_DIR 方式」）— `crate::grpc` が
@@ -27,7 +27,7 @@
 //! 常に同じ `protoc` バイナリで再現する。
 //!
 //! `banto-hub-elev.exe` への `requireAdministrator` マニフェストの埋め込みは、
-//! R1-7a（docs/banto-driver-api-design.md §2.4）で bin と一緒に
+//! R1-7a（docs/hub/driver/banto-driver-api-design.md §2.4）で bin と一緒に
 //! `apps/banto-hub/host/build.rs` へ移した。ここには proto のコード生成だけが残る。
 
 use std::path::PathBuf;

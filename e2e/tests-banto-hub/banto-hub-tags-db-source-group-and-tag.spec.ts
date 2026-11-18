@@ -1,5 +1,5 @@
 /**
- * S3（docs/banto-hub-external-db-design.md §7 row S3「Source の UI / CSV /
+ * S3（docs/hub/banto-hub-external-db-design.md §7 row S3「Source の UI / CSV /
  * MCP: Drawer の DB フィールド、列名候補の提示、`db` タグの登録 UI、E2E」）:
  * postgres（DB Source）接続配下に収集グループ（`query_sql` 付き）を作り、
  * その配下に `db` タグ（結果列名を手入力）を登録する一連の SvelteKit/TS

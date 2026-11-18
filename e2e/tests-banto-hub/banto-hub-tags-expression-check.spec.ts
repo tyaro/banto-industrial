@@ -1,5 +1,5 @@
 /**
- * #342 段階A（docs/tag-server-design.md §4.2「演算タグの式チェック API」）:
+ * #342 段階A（docs/hub/tag-server-design.md §4.2「演算タグの式チェック API」）:
  * 演算タグの式欄（`#tag-expression`）のライブチェック - エラー位置の下線
  * 表示・`POST /api/tags/expression/check` によるプレビュー（結果型・参照
  * タグ一覧・試算値）・エラーメッセージのクリックでキャレットが移動する

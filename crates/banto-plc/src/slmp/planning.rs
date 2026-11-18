@@ -1,7 +1,7 @@
 //! SLMP request planning (I2a): the mirror image of [`crate::planning`] for
 //! MELSEC device addressing. Same job, same reason it exists - one wire round
 //! trip per contiguous *group* of tags rather than one per tag, which is what
-//! makes 256-tag/100ms collection cycles (docs/recorder-requirements.md §3.1)
+//! makes 256-tag/100ms collection cycles (docs/chronogazer/recorder-requirements.md §3.1)
 //! feasible - and the same purity: no I/O, no `slmp`-crate types.
 //!
 //! ## Why this is a separate function rather than a generic one
@@ -78,7 +78,7 @@ fn max_count_for(access: SlmpAccess) -> u32 {
 /// (docs/plan.md I2 §4): a `bit` tag with **no** bit-in-word qualifier
 /// addresses a bit device, every other unqualified data type addresses a
 /// word device. This is exactly the pre-T8 shape - a bit-in-word request
-/// (`D100.5`, T8, docs/tag-server-design.md §6.1) is a *different*
+/// (`D100.5`, T8, docs/hub/tag-server-design.md §6.1) is a *different*
 /// combination handled separately in [`plan_slmp_batch`]'s per-request match,
 /// not folded into this function, so `is_compatible`'s contract never had to
 /// change: it still means "does this data type live at this device with no
@@ -97,7 +97,7 @@ fn is_compatible(access: SlmpAccess, data_type: DataType) -> bool {
 /// else is an `UnsupportedCombination`.
 ///
 /// Public so that the SLMP driver's `parse_address` (R2b-2a, design
-/// docs/banto-hub-driver-address-design.md §3.2 Q4) refuses exactly what the
+/// docs/hub/driver/banto-hub-driver-address-design.md §3.2 Q4) refuses exactly what the
 /// planner would, with no second copy of the table to drift.
 pub fn slmp_accepts_numeric(access: SlmpAccess, bit: Option<u8>, data_type: DataType) -> bool {
     match (access, data_type, bit) {
@@ -123,12 +123,12 @@ pub enum ReadKind {
     Numeric(DataType),
     Str {
         words: u16,
-        /// T20 ①b (docs/banto-hub-t20-design.md §3.1): which table
+        /// T20 ①b (docs/hub/banto-hub-t20-design.md §3.1): which table
         /// the driver engine uses to decode the span -
         /// threaded straight through from [`crate::types::StringReadRequest::encoding`].
         encoding: StringEncoding,
     },
-    /// A single bit of a *word* device (T8, docs/tag-server-design.md §6.1:
+    /// A single bit of a *word* device (T8, docs/hub/tag-server-design.md §6.1:
     /// `"D100.5"`) - the group is still an ordinary word-unit bulk read
     /// (`span` is 1 register, exactly like [`ReadKind::Numeric`] with a
     /// 16-bit type), only the decode step differs: `slmp/mod.rs` extracts
@@ -236,7 +236,7 @@ pub fn plan_slmp_requests(requests: &[ReadRequest]) -> SlmpPlanOutcome {
 /// here (only the CPU knows its own catalogue); that one comes back as a
 /// [`PlcError::SlmpEndCode`] `Bad` for its group at read time.
 ///
-/// ## T8 bit-in-word requests (docs/tag-server-design.md §6.1)
+/// ## T8 bit-in-word requests (docs/hub/tag-server-design.md §6.1)
 ///
 /// A [`BatchReadRequest::Numeric`] whose address carries a bit position
 /// (`address.as_slmp()`'s third element) is accepted only at a **word**
@@ -737,7 +737,7 @@ mod tests {
         assert_eq!(seen, (0..requests.len()).collect::<Vec<_>>());
     }
 
-    // --- T8, docs/tag-server-design.md §6.1: bit-in-word requests ----------
+    // --- T8, docs/hub/tag-server-design.md §6.1: bit-in-word requests ----------
 
     /// The core §6.1 property: a bit-in-word request folds into the ordinary
     /// word read - `count` stays 1, not 2, for a single `D100.5` tag.
@@ -821,7 +821,7 @@ mod tests {
     use crate::types::{BatchReadRequest, StringReadRequest};
 
     /// Every pre-①b test below is Shift-JIS, this crate's pre-①b-only
-    /// encoding (T20 ①b, docs/banto-hub-t20-design.md §3.1) - planning
+    /// encoding (T20 ①b, docs/hub/banto-hub-t20-design.md §3.1) - planning
     /// itself never inspects `encoding` (only `decode.rs` does), so these
     /// tests do not need a UTF-8 counterpart.
     fn sreq(raw: &str, words: u16) -> BatchReadRequest {

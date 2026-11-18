@@ -175,7 +175,7 @@ export async function listBackups(): Promise<BackupInfo[]> {
  * （REST）。デスクトップはフォルダを開く"): fetch the raw bytes of
  * `fileName` and save them via a temporary `Blob` object URL (banto's
  * `routes/(app)/items/+page.svelte` `downloadTextFile` used the same
- * pattern before that demo page was removed - docs/r1a-readme-gaps.md). In
+ * pattern before that demo page was removed - docs/archive/r1a-readme-gaps.md). In
  * Tauri mode this rejects with a message directing the caller to
  * `openBackupsFolder` instead - there is no browser download mechanism
  * inside the webview.

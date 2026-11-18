@@ -5,7 +5,7 @@
 //! 限定する。実行構成への適用（preflight + apply_run）や controller 連携は
 //! `crate::rest`/`crate::controller` 側が後続スライスで担う。
 //!
-//! # 接続の秘密値を平文で持たない（R2b-1e・R2b-6b、docs/banto-hub-connection-settings-design.md §5.3、docs/banto-hub-driver-ui-design.md §5）
+//! # 接続の秘密値を平文で持たない（R2b-1e・R2b-6b、docs/hub/banto-hub-connection-settings-design.md §5.3、docs/hub/driver/banto-hub-driver-ui-design.md §5）
 //!
 //! `plc_connections.create` / `.update` のペイロード（`{"input": ...}`）は秘密値を持ちうる。
 //! R2b-6b から `input` は `settings` の形（`crate::rest::PlcConnectionPayload`）で、秘密の
@@ -935,7 +935,7 @@ mod tests {
             .contains("pending 状態以外の提案はキャンセルできません"));
     }
 
-    // ---- R2b-1e（docs/banto-hub-connection-settings-design.md §5.3）--------------------
+    // ---- R2b-1e（docs/hub/banto-hub-connection-settings-design.md §5.3）--------------------
 
     const QUEUED_SECRET: &str = "TOPSECRET-queue-pw-5d1e";
 

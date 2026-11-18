@@ -1,7 +1,7 @@
 use super::super::*;
 use super::common::{admin_delete, admin_post, test_env};
 
-// --- T19 S2-b (UX-38, docs/banto-hub-t19-design.md §3.4/§7.5,
+// --- T19 S2-b (UX-38, docs/hub/banto-hub-t19-design.md §3.4/§7.5,
 // 2026-09-02 オーナー決定「タグがあってもグループ・接続を削除可。定義の
 // み削除し、履歴は残す」) --------------------------------------------
 

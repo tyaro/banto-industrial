@@ -160,7 +160,7 @@ struct TestApp {
     token: String,
     pool: SqlitePool,
     manager: Arc<CollectorManager>,
-    /// T2-2 (docs/tag-server-design.md §6-5): the broker session directory
+    /// T2-2 (docs/hub/tag-server-design.md §6-5): the broker session directory
     /// `manager` was built with - exposed so a test can inspect broker-side
     /// state directly (e.g. `sessions.status_watch`) without going through
     /// REST, the way `e2e_slmp_session_survives_a_reapply_via_broker` below
@@ -256,7 +256,7 @@ async fn test_app(label: &str) -> TestApp {
         .expect("initial catalog commit");
 
     let (events_tx, _rx) = broadcast::channel(16);
-    // T2-4: WriteControl always constructs disabled (docs/tag-server-design.md
+    // T2-4: WriteControl always constructs disabled (docs/hub/tag-server-design.md
     // §6-6) - no persisted state to read for a fresh test DB either way.
     let write_control = Arc::new(banto_hub_core::write_control::WriteControl::new(false));
     let write_audit = banto_hub_core::write_audit::WriteAuditService::new(pool.clone());
@@ -459,7 +459,7 @@ async fn e2e_read_via_rest_after_commit() {
 }
 
 // ---------------------------------------------------------------------------
-// 1a-2. T19 S2-b (UX-38, docs/banto-hub-t19-design.md §3.4「親の削除は
+// 1a-2. T19 S2-b (UX-38, docs/hub/banto-hub-t19-design.md §3.4「親の削除は
 //       『定義のみ・履歴は残す』」): カスケード削除しても banto-tstore の
 //       実データは無傷 - このクレートは tags/collection_groups/
 //       plc_connections の3テーブルしか触らない (banto-tags は
@@ -632,7 +632,7 @@ async fn e2e_read_slmp_via_rest_after_commit() {
 }
 
 // ---------------------------------------------------------------------------
-// 1c. E2E ブローカーセッション維持 (T2-2, docs/tag-server-design.md §6-5):
+// 1c. E2E ブローカーセッション維持 (T2-2, docs/hub/tag-server-design.md §6-5):
 //     SLMP 接続の読み取りが banto-broker 経由であることと、catalog の commit を跨いでも
 //     同じセッション（同じ broker タスク）が維持されることを検証する。
 // ---------------------------------------------------------------------------
@@ -922,7 +922,7 @@ async fn catalog_exposes_external_name_address_and_stable_ids() {
     assert_eq!(entry["address"], "40001");
     assert_eq!(entry["ids"], serde_json::json!([conn.id, group.id, tag.id]));
     assert_eq!(entry["enabled"], true);
-    // T2-3 (docs/tag-server-design.md §4/§6 item 1): catalog exposes
+    // T2-3 (docs/hub/tag-server-design.md §4/§6 item 1): catalog exposes
     // per-tag write opt-in - `tag_input()`'s fixture defaults to
     // `writable: false`, same pre-T2 behaviour as every other catalog field.
     assert_eq!(entry["writable"], false);
@@ -1278,7 +1278,7 @@ async fn settings_defaults_are_port_8722_and_retention_7_days() {
 }
 
 // ---------------------------------------------------------------------------
-// T19 S3-b（docs/banto-hub-t19-design.md §3.9、UX-46「サーバー状態の拡充」）:
+// T19 S3-b（docs/hub/banto-hub-t19-design.md §3.9、UX-46「サーバー状態の拡充」）:
 // `GET /api/v1/status` の `system`（CPU%・メモリ）がもっともらしい値で
 // 載ることを確認する。CPU% は初回サンプルで 0 になりうる
 // （`crate::system_info::SystemInfoSampler`のモジュール doc comment参照）
@@ -1331,7 +1331,7 @@ async fn status_reports_plausible_system_cpu_and_memory() {
 // 居座り、収集用の2本目が即切断され、以後1秒ごとに再接続→即切断を繰り返して
 // 全タグが Bad のままになった（TCP プロキシで観測）。
 //
-// 修正（案1、2026-09-08 オーナー決定、docs/tag-server-design.md §6-5）は
+// 修正（案1、2026-09-08 オーナー決定、docs/hub/tag-server-design.md §6-5）は
 // Modbus の収集読み取りも SLMP と同様 broker セッションへ相乗りさせること。
 // このテストはその結果を固定する: 「収集が実際に成立している（値が Good で
 // 取れている）状態で、シミュレータが受理した接続は累計1本だけ」。値が取れる

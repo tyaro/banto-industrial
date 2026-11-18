@@ -1069,7 +1069,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  # 外部 DB 連携 S2（docs/banto-hub-external-db-design.md §7「S2 / S5 の統合
+  # 外部 DB 連携 S2（docs/hub/banto-hub-external-db-design.md §7「S2 / S5 の統合
   # テストは CI で PostgreSQL のサービスコンテナを使う」）。上の `rust` ジョブ
   # は windows-latest で、GitHub Actions のサービスコンテナは Linux ランナー
   # でしか使えないため、DB Source（S2）と DB Sink サイドカー（S5、
@@ -1186,7 +1186,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: clippy (chronogazer-elev / banto-hub-core の lib)
         run: cargo clippy -p chronogazer-elev -p banto-hub-core --lib -- -D warnings
-      # R1-7a（docs/banto-driver-api-design.md §2.4）: banto-hub の bin（`banto-hub`・
+      # R1-7a（docs/hub/driver/banto-driver-api-design.md §2.4）: banto-hub の bin（`banto-hub`・
       # `banto-hub-elev`）は `banto-hub-host` へ移った。bin は lib を持たないので `--lib`
       # とは別の段にする。Windows 専用の `win_service` は `cfg(windows)` で外れ、非 Windows の
       # 分岐（`banto-hub-elev` の案内だけの `main` など）とマニフェストのテストを見る。
@@ -1212,7 +1212,7 @@ jobs:
           cargo clippy -p banto-safe-root --all-targets -- -D warnings
           cargo test -p banto-safe-root
 
-  # R1-1 / R1-2（docs/banto-driver-api-design.md §2.2・§9.1）: crates.io へ公開する
+  # R1-1 / R1-2（docs/hub/driver/banto-driver-api-design.md §2.2・§9.1）: crates.io へ公開する
   # `banto-driver-api`・`banto-driver-engine`・`banto-driver-conformance`（API の適合テスト一式。API に
   # path + version で依存）の互換性を守る軽いジョブ（ubuntu）。いずれかが Rust の対象に
   # 入るとき（= いずれか自身の変更か、workspace 全体のとき。API の変更は逆依存の
@@ -1367,7 +1367,7 @@ jobs:
             e2e/playwright-report-chronogazer-server/
           retention-days: 7
 
-  # T18-1 (docs/banto-hub-desktop-plan.md §16.3): apps/banto-hub has its own
+  # T18-1 (docs/hub/banto-hub-desktop-plan.md §16.3): apps/banto-hub has its own
   # Playwright config (e2e/banto-hub.playwright.config.ts,
   # `pnpm e2e:banto-hub`) covering first-run setup/login/logout and the
   # TAG-P0-1 continuous-registration DOM behavior.

@@ -1,5 +1,5 @@
 //! シェル（デスクトップの `src-tauri`）の起動判定（#392 段階 B の B2-4a、
-//! `docs/chronogazer-service-design.md` §3.2・2026-10-14 オーナー決定 O1・O8）。
+//! `docs/chronogazer/chronogazer-service-design.md` §3.2・2026-10-14 オーナー決定 O1・O8）。
 //!
 //! シェルは起動のたびに「サービスへつなぐ（navigate）」「プロセスの中でエンジンを
 //! 動かす（デスクトップ host）」「どちらもせず状態を見せる（fallback）」の 3 つから

@@ -1,5 +1,5 @@
 /**
- * T19 S3-a（UX-43、docs/banto-hub-t19-design.md §8.2）: オフキャンバス
+ * T19 S3-a（UX-43、docs/hub/banto-hub-t19-design.md §8.2）: オフキャンバス
  * サイドバー（≤900px）の開閉状態と現在のビューポート判定を集約する
  * シングルトンストア。`commandPalette.svelte.ts` と同じ流儀（Svelte 5
  * runes のクラス）。状態遷移の純粋ロジックは `mobileNav.ts`
@@ -23,7 +23,7 @@ import { watchMediaQuery } from './viewportWatch';
 /** `(app)/+layout.svelte` のバックドロップ `<button>` のクラス名。 */
 export const NAV_BACKDROP_CLASS = 'nav-backdrop';
 
-/** admin-template のブレークポイント・docs/banto-hub-t19-design.md §8.2 に合わせる。 */
+/** admin-template のブレークポイント・docs/hub/banto-hub-t19-design.md §8.2 に合わせる。 */
 export const NARROW_BREAKPOINT_QUERY = '(max-width: 900px)';
 
 class MobileNavStore {

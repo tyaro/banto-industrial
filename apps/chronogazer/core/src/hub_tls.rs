@@ -17,7 +17,7 @@
 //! IPv6 の loopback（`::1`、IPv4-mapped の `::ffff:127.x.x.x`）も loopback として扱う（Hub は `::1` では
 //! 待ち受けないので https は繋がらないだけ）。それ以外の IPv6 は LAN 扱い。
 //!
-//! # 2 つの置き場（#1121 PR4a、docs/hub-desktop-tls-design.md §4.4）
+//! # 2 つの置き場（#1121 PR4a、docs/hub/hub-desktop-tls-design.md §4.4）
 //!
 //! Hub は動かし方で証明書の置き場が違う。サービスは `%ProgramData%\BantoHub\tls\`、
 //! デスクトップ版は利用者ごとの `%LOCALAPPDATA%\BantoHub\tls\`。どちらも 127.0.0.1:8723 で

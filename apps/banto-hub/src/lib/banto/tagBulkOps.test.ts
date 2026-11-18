@@ -1,5 +1,5 @@
 /**
- * `tagBulkOps.ts`（T18-3b、docs/banto-hub-t18-design.md「T18-3b 一括操作」）
+ * `tagBulkOps.ts`（T18-3b、docs/hub/banto-hub-t18-design.md「T18-3b 一括操作」）
  * に対するユニットテスト。`tagDuplicate.test.ts`/`tagCsv.test.ts` と同じ
  * スタイル（describe/it、依存ゼロの純関数を直接 import）。
  */

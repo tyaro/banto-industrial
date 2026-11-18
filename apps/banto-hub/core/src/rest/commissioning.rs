@@ -1,7 +1,7 @@
 //! 試運転モード/ロックダウン（設計 §5.6・2026-08-30 オーナー決定）:
 //! `GET /api/commissioning/status` と `POST /api/commissioning/lock-down`。
 //!
-//! `rest.rs` から中身を変えずに移したもの（docs/banto-hub-driver-refactor-plan.md §8.1、
+//! `rest.rs` から中身を変えずに移したもの（docs/hub/driver/banto-hub-driver-refactor-plan.md §8.1、
 //! P0-1 の手順 8）。認証・ガード・監査の補助は親の `rest.rs` にあり、`use super::{...}` で
 //! 使う。外から使われるパス（`crate::rest::X`）は親の re-export で保つ。
 

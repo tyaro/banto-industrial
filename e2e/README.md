@@ -85,7 +85,7 @@ pnpm exec playwright install chromium                               # 初回の�
 
 ## banto-hub 性能計測ハーネス（T18-5a 第2段、opt-in）
 
-`docs/banto-hub-t18-design.md` §4 決定3/決定6 の性能目標を実測するハーネス。**CI では走らない**（`banto-hub.playwright.config.ts` の `testMatch: 'banto-hub-*.spec.ts'` に一致しないファイル名 `e2e/tests-banto-hub-perf/perf-tags-10k.spec.ts` を使い、専用 config からしか拾われない）。10,000 タグ・500 グループを seed するため使い捨ての専用 DB（一時ディレクトリ、実行後に自動削除）・専用ポート（8801）で動く — 本体 e2e や chronogazer の DB とは一切共有しない。
+`docs/hub/banto-hub-t18-design.md` §4 決定3/決定6 の性能目標を実測するハーネス。**CI では走らない**（`banto-hub.playwright.config.ts` の `testMatch: 'banto-hub-*.spec.ts'` に一致しないファイル名 `e2e/tests-banto-hub-perf/perf-tags-10k.spec.ts` を使い、専用 config からしか拾われない）。10,000 タグ・500 グループを seed するため使い捨ての専用 DB（一時ディレクトリ、実行後に自動削除）・専用ポート（8801）で動く — 本体 e2e や chronogazer の DB とは一切共有しない。
 
 実行:
 

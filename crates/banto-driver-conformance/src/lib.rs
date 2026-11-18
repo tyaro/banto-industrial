@@ -1,5 +1,5 @@
 //! banto-driver-conformance: check a [`banto_driver_api`] driver without a
-//! Hub (docs/banto-driver-api-design.md §7).
+//! Hub (docs/hub/driver/banto-driver-api-design.md §7).
 //!
 //! A driver written against `banto-driver-api` - in this repository or in
 //! a third party's - proves here that it keeps the contracts the Hub's

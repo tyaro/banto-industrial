@@ -277,7 +277,7 @@ pub(crate) fn encode_bit_value(value: TagValue) -> Result<bool, PlcWriteError> {
 /// evidence from the wrapped `slmp` crate), so a write→read round trip is
 /// byte-for-byte **when the reader decodes with the same encoding** (T20 ①a
 /// keeps the recorder's read path Shift-JIS-only by design -
-/// docs/banto-hub-t20-design.md §3.1's 案A - so a UTF-8-written tag round-trips
+/// docs/hub/banto-hub-t20-design.md §3.1's 案A - so a UTF-8-written tag round-trips
 /// only through this crate's own read helpers, not the recorder). Note
 /// [`banto_plc::WordOrder`] plays no part here: it orders the two words of a
 /// 32-bit *numeric* value, whereas a string's byte order within each word is

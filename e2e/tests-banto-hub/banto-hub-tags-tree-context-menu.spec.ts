@@ -1,5 +1,5 @@
 /**
- * T19 S1-a（docs/banto-hub-t19-design.md §7.1「旧画面を消すと失われる機能」）
+ * T19 S1-a（docs/hub/banto-hub-t19-design.md §7.1「旧画面を消すと失われる機能」）
  * の実 DOM 受け入れテスト。PLC 接続画面・収集グループ画面を廃止する前に、
  * タグ画面のツリー右クリックメニューへ移設した機能のうち、**virtual
  * （calc/mem）配下の収集グループ操作**をここで固定する:
@@ -15,7 +15,7 @@
  * `CollectionGroupDrawer` の `readOnly` モード、`resolveReadOnlyTreeContextMenuItems`/
  * `resolveTreeContextMenuItemsForRole`）は、この E2E スイートでは検証
  * できない。** 理由: このスイートの `banto-hub.exe` は新規 DB で起動した
- * ままロックダウン（`docs/tag-server-design.md` §5.6「試運転モードと
+ * ままロックダウン（`docs/hub/tag-server-design.md` §5.6「試運転モードと
  * ロックダウン」の `POST /api/commissioning/lock-down`）を一度も行わない
  * ため、常に**試運転モード**で動く。試運転モード中は
  * banto v2 まで `commissioning.rs::synthetic_identity` がどんなリクエスト

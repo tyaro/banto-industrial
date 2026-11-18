@@ -1,5 +1,5 @@
 /**
- * R2a-2b（docs/banto-hub-ingest-design.md §5・§12 Q9、2026-10-21 オーナー
+ * R2a-2b（docs/hub/banto-hub-ingest-design.md §5・§12 Q9、2026-10-21 オーナー
  * 決定）: API キーのスコープ `ingest:#{接続 id}` の組み立て・読み取りと、
  * 一覧の表示（純関数のみ、依存ゼロ）。
  *

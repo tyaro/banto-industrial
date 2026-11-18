@@ -4,7 +4,7 @@
 //! `period_ms` (one of [`ALLOWED_PERIOD_MS`]) is how often the collection
 //! engine (I3) reads every tag in it in one PLC round-trip.
 //!
-//! ## DB Source のグループ（S2、docs/banto-hub-external-db-design.md §4.1・
+//! ## DB Source のグループ（S2、docs/hub/banto-hub-external-db-design.md §4.1・
 //! §4.2、2026-09-06 オーナー決定「案A: 既存3階層の流用」）
 //!
 //! `protocol = `[`crate::plc_connection::POSTGRES_PROTOCOL`] の接続配下の
@@ -21,7 +21,7 @@
 //! では `query_sql` 必須・それ以外では指定不可」という2方向のルールを
 //! 強制する。
 //!
-//! ## レジストリつきの移動（R2b-2b、docs/banto-hub-driver-address-design.md §3.3）
+//! ## レジストリつきの移動（R2b-2b、docs/hub/driver/banto-hub-driver-address-design.md §3.3）
 //!
 //! [`CollectionGroupService::with_registry`]（banto-hub）のサービスは、グループの
 //! `plc_connection_id` を**別のドライバ（`protocol`）の接続**へ変えるとき、同じ
@@ -57,7 +57,7 @@ fn default_enabled() -> bool {
     true
 }
 
-/// T19 S1-b（UX-34、docs/banto-hub-t19-design.md §2・§3.3、2026-09-02
+/// T19 S1-b（UX-34、docs/hub/banto-hub-t19-design.md §2・§3.3、2026-09-02
 /// オーナー決定）: `default_writable` の既定値。UX-34 の全体方針「既定
 /// ON」に合わせ、`CollectionGroupInput` に列を省略した既存クライアント
 /// （relay-wright/chronogazer にはこの列自体が無いので該当しないが、将来
@@ -87,7 +87,7 @@ pub struct CollectionGroup {
     /// 収集・書き込み動作はこの列を一切参照しない（`migrations/0012_
     /// collection_groups_add_default_writable.sql` 参照）。
     pub default_writable: bool,
-    /// 外部 DB 連携 S2（docs/banto-hub-external-db-design.md §4.1・§4.2、
+    /// 外部 DB 連携 S2（docs/hub/banto-hub-external-db-design.md §4.1・§4.2、
     /// 2026-09-06 オーナー決定「案A」）: このグループが1周期ごとに実行する
     /// SELECT 文（「1 グループ = 1 SELECT = N タグ」）。
     /// `protocol = "postgres"` の接続配下のグループでは**必須**、それ以外の
@@ -199,7 +199,7 @@ where
 /// （[`MAX_NAME_LEN`] が `name` に対して果たしているのと同じ役割）。
 const MAX_QUERY_SQL_LEN: usize = 8192;
 
-/// S2（docs/banto-hub-external-db-design.md §4.1・§4.2、2026-09-06 オーナー
+/// S2（docs/hub/banto-hub-external-db-design.md §4.1・§4.2、2026-09-06 オーナー
 /// 決定「案A」）: グループの `query_sql` を、そのグループが属する接続の
 /// `protocol` に照らして検証し、**保存する値**（`postgres` 配下なら trim 済み
 /// の `Some`、それ以外は常に `None`）を返す。S1a の
@@ -750,7 +750,7 @@ impl CollectionGroupService {
         Ok(())
     }
 
-    /// T19 S2-b（UX-38、docs/banto-hub-t19-design.md §3.4・§7.5）: カスケード
+    /// T19 S2-b（UX-38、docs/hub/banto-hub-t19-design.md §3.4・§7.5）: カスケード
     /// 削除の入口 - [`crate::plc_connection::PlcConnectionService::cascade_delete_tx`]
     /// の doc comment がここでの設計判断（[`Self::delete`]/[`Self::delete_tx`]
     /// は変更せず新メソッドを足す理由 - relay-wright との契約）をそのまま
@@ -1146,7 +1146,7 @@ mod tests {
         }
     }
 
-    /// S2 (docs/banto-hub-external-db-design.md §4.2): `postgres` 接続配下の
+    /// S2 (docs/hub/banto-hub-external-db-design.md §4.2): `postgres` 接続配下の
     /// グループは `query_sql` **必須** - S1a の「DB 接続配下にはそもそも
     /// グループを作れない」拒否を置き換えたルール（このモジュール doc
     /// comment の「DB Source のグループ」節参照）。
@@ -1271,7 +1271,7 @@ mod tests {
         svc.get(group.id).await.expect("group should survive");
     }
 
-    // --- T19 S2-b (UX-38, docs/banto-hub-t19-design.md §3.4/§7.5): cascade
+    // --- T19 S2-b (UX-38, docs/hub/banto-hub-t19-design.md §3.4/§7.5): cascade
     // delete - a NEW method, `delete`/`delete_tx` above are unchanged (see
     // `CollectionGroupService::cascade_delete_tx`'s doc comment, which points
     // at `PlcConnectionService::cascade_delete_tx`'s longer explanation of
@@ -1446,7 +1446,7 @@ mod tests {
         assert_eq!(result.rows[0].name, "Alpha_East");
     }
 
-    // --- S2 (docs/banto-hub-external-db-design.md §4.2): `query_sql` の
+    // --- S2 (docs/hub/banto-hub-external-db-design.md §4.2): `query_sql` の
     // ベストエフォート検証。純関数なので DB を触らない unit test で固定する
     // （`validate_query_sql` の doc comment: 本当の防御は DB 側の read-only
     // ユーザーであり、ここは「うっかり UPDATE」を早期に気づかせるだけ）。

@@ -1075,7 +1075,7 @@ fn current_pair_line(
 /// ChronoGazer だけ（`check_own_hub` で今回の子と照合してから使う）。名前の
 /// 規則（`{app_id}-{installation_id}-{秒}`）に頼ると、`connect` が同秒の
 /// 衝突で秒をずらした再発行などで規則から外れたときに取りこぼす。本番の
-/// Hub では絶対にやらないこと（docs/banto-hub-client-bootstrap.md）。
+/// Hub では絶対にやらないこと（docs/hub/banto-hub-client-bootstrap.md）。
 fn live_key_ids(list: &Value) -> Vec<i64> {
     list.as_array()
         .map(|rows| {

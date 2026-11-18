@@ -1,4 +1,4 @@
-//! 起動時の DB の移行の前後処理（R2b-1d・R2b-1e、docs/banto-hub-connection-settings-design.md
+//! 起動時の DB の移行の前後処理（R2b-1d・R2b-1e、docs/hub/banto-hub-connection-settings-design.md
 //! §6.1 の 2-b・§6.3・§6.4・§6.5・§6.6、§5.3 の最後の行）。
 //!
 //! migration `0025`（`banto-tags`、接続設定を `settings` の JSON と秘密の表へ移す）は
@@ -72,7 +72,7 @@
 //!    - (a) protector があるとき（Windows の DPAPI）、`plc_connection_secrets` の `plain-v1`
 //!      の行を開いて**同じ参照のまま**封印し直す（entropy は参照とキー）。
 //!    - (b) 未適用（`pending`・`applying`・`failed`）の `plc_connections.create` / `.update` の
-//!      ペイロードが R2b-6b より前の平らな形なら捨てる（Q10、docs/banto-hub-driver-ui-design.md
+//!      ペイロードが R2b-6b より前の平らな形なら捨てる（Q10、docs/hub/driver/banto-hub-driver-ui-design.md
 //!      §5。起動ログに出す）。
 //!    - (c) 同じ 3 つの状態の `plain-v1` の `sealedSecrets` を、protector があれば封印し直す。
 //!    - (d) 履歴（`applied`・`canceled`）のペイロードから `sealedSecrets`（と古い形の
@@ -178,7 +178,7 @@ impl std::fmt::Display for PreflightRefusal {
             "接続設定の移行（R2b-1、migration 0025）の予行で問題が見つかったため、移行せずに\
              起動を中止しました。DB（{}）は変更していません。旧版（v0.2.0-alpha.33 など）の \
              banto-hub でこれらの接続を直すか削除してから、この版で起動し直してください\
-             （手順は docs/banto-hub-operations.md）。",
+             （手順は docs/hub/banto-hub-operations.md）。",
             self.db_path.display()
         )?;
         for row in &self.rows {
@@ -969,7 +969,7 @@ async fn rewrite_secrets_inner(
         };
         let mut changed = false;
         if UNAPPLIED_STATES.contains(&state.as_str()) {
-            // (b) R2b-6b（Q10、docs/banto-hub-driver-ui-design.md §5）: 平らな形の古い提案は
+            // (b) R2b-6b（Q10、docs/hub/driver/banto-hub-driver-ui-design.md §5）: 平らな形の古い提案は
             // 読めないので捨てる（使用者無しの前提、2026-10-22 オーナー）。平文の `password`
             // を持ちうるので、清掃待ちの印も立てる（下の (e)）。
             if !is_current_connection_input(&source, &payload) {
@@ -1138,7 +1138,7 @@ pub fn log_upkeep(report: &UpkeepReport) {
             report.stripped_history
         ));
     }
-    // Q10（docs/banto-hub-driver-ui-design.md §5）: 捨てた提案を 1 件ずつ分かるように出す。
+    // Q10（docs/hub/driver/banto-hub-driver-ui-design.md §5）: 捨てた提案を 1 件ずつ分かるように出す。
     if !report.discarded_queue.is_empty() {
         let ids: Vec<String> = report
             .discarded_queue

@@ -1,6 +1,6 @@
 //! 値の層のシミュレータ（`banto_driver_engine::sim`）を、セッション型の適合テストの
 //! ワイヤに依らない項目（C3 の順序・空の要求、C4 の `Rejected` の形、C8 の書いて読み戻す）
-//! で確かめる（docs/banto-hub-driver-sim-design.md §3.5）。
+//! で確かめる（docs/hub/driver/banto-hub-driver-sim-design.md §3.5）。
 //!
 //! `session::run_all_against` は TCP の相手（`FaultProxy`）を前提にし、公開 API を
 //! 変えずにシミュレータへ向けられないので、同じ性質の主張をここに書く。

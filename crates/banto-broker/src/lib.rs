@@ -1,4 +1,4 @@
-//! `banto-broker`: the PLC access broker (I6, docs/tag-server-design.md
+//! `banto-broker`: the PLC access broker (I6, docs/hub/tag-server-design.md
 //! §6-5). One live SLMP session per PLC CPU ([`BrokerSupervisor::spawn`]
 //! spawns one [`tokio::task`] per [`banto_tags::PlcConnection`]), and every
 //! read/write caller reaches it through this crate so that a read and a
@@ -13,7 +13,7 @@
 //! logic changes) so a second consumer (banto-hub's write path, wired in
 //! T2-2) can reuse the exact "read/write serialized on one socket" guarantee
 //! instead of re-implementing it and risking the two copies drifting apart -
-//! the motivating risk docs/tag-server-design.md §10 item 3 records: "同型
+//! the motivating risk docs/hub/tag-server-design.md §10 item 3 records: "同型
 //! 再実装は2実装の乖離リスクが最悪". Relay-wright's own behavior is
 //! unchanged by the move: `apps/relay-wright/core/src/engine/mod.rs` still
 //! documents the *why* of this module from inside relay-wright's W3 engine
@@ -35,7 +35,7 @@
 //! #130 (I9) put read/write execution behind a small trait and a protocol ->
 //! dial-function table; R1-3a made the table injected; R1-4a moved the two
 //! drivers out into their own crates. **R2b-3a-2
-//! (docs/banto-hub-driver-io-design.md §4.2) removed the table itself**: the
+//! (docs/hub/driver/banto-hub-driver-io-design.md §4.2) removed the table itself**: the
 //! broker now dials through the `banto-driver-api`
 //! [`DriverRegistry`](banto_driver_api::DriverRegistry) it is given. A
 //! connection's protocol is broker-managed exactly when the registry holds a
@@ -172,7 +172,7 @@
 //! [`BrokerConnectionStatus`] plus [`BrokerHandle::status_watch`] /
 //! [`SessionDirectory::status_watch`] expose the same `ConnState` lifecycle
 //! the previous sections describe as a `tokio::sync::watch` value external
-//! code can observe: banto-hub's `/api/v1/status` (docs/tag-server-design.md
+//! code can observe: banto-hub's `/api/v1/status` (docs/hub/tag-server-design.md
 //! §8) needs to report whether each managed connection is up, and banto-hub's
 //! PLC断/再接続 event generation needs a transition to fire on - both need to
 //! see this broker's connection state from *outside* the task. This is a
@@ -1293,7 +1293,7 @@ impl SessionDirectory {
 
     /// As [`Self::ensure_connection_with_settings`], but the session is the
     /// value layer's [`SimDevice`] instead of the wire (R2b-5b,
-    /// docs/banto-hub-driver-sim-design.md §4.1): no dial, no secrets opened.
+    /// docs/hub/driver/banto-hub-driver-sim-design.md §4.1): no dial, no secrets opened.
     /// The registry check and `validate_config` are the same - a simulation
     /// that would not work against the real device is refused too. The
     /// handle's fingerprint carries the simulation mark

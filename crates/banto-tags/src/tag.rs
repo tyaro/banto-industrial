@@ -12,7 +12,7 @@
 //! and `string` tags included - with the driver of the tag's connection and
 //! stores the driver's `canonical` form (`40001` -> `400001`); see
 //! [`normalize_tag_address`] (the single pure function the save path and the parse
-//! API share) and docs/banto-hub-driver-address-design.md §3. A protocol change
+//! API share) and docs/hub/driver/banto-hub-driver-address-design.md §3. A protocol change
 //! or a group move to another driver re-parses the affected tags in the same
 //! transaction (`reparse_tags`).
 
@@ -95,7 +95,7 @@ pub const NUMERIC_DATA_TYPES: &[&str] = &[
 ///
 /// **Registry-less services only** ([`TagService::new`], ChronoGazer until
 /// R2b-7). With a registry (the Hub) the connection's driver decides through
-/// `supported_kinds` instead (R2b-6b, docs/banto-hub-driver-ui-design.md §3.4) -
+/// `supported_kinds` instead (R2b-6b, docs/hub/driver/banto-hub-driver-ui-design.md §3.4) -
 /// the same verdict for Modbus / SLMP, without the protocol name.
 pub const MODBUS_ONLY_DATA_TYPES: &[&str] = &["i64", "u64", "f64"];
 
@@ -104,7 +104,7 @@ pub const MODBUS_ONLY_DATA_TYPES: &[&str] = &["i64", "u64", "f64"];
 /// below and any consumer reads as prose.
 pub const STRING_DATA_TYPE: &str = "string";
 
-/// `tags.string_encoding` vocabulary (T20 ①a, docs/banto-hub-t20-design.md
+/// `tags.string_encoding` vocabulary (T20 ①a, docs/hub/banto-hub-t20-design.md
 /// §3.1, 2026-09-04 オーナー決定「文字コードは既定 UTF-8、タグ単位で
 /// Shift-JIS も選択可」) - mirrors the SQL `CHECK` in
 /// `migrations/0013_tags_add_string_encoding.sql`. Meaningful only for
@@ -132,7 +132,7 @@ const MAX_STRING_LENGTH: i64 = 128;
 /// The driver API's [`TagKind`](banto_driver_api::TagKind) of a tag, from its
 /// `data_type` column (and, for `"string"`, `string_length` and
 /// `string_encoding`) - the `kind` a driver's `parse_address` takes
-/// (docs/banto-hub-driver-address-design.md §3.2). A pure function over the
+/// (docs/hub/driver/banto-hub-driver-address-design.md §3.2). A pure function over the
 /// raw fields so the save path (`TagInput`) and the read path (`Tag`) share
 /// it: `tag_kind(&t.data_type, t.string_length, &t.string_encoding)`.
 ///
@@ -179,7 +179,7 @@ fn default_tag_kind() -> String {
 
 /// Full `tag_kind` vocabulary from design §4.2's table (`plc` / `computed` /
 /// `internal`), widened by the DB Source slice S2 with `db`
-/// (docs/banto-hub-external-db-design.md §4.1) - mirrors the SQL `CHECK`
+/// (docs/hub/banto-hub-external-db-design.md §4.1) - mirrors the SQL `CHECK`
 /// added in `migrations/0006_tags_writable_kind.sql` and widened by
 /// `migrations/0015_db_source_query_sql_and_tag_kind.sql`. All four are
 /// accepted by [`validate_tag_input`] (design §6 item 9's "computed/internal
@@ -215,7 +215,7 @@ pub const COMPUTED_TAG_KIND: &str = "computed";
 pub const INTERNAL_TAG_KIND: &str = "internal";
 
 /// An external-database tag (外部 DB 連携 S2,
-/// docs/banto-hub-external-db-design.md §4.1・§4.4, 2026-09-06 オーナー決定
+/// docs/hub/banto-hub-external-db-design.md §4.1・§4.4, 2026-09-06 オーナー決定
 /// 「案A: 既存3階層の流用」): value comes from **one result column of its
 /// group's SELECT** (`crate::collection_group::CollectionGroup::query_sql`),
 /// polled by the hub's DB Source engine (`apps/banto-hub/core/src/db_source`)
@@ -316,7 +316,7 @@ pub struct Tag {
     /// `data_type == "string"`, `None` otherwise - enforced by
     /// [`validate_tag_input`], same all-or-nothing style as scaling.
     pub string_length: Option<i64>,
-    /// T20 ①a (docs/banto-hub-t20-design.md §3.1): character encoding used to
+    /// T20 ①a (docs/hub/banto-hub-t20-design.md §3.1): character encoding used to
     /// render this tag's value onto the wire when writing a `"string"` tag
     /// (`banto_plc_write::StringEncoding` at the write path -
     /// `apps/banto-hub/core/src/write_path.rs`). One of
@@ -355,7 +355,7 @@ pub struct Tag {
     /// consumer - `tag_kind` staying `"plc"`-only until T6 means no row can
     /// reach the internal-tag code path that would read it.
     pub retain: bool,
-    /// T18-1 (docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目「revision /
+    /// T18-1 (docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目「revision /
     /// ETag で後勝ち上書きを防ぐ」): 楽観的ロック用の行バージョン。
     /// `migrations/0009_tags_revision.sql` により新規行は `1` から始まり、
     /// [`TagService::update`]/[`TagService::update_tx`] が成功する度に必ず
@@ -389,7 +389,7 @@ impl Tag {
     }
 }
 
-/// Per-group tag count (T18-5a 第2段, docs/banto-hub-t18-design.md §4 決定6:
+/// Per-group tag count (T18-5a 第2段, docs/hub/banto-hub-t18-design.md §4 決定6:
 /// 薄い部品の先行配線). Lets the admin UI show "N tags" next to each
 /// collection group without pulling every tag row. `collection_group_id`
 /// carries no join to the group's name - the caller already has the group
@@ -449,7 +449,7 @@ pub struct TagInput {
     pub expression: Option<String>,
     #[serde(default)]
     pub retain: bool,
-    /// T18-1 (docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目): 更新時の
+    /// T18-1 (docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目): 更新時の
     /// 楽観ロック用。create では無視。`None` なら revision チェック無し
     /// （relay-wright 等の既存クライアント互換）だが revision は +1 する。
     #[serde(default)]
@@ -548,7 +548,7 @@ fn modbus_read_only_area(address: &str) -> Option<&'static str> {
     }
 }
 
-/// Which address rules a save runs (R2b-2b, docs/banto-hub-driver-address-design.md
+/// Which address rules a save runs (R2b-2b, docs/hub/driver/banto-hub-driver-address-design.md
 /// §3): the registry-less services ([`TagService::new`]) keep the old rules -
 /// the address is only checked for being non-empty and a `writable` tag on a
 /// Modbus read-only reference number is refused by [`modbus_read_only_area`]'s
@@ -593,7 +593,7 @@ impl AddressRules {
 /// write stack's protocol coverage at all - keeping the two concerns (row
 /// validity vs. write-path capability) from being entangled in one crate.
 ///
-/// **The exception (2026-09-01 オーナー決定 A, docs/tag-server-design.md §6):
+/// **The exception (2026-09-01 オーナー決定 A, docs/hub/tag-server-design.md §6):
 /// a Modbus DiscreteInput/InputRegister address IS checked here**, and
 /// `writable = true` on one is rejected at registration. This does not
 /// contradict the reasoning above - it is a different kind of fact:
@@ -704,7 +704,7 @@ fn validate_tag_input(input: &TagInput, rules: AddressRules) -> Result<Validated
                     message: "plc タグには expression を設定できません".to_string(),
                 });
             }
-            // 2026-09-01 オーナー決定A (docs/tag-server-design.md §6): Modbus
+            // 2026-09-01 オーナー決定A (docs/hub/tag-server-design.md §6): Modbus
             // の DiscreteInput(1xxxx)/InputRegister(3xxxx) は仕様上ずっと
             // 読み取り専用 - どんな書き込みスタックを実装しても書けないので、
             // writable との組み合わせを登録時に拒否する。エラーは
@@ -774,7 +774,7 @@ fn validate_tag_input(input: &TagInput, rules: AddressRules) -> Result<Validated
             }
         }
         DB_TAG_KIND => {
-            // 外部 DB 連携 S2 (docs/banto-hub-external-db-design.md §4.1・
+            // 外部 DB 連携 S2 (docs/hub/banto-hub-external-db-design.md §4.1・
             // §4.4): `address` はここでは PLC アドレスではなく**結果列名**。
             // 識別子として検証し（PostgreSQL の bare identifier 文法 +
             // 63 文字上限）、大文字小文字はそのまま保存する - DB Source
@@ -989,7 +989,7 @@ fn tag_kind_placement_error(conn_name: &str, protocol: &str, tag_kind: &str) -> 
         PLC_TAG_KIND if is_virtual => {
             "plc タグは予約接続（calc/mem）配下に作成できません".to_string()
         }
-        // 外部 DB 連携 S2 (docs/banto-hub-external-db-design.md §4.1「配置
+        // 外部 DB 連携 S2 (docs/hub/banto-hub-external-db-design.md §4.1「配置
         // 制約」): `postgres` 接続は PLC 収集パイプラインに一切参加しない
         // (`banto_collect::build_config_from` が除外する) ので、その配下の
         // `plc` タグは永久に収集されない - `"virtual"` 配下の `plc` タグを
@@ -1047,7 +1047,7 @@ fn tag_kind_placement_error(conn_name: &str, protocol: &str, tag_kind: &str) -> 
 /// `writable` must be `false` (no writes through the Hub). Every violation
 /// of this family is reported together.
 ///
-/// A fourth family (R2a-2a, docs/banto-hub-ingest-design.md §3.3) applies to
+/// A fourth family (R2a-2a, docs/hub/banto-hub-ingest-design.md §3.3) applies to
 /// a `plc` tag under a [`PUSH_PROTOCOL`] connection - see [`push_tag_errors`]:
 /// the same shape as the hub family, with the sender's opaque key
 /// ([`crate::push::validate_push_key`]) in place of the external name.
@@ -1161,7 +1161,7 @@ fn hub_tag_errors(input: &TagInput) -> Vec<FieldError> {
 }
 
 /// The push-tag family of [`placement_verdict`] (R2a-2a,
-/// docs/banto-hub-ingest-design.md §3.3), every violation at once - the
+/// docs/hub/banto-hub-ingest-design.md §3.3), every violation at once - the
 /// [`hub_tag_errors`] rules with the key grammar swapped in: `address` is the
 /// sender's opaque key ([`crate::push::validate_push_key`]: 1..=256
 /// characters after trimming, no control characters, case-sensitive), no
@@ -1323,7 +1323,7 @@ const HUB_EXTERNAL_NAME_TAKEN_RACE_MESSAGE: &str =
 pub(crate) const HUB_EXTERNAL_NAME_TRIGGER_MESSAGE: &str =
     "banto_tags: hub external name already registered";
 
-/// R2a-2a（docs/banto-hub-ingest-design.md §3.3）: `push` 接続の下の `plc` タグの
+/// R2a-2a（docs/hub/banto-hub-ingest-design.md §3.3）: `push` 接続の下の `plc` タグの
 /// キーは**接続ごとに**一意（1 つのキーが 2 本のタグに割れると、送られた値が
 /// どちらに入ったか分からない）。Hub の外部名と同じく、書き込みの前の照会と
 /// migration `0024_tags_push_key_unique.sql` のトリガの二重。`exclude_tag_id` の
@@ -1645,7 +1645,7 @@ fn decide_placement(
 
 /// The verdict on a tag's `address` that does not need a database: the
 /// canonical form to store and, for a `plc` tag under a driver, the parsed
-/// address (R2b-2b, docs/banto-hub-driver-address-design.md §3.2・§7.1).
+/// address (R2b-2b, docs/hub/driver/banto-hub-driver-address-design.md §3.2・§7.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedAddress {
     /// The text to store in `tags.address`: the driver's `canonical` for a
@@ -1751,7 +1751,7 @@ pub struct AddressProbe<'a> {
     pub string_encoding: &'a str,
 }
 
-/// The parse API's whole verdict (R2b-2d, docs/banto-hub-driver-address-design.md
+/// The parse API's whole verdict (R2b-2d, docs/hub/driver/banto-hub-driver-address-design.md
 /// §7.1): the address-independent field validation of [`validate_tag_input`]
 /// first (`tagKind` / `dataType` / `stringLength` / `stringEncoding`, the same
 /// messages the save path gives), then [`normalize_tag_address`] - the very
@@ -1809,7 +1809,7 @@ pub fn parse_tag_address(
     normalize_tag_address(conn_name, protocol, &input, registry)
 }
 
-/// How [`offset_tag_address`] counts `n` (docs/banto-hub-driver-ui-design.md §4.3).
+/// How [`offset_tag_address`] counts `n` (docs/hub/driver/banto-hub-driver-ui-design.md §4.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OffsetUnit {
     /// `n` points of the tag's own kind (continuous registration): the driver's
@@ -1821,7 +1821,7 @@ pub enum OffsetUnit {
     Words,
 }
 
-/// The address `n` units away from `probe`'s (R2b-6d-1, docs/banto-hub-driver-ui-design.md
+/// The address `n` units away from `probe`'s (R2b-6d-1, docs/hub/driver/banto-hub-driver-ui-design.md
 /// §4.3): the pure core of `POST /api/tags/offset-addresses`. The address is first
 /// verified with the very function the save path uses ([`parse_tag_address`]) and
 /// moved from its canonical form by the connection's driver ([`OffsetUnit`]); the
@@ -1946,7 +1946,7 @@ fn normalize_plc_address(
 
 /// The `dataType` error of a `plc` tag whose kind `driver` does not list in
 /// [`DriverBase::supported_kinds`](banto_driver_api::DriverBase::supported_kinds)
-/// (R2b-6b, docs/banto-hub-driver-ui-design.md §3.4): with a registry this replaces
+/// (R2b-6b, docs/hub/driver/banto-hub-driver-ui-design.md §3.4): with a registry this replaces
 /// the protocol-name rule [`MODBUS_ONLY_DATA_TYPES`] (#325: the Modbus driver lists
 /// the 64-bit types, the SLMP driver does not; the SLMP driver lists `string`, the
 /// Modbus driver does not). Conformance C20 keeps the list and `parse_address` in
@@ -2122,7 +2122,7 @@ pub(crate) struct AddressRewrite {
     address: String,
 }
 
-/// R2b-2b (docs/banto-hub-driver-address-design.md §3.3, Q2), shared by
+/// R2b-2b (docs/hub/driver/banto-hub-driver-address-design.md §3.3, Q2), shared by
 /// [`crate::PlcConnectionService`]'s protocol change and
 /// [`crate::CollectionGroupService`]'s move to a connection of another driver:
 /// loads **every** tag in `scope` (disabled and `string` ones included, on the
@@ -2233,7 +2233,7 @@ pub(crate) async fn apply_address_rewrites(
 }
 
 /// A single row's worth of field errors within a [`TagService::create_batch`]
-/// call (T11-1, docs/ux-plan.md §3: "行番号/インデックス付きのエラー一覧").
+/// call (T11-1, docs/archive/ux-plan.md §3: "行番号/インデックス付きのエラー一覧").
 /// `index` is the row's 0-based position in the request's `tags` array, so a
 /// client (the continuous-registration preview, and later T11-2's CSV
 /// import) can point back at exactly the offending row/line.
@@ -2326,7 +2326,7 @@ pub enum BatchTagDeleteOutcome {
     Valid { count: usize },
 }
 
-/// [`TagService::update_tx`]'s error type (T18-1, docs/banto-hub-desktop-plan.md
+/// [`TagService::update_tx`]'s error type (T18-1, docs/hub/banto-hub-desktop-plan.md
 /// §9.4 TAG-UX-C 4点目). A superset of `BantoError` that additionally
 /// distinguishes the one new failure mode the optimistic-lock `WHERE id = ?
 /// AND revision = ?` clause can produce: zero rows updated *because another
@@ -2352,7 +2352,7 @@ pub enum TagUpdateError {
     /// connection found it) - i.e. another session updated it first. Carries
     /// that current row so the caller can hand it back to the client
     /// (differencing which fields actually changed is explicitly out of
-    /// scope for this PR - see docs/banto-hub-desktop-plan.md §9.4's
+    /// scope for this PR - see docs/hub/banto-hub-desktop-plan.md §9.4's
     /// implementation note). Boxed - `Tag` is large enough that
     /// `clippy::large_enum_variant` flags an unboxed `Tag` here (it would
     /// roughly triple this enum's size over the `Banto` variant).
@@ -2370,7 +2370,7 @@ impl From<BantoError> for TagUpdateError {
 /// [`crate::collection_group::CollectionGroupService::delete`]): nothing in
 /// this crate references a `tags` row by id.
 ///
-/// ## Registry mode (R2b-2b, docs/banto-hub-driver-address-design.md §3)
+/// ## Registry mode (R2b-2b, docs/hub/driver/banto-hub-driver-address-design.md §3)
 ///
 /// [`Self::new`] keeps the old rules (the address is any non-empty text, saved
 /// as typed; [`placement_verdict`], [`MODBUS_ONLY_DATA_TYPES`] and
@@ -2462,7 +2462,7 @@ impl TagService {
     }
 
     /// Tag counts grouped by `collection_group_id` (T18-5a 第2段,
-    /// docs/banto-hub-t18-design.md §4 決定6). A fixed aggregate, not a
+    /// docs/hub/banto-hub-t18-design.md §4 決定6). A fixed aggregate, not a
     /// `list`-style filter/sort/paginate query - covered by the existing
     /// `idx_tags_collection_group_id` index (`migrations/0003_tags.sql`).
     /// Groups with zero tags simply do not appear in the result; the caller
@@ -2580,7 +2580,7 @@ impl TagService {
             .map_err(map_tag_write_error)
     }
 
-    /// **T18-1 optimistic lock** (docs/banto-hub-desktop-plan.md §9.4
+    /// **T18-1 optimistic lock** (docs/hub/banto-hub-desktop-plan.md §9.4
     /// TAG-UX-C 4点目): when `input.expected_revision` is `Some(r)`, the
     /// `UPDATE` only touches the row if it is still at revision `r`
     /// (`WHERE id = ? AND revision = ?`) - a stale caller (one that read the
@@ -3462,7 +3462,7 @@ impl TagService {
         })
     }
 
-    /// Bulk create - T11-1 (docs/ux-plan.md §3): the shared foundation both
+    /// Bulk create - T11-1 (docs/archive/ux-plan.md §3): the shared foundation both
     /// continuous registration and CSV import (T11-2) build on. Calling
     /// [`TagService::create`] `n` times would (a) be all-or-nothing only at
     /// the row level, leaving a partially-applied registry on a mid-batch
@@ -4843,7 +4843,7 @@ mod tests {
         }
     }
 
-    // --- validation: string_encoding (T20 ①a, docs/banto-hub-t20-design.md
+    // --- validation: string_encoding (T20 ①a, docs/hub/banto-hub-t20-design.md
     // §3.1, migrations/0013_tags_add_string_encoding.sql) ------------------
 
     /// `sample_input`/`string_input` leave `string_encoding` at its
@@ -5458,7 +5458,7 @@ mod tests {
 
     /// `1xxxx`(DiscreteInput) は Modbus 仕様上ずっと読み取り専用 - #131 で
     /// 書き込みスタックが実装されても書けるようにはならないので、登録時に
-    /// 拒否する（docs/tag-server-design.md §6 決定A）。
+    /// 拒否する（docs/hub/tag-server-design.md §6 決定A）。
     #[tokio::test]
     async fn create_rejects_writable_discrete_input() {
         let (svc, group_id) = setup().await;
@@ -6166,7 +6166,7 @@ mod tests {
         .is_err());
     }
 
-    // --- 外部 DB 連携 S2 (docs/banto-hub-external-db-design.md §4.1・§4.4・
+    // --- 外部 DB 連携 S2 (docs/hub/banto-hub-external-db-design.md §4.1・§4.4・
     // §6-10): `tag_kind = "db"` の登録時検証と配置制約 --------------------
 
     /// A `db` group under a `"postgres"` connection - the placement the DB
@@ -7181,7 +7181,7 @@ mod tests {
         assert_eq!(searched.rows[0].name, "B");
     }
 
-    // --- count_by_group (T18-5a 第2段, docs/banto-hub-t18-design.md §4 決定6) --
+    // --- count_by_group (T18-5a 第2段, docs/hub/banto-hub-t18-design.md §4 決定6) --
 
     #[tokio::test]
     async fn count_by_group_is_empty_for_an_empty_db() {
@@ -7253,7 +7253,7 @@ mod tests {
         );
     }
 
-    // --- create_batch (T11-1, docs/ux-plan.md §3) --------------------------
+    // --- create_batch (T11-1, docs/archive/ux-plan.md §3) --------------------------
 
     #[tokio::test]
     async fn create_batch_persists_every_row_in_request_order() {
@@ -8878,7 +8878,7 @@ mod tests {
             .expect("empty push -> modbus");
     }
 
-    // ---- R2b-2b: registry mode (docs/banto-hub-driver-address-design.md §3) ----------
+    // ---- R2b-2b: registry mode (docs/hub/driver/banto-hub-driver-address-design.md §3) ----------
     //
     // The real Modbus / SLMP drivers live in crates that depend on this one, so these
     // tests use fakes with the same *shape* of behavior: `modbus-tcp` canonicalizes to

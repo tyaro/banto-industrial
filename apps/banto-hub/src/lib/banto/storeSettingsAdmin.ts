@@ -1,6 +1,6 @@
 /**
  * `admin` 限定の履歴（tstore）保持期間設定クライアント（T19 S2-d、
- * docs/banto-hub-t19-design.md §5.1、UX-39、新規作成）。
+ * docs/hub/banto-hub-t19-design.md §5.1、UX-39、新規作成）。
  * `apps/banto-hub/core/src/rest.rs` の `GET/PUT /api/store-settings`・
  * `POST /api/store-settings/prune-preview`・`POST /api/store-settings/
  * prune-now` に対応する - `mqttSettingsAdmin.ts`/`grpcSettingsAdmin.ts` と

@@ -1,7 +1,7 @@
 //! 収集グループの CRUD（`/api/collection-groups`）と `describe`（外部 DB 連携 S3）、および
 //! 収集グループの作成・更新ペイロード（`CollectionGroupPayload`）。
 //!
-//! `rest.rs` から中身を変えずに移したもの（docs/banto-hub-driver-refactor-plan.md §8.1、
+//! `rest.rs` から中身を変えずに移したもの（docs/hub/driver/banto-hub-driver-refactor-plan.md §8.1、
 //! P0-1 の手順 4）。I1 CRUD の共通層は `rest/crud.rs` にあり、認証・ガード・監査の補助は
 //! 親の `rest.rs` にある。どちらも `use super::{...}` で使う。外から使われるパス
 //! （`crate::rest::X`）は親の re-export で保つ。
@@ -14,7 +14,7 @@ use super::{
     RegistryMutationResult, Response, Serialize, State, StatusCode, TagRegistryState,
 };
 
-/// T19 S1-b（UX-34、docs/banto-hub-t19-design.md §2）: a
+/// T19 S1-b（UX-34、docs/hub/banto-hub-t19-design.md §2）: a
 /// `CollectionGroupPayload` missing `defaultWritable` (an old client, or a
 /// create/update that never mentions it) keeps the same default as the
 /// column itself (`migrations/0012_collection_groups_add_default_writable
@@ -40,7 +40,7 @@ pub struct CollectionGroupPayload {
     /// 同じ既定値）。
     #[serde(default = "default_group_writable")]
     pub default_writable: bool,
-    /// 外部 DB 連携 S2（docs/banto-hub-external-db-design.md §4.1・§4.2）:
+    /// 外部 DB 連携 S2（docs/hub/banto-hub-external-db-design.md §4.1・§4.2）:
     /// `protocol = "postgres"` の接続配下のグループが1周期ごとに実行する
     /// SELECT 文。`#[serde(default)]`（= `None`）なので、この列を知らない
     /// 既存クライアントの PLC グループ payload は無変更で通る
@@ -88,7 +88,7 @@ pub(super) async fn collection_groups_get(
 }
 
 /// `POST /api/collection-groups/{id}/describe` - S3
-/// (docs/banto-hub-external-db-design.md §4.6・§7 スライス表「S3: 列名候補の
+/// (docs/hub/banto-hub-external-db-design.md §4.6・§7 スライス表「S3: 列名候補の
 /// 提示」): 保存済みグループの `query_sql` を対象に、`db_source::describe_group`
 /// （5秒タイムアウトの `describe` 1回、実行はしない）を呼び、列名・
 /// PostgreSQL型・v1 対応可否を返す。タグ登録 UI の「列を取得」ボタンが

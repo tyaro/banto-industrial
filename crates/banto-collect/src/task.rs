@@ -210,7 +210,7 @@ pub(crate) type StatusMap = Arc<RwLock<HashMap<String, ConnectionStatus>>>;
 
 /// Drop every status entry whose key is not in `keys` - the [`StatusMap`]
 /// twin of [`crate::current::CurrentValuesHandle::retain`] (T7-1,
-/// docs/tag-server-design.md §4.3: a connection removed by
+/// docs/hub/tag-server-design.md §4.3: a connection removed by
 /// [`crate::collector::Collector::apply_config`] must not leave a stale
 /// `Stopped`/`Reconnecting` entry behind forever).
 pub(crate) fn retain_status(status: &StatusMap, keys: &HashSet<String>) {
@@ -223,7 +223,7 @@ pub(crate) fn retain_status(status: &StatusMap, keys: &HashSet<String>) {
 /// Everything one connection task shares with the rest of the engine.
 pub(crate) struct TaskContext {
     /// The *current* writer, read fresh on every append via `borrow().clone()`
-    /// rather than held for the task's lifetime (T7-1, docs/tag-server-design.md
+    /// rather than held for the task's lifetime (T7-1, docs/hub/tag-server-design.md
     /// §4.3): [`crate::collector::Collector::apply_config`] can rotate the
     /// writer (a config change that alters the collected tag/group set - and
     /// therefore the frozen `StoreConfig` schema - forces a fresh file) while

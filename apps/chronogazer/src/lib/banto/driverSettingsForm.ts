@@ -1,5 +1,5 @@
 /**
- * R2b-6c（docs/banto-hub-driver-ui-design.md §6.1・§6.2）: 機器のドライバの接続設定を
+ * R2b-6c（docs/hub/driver/banto-hub-driver-ui-design.md §6.1・§6.2）: 機器のドライバの接続設定を
  * `GET /api/drivers` のスキーマ（{@link DriverSettingField}）から組み立てる、依存の無い
  * 純関数。`DriverSettingsForm.svelte` は描画だけを持ち、判断（既定値・保存前の検査・
  * 送る `settings` の組み立て・ドライバを替えたときの引き継ぎ・サーバーの項目エラーの写し）は

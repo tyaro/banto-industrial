@@ -1,4 +1,4 @@
-//! 品質の梯子（docs/banto-hub-external-db-design.md §4.3「Quality の変換」）を
+//! 品質の梯子（docs/hub/banto-hub-external-db-design.md §4.3「Quality の変換」）を
 //! **純関数の状態機械**として切り出したもの。
 //!
 //! 元は `banto-hub-core` の `db_source/task.rs`（`run_group_tick` の 0 行・

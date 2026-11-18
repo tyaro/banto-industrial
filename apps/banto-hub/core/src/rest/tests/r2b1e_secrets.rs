@@ -1,4 +1,4 @@
-//! R2b-1e（docs/banto-hub-connection-settings-design.md §5.3・§6.5・§8 の 1・§9）: REST の
+//! R2b-1e（docs/hub/banto-hub-connection-settings-design.md §5.3・§6.5・§8 の 1・§9）: REST の
 //! 全入口（作成・更新・未適用キューに積む・取り消す・適用する）から送ったパスワードが、
 //! キューに平文で載らず（積む時点で封印）、応答に平文も封印した値も出ず、起動時の後処理と
 //! `VACUUM` の後は DB・WAL のバイト列に残らないこと。

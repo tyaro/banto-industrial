@@ -1,6 +1,6 @@
 /**
  * `admin` 限定の API キー管理クライアント（#1161 PR4b、`apps/chronogazer/core/src/rest/api_keys.rs` の
- * `/api/api-keys*` に対応、docs/chronogazer-agent-api-design.md §3.4）。HTTP（LAN・サービス）専用。
+ * `/api/api-keys*` に対応、docs/chronogazer/chronogazer-agent-api-design.md §3.4）。HTTP（LAN・サービス）専用。
  * 平文のキーは発行の応答（`IssuedApiKey.key`）にしか載らない（DB にはハッシュだけ）ので、呼び出し側は
  * その場で表示する。削除は失効済みのキーだけ（有効なキーは 409）。
  *

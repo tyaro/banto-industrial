@@ -1,5 +1,5 @@
 /**
- * S1（docs/banto-hub-external-db-design.md §3.1「案A: 既存3階層の流用」・
+ * S1（docs/hub/banto-hub-external-db-design.md §3.1「案A: 既存3階層の流用」・
  * §4.1・§6-4）: `protocol: "postgres"`（DB Source）接続の SvelteKit/TS 側
  * 受け入れテスト。実 PostgreSQL には依存しない。保存前テストの要求、
  * 応答を待つ間の操作の制限、成功/失敗の表示、保存前に行を作らないことを確認する。
@@ -15,7 +15,7 @@
  *    パスワードがある）と出て、パスワード欄は空欄のまま（絶対にプリ
  *    フィルしない）。接続先を変えて保存した場合は、422 の項目エラーが
  *    パスワード欄のそばに出る。
- * 4. **S3（docs/banto-hub-external-db-design.md §7 row S3）で更新**:
+ * 4. **S3（docs/hub/banto-hub-external-db-design.md §7 row S3）で更新**:
  *    「収集グループを作成」メニュー項目は S1 時点では無効化されていた
  *    （実装指示4「サーバーの422だけに頼らない」）が、S2/S2b で DB Source
  *    本体が実装されたため S3 でその制限を撤去した - この項目は常時有効に

@@ -1,5 +1,5 @@
 /**
- * ライブタグモニタ（T10、docs/ux-plan.md §2）のクライアント。
+ * ライブタグモニタ（T10、docs/archive/ux-plan.md §2）のクライアント。
  *
  * **2026-08-31 オーナー決定（案A の見落とし是正）**: catalog（`getCatalog`）・
  * WS 購読（`connectTagStream`）とも、元々は `/api/v1/tags`・`/api/v1/stream`

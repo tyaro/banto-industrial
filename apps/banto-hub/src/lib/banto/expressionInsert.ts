@@ -1,6 +1,6 @@
 /**
- * #342 段階C（docs/tag-server-design.md §4.2「一覧から挿入」、
- * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 追補）: 演算タグの式欄の
+ * #342 段階C（docs/hub/tag-server-design.md §4.2「一覧から挿入」、
+ * docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-C 追補）: 演算タグの式欄の
  * 「一覧から挿入」トグルが ON の間、タグ一覧グリッドの行クリックで
  * 挿入してよいかを判定する純関数群。
  *

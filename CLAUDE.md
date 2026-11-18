@@ -7,7 +7,7 @@
 実際に踏んだ事故だけを載せた表なので、実装を委譲する前・検証する前・マージする前に当たること。
 新しい事故を踏んだら同じ PR で 1 行足す。**
 全体計画は [docs/plan.md](docs/plan.md)、タグサーバー banto-hub の設計は
-[docs/tag-server-design.md](docs/tag-server-design.md)。
+[docs/hub/tag-server-design.md](docs/hub/tag-server-design.md)。
 
 ## 作業の引き継ぎ（2026-10-21 オーナー指示）
 

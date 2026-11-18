@@ -1,4 +1,4 @@
-# I6 (docs/tag-server-design.md §6-5「読み書き単一セッション」、2026-08-04/
+# I6 (docs/hub/tag-server-design.md §6-5「読み書き単一セッション」、2026-08-04/
 # 2026-08-05 決定): relay-wright W3-A の PLC access broker
 # (`apps/relay-wright/core/src/engine/broker.rs`) を共有クレートへ抽出した
 # もの。relay-wright とタグサーバー(banto-hub、T2-2 で配線)の両方が、同じ
@@ -6,7 +6,7 @@
 # 不変 - relay-wright 側の既存テストが回帰網（詳細は src/lib.rs 冒頭 doc）。
 [package]
 name = "banto-broker"
-description = "I6: PLC access broker（read/write 単一セッション、レジストリの Session 型ドライバでダイヤル）- relay-wright W3-A から抽出、banto-hub T2-2 と共用 (docs/tag-server-design.md §6-5)"
+description = "I6: PLC access broker（read/write 単一セッション、レジストリの Session 型ドライバでダイヤル）- relay-wright W3-A から抽出、banto-hub T2-2 と共用 (docs/hub/tag-server-design.md §6-5)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -28,7 +28,7 @@ test-util = []
 # `settings_to_api`（R2b-3a-2）。banto-tags は共通クレートなのでここから
 # 依存してよい（DB・ログ・監査・エンジン設定への依存はゼロ）。
 banto-tags = { path = "../banto-tags" }
-# R2b-3a-2 (docs/banto-hub-driver-io-design.md §4.2): 要求・応答の型
+# R2b-3a-2 (docs/hub/driver/banto-hub-driver-io-design.md §4.2): 要求・応答の型
 # (`TagSpec` / `WriteItem` → `Value` / `ItemError`、致命は `FatalError`)、
 # セッションの trait (`Session` / `SessionDriver`)、ダイヤルに使うレジストリ
 # (`DriverRegistry` の `DriverKind::Session`)。broker の要求の型が API の型に
@@ -53,4 +53,4 @@ futures-util = { workspace = true }
 serde_json = { workspace = true }
 # R1-4a: ブローカーの単体テストは in-memory の偽セッション（src/fake.rs）を相手に
 # する。SLMP / Modbus のシミュレータで broker 越しの振る舞いを見るテストは、
-# 各ドライバ crate の tests/broker.rs へ移した（docs/banto-driver-api-design.md §4.4）。
+# 各ドライバ crate の tests/broker.rs へ移した（docs/hub/driver/banto-driver-api-design.md §4.4）。

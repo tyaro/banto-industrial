@@ -1,5 +1,5 @@
 //! 設定モード ⇔ 運用モードの切り替えの配線（#623 PR-4。設計は
-//! `docs/chronogazer-service-design.md` §5 の「設定モード ⇔ 運用モード」・§4 の「#623 PR-4 の
+//! `docs/chronogazer/chronogazer-service-design.md` §5 の「設定モード ⇔ 運用モード」・§4 の「#623 PR-4 の
 //! 実装メモ」と、PR-1 設計書の §3.6・§3.9・§8 の PR-4）。
 //!
 //! SCM の扱いと待ち方（checkpoint が進む間は待つ・1061／1052 は待って出し直す・`relax-only` は `Ok` の

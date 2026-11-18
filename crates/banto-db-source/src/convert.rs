@@ -1,4 +1,4 @@
-//! DB Source の「列 → f64」変換戦略（docs/banto-hub-external-db-design.md
+//! DB Source の「列 → f64」変換戦略（docs/hub/banto-hub-external-db-design.md
 //! §4.4「値の型（v1 は数値・bool のみ）」）。
 //!
 //! ## なぜ describe + 生成ラッパーなのか

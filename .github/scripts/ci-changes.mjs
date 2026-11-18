@@ -146,7 +146,7 @@ export const RULES = [
  *   crates/banto-tagclient のテスト（src/close.rs）は
  *   apps/banto-hub/core/src/stream.rs を include_str! で読む。
  *   banto-hub-host は bin `banto-hub`・`banto-hub-elev` の package（R1-7a、
- *   docs/banto-driver-api-design.md §2.4）。
+ *   docs/hub/driver/banto-driver-api-design.md §2.4）。
  */
 export const RUST_PACKAGES = {
 	hub: ['banto-hub-core', 'banto-hub-host', 'banto-hub-shell', 'banto-hub-sink', 'banto-tagclient'],
@@ -169,7 +169,7 @@ export const RUST_PACKAGES = {
  * - e2e-chronogazer: `-p chronogazer-core`（banto-serve・dev_plc・chronogazer-server）
  * - driver-api: `-p banto-driver-api -p banto-driver-engine -p banto-driver-conformance`（MSRV の check・
  *   `--all-features` の clippy / test・cargo-semver-checks。R1-1・R1-2、
- *   docs/banto-driver-api-design.md §9.1）
+ *   docs/hub/driver/banto-driver-api-design.md §9.1）
  */
 export const JOB_PACKAGES = {
 	run_driver_api: ['banto-driver-api', 'banto-driver-engine', 'banto-driver-conformance'],

@@ -6,7 +6,7 @@
  * （`BANTO_HUB_E2E_DB_DIR`）/chronogazer（`BANTO_E2E_DB_DIR`）どちらの一時
  * ディレクトリも誤って消さないようにしている。
  *
- * T18-5a 第2段（docs/banto-hub-t18-design.md §4 決定6「実測ファースト」）の
+ * T18-5a 第2段（docs/hub/banto-hub-t18-design.md §4 決定6「実測ファースト」）の
  * 性能計測ハーネス専用 - 10,000 タグ・500 グループを seed するので、本体
  * e2e（`banto-hub.playwright.config.ts`）と DB を共有しない使い捨て DB に
  * している（共有 DB を汚さない、というオーナー指示）。

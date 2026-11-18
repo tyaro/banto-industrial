@@ -1,5 +1,5 @@
 //! Connection settings (WIT `record setting { key, value }`,
-//! docs/banto-driver-api-design.md §3.5).
+//! docs/hub/driver/banto-driver-api-design.md §3.5).
 //!
 //! [`Settings`] is an ordered list (the order is the UI's and the audit
 //! log's display order) with no duplicate keys; the field is private so the

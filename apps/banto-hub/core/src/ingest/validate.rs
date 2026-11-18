@@ -1,4 +1,4 @@
-//! 送り手のメッセージの検証（R2a-2c、docs/banto-hub-ingest-design.md §6.2・§6.3・§7）。
+//! 送り手のメッセージの検証（R2a-2c、docs/hub/banto-hub-ingest-design.md §6.2・§6.3・§7）。
 //! REST（[`super::rest`]）と R2a-2d の WebSocket が同じ関数を使う。
 //!
 //! 2 つの段に分ける:

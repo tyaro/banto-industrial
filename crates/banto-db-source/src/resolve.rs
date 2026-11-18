@@ -1,4 +1,4 @@
-//! `describe` の結果と、欲しい列名の突き合わせ（docs/banto-hub-external-db-design.md
+//! `describe` の結果と、欲しい列名の突き合わせ（docs/hub/banto-hub-external-db-design.md
 //! §4.1・§4.3・§4.4）。
 //!
 //! 元は `banto-hub-core` の `db_source/plan.rs` の `resolve_group` /

@@ -1,4 +1,4 @@
-//! 購読の共有ロジック (docs/tag-server-design.md §5.2「WebSocket（T1）」・
+//! 購読の共有ロジック (docs/hub/tag-server-design.md §5.2「WebSocket（T1）」・
 //! §5.4「gRPC（T4）」)。
 //!
 //! T1 時点では `crate::stream`(WebSocket `/api/v1/stream`)だけがこの
@@ -37,7 +37,7 @@
 //! `Result<ValueBatch, Status>` で異なるため、タスク本体までは統合しない)。
 //!
 //! ## per-tag read スコープの交差(H10 ③、Option B、
-//! docs/h10-3-read-scope-proposal.md §5 S4・§6)
+//! docs/archive/h10-3-read-scope-proposal.md §5 S4・§6)
 //!
 //! [`initial_values`]/[`evaluate`] は `scope: Option<&ApiKeyContext>` を
 //! 受け取り、[`resolve`] が返したマッチ集合をさらに

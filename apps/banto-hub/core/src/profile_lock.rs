@@ -1,5 +1,5 @@
-//! T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P2、
-//! docs/banto-hub-desktop-plan.md §16.2「mutex 命名決定」）:
+//! T17-1（docs/hub/banto-hub-t17-design.md §3「T17-1」・P2、
+//! docs/hub/banto-hub-desktop-plan.md §16.2「mutex 命名決定」）:
 //! `HubRuntime::start`冒頭で取る profile 単位の排他。3層のうち (b)/(c) を
 //! ここに実装する（(a) SCM `query_status`は`crate::service_manager`側）。
 //!

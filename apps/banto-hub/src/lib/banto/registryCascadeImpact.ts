@@ -1,5 +1,5 @@
 /**
- * T19 S2-b（UX-38、docs/banto-hub-t19-design.md §3.4「親の削除は『定義の
+ * T19 S2-b（UX-38、docs/hub/banto-hub-t19-design.md §3.4「親の削除は『定義の
  * み・履歴は残す』」、2026-09-02 オーナー決定）: 接続・収集グループの削除
  * 確認ダイアログ用ヘルパー。バックエンドが `banto_tags::plc_connection::
  * PlcConnectionService::cascade_delete_tx`/`banto_tags::collection_group::

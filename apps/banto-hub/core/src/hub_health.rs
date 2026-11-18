@@ -1,4 +1,4 @@
-//! T17-3（docs/banto-hub-t17-design.md §3「T17-3」・§4「T16-2 への引き渡し
+//! T17-3（docs/hub/banto-hub-t17-design.md §3「T17-3」・§4「T16-2 への引き渡し
 //! 契約」）: 設計 §4 に記述だけがあった [`HubHealthProbe`] を実装するモジュール。
 //!
 //! fallback UI（T16-2、desktop-plan §9.9）が「別の Banto Hub が使用中、
@@ -17,7 +17,7 @@
 //!   1回ずつ消費する queue の2段構成（[`crate::service_manager::MockServiceManager::inject_error`]
 //!   の一時失敗フックと同じ発想）。
 //! - **実 HTTP probe**は T17-3 時点では入れていなかったが、T16-2
-//!   （docs/banto-hub-t16-design.md §3「T16-2」）で
+//!   （docs/hub/banto-hub-t16-design.md §3「T16-2」）で
 //!   [`crate::http_hub_health::HttpHubHealthProbe`]として追加した -
 //!   [`crate::host_switch`]はこの trait だけに依存していたため、
 //!   [`crate::host_switch::HostSwitchEngine`]側の変更は不要だった

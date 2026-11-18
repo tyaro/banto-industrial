@@ -1,4 +1,4 @@
-//! Read-on-demand(「その場読み」、T20 ①b、docs/banto-hub-t20-design.md §3.1、
+//! Read-on-demand(「その場読み」、T20 ①b、docs/hub/banto-hub-t20-design.md §3.1、
 //! 案A「分離経路」)の共有実装。
 //!
 //! ## ①a(write_path.rs)との対称性・非対称性
@@ -142,7 +142,7 @@ pub fn plc_value_to_json(value: &PlcValue) -> serde_json::Value {
     }
 }
 
-/// T20 ①b(案A、docs/banto-hub-t20-design.md §3.1)の唯一の入口: `tag`
+/// T20 ①b(案A、docs/hub/banto-hub-t20-design.md §3.1)の唯一の入口: `tag`
 /// (外部名)を PLC からその場で読む。**current_values/tstore/収集タスクの
 /// string スキップには一切触れない**(このモジュールの doc comment参照) -
 /// catalog から接続情報を引き、`CollectorManager::sessions().handle_for`
@@ -193,7 +193,7 @@ pub async fn execute_read_now(
 
     // gate 5: broker への読み取り（R2b-3a-2: 要求は `TagSpec`、結果はタグごとの
     // `Result<Value, ItemError>`。broker はジョブに上限を掛けるので、応答しない
-    // セッションでも時間切れで返る - docs/banto-hub-driver-io-design.md §5.5）。
+    // セッションでも時間切れで返る - docs/hub/driver/banto-hub-driver-io-design.md §5.5）。
     let results = handle
         .read(vec![spec])
         .await
@@ -238,8 +238,8 @@ pub async fn execute_read_now(
     })
 }
 
-/// R2b-2c(docs/banto-hub-driver-address-design.md §4.1・§4.2)/ R2b-3a-2
-/// (docs/banto-hub-driver-io-design.md §4.2): 読み取り・書き込み(数値・文字列)が
+/// R2b-2c(docs/hub/driver/banto-hub-driver-address-design.md §4.1・§4.2)/ R2b-3a-2
+/// (docs/hub/driver/banto-hub-driver-io-design.md §4.2): 読み取り・書き込み(数値・文字列)が
 /// 共有する、PLC タグのアドレス解決。`conn.protocol` のドライバ(`registry`)の
 /// `parse_address` にタグの [`banto_tags::tag_kind`] を渡して
 /// [`banto_driver_api::DriverAddress`] を得て、その kind と組にした

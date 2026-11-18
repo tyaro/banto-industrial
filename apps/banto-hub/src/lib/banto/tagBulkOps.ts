@@ -1,5 +1,5 @@
 /**
- * T18-3b 一括操作（docs/banto-hub-t18-design.md「T18-3b 一括操作
+ * T18-3b 一括操作（docs/hub/banto-hub-t18-design.md「T18-3b 一括操作
  * （TAG-UX-D 中）」: 複数選択＋一括有効/無効・グループ移動。一括削除は
  * 当時は参照影響・復旧方法が未確定のためバックログ扱いで対象外だった
  * （T19 S2-c1、UX-37 でこのファイルに追加 - {@link formatTagsBulkDeleteConfirmMessage}

@@ -456,7 +456,7 @@ describe('ConnectionDrawer の dirty 判定（baseline は開いた時点のフ�
 	});
 });
 
-// --- R2a-2e: 取り込み口 push（docs/banto-hub-ingest-design.md §3.2・§7.1） ---
+// --- R2a-2e: 取り込み口 push（docs/hub/banto-hub-ingest-design.md §3.2・§7.1） ---
 
 function pushForm(overrides: Partial<PlcConnectionFormState> = {}): PlcConnectionFormState {
 	return {

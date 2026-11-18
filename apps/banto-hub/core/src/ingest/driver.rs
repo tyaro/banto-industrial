@@ -1,11 +1,11 @@
-//! `push` の静的な部分（R2a-2a、docs/banto-hub-ingest-design.md §2・§3.2・§3.3）:
+//! `push` の静的な部分（R2a-2a、docs/hub/banto-hub-ingest-design.md §2・§3.2・§3.3）:
 //! [`PushDriver`]（`banto_driver_api::DriverBase`）。
 //!
 //! `push` は R2a では Hub 側の `ExternalSource` で、`DriverKind::Session` でも
 //! `HostBound` でもない（§2 の表、Q1）。それでも識別・設定の検証・キーの検証は
 //! ドライバと同じ形（`DriverBase`）で持つ。**R2b-1a から host が `DriverKind::HostProvided`
 //! でレジストリへ登録する**（[`crate::host_provided`]、設計
-//! docs/banto-hub-connection-settings-design.md §4.1。I/O は Hub の収集の外部ソースのまま）。
+//! docs/hub/banto-hub-connection-settings-design.md §4.1。I/O は Hub の収集の外部ソースのまま）。
 //! `banto_drivers::builtin()` には入れない（`builtin()` は組み込みのドライバだけ。
 //! トリップワイヤ 2 は R2b-3a-2 から「`builtin()` の項目はすべて `Frame` か `Session`」、
 //! §2 の案 C）。core はこのために `banto-drivers` に依存しない（R2b-0 の決まりのまま）。

@@ -8,7 +8,7 @@ use tower::ServiceExt;
 //
 // 保存と同じ関数（`banto_tags::parse_tag_address` → `normalize_tag_address`）に、
 // 保存の入口と同じドライバのレジストリ（`CollectorManager::registry()`）を渡した
-// 結果を返す口の固定（設計 docs/banto-hub-driver-address-design.md §7.1）。
+// 結果を返す口の固定（設計 docs/hub/driver/banto-hub-driver-address-design.md §7.1）。
 // テストの環境のレジストリは `test_support::test_drivers()` の代役のドライバ
 // （`banto_plc` の文法を持つ）。
 

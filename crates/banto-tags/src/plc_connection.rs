@@ -22,7 +22,7 @@
 //! is the network/PC/IO/area access route in `banto_plc::slmp::SlmpConfig` - so
 //! `"slmp"` rows have no `unit_id` setting.
 //!
-//! ## `"virtual"` (T6-2, docs/tag-server-design.md §4.2/§4.3(a))
+//! ## `"virtual"` (T6-2, docs/hub/tag-server-design.md §4.2/§4.3(a))
 //!
 //! A third protocol joined the other two in migration
 //! `0007_plc_connections_allow_virtual.sql`: `"virtual"` names a connection
@@ -53,7 +53,7 @@
 //! migration `0007`'s own header), so this is purely an application-layer
 //! rule.
 //!
-//! ## `simulation` (T9-1, docs/ux-plan.md §1, 2026-08-06 オーナー決定)
+//! ## `simulation` (T9-1, docs/archive/ux-plan.md §1, 2026-08-06 オーナー決定)
 //!
 //! Migration `0008_plc_connections_add_simulation.sql` adds a `simulation`
 //! column (`INTEGER NOT NULL DEFAULT 0`), surfaced as [`PlcConnection::simulation`]/
@@ -82,7 +82,7 @@
 //! validation error at write time is more honest than a flag that is
 //! silently truthy in the database but never observed by anything.
 //!
-//! ## `"postgres"` (S1, docs/banto-hub-external-db-design.md §4.1・§6-4,
+//! ## `"postgres"` (S1, docs/hub/banto-hub-external-db-design.md §4.1・§6-4,
 //! 2026-09-06 オーナー決定「案A: 既存3階層の流用」)
 //!
 //! A fourth protocol joins the other three in migration
@@ -104,7 +104,7 @@
 //! `"modbus-tcp"` row can never carry a stray DB password.
 //!
 //! The password was a plaintext column until R2b-1d (§2.2's "v1 は MQTT と同じ平文").
-//! Since migration `0025` (docs/banto-hub-connection-settings-design.md §3.3・§5) it is
+//! Since migration `0025` (docs/hub/banto-hub-connection-settings-design.md §3.3・§5) it is
 //! a sealed row of `plc_connection_secrets` that `settings.password` refers to with
 //! `{"$secret": "<ref>"}`; this crate receives it already sealed
 //! ([`PlcConnectionInput::secrets`]) and never sees the plaintext
@@ -223,7 +223,7 @@
 //! accepts a `"hub"` connection (a Hub does not subscribe to itself) -
 //! `apps/banto-hub/core/src/rest.rs::reject_hub_connection_protocol`.
 //!
-//! ## `"push"` (R2a-2a, docs/banto-hub-ingest-design.md §3, 2026-10-21 オーナー決定)
+//! ## `"push"` (R2a-2a, docs/hub/banto-hub-ingest-design.md §3, 2026-10-21 オーナー決定)
 //!
 //! A sixth protocol joins in migration `0023_plc_connections_allow_push.sql`:
 //! `"push"` ([`PUSH_PROTOCOL`]) names a connection whose values an external
@@ -399,7 +399,7 @@ pub const POSTGRES_PROTOCOL: &str = "postgres";
 /// [`crate::tag::TagService`]'s hub-tag placement rules.
 pub const HUB_PROTOCOL: &str = "hub";
 
-/// The push-ingest protocol (docs/banto-hub-ingest-design.md §3, this
+/// The push-ingest protocol (docs/hub/banto-hub-ingest-design.md §3, this
 /// module's doc comment "`\"push\"`" section): a connection whose values are
 /// pushed *into* banto-hub by an external sender rather than dialed or
 /// subscribed to. Added to [`ALLOWED_PROTOCOLS`] and the SQL `CHECK` by
@@ -712,7 +712,7 @@ fn settings_to_write(input: &PlcConnectionInput) -> Option<PushSettings> {
 /// `SELECT protocol` of the connection a bridge's `db_connection_id` names.
 const BRIDGE_DB_CONNECTION_SQL: &str = "SELECT protocol FROM plc_connections WHERE id = ?";
 
-/// R2a-2a (docs/banto-hub-ingest-design.md §3.2・§10.2): a bridge's
+/// R2a-2a (docs/hub/banto-hub-ingest-design.md §3.2・§10.2): a bridge's
 /// `db_connection_id` must name an existing `"postgres"` connection. The one
 /// `settings` rule that needs the registry, so it runs here rather than in
 /// the pure `validate_push_settings`; `protocol` is the referenced row's
@@ -787,7 +787,7 @@ const PUSH_BRIDGES_REFERENCING_SQL: &str = "SELECT name FROM plc_connections \
      WHERE protocol = 'push' AND settings IS NOT NULL \
      AND json_extract(settings, '$.bridge.db_connection_id') = ? ORDER BY id";
 
-/// R2a-2e (docs/banto-hub-ingest-design.md §3.2): refuse to delete a
+/// R2a-2e (docs/hub/banto-hub-ingest-design.md §3.2): refuse to delete a
 /// connection that a `"push"` bridge's `settings.bridge.db_connection_id`
 /// still names - the same RESTRICT-style refusal banto-hub's
 /// `reject_delete_if_referenced_by_sink_group` gives a sink group's
@@ -829,7 +829,7 @@ where
 }
 
 /// A row of the `plc_connections` table, wire-shaped (camelCase) for a
-/// future settings grid (docs/recorder-requirements.md §6 "タグ設定"
+/// future settings grid (docs/chronogazer/recorder-requirements.md §6 "タグ設定"
 /// screen: "PLC 接続設定含む").
 ///
 /// ## R2b-7c: `settings` is the only protocol settings source
@@ -1032,7 +1032,7 @@ pub struct PlcConnectionInput {
     /// required-for-postgres/forbidden-otherwise rule as [`Self::database`].
     #[serde(default)]
     pub username: Option<String>,
-    /// R2b-1d (docs/banto-hub-connection-settings-design.md §5.3): what to do with each
+    /// R2b-1d (docs/hub/banto-hub-connection-settings-design.md §5.3): what to do with each
     /// secret key of the connection, **already sealed** by the caller (banto-hub's
     /// `secrets` module) - this crate never receives a plaintext secret. A key that is
     /// absent means [`SecretChange::Keep`]. Replaces the plaintext `password` field.
@@ -1396,7 +1396,7 @@ fn validation(field_errors: Vec<FieldError>) -> Result<(), BantoError> {
 #[derive(Clone)]
 pub struct PlcConnectionService {
     pool: SqlitePool,
-    /// R2b-1d（docs/banto-hub-connection-settings-design.md §4.2）: [`Self::with_registry`]
+    /// R2b-1d（docs/hub/banto-hub-connection-settings-design.md §4.2）: [`Self::with_registry`]
     /// で渡されたレジストリ。あるときは書き込みが旧い検証 (1) の後に (2)〜(4)（平らな形 →
     /// `settings` → `registry.get` → `validate_config`）を走らせ、秘密のキーと
     /// `settings_version` をドライバから引く。
@@ -1882,7 +1882,7 @@ impl PlcConnectionService {
                 return Err(err);
             }
         }
-        // R2b-2b (docs/banto-hub-driver-address-design.md §3.3, Q2): with a registry a
+        // R2b-2b (docs/hub/driver/banto-hub-driver-address-design.md §3.3, Q2): with a registry a
         // protocol change hands every tag of this connection (disabled and `string`
         // ones too) to the new driver in this same transaction. One that does not pass
         // refuses the change - nothing written - and the others are rewritten to the new
@@ -2091,7 +2091,7 @@ impl PlcConnectionService {
         Ok(())
     }
 
-    /// T19 S2-b（UX-38、docs/banto-hub-t19-design.md §3.4・§7.5、2026-09-02
+    /// T19 S2-b（UX-38、docs/hub/banto-hub-t19-design.md §3.4・§7.5、2026-09-02
     /// オーナー決定「タグがあってもグループ・接続を削除可。定義のみ削除し、
     /// 履歴は残す」）: [`Self::delete`]/[`Self::delete_tx`] とは別の、
     /// カスケード削除の入口。この接続配下の全グループの全タグ →
@@ -4639,7 +4639,7 @@ mod tests {
         svc.get(conn.id).await.expect("connection should survive");
     }
 
-    // --- T19 S2-b (UX-38, docs/banto-hub-t19-design.md §3.4/§7.5): cascade
+    // --- T19 S2-b (UX-38, docs/hub/banto-hub-t19-design.md §3.4/§7.5): cascade
     // delete - deliberately a NEW method (`cascade_delete`/`cascade_delete_tx`),
     // not a change to `delete`/`delete_tx` above. See `cascade_delete_tx`'s
     // own doc comment for why the guarded methods stay untouched (relay-wright
@@ -5688,7 +5688,7 @@ mod tests {
         );
     }
 
-    /// R2a-2e (docs/banto-hub-ingest-design.md §3.2): a postgres connection
+    /// R2a-2e (docs/hub/banto-hub-ingest-design.md §3.2): a postgres connection
     /// a push bridge reads from cannot be deleted through any delete entry
     /// (`delete`, `delete_tx`, `cascade_delete_tx`); the message names the
     /// bridge. Once the bridge no longer names it (settings replaced), the
@@ -5842,7 +5842,7 @@ mod tests {
     /// (whole file, one pinned connection, one transaction) to a database the
     /// real migrator brought up to 0022 and that has rows in every table.
     ///
-    /// Checks (docs/banto-hub-ingest-design.md §11, R2a-2a): every column of
+    /// Checks (docs/hub/banto-hub-ingest-design.md §11, R2a-2a): every column of
     /// every row survives - `cpu_type` included - and `settings` is NULL;
     /// `sqlite_sequence` is unchanged for every table; **no id is reused**
     /// (a non-max id and the max id were deleted before 0023, and the next
@@ -6352,7 +6352,7 @@ mod tests {
         );
     }
 
-    // ---- R2b-1d: migration 0025 (docs/banto-hub-connection-settings-design.md §6.2・§9) ----
+    // ---- R2b-1d: migration 0025 (docs/hub/banto-hub-connection-settings-design.md §6.2・§9) ----
 
     /// Every trigger and `idx_*` index, with its full SQL text, sorted.
     async fn trigger_and_index_sql(conn: &mut SqliteConnection) -> Vec<(String, String, String)> {

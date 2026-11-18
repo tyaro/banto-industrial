@@ -168,7 +168,7 @@ async fn a_changed_modbus_unit_id_or_word_order_changes_the_resolved_dial_identi
     assert!(changed, "word_order の変更");
 }
 
-/// R2b-6b（docs/banto-hub-driver-ui-design.md §5）: 接続テストの `settings` はフォームの値だけを
+/// R2b-6b（docs/hub/driver/banto-hub-driver-ui-design.md §5）: 接続テストの `settings` はフォームの値だけを
 /// スキーマに通す（省いた `cpu_type`・`word_order` はスキーマの既定。保存済みからは引き継がない。
 /// #790 の「保存済みの CPU を引き継ぐ」は MCP の平らな形のアダプタに移した）。保存済みの接続は
 /// `connectionId` が**同じプロトコル**のときだけ返る（指紋用の参照の出どころ）。
@@ -981,7 +981,7 @@ pub(super) fn modbus_flat_input(name: &str, port: i64) -> banto_tags::PlcConnect
     }
 }
 
-/// T19 S2-a 案B (UX-48, docs/banto-hub-t19-design.md §3.8, 2026-09-03)
+/// T19 S2-a 案B (UX-48, docs/hub/banto-hub-t19-design.md §3.8, 2026-09-03)
 /// で追加、#341 (2026-09-14) で live re-apply 経路の回帰テストとして
 /// 引き継いだ: a manager/controller pair without the router/RBAC/session
 /// layer around it, so the tests below can call

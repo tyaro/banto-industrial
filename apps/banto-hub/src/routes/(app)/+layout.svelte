@@ -1,7 +1,7 @@
 <script lang="ts">
 	// relay-wright の同名ファイルから複製（banto v2.0.0 の配線①②と世代ゲートは
 	// admin-template から写した。下の「3 本の配線」）。
-	// T19 S1-d（UX-45、docs/banto-hub-t19-design.md §3.6、2026-09-03）:
+	// T19 S1-d（UX-45、docs/hub/banto-hub-t19-design.md §3.6、2026-09-03）:
 	// `CommissioningBanner`（試運転モードの常時表示バナー）を撤去した
 	// （2026-09-02 オーナー決定「常時表示しない」）。安全性は損なわれない -
 	// 試運転モード中は非 loopback バインドが構造的に拒否される
@@ -284,7 +284,7 @@
 
 <style>
 	/*
-	 * T19 S3-a（UX-43、docs/banto-hub-t19-design.md §8.2）: 真の固定。
+	 * T19 S3-a（UX-43、docs/hub/banto-hub-t19-design.md §8.2）: 真の固定。
 	 * ページ全体をスクロールさせるのではなく、シェルをビューポート全高に
 	 * 固定し（`overflow: hidden`）、ヘッダーは縮まない固定領域、本文
 	 * （`main`）だけが独自スクロール領域を持つ。position: fixed は使わない

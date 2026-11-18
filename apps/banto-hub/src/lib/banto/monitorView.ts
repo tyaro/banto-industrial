@@ -1,5 +1,5 @@
 /**
- * #1179 PR3b（docs/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、段階 ①
+ * #1179 PR3b（docs/hub/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、段階 ①
  * 「2 つのページでツリーの選択を共有する」）: タグモニタ（`(app)/monitor/+page.svelte`）
  * の URL の形。対象はタグ登録と同じ `?target=connection:<id>` / `group:<id>`
  * （`#lib/banto/tagsView.ts` の `parseTreeTarget`・`treeTargetSearch`）。

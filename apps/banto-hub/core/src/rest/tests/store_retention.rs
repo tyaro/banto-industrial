@@ -5,7 +5,7 @@ use axum::http::Request as HttpRequest;
 use banto_tstore::{Clock, ManualClock};
 use tower::ServiceExt;
 
-// --- T19 S2-d (docs/banto-hub-t19-design.md §5.1、UX-39): 履歴の保持
+// --- T19 S2-d (docs/hub/banto-hub-t19-design.md §5.1、UX-39): 履歴の保持
 // 期間 - GET/PUT /api/store-settings と POST /api/store-settings/
 // prune-preview・prune-now -------------------------------------------
 

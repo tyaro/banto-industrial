@@ -1,7 +1,7 @@
 //! 書き込みエンドポイント: `POST /api/v1/values/{tag}`（T2-4、設計 §5.1・§6）と
-//! レシピ一括書き込み `POST /api/v1/values/batch`（T20-3a、docs/banto-hub-t20-design.md §3.3）。
+//! レシピ一括書き込み `POST /api/v1/values/batch`（T20-3a、docs/hub/banto-hub-t20-design.md §3.3）。
 //!
-//! `rest.rs` から中身を変えずに移したもの（docs/banto-hub-driver-refactor-plan.md §8.1、
+//! `rest.rs` から中身を変えずに移したもの（docs/hub/driver/banto-hub-driver-refactor-plan.md §8.1、
 //! P0-1 の手順 7）。ルーターへの組み込み（`tag_space_router`）は `rest/tag_space.rs`、
 //! OpenAPI の `ApiDoc` は親の `rest.rs` にある。外から使われるパス（`crate::rest::X`）は
 //! 親の re-export で保つ。
@@ -41,7 +41,7 @@ use crate::api_keys::HubScopeChecks;
 // へ変換する [`write_rejection_response`] のみ。
 
 /// `POST /api/v1/values/{tag}` の request body（設計 §5.1「body
-/// `{ "v": <number|bool> }`」、T20 ①a で文字列を追加 - docs/banto-hub-t20-design.md
+/// `{ "v": <number|bool> }`」、T20 ①a で文字列を追加 - docs/hub/banto-hub-t20-design.md
 /// §3.1）。`v` は `serde_json::Value` のまま保持し、[`parse_requested_value`]
 /// で数値/真偽値/文字列のみを受理する（配列・オブジェクトは 422）—
 /// `bool`/`number`/`string` を1つの Rust 型に素直にマップする serde 表現が
@@ -66,7 +66,7 @@ pub(super) struct WriteValueResponse {
 
 /// リクエスト body の `v` を [`crate::write_path::RequestedValue`] に正規化
 /// する。`bool` は [`RequestedValue::Bool`]、数値は [`RequestedValue::Num`]、
-/// 文字列は [`RequestedValue::Str`](T20 ①a、docs/banto-hub-t20-design.md
+/// 文字列は [`RequestedValue::Str`](T20 ①a、docs/hub/banto-hub-t20-design.md
 /// §3.1 で追加 - string タグへの書き込みに使う)。どちらの型が来たかは
 /// gate 7（`crate::write_path::execute_write`）が data_type との対称性検査に
 /// 使うので、ここで `f64` へ潰さない（2026-08-06 変更: 従来は `bool` を
@@ -259,7 +259,7 @@ pub(super) async fn v1_write_value(
     }
 }
 
-// --- レシピ一括書き込み（T20-3a、docs/banto-hub-t20-design.md §3.3） -------
+// --- レシピ一括書き込み（T20-3a、docs/hub/banto-hub-t20-design.md §3.3） -------
 //
 // `POST /api/v1/values/batch`。ゲート1〜8の本体は
 // `crate::write_path::execute_write_batch` へ丸ごと委譲する（単票

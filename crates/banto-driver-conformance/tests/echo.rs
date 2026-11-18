@@ -1,4 +1,4 @@
-//! The harness's self-check (docs/banto-driver-api-design.md §10 R1-2):
+//! The harness's self-check (docs/hub/driver/banto-driver-api-design.md §10 R1-2):
 //! the reference `EchoFrameDriver` passes `frame::run_all` under every
 //! framing rule, and deliberately broken variants of it are caught by the
 //! check that guards the broken contract.

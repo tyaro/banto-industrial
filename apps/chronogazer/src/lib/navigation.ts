@@ -48,7 +48,7 @@
  * 純粋関数に切り出した）、`navBarEntries()`（グループを最初のメンバーの位置に集める）、
  * `isNavItemActive()` を足した。メニューバー（`ShellMenubar.svelte`）・ドック
  * （`ShellLauncher.svelte`）・サイドバーが同じ関数で並べる。並びは改善案
- * （docs/chronogazer-ui-improvement-proposal.md）に合わせ「監視 / ヒストリカル /
+ * （docs/chronogazer/chronogazer-ui-improvement-proposal.md）に合わせ「監視 / ヒストリカル /
  * イベント / 記録 / 表示グループ / 管理 ▾（ユーザー管理・監査ログ、admin だけ）/ 設定」。
  * `adminOnly` の項目は 1 つの「管理」グループとして**最初の管理項目の位置**に集める
  * （`group` の指定は要らない）。表の順はサイドバー・コマンドパレットの並びでもある。

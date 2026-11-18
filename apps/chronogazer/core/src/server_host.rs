@@ -1,5 +1,5 @@
 //! 画面の無い本番用の host `chronogazer-server`（#392 段階 B の B1-5、2026-10-13。
-//! 設計は docs/chronogazer-service-design.md §3.1(b)・§4 の B1-5）の、OS に
+//! 設計は docs/chronogazer/chronogazer-service-design.md §3.1(b)・§4 の B1-5）の、OS に
 //! 依存しない部分。
 //!
 //! `src/bin/chronogazer-server.rs` は「引数・環境変数を読む → ログを開く →

@@ -1,4 +1,4 @@
-//! 送信口の上限（R2a-2c、docs/banto-hub-ingest-design.md §7・§12 Q4）。
+//! 送信口の上限（R2a-2c、docs/hub/banto-hub-ingest-design.md §7・§12 Q4）。
 //!
 //! 数値は `banto_tags::push::PUSH_LIMITS` の 1 か所だけ（登録時の見積もり
 //! `bridge_load`・ブリッジの分割と同じ値。§7.1、オーナーの監査 (8)）。ここは判定だけを

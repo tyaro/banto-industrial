@@ -1,4 +1,4 @@
-//! R2a-2c の完了の確かめ（docs/banto-hub-ingest-design.md §11 の R2a-2c の行）:
+//! R2a-2c の完了の確かめ（docs/hub/banto-hub-ingest-design.md §11 の R2a-2c の行）:
 //! `POST /api/v1/ingest/{id}/values` を本物のルーター（`api_router`）越しに叩く。
 //!
 //! - §6 の応答の表の総当たり（401・403 の 3 種・404 の 2 種・409 の 2 種・400・413・

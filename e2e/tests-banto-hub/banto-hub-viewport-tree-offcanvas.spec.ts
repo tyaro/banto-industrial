@@ -1,5 +1,5 @@
 /**
- * #378（2026-09-16 オーナー決定、docs/banto-hub-desktop-plan.md §9.4
+ * #378（2026-09-16 オーナー決定、docs/hub/banto-hub-desktop-plan.md §9.4
  * TAG-UX-G）: 狭幅でタグ登録・タグモニタの左ツリーをオフキャンバスへ退避する
  * ことの実 DOM 受け入れテスト。
  *

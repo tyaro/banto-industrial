@@ -1,4 +1,4 @@
-//! 書き込みレート制限 (docs/tag-server-design.md §6-4「レート制限
+//! 書き込みレート制限 (docs/hub/tag-server-design.md §6-4「レート制限
 //! ブレーカ」、§6 実装指示 §3)。relay-wright の `engine/rate_limiter.rs`
 //! (コネクション毎 + 全体の2段スライディングウィンドウ) を、hub の語彙で
 //! **タグ毎 + 全体**の2段に読み替えて移植したもの。構造・意味論・

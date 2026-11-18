@@ -1,5 +1,5 @@
 //! この PC からの接続を通す grant `localDesktop`（#392 段階 B の B2-1、H8、2026-10-14。
-//! 設計は docs/chronogazer-service-design.md §3.2・§4 の B2-1・§5 の決定 8）。
+//! 設計は docs/chronogazer/chronogazer-service-design.md §3.2・§4 の B2-1・§5 の決定 8）。
 //!
 //! サービス（B3）では画面（シェル）とエンジンが別のプロセスになり、シェルはエンジンの
 //! loopback の listener へ HTTP で入る。そのときにログイン画面を挟まずに入れる口が

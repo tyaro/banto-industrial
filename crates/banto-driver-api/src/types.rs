@@ -1,6 +1,6 @@
 //! Values and data types that cross the driver boundary.
 //!
-//! Two groups live here (docs/banto-driver-api-design.md §3.1 / §3.2):
+//! Two groups live here (docs/hub/driver/banto-driver-api-design.md §3.1 / §3.2):
 //!
 //! - **Moved from `banto-plc` (R1-1), not `#[non_exhaustive]`**: [`DataType`],
 //!   [`TagValue`], [`Value`] (`banto_plc::PlcValue`), [`StringEncoding`],
@@ -152,7 +152,7 @@ pub enum TagValue {
 }
 
 /// Character encoding of a string tag's word span (T20 ①b,
-/// docs/banto-hub-t20-design.md §3.1). Selects which `encoding_rs` table
+/// docs/hub/banto-hub-t20-design.md §3.1). Selects which `encoding_rs` table
 /// `banto-plc` decodes with / `banto-plc-write` encodes with; the
 /// byte-packing convention itself (low byte first within each word -
 /// MELSEC's storage convention) is unaffected by this choice, exactly as

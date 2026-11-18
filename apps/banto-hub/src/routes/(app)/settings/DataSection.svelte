@@ -71,7 +71,7 @@
 	onMount(scrollToConfigPackageIfHashed);
 	afterNavigate(scrollToConfigPackageIfHashed);
 
-	// --- 履歴の保持期間（T19 S2-d、docs/banto-hub-t19-design.md §5.1、UX-39、
+	// --- 履歴の保持期間（T19 S2-d、docs/hub/banto-hub-t19-design.md §5.1、UX-39、
 	// admin 限定） -------------------------------------------------------------
 	//
 	// 2026-09-03 オーナー決定1: 「保存」ボタンは保持方針を**保存するだけ**
@@ -412,7 +412,7 @@
 				{/if}
 				{#if configPackageInspection.ingestConnections.length > 0}
 					<!--
-						R2a-2e（docs/banto-hub-ingest-design.md §5.1）: 構成パッケージは
+						R2a-2e（docs/hub/banto-hub-ingest-design.md §5.1）: 構成パッケージは
 						API キーを持ち運ばず、取り込み先では push 接続の id が変わる
 						（送り手の URL とスコープ ingest:#{id} も変わる）。
 					-->

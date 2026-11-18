@@ -6,9 +6,9 @@ FA-Server 型の独立タグサーバー。産業用 PLC（Modbus TCP / MELSEC S
 のヘッドレス単一 exe**（`banto-hub.exe`）で、管理 UI もこのプロセス自身が
 配信する。
 
-設計の背景・決定事項は [../../docs/tag-server-design.md](../../docs/tag-server-design.md)、
+設計の背景・決定事項は [../../docs/hub/tag-server-design.md](../../docs/hub/tag-server-design.md)、
 現場での運用手順（API キー運用・TLS/リバースプロキシ・Windows サービス化・
-インストーラ等）は [../../docs/banto-hub-operations.md](../../docs/banto-hub-operations.md)
+インストーラ等）は [../../docs/hub/banto-hub-operations.md](../../docs/hub/banto-hub-operations.md)
 を参照。本 README は最小限の起動方法のみを扱う。
 
 ## 起動方法
@@ -30,7 +30,7 @@ cargo run -p banto-hub-host --bin banto-hub --features embed-ui
 引数なしはコンソールモード（Ctrl-C で停止）。Windows では
 `banto-hub.exe install` / `uninstall` / `run-service` でサービス化もできる
 （`host/src/bin/banto_hub/win_service.rs`。手順は
-[../../docs/banto-hub-operations.md](../../docs/banto-hub-operations.md) の
+[../../docs/hub/banto-hub-operations.md](../../docs/hub/banto-hub-operations.md) の
 「Windows サービス化」節を参照）。
 
 管理UIの画面だけを Vite の dev server（ホットリロード付き）で動かしたい
@@ -64,7 +64,7 @@ $env:BANTO_ALLOW_SETUP = "1"
 ```
 
 詳細は
-[../../docs/banto-hub-operations.md](../../docs/banto-hub-operations.md)
+[../../docs/hub/banto-hub-operations.md](../../docs/hub/banto-hub-operations.md)
 の「起動・環境変数」節を参照。
 
 ## OPC UA 外部クライアント smoke
@@ -83,11 +83,11 @@ python3.12 -m venv /tmp/banto-hub-opcua-interop-venv
 ```
 
 検証範囲と未実施の Windows Service / UaExpert 手動確認は
-[../../docs/banto-hub-opcua-verification.md](../../docs/banto-hub-opcua-verification.md)
+[../../docs/testing/banto-hub-opcua-verification.md](../../docs/testing/banto-hub-opcua-verification.md)
 を参照。
 
 ## 関連ドキュメント
 
-- 設計: [../../docs/tag-server-design.md](../../docs/tag-server-design.md)
-- 運用ガイド: [../../docs/banto-hub-operations.md](../../docs/banto-hub-operations.md)
+- 設計: [../../docs/hub/tag-server-design.md](../../docs/hub/tag-server-design.md)
+- 運用ガイド: [../../docs/hub/banto-hub-operations.md](../../docs/hub/banto-hub-operations.md)
 - 全体計画（T系マイルストーン）: [../../docs/plan.md](../../docs/plan.md) §4c

@@ -1,4 +1,4 @@
-//! #1161 PR5b: `POST /mcp` のテスト（docs/chronogazer-agent-api-design.md §8 の
+//! #1161 PR5b: `POST /mcp` のテスト（docs/chronogazer/chronogazer-agent-api-design.md §8 の
 //! ChronoGazer の MCP）。
 //!
 //! どれも**本物の `api_router`**（`crate::rest::tests` のヘルパーが組む物）に HTTP の

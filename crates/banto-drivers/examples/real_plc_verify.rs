@@ -1,10 +1,10 @@
-//! T5-5 実機検証ツール（docs/t5-handoff.md §3 T5-5、docs/tag-server-design.md
+//! T5-5 実機検証ツール（docs/archive/t5-handoff.md §3 T5-5、docs/hub/tag-server-design.md
 //! §9 T5 行、docs/plan.md W5 の残項目「実機検証」に対応）。
 //!
 //! R2b-3d-join で、旧 `SlmpClient` / `SlmpWriteClient` の I/O から
 //! **エンジン経由**（`FrameSession::connect` + フレーム型の `SlmpDriver`、
 //! `Session` の `read_batch` / `write_batch`）に書き直した
-//! （docs/banto-hub-driver-io-design.md §6.2）。ワード内ビットの書き込みは
+//! （docs/hub/driver/banto-hub-driver-io-design.md §6.2）。ワード内ビットの書き込みは
 //! ドライバの `write_next` が RMW で行う（`D<n>.<b>` への Bit 書き込み）。
 //!
 //! 既定の対象は三菱 R08ENCPU（iQ-R、`192.168.11.200:5200`、CPU 種別 R）。

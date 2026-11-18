@@ -1,5 +1,5 @@
 /**
- * S6（docs/banto-hub-external-db-design.md §5.2・§5.3・§5.5・§7 row S6）: DB
+ * S6（docs/hub/banto-hub-external-db-design.md §5.2・§5.3・§5.5・§7 row S6）: DB
  * Sink の sink group 管理画面（`/sink`）と状態画面（`/status`）の「DB
  * Sink」節の SvelteKit/TS 側受け入れテスト。実 PostgreSQL には依存しない -
  * `banto-hub-tags-db-source-connection.spec.ts`（S1/S3）と同じ方針で、

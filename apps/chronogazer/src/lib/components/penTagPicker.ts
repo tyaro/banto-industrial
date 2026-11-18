@@ -1,5 +1,5 @@
 /**
- * #1179 PR6b（docs/chronogazer-ui-improvement-proposal.md §4、2026-11-18）:
+ * #1179 PR6b（docs/chronogazer/chronogazer-ui-improvement-proposal.md §4、2026-11-18）:
  * 「表示グループ」ページの右ペイン「タグ選択」（`PenTagPicker.svelte`）の判断を、
  * DOM に依存しない純関数に出したもの。unit test で確かめる。
  *

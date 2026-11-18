@@ -1,4 +1,4 @@
-//! サービスの Hub の、動いている間の周期の確かめ（#1121 PR2c。docs/hub-desktop-tls-design.md
+//! サービスの Hub の、動いている間の周期の確かめ（#1121 PR2c。docs/hub/hub-desktop-tls-design.md
 //! §4.4.1「照合する時点」のサービスの Hub、§4.4.2 の場面 8・25・26、§7「PR2 で決めたこと」1〜4・
 //! 「PR2c で決めたこと」）。
 //!

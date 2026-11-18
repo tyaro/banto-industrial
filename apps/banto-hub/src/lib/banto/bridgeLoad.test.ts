@@ -1,5 +1,5 @@
 /**
- * `bridgeLoad.ts` のユニットテスト（R2a-2e、docs/banto-hub-ingest-design.md §7.1）。
+ * `bridgeLoad.ts` のユニットテスト（R2a-2e、docs/hub/banto-hub-ingest-design.md §7.1）。
  *
  * 表の値は `bridgeLoad.fixtures.json` にあり、Rust の
  * `apps/banto-hub/core/src/ingest/bridge_load_fixtures.rs` が同じ fixtures を

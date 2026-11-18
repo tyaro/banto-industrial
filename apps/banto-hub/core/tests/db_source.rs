@@ -1,4 +1,4 @@
-//! 外部 DB 連携 S2 / S2b の統合テスト（docs/banto-hub-external-db-design.md
+//! 外部 DB 連携 S2 / S2b の統合テスト（docs/hub/banto-hub-external-db-design.md
 //! §7 のスライス表「S2 の完了条件: ローカル PostgreSQL に対する統合テスト -
 //! 正常・NULL・0 行・クエリエラー・接続断からの復帰」と「S2b の完了条件:
 //! 停止中は接続しない・開始で復帰」）。
@@ -290,7 +290,7 @@ async fn test_app(label: &str) -> TestApp {
     let sessions = Arc::new(HubSessions::new(
         banto_broker::BackoffConfig::default(),
         // R2b-0: ドライバ無し（このテストは PLC と通信しない。core は
-        // banto-drivers に依存しない。docs/banto-driver-api-design.md §2.4）。
+        // banto-drivers に依存しない。docs/hub/driver/banto-driver-api-design.md §2.4）。
         common::no_io_drivers(),
     ));
     let sim_registry = Arc::new(BrokerSimRegistry::new());

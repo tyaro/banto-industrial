@@ -1,4 +1,4 @@
-//! 利用者の失効の記録（#1121 PR1b。docs/hub-desktop-tls-design.md §4.4.1・§4.4.2）: 記録の形
+//! 利用者の失効の記録（#1121 PR1b。docs/hub/hub-desktop-tls-design.md §4.4.1・§4.4.2）: 記録の形
 //! （[`RevocationRecord`]）、ロック無しの照合の読み口（[`read_user_revocations`]）、整える手順
 //! （[`reconcile_user_revocations`]）、失効を書き足す口（[`record_user_revocation`]）。Hub の
 //! デスクトップ版と ChronoGazer デスクトップが同じコードを使う。

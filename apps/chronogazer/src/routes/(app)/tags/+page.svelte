@@ -2,7 +2,7 @@
 	/**
 	 * 「記録」ページ（#383 段階2a / R1-B、recorder-requirements.md §6）。
 	 *
-	 * **3 ペイン（#1179 PR4b、2026-11-18、docs/chronogazer-ui-improvement-proposal.md
+	 * **3 ペイン（#1179 PR4b、2026-11-18、docs/chronogazer/chronogazer-ui-improvement-proposal.md
 	 * §2.1）**: HUB のタグページ（#1179 PR2a〜PR3c）と同じ banto 系の型にした。
 	 * - 左 = `RecordTree`（`@banto/tree-svelte` の `BantoTree`。すべて / 接続先 /
 	 *   収集グループ。記録項目はツリーに出さない）。上のツールバーに「接続先を追加」
@@ -1340,7 +1340,7 @@
 
 	// --- #1179 PR4b: 3 ペインの状態（右ペイン・中央のタブ・URL） -----------------
 	//
-	// docs/chronogazer-ui-improvement-proposal.md §2.1（2026-11-18）。HUB のタグ
+	// docs/chronogazer/chronogazer-ui-improvement-proposal.md §2.1（2026-11-18）。HUB のタグ
 	// ページ（`apps/banto-hub/src/routes/(app)/tags/+page.svelte`、#1179 PR3a）の
 	// 作法を写す:
 	// - **画面の操作（ツリー・タブ）は状態を先に同期で変え、URL は後から追う**

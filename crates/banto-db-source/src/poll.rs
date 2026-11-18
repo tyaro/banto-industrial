@@ -1,5 +1,5 @@
-//! ポーリングの失敗の分類と時間の決まり（docs/banto-hub-external-db-design.md §4.2・
-//! §4.3、docs/banto-hub-ingest-design.md §10.3）。
+//! ポーリングの失敗の分類と時間の決まり（docs/hub/banto-hub-external-db-design.md §4.2・
+//! §4.3、docs/hub/banto-hub-ingest-design.md §10.3）。
 //!
 //! 元は `banto-hub-core` の `db_source/task.rs` の `PgFailure`・`classify`・
 //! `query_timeout`・`describe_retry_interval`。R2a-3b で DB ブリッジ

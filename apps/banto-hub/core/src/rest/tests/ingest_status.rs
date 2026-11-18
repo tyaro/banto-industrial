@@ -1,4 +1,4 @@
-//! R2a-2e の完了の確かめ（docs/banto-hub-ingest-design.md §11 の R2a-2e の行）の
+//! R2a-2e の完了の確かめ（docs/hub/banto-hub-ingest-design.md §11 の R2a-2e の行）の
 //! サーバー側:
 //!
 //! - `GET /api/status`（camelCase）・`GET /api/v1/status`（snake_case）の `ingest` 節

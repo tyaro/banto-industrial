@@ -1,6 +1,6 @@
 /**
- * T18-2e（docs/banto-hub-t18-design.md「T18-2e T13-3 移管（右クリック作成
- * ＋常時表示作成）」、docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A「T13-3
+ * T18-2e（docs/hub/banto-hub-t18-design.md「T18-2e T13-3 移管（右クリック作成
+ * ＋常時表示作成）」、docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-A「T13-3
  * の右クリック作成に加え、キーボード・タッチでも使える常時表示の作成操作を
  * 必ず用意する」）: タグ登録画面のツリー（`ConnectionTree.svelte`）で右
  * クリック（またはキーボードのコンテキストメニューキー。banto の `BantoTree`
@@ -23,7 +23,7 @@
  *   （`openCreateDrawer`、`resolveGroupIdFromTreeSelection` 経由で選択中
  *   ノードからプリセットする既存 T18-2d ロジック）をそのまま開けばよい）。
  *
- * T19 S1-d（docs/banto-hub-t19-design.md UX-30、2026-09-03）追記:
+ * T19 S1-d（docs/hub/banto-hub-t19-design.md UX-30、2026-09-03）追記:
  * `createConnection`/`createGroup` はもともと T18-2e 時点では
  * `/plc-connections`・`/collection-groups` への `goto`（`href` 付き）
  * だったが、T18-6d で「その場で Drawer を開く」方式に置き換わって以来
@@ -33,7 +33,7 @@
  * 削除された（設計 §3.1・§7.1）のに合わせ、この死んだ `href` フィールドと
  * `tagOnboarding.ts::collectionGroupsHref` への依存を除去した。
  *
- * T19 S1-a（docs/banto-hub-t19-design.md §7.1、2026-09-02）追記: T18-2e〜
+ * T19 S1-a（docs/hub/banto-hub-t19-design.md §7.1、2026-09-02）追記: T18-2e〜
  * T18-6d 時点は `calc`/`mem`（`protocol: 'virtual'`）接続、およびその配下の
  * グループを丸ごと対象外（`null`）にしていたが、これは行き過ぎだった。
  * 旧 `collection-groups` 画面のドロップダウンは virtual 接続を含んでおり、
@@ -141,7 +141,7 @@ export function resolveTagTreeContextMenuAction(
  * 開くかだけを振り分ける - 判定ロジック自体はここに閉じ込め、ページ側は
  * DOM 組み立てと実行に専念させる（`tagOnboarding.ts`/上記関数と同じ方針）。
  *
- * T19 S1-a（docs/banto-hub-t19-design.md §7.1、2026-09-02）追記: virtual
+ * T19 S1-a（docs/hub/banto-hub-t19-design.md §7.1、2026-09-02）追記: virtual
  * （calc/mem）接続配下の収集グループは作成・再設定・削除のすべてを許可する
  * よう改めた（旧画面のドロップダウンが virtual 接続を含んでいたのと同じ
  * 権限に揃える）。**禁止のまま維持するのは「接続ノードそのものの再設定・
@@ -156,7 +156,7 @@ export function resolveTagTreeContextMenuAction(
  * 扱ってよいため。
  */
 /**
- * S3（docs/banto-hub-external-db-design.md §7 row S3、実装指示1「S1 の
+ * S3（docs/hub/banto-hub-external-db-design.md §7 row S3、実装指示1「S1 の
  * ガードを解除する」）: S1 は postgres（DB Source）接続配下のグループ作成を
  * `disabled` + ツールチップで先取り無効化していたが、S2/S2b で DB Source
  * 本体（`query_sql`・`db` タグ・ポーリング）が実装済みのため、その制限は
@@ -224,7 +224,7 @@ export function resolveTreeContextMenuItems(
 }
 
 /**
- * T19 S1-a（docs/banto-hub-t19-design.md §7.1「viewer ロールからの接続・
+ * T19 S1-a（docs/hub/banto-hub-t19-design.md §7.1「viewer ロールからの接続・
  * グループ詳細の閲覧」）: 書き込み権限が無い利用者（viewer）向けの右クリック
  * メニュー項目を決める純関数。`resolveTreeContextMenuItems`（上、書き込み
  * 権限がある利用者向け）とは意図的に別関数にする - 「配下に作る／対象を

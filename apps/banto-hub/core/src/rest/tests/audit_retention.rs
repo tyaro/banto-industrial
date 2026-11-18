@@ -4,7 +4,7 @@ use axum::body::Body;
 use axum::http::Request as HttpRequest;
 use tower::ServiceExt;
 
-// --- 監査ログ retention 設定 (docs/banto-hub-remaining-plan.md P3-a) ----
+// --- 監査ログ retention 設定 (docs/hub/banto-hub-remaining-plan.md P3-a) ----
 
 /// `GET/PUT /api/audit-log/config`: admin 限定（viewer は403）、既定値
 /// （90日/100,000件）、保存した値の round-trip、PUT が
@@ -128,7 +128,7 @@ async fn audit_log_config_round_trips_and_requires_admin() {
 
 /// `POST /api/audit-log/list`が読む前に retention 設定に従って
 /// opportunistic に剪定すること（`crate::audit::AuditLogService::prune`
-/// の配線そのもの、docs/banto-hub-remaining-plan.md P3-a）を、REST
+/// の配線そのもの、docs/hub/banto-hub-remaining-plan.md P3-a）を、REST
 /// エンドポイント越しに確認する - `crate::audit`の単体テストは
 /// `prune`自体の正しさを担保済みなので、ここでは「呼ばれること」だけを
 /// 見る。

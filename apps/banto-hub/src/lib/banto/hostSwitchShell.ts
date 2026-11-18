@@ -3,7 +3,7 @@
  *
  * Hub 管理 UI 自体は引き続き HTTP REST で運転するが、SCM／切替／UAC 昇格は
  * シェル composition に属するため、ここだけ Tauri invoke／event を使う
- * （docs/banto-hub-desktop-plan.md §9.7）。
+ * （docs/hub/banto-hub-desktop-plan.md §9.7）。
  *
  * 非シェル（通常ブラウザ）では `isLocalShell()` が false になり、カード側で
  * 無効化する。`@tauri-apps/api` の静的 import はモジュール評価時に壊れない

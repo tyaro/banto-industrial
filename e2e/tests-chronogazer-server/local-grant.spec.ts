@@ -1,5 +1,5 @@
 /**
- * サービス接続モードの画面（#392 B2-2、設計書 docs/chronogazer-service-design.md
+ * サービス接続モードの画面（#392 B2-2、設計書 docs/chronogazer/chronogazer-service-design.md
  * §3.2・§4 の B2-2 の実装メモ）: `chronogazer-server` が配る画面に、この PC から
  * ログインなしで入る（grant `localDesktop`）。
  *

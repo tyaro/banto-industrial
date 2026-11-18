@@ -1,5 +1,5 @@
 /**
- * S6（docs/banto-hub-external-db-design.md §5.2・§5.3・§7 row S6）:
+ * S6（docs/hub/banto-hub-external-db-design.md §5.2・§5.3・§7 row S6）:
  * `SinkGroupDrawer.svelte` が使う、依存ゼロの純関数・定数・フォーム状態の
  * 型だけを切り出したモジュール - `plcConnectionForm.ts`/`collectionGroupForm.ts`
  * と同じ方針（Svelte 側は `$state`/DOM 組み立てに専念させ、ここに置く関数は

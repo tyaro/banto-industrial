@@ -1,4 +1,4 @@
-//! T6-2 の統合テスト（docs/tag-server-design.md §4.2/§4.3(a)）:
+//! T6-2 の統合テスト（docs/hub/tag-server-design.md §4.2/§4.3(a)）:
 //! 演算タグ・内部タグの hub 配線を実際の axum `Router`
 //! （`tower::ServiceExt::oneshot` / 実サーバーの WebSocket）+ Modbus TCP
 //! シミュレータで通す E2E。`tests/integration.rs`/`tests/stream.rs`/

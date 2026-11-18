@@ -1,6 +1,6 @@
 /**
  * タグ create/edit Drawer の `<form>` 化・Enter 送信・必須表示（T18-1
- * 続き、TAG-UX-C 1点目、docs/banto-hub-desktop-plan.md §9.4「create /
+ * 続き、TAG-UX-C 1点目、docs/hub/banto-hub-desktop-plan.md §9.4「create /
  * edit を `<form>` 化し、必須表示、Enter 送信、クライアント軽量検証と
  * サーバー検証を組み合わせる」）の実 DOM 受け入れテスト。
  *

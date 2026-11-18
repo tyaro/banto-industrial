@@ -40,7 +40,7 @@ const VIRTUAL_CONNECTION: PlcConnection = {
 	settings: {}
 };
 
-// S1（docs/banto-hub-external-db-design.md §4.1・§2.2）: postgres（DB
+// S1（docs/hub/banto-hub-external-db-design.md §4.1・§2.2）: postgres（DB
 // Source）接続のフィクスチャ - 保存済みパスワードあり（`{"$secret": "set"}`）
 // でも export には一切パスワードが乗らないことを確認する用。
 const DB_CONNECTION: PlcConnection = {
@@ -88,7 +88,7 @@ const VIRTUAL_GROUP: CollectionGroup = {
 	querySql: null
 };
 
-// S3（docs/banto-hub-external-db-design.md §7 row S3）: postgres（DB
+// S3（docs/hub/banto-hub-external-db-design.md §7 row S3）: postgres（DB
 // Source）接続配下の収集グループのフィクスチャ - `querySql`が export に
 // 含まれ、往復できることを確認する用。
 const DB_GROUP: CollectionGroup = {
@@ -147,7 +147,7 @@ const DB_TAG: Tag = {
 	expression: null
 };
 
-// S6（docs/banto-hub-external-db-design.md §5.2・§6 item 6）: sink group の
+// S6（docs/hub/banto-hub-external-db-design.md §5.2・§6 item 6）: sink group の
 // フィクスチャ - `dbConnectionId`は`DB_CONNECTION`（postgres）、`tagIds`は
 // `BASE_TAG`/`DB_TAG`の2件を参照する。
 const SINK_GROUP: SinkGroup = {
@@ -548,7 +548,7 @@ describe('configPackage', () => {
 		);
 	});
 
-	// --- S1（docs/banto-hub-external-db-design.md §4.1・§2.2、実装指示5）+ 版 3:
+	// --- S1（docs/hub/banto-hub-external-db-design.md §4.1・§2.2、実装指示5）+ 版 3:
 	// postgres（DB Source）接続は settings の host/port/database/username を export に
 	// 含むが、パスワード（応答の `{"$secret": …}`）は絶対に含まない。
 
@@ -614,7 +614,7 @@ describe('configPackage', () => {
 		expect(() => checkConfigPackageConnectionFields(parsed, TEST_DRIVERS)).not.toThrow();
 	});
 
-	// --- S3（docs/banto-hub-external-db-design.md §7 row S3）: 収集グループの
+	// --- S3（docs/hub/banto-hub-external-db-design.md §7 row S3）: 収集グループの
 	// `querySql`（postgres 配下限定）と `tagKind: 'db'` のタグが export/import
 	// で往復できること、非 postgres グループでは `querySql` が現れないことを
 	// 固定する。
@@ -932,7 +932,7 @@ describe('configPackage', () => {
 	});
 });
 
-// R2a-2e（docs/banto-hub-ingest-design.md §3.1・§5.1）: push 接続の `settings`
+// R2a-2e（docs/hub/banto-hub-ingest-design.md §3.1・§5.1）: push 接続の `settings`
 // の往復。ブリッジの読む DB は id ではなく接続名（`dbConnectionName`）で持ち運ぶ。
 const PUSH_BRIDGE_CONNECTION: PlcConnection = {
 	id: 12,

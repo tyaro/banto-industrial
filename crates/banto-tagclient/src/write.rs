@@ -24,14 +24,14 @@
 //! Tags are written **by `external_name`** (`{connection}.{group}.{tag}`),
 //! the same key the Hub's write contract (`POST /api/v1/values/{tag}`, the
 //! write scope) and every other public contract uses (2026-09-30 owner
-//! decision, docs/scada-design.md §9.6). [`RestClient::write_tag`] therefore
+//! decision, docs/scada/scada-design.md §9.6). [`RestClient::write_tag`] therefore
 //! fetches no catalog: it sends one POST and nothing else. Right after a
 //! rename the old name no longer exists, so the Hub answers 404
 //! ([`ErrorKind::WriteRejected`]) and nothing is written to the wrong tag.
 //! The one case a name cannot distinguish is "a different tag was later
 //! registered under the old name" - a write would then land on that tag. This
 //! is **accepted by policy, not closed by the SDK** (2026-09-30 owner
-//! decision, docs/scada-design.md §9.6): under a name contract it is the same
+//! decision, docs/scada/scada-design.md §9.6): under a name contract it is the same
 //! thing as a deliberate delete-and-recreate, and the Hub's per-tag `writable`
 //! opt-in (a newly created tag cannot be written), the caller's type check
 //! against the catalog, the Hub's rename warning and the write audit are the
@@ -339,7 +339,7 @@ mod tests {
 
         let (write_request, extra_connection) = server.await.unwrap();
         // The first (and only) request is the POST: no `GET /api/v1/tags`
-        // precedes it (2026-09-30 owner decision, docs/scada-design.md §9.6).
+        // precedes it (2026-09-30 owner decision, docs/scada/scada-design.md §9.6).
         assert!(write_request.starts_with("POST /api/v1/values/line1.fast.temp01 HTTP/1.1"));
         assert!(
             !extra_connection,

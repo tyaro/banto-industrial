@@ -1,6 +1,6 @@
 /**
- * T18-3e（docs/banto-hub-t18-design.md「T18-3e BantoGrid セル編集/TSV貼付の
- * 接続」、docs/banto-hub-desktop-plan.md §9.4 TAG-UX-D 後半）: BantoGrid の
+ * T18-3e（docs/hub/banto-hub-t18-design.md「T18-3e BantoGrid セル編集/TSV貼付の
+ * 接続」、docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-D 後半）: BantoGrid の
  * `onCellEdit`/`onRangePaste`（`@banto/grid-svelte`、`CellEdit<Tag>`）が返す
  * 生のセル編集を、`updateTagsBatch`（`POST /api/tags/batch-update`）に渡せる
  * {@link BatchTagUpdateRow}[] へ変換する依存ゼロの純関数群。

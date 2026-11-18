@@ -399,7 +399,7 @@ fn unix_seconds_to_utc_string(secs: i64) -> String {
 
 /// `lastValueAt`（[`HubSubscriptionView::last_value_at`]）を表示用に整形する。
 ///
-/// **単位は epoch ミリ秒**（`docs/tag-server-design.md`「タイムスタンプ:
+/// **単位は epoch ミリ秒**（`docs/hub/tag-server-design.md`「タイムスタンプ:
 /// サンプル取得時刻（サーバー時計、UTC、ミリ秒）。PLC 時計は使わない」―
 /// `banto_tagclient::ValuesSnapshot::t` 由来で、値の表の `t` 列と同じ単位）。
 /// 秒として解釈すると実機で `58681-09-22 ...` のようなあり得ない年になる

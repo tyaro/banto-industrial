@@ -5,7 +5,7 @@
 //! wire properties the `slmp` crate wants), [`SlmpDevice::to_wire`] and
 //! [`classify_slmp`] / [`SlmpErrorClass`].
 //!
-//! R2b-3d-join (docs/banto-hub-driver-io-design.md §6.2): the I/O that used to
+//! R2b-3d-join (docs/hub/driver/banto-hub-driver-io-design.md §6.2): the I/O that used to
 //! live here - `SlmpClient`, `dial_slmp`, `execute_slmp_reads` and
 //! `execute_slmp_batch_reads` - is gone. The SLMP driver now builds the 4E
 //! frames itself (`banto-driver-slmp`'s `frame.rs`, checked byte for byte
@@ -34,7 +34,7 @@
 //!   to a request boundary.
 //! - **Anything else** (`Framing`, `Timeout`, `NotConnected`, `Io`) - fatal.
 //!
-//! H9 (docs/h9-slmp-structured-error-spec.md, 2026-08-12) replaced the old
+//! H9 (docs/hub/driver/h9-slmp-structured-error-spec.md, 2026-08-12) replaced the old
 //! text parsing of the wrapped crate's errors with the git dependency on the
 //! owner's fork (`slmp` 0.2.1), which exposes `SlmpError::Device { end_code }`
 //! as its own enum variant.
@@ -145,7 +145,7 @@ impl SlmpDevice {
 /// MELSEC capability, deliberately left as configuration rather than modelled,
 /// because nothing in recorder-requirements.md asks for it and a wrong value
 /// here fails loudly (the CPU rejects the frame) rather than silently.
-/// `PartialEq` (T7-1, docs/tag-server-design.md §4.3): same reasoning as
+/// `PartialEq` (T7-1, docs/hub/tag-server-design.md §4.3): same reasoning as
 /// [`crate::modbus::ModbusTcpConfig`]'s derive - lets `banto-collect` diff a
 /// connection's config across a config reload. No `f64` field here either,
 /// so the derived structural comparison is exact.
@@ -247,7 +247,7 @@ impl SlmpConfig {
 
 /// Read/write-independent classification of a structured [`slmp::SlmpError`].
 /// The single source of truth for the SLMP error classification policy (H9,
-/// docs/h9-slmp-structured-error-spec.md): both [`PlcError`] (this crate) and
+/// docs/hub/driver/h9-slmp-structured-error-spec.md): both [`PlcError`] (this crate) and
 /// `banto_plc_write::PlcWriteError` map this via `From` into their own error
 /// vocabulary, so the decision logic that used to be duplicated as two
 /// identical 5-arm `match`es now lives in exactly one place. Each variant
@@ -391,7 +391,7 @@ mod tests {
 
     /// Pins down [`classify_slmp`]'s mapping table - the single source the
     /// two crates' `PlcError`/`PlcWriteError` `From<SlmpErrorClass>` impls
-    /// both build on (H9, docs/h9-slmp-structured-error-spec.md).
+    /// both build on (H9, docs/hub/driver/h9-slmp-structured-error-spec.md).
     #[test]
     fn classify_slmp_maps_every_slmp_error_variant() {
         assert_eq!(
@@ -428,7 +428,7 @@ mod tests {
 
     /// The classification table this module's whole error contract rests on -
     /// now a plain structural `match` over `slmp::SlmpError` (H9,
-    /// docs/h9-slmp-structured-error-spec.md), no message text anywhere. The
+    /// docs/hub/driver/h9-slmp-structured-error-spec.md), no message text anywhere. The
     /// end-to-end proof that the *real* wrapped crate actually produces
     /// `Device` vs `Framing` correctly still lives in `integration_tests.rs`'s
     /// `slmp_end_code_is_bad_not_fatal` /

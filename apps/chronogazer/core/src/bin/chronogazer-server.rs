@@ -1,5 +1,5 @@
 //! `chronogazer-server`: 画面の無い本番用の ChronoGazer の記録エンジン（#392 段階 B
-//! の B1-5、2026-10-13。設計は docs/chronogazer-service-design.md §3.1(b)）。
+//! の B1-5、2026-10-13。設計は docs/chronogazer/chronogazer-service-design.md §3.1(b)）。
 //!
 //! B1 ではコンソールで動かす形だけ（引数なし）。B3-2b（2026-10-15）で同じ exe に
 //! Windows サービス（`run-service`・`install`・`uninstall`、Windows だけ）を足した

@@ -1,4 +1,4 @@
-//! banto-tags: I1 タグレジストリ (docs/plan.md I1, docs/recorder-requirements.md
+//! banto-tags: I1 タグレジストリ (docs/plan.md I1, docs/chronogazer/recorder-requirements.md
 //! §2 "用語", §3.1 "タグ・収集", §3.2 "表示グループ").
 //!
 //! Three-tier entity model consumed by the collection engine (I3) and any
@@ -13,7 +13,7 @@
 //!   registry, no endpoint of its own (ChronoGazer's `hub.record` owns it),
 //!   and its tags' `address` is the Hub tag's external name - see
 //!   [`plc_connection`]'s "`\"hub\"`" section. `"push"` (R2a-2a,
-//!   docs/banto-hub-ingest-design.md §3) is a connection banto-hub *receives*
+//!   docs/hub/banto-hub-ingest-design.md §3) is a connection banto-hub *receives*
 //!   values on: no endpoint either, a JSON `settings` column of its own, and
 //!   tags whose `address` is an opaque sender-chosen key - the pure rules
 //!   (limits, settings, keys, the bridge's load estimate) live in [`push`]
@@ -24,7 +24,7 @@
 //!   (#533, 2026-10-08 owner decision: しきい値は使う側（記録計・SCADA）の
 //!   設定) - migration 0018 dropped the `threshold_*` columns
 //!
-//! - The tag `address` (R2b-2b, docs/banto-hub-driver-address-design.md §3): a service
+//! - The tag `address` (R2b-2b, docs/hub/driver/banto-hub-driver-address-design.md §3): a service
 //!   built with a driver registry ([`TagService::with_registry`],
 //!   [`CollectionGroupService::with_registry`]) validates **every** tag's address with its
 //!   connection's driver and stores the driver's canonical form ([`normalize_tag_address`]
@@ -32,7 +32,7 @@
 //!   a protocol change or a move changes their driver. The services built with `new`
 //!   (ChronoGazer, this crate's tests) keep the old rules: the address is any non-empty
 //!   text, saved as typed.
-//! - [`settings_json`] (R2b-1c, docs/banto-hub-connection-settings-design.md
+//! - [`settings_json`] (R2b-1c, docs/hub/banto-hub-connection-settings-design.md
 //!   §3.5・§4.2・§4.3): a connection's JSON `settings` -> the driver API's
 //!   `Settings` ([`settings_to_api`]), the flat-columns <-> `settings` adapter
 //!   (`settings_json::legacy`) and validation through a `DriverRegistry`
@@ -118,7 +118,7 @@ use sqlx::SqlitePool;
 /// `_sqlx_migrations`: the consuming app runs its OWN `sqlx::migrate!` on the
 /// same pool, and two migrators sharing one bookkeeping table collide on
 /// overlapping version numbers (`MigrateError::VersionMismatch`,
-/// docs/r1a-readme-gaps.md). sqlx 0.9's `Migrator::dangerous_set_table_name`
+/// docs/archive/r1a-readme-gaps.md). sqlx 0.9's `Migrator::dangerous_set_table_name`
 /// lets each migrator keep its own table (schema cleanup, 2026-10-02). The `dangerous_`
 /// part - a database migrated under the old shared table loses track of what
 /// was applied - is accepted because existing alpha databases may be thrown

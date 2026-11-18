@@ -1,7 +1,7 @@
 //! The shape of a driver's connection settings ([`SettingsSchema`]) and the
 //! names of the tag kinds it can read ([`KindName`]) - what the Hub's generic
 //! connection form and tag screens are built from instead of per-protocol
-//! code (docs/banto-hub-driver-ui-design.md §3, R2b-6a; WIT `config.schema`
+//! code (docs/hub/driver/banto-hub-driver-ui-design.md §3, R2b-6a; WIT `config.schema`
 //! and `address.supported-kinds`).
 //!
 //! Types and plain data only, like the rest of the crate: no validation

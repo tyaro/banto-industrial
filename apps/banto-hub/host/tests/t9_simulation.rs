@@ -1,4 +1,4 @@
-//! T9-2 の E2E テスト（docs/ux-plan.md §1「接続単位のシミュレーションモード」、
+//! T9-2 の E2E テスト（docs/archive/ux-plan.md §1「接続単位のシミュレーションモード」、
 //! `apps/banto-hub/core/src/broker_glue.rs`の`BrokerSimRegistry`と
 //! `apps/banto-hub/core/src/hub.rs`の`CollectorManager::sync_broker_sessions_from`の
 //! 配線を broker 経由 SLMP 接続で確認する）。

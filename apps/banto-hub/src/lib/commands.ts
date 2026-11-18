@@ -88,7 +88,7 @@ function sessionCommands(): PaletteCommand[] {
 const CONFIG_GROUP = '構成';
 
 /**
- * T19 S4（UX-42、docs/banto-hub-t19-design.md §8.1/§7.6）: 構成パッケージの
+ * T19 S4（UX-42、docs/hub/banto-hub-t19-design.md §8.1/§7.6）: 構成パッケージの
  * export/import はコマンドパレットに未登録だった。新規 API は無く既存の
  * export 処理（`configPackageAdmin.ts` の `exportConfigPackageToDownload`）
  * を呼ぶだけ。import はファイル選択が要るため、設定画面の該当セクション

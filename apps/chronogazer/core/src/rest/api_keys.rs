@@ -1,4 +1,4 @@
-//! `/api/api-keys*`（#1161 PR4、docs/chronogazer-agent-api-design.md §3.4）。
+//! `/api/api-keys*`（#1161 PR4、docs/chronogazer/chronogazer-agent-api-design.md §3.4）。
 //!
 //! | Method | Path                          | Body                                  | Response |
 //! |--------|-------------------------------|---------------------------------------|----------|

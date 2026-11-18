@@ -7,7 +7,7 @@
 
 - 計画: [docs/plan.md](docs/plan.md)（I系 = 資産クレート、R系 = 記録計 **ChronoGazer**、
   W系 = 自動書き込みアプリ **relay-wright**、T系 = タグサーバー **banto-hub**）
-- ChronoGazer（記録計）要件定義: [docs/recorder-requirements.md](docs/recorder-requirements.md)
+- ChronoGazer（記録計）要件定義: [docs/chronogazer/recorder-requirements.md](docs/chronogazer/recorder-requirements.md)
 - banto 側のスコープ整理: banto リポジトリの docs/template-scope.md
 
 ## 構成
@@ -87,7 +87,7 @@ CRUD/一覧サービス + スケーリング純関数（`scale_raw`/`unscale`）
 ### `banto-tstore`（I3a）
 
 時系列データの保存層。**日次ファイル + スキーマ凍結**方式
-（2026-07-12 決定、docs/recorder-requirements.md §8）:
+（2026-07-12 決定、docs/chronogazer/recorder-requirements.md §8）:
 データファイル（SQLite、`YYYYMMDD-NNN.sqlite3`）は作成時にスキーマが
 確定し以後変更しない。収集グループ/タグの構成が変わっても既存ファイルは
 `ALTER` せず、新しい連番ファイルへローテーションする。`banto-tags`/
@@ -208,8 +208,8 @@ docs/plan.md §4）。PLC通信 + タグデータ保存 + リアルタイム/ヒ
 依存には追加済みだが、**まだ REST/Tauri コマンドのどこにも配線されていない**
 （`apps/chronogazer/core/Cargo.toml` の依存コメント参照）。監視・
 ヒストリカル・イベントの各画面は実データ無しのプレースホルダ表示のまま。
-実施計画は [docs/r1-plan.md](docs/r1-plan.md)（Phase R1-A〜R1-D）、要件定義は
-[docs/recorder-requirements.md](docs/recorder-requirements.md)を参照。詳細は
+実施計画は [docs/archive/r1-plan.md](docs/archive/r1-plan.md)（Phase R1-A〜R1-D）、要件定義は
+[docs/chronogazer/recorder-requirements.md](docs/chronogazer/recorder-requirements.md)を参照。詳細は
 [apps/chronogazer/README.md](apps/chronogazer/README.md)。
 
 ### `apps/relay-wright`（W系、2026-09-24 に main から退避）
@@ -245,7 +245,7 @@ banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v1.6.0" }
 ### `apps/banto-hub`（T系）
 
 FA-Server 型の独立タグサーバー **banto-hub**（Tauri を使わないヘッドレスの
-単一 exe、axum + SQLite。docs/tag-server-design.md §3.1）。I系クレート
+単一 exe、axum + SQLite。docs/hub/tag-server-design.md §3.1）。I系クレート
 （タグレジストリ・PLC通信・収集エンジン・時系列ストレージ）を束ね、
 タグ空間（= banto-collect の現在値キャッシュ）を **REST / WebSocket /
 MQTT publish / gRPC** の4経路で外部（MES・クラウド・自作画面等）へ公開する。
@@ -258,8 +258,8 @@ banto-hub のスコープ外 - relay-wright が構想していた領域で、同
 実装状況は **T0〜T18-6 実装済み**（試運転モード・ロックダウン、収集の開始/停止 UI、
 タグ名一意性の収集グループ内一意への緩和を含む。2026-08-31 時点）。残るは
 T18-5c/d・T5-5（Windows 実機往復・72h soak 実行 + 実機最終サインオフ）等の
-実機依存項目のみ。詳細設計は [docs/tag-server-design.md](docs/tag-server-design.md)、運用手順は
-[docs/banto-hub-operations.md](docs/banto-hub-operations.md)、起動方法は
+実機依存項目のみ。詳細設計は [docs/hub/tag-server-design.md](docs/hub/tag-server-design.md)、運用手順は
+[docs/hub/banto-hub-operations.md](docs/hub/banto-hub-operations.md)、起動方法は
 [apps/banto-hub/README.md](apps/banto-hub/README.md) を参照。
 
 ## ライセンス

@@ -1,6 +1,6 @@
 /**
  * CSV 新規/更新インポート + テンプレート/エクスポート DL（T18-3d、
- * docs/banto-hub-t18-design.md「T18-3d CSV 新規/更新分離＋テンプレート」、
+ * docs/hub/banto-hub-t18-design.md「T18-3d CSV 新規/更新分離＋テンプレート」、
  * TAG-UX-F）の実 DOM 受け入れテスト。
  *
  * `banto-hub-tags-form.spec.ts`/`banto-hub-tags-revision.spec.ts` と同じ

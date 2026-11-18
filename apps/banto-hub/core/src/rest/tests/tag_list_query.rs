@@ -6,7 +6,7 @@ use axum::body::Body;
 use axum::http::Request as HttpRequest;
 use tower::ServiceExt;
 
-// --- T18-5a 第2段 (docs/banto-hub-t18-design.md §4 決定6): 薄い部品の
+// --- T18-5a 第2段 (docs/hub/banto-hub-t18-design.md §4 決定6): 薄い部品の
 // 先行配線 - POST /api/tags/list と GET /api/tags/group-counts --------
 
 /// `admin_post` 経由で PLC接続 → 収集グループ → タグ を1本作る。

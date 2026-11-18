@@ -1,12 +1,12 @@
 //! The conformance checks of `banto-driver-conformance` against the R1
-//! Modbus TCP driver (docs/banto-driver-api-design.md §7.3, R1-5):
+//! Modbus TCP driver (docs/hub/driver/banto-driver-api-design.md §7.3, R1-5):
 //!
 //! - `static_checks` (C1, C2) on [`ModbusDriver`], with fixtures copied from
 //!   `banto-plc/src/address.rs`'s tests (the grammar) and the TypeScript
 //!   `continuousRegistration.test.ts` / `offsetCopy.test.ts` (offsets).
 //! - `session::run_all_against` (C1-C8, C12) through the frame-type
 //!   `ModbusDriver` wrapped by the real engine (`FrameSession`, R2b-3c,
-//!   docs/banto-hub-driver-io-design.md §11.2; R2b-3a-1 to 3b it was the
+//!   docs/hub/driver/banto-hub-driver-io-design.md §11.2; R2b-3a-1 to 3b it was the
 //!   production session-type `Session`), against `banto-plc`'s Modbus TCP
 //!   simulator behind a `FaultProxy`. The wrapper is the one `banto-broker`
 //!   puts around a frame-type entry (`FrameDial`, crate-private there), kept

@@ -4,7 +4,7 @@
 ; 上書きインストールで稼働中の exe を差し替えられるよう、コピー前に
 ; Windows サービスとデスクトップシェルを止め、止めたサービスだけを
 ; POSTINSTALL で `sc start` し直す、という H11 の同じ手順を 1 か所に
-; 置く（docs/chronogazer-service-design.md §1.2 の表）。製品ごとに違う
+; 置く（docs/chronogazer/chronogazer-service-design.md §1.2 の表）。製品ごとに違う
 ; のは、サービス名・exe 名・DetailPrint の接頭辞・運用文書の参照だけ。
 ;
 ; 使い方: include する側のフックが、このファイルを `!include` する
@@ -12,7 +12,7 @@
 ; ないよう、製品固有の文言は引数ではなく定数で受ける）。
 ;   SERVICE_COMMON_LOG_PREFIX  DetailPrint の接頭辞（例: "banto-hub"）
 ;   SERVICE_COMMON_OPS_DOC     タイムアウト時に案内する運用文書の参照
-;                              （例: "docs/banto-hub-operations.md §12"）
+;                              （例: "docs/hub/banto-hub-operations.md §12"）
 ; どのステップが失敗してもインストーラ本体は中断させず、DetailPrint で
 ; 案内するだけに留める（T5-2 以来の方針）。
 ;

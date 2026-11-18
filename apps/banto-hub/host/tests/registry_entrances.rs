@@ -1,7 +1,7 @@
-//! R2b-1d（docs/banto-hub-connection-settings-design.md §4.2・§8 の 10）／R2b-2b
-//! （docs/banto-hub-driver-address-design.md §3.1）: Hub の入口が旧規則で書けないことを、
+//! R2b-1d（docs/hub/banto-hub-connection-settings-design.md §4.2・§8 の 10）／R2b-2b
+//! （docs/hub/driver/banto-hub-driver-address-design.md §3.1）: Hub の入口が旧規則で書けないことを、
 //! ソースの grep で固定する。R2b-2c でアドレスの解析の 2 つ（`Address::parse(`・
-//! `parse_slmp(`）を、R2b-3a-2（docs/banto-hub-driver-io-design.md §4.2）で broker の
+//! `parse_slmp(`）を、R2b-3a-2（docs/hub/driver/banto-hub-driver-io-design.md §4.2）で broker の
 //! 旧い要求の型と橋（`BatchReadRequest`・`BatchWriteRequest`・`from_driver_address`・
 //! `banto_plc::Address`・`to_driver_address(`）とプロトコルの名前での比較
 //! （`conn.protocol == "slmp"`・`conn.protocol == "modbus-tcp"`）を足した。見るのは

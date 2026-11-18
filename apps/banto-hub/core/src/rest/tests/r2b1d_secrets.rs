@@ -1,4 +1,4 @@
-//! R2b-1d（docs/banto-hub-connection-settings-design.md §5.4・§5.5・§2）: パスワードを
+//! R2b-1d（docs/hub/banto-hub-connection-settings-design.md §5.4・§5.5・§2）: パスワードを
 //! 読めない接続を読む側（REST の `passwordState`・`GET /api/sink/config`・
 //! `GET /api/ingest/bridge-config`・保存済みの接続のテスト）が空のパスワードに潰さないこと、
 //! と `push` の `settings` の REST の形（既定のままなら `null`）と未適用キューの指紋の互換。

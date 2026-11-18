@@ -5,12 +5,12 @@
 //! collector, broker sessions, simulators, and computed engine; this module
 //! owns only lifecycle state, transition serialization, and run identifiers.
 //!
-//! 外部 DB 連携 S2b（docs/banto-hub-external-db-design.md §4.8・§6-16、
+//! 外部 DB 連携 S2b（docs/hub/banto-hub-external-db-design.md §4.8・§6-16、
 //! 2026-09-06 オーナー決定）以降、ここは「収集が Running か」に連動して
 //! 動く**唯一の**もう1つの機構、`crate::db_source::DbSourceEngine` の
 //! 起動・停止点でもある（`CollectionController::db_source` のフィールド
 //! doc comment に、なぜ `CollectorManager` 側ではなくここなのかを書いて
-//! ある）。R2a-1c（docs/banto-hub-ingest-design.md §4.5）からは、取り込み口
+//! ある）。R2a-1c（docs/hub/banto-hub-ingest-design.md §4.5）からは、取り込み口
 //! `push` の受信側 `crate::ingest::IngestHub` の保持値の破棄と epoch も同じ
 //! 遷移に連動する（`CollectionController::ingest` のフィールド doc comment）。
 //!
@@ -153,7 +153,7 @@ impl std::error::Error for QuitInProgress {}
 /// The serialized collection lifecycle controller.
 pub struct CollectionController {
     manager: Arc<CollectorManager>,
-    /// 外部 DB 連携 S2b（docs/banto-hub-external-db-design.md §4.8・§6-16、
+    /// 外部 DB 連携 S2b（docs/hub/banto-hub-external-db-design.md §4.8・§6-16、
     /// 2026-09-06 オーナー決定「DB Source は収集が Running のときだけ
     /// 動く」）: `manager` が所有する `Arc` の複製
     /// （[`CollectorManager::db_source_engine`]）。
@@ -175,7 +175,7 @@ pub struct CollectionController {
     /// `commit_catalog` が担当し、走行中なら接続単位の差分で task を
     /// 作り直す - `crate::db_source` のモジュール doc comment 参照）。
     db_source: Arc<DbSourceEngine>,
-    /// R2a-1c（docs/banto-hub-ingest-design.md §4.5）: 取り込み口 `push` の受信側
+    /// R2a-1c（docs/hub/banto-hub-ingest-design.md §4.5）: 取り込み口 `push` の受信側
     /// （[`CollectorManager::ingest_hub`] の複製）。`db_source` と同じ理由でここから
     /// 呼ぶ: 収集の**遷移**（[`Self::start_locked`] / [`Self::stop_locked`]）だけが
     /// 保持値を捨てて epoch を進めてよく、稼働中の再適用
@@ -189,7 +189,7 @@ pub struct CollectionController {
     ///
     /// ライフサイクル操作（[`Self::start`]/[`Self::stop`]/[`Self::set_mode`]）は
     /// 「遷移中に重ねて来た要求は待たずに現在状態を返す」という冪等契約
-    /// （docs/banto-hub-desktop-plan.md）を持つため `try_lock` する。ところが
+    /// （docs/hub/banto-hub-desktop-plan.md）を持つため `try_lock` する。ところが
     /// #341 で live apply が同じロックを**保持して待つ**ようになった結果、
     /// live apply 中（PLC へのダイヤルを含み数秒かかりうる）に運用者の
     /// 「停止」が来ると黙って無視され、収集が続いてしまう。
@@ -384,7 +384,7 @@ impl CollectionController {
         self.status_tx.send_replace(self.status());
     }
 
-    /// #341（オーナー決定 2026-09-09 / 2026-09-14、`docs/tag-server-design.md`
+    /// #341（オーナー決定 2026-09-09 / 2026-09-14、`docs/hub/tag-server-design.md`
     /// §4.3）: 直前にコミットされたレジストリ変更を catalog へ反映し、収集が
     /// 実際に `Running` なら**収集を止めずに実行構成へも反映する** -
     /// [`crate::rest::commit_catalog_and_notify`]（REST/MCP の全レジストリ
@@ -537,7 +537,7 @@ impl CollectionController {
     /// - **取れず、保持者が別のライフサイクル遷移**: 従来どおり `None`
     ///   （呼び出し元は現在状態を返して終わる）。これは「遷移中に重ねて
     ///   来た開始・停止要求は待たずに現在状態を返す」という冪等契約
-    ///   （docs/banto-hub-desktop-plan.md §9.1・T14）そのもので、待って
+    ///   （docs/hub/banto-hub-desktop-plan.md §9.1・T14）そのもので、待って
     ///   実行すると start→start が2回走ってしまう。
     ///
     /// 競合について: `try_lock` 失敗 → フラグ確認の間に live apply が

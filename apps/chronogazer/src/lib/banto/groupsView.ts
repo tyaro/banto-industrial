@@ -1,5 +1,5 @@
 /**
- * #1179 PR6a（docs/chronogazer-ui-improvement-proposal.md §2.1・§4、2026-11-18）:
+ * #1179 PR6a（docs/chronogazer/chronogazer-ui-improvement-proposal.md §2.1・§4、2026-11-18）:
  * 「表示グループ」ページ（`(app)/groups/+page.svelte`）の「左の一覧で選んだ
  * 表示グループ」と「中央のタブ」を URL のクエリと行き来させる純関数。
  * 「記録」ページの `recordsView.ts` と同じ形にしてある。

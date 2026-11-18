@@ -136,7 +136,7 @@ impl Drop for TempEnv {
 /// (the same startup sequence the ChronoGazer app will run).
 /// The built-in drivers (Modbus TCP and SLMP): every plan is read through
 /// them and every PLC read goes through a broker session dialing them
-/// (R2b-3a-3, docs/banto-hub-driver-io-design.md §4.3・§8).
+/// (R2b-3a-3, docs/hub/driver/banto-hub-driver-io-design.md §4.3・§8).
 fn drivers() -> &'static DriverRegistry {
     &DRIVERS
 }
@@ -424,7 +424,7 @@ async fn collects_values_in_tag_order_with_scaling_applied() {
     );
 }
 
-/// T9-1 / R2b-3a-3 (docs/banto-hub-driver-io-design.md §8): a
+/// T9-1 / R2b-3a-3 (docs/hub/driver/banto-hub-driver-io-design.md §8): a
 /// `simulation = true` connection whose real host can never answer
 /// (`203.0.113.1`, TEST-NET-3, RFC 5737) still collects live, changing
 /// values - proof that [`BrokerSessions`] started an in-process simulator,
@@ -1751,7 +1751,7 @@ async fn status_reports_connected_while_running_and_stop_completes_cleanly() {
     assert_eq!(count_events(&pool, "collection_stopped").await, 1);
 }
 
-/// P0-3 #5 (docs/banto-hub-driver-refactor-plan.md §8.3): one connection = one
+/// P0-3 #5 (docs/hub/driver/banto-hub-driver-refactor-plan.md §8.3): one connection = one
 /// socket at the collection engine level. Mirrors banto-hub's #337 test
 /// (`apps/banto-hub/core/tests/integration.rs`
 /// `modbus_collection_uses_exactly_one_socket`), minus the Hub: a collector
@@ -2201,7 +2201,7 @@ async fn long_soak_sixty_seconds() {
 }
 
 // ---------------------------------------------------------------------------
-// T7-1 (docs/tag-server-design.md §4.3): online partial reconfiguration -
+// T7-1 (docs/hub/tag-server-design.md §4.3): online partial reconfiguration -
 // `Collector::apply_config`. Every test below drives the real engine (real
 // sockets, real `Collector::start`) and proves the core claim: the influence
 // radius of a config change is exactly the connections that changed - an

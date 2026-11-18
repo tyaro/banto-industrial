@@ -1,4 +1,4 @@
-//! API キー基盤 (docs/tag-server-design.md §5.6「認証（全プロトコル共通）」、
+//! API キー基盤 (docs/hub/tag-server-design.md §5.6「認証（全プロトコル共通）」、
 //! T0-2 実装指示 §1「API キー基盤」)。`/api/v1/*` を叩く機械クライアント
 //! （MES/クラウド収集/自作ダッシュボード等）向けの、管理 UI セッションとは
 //! 別系統の認証情報。管理 API（`/api/api-keys/*`、admin ロール限定）で
@@ -6,7 +6,7 @@
 //! ミドルウェアがこのモジュールの [`ApiKeysService::lookup`] を呼んで行う。
 //!
 //! ## 共有 crate `banto-api-keys` との分担（#1161 PR3、
-//! docs/chronogazer-agent-api-design.md §3.1・§3.2）
+//! docs/chronogazer/chronogazer-agent-api-design.md §3.1・§3.2）
 //!
 //! アプリに依らない部分は共有 crate `banto_api_keys` にある（ChronoGazer と
 //! 共有する）: キーの形式 `bh_{prefix}_{secret}` の生成と固定長の読み取り、
@@ -33,7 +33,7 @@
 //! 発行時に検証するが、**実際の書き込み検査（T2）はここでは行わない**
 //! （書き込み API 自体が T0-2 の時点でまだ存在しない）。
 //!
-//! `admin`（T21 S1-a、docs/banto-hub-t21-design.md §3.1）は、MCP から行う
+//! `admin`（T21 S1-a、docs/hub/banto-hub-t21-design.md §3.1）は、MCP から行う
 //! 構成操作（接続/グループ/タグ CRUD・設定・API キー発行等）専用の独立
 //! スコープ。read/write のタグ値アクセスとは**意図的に直交**しており、
 //! `admin` だけを持つキーはタグの値を一切読み書きできない
@@ -41,7 +41,7 @@
 //! ツール（接続 CRUD: create/delete/list_connections）が既に `admin` を
 //! 要求する形で配線済み。以降のスライスでグループ/タグ/設定へ拡張予定。
 //!
-//! ### 取り込み `ingest:#{id}`（R2a-2b、docs/banto-hub-ingest-design.md §5・
+//! ### 取り込み `ingest:#{id}`（R2a-2b、docs/hub/banto-hub-ingest-design.md §5・
 //! §12 Q9、2026-10-21 オーナー決定）
 //!
 //! `ingest:#{id}` は `push` 接続（`plc_connections.id` = `{id}`）へ値を送る
@@ -67,7 +67,7 @@
 //!   はその認証層が、パスの id とこのスコープを照合するために使う。
 //!
 //! ### read のタグ単位化（H10 ③、Option B、2026-08-08 オーナー決定・
-//! docs/h10-3-read-scope-proposal.md §5 S1・§6）
+//! docs/archive/h10-3-read-scope-proposal.md §5 S1・§6）
 //!
 //! read は write と**意図的に非対称**: write の完全一致に加え、read に
 //! 限り `{connection}.{group}.*` のグループ・ワイルドカードも許可する
@@ -170,7 +170,7 @@ impl ApiKeyScopes for HubScopes {
 /// `ingest:#{id}` の接頭辞（R2a-2b、このモジュールの doc comment「取り込み」）。
 pub const INGEST_SCOPE_PREFIX: &str = "ingest:#";
 
-/// `ingest:#{id}` の `{id}` を取り出す（R2a-2b、docs/banto-hub-ingest-design.md
+/// `ingest:#{id}` の `{id}` を取り出す（R2a-2b、docs/hub/banto-hub-ingest-design.md
 /// §5「文法」）。正規形だけを受ける: `ingest:#` の直後が `[1-9][0-9]*` で
 /// 終わり、`i64` に収まること。`ingest:`・`ingest:#`・`ingest:#0`・
 /// `ingest:#012`・`ingest:#-1`・`ingest:#+1`・`ingest:# 12`・`ingest:#12x`・
@@ -184,7 +184,7 @@ pub fn parse_ingest_scope(scope: &str) -> Option<i64> {
 
 /// 接続 id の 10 進の正規形（`[1-9][0-9]*`・`i64` の範囲）だけを受ける。
 /// [`parse_ingest_scope`] の `#` の後ろと、送信口のパスの `{id}`
-/// （R2a-2c、`crate::ingest::auth`。docs/banto-hub-ingest-design.md §6 の
+/// （R2a-2c、`crate::ingest::auth`。docs/hub/banto-hub-ingest-design.md §6 の
 /// 404 `unknown_connection`（パスの形））が同じこの関数を使う - スコープの
 /// 文字列とパスの id が同じ規則で 1 対 1 に対応するように。
 pub fn parse_canonical_connection_id(digits: &str) -> Option<i64> {
@@ -260,7 +260,7 @@ fn validate_scope(scope: &str) -> Result<(), String> {
 }
 
 /// `"read:"` の後半（`pattern`）の構文検証（H10 ③ S1、
-/// docs/h10-3-read-scope-proposal.md §5・§6）。`scope` は元のスコープ文字列
+/// docs/archive/h10-3-read-scope-proposal.md §5・§6）。`scope` は元のスコープ文字列
 /// 全体 - エラーメッセージにそのまま出す。
 ///
 /// 2つの形を許可する:
@@ -324,7 +324,7 @@ fn validate_ingest_scope(target: &str, scope: &str) -> Result<(), String> {
 /// Hub のスコープの判定（`ApiKeyContext` は共有 crate の型なので、inherent の
 /// メソッドではなくこの拡張 trait で足す。判定の中身は移す前と同じ）。
 pub trait HubScopeChecks {
-    /// H10 ③（Option B、docs/h10-3-read-scope-proposal.md §6）: 認証層の
+    /// H10 ③（Option B、docs/archive/h10-3-read-scope-proposal.md §6）: 認証層の
     /// 「`/api/v1/*` の read 系ルートに入れるか」のゲート。素の `read` か、
     /// 任意の `read:...`（完全一致・グループ・ワイルドカードいずれも）を
     /// 1つでも持っていれば true。write 専用キーは従来どおり false（403）
@@ -335,7 +335,7 @@ pub trait HubScopeChecks {
     /// の doc comment「read のタグ単位化」参照）。
     fn has_any_read(&self) -> bool;
 
-    /// H10 ③（Option B、docs/h10-3-read-scope-proposal.md §6）: 個々の
+    /// H10 ③（Option B、docs/archive/h10-3-read-scope-proposal.md §6）: 個々の
     /// タグの**値**を読めるか（catalog の可視性とは別軸 - catalog は絞らず、
     /// 値ハンドラだけがこれを使う）。素の `read`、`external_name` との
     /// 完全一致 `read:{external_name}`、または `read:{connection}.{group}.*`
@@ -365,7 +365,7 @@ pub trait HubScopeChecks {
     /// 書けない。
     fn has_write_scope(&self, external_name: &str) -> bool;
 
-    /// T21 S1-a（docs/banto-hub-t21-design.md §3.1）: 構成補助 MCP ツール
+    /// T21 S1-a（docs/hub/banto-hub-t21-design.md §3.1）: 構成補助 MCP ツール
     /// （接続/グループ/タグ CRUD・設定・API キー発行等）が要求する管理
     /// スコープを持つか。`admin` は read/write とは**直交** — `admin`
     /// だけを持つキーは [`has_any_read`](Self::has_any_read)・
@@ -375,7 +375,7 @@ pub trait HubScopeChecks {
     /// （`crate::mcp` の `require_admin_scope` 参照）。
     fn has_admin_scope(&self) -> bool;
 
-    /// R2a-2b（docs/banto-hub-ingest-design.md §5「判定」）: `push` 接続
+    /// R2a-2b（docs/hub/banto-hub-ingest-design.md §5「判定」）: `push` 接続
     /// `connection_id` へ値を送れるか。`ingest:#{connection_id}` の**完全
     /// 一致**だけで true（ワイルドカードは無い）。発行時に正規形へ限っている
     /// （[`parse_ingest_scope`]）ので、文字列の比較で足りる。0 以下の id は
@@ -553,7 +553,7 @@ mod tests {
 
     // --- R2a-2b: ingest:#{id} の文法 -----------------------------------------
 
-    /// docs/banto-hub-ingest-design.md §11 の R2a-2b の文法の表。
+    /// docs/hub/banto-hub-ingest-design.md §11 の R2a-2b の文法の表。
     #[test]
     fn ingest_scope_grammar_table() {
         let accepted: &[(&str, i64)] = &[

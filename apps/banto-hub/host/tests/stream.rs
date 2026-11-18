@@ -286,7 +286,7 @@ async fn test_app_with(
 
     let api_keys = ApiKeysService::new(pool.clone());
     let (events_tx, _rx) = broadcast::channel(16);
-    // T2-4: WriteControl always constructs disabled (docs/tag-server-design.md
+    // T2-4: WriteControl always constructs disabled (docs/hub/tag-server-design.md
     // §6-6) - not exercised by these WebSocket-subscription tests.
     let write_audit = banto_hub_core::write_audit::WriteAuditService::new(pool.clone());
     let mqtt = std::sync::Arc::new(banto_hub_core::mqtt::MqttPublisher::new(manager.clone()));
@@ -1327,7 +1327,7 @@ async fn malformed_subprotocol_header_is_still_rejected_with_401() {
 }
 
 // ---------------------------------------------------------------------------
-// 10. H10 ③(Option B、docs/h10-3-read-scope-proposal.md §5・§6): per-tag
+// 10. H10 ③(Option B、docs/archive/h10-3-read-scope-proposal.md §5・§6): per-tag
 //     read スコープは購読解決(`crate::subscribe_core::resolve`)の結果を
 //     交差させる。`read:{tag}` キーはワイルドカード `*` 購読でもスコープ内
 //     のタグしか受信できない。素の `read` キーは従来どおり全件受信する
@@ -1523,7 +1523,7 @@ async fn wildcard_subscription_with_bare_read_scope_receives_every_tag() {
 }
 
 // ---------------------------------------------------------------------------
-// 11. T18-4b（docs/banto-hub-t18-design.md「T18-4b 選択購読と再接続堅牢化」、
+// 11. T18-4b（docs/hub/banto-hub-t18-design.md「T18-4b 選択購読と再接続堅牢化」、
 //     TAG-UX-H の一部）: グループワイルドカード購読
 //     (`"{connection}.{group}.*"`、`subscribe_core.rs::TagPattern::GroupWildcard`)
 //     は宣言したグループのタグだけを対象にする - banto-hub のモニタ画面が

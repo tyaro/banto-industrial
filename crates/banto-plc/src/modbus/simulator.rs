@@ -2,7 +2,7 @@
 //! good enough to drive this crate's own integration tests against a real
 //! socket instead of hand-decoded byte arrays, and public (behind the
 //! `simulator` feature) so I3's later integration tests and R4's 72-hour
-//! soak-test harness (docs/recorder-requirements.md §4) can reuse it rather
+//! soak-test harness (docs/chronogazer/recorder-requirements.md §4) can reuse it rather
 //! than each standing up their own fake PLC.
 //!
 //! Not a Modbus conformance test tool: it implements exactly the function
@@ -339,7 +339,7 @@ impl Simulator {
     }
 
     /// Send every response in pieces of `chunk` bytes with `delay` between
-    /// them (P0-3, docs/banto-hub-driver-refactor-plan.md §8.3 #1) - so the
+    /// them (P0-3, docs/hub/driver/banto-hub-driver-refactor-plan.md §8.3 #1) - so the
     /// client sees one MBAP response arrive over several `read()`s, as it can
     /// on a real network. Off by default; `None` turns it back off.
     pub fn set_response_chunking(&self, chunking: Option<(usize, Duration)>) {

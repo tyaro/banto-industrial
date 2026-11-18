@@ -1,7 +1,7 @@
 //! 管理系の `GET /api/status`・`GET /api/values`・`GET /api/tag-catalog`・
 //! `GET /api/tag-stream`（設計 §5.6・2026-08-31 オーナー決定「案A」）と、その並びにある `GET /api/v1/events`。
 //!
-//! `rest.rs` から中身を変えずに移したもの（docs/banto-hub-driver-refactor-plan.md §8.1、
+//! `rest.rs` から中身を変えずに移したもの（docs/hub/driver/banto-hub-driver-refactor-plan.md §8.1、
 //! P0-1 の手順 7）。タグ空間 API の状態型・ヘルパは `rest/tag_space.rs` にあり、
 //! 認証・ガードの補助は親の `rest.rs` にある。どちらも `use super::{...}` で使う。
 //! 外から使われるパス（`crate::rest::X`）は親の re-export で保つ。
@@ -163,7 +163,7 @@ struct AdminDbSourceStatusEntry {
     restarts: u32,
     last_restart_reason: Option<String>,
     groups: Vec<AdminDbSourceGroupStatusEntry>,
-    /// R2b-1e（docs/banto-hub-connection-settings-design.md §5.5）: パスワードを読めないので
+    /// R2b-1e（docs/hub/banto-hub-connection-settings-design.md §5.5）: パスワードを読めないので
     /// 起こしていない接続だけ `"unreadable"`、それ以外は `null`（`lastError` の文言は
     /// 「パスワード: 読めません（この PC で再入力してください）（理由: …）」）。
     password_state: Option<&'static str>,
@@ -212,7 +212,7 @@ impl From<DbSourceStatusEntry> for AdminDbSourceStatusEntry {
 }
 
 /// [`IngestStatusEntry`]のcamelCase版（取り込み口 `push`、R2a-2e、
-/// docs/banto-hub-ingest-design.md §9）。資格情報・値を含まないのは元の型と同じ。
+/// docs/hub/banto-hub-ingest-design.md §9）。資格情報・値を含まないのは元の型と同じ。
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct AdminIngestStatusEntry {
@@ -319,7 +319,7 @@ struct AdminStatusResponse {
     system: AdminSystemInfoEntry,
     /// 外部 DB 連携 S4: [`SinkStatusEntry`]のcamelCase版。
     sink: AdminSinkStatusEntry,
-    /// R2b-1e（docs/banto-hub-connection-settings-design.md §5.8・§6.5）: 接続の秘密値の
+    /// R2b-1e（docs/hub/banto-hub-connection-settings-design.md §5.8・§6.5）: 接続の秘密値の
     /// 保存の方式と警告。管理系の `GET /api/status` だけに出す（`/api/v1/status` には無い）。
     secret_storage: AdminSecretStorageEntry,
 }

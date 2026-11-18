@@ -26,7 +26,7 @@
 //!    [`exposure_beyond_users_read`](banto_safe_root::acl::exposure_beyond_users_read)。
 //! 5. 確かめてから、握ったハンドルから [`MAX_PEM_BYTES`](super::MAX_PEM_BYTES) まで読み、[`inspect_identity`] で中身を
 //!    確かめる。
-//! 6. **サービスの失効の記録**（#1121 PR2b。docs/hub-desktop-tls-design.md §4.4.1「サービスの
+//! 6. **サービスの失効の記録**（#1121 PR2b。docs/hub/hub-desktop-tls-design.md §4.4.1「サービスの
 //!    記録」、場面 25・26）: 確かめたルートのハンドル基準で `tls-revocations\` を確かめ（無ければ
 //!    `tls\` と同じ保護された DACL を付けて作る）、記録を読む（無ければ空で作る。#1116 で作った
 //!    証明書だけがある PC のため。置き換えずに作るので、同時に elev が作った記録を上書きしない）。

@@ -24,7 +24,7 @@
 //! exactly once ([`exit_cleanup`]). A second launch focuses the existing
 //! window (`tauri-plugin-single-instance`). See the [`tray`] module doc.
 //!
-//! #392 B1-2 (docs/chronogazer-service-design.md §4): startup and exit are the
+//! #392 B1-2 (docs/chronogazer/chronogazer-service-design.md §4): startup and exit are the
 //! engine's (`chronogazer_core::engine`, shared with `banto-serve` and the
 //! future headless/service hosts). `setup()` runs [`launch_desktop`]: open it
 //! (A1 lock → staged restore → `init_db`), decide the LAN auto-start, start it
@@ -42,7 +42,7 @@
 //! old file, or quit) and then retries [`launch_desktop`] in the same process.
 //! See the [`startup`] module.
 //!
-//! #392 B2-4b (docs/chronogazer-service-design.md §4): the desktop host uses
+//! #392 B2-4b (docs/chronogazer/chronogazer-service-design.md §4): the desktop host uses
 //! the same data root as `chronogazer-server` (`%ProgramData%\ChronoGazer`,
 //! overridable with `CHRONOGAZER_ROOT`; [`startup::LaunchPaths`]), keeps the
 //! Hub API key in the DPAPI file store under that root ([`desktop_key_store`],
@@ -51,7 +51,7 @@
 //! longer used ([`legacy_notice`], decision 3 / O10). The old data is never
 //! read, moved or deleted (H9).
 //!
-//! #392 B2-4c (docs/chronogazer-service-design.md §4): `setup()` no longer
+//! #392 B2-4c (docs/chronogazer/chronogazer-service-design.md §4): `setup()` no longer
 //! always starts the in-process engine. [`shell::start`] asks the SCM about
 //! the `ChronoGazer` service (and probes its `GET /api/host` when it is
 //! `Running`), then picks one of three views with the pure
@@ -3458,7 +3458,7 @@ async fn hub_disconnect(state: State<'_, AppState>) -> Result<HubView, BantoErro
 /// （[`COLLECT_OPERATION_ROLE`] / [`COLLECT_READ_ROLE`]）から来ているので、
 /// 経路によって割れようがない。
 ///
-/// **根拠**: `docs/recorder-requirements.md` §3.6「収集の開始/停止は editor
+/// **根拠**: `docs/chronogazer/recorder-requirements.md` §3.6「収集の開始/停止は editor
 /// 以上」と、そこに追記された **2026-09-18 のオーナー決定** - 「banto-hub は
 /// 同種の制御（自動書き込みエンジンの arm/disarm 等）を admin 限定にして
 /// いるが、chronogazer は別プロダクトであり R0 本文のこの決定を継承する。
@@ -3701,7 +3701,7 @@ async fn collect_events_list_body(
 ///
 /// 総件数は `totalCount` で返す - [`audit_log_list`]（監査ログ
 /// 一覧）と同じ綴りで、既定の取得件数も同じ 50
-/// （docs/r1-plan.md の R1-C「`collect_events` のイベント一覧ページ
+/// （docs/archive/r1-plan.md の R1-C「`collect_events` のイベント一覧ページ
 /// （banto 監査ログページの流儀）」）。
 ///
 /// **`asOfId` は任意のスナップショット境界**（#409 レビュー P2-2。
@@ -4887,7 +4887,7 @@ pub fn run() {
             // Drop が走らない** - ここを通らない限り、Hub の購読 WS は close を
             // 送らずに切れ、LAN サーバーは graceful shutdown せず、SQLite の
             // `-wal`/`-shm` が残る。収集エンジンを同じプロセスに載せる
-            // オーナー決定（2026-09-18、docs/recorder-requirements.md §4）の
+            // オーナー決定（2026-09-18、docs/chronogazer/recorder-requirements.md §4）の
             // 下では、**ここが唯一の「止める場所」**になる。
             //
             // Best effort: `try_state` が `None`（`setup()` がエンジンを
@@ -6001,7 +6001,7 @@ mod tests {
     /// 収集の床は **2 段**: 状態の**読み取りは `viewer` 以上**、
     /// **変更（開始・停止・再起動）は `editor` 以上**（`admin` ではない）。
     /// 2026-09-20 オーナー決定（#407 レビュー）と
-    /// docs/recorder-requirements.md §3.6 + 2026-09-18 のオーナー決定が根拠
+    /// docs/chronogazer/recorder-requirements.md §3.6 + 2026-09-18 のオーナー決定が根拠
     /// （[`require_collect_reader`] / [`require_collect_editor`] の doc）。
     ///
     /// **これは `chronogazer_core::rest` 側の双子のテストと対**になっていて、

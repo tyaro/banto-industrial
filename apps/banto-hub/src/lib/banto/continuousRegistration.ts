@@ -1,5 +1,5 @@
 /**
- * T11-1 連続登録（docs/ux-plan.md §3「T11: タグの一括登録」、連続登録は
+ * T11-1 連続登録（docs/archive/ux-plan.md §3「T11: タグの一括登録」、連続登録は
  * オーナー発案・2026-08-06 採用）: 名前パターン + 開始アドレス + 点数 +
  * 共通設定から連続タグ（{@link TagInput} の配列）を生成する。
  *
@@ -11,7 +11,7 @@
  *   受け取るだけの汎用エンドポイントのまま保てる（T11-2 の CSV インポート
  *   も同じ API を、別の展開ロジック — CSV パース — から呼ぶだけで済む）。
  *
- * **R2b-6d-2a（docs/banto-hub-driver-ui-design.md §4.3・§7・§7.1、2026-10-24）: アドレスの
+ * **R2b-6d-2a（docs/hub/driver/banto-hub-driver-ui-design.md §4.3・§7・§7.1、2026-10-24）: アドレスの
  * 計算はドライバに任せる**。以前はここ（と `slmpDeviceTable.ts`）が SLMP のデバイス表記・
  * 基数・ビットの軸を読んで番号を進めていた。いまは `POST /api/tags/offset-addresses`
  * （`unit: "points"`。1 点ごとに型のワード数ぶん動く）が返したアドレスをそのまま使い、
@@ -81,7 +81,7 @@ export interface ContinuousRegistrationParams extends ContinuousRegistrationComm
 /**
  * 連続登録フォーム（`+page.svelte` の `continuousForm`）の生の入力状態。
  *
- * **TAG-P0-1（2026-08-09、docs/banto-hub-desktop-plan.md §9 TAG-P0-1）:
+ * **TAG-P0-1（2026-08-09、docs/hub/banto-hub-desktop-plan.md §9 TAG-P0-1）:
  * フィールドの型宣言は `string` だが実際の代入値は必ずしも文字列ではない**。
  * Svelte 5 の `<input type="number" bind:value>` は空欄で `null` を、
  * 入力時は `number` を代入する（`<input type="text">`/`<select>` のみが
@@ -120,7 +120,7 @@ export interface ContinuousFormState {
 }
 
 /**
- * T19 S1-b（UX-35、docs/banto-hub-t19-design.md §2「連続登録の名前パターン
+ * T19 S1-b（UX-35、docs/hub/banto-hub-t19-design.md §2「連続登録の名前パターン
  * — デバイス名（M/D/W/B 等）を既定とし、開始番号はアドレスから導出（入力
  * 不要）」、2026-09-02 オーナー決定）: 開始アドレスの解析結果から連続登録フォームの
  * 名前パターンの既定値を導出する。

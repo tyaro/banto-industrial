@@ -1,5 +1,5 @@
 //! The SLMP 4E binary frame, built and checked by this driver itself
-//! (R2b-3d, docs/banto-hub-driver-io-design.md §6.2, owner decision Q4):
+//! (R2b-3d, docs/hub/driver/banto-hub-driver-io-design.md §6.2, owner decision Q4):
 //! the frame-type driver hands the engine bytes, so the request and the
 //! response check can no longer live inside the `slmp` crate's socket code.
 //!

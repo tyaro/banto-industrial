@@ -4,7 +4,7 @@
 # ## なぜ
 #
 # banto-hub の配布物は (a) NSIS インストーラ経由と (b) 単体 exe 配布の
-# 両方がある（docs/banto-hub-installer-design.md）。デフォルトの MSVC
+# 両方がある（docs/hub/banto-hub-installer-design.md）。デフォルトの MSVC
 # ターゲットは C ランタイムを動的リンクするため、実行環境に VC++ 再頒布
 # 可能パッケージ（vc_redist）が入っていないと
 # "VCRUNTIME140_1.dll が見つかりません" のようなエラーで起動できない。

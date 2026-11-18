@@ -1,4 +1,4 @@
-//! `GET /api/v1/stream` の WebSocket 購読 (docs/tag-server-design.md
+//! `GET /api/v1/stream` の WebSocket 購読 (docs/hub/tag-server-design.md
 //! §5.2「WebSocket（T1）」が仕様書。§4「タグ空間のセマンティクス」・
 //! §4.1「catalog はバインディング契約である」の `config_changed` も前提)。
 //!
@@ -120,7 +120,7 @@
 //!   トークン無しのストリーム用の `CommissioningStreamCredential`
 //!   （`commissioning_ended`）は、トークン無しの経路が無くなったので削除した。
 //!   ロックダウンの操作から即座に閉じる通知は持たない（周期の照合だけ。
-//!   運用ガイド docs/banto-hub-operations.md「開いているストリームの再検証」）。
+//!   運用ガイド docs/hub/banto-hub-operations.md「開いているストリームの再検証」）。
 //! - **照合できない（DB エラー・タイムアウト）ときは閉じない**。次の期限で
 //!   もう一度照合する。
 //! - **タイマーはストリーム 1 本につき 1 つ**（[`Revalidator`]、

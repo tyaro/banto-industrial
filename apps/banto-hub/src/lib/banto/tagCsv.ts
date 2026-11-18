@@ -1,5 +1,5 @@
 /**
- * T11-2 CSV インポート/エクスポート（docs/ux-plan.md §3「T11: タグの一括
+ * T11-2 CSV インポート/エクスポート（docs/archive/ux-plan.md §3「T11: タグの一括
  * 登録（連続登録 + CSV インポート/エクスポート）」）: タグ定義を CSV で
  * バックアップ/複製/レビューする。T11-1 の一括登録 API
  * （`POST /api/tags/batch`、`#lib/banto/tagRegistryAdmin.ts::createTagsBatch`）
@@ -139,7 +139,7 @@ export function serializeCsv(rows: string[][]): string {
 // --- 列スキーマ（エクスポート/インポート共通の単一の情報源） ----------------
 
 /**
- * CSV の列順（docs/ux-plan.md §3「接続・グループは名前で参照」の決定に
+ * CSV の列順（docs/archive/ux-plan.md §3「接続・グループは名前で参照」の決定に
  * 従い、`TagInput.collectionGroupId` を `connection`+`group` の2列の名前
  * 参照に置き換えた以外は `TagInput` の全フィールドと1:1対応）。
  * エクスポート（{@link exportTagsCsv}）とインポート（{@link parseTagsCsv}）
@@ -180,7 +180,7 @@ function numCell(v: number | null | undefined): string {
  * タグ一覧を CSV テキストへ変換する純関数（Blob/DOM 操作は呼び出し元の
  * `+page.svelte` が担当 — このモジュールはブラウザ API に依存しない）。
  * Excel での文字化け対策として **UTF-8 BOM を先頭に付与**する
- * （docs/ux-plan.md §3「Excel 想定のため UTF-8 BOM 付きで出力」）。
+ * （docs/archive/ux-plan.md §3「Excel 想定のため UTF-8 BOM 付きで出力」）。
  */
 export function exportTagsCsv(
 	tags: Tag[],
@@ -255,7 +255,7 @@ const TAG_DATA_TYPES: ReadonlySet<string> = new Set<TagDataType>([
 ]);
 
 /**
- * S3（docs/banto-hub-external-db-design.md §7 row S3）: `db` を CSV の
+ * S3（docs/hub/banto-hub-external-db-design.md §7 row S3）: `db` を CSV の
  * `tagKind` 列として受理する - `TAG_CSV_COLUMNS` は変更しない（実装指示
  * 「strict header, non-backward-compatible」、#264 の教訓）ので、既存の
  * `tagKind` 列がそのまま `db` も表現できる。配置規則（postgres 接続配下の
@@ -283,11 +283,11 @@ const COLUMN_INDEX: Record<TagCsvColumn, number> = Object.fromEntries(
 /**
  * CSV → `TagInput[]` への変換。エラーはすべての行にわたって収集し
  * （最初の不正行で止めない — all-or-nothing 表示のため）、1件でもあれば
- * `{ok: false, errors}` を返す（部分適用はしない、docs/ux-plan.md §3の
+ * `{ok: false, errors}` を返す（部分適用はしない、docs/archive/ux-plan.md §3の
  * 決定）。
  *
  * **接続・グループは名前で解決し、見つからなければエラー（自動作成は
- * しない）** — docs/ux-plan.md §3「接続・グループは名前で参照。存在
+ * しない）** — docs/archive/ux-plan.md §3「接続・グループは名前で参照。存在
  * しなければエラー。自動作成はしない — 暗黙の副作用を避ける」の決定
  * どおり。グループ名は接続内でのみ一意（`+page.svelte::groupsFor` と
  * 同じ前提）なので、`group` 列は解決済みの `connection` の
@@ -389,7 +389,7 @@ export function parseTagsCsv(
 			rowErrors.push(`tagKind "${tagKindRaw}" は不正な値です。`);
 		}
 
-		// S3（docs/banto-hub-external-db-design.md §4.1「db は postgres 接続
+		// S3（docs/hub/banto-hub-external-db-design.md §4.1「db は postgres 接続
 		// 配下のみ」、`banto_tags::tag::validate_tag_kind_placement`と同じ
 		// 配置規則）: この規則だけは CSV パース時点で先取りする（他の
 		// tagKind の配置規則 - computed は calc 配下のみ・internal は mem
@@ -528,7 +528,7 @@ export function parseTagsCsv(
 // --- T18-3d 更新用テンプレート/エラー行 CSV/上限 ------------------------------
 
 /**
- * ヘッダ行のみの空 CSV テンプレート（T18-3d、docs/banto-hub-t18-design.md
+ * ヘッダ行のみの空 CSV テンプレート（T18-3d、docs/hub/banto-hub-t18-design.md
  * 「T18-3d CSV 新規/更新分離」）。ダウンロードしてそのまま `parseTagsCsv`
  * に通せる形にするため、列は {@link TAG_CSV_COLUMNS} と完全に一致させる
  * （{@link exportTagsCsv} のヘッダ行と同じ単一の情報源を使う）。
@@ -562,7 +562,7 @@ export function buildErrorRowsCsv(
 }
 
 /**
- * CSV インポートの性能目標（docs/ux-plan.md §4「10,000タグ」）に合わせた
+ * CSV インポートの性能目標（docs/archive/ux-plan.md §4「10,000タグ」）に合わせた
  * 事前チェック用の上限定数。{@link checkCsvSizeLimit} は「解析前に」
  * ファイルサイズ（バイト数）で弾くため、パースコストをかける前に明らかに
  * 過大なファイルを早期に拒否できる。{@link checkCsvRowLimit} はパース後の

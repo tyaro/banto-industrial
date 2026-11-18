@@ -1,6 +1,6 @@
 <script lang="ts">
 	/**
-	 * S6（docs/banto-hub-external-db-design.md §5.2・§5.3・§7 row S6）: sink
+	 * S6（docs/hub/banto-hub-external-db-design.md §5.2・§5.3・§7 row S6）: sink
 	 * group（`hub_sink_groups`）の作成・再設定・削除を担う自己完結コンポーネント
 	 * - `ConnectionDrawer.svelte`/`CollectionGroupDrawer.svelte`と同じ「`Drawer`
 	 * を内包し、呼び出し側は `<SinkGroupDrawer open={...} group={...} .../>` を

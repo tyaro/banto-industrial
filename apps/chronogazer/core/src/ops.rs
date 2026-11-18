@@ -1,4 +1,4 @@
-//! 設定を変える操作の本体（#1161 PR5a、docs/chronogazer-agent-api-design.md
+//! 設定を変える操作の本体（#1161 PR5a、docs/chronogazer/chronogazer-agent-api-design.md
 //! §5.4「処理を一つにする」）。
 //!
 //! REST のハンドラ（`crate::rest`）と MCP のツール（#1161 PR5b）は、どちらも

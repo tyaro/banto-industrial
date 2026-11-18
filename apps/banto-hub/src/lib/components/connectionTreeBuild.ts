@@ -1,5 +1,5 @@
 /**
- * T18-5a（docs/banto-hub-t18-design.md「T18-5a 大量タグ性能」第1段）:
+ * T18-5a（docs/hub/banto-hub-t18-design.md「T18-5a 大量タグ性能」第1段）:
  * ConnectionTree.svelte のツリー構築を O(T+G+C) 化するための集計ヘルパー。
  *
  * 改修前は「接続ごとに groups を全走査してフィルタする」

@@ -1,4 +1,4 @@
-# R1-4a（docs/banto-driver-api-design.md §2.3・§4.4・§10）: Modbus TCP の R1 の
+# R1-4a（docs/hub/driver/banto-driver-api-design.md §2.3・§4.4・§10）: Modbus TCP の R1 の
 # 薄いアダプター。`banto-broker` の `src/modbus_driver.rs` と `modbus_config_for` を
 # `git mv` で移したもの（中身は不変）。broker の `DriverTable` の 1 行
 # （`("modbus-tcp", banto_driver_modbus::dial)`）として、組み立て役 `banto-drivers` が
@@ -6,11 +6,11 @@
 # でも依存しない。循環と二重コンパイルを避ける）。内部 crate（`publish = false`）。
 # R1-4b: `DriverBase` の実装（`src/base.rs`）と `classify_read` / `classify_write`
 # （`src/classify.rs`）を足した（`banto-driver-api` は通常の依存）。
-# R2b-3a-2（docs/banto-hub-driver-io-design.md §4.2）: broker の表の行（`dial`）と
+# R2b-3a-2（docs/hub/driver/banto-hub-driver-io-design.md §4.2）: broker の表の行（`dial`）と
 # `BrokerSession` の実装を消し、`banto-drivers` が `DriverEntry::session` で登録する。
 [package]
 name = "banto-driver-modbus"
-description = "Modbus TCP ドライバ（banto-driver-api の FrameDriver。R2b-3c から broker がレジストリ経由でエンジンに載せて使う）(docs/banto-hub-driver-io-design.md §6.1)"
+description = "Modbus TCP ドライバ（banto-driver-api の FrameDriver。R2b-3c から broker がレジストリ経由でエンジンに載せて使う）(docs/hub/driver/banto-hub-driver-io-design.md §6.1)"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true

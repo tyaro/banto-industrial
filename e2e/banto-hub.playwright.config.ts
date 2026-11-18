@@ -1,6 +1,6 @@
 /**
  * Playwright config for banto-hub's own E2E suite (T18-1、
- * docs/banto-hub-desktop-plan.md §16.3「banto-hub の Playwright/DOM テスト
+ * docs/hub/banto-hub-desktop-plan.md §16.3「banto-hub の Playwright/DOM テスト
  * 基盤を T18-1 の成果物へ前倒し」+ §9 TAG-P0-1 の残受け入れ「実 DOM
  * テストを追加する」)。
  *

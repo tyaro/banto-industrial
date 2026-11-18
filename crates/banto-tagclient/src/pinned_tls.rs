@@ -32,7 +32,7 @@ impl PinnedHubTls {
     /// Multiple entries permit a bounded old/new certificate rotation.
     ///
     /// The limit of two is also what ChronoGazer needs for the Hub on the same
-    /// PC (#1121, docs/hub-desktop-tls-design.md §4.4): one certificate from the
+    /// PC (#1121, docs/hub/hub-desktop-tls-design.md §4.4): one certificate from the
     /// Hub service's place plus one from the current user's place (the desktop
     /// Hub), which uses up both slots. ChronoGazer re-reads the places on every
     /// operation, so it never holds an old/new pair of the same place, and the

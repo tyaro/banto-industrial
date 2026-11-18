@@ -71,7 +71,7 @@ pub fn decode_register_value(
     Ok(TagValue::F64(value))
 }
 
-/// Decode a single bit out of the word at `regs[start]` (T8, docs/tag-server-design.md
+/// Decode a single bit out of the word at `regs[start]` (T8, docs/hub/tag-server-design.md
 /// §6.1: "D100.5" - a bit-in-word address, folded into the word's ordinary
 /// bulk read rather than requiring a dedicated wire operation). `bit` is
 /// `0..=15`, already range-checked by [`crate::address::Address::parse`]/
@@ -295,7 +295,7 @@ mod tests {
         assert!(matches!(err, PlcError::Protocol(_)));
     }
 
-    // --- decode_register_bit (T8, docs/tag-server-design.md §6.1) ---------
+    // --- decode_register_bit (T8, docs/hub/tag-server-design.md §6.1) ---------
 
     #[test]
     fn decodes_every_bit_position_of_a_word() {

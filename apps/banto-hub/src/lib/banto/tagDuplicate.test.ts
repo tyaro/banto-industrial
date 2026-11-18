@@ -1,5 +1,5 @@
 /**
- * `tagDuplicate.ts`（T18-3a、docs/banto-hub-desktop-plan.md §9.4 TAG-UX-D
+ * `tagDuplicate.ts`（T18-3a、docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-D
  * 前半）に対するユニットテスト。`tagFormCarry.test.ts`/`tagConflictDiff.test.ts`
  * と同じスタイル（describe/it、依存ゼロの純関数を直接 import）。
  */

@@ -3,10 +3,10 @@
 //!
 //! [`DriverAddress`] is produced by a driver's address parser
 //! ([`DriverBase::parse_address`](crate::DriverBase::parse_address)), and
-//! since R2b-2 (docs/banto-hub-driver-address-design.md) the production paths
+//! since R2b-2 (docs/hub/driver/banto-hub-driver-address-design.md) the production paths
 //! go through it: the save path of `banto-tags` (when built with a registry)
 //! stores its `canonical`, and the Hub's plan, instant read and write paths
-//! parse with it. Since R2b-3a-2 (docs/banto-hub-driver-io-design.md §4.2)
+//! parse with it. Since R2b-3a-2 (docs/hub/driver/banto-hub-driver-io-design.md §4.2)
 //! the broker's requests are [`TagSpec`](crate::TagSpec) /
 //! [`WriteItem`](crate::WriteItem), which carry it to the driver as is; the
 //! Modbus / SLMP drivers (session drivers in R2b-3a, frame drivers since
@@ -155,7 +155,7 @@ pub struct DriverAddress {
     /// to WIT's `u32` at the boundary.
     pub word_count: u16,
     /// The position inside [`area`](Self::area), for telling whether two
-    /// addresses overlap (R2b-6a, docs/banto-hub-driver-ui-design.md §3.6):
+    /// addresses overlap (R2b-6a, docs/hub/driver/banto-hub-driver-ui-design.md §3.6):
     /// the word number of a word address (SLMP hexadecimal device numbers
     /// are converted to a plain number; a bit inside a word is the *word's*
     /// number, [`bit`](Self::bit) stays a separate field), the bit number of

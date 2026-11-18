@@ -1,6 +1,6 @@
 //! An in-memory fake session driver for this crate's own unit tests (R1-4a;
 //! rewritten for the driver API's `Session` by R2b-3a-2,
-//! docs/banto-hub-driver-io-design.md §4.2).
+//! docs/hub/driver/banto-hub-driver-io-design.md §4.2).
 //!
 //! The real drivers live in `banto-driver-slmp` / `banto-driver-modbus`,
 //! which depend on this crate - so this crate cannot use them, not even as a

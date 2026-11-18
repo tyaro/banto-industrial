@@ -139,7 +139,7 @@ impl Drop for TempDir {
 }
 
 /// R2b-0: the drivers a unit test injects into `HubSessions::new` /
-/// `HubConfig` (docs/banto-driver-api-design.md §6.4・§7.4). Until R2b-0 this
+/// `HubConfig` (docs/hub/driver/banto-driver-api-design.md §6.4・§7.4). Until R2b-0 this
 /// was `banto_drivers::builtin()`; core no longer depends on `banto-drivers`
 /// (not even as a dev-dependency, §2.4), so a driver-only change does not
 /// select this crate in CI. The `src` tests are about the hub's own machinery
@@ -147,7 +147,7 @@ impl Drop for TempDir {
 /// fake is enough:
 ///
 /// - `registry`: **fake session-type** drivers for `slmp` / `modbus-tcp`
-///   ([`FakePlcDriver`], R2b-3a-2, docs/banto-hub-driver-io-design.md §4.2:
+///   ([`FakePlcDriver`], R2b-3a-2, docs/hub/driver/banto-hub-driver-io-design.md §4.2:
 ///   the broker dials through the registry, so the same two ids as the
 ///   built-ins make `HubSessions::is_broker_managed` answer exactly as in
 ///   production), plus the host-provided protocols (`push` / `postgres` /

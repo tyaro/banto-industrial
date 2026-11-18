@@ -1,5 +1,5 @@
 //! 接続の秘密値の行（`plc_connection_secrets`）と、`settings` の秘密の参照の扱い
-//! （R2b-1d、docs/banto-hub-connection-settings-design.md §3.1・§3.3・§5.3・§8）。
+//! （R2b-1d、docs/hub/banto-hub-connection-settings-design.md §3.1・§3.3・§5.3・§8）。
 //!
 //! # 置き場
 //!

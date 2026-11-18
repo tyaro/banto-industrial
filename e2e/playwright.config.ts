@@ -1,5 +1,5 @@
 /**
- * Playwright config for ChronoGazer's R1-A smoke E2E suite (docs/r1-plan.md
+ * Playwright config for ChronoGazer's R1-A smoke E2E suite (docs/archive/r1-plan.md
  * R1-A "CI に frontend/E2E ジョブ追加").
  *
  * Mirrors banto's own e2e/playwright.config.ts: a LAN/REST-mode smoke pass,

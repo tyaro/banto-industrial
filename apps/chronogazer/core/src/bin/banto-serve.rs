@@ -74,7 +74,7 @@ const DEFAULT_DB_PATH: &str = "./banto-dev.sqlite3";
 /// Ctrl-C からの終了の予算（`chronogazer_core::engine` のモジュール doc
 /// 「終了の順序」）。開発用なのでデスクトップの 5 秒より長めに取り、
 /// 計画中の `chronogazer-server` の Ctrl-C と同じ 15 秒にする
-/// （docs/chronogazer-service-design.md §3.1(b)）。
+/// （docs/chronogazer/chronogazer-service-design.md §3.1(b)）。
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(15);
 
 #[tokio::main]

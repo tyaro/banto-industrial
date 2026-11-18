@@ -1,4 +1,4 @@
-//! DB Source の共有部品（docs/banto-hub-ingest-design.md §10.1・§11 の R2a-3a）。
+//! DB Source の共有部品（docs/hub/banto-hub-ingest-design.md §10.1・§11 の R2a-3a）。
 //!
 //! Hub 内の PostgreSQL Source（`banto-hub-core` の `db_source`）と、R2a-3b で
 //! 入る DB ブリッジ（`banto-hub-sink` の `source/`）が**同じ変換と同じ梯子**を

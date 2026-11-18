@@ -1,4 +1,4 @@
-//! T3（docs/tag-server-design.md §5.3「MQTT publish（T3）」）: 外部 MQTT
+//! T3（docs/hub/tag-server-design.md §5.3「MQTT publish（T3）」）: 外部 MQTT
 //! ブローカーへ接続する**クライアントモード**の発行機能（rumqttc）。組み込み
 //! ブローカー（§10-4 の判断待ち）・MQTT 経由の書き込み（§6 で不採用決定）は
 //! スコープ外。
@@ -22,7 +22,7 @@
 //!   REST/UI 設定（[`crate::settings::MqttSettings`]）だけで完結させる段階
 //!   実装とし、**全タグ一律 on_change + `min_interval_ms` スロットル**を
 //!   既定動作として先行実装する（per-tag 化はバックログ、
-//!   docs/tag-server-design.md §5.3 に追記した）。
+//!   docs/hub/tag-server-design.md §5.3 に追記した）。
 //! - **削除されたタグの retain クリアはやらない**: `.../set` 相当の空
 //!   ペイロード発行を catalog 削除時に打つには「消えた外部名」を追跡する
 //!   仕組みが要るが、`crate::hub::TagMap` は revision ごとに丸ごと作り直す
@@ -41,7 +41,7 @@
 //! ## T15-3 → 2026-09-15 オーナー決定（#335 追補）で撤回、#362 で機構ごと撤去:
 //! AllSimulation の出力抑止
 //!
-//! 旧仕様（T15-3、docs/banto-hub-desktop-plan.md §6.3、撤去済み・経緯として
+//! 旧仕様（T15-3、docs/hub/banto-hub-desktop-plan.md §6.3、撤去済み・経緯として
 //! 保存）は「`AllSimulation`中は通常トピック（[`topic_for`]、retain=true）を
 //! 抑止し、`TestOutputControl`が現在の run_id に対して有効な間だけ
 //! `{prefix}/test/{run_id}/...`という別トピックへ`retain=false`で発行する」

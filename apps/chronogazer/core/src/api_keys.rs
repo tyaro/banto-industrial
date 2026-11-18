@@ -1,4 +1,4 @@
-//! ChronoGazer の API キー（#1161 PR4、docs/chronogazer-agent-api-design.md
+//! ChronoGazer の API キー（#1161 PR4、docs/chronogazer/chronogazer-agent-api-design.md
 //! §3）。
 //!
 //! キーの形式・ハッシュ・照合の順・表への SQL・拒否の応答は共有 crate

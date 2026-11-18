@@ -7,7 +7,7 @@
 	 * 切替 - 試運転モード中は `/api/v1/*` が 401 になるため、
 	 * `hubStatus.ts`冒頭のdoc comment参照）。
 	 *
-	 * **T19 S3-b（UX-47、docs/banto-hub-t19-design.md §3.9、2026-09-04）**:
+	 * **T19 S3-b（UX-47、docs/hub/banto-hub-t19-design.md §3.9、2026-09-04）**:
 	 * 以前はここに `GET /api/values`（全タグ現在値）も3秒ポーリングして
 	 * 表示していたが撤去した - 現在値はタグモニタ画面が担う（同じ情報を
 	 * 複数画面が持つと表示規約の二重管理になる、という UX-30 と同じ理屈）。
@@ -23,7 +23,7 @@
 	 * 差分配信を新設するより単純な定期ポーリングで十分（WebSocket は
 	 * 実装指示でも明示的にスコープ外）。
 	 *
-	 * T19 S1-d（docs/banto-hub-t19-design.md UX-44、2026-09-03）: T18-2d で
+	 * T19 S1-d（docs/hub/banto-hub-t19-design.md UX-44、2026-09-03）: T18-2d で
 	 * 「サーバー状態」の上に置いていた初回チェックリスト（PLC接続作成→収集
 	 * グループ作成→タグ登録→収集開始→モニタで値確認、完了判定は
 	 * `#lib/banto/tagOnboarding.ts::computeOnboardingSteps` の純関数）を撤去
@@ -129,7 +129,7 @@
 	}
 
 	/**
-	 * S3（docs/banto-hub-external-db-design.md §7 row S3、実装指示8）: DB
+	 * S3（docs/hub/banto-hub-external-db-design.md §7 row S3、実装指示8）: DB
 	 * Source 節（`status.db_source`）の epoch ミリ秒（`last_poll_at`/
 	 * `last_ok_at`）表示。`formatDateTime`（ISO 文字列専用）とは別に持つ -
 	 * こちらは `number | null` を受け取り、`null`（一度もポーリング/成功
@@ -152,7 +152,7 @@
 	}
 
 	/**
-	 * S6（docs/banto-hub-external-db-design.md §5.2・§5.5・§7 row S6）: `sink`
+	 * S6（docs/hub/banto-hub-external-db-design.md §5.2・§5.5・§7 row S6）: `sink`
 	 * 節の表示ラベル・バッジクラス。サイドカーの`sidecar.state`は
 	 * `"online"`/`"unknown"`の2値のみ（`crate::sink::status`のモジュール doc
 	 * 参照 - 15秒以上 push が無ければ`unknown`）。
@@ -235,7 +235,7 @@
 		}
 	}
 
-	// T19 S1-d（UX-44、docs/banto-hub-t19-design.md、2026-09-03）: T18-2d の
+	// T19 S1-d（UX-44、docs/hub/banto-hub-t19-design.md、2026-09-03）: T18-2d の
 	// 初回チェックリスト（`registrySnapshot`/`onboardingDone`/`pollRegistry`/
 	// `onboardingSteps` とそれを完了させる `$effect`）を撤去した（2026-09-02
 	// オーナー決定「起動直後は何も出さない」）。`listPlcConnections` は
@@ -486,7 +486,7 @@
 	// シェルの状態（`hostSwitch.fallbackCause`）が来たらそちらを正とする。
 	let hostFallbackCause: string | null = $state(null);
 
-	// --- サービス一覧（S6、docs/banto-hub-external-db-design.md §5.5・§7 row
+	// --- サービス一覧（S6、docs/hub/banto-hub-external-db-design.md §5.5・§7 row
 	// S6、ローカルシェル限定）: BantoHub は上の hostSwitch カードが持つ状態
 	// をそのまま表示専用の1行として流用し、BantoHubSink（外部 DB 連携 S5 の
 	// サイドカー）だけをこのセクション固有に start/stop する
@@ -740,7 +740,7 @@
 				<dt>リビジョン</dt>
 				<dd>{status.revision}</dd>
 				<!--
-					T19 S1-d（UX-45、docs/banto-hub-t19-design.md §3.6、2026-09-03）:
+					T19 S1-d（UX-45、docs/hub/banto-hub-t19-design.md §3.6、2026-09-03）:
 					`CommissioningBanner.svelte` の常時表示（全画面共通の警告バナー）を
 					やめた代わりに、事実として状態を確認できる場所をここに残す -
 					警告ではなく「サーバー状態」の一項目として並べる。安全性は
@@ -761,7 +761,7 @@
 				</dd>
 			</dl>
 			<!--
-				#341（オーナー決定 2026-09-09 / 2026-09-14、docs/tag-server-design.md
+				#341（オーナー決定 2026-09-09 / 2026-09-14、docs/hub/tag-server-design.md
 				§4.3）: 構成変更（接続・グループ・タグ）がいつ実行構成へ届くかの契約を、
 				試運転モードの表示のすぐ近くに事実として置く。issue 本文は
 				`CommissioningBanner` に添えることを想定していたが、そのバナーは
@@ -827,7 +827,7 @@
 
 	<section>
 		<!--
-			S3（docs/banto-hub-external-db-design.md §7 row S3、実装指示8）:
+			S3（docs/hub/banto-hub-external-db-design.md §7 row S3、実装指示8）:
 			`GET /api/status` の `dbSource` 節（接続ごとの運転状態・配下
 			グループの直近成功時刻/エラー/行数）を表示する。接続一覧
 			（PLC）と同じ「状態バッジ + 表」の見た目に揃える -
@@ -896,7 +896,7 @@
 
 	<section>
 		<!--
-			S6（docs/banto-hub-external-db-design.md §5.2・§5.5・§7 row S6）:
+			S6（docs/hub/banto-hub-external-db-design.md §5.2・§5.5・§7 row S6）:
 			`GET /api/status` の `sink` 節（DB Sink サイドカーの運転状態）を
 			表示する。DB Source 節と同じ「状態バッジ + 表」の見た目に揃える。
 			サイドカーは別プロセス（`apps/banto-hub-sink`）なので、この画面
@@ -1262,7 +1262,7 @@
 	</section>
 
 	<!--
-		S6（docs/banto-hub-external-db-design.md §5.5・§7 row S6）: 「サービス」
+		S6（docs/hub/banto-hub-external-db-design.md §5.5・§7 row S6）: 「サービス」
 		一覧 - BantoHub（上のカードの状態を表示専用の1行として流用）と
 		BantoHubSink（外部 DB 連携 S5 のサイドカー、この行だけ起動・停止を
 		行う）の SCM 状態をまとめて見せる。ローカルシェル限定
@@ -1430,7 +1430,7 @@
 		font-family: var(--banto-font-mono, monospace);
 	}
 
-	/* S3（docs/banto-hub-external-db-design.md §7 row S3）: DB Source 節、接続1件分の区切り。 */
+	/* S3（docs/hub/banto-hub-external-db-design.md §7 row S3）: DB Source 節、接続1件分の区切り。 */
 	.db-source-connection {
 		margin-bottom: 1rem;
 	}

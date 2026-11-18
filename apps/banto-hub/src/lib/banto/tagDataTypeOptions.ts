@@ -1,5 +1,5 @@
 /**
- * R2b-6d-2b（docs/banto-hub-driver-ui-design.md §7）: タグのデータ型プルダウンの選択肢を、
+ * R2b-6d-2b（docs/hub/driver/banto-hub-driver-ui-design.md §7）: タグのデータ型プルダウンの選択肢を、
  * 選択中の接続から決める依存の少ない純関数モジュール（`tags/+page.svelte` の単票フォーム・
  * 連続登録・構造体登録の 3 か所が使う）。
  *
@@ -74,7 +74,7 @@ export function dataTypeOptionsFor(
 		return DATA_TYPE_OPTIONS.filter((opt) => kinds.has(opt.value));
 	}
 	if (isDriverPending(protocol, driversLoaded, driver)) return DATA_TYPE_OPTIONS;
-	// R2a-2e（docs/banto-hub-ingest-design.md §3.3）: push のタグは数値（64bit を
+	// R2a-2e（docs/hub/banto-hub-ingest-design.md §3.3）: push のタグは数値（64bit を
 	// 含む）と bit だけ。string は送れない（サーバーの `push_tag_errors` が断る）。
 	if (protocol === 'push') return DATA_TYPE_OPTIONS.filter((opt) => opt.value !== 'string');
 	if (protocol === 'postgres') {

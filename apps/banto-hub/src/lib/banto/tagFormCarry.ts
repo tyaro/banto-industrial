@@ -1,6 +1,6 @@
 /**
- * T18-2c（docs/banto-hub-t18-design.md「T18-2c 登録後分岐と親引継ぎ」、
- * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-2「作成後は『保存して次を追加』と
+ * T18-2c（docs/hub/banto-hub-t18-design.md「T18-2c 登録後分岐と親引継ぎ」、
+ * docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-2「作成後は『保存して次を追加』と
  * 『保存して閉じる』を分け、連続作業では親設定と明示選択した共通値を
  * 保持する」）: タグ単票 create Drawer の「保存して次を追加」が使う、依存ゼロの
  * 純関数。`tagFormLayout.ts`/`tagFormNumeric.ts` と同じ方針 -

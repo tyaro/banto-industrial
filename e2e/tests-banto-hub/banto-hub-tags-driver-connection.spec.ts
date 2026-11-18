@@ -1,5 +1,5 @@
 /**
- * R2b-6c（docs/banto-hub-driver-ui-design.md §6・§7.1）: 機器のドライバの接続を
+ * R2b-6c（docs/hub/driver/banto-hub-driver-ui-design.md §6・§7.1）: 機器のドライバの接続を
  * `GET /api/drivers` のスキーマから組み立てた欄で作る受け入れテスト。
  *
  * 固定する内容:

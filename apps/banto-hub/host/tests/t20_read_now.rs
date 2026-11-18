@@ -1,4 +1,4 @@
-//! T20 ①b の統合テスト（docs/banto-hub-t20-design.md §3.1、案A「分離経路」）:
+//! T20 ①b の統合テスト（docs/hub/banto-hub-t20-design.md §3.1、案A「分離経路」）:
 //! read-on-demand（その場読み）REST `GET /api/v1/values/{tag}/read-now` と
 //! MCP `read_tag_now` の E2E。
 //!
@@ -1088,7 +1088,7 @@ async fn mcp_read_tag_now_denies_missing_read_scope() {
 
 // ---------------------------------------------------------------------------
 // 6. R2b-2c: アドレスは接続のドライバ(レジストリ)で解析する
-//    (docs/banto-hub-driver-address-design.md §4.1・§5・§9)
+//    (docs/hub/driver/banto-hub-driver-address-design.md §4.1・§5・§9)
 //
 // 計画(`build_hub_config`)は厳格版なので、有効な数値タグの不正なアドレスは
 // commit_catalog ごと断る(カタログに載らない)。カタログの `entry.address` が不正な

@@ -1,5 +1,5 @@
 /**
- * `tagFormNumeric.ts`（TAG-P0-1 拡大分、docs/banto-hub-desktop-plan.md
+ * `tagFormNumeric.ts`（TAG-P0-1 拡大分、docs/hub/banto-hub-desktop-plan.md
  * §16.4「`optNum` の null 取りこぼし」）に対するユニットテスト。
  * `tagCsv.test.ts`/`apiKeysAdmin.test.ts` と同じスタイル（describe/it、
  * 依存ゼロの純関数を直接 import）。

@@ -1,4 +1,4 @@
-//! DB Source（docs/banto-hub-external-db-design.md #228・§4）: 外部
+//! DB Source（docs/hub/banto-hub-external-db-design.md #228・§4）: 外部
 //! PostgreSQL の SELECT 結果を、PLC タグと区別のつかない現在値としてタグ
 //! 空間へ載せる仕組み。
 //!
@@ -618,7 +618,7 @@ async fn run_test(options: PgConnectOptions) -> DbConnectionTestOutcome {
     }
 }
 
-/// S3（docs/banto-hub-external-db-design.md §7 row S3）: `describe` した
+/// S3（docs/hub/banto-hub-external-db-design.md §7 row S3）: `describe` した
 /// 1列の応答。`banto_hub_core::rest`（`POST
 /// /api/collection-groups/{id}/describe`）がそのまま JSON へ変換する -
 /// `kind` は [`convert::ColumnKind::classify`] の3値を文字列化したもの
@@ -1332,7 +1332,7 @@ mod tests {
         engine.shutdown().await;
     }
 
-    /// R2b-1d（docs/banto-hub-connection-settings-design.md §5.4・§5.5）: パスワードを読めない
+    /// R2b-1d（docs/hub/banto-hub-connection-settings-design.md §5.4・§5.5）: パスワードを読めない
     /// 接続はタスクを起こさず（＝再試行でも繋ぎに行かない）、その接続だけ状態が `error`
     /// 「パスワード: 読めません」、配下のタグは Bad。読める接続は今どおり起きる。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

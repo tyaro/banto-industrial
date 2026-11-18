@@ -1,4 +1,4 @@
-//! MCP（Model Context Protocol）サーバー(T19 S5、docs/banto-hub-t19-design.md
+//! MCP（Model Context Protocol）サーバー(T19 S5、docs/hub/banto-hub-t19-design.md
 //! §3.7・UX-41)。
 //!
 //! JSON-RPC の受け付け・`initialize`/`ping`/`tools/list`/`tools/call`・ツール表・
@@ -161,7 +161,7 @@ struct McpState {
     /// `collection_controller`と違い`enforce_collection_state`に関わらず
     /// 常に実体を持つ（このモジュールの doc comment「安全境界」節参照）。
     status: TagSpaceState,
-    // --- T21 S1-b（docs/banto-hub-t21-design.md §4・§5）: 構成補助ツール
+    // --- T21 S1-b（docs/hub/banto-hub-t21-design.md §4・§5）: 構成補助ツール
     // （接続 CRUD）用の追加状態。REST の `plc_connections_create`/
     // `plc_connections_delete`（`crate::rest`）と全く同じ mutation フロー
     // （tx → preflight → commit → catalog commit・pending queue）を再利用
@@ -175,7 +175,7 @@ struct McpState {
     /// 今スライスでは接続のみ扱うが、この関数の署名（REST と共有）は
     /// group ソースの分岐も持つため必要。
     collection_groups: CollectionGroupService,
-    /// T21 S1-d（docs/banto-hub-t21-design.md §4・§5）: タグ CRUD 用。
+    /// T21 S1-d（docs/hub/banto-hub-t21-design.md §4・§5）: タグ CRUD 用。
     /// `TagService::new(manager.pool())`で構築（REST の
     /// `tag_registry_router`と同じ生成方法）。
     tags: TagService,
@@ -185,7 +185,7 @@ struct McpState {
     /// （`crate::rest::api_router_with_controller_mode`）が REST と同じ
     /// `Arc`/`SqlitePool`ベースの `AuditLogService` をそのまま渡す。
     audit: AuditLogService,
-    // T21 S2-b（docs/banto-hub-t21-design.md、構成補助 MCP の設定
+    // T21 S2-b（docs/hub/banto-hub-t21-design.md、構成補助 MCP の設定
     // get/set）: `get_grpc_settings`/`get_mqtt_settings`/`get_retention`/
     // `set_grpc_settings`/`set_mqtt_settings`/`set_retention`用の追加状態。
     // 設定はレジストリ mutation ではなく key-value なので pending
@@ -198,7 +198,7 @@ struct McpState {
     /// 呼び出し元（`mcp_router`引数）が REST の`grpc_settings_router`と
     /// **同じ** `Arc`を渡す。
     grpc_server: Arc<crate::grpc::GrpcServer>,
-    // T21 S3（docs/banto-hub-t21-design.md、構成補助 MCP の最終スライス）:
+    // T21 S3（docs/hub/banto-hub-t21-design.md、構成補助 MCP の最終スライス）:
     // `lock_down`ツール用。`commissioning`（`CommissioningState`、上記）は
     // write 系ツールの`is_locked_down()`判定専用のまま触らない - `lock_down`
     // 自体を呼ぶにはフルの`CommissioningService`（`CommissioningState`より
@@ -209,7 +209,7 @@ struct McpState {
     /// （`.clone()`）を渡す（このモジュールの doc comment「呼び出し元は
     /// ...同じインスタンスを渡すこと」と同じ規律）。
     commissioning_service: CommissioningService,
-    // 外部 DB 連携 S4（docs/banto-hub-external-db-design.md §5.2）:
+    // 外部 DB 連携 S4（docs/hub/banto-hub-external-db-design.md §5.2）:
     // `list_sink_groups`等5ツール用。`SinkGroupService::new(manager.pool())`
     // で構築（REST の `crate::rest::sink_groups_router`と同じ生成方法）。
     // `get_server_status`の`sink`節は`status`（`TagSpaceState`、下）が既に
@@ -239,12 +239,12 @@ pub(crate) fn mcp_router(
     // T14-4 由来: `crate::rest::tag_space_router`の`enforce_collection_state`
     // と同じ意味 - `!legacy_compat_router`を渡す（呼び出し元の責務）。
     enforce_collection_state: bool,
-    // T21 S1-b（docs/banto-hub-t21-design.md §5）: 構成補助ツール用に追加。
+    // T21 S1-b（docs/hub/banto-hub-t21-design.md §5）: 構成補助ツール用に追加。
     // 呼び出し元（`crate::rest::api_router_with_controller_mode`）が REST の
     // 他ルーターと**同じ** `Arc`/値を渡すこと（このモジュールの doc comment
     // 「呼び出し元は...同じインスタンスを渡すこと」と同じ規律）。
     audit: AuditLogService,
-    // T21 S2-b（docs/banto-hub-t21-design.md、構成補助 MCP の設定
+    // T21 S2-b（docs/hub/banto-hub-t21-design.md、構成補助 MCP の設定
     // get/set）: `set_grpc_settings`が`GrpcServer::apply`を呼ぶために必要 -
     // 呼び出し元は`crate::rest::grpc_settings_router`へ渡すものと**同じ**
     // `Arc`を渡すこと（このモジュールの doc comment「呼び出し元は...同じ
@@ -517,7 +517,7 @@ fn tool_registry() -> ToolRegistry<McpState, ApiKeyContext> {
             }),
             async1!(tool_write_recipe),
         )
-            // --- T21 S1-b（docs/banto-hub-t21-design.md §4）: 構成補助ツール
+            // --- T21 S1-b（docs/hub/banto-hub-t21-design.md §4）: 構成補助ツール
             // （接続 CRUD の第一弾）。いずれも `admin` スコープ必須 - ロック
             // ダウンの前後を問わず常時可（設計 §3.2「有効化ガードは不採用」）。
         .tool(
@@ -625,7 +625,7 @@ fn tool_registry() -> ToolRegistry<McpState, ApiKeyContext> {
             }),
             async1!(tool_delete_connection),
         )
-            // --- T21 S1-c（docs/banto-hub-t21-design.md §4・§5）: 構成補助ツール
+            // --- T21 S1-c（docs/hub/banto-hub-t21-design.md §4・§5）: 構成補助ツール
             // 第二弾(接続 update/test・グループ CRUD)。S1-b と同じゲート
             // (admin スコープ必須・有効化ガードなし)。
         .tool(
@@ -687,7 +687,7 @@ fn tool_registry() -> ToolRegistry<McpState, ApiKeyContext> {
             }),
             async1!(tool_test_connection),
         )
-            // S1a（docs/banto-hub-external-db-design.md §4.6）: 保存済み接続の
+            // S1a（docs/hub/banto-hub-external-db-design.md §4.6）: 保存済み接続の
             // 接続テスト - 上の`test_connection`（保存前のフォーム値）
             // とは別ツール。
         .tool(
@@ -797,7 +797,7 @@ fn tool_registry() -> ToolRegistry<McpState, ApiKeyContext> {
             }),
             async1!(tool_delete_group),
         )
-            // --- T21 S1-d（docs/banto-hub-t21-design.md §4・§5）: 構成補助ツール
+            // --- T21 S1-d（docs/hub/banto-hub-t21-design.md §4・§5）: 構成補助ツール
             // 第三弾（タグ CRUD）。S1-b/S1-c と同じゲート(admin スコープ必須・
             // 有効化ガードなし)。`create_tag`/`update_tag`/`delete_tag`の
             // properties は REST の `TagPayload`（`crate::rest`）と同じ wire
@@ -960,7 +960,7 @@ fn tool_registry() -> ToolRegistry<McpState, ApiKeyContext> {
             }),
             async1!(tool_delete_tag),
         )
-            // --- T21 S2-a（docs/tag-server-design.md §8想定の可逆ランタイム
+            // --- T21 S2-a（docs/hub/tag-server-design.md §8想定の可逆ランタイム
             // 制御。ここまでの構成 CRUD 系ツールと違い、レジストリ mutation
             // ではなく collection controller / write_control を直接叩く
             // ランタイム制御 - pending queue も preflight も通らない
@@ -1004,7 +1004,7 @@ fn tool_registry() -> ToolRegistry<McpState, ApiKeyContext> {
             }),
             async1!(tool_set_write_control),
         )
-            // --- T21 S2-b（docs/tag-server-design.md §5.3/§5.4、docs/banto-hub-t19-design.md
+            // --- T21 S2-b（docs/hub/tag-server-design.md §5.3/§5.4、docs/hub/banto-hub-t19-design.md
             // §5.1想定の設定 get/set）: gRPC/MQTT/データストア保持の構成補助
             // ツール。ここまでの接続/グループ/タグ系ツールと違い、設定は
             // レジストリ mutation ではなく key-value（`crate::settings::SettingsService`）
@@ -1126,7 +1126,7 @@ fn tool_registry() -> ToolRegistry<McpState, ApiKeyContext> {
             }),
             async1!(tool_set_retention),
         )
-            // --- T21 S3（docs/banto-hub-t21-design.md、構成補助 MCP の最終
+            // --- T21 S3（docs/hub/banto-hub-t21-design.md、構成補助 MCP の最終
             // スライス）: API キー発行/一覧/失効・ロックダウン。ここまでの
             // ツールと同じ admin スコープ必須。`revoke_api_key`/`lock_down`は
             // 不可逆操作のため confirm:true が必須(delete 系ツールと同じ規律)。
@@ -1203,7 +1203,7 @@ fn tool_registry() -> ToolRegistry<McpState, ApiKeyContext> {
             }),
             async1!(tool_lock_down),
         )
-            // --- 外部 DB 連携 S4（docs/banto-hub-external-db-design.md §5.2）:
+            // --- 外部 DB 連携 S4（docs/hub/banto-hub-external-db-design.md §5.2）:
             // DB Sink の Hub 側構成補助ツール。他の構成 CRUD ツールと同じゲート
             // (admin スコープ必須)・同じ監査だが、pending queue には載らない
             // （`crate::rest::sink_groups_router`のdoc comment参照 - sink group
@@ -1450,7 +1450,7 @@ fn tool_read_tag_values(
     Ok(tool_ok(json!({ "values": values })))
 }
 
-// --- 3. read_tag_now (T20 ①b、docs/banto-hub-t20-design.md §3.1) ---------
+// --- 3. read_tag_now (T20 ①b、docs/hub/banto-hub-t20-design.md §3.1) ---------
 
 /// `read_tag_now` - `crate::read_path::execute_read_now`をそのまま呼ぶだけ
 /// (`crate::rest::v1_value_read_now`と全く同じ形で委譲する - ①a の
@@ -1724,7 +1724,7 @@ fn write_recipe_advisory(entries: &[(String, Value)]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// T21 S1-b（docs/banto-hub-t21-design.md §3・§4）: 構成補助ツール（接続
+// T21 S1-b（docs/hub/banto-hub-t21-design.md §3・§4）: 構成補助ツール（接続
 // CRUD の第一弾）。すべて `admin` スコープを要求する - 有効化ガードは無く
 // （設計 §3.2「不採用」オーナー決定）、`admin` スコープ＋監査＋（delete 系は）
 // confirm が唯一のガード。mutation 本体（tx・preflight・catalog commit・
@@ -1805,7 +1805,7 @@ async fn tool_list_connections(state: &McpState, ctx: &ApiKeyContext) -> Value {
     if let Err(err) = require_admin_scope(ctx) {
         return err;
     }
-    // S1（docs/banto-hub-external-db-design.md §2.2）: 生の`PlcConnection`
+    // S1（docs/hub/banto-hub-external-db-design.md §2.2）: 生の`PlcConnection`
     // を返さない - `PlcConnectionResponse`（秘密のキーは `{"$secret": ...}`）へ変換して
     // から返す（`crate::rest::PlcConnectionResponse`の doc comment参照、REST の
     // `plc_connections_list`と同じ変換）。
@@ -2167,7 +2167,7 @@ async fn tool_delete_connection(
 }
 
 // ---------------------------------------------------------------------------
-// T21 S1-c（docs/banto-hub-t21-design.md §3・§4）: 構成補助ツール第二弾
+// T21 S1-c（docs/hub/banto-hub-t21-design.md §3・§4）: 構成補助ツール第二弾
 // （接続 update/test・グループ CRUD）。S1-b（[`tool_create_connection`]/
 // [`tool_delete_connection`]）と全く同じ書き方をそのまま踏襲する - ゲート
 // （admin スコープ・監査・delete 系 confirm）・mutation フロー（tx →
@@ -2853,7 +2853,7 @@ async fn tool_delete_group(
 }
 
 // ---------------------------------------------------------------------------
-// T21 S1-d（docs/banto-hub-t21-design.md §3・§4）: 構成補助ツール第三弾
+// T21 S1-d（docs/hub/banto-hub-t21-design.md §3・§4）: 構成補助ツール第三弾
 // （タグ CRUD）。S1-b/S1-c（[`tool_create_connection`]/[`tool_update_connection`]/
 // [`tool_delete_connection`]）と全く同じ書き方をそのまま踏襲する - ゲート
 // （admin スコープ・監査・delete 系 confirm・update 系 全項目必須）・
@@ -3700,7 +3700,7 @@ async fn tool_set_retention(
 }
 
 // ---------------------------------------------------------------------------
-// T21 S3（docs/banto-hub-t21-design.md、構成補助 MCP の最終スライス）:
+// T21 S3（docs/hub/banto-hub-t21-design.md、構成補助 MCP の最終スライス）:
 // API キー発行/一覧/失効・ロックダウン。ここまでの構成 CRUD/設定ツールと
 // 同じ `admin` スコープ必須＋監査規律（[`audit_config_action`]）だが、
 // mutation 本体は `crate::api_keys::ApiKeysService`/
@@ -3776,7 +3776,7 @@ async fn tool_create_api_key(
 /// [`require_admin_scope`]のdoc comment「ゲート拒否は監査しない」と同じ
 /// 「読み取り専用ルートは監査しない」規律）。
 ///
-/// R2a-2b（docs/banto-hub-ingest-design.md §5「キーの一覧」）: REST の一覧と
+/// R2a-2b（docs/hub/banto-hub-ingest-design.md §5「キーの一覧」）: REST の一覧と
 /// 同じ各行に `ingestTargets`（[`ingest_targets`]）を足す。`scopes` の文字列は
 /// そのまま返す（変えない）。`ingest:` のスコープを持つキーがあるときだけ
 /// 接続の一覧を 1 回読み、読めなければキーの一覧は返したまま各行を
@@ -3823,7 +3823,7 @@ async fn tool_list_api_keys(state: &McpState, ctx: &ApiKeyContext) -> Value {
 }
 
 /// R2a-2b: キーの `ingest:#{id}` のスコープを、接続の一覧（id → (名前,
-/// プロトコル)）から引いた表示に直す（docs/banto-hub-ingest-design.md §5
+/// プロトコル)）から引いた表示に直す（docs/hub/banto-hub-ingest-design.md §5
 /// 「キーの一覧」）。画面の `apiKeyScopes.ts` の `describeApiKeyScope` と同じ
 /// 文言・同じ場合分け:
 ///
@@ -3963,7 +3963,7 @@ async fn tool_lock_down(
 }
 
 // ---------------------------------------------------------------------------
-// 外部 DB 連携 S4（docs/banto-hub-external-db-design.md §5.2）: DB Sink の
+// 外部 DB 連携 S4（docs/hub/banto-hub-external-db-design.md §5.2）: DB Sink の
 // Hub 側構成補助ツール。他の構成 CRUD ツール（[`tool_create_connection`]等）
 // と同じゲート（admin スコープ必須）・同じ監査（[`audit_config_action`]、
 // resource は`"sink_groups"`）だが、**pending queue には載らない**

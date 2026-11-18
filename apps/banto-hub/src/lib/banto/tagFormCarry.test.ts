@@ -1,5 +1,5 @@
 /**
- * `tagFormCarry.ts`（T18-2c、docs/banto-hub-desktop-plan.md §9.4 TAG-UX-2）
+ * `tagFormCarry.ts`（T18-2c、docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-2）
  * に対するユニットテスト。`tagFormLayout.test.ts` と同じスタイル
  * （describe/it、依存ゼロの純関数を直接 import）。
  */

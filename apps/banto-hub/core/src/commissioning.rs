@@ -1,4 +1,4 @@
-//! 試運転モードとロックダウン (docs/tag-server-design.md §5.6「試運転モードと
+//! 試運転モードとロックダウン (docs/hub/tag-server-design.md §5.6「試運転モードと
 //! ロックダウン」・2026-08-30 オーナー決定)。
 //!
 //! ## 状態は2つだけ
@@ -235,7 +235,7 @@ pub fn enforce_loopback_when_commissioning(bind: &str, locked_down: bool) -> Res
         "banto-hub: 試運転モード（未ロックダウン）のまま非 loopback バインド（{bind}）で\
          起動することはできません。対処: (a) 管理 UI からロックダウンを実行してから\
          起動し直すか、(b) server.bind / BANTO_BIND を 127.0.0.1 等の loopback アドレスに\
-         変更してください。（docs/tag-server-design.md §5.6「試運転モードとロックダウン」\
+         変更してください。（docs/hub/tag-server-design.md §5.6「試運転モードとロックダウン」\
          制約1: 認証なしの状態をネットワークへ露出させないための安全装置です）"
     ))
 }

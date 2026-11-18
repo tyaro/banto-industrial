@@ -1,6 +1,6 @@
 //! 昇格ヘルパーが、ディレクトリの DACL を**書き直す前に**使う、製品に依らない確かめ
 //! （#626 PR-A、2026-10-16。chronogazer-elev の中にあった部品を移した - 設計は
-//! docs/chronogazer-service-design.md §4 の B3-3b の実装メモ）。
+//! docs/chronogazer/chronogazer-service-design.md §4 の B3-3b の実装メモ）。
 //!
 //! ## 設計意図
 //!

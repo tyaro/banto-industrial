@@ -1,4 +1,4 @@
-// T17-2 スライス2（docs/banto-hub-t17-design.md §3「T17-2」）:
+// T17-2 スライス2（docs/hub/banto-hub-t17-design.md §3「T17-2」）:
 // `banto-hub-elev.exe`だけに`requireAdministrator`マニフェストを埋め込む
 // ためのリソーススクリプト。`build.rs`が`embed_resource::compile_for`で
 // `banto-hub-elev`という`[[bin]]`名にのみリンクする。

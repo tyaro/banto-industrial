@@ -1,7 +1,7 @@
 //! 1 つの source（= Hub の `push` 接続 1 つ）の実行: 取り込み口の WebSocket
 //! `GET /api/v1/ingest/{connectionId}/stream` を 1 本持ち、Hub の `state` に合わせて
 //! 問い合わせのタスク（[`super::poll`]）を起こし・止め、周期の値を分けて
-//! （[`super::split`]）速さを抑えて（[`super::budget`]）送る（docs/banto-hub-ingest-design.md
+//! （[`super::split`]）速さを抑えて（[`super::budget`]）送る（docs/hub/banto-hub-ingest-design.md
 //! §10.3 の「送信」「収集の停止」「設定の変更」「タスクの異常」「状態」「停止」）。
 //!
 //! ## 1 本の WS の一生
@@ -181,7 +181,7 @@ pub enum SourceState {
     NoPermission,
     /// 参照先の DB 接続が Hub で無効になっている。
     DbDisabled,
-    /// R2b-1d（docs/banto-hub-connection-settings-design.md §5.4）: Hub が読み先の DB 接続の
+    /// R2b-1d（docs/hub/banto-hub-connection-settings-design.md §5.4）: Hub が読み先の DB 接続の
     /// パスワードを読めない（`unavailableSources`）。動かさない。
     PasswordUnreadable,
     /// 止めた。

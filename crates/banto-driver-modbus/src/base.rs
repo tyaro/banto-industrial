@@ -1,12 +1,12 @@
 //! [`ModbusDriver`]: the `banto-driver-api` identity of Modbus TCP
-//! (docs/banto-driver-api-design.md §4.1, R1-4b).
+//! (docs/hub/driver/banto-driver-api-design.md §4.1, R1-4b).
 //!
 //! The stateless half of the driver ([`DriverBase`]): who it is, whether a
 //! connection's settings are valid, and the address functions. Its I/O is
 //! the `FrameDriver` in `frame_conn.rs` (registered as
 //! `DriverEntry::frame` since R2b-3c; R2b-3a-2 to R2b-3b it was a
 //! `SessionDriver`). Since R2b-2
-//! (docs/banto-hub-driver-address-design.md) the address functions are on the
+//! (docs/hub/driver/banto-hub-driver-address-design.md) the address functions are on the
 //! production path: the save path of `banto-tags` (built with a registry)
 //! and the Hub's plan, instant read and write paths call `parse_address`;
 //! since R2b-3a-2 the broker carries the resulting `TagSpec` to this
@@ -273,7 +273,7 @@ impl DriverBase for ModbusDriver {
         ))
     }
 
-    /// The connection form's fields (R2b-6a, docs/banto-hub-driver-ui-design.md
+    /// The connection form's fields (R2b-6a, docs/hub/driver/banto-hub-driver-ui-design.md
     /// §3.5): the same keys, ranges and defaults as `validate_config` and
     /// `banto-tags`' normalization (port 502, unit 1, `high_low`).
     fn settings_schema(&self) -> SettingsSchema {
@@ -909,7 +909,7 @@ mod tests {
 
     // ------------------------------------------------------------------
     // R2b-2a: canonical table, kind-dependent refusals, the bridge
-    // (docs/banto-hub-driver-address-design.md §1.4, §3.2 Q4, §4.2)
+    // (docs/hub/driver/banto-hub-driver-address-design.md §1.4, §3.2 Q4, §4.2)
     // ------------------------------------------------------------------
 
     /// `(text, kind, canonical)`: spellings of one address share a canonical

@@ -1,7 +1,7 @@
 //! 外部 DB 連携（Sink）の REST API: sink group の CRUD（`/api/sink/groups`）と、
 //! サイドカー専用の admin 面（`GET /api/sink/config`・`PUT /api/sink/status`）。
 //!
-//! `rest.rs` から中身を変えずに移したもの（docs/banto-hub-driver-refactor-plan.md §8.1、
+//! `rest.rs` から中身を変えずに移したもの（docs/hub/driver/banto-hub-driver-refactor-plan.md §8.1、
 //! P0-1 の手順 6）。I1 CRUD の共通層は `rest/crud.rs` にあり、認証・ガード・監査の補助は
 //! 親の `rest.rs` にある。どちらも `use super::{...}` で使う。外から使われるパス
 //! （`crate::rest::X`）は親の re-export で保つ。
@@ -17,7 +17,7 @@ use super::{
 };
 use crate::api_keys::HubScopeChecks;
 
-// --- 外部 DB 連携 S4（docs/banto-hub-external-db-design.md §5.2・§6-13）:
+// --- 外部 DB 連携 S4（docs/hub/banto-hub-external-db-design.md §5.2・§6-13）:
 // `hub_sink_groups` の CRUD ---------------------------------------------------
 //
 // `plc_connections`/`collection_groups`/`tags`（[`tag_registry_router`]）と
@@ -197,7 +197,7 @@ pub(super) fn sink_groups_router(
 ///
 /// `Ok` は通った呼び出し手の API キー（admin ロールのセッションなら `None`）。
 /// R2a-3b の `GET /api/ingest/bridge-config`（`super::ingest_bridge`）が同じゲートを
-/// 使い（docs/banto-hub-ingest-design.md §10.2・§12 Q13「新しい信頼の形を作らない」）、
+/// 使い（docs/hub/banto-hub-ingest-design.md §10.2・§12 Q13「新しい信頼の形を作らない」）、
 /// キーの `ingest:#{id}` で source ごとに `ingestAllowed` を詰めるために使う。
 #[allow(clippy::result_large_err)]
 pub(super) async fn require_sink_admin(
@@ -258,7 +258,7 @@ struct SinkAdminState {
 
 /// `GET /api/sink/config`の応答（設計 §5.2）。
 ///
-/// R2b-1d（docs/banto-hub-connection-settings-design.md §5.4、追加だけ）: パスワードを
+/// R2b-1d（docs/hub/banto-hub-connection-settings-design.md §5.4、追加だけ）: パスワードを
 /// 読めない接続（秘密値の行が無い・この PC で開けない）は `connections` に**載せず**、
 /// `unavailable_connections` に理由つきで出す。`password: null` で返すことはしない
 /// （古いサイドカーの `build_pool` は `null` を空文字にして繋ぐので、`trust` 認証の DB
@@ -317,7 +317,7 @@ struct SinkConfigTagEntry {
 /// 接続1件分。**パスワードを平文で含む**（設計 §6-15、2026-09-06 オーナー
 /// 決定「admin スコープの専用 API キー + ループバック」）- このエンドポイント
 /// 自体が admin スコープ限定であることと、Hub・サイドカーが同一マシンで
-/// ループバック接続する運用前提（docs/banto-hub-external-db-design.md
+/// ループバック接続する運用前提（docs/hub/banto-hub-external-db-design.md
 /// §2.2・§5.2）がその埋め合わせ。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -447,7 +447,7 @@ async fn sink_config_get(State(state): State<SinkAdminState>, headers: HeaderMap
         eprintln!(
             "banto-hub: warn: GET /api/sink/config はDB接続のパスワードを平文で返します。\
              サイドカーは Hub と同一マシンからのループバック接続のみを前提とします\
-             （docs/banto-hub-external-db-design.md §2.2・§5.2・§6-15）。"
+             （docs/hub/banto-hub-external-db-design.md §2.2・§5.2・§6-15）。"
         );
     });
     match build_sink_config_response(&state).await {

@@ -1,4 +1,4 @@
-//! gRPC タグ空間 API (T4、docs/tag-server-design.md §5.4「gRPC（T4）」)。
+//! gRPC タグ空間 API (T4、docs/hub/tag-server-design.md §5.4「gRPC（T4）」)。
 //!
 //! `proto/tagserver/v1/tagserver.proto`(リポジトリルート相対)を
 //! `build.rs` が `tonic-prost-build` でビルド時コード生成し
@@ -85,7 +85,7 @@
 //! ストリームは無い。
 //!
 //! ## H10 ③: per-tag read スコープ(Option B、
-//! docs/h10-3-read-scope-proposal.md §5・§6、REST/WS と同じ絞り方)
+//! docs/archive/h10-3-read-scope-proposal.md §5・§6、REST/WS と同じ絞り方)
 //!
 //! `GetCatalog` は絞らない(全タグ・PLC アドレス込みで返す - 案 B の核、
 //! `has_any_read` だけを要求)。`ReadValues`/`StreamValues` はそれぞれの
@@ -701,7 +701,7 @@ impl TagServiceTrait for GrpcService {
                     unknown.join(", ")
                 )));
             }
-            // H10 ③(Option B、docs/h10-3-read-scope-proposal.md §5 S4、
+            // H10 ③(Option B、docs/archive/h10-3-read-scope-proposal.md §5 S4、
             // REST の v1_values `?tags=` と同じ規律): 明示指定でスコープ外
             // を1つでも挙げたら拒否(REST の 403 に対応する gRPC ステータス、
             // `write_rejection_status` の doc comment の対応表参照)。

@@ -1,6 +1,6 @@
 //! 書き込み監査の閲覧 API（`/api/write-audit/list`）。
 //!
-//! `rest.rs` から中身を変えずに移したもの（docs/banto-hub-driver-refactor-plan.md §8.1、
+//! `rest.rs` から中身を変えずに移したもの（docs/hub/driver/banto-hub-driver-refactor-plan.md §8.1、
 //! P0-1 の手順 2）。共通部品（認証・ガード・監査の補助）は親の `rest.rs` にあり、
 //! `use super::{...}` で使う。外から使われるパス（`crate::rest::X`）は親の re-export で
 //! 保つ。

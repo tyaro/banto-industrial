@@ -1484,7 +1484,7 @@ fn refuses_an_exposed_root_without_opening_the_tls_dir() {
     assert_eq!(result, Ok(()), "{lines:#?}");
 }
 
-// --- 手順: サービスの失効の記録（#1121 PR2b。docs/hub-desktop-tls-design.md 場面 11・25・26） ---
+// --- 手順: サービスの失効の記録（#1121 PR2b。docs/hub/hub-desktop-tls-design.md 場面 11・25・26） ---
 
 /// 拇印 `n` を並べた、ただの拇印（記録の中身用）。
 fn thumb(n: u8) -> CertThumbprint {

@@ -1,5 +1,5 @@
 //! #1161 PR4: API キーで `/api/*` を使うときの受け付け・権限・監査のテスト
-//! （docs/chronogazer-agent-api-design.md §8 の ChronoGazer の REST）。
+//! （docs/chronogazer/chronogazer-agent-api-design.md §8 の ChronoGazer の REST）。
 //!
 //! どれも**本物の `api_router`**（`crate::rest::tests` のヘルパーが組む物。CSRF の層・
 //! 子ルーターごとの `require_auth`・`RoleGuard` をすべて含む）に要求を通す。ハンドラ

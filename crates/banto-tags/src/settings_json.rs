@@ -1,5 +1,5 @@
 //! 接続の `settings`（JSON）⇔ ドライバ API の `Settings`、平らな形 ⇔ `settings`、
-//! レジストリによる検証（R2b-1c、docs/banto-hub-connection-settings-design.md
+//! レジストリによる検証（R2b-1c、docs/hub/banto-hub-connection-settings-design.md
 //! §3.2・§3.3・§3.5・§4.2・§4.3）。
 //!
 //! The legacy host input adapter writes validated settings to the JSON column.
@@ -134,7 +134,7 @@ pub fn validate_settings_with_registry(
 }
 
 /// スキーマに従って、汎用フォームの入力（JSON のオブジェクト）から接続の `settings` を作る
-/// （R2b-6b、docs/banto-hub-driver-ui-design.md §4.2）。純関数。この後に今までどおり
+/// （R2b-6b、docs/hub/driver/banto-hub-driver-ui-design.md §4.2）。純関数。この後に今までどおり
 /// [`settings_to_api`] → `validate_config` を通す（欄どうしの整合はドライバが見る）。
 ///
 /// - **種類**: キーごとに [`FieldKind`] と JSON の型を合わせる。`Integer` は JSON の整数だけ

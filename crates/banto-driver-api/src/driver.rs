@@ -1,6 +1,6 @@
 //! The static, stateless half of every driver: identification, settings
 //! validation and the address functions ([`DriverBase`],
-//! docs/banto-driver-api-design.md §4.1).
+//! docs/hub/driver/banto-driver-api-design.md §4.1).
 //!
 //! Every driver kind - frame ([`FrameDriver`](crate::FrameDriver)), session
 //! ([`SessionDriver`](crate::SessionDriver)) and the
@@ -52,7 +52,7 @@ pub struct DriverDescriptor {
     /// [`API_VERSION`] at build time (set by [`DriverDescriptor::new`]).
     pub api_version: u32,
     /// The version of the shape of this driver's `settings` (R2b-1a,
-    /// docs/banto-hub-connection-settings-design.md §3.4). A host stores it
+    /// docs/hub/banto-hub-connection-settings-design.md §3.4). A host stores it
     /// next to a connection's settings when it writes them and refuses to
     /// read settings written under a *newer* version than the driver's
     /// (a rolled-back host or plugin). Starts at 1
@@ -210,7 +210,7 @@ pub trait DriverBase: Send + Sync + 'static {
     fn address_help(&self) -> String;
 
     /// The one point a host's connection test reads (R2b-3a-2,
-    /// docs/banto-hub-driver-io-design.md §4.2 / Q11): an address as a
+    /// docs/hub/driver/banto-hub-driver-io-design.md §4.2 / Q11): an address as a
     /// person would write it (the host runs it through
     /// [`parse_address`](Self::parse_address)) and its kind. The host
     /// connects, reads this point once and disconnects, so every driver gets
@@ -224,7 +224,7 @@ pub trait DriverBase: Send + Sync + 'static {
     }
 
     /// The fields of a connection's settings, for the host's generic form
-    /// (WIT `config.schema`; R2b-6a, docs/banto-hub-driver-ui-design.md §3).
+    /// (WIT `config.schema`; R2b-6a, docs/hub/driver/banto-hub-driver-ui-design.md §3).
     ///
     /// Default: empty - the generic form shows no fields for this driver.
     /// A non-empty schema must agree with the driver (C17-C19): unique keys,
@@ -258,7 +258,7 @@ pub trait DriverBase: Send + Sync + 'static {
 
     /// The canonical address `n` *words* away from `canonical`, whatever the
     /// tag's kind (WIT `address.offset-words`;
-    /// docs/banto-hub-driver-ui-design.md §3.4, §4.3), for offset copy and
+    /// docs/hub/driver/banto-hub-driver-ui-design.md §3.4, §4.3), for offset copy and
     /// struct registration (where [`offset_address`](Self::offset_address)
     /// would step by the kind's width). The contract:
     ///

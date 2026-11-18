@@ -1,4 +1,4 @@
-//! migration `0025` の前に DB を守る部品（R2b-1d、docs/banto-hub-connection-settings-design.md
+//! migration `0025` の前に DB を守る部品（R2b-1d、docs/hub/banto-hub-connection-settings-design.md
 //! §6.4・§6.6・§6.7）。アプリに依存しないので、Hub と ChronoGazer が同じものを呼ぶ。
 //!
 //! migration `0025`（接続設定を `settings` の JSON と秘密の表へ移す）は**戻せない**

@@ -1,5 +1,5 @@
 /**
- * T18-4a（docs/banto-hub-t18-design.md「T18-4a モニタの Tree/検索統合」、
+ * T18-4a（docs/hub/banto-hub-t18-design.md「T18-4a モニタの Tree/検索統合」、
  * T13-2 移管）: ライブタグモニタ（`(app)/monitor/+page.svelte`）向けの
  * クライアント側絞り込み純関数。
  *

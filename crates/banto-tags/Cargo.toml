@@ -1,6 +1,6 @@
 [package]
 name = "banto-tags"
-description = "I1: タグレジストリ - PLC接続/収集グループ/タグの定義・型・スケーリング (docs/plan.md I1, docs/recorder-requirements.md §2/§3.1/§3.2)"
+description = "I1: タグレジストリ - PLC接続/収集グループ/タグの定義・型・スケーリング (docs/plan.md I1, docs/chronogazer/recorder-requirements.md §2/§3.1/§3.2)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -23,7 +23,7 @@ banto-storage = { workspace = true, features = ["sqlite"] }
 # deliberately avoids (tokio/slmp/encoding_rs - see `tag.rs`'s
 # `modbus_read_only_area` doc comment).
 banto-plc-address = { path = "../banto-plc-address" }
-# R2b-1c (docs/banto-hub-connection-settings-design.md §4.2): `settings_json.rs` turns a
+# R2b-1c (docs/hub/banto-hub-connection-settings-design.md §4.2): `settings_json.rs` turns a
 # connection's JSON `settings` into `banto_driver_api::Settings` and validates it through a
 # `DriverRegistry` (`PlcConnectionService::with_registry`). Dependency-free, and it does not
 # depend on this crate, so there is no cycle.
@@ -38,7 +38,7 @@ utoipa = { workspace = true, optional = true }
 # 使わない）。本番の依存は thiserror・windows-sys（どちらも既にある版）で、Cargo.lock に新しい
 # package は増えない。safe-root は banto-tags に依存しないので循環しない。
 banto-safe-root = { path = "../banto-safe-root" }
-# R2b-1d (docs/banto-hub-connection-settings-design.md §5.2・§5.3): the sealed secret rows
+# R2b-1d (docs/hub/banto-hub-connection-settings-design.md §5.2・§5.3): the sealed secret rows
 # (`plc_connection_secrets.blob`) are carried in `Zeroizing` - a `plain-v1` blob is the
 # plaintext itself. Already in the workspace (banto-secret-store, banto-hub-core), so
 # Cargo.lock gains no new package.

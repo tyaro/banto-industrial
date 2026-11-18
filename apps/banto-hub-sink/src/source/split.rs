@@ -1,4 +1,4 @@
-//! 1 周期の値を送信の単位に分ける（docs/banto-hub-ingest-design.md §7.1 の (a)）。
+//! 1 周期の値を送信の単位に分ける（docs/hub/banto-hub-ingest-design.md §7.1 の (a)）。
 //!
 //! 1 周期の全キーを、**件数が `max_items`（1,000）以下、かつ JSON の `items` の配列が
 //! `max_message_bytes − 512` バイト（256 KiB − 512）以下**になるように、複数の

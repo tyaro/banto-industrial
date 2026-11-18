@@ -44,7 +44,7 @@
 //!
 //! # PLC は broker のセッションを通して読む（R2b-3a-3）
 //!
-//! docs/banto-hub-driver-io-design.md §8（Q5）: SLMP / Modbus TCP の接続は、
+//! docs/hub/driver/banto-hub-driver-io-design.md §8（Q5）: SLMP / Modbus TCP の接続は、
 //! 接続タスクが自分でソケットを張るのではなく、banto-hub と同じ
 //! `banto-broker` のセッション（[`banto_collect::BrokerSessions`]）を通して読む。
 //! 計画もドライバの `parse_address` で組む（`EngineConfig::drivers`）。保存時も
@@ -264,14 +264,14 @@
 //!
 //! アプリ（`src-tauri` の `setup()`）と LAN サーバー単体（`banto-serve` の
 //! `main()`）は、どちらも起動時に [`CollectorService::autostart`] を spawn
-//! する（docs/r1-plan.md の R1-C「起動時に build_config → start」）。
+//! する（docs/archive/r1-plan.md の R1-C「起動時に build_config → start」）。
 //! **失敗しても起動は止めない** - `crate::hub` の `resume()` と同じ流儀で、
 //! 理由は [`CollectorState::StartFailed`] に残るので画面から見える。
 //! **収集対象 0 件は失敗ではない**（[`CollectorState::NoTargets`]）。
 //!
 //! **レジストリ（接続・グループ・タグ）の変更では自動再起動しない。** 反映は
 //! **明示的な「収集を再起動」操作**（[`CollectorService::restart`]、
-//! `collect_restart`）だけで行う。docs/r1-plan.md の R1-C がそう定めている
+//! `collect_restart`）だけで行う。docs/archive/r1-plan.md の R1-C がそう定めている
 //! のに加え、記録計としてはこちらが正しい: レジストリ CRUD のたびに
 //! `restart()` を掛けると、**設定を 1 行直すたびに収集が途切れる**。タグの
 //! 名前を 1 つ直す、しきい値を 1 つ足す、といった編集の最中に何度も
@@ -319,7 +319,7 @@
 //! `collect_events` は**過去の記録**であって、走っている収集エンジンの
 //! 覗き窓ではない。収集が止まっていても「なぜ止まったか」を調べるために
 //! 読むものなので、**停止中でも読めなければ意味が無い**
-//! （docs/r1-plan.md の R1-C が「`collect_events` のイベント一覧ページ
+//! （docs/archive/r1-plan.md の R1-C が「`collect_events` のイベント一覧ページ
 //! （banto 監査ログページの流儀）」と書いているとおり、`crate::audit` の
 //! 一覧と同じ性質の口）。ここで「走っていないので返しません」と答えるのは、
 //! **読めた過去を隠す**ことになる。
@@ -657,7 +657,7 @@
 //!
 //! `crate::settings::StoreSettings` が `data.dir` / `retention.days` を持つ。
 //! **このモジュールのコードはファイルを一切削除しない**（収集と削除は別の
-//! 責務）。期限超過ファイルの自動削除（docs/recorder-requirements.md §3.4）は
+//! 責務）。期限超過ファイルの自動削除（docs/chronogazer/recorder-requirements.md §3.4）は
 //! [`crate::retention`] が行う（#538。起動時と日付が変わるたびに
 //! `banto_tstore::prune_files`）。`src-tauri` と `banto-serve` が、この
 //! サービスと同じ `data.dir` を渡して起動する。
@@ -981,7 +981,7 @@ pub const COLLECT_AUDIT_RESOURCE: &str = "collect";
 
 /// 収集の**変更操作**（開始・停止・再起動）に要る最低ロール。
 ///
-/// **`editor` 以上**（`admin` ではない）: docs/recorder-requirements.md §3.6
+/// **`editor` 以上**（`admin` ではない）: docs/chronogazer/recorder-requirements.md §3.6
 /// 「収集の開始/停止は editor 以上」と、そこに追記された 2026-09-18 の
 /// オーナー決定 -「banto-hub は同種の制御を admin 限定にしているが、
 /// chronogazer は別プロダクトであり R0 本文の決定を継承する。**banto-hub の
@@ -1368,7 +1368,7 @@ pub struct CollectEventRow {
 
 /// イベント一覧の 1 ページ分の要求。
 ///
-/// **監査ログ一覧（`crate::audit`）の流儀に合わせる**（docs/r1-plan.md の
+/// **監査ログ一覧（`crate::audit`）の流儀に合わせる**（docs/archive/r1-plan.md の
 /// R1-C「`collect_events` のイベント一覧ページ（banto 監査ログページの
 /// 流儀）」）:
 ///
@@ -1748,7 +1748,7 @@ struct CollectorContext {
     events: EventSink,
     options: CollectorOptions,
     /// 計画を組むドライバと、broker のセッションがダイヤルするドライバ
-    /// （R2b-3a-3、docs/banto-hub-driver-io-design.md §8。host が
+    /// （R2b-3a-3、docs/hub/driver/banto-hub-driver-io-design.md §8。host が
     /// `banto_drivers::builtin().registry` を [`crate::engine::EngineConfig::drivers`] で渡す）。
     drivers: Arc<banto_driver_api::DriverRegistry>,
     /// 収集が読む broker のセッション（R2b-3a-3、§8。以前は接続タスクが自分で
@@ -2107,7 +2107,7 @@ impl CollectorService {
         }
     }
 
-    /// 起動時の自動開始（docs/r1-plan.md の R1-C「起動時に build_config →
+    /// 起動時の自動開始（docs/archive/r1-plan.md の R1-C「起動時に build_config →
     /// start」）。`src-tauri` の `setup()` と [`crate::engine::EngineRuntime`]
     /// （`banto-serve`）が**共通で通る唯一の口**で、どちらも `spawn` して投げっぱなしにする
     /// （`crate::hub` の `resume()` と同じ形 - 起動を待たせない）。
@@ -3017,7 +3017,7 @@ impl Lifecycle {
 
         let groups = config.group_count();
         let tags = config.tag_count();
-        // R2b-3a-3（docs/banto-hub-driver-io-design.md §8）: PLC の接続は broker の
+        // R2b-3a-3（docs/hub/driver/banto-hub-driver-io-design.md §8）: PLC の接続は broker の
         // セッションを通して読む。計画のどの接続にもセッションを用意し（シミュレーション
         // の接続はシミュレータのアドレスへ。banto-hub の `BrokerSimRegistry` と同じ形）、
         // そのハンドルを読む生成口を渡す。

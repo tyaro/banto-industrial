@@ -1,6 +1,6 @@
 [package]
 name = "banto-tstore"
-description = "I3a: 時系列ストレージ - 日次ファイル+スキーマ凍結の自己記述的SQLite (docs/plan.md I3, docs/recorder-requirements.md §3.4)"
+description = "I3a: 時系列ストレージ - 日次ファイル+スキーマ凍結の自己記述的SQLite (docs/plan.md I3, docs/chronogazer/recorder-requirements.md §3.4)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

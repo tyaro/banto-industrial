@@ -79,7 +79,7 @@
 	 * 開いた時点のまま変わらないため、ステップを進めて入力するだけで自然に
 	 * `dirty` になる。
 	 *
-	 * **R2a-2e（docs/banto-hub-ingest-design.md §3.1・§3.2・§7.1・§9）: 取り込み口
+	 * **R2a-2e（docs/hub/banto-hub-ingest-design.md §3.1・§3.2・§7.1・§9）: 取り込み口
 	 * `push`**。プロトコルに `push` を選ぶと、接続先（ホスト・ポート等）の代わりに
 	 * `stale_timeout_ms` とブリッジの区画（読む `postgres` 接続・クエリ・列とキーの
 	 * 対応）を出し、ブリッジの送る量の見積もり（`bridgeLoad.ts`、§7.1）をその場で
@@ -185,7 +185,7 @@
 		/** TAG-UX-8 の連番プリフィルに使う、既存の接続名一覧（新規作成時のみ参照）。 */
 		existingNames: string[];
 		/**
-		 * T19 S2-b（UX-38、docs/banto-hub-t19-design.md §3.4）: 削除確認
+		 * T19 S2-b（UX-38、docs/hub/banto-hub-t19-design.md §3.4）: 削除確認
 		 * ダイアログで「消える定義の件数」を出すために必要な、ページが既に
 		 * 読み込み済みの収集グループ・タグの一覧（新規作成時は参照しない）。
 		 * `registryCascadeImpact.ts::countConnectionCascadeImpact` へそのまま
@@ -211,7 +211,7 @@
 		 */
 		requestDelete?: boolean;
 		/**
-		 * T19 S1-a（docs/banto-hub-t19-design.md §7.1「viewer ロールからの
+		 * T19 S1-a（docs/hub/banto-hub-t19-design.md §7.1「viewer ロールからの
 		 * 接続・グループ詳細の閲覧」）: `true` なら閲覧専用モードで開く -
 		 * 入力はすべて `disabled`、接続テスト・保存・削除のボタンは出さない。
 		 * viewer ロールはツリーの右クリックから編集 Drawer 自体を開けない
@@ -241,7 +241,7 @@
 		 */
 		focusFallback?: () => HTMLElement | null | undefined;
 		/**
-		 * #1179 PR3a（docs/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、
+		 * #1179 PR3a（docs/hub/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、
 		 * 2026-11-17 オーナー決定「中央のタブ『設定』」）: `true` なら再設定
 		 * フォーム（`connection` 非 `null`）を `Drawer` の外枠なしで、その場に描く
 		 * （タグページの「設定」タブに埋め込む）。フォーム・dirty 判定（時計の
@@ -319,7 +319,7 @@
 	}
 
 	/**
-	 * T12 (docs/ux-plan.md §4): 接続テストの実行状態。旧ページ実装から無改変
+	 * T12 (docs/archive/ux-plan.md §4): 接続テストの実行状態。旧ページ実装から無改変
 	 * で移設（作成・再設定それぞれ独立した `TestState` を持つ）。
 	 */
 	interface TestState {
@@ -591,7 +591,7 @@
 		protocol: 2,
 		host: 2,
 		port: 2,
-		// S1（docs/banto-hub-external-db-design.md §4.1）: postgres 接続の
+		// S1（docs/hub/banto-hub-external-db-design.md §4.1）: postgres 接続の
 		// 追加フィールドも「2. プロトコルと接続先」ステップに置く
 		// （destinationFields スニペット内、下記マークアップ参照）。
 		database: 2,
@@ -1114,7 +1114,7 @@
 				{#if errors.port}<span class="err">{errors.port}</span>{/if}
 			</label>
 			<!--
-				S1（docs/banto-hub-external-db-design.md §4.1）: postgres 接続
+				S1（docs/hub/banto-hub-external-db-design.md §4.1）: postgres 接続
 				専用フィールド（`settings` の database / username / 秘密の password）。
 			-->
 			<label class="field">
@@ -1203,7 +1203,7 @@
 
 {#snippet pushFields()}
 	<!--
-		R2a-2e（docs/banto-hub-ingest-design.md §3.2・§4.3・§7.1）: push 接続は接続先を
+		R2a-2e（docs/hub/banto-hub-ingest-design.md §3.2・§4.3・§7.1）: push 接続は接続先を
 		持たず（サーバーが host / port を正規化する）、受信のタイムアウトと DB ブリッジの
 		区画だけを持つ。ブリッジの送る量の見積もりは入力のたびに出し、上限の 8 割を
 		超えたら赤くする（保存の前に `validatePushFields` が断る）。

@@ -36,7 +36,7 @@
 //! wrapped crate actually keeps returning `slmp::SlmpError::Device { .. }`
 //! for a non-zero end code and `slmp::SlmpError::Framing(_)` for a corrupt
 //! frame - the structured distinction [`super::classify_slmp_error`] matches
-//! on (H9, docs/h9-slmp-structured-error-spec.md) - and (b) whether a
+//! on (H9, docs/hub/driver/h9-slmp-structured-error-spec.md) - and (b) whether a
 //! bit-unit response's nibble packing is decoded the way the crate expects.
 //! Both live strictly *inside* the crate, so only real bytes on a real socket
 //! exercise them. That is also what makes `slmp_end_code_is_bad_not_fatal` a
@@ -333,7 +333,7 @@ impl Simulator {
     }
 
     /// Send every response in pieces of `chunk` bytes with `delay` between
-    /// them (P0-3, docs/banto-hub-driver-refactor-plan.md §8.3 #6) - so the
+    /// them (P0-3, docs/hub/driver/banto-hub-driver-refactor-plan.md §8.3 #6) - so the
     /// client sees one SLMP response arrive over several `read()`s, as it can
     /// on a real network. Off by default; `None` turns it back off.
     pub fn set_response_chunking(&self, chunking: Option<(usize, Duration)>) {
@@ -354,7 +354,7 @@ impl Simulator {
         self.state.lock().unwrap().hang = false;
     }
 
-    /// R2b-3d（docs/banto-hub-driver-io-design.md §11.2）: one whole request
+    /// R2b-3d（docs/hub/driver/banto-hub-driver-io-design.md §11.2）: one whole request
     /// frame in, the response frame out - the socket-free half of the
     /// connection handler, for the frame-type conformance harness's
     /// `Responder` (the engine owns the wire there). Same device state, end

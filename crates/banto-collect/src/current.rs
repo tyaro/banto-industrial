@@ -406,7 +406,7 @@ impl CurrentValuesHandle {
     }
 
     /// Drop every cached entry whose key is not in `keys` (T7-1,
-    /// docs/tag-server-design.md §4.3: after [`crate::collector::Collector::apply_config`]
+    /// docs/hub/tag-server-design.md §4.3: after [`crate::collector::Collector::apply_config`]
     /// adopts a new config, a tag removed from the registry - or one whose
     /// owning connection was removed - must not linger in the snapshot
     /// forever with a slowly-staling last value). Keys are `tag_key`s

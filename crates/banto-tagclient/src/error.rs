@@ -17,7 +17,7 @@ pub enum ErrorKind {
     /// a requested tag disappeared between the catalog fetch and the
     /// subscribe. Rebindable - the next catalog moves that name to
     /// `BindingResolution::unresolved` (#682,
-    /// docs/banto-tagclient-partial-binding-design.md §4.3).
+    /// docs/crates/banto-tagclient-partial-binding-design.md §4.3).
     ///
     /// A name missing from the catalog (never created, deleted, or the old
     /// name after a rename - tag-server-design.md §4.1) is not an error by

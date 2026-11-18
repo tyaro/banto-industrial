@@ -1,4 +1,4 @@
-//! T12 の統合テスト(docs/ux-plan.md §4「PLC 接続テストボタン」、
+//! T12 の統合テスト(docs/archive/ux-plan.md §4「PLC 接続テストボタン」、
 //! `apps/banto-hub/core/src/rest.rs`の`plc_connections_test`ハンドラ)。
 //!
 //! `tests/t9_simulation.rs`/`tests/integration.rs`と同じ理由(各`tests/*.rs`は
@@ -2082,7 +2082,7 @@ async fn viewer_role_is_forbidden_and_missing_csrf_header_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// R2b-6b（docs/banto-hub-driver-ui-design.md §4.1）: `GET /api/drivers`。実ドライバの
+// R2b-6b（docs/hub/driver/banto-hub-driver-ui-design.md §4.1）: `GET /api/drivers`。実ドライバの
 // レジストリ（`common::hub_drivers()` = 組み込み + ホストの接続）で、機器のドライバだけが
 // レジストリの順に載り、JSON の形（6c の UI がそのまま読む）が固定されていること。
 // ---------------------------------------------------------------------------

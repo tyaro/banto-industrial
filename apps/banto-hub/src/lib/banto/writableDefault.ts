@@ -1,5 +1,5 @@
 /**
- * T19 S1-b（UX-34、docs/banto-hub-t19-design.md §2・§3.3、2026-09-02
+ * T19 S1-b（UX-34、docs/hub/banto-hub-t19-design.md §2・§3.3、2026-09-02
  * オーナー決定「`writable` の既定 ON。ただし収集グループ単位で変更可
  * （条件付き適用）」）: 新規タグフォームの `writable` チェックボックスの
  * 既定値を決める、依存ゼロの純関数モジュール。
@@ -90,7 +90,7 @@ export function writableDefaultBlockedReason(
 	if (tagKind === 'computed') {
 		return 'computed タグは値が式で決まるため、書き込み可（writable）にできません。';
 	}
-	// S3（docs/banto-hub-external-db-design.md §6-10「v1 は読み取り専用」）:
+	// S3（docs/hub/banto-hub-external-db-design.md §6-10「v1 は読み取り専用」）:
 	// db タグは常に writable=false へ正規化される（サーバー側はエラーに
 	// せず黙って正規化するが、UI 側では computed と同じ「書き込み安全
 	// 設定」セクション自体を非表示にする - 呼び出し側 `tags/+page.svelte`

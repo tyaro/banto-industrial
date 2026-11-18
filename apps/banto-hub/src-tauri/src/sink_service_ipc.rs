@@ -1,4 +1,4 @@
-//! S6（docs/banto-hub-external-db-design.md §5.5・§7 row S6、2026-09-07）:
+//! S6（docs/hub/banto-hub-external-db-design.md §5.5・§7 row S6、2026-09-07）:
 //! デスクトップシェルの「サービス」一覧が使う `BantoHubSink` 専用の
 //! Tauri invoke 面。
 //!

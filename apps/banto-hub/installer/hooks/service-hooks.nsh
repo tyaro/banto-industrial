@@ -1,6 +1,6 @@
 ; banto-hub 一体インストーラの NSIS フック（T5-2 → I1、
-; docs/banto-hub-installer-design.md §4.3・§7 決定4/6・
-; docs/banto-hub-operations.md §12）。
+; docs/hub/banto-hub-installer-design.md §4.3・§7 決定4/6・
+; docs/hub/banto-hub-operations.md §12）。
 ;
 ; tauri-bundler の NSIS バンドラ（NsisSettings::installer_hooks、
 ; apps/banto-hub/installer/src/main.rs 参照）が対応する4フックのうち、
@@ -42,7 +42,7 @@
 ; トーラでは安全）。
 ;
 ; **サブコマンド（service-install など）の失敗ではインストーラ本体を中断させない**
-; - DetailPrint で案内するだけに留め、必要なら docs/banto-hub-operations.md §12
+; - DetailPrint で案内するだけに留め、必要なら docs/hub/banto-hub-operations.md §12
 ; の手順で手動対応してもらう（T5-2 以来の方針）。**例外**は ChronoGazer（#972）に
 ; そろえた次の 6 つで、どれも「置き場・ファイルの状態が壊れたまま成功に見える」
 ; のを防ぐためのもの（#973 PR-3a・PR-3b）:
@@ -185,7 +185,7 @@
 ;     発行するもの（§4.4）。以前の NSIS の `CreateDirectory`/`CopyFiles` は継承の
 ;     DACL（Users が読める）で作ってしまうので使わない。ルート直下の旧い
 ;     `.example`・旧い toml には触らない（旧い toml があると sink は起動しない -
-;     docs/banto-hub-operations.md §12「サイドカーの初回セットアップ」）。sink の `install`・
+;     docs/hub/banto-hub-operations.md §12「サイドカーの初回セットアップ」）。sink の `install`・
 ;     `grant-service-acl` の後、サービスの再開の前に呼ぶ（再開した sink が新しい
 ;     置き場を読むように）。
 ; (4b) `banto-hub-elev.exe prepare-hub-tls`（#644 PR1a、2026-11-13 オーナー決定 1〜3）:
@@ -208,17 +208,17 @@
 ; （T17-4、apps/banto-hub/core/src/service_install.rs 参照）。ただし profile の ACL は
 ; `service-install` のたびに保護された DACL へ書き直す（#626、既存の owner は引き継ぐ。
 ; profile が使用中のときだけ書き直しを飛ばして 0 で終わる - 警告は標準エラー出力だけで
-; インストーラには残らない。docs/banto-hub-operations.md §11）。
+; インストーラには残らない。docs/hub/banto-hub-operations.md §11）。
 ; #589 以降、その経路でも PRESHUTDOWN の待ち時間（30 秒）だけは更新し、
 ; 読み戻して確認する。設定できなかったときも `install` は終了コード 0 で
 ; 警告を 1 行出すだけ（2026-10-15）- 下の `$0 != 0` の案内には出ず、
 ; `service-install` は続く Operators・ACL の付与まで進む。その警告は
 ; 標準エラー出力だけで、`ExecWait` は子の出力を取り込まないので
 ; インストーラには表示も記録もされない（確認はレジストリの
-; `PreshutdownTimeout`、docs/banto-hub-operations.md §11）。
+; `PreshutdownTimeout`、docs/hub/banto-hub-operations.md §11）。
 ;
 ; (6) デスクトップショートカットの削除（I4 追従、
-;     docs/banto-hub-installer-design.md §7-3「デスクトップショートカット
+;     docs/hub/banto-hub-installer-design.md §7-3「デスクトップショートカット
 ;     は作らない」・§8.2）。tauri-bundler 2.9.4 の installer.nsi テンプレ
 ;     ートは `$DESKTOP\${PRODUCTNAME}.lnk` を2経路で作る（ソース確認済み）:
 ;     (a) silent / passive（`/S` `/P`）では Section Install 内の
@@ -288,7 +288,7 @@
 ; `!define` する（makensis の作業ディレクトリは tauri-bundler の出力先で、相対パスは
 ; 頼れないため）。
 !define SERVICE_COMMON_LOG_PREFIX "banto-hub"
-!define SERVICE_COMMON_OPS_DOC "docs/banto-hub-operations.md §12"
+!define SERVICE_COMMON_OPS_DOC "docs/hub/banto-hub-operations.md §12"
 !include "${BANTO_INSTALLER_COMMON_DIR}\service-common.nsh"
 
 ; インストール先の固定と所有者・ACL の既定への戻し（RequireDefaultInstallDir・
@@ -684,7 +684,7 @@ Var RestoreSaved3
   DetailPrint "banto-hub: Windows サービス (BantoHub) を登録しています..."
   ExecWait '"$INSTDIR\banto-hub-elev.exe" service-install' $0
   ${If} $0 != 0
-    DetailPrint "banto-hub: BantoHub サービス登録に失敗しました（終了コード $0）。管理者権限の PowerShell から手動で次を実行してください: $\"$INSTDIR\banto-hub-elev.exe$\" service-install （docs/banto-hub-operations.md §12 参照） インストール先が Program Files の外（既定は C:\Program Files\BantoHub）だと、権限の昇格を防ぐためサービスは登録できません。その場合は既定の場所に入れ直してください。"
+    DetailPrint "banto-hub: BantoHub サービス登録に失敗しました（終了コード $0）。管理者権限の PowerShell から手動で次を実行してください: $\"$INSTDIR\banto-hub-elev.exe$\" service-install （docs/hub/banto-hub-operations.md §12 参照） インストール先が Program Files の外（既定は C:\Program Files\BantoHub）だと、権限の昇格を防ぐためサービスは登録できません。その場合は既定の場所に入れ直してください。"
   ${Else}
     DetailPrint "banto-hub: サービス (BantoHub) の登録・Operators グループ・サービス ACL・profile ACL を確認しました。起動種別は手動（Demand）です - OS 再起動では開始しません。"
   ${EndIf}
@@ -707,7 +707,7 @@ Var RestoreSaved3
   DetailPrint "banto-hub: サイドカーの設定ファイルの置き場 (%ProgramData%\BantoHub\sink) を整えています..."
   ExecWait '"$INSTDIR\banto-hub-elev.exe" prepare-sink-config' $0
   ${If} $0 != 0
-    DetailPrint "banto-hub: prepare-sink-config に失敗しました（終了コード $0）。管理者権限の PowerShell から手動で次を実行してください: $\"$INSTDIR\banto-hub-elev.exe$\" prepare-sink-config （docs/banto-hub-operations.md §12「サイドカーの初回セットアップ」参照）"
+    DetailPrint "banto-hub: prepare-sink-config に失敗しました（終了コード $0）。管理者権限の PowerShell から手動で次を実行してください: $\"$INSTDIR\banto-hub-elev.exe$\" prepare-sink-config （docs/hub/banto-hub-operations.md §12「サイドカーの初回セットアップ」参照）"
   ${Else}
     DetailPrint "banto-hub: サイドカーの設定ファイルの置き場を整え、雛形 (banto-hub-sink.toml.example) を置きました。管理者のメモ帳で雛形をコピーして banto-hub-sink.toml を作り、編集の後に prepare-sink-config をもう一度実行してください。"
   ${EndIf}
@@ -717,7 +717,7 @@ Var RestoreSaved3
   DetailPrint "banto-hub: Hub の loopback TLS の鍵と証明書 (%ProgramData%\BantoHub\tls) を確かめています..."
   ExecWait '"$INSTDIR\banto-hub-elev.exe" prepare-hub-tls' $0
   ${If} $0 != 0
-    DetailPrint "banto-hub: prepare-hub-tls に失敗しました（終了コード $0）。理由を確かめてから、管理者権限の PowerShell で手動で次を実行してください: $\"$INSTDIR\banto-hub-elev.exe$\" prepare-hub-tls （壊れている・期限切れなら --renew を付けて作り直し、証明書を pin しているクライアントを書き換える。docs/banto-hub-operations.md「Hub–Sink 専用 loopback TLS（#644）」参照）"
+    DetailPrint "banto-hub: prepare-hub-tls に失敗しました（終了コード $0）。理由を確かめてから、管理者権限の PowerShell で手動で次を実行してください: $\"$INSTDIR\banto-hub-elev.exe$\" prepare-hub-tls （壊れている・期限切れなら --renew を付けて作り直し、証明書を pin しているクライアントを書き換える。docs/hub/banto-hub-operations.md「Hub–Sink 専用 loopback TLS（#644）」参照）"
   ${Else}
     DetailPrint "banto-hub: Hub の loopback TLS の鍵と証明書を確かめました（無ければ作りました。既存は保ちます）。"
   ${EndIf}
@@ -727,10 +727,10 @@ Var RestoreSaved3
   ; 再開しても、すぐ止まるので、インストーラの詳細に移し方を残す。パスは (4) の旧い処理と
   ; 同じ求め方（PerMachine の $APPDATA = %ProgramData%）と $INSTDIR。旧いファイルには触らない。
   ${If} ${FileExists} "$APPDATA\BantoHub\banto-hub-sink.toml"
-    DetailPrint "banto-hub: 旧い置き場に設定ファイル ($APPDATA\BantoHub\banto-hub-sink.toml) があります。この版の DB Sink サイドカーは旧い置き場を読まず、残っている間は起動しません。移し方（新しい置き場で作り直し・キーの失効と再発行・旧いファイルの削除）は docs/banto-hub-operations.md §12 を参照してください。上書き前に稼働していた場合も BantoHubSink は再開を試みますが、設定を移すまで止まります。"
+    DetailPrint "banto-hub: 旧い置き場に設定ファイル ($APPDATA\BantoHub\banto-hub-sink.toml) があります。この版の DB Sink サイドカーは旧い置き場を読まず、残っている間は起動しません。移し方（新しい置き場で作り直し・キーの失効と再発行・旧いファイルの削除）は docs/hub/banto-hub-operations.md §12 を参照してください。上書き前に稼働していた場合も BantoHubSink は再開を試みますが、設定を移すまで止まります。"
   ${EndIf}
   ${If} ${FileExists} "$INSTDIR\banto-hub-sink.toml"
-    DetailPrint "banto-hub: 旧い置き場に設定ファイル ($INSTDIR\banto-hub-sink.toml) があります。この版の DB Sink サイドカーは旧い置き場を読まず、残っている間は起動しません。移し方は docs/banto-hub-operations.md §12 を参照してください。上書き前に稼働していた場合も BantoHubSink は再開を試みますが、設定を移すまで止まります。"
+    DetailPrint "banto-hub: 旧い置き場に設定ファイル ($INSTDIR\banto-hub-sink.toml) があります。この版の DB Sink サイドカーは旧い置き場を読まず、残っている間は起動しません。移し方は docs/hub/banto-hub-operations.md §12 を参照してください。上書き前に稼働していた場合も BantoHubSink は再開を試みますが、設定を移すまで止まります。"
   ${EndIf}
 
   ; §7 決定4: PREINSTALL で止めたものだけ再開する（Hub → Sink の順）。

@@ -3,7 +3,7 @@
 //!
 //! **Bindings are keyed by `external_name` (`{connection}.{group}.{tag}`), not
 //! by the Hub's numeric [`StableTagId`]** (2026-09-30 owner decision,
-//! docs/scada-design.md §9.6). Every Hub public contract - WebSocket
+//! docs/scada/scada-design.md §9.6). Every Hub public contract - WebSocket
 //! subscribe, `POST /api/v1/values/{tag}`, the write scope, MQTT - already
 //! speaks names, and a numeric ID does not survive a delete-and-recreate of
 //! the same tag or a CSV re-import, nor can it be carried across

@@ -1,7 +1,7 @@
 //! Network-free S2a Hub wire parsing and race-free publish gate.
 //!
 //! This module deliberately has no socket, async task, WebSocket client,
-//! worker, reconnect, or secret handling. See `docs/banto-tagclient-design.md`
+//! worker, reconnect, or secret handling. See `docs/crates/banto-tagclient-design.md`
 //! §5-§9 and the S2a implementation slice.
 
 use std::collections::{HashMap, HashSet};
@@ -113,7 +113,7 @@ pub(crate) fn parse_hub_wire(
 }
 
 /// Hub wire message seen on an `Unbound` connection, which has no
-/// subscription (#682 PR-3, docs/banto-tagclient-partial-binding-design.md
+/// subscription (#682 PR-3, docs/crates/banto-tagclient-partial-binding-design.md
 /// §5.1). Kept separate from [`parse_hub_wire`] so the publish gate's
 /// treatment of `pong` as `Ignored` does not change.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

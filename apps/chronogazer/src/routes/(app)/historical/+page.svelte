@@ -3,7 +3,7 @@
 	 * ヒストリカル画面（R1-A: プレースホルダ）。
 	 *
 	 * 実装は R2 フェーズ（過去データの期間指定表示、banto-tsquery の
-	 * read_decimated を使ったサーバー側間引き）。docs/r1-plan.md 参照。
+	 * read_decimated を使ったサーバー側間引き）。docs/archive/r1-plan.md 参照。
 	 */
 </script>
 

@@ -130,7 +130,7 @@ pub enum GroupSetupError {
     UnknownMode(String),
     InvalidTableName(String),
     MissingConnection(i64),
-    /// R2b-1d（docs/banto-hub-connection-settings-design.md §5.4）: Hub がその接続の
+    /// R2b-1d（docs/hub/banto-hub-connection-settings-design.md §5.4）: Hub がその接続の
     /// パスワードを読めない（`unavailableConnections`）。繋がない。
     ConnectionUnavailable {
         id: i64,

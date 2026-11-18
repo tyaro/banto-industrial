@@ -1,6 +1,6 @@
 <script lang="ts">
 	/**
-	 * S6（docs/banto-hub-external-db-design.md §5.2・§5.3・§5.6・§7 row S6）:
+	 * S6（docs/hub/banto-hub-external-db-design.md §5.2・§5.3・§5.6・§7 row S6）:
 	 * DB Sink（`hub_sink_groups`）の管理画面。sink group の一覧・作成・編集・
 	 * 削除（`SinkGroupDrawer.svelte`）、サイドカー用 API キーの発行導線、
 	 * `banto-hub-sink.toml`の設定スニペット表示を1画面にまとめる。

@@ -28,7 +28,7 @@ pub enum Remedy {
 }
 
 /// 置き場を信じられない理由の種類のうち、サービスの証明書を失効に入れるかどうかを分けるもの
-/// （#1121 PR2c。docs/hub-desktop-tls-design.md §7「PR2 で決めたこと」1）。
+/// （#1121 PR2c。docs/hub/hub-desktop-tls-design.md §7「PR2 で決めたこと」1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaceFault {
     /// 露出: 信頼する相手以外への許可（null DACL・種類の分からない ACE・SID の読めない ACE を

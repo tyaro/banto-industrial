@@ -1,4 +1,4 @@
-//! 値の層のシミュレータ（docs/banto-hub-driver-sim-design.md §3、R2b-5a）。
+//! 値の層のシミュレータ（docs/hub/driver/banto-hub-driver-sim-design.md §3、R2b-5a）。
 //!
 //! ワイヤ（Modbus / SLMP のフレーム）を作らず、`Session` の契約だけを守る。値は
 //! [`SimDevice`] が持つ表（鍵は `DriverAddress::canonical` と `TagKind` の組。`D100.5` と

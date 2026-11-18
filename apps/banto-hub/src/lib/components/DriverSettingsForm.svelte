@@ -1,6 +1,6 @@
 <script lang="ts">
 	/**
-	 * R2b-6c（docs/banto-hub-driver-ui-design.md §6.1）: 機器のドライバの接続設定の欄を
+	 * R2b-6c（docs/hub/driver/banto-hub-driver-ui-design.md §6.1）: 機器のドライバの接続設定の欄を
 	 * `GET /api/drivers` のスキーマ（`DriverSettingField[]`）から描く汎用部品。ドライバごとの
 	 * 分岐は持たない（欄の種類 → 部品だけ）。判断（既定値・検査・送る形・引き継ぎ）は
 	 * `#lib/banto/driverSettingsForm.ts` の純関数。

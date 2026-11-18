@@ -1,5 +1,5 @@
-//! T17-2 スライス2（docs/banto-hub-t17-design.md §3「T17-2」・P3、
-//! docs/banto-hub-desktop-plan.md §8.3）: UAC 昇格ヘルパー
+//! T17-2 スライス2（docs/hub/banto-hub-t17-design.md §3「T17-2」・P3、
+//! docs/hub/banto-hub-desktop-plan.md §8.3）: UAC 昇格ヘルパー
 //! `banto-hub-elev.exe`（`banto-hub-host` の `src/bin/banto-hub-elev.rs`）が呼ぶ実装本体。
 //!
 //! [`crate::service_operators`]（slice 1）はローカルグループ
@@ -32,7 +32,7 @@
 //! | `prepare-hub-tls`            | `[--renew]` - Hub の loopback TLS の鍵と証明書を `%ProgramData%\BantoHub\tls\` に、作るのと同時に保護された DACL を付けて作る。既にあれば確かめて保つ（壊れている・期限切れ・片方だけ・露出していれば断る）。`--renew` で作り直す（[`crate::hub_tls_prepare`]、#644 PR1a） |
 //!
 //! ## ロックダウン回復アクション（`reset-password`/`revert-to-commissioning`、
-//! 2026-08-31 オーナー決定・docs/tag-server-design.md §5.6 制約3/4）
+//! 2026-08-31 オーナー決定・docs/hub/tag-server-design.md §5.6 制約3/4）
 //!
 //! **背景**: §5.6 の「ロックダウンは UI・REST からは後戻りできない」設計は、
 //! 裏を返すと「管理者パスワードを紛失した」「ロックダウンしたまま改造・
@@ -166,7 +166,7 @@
 //! `#[cfg(windows)] fn main()`のみで、非 Windows 側の`main`はそもそも
 //! これらを呼ばない。
 //!
-//! ## S6 申し送りの follow-up（docs/banto-hub-external-db-design.md §5.5・
+//! ## S6 申し送りの follow-up（docs/hub/banto-hub-external-db-design.md §5.5・
 //! §7 row S6、PR #313 レビュー指摘）: `grant-service-acl`のサービス名
 //! パラメータ化
 //!
@@ -190,7 +190,7 @@
 //!
 //! **`apps/banto-hub-sink`はこの関数を直接呼ばない** -
 //! `banto-hub-sink`はリリースバイナリを小さく保つ設計
-//! （docs/banto-hub-external-db-design.md §5.6「新規依存なし」）のため、
+//! （docs/hub/banto-hub-external-db-design.md §5.6「新規依存なし」）のため、
 //! `banto-hub-core`（tonic/grpc・sqlx の postgres+sqlite・axum 等を抱える
 //! 大きな crate）を本番依存に加えたくない。代わりに
 //! `banto-hub-sink.exe grant-service-acl`サブコマンド
@@ -858,7 +858,7 @@ fn ensure_inside_program_files(
 /// （[`crate::profile_grant::service_install`]）。`grant-profile-acl`を新規
 /// インストール時点で流しておくことで、初回起動が Desktop/Service
 /// どちらであっても「LocalSystem 作成 profile が readonly になる」実機
-/// バグ（docs/banto-hub-t16-design.md §3 実機メモ）を未然に防ぐ。上書きインストール
+/// バグ（docs/hub/banto-hub-t16-design.md §3 実機メモ）を未然に防ぐ。上書きインストール
 /// でも既存の profile を保護された DACL へ書き直す（足していく意味は保つ - 論点 4）。
 ///
 /// `service_install::install`自体は失敗時に`eprintln!`案内の上で
@@ -1010,7 +1010,7 @@ fn revert_to_commissioning_action(profile_id: Option<&str>) -> Result<(), Elevat
     println!(
         "banto-hub-elev: 警告: 復帰後も server.bind / BANTO_BIND が loopback（127.0.0.1 等）\
          でないままだと、次回起動時に banto-hub は起動を拒否します\
-         （docs/tag-server-design.md §5.6 制約1）。先に loopback へ変更するか、\
+         （docs/hub/tag-server-design.md §5.6 制約1）。先に loopback へ変更するか、\
          復帰直後に変更してください。"
     );
     if !windows_impl::confirm("本当に試運転モードへ戻しますか？")? {

@@ -1,5 +1,5 @@
 /**
- * T19 S2-c2（UX-40、docs/banto-hub-t19-design.md §3.10）: タグ削除の
+ * T19 S2-c2（UX-40、docs/hub/banto-hub-t19-design.md §3.10）: タグ削除の
  * 「取り消し」＝削除の遅延実行、を画面へ配線する薄い Svelte 5 runes
  * ラッパー。状態機械の本体（猶予・再入ガード・失敗時の扱い、設計意図の
  * doc comment）は `deferredDeleteCore.ts` にある - このファイルが薄いのは

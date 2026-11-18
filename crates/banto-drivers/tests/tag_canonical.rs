@@ -1,4 +1,4 @@
-//! R2b-2b（docs/banto-hub-driver-address-design.md §3・§9）: 本物の Modbus / SLMP のドライバ
+//! R2b-2b（docs/hub/driver/banto-hub-driver-address-design.md §3・§9）: 本物の Modbus / SLMP のドライバ
 //! （`banto_drivers::builtin().registry`）で `TagService::with_registry` がアドレスを正規形で
 //! 保存し、文法違反・種類に依る断りをその場で断ることの確認。`banto-tags` 自身のテストは
 //! ドライバ crate に依存できない（循環）ので偽のドライバで形を固定しており、ここは同じ事を

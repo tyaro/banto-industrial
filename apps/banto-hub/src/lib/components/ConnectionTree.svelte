@@ -1,6 +1,6 @@
 <script lang="ts">
 	/**
-	 * T13-1（docs/ux-plan.md §4b）: 接続（plc_connections）→ 収集グループの
+	 * T13-1（docs/archive/ux-plan.md §4b）: 接続（plc_connections）→ 収集グループの
 	 * 2階層を、banto の `@banto/tree-svelte` の `BantoTree` に流し込む、
 	 * アプリ側コンポーネント。banto-hub の型（PlcConnection/CollectionGroup/
 	 * Tag）に依存する部分はすべてここに閉じ込める。
@@ -84,7 +84,7 @@
 
 	type NodeData = ConnectionTreeNodeData;
 
-	// T18-5a（docs/banto-hub-t18-design.md「T18-5a 大量タグ性能」第1段）:
+	// T18-5a（docs/hub/banto-hub-t18-design.md「T18-5a 大量タグ性能」第1段）:
 	// tags/groups をそれぞれ1回だけ Map に集計する（O(T)/O(G)）。connections/
 	// groups/tags が変わらない限り再計算されないので、ラベル描画のたびに
 	// 全走査していた旧実装（tagCountForGroup の O(グループ数×タグ数)、
@@ -150,7 +150,7 @@
 	 * 予約接続はそれぞれ 🧮/💾（末尾バッジ側の絵文字と重複させないため、
 	 * `connectionBadge` からは絵文字を外しテキストのみにした - 下記参照）。
 	 *
-	 * S1（docs/banto-hub-external-db-design.md §4.1、実装指示4）追記:
+	 * S1（docs/hub/banto-hub-external-db-design.md §4.1、実装指示4）追記:
 	 * `protocol === 'postgres'`（DB Source 接続）は 🗄 - PLC とは全く別の
 	 * 接続先（RDB）であることを行頭で即座に区別できるようにする。
 	 */
@@ -270,7 +270,7 @@
 		<span class="period">{formatPeriod(node.data.group.periodMs)}</span>
 		{#if node.data.group.querySql !== null}
 			<!--
-				S3（docs/banto-hub-external-db-design.md §7 row S3、実装指示5
+				S3（docs/hub/banto-hub-external-db-design.md §7 row S3、実装指示5
 				「postgres グループは小さな『SQL』バッジを出す」）:
 				`querySql` が非 `null`（= postgres 接続配下）のグループにだけ
 				出す。接続ノードの「DB」バッジ（上）と同じ位置づけ - グループ

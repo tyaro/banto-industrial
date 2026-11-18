@@ -10,7 +10,7 @@
 //! `hub_log::log_line`/`log_err_line` 経由でサービスログファイルにも残るのと
 //! 非対称だった。
 //!
-//! （T14-1、docs/banto-hub-t14-design.md §3「D1」で `hub_log` 自体はこの
+//! （T14-1、docs/archive/banto-hub-t14-design.md §3「D1」で `hub_log` 自体はこの
 //! lib クレートへ移設されたが、`hub.rs` を `hub_log` の具体的な宛先に直接
 //! 結合させないという [`DiagLog`] の decoupling 自体は変えていない。呼び
 //! 出し側の `crate::runtime::HubRuntime::start` が引き続き明示的に配線する。）

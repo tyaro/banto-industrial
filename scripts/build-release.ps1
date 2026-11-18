@@ -1,5 +1,5 @@
 <#
-  banto-hub 配布物の一括ビルド（I3、docs/banto-hub-installer-design.md
+  banto-hub 配布物の一括ビルド（I3、docs/hub/banto-hub-installer-design.md
   §4.6・§6 row I3）。alpha.2 で実際に踏んだ手順（シェル・Hub 本体・elev・
   DB Sink サイドカーの4バイナリをビルド → 一体インストーラを生成）を
   1本にまとめ、リリース向けファイル名へのリネームと SHA256SUMS.txt の
@@ -188,4 +188,4 @@ Write-Host "生成物（$OutDir）:"
 $produced | Sort-Object | ForEach-Object { Write-Host "  $_" }
 Write-Host '  SHA256SUMS.txt'
 Write-Host ''
-Write-Host '注意: 生成したインストーラをビルド機の評価用 Hub に対して実行しないこと（Windows サービス化・ACL 付与が実環境に及ぶ - 実機確認は docs/banto-hub-installer-design.md §6 row I4 の手順で別途行う）。'
+Write-Host '注意: 生成したインストーラをビルド機の評価用 Hub に対して実行しないこと（Windows サービス化・ACL 付与が実環境に及ぶ - 実機確認は docs/hub/banto-hub-installer-design.md §6 row I4 の手順で別途行う）。'

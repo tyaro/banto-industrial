@@ -3,7 +3,7 @@
 
 use crate::address::Address;
 
-// R1-1 (docs/banto-driver-api-design.md §3.1): the value/data-type vocabulary
+// R1-1 (docs/hub/driver/banto-driver-api-design.md §3.1): the value/data-type vocabulary
 // moved to the published, dependency-free `banto-driver-api` crate so that
 // drivers outside this repository can share it. Re-exported here under the
 // old names and paths (`banto_plc::types::DataType`, `banto_plc::PlcValue`, ...)

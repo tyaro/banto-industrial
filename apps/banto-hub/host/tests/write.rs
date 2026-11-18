@@ -1,4 +1,4 @@
-//! T2-4 の統合テスト（docs/tag-server-design.md §6 全体）: `banto-plc-write`
+//! T2-4 の統合テスト（docs/hub/tag-server-design.md §6 全体）: `banto-plc-write`
 //! の読み書き両対応シミュレータ + `banto-broker` 経由での
 //! `POST /api/v1/values/{tag}` 安全ゲート一式の E2E。
 //!
@@ -276,7 +276,7 @@ async fn test_app(label: &str) -> TestApp {
         .expect("initial catalog commit");
 
     let (events_tx, _rx) = broadcast::channel(16);
-    // T2-4 (docs/tag-server-design.md §6-6): this fixture constructs the
+    // T2-4 (docs/hub/tag-server-design.md §6-6): this fixture constructs the
     // live flag disabled - each test explicitly calls
     // `write_control.enable()` when it needs writes accepted (or exercises
     // the REST enable endpoint directly, see `rest_enable_disable_round_trip`).
@@ -586,7 +586,7 @@ async fn e2e_write_then_collection_reads_the_value_back_through_the_same_broker_
 //    `banto_plc_write::modbus::simulator::Simulator`. #131 left Modbus reads
 //    on banto-collect's own direct `ModbusTcpClient`, so the collection
 //    read-back below used to travel over a SECOND socket to the same external
-//    simulator process (the two-socket tradeoff docs/tag-server-design.md §6
+//    simulator process (the two-socket tradeoff docs/hub/tag-server-design.md §6
 //    item 5 accepted at the time). **#337 (2026-09-08) reversed that**: reads
 //    and writes now share the one broker session, exactly like the SLMP test
 //    above, so this test is now a genuine "読み書き単一セッション" round trip
@@ -1848,7 +1848,7 @@ async fn rest_enable_stays_disabled_when_the_state_file_cannot_be_written() {
 }
 
 // ---------------------------------------------------------------------------
-// T20 ①a (docs/banto-hub-t20-design.md §3.1, 案A): 文字列タグへの単票書き込み
+// T20 ①a (docs/hub/banto-hub-t20-design.md §3.1, 案A): 文字列タグへの単票書き込み
 // (`POST /api/v1/values/{tag}`)。`make_tag`/`tag_input`(数値/bit 専用)とは別
 // に string タグ専用のフィクスチャを立て、UTF-8/Shift-JIS それぞれで
 // シミュレータのワイヤに正しいバイト列が届くことを確認する - `encode.rs`の

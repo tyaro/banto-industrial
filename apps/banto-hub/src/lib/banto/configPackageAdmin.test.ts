@@ -72,7 +72,7 @@ vi.mock('./mqttSettingsAdmin', () => ({
 	saveMqttSettings: vi.fn()
 }));
 
-// S6（docs/banto-hub-external-db-design.md §5.2・§6 item 6）: 上の
+// S6（docs/hub/banto-hub-external-db-design.md §5.2・§6 item 6）: 上の
 // `tagRegistryAdmin`/`grpcSettingsAdmin`/`mqttSettingsAdmin` と同じ理由
 // （`@banto/admin-core`を経由させない）でモックする。
 vi.mock('./sinkGroupsAdmin', () => ({
@@ -444,7 +444,7 @@ describe('applyConfigPackage: 全件成功する通常の import（回帰ガー�
 	});
 });
 
-// --- S1（docs/banto-hub-external-db-design.md §4.1・§2.2、実装指示5）:
+// --- S1（docs/hub/banto-hub-external-db-design.md §4.1・§2.2、実装指示5）:
 // 構成パッケージは postgres 接続のパスワードを一切含まない
 // （`configPackage.test.ts`側で export 自体を固定済み）ので、import 経路
 // （`applyConfigPackage`）が実際に「パスワード無しで作成する」呼び出しに
@@ -536,7 +536,7 @@ describe('applyConfigPackage: postgres（DB Source）接続の import はパス�
 	});
 });
 
-// --- S3（docs/banto-hub-external-db-design.md §7 row S3）: 収集グループの
+// --- S3（docs/hub/banto-hub-external-db-design.md §7 row S3）: 収集グループの
 // `querySql`（postgres 配下限定）が import 経路（`applyConfigPackage`）で
 // `createCollectionGroup`/`updateCollectionGroup` へそのまま渡ることを固定
 // する - S1 の database/username と同じ「pkg の値を転記するだけ」の経路。
@@ -731,7 +731,7 @@ describe('inspectConfigPackage: dbConnectionsPasswordRequired は再設定が必
 	});
 });
 
-// --- S6（docs/banto-hub-external-db-design.md §5.2・§6 item 6）: sink group
+// --- S6（docs/hub/banto-hub-external-db-design.md §5.2・§6 item 6）: sink group
 // の import/inspect - 接続名・タグ名からサーバー側 id への解決を含む点が
 // 他のエンティティと違うため個別に固定する。
 
@@ -1258,7 +1258,7 @@ describe('applyConfigPackage / inspectConfigPackage: 版 2 のキーで突き合
 	});
 });
 
-// R2a-2e（docs/banto-hub-ingest-design.md §3.1・§5.1・§10.2）: push 接続の
+// R2a-2e（docs/hub/banto-hub-ingest-design.md §3.1・§5.1・§10.2）: push 接続の
 // ブリッジは読む postgres 接続を id で持つので、取り込みは postgres 接続を先に
 // 作成・更新し、パッケージの名前（`dbConnectionName`）を取り込み先の id に付け
 // 直す。API キーは移らないので、結果に push 接続の新しい id を返す。

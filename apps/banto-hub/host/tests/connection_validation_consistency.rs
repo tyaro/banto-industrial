@@ -1,5 +1,5 @@
 //! ホスト接続（postgres・push）の平らな形の旧い検証とレジストリの検証の一致の表（R2b-1c、
-//! docs/banto-hub-connection-settings-design.md §4.2・§9「平らな形とレジストリの一致」）。
+//! docs/hub/banto-hub-connection-settings-design.md §4.2・§9「平らな形とレジストリの一致」）。
 //!
 //! R2b-1d で検証の正がレジストリになるとき、「今の画面とテストが見るエラーの文言は
 //! 変わらない」ために、組み込みのプロトコルについて次の 2 つが**同じ入力を断る**ことを、

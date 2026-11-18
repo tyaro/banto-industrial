@@ -22,7 +22,7 @@
 
 <script lang="ts">
 	/**
-	 * #342 段階B（docs/tag-server-design.md §4.2「セグメント補完」）: 演算タグの
+	 * #342 段階B（docs/hub/tag-server-design.md §4.2「セグメント補完」）: 演算タグの
 	 * 式欄（`(app)/tags/+page.svelte` の `#tag-expression`）のキャレット位置に
 	 * 浮かべる補完候補のポップアップ。座標に浮かべる小さな一覧という点は
 	 * `TreeContextMenu.svelte` を手本にしている（`position: fixed` + x/y、

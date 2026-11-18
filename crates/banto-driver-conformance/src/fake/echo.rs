@@ -1,6 +1,6 @@
 //! [`EchoFrameDriver`]: the reference frame-type driver, and
 //! [`EchoResponder`], the device it talks to
-//! (docs/banto-driver-api-design.md §4.3, §7.4).
+//! (docs/hub/driver/banto-driver-api-design.md §4.3, §7.4).
 //!
 //! Small enough to read in one sitting, but it does what real drivers do,
 //! so that the harness has something real to check and a third party has

@@ -1,5 +1,5 @@
 /**
- * R2a-2e（docs/banto-hub-ingest-design.md §11 の R2a-2e の行）: 取り込み口 `push` の
+ * R2a-2e（docs/hub/banto-hub-ingest-design.md §11 の R2a-2e の行）: 取り込み口 `push` の
  * 実 DOM 受け入れテスト。
  *
  * 固定する内容:

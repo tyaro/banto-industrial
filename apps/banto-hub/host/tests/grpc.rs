@@ -1,4 +1,4 @@
-//! T4 の統合テスト（docs/tag-server-design.md §5.4「gRPC（T4）」)。
+//! T4 の統合テスト（docs/hub/tag-server-design.md §5.4「gRPC（T4）」)。
 //!
 //! `tests/write.rs`/`tests/stream.rs`/`tests/integration.rs` と同じ理由
 //! （各 `tests/*.rs` は独立クレートとしてコンパイルされ、private helper を
@@ -1632,7 +1632,7 @@ async fn grpc_apply_with_invalid_bind_does_not_crash_and_leaves_port_unbound() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. H10 ③(Option B、docs/h10-3-read-scope-proposal.md §5・§6): per-tag
+// 8. H10 ③(Option B、docs/archive/h10-3-read-scope-proposal.md §5・§6): per-tag
 //    read スコープ。GetCatalog は絞らない(素の read/read:{tag} いずれでも
 //    全タグ)。ReadValues/StreamValues はスコープ外を除く。
 // ---------------------------------------------------------------------------

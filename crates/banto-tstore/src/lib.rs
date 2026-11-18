@@ -1,4 +1,4 @@
-//! banto-tstore: I3a 時系列ストレージ (docs/plan.md I3, docs/recorder-requirements.md
+//! banto-tstore: I3a 時系列ストレージ (docs/plan.md I3, docs/chronogazer/recorder-requirements.md
 //! §3.4 "保存・保持", §8 "時系列スキーマ" 未決事項の解決).
 //!
 //! **日次ファイル + スキーマ凍結**方式（2026-07-12 決定）: 1つのデータ
