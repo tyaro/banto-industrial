@@ -114,6 +114,9 @@ importers:
       '@banto/theme':
         specifier: github:tyaro/banto#v7.5.0&path:packages/theme
         version: https://codeload.github.com/tyaro/banto/tar.gz/a8b311a66679d46496cfba41cff1e00a4906f402#path:packages/theme
+      '@banto/tree-svelte':
+        specifier: github:tyaro/banto#v7.5.0&path:packages/tree-svelte
+        version: https://codeload.github.com/tyaro/banto/tar.gz/a8b311a66679d46496cfba41cff1e00a4906f402#path:packages/tree-svelte
       '@banto/ui':
         specifier: github:tyaro/banto#v7.5.0&path:packages/ui
         version: https://codeload.github.com/tyaro/banto/tar.gz/a8b311a66679d46496cfba41cff1e00a4906f402#path:packages/ui
