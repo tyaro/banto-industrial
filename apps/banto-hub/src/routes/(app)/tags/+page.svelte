@@ -3504,8 +3504,8 @@
 
 	/**
 	 * `ConnectionTree` の `onselect`。`navigation` は上下・Home・End・左右の
-	 * キーでフォーカスが動いたことに選択が付いてきた場合（BantoTree は単一
-	 * 選択でフォーカスに選択が付く）。
+	 * キーでフォーカスが動いたことに選択が付いてきた場合（広幅のみ。狭幅は
+	 * `selectionFollowsFocus=false` で、キーは選択を起こさない）。
 	 */
 	function handleTreeSelect(
 		data: ConnectionTreeNodeData,
@@ -3515,9 +3515,10 @@
 		// #378: 狭幅では「選んだ」時点（クリック・Space・Enter）で退避パネルを
 		// 閉じる（`Sidebar.svelte` のリンククリックで `closeNav()` するのと同じ
 		// 「閉じる契機」）。上下キーなどのフォーカス移動に付いてきた選択
-		// （`navigation`）では閉じない - キーで目的の行まで動かせなくなる。
+		// （狭幅では起きない: `selectionFollowsFocus=false` なので、キーは
+		// 目的の行までフォーカスだけを動かし、Enter・Space・クリックで選ぶ）。
 		// **閉じるのはこの経路だけ** - 右クリック経路は下記参照。
-		if (layoutNarrow && !navigation) treeOpen = false;
+		if (layoutNarrow) treeOpen = false;
 	}
 
 	/**
@@ -6943,6 +6944,7 @@
 						{groups}
 						tags={visibleTags}
 						selectedId={treeSelectedId}
+						selectionFollowsFocus={!layoutNarrow}
 						onselect={handleTreeSelect}
 						oncontextmenu={handleTreeContextMenu}
 					/>

@@ -214,28 +214,83 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(page.getByRole('gridcell', { name: TAG_A, exact: true })).toHaveCount(0);
 	});
 
-	test('2b. 上下キーで行を動かしただけでは閉じず、Enter で確定すると閉じる（#1179 PR2a）', async () => {
-		// BantoTree は単一選択でフォーカスに選択が付いてくる。その選択では退避
-		// パネルを閉じない（`ConnectionTree` の `onselect` の `navigation`）。
+	test('2b. 狭幅では上下キーはフォーカスだけを動かし、Enter で選ぶと閉じる（#1179、banto#653）', async () => {
+		// 狭幅は `selectionFollowsFocus=false`（2026-11-18 オーナー決定）。上下キーでは
+		// 選択もパネルも変わらず、Enter（子の無い行の確定）で選んで閉じる。
 		// 前のテストの終わりで GROUP_B が選択中（= ツリーのタブ停止位置）。
 		await treeToggle.click();
 		await expect(treePane).toBeVisible();
 		await groupNodeByName(page, GROUP_B).focus();
 
 		await page.keyboard.press('ArrowUp');
-		await expect(treePane).toBeVisible();
-		await expect(treeSelection).toHaveText(GROUP_A);
-		await expect(treeToggle).toHaveAttribute('aria-expanded', 'true');
-
-		await page.keyboard.press('ArrowDown');
+		await expect(groupNodeByName(page, GROUP_A)).toBeFocused();
 		await expect(treePane).toBeVisible();
 		await expect(treeSelection).toHaveText(GROUP_B);
+		await expect(treeToggle).toHaveAttribute('aria-expanded', 'true');
 
-		// Enter（子の無い行の確定 = BantoTree の `onActivate`）で閉じる。
 		await page.keyboard.press('Enter');
 		await expect(treePane).toBeHidden();
 		await expect(treeToggle).toHaveAttribute('aria-expanded', 'false');
-		await expect(treeSelection).toHaveText(GROUP_B);
+		await expect(treeSelection).toHaveText(GROUP_A);
+
+		// 選択済みの行でも、Enter で確定すれば閉じる（`onActivate`）。
+		await treeToggle.click();
+		await expect(treePane).toBeVisible();
+		await groupNodeByName(page, GROUP_A).focus();
+		await page.keyboard.press('Enter');
+		await expect(treePane).toBeHidden();
+		await expect(treeSelection).toHaveText(GROUP_A);
+	});
+
+	test('2c. 狭幅の Enter は選択の要求を 1 回だけ出す: 未保存の確認を 1 回キャンセルすれば、もう出ない（#1187）', async () => {
+		// 狭幅（`selectionFollowsFocus=false`）の BantoTree は、葉の Enter で
+		// `onSelectionChange` の後に `onActivate` も呼ぶ。両方でページへ通知すると
+		// 確認が同じキー操作で 2 回出て、2 回目の誤承諾で入力を失う。
+		// 前のテストの終わりで GROUP_A が選択中。「設定」タブのフォームを未保存にする。
+		await page.getByRole('tab', { name: '設定' }).click();
+		const nameInput = page.getByLabel('名前', { exact: true });
+		await expect(nameInput).toHaveValue(GROUP_A);
+		await nameInput.fill(`${GROUP_A}-edited`);
+		const urlBefore = page.url();
+
+		const messages: string[] = [];
+		const onDialog = (dialog: Dialog): void => {
+			messages.push(dialog.message());
+			void dialog.dismiss();
+		};
+		page.on('dialog', onDialog);
+		try {
+			await treeToggle.click();
+			await expect(treePane).toBeVisible();
+			await groupNodeByName(page, GROUP_A).focus();
+			await page.keyboard.press('ArrowDown');
+			await expect(groupNodeByName(page, GROUP_B)).toBeFocused();
+			await page.keyboard.press('Enter');
+			await expect.poll(() => messages).toEqual(['変更を破棄しますか？']);
+			// 2 回目が遅れて出ないことを、少し待って確かめる。
+			await page.waitForTimeout(500);
+			expect(messages).toHaveLength(1);
+
+			// 対象・URL・入力・パネルの開閉は元のまま。
+			await expect(treeSelection).toHaveText(GROUP_A);
+			expect(page.url()).toBe(urlBefore);
+			await expect(nameInput).toHaveValue(`${GROUP_A}-edited`);
+			await expect(treePane).toBeVisible();
+			await expect(treeToggle).toHaveAttribute('aria-expanded', 'true');
+		} finally {
+			page.off('dialog', onDialog);
+		}
+
+		// 後片付け: パネルを閉じ、入力を捨てて「タグ一覧」へ戻す（後続の前提）。
+		await page.keyboard.press('Escape');
+		await expect(treePane).toBeHidden();
+		page.once('dialog', (dialog) => void dialog.accept());
+		await page.getByRole('tab', { name: 'タグ一覧' }).click();
+		await expect(page.getByRole('tab', { name: 'タグ一覧' })).toHaveAttribute(
+			'aria-selected',
+			'true'
+		);
+		await expect(treeSelection).toHaveText(GROUP_A);
 	});
 
 	test('3. Esc とバックドロップのクリックで閉じ、フォーカスはボタンへ戻る', async () => {
