@@ -18,9 +18,13 @@
 	 *   そのペンの設定を出す）と「設定」（名前・表示種別・既定の時間窓・削除）。
 	 *   保存・取り消し・未保存の表示・楽観ロックの「最新の内容を読み込む」は、
 	 *   どちらのタブでも見えるよう中央の上に置く。
-	 * - 右 = 選んだペンの設定（タグの選択と色）。編集者以上のときだけ開く。
-	 *   Hub のカタログからのタグ選択は次の PR（PR6b）で、今は登録済みの記録項目の
-	 *   `<select>` のまま。
+	 * - 右 = 編集者以上のときだけ開く。2 つのモードを持つ（#1179 PR6b）:
+	 *   「ペンの設定」（今のタグと「タグを選び直す」、色）と「タグ選択」
+	 *   （`PenTagPicker.svelte`。接続先 → 収集グループのツリーか検索から選ぶ。
+	 *   出どころは Hub 以外の接続先の記録項目と Hub のカタログ。未登録の Hub タグは
+	 *   `hubTag` のペンになり、保存で記録項目に登録される。登録先は「ペン」タブの
+	 *   ペン一覧の下）。中央の「タグを追加」で追加モード、「タグを選び直す」で
+	 *   置き換えモードになる。
 	 * - **下書き（`draft`）はグループ単位で一つ**。ペンの編集（右ペイン）も
 	 *   名前などの編集（「設定」タブ）も同じ下書きを書き換え、保存も一回。
 	 *   だからタブの切り替えやペンの選択・右ペインを閉じる操作では、未保存の
@@ -61,11 +65,23 @@
 	import {
 		listTags,
 		listCollectionGroups,
+		listPlcConnections,
 		isTagRegistryAvailable,
+		ALLOWED_PERIOD_MS,
 		DEMO_MODE_MESSAGE,
 		type Tag,
-		type CollectionGroup
+		type CollectionGroup,
+		type PlcConnection
 	} from '#lib/banto/tagRegistryAdmin.js';
+	import { getHubCatalog } from '#lib/banto/hubAdmin.js';
+	import { hubGroupsOf } from '#lib/banto/hubRegistration.js';
+	import PenTagPicker from '#lib/components/PenTagPicker.svelte';
+	import {
+		describePenTag,
+		penFromRow,
+		type PickerHubCatalog,
+		type PickerRow
+	} from '#lib/components/penTagPicker.js';
 	import { errorText } from '../settings/modeSwitch';
 	import { listTagThresholds, type TagThresholds } from '#lib/banto/tagThresholdsAdmin.js';
 	import {
@@ -92,11 +108,15 @@
 		KIND_OPTIONS,
 		MAX_DISPLAY_GROUPS,
 		MAX_PENS,
+		DEFAULT_HUB_GROUP_NAME,
 		TIME_WINDOW_OPTIONS,
-		addPen,
-		canAddPen,
+		appendPens,
 		colorSlotVar,
 		defaultColorSlot,
+		defaultHubTarget,
+		hasHubPens,
+		remainingPens,
+		replacePenTag,
 		draftFromGroup,
 		draftProblems,
 		draftToInput,
@@ -117,6 +137,12 @@
 	} from './groupsPageLogic';
 
 	const available = isTagRegistryAvailable();
+	/** 新しい収集グループの周期の既定（`DEFAULT_HUB_GROUP_PERIOD_MS` と同じ 1 秒）。 */
+	const DEFAULT_PERIOD = 1000;
+	const periodOptions = ALLOWED_PERIOD_MS.map((ms) => ({
+		value: ms,
+		label: ms >= 1000 ? `${ms / 1000}s` : `${ms}ms`
+	}));
 	const canWrite = $derived(canWriteResources(sessionStore.role));
 
 	// --- 一覧（「読めていない」と「0 件」を分ける - チェックリスト §5） --------
@@ -128,6 +154,7 @@
 	let tags = $state<Tag[] | null>(null);
 	let tagsError = $state<string | null>(null);
 	let collectionGroups = $state<CollectionGroup[]>([]);
+	let connections = $state<PlcConnection[]>([]);
 
 	function errorMessage(err: unknown): string {
 		if (isProviderError(err)) {
@@ -153,9 +180,14 @@
 	async function reloadTags(): Promise<void> {
 		void reloadThresholds();
 		try {
-			const [tagRows, groupRows] = await Promise.all([listTags(), listCollectionGroups()]);
+			const [tagRows, groupRows, connectionRows] = await Promise.all([
+				listTags(),
+				listCollectionGroups(),
+				listPlcConnections()
+			]);
 			tags = tagRows;
 			collectionGroups = groupRows;
+			connections = connectionRows;
 			tagsError = null;
 		} catch (err) {
 			tagsError = errorMessage(err);
@@ -182,20 +214,38 @@
 
 	const tagsById = $derived(new Map((tags ?? []).map((tag) => [tag.id, tag])));
 
-	/** タグの選択肢を収集グループごとにまとめる（名前順）。 */
-	const tagOptionGroups = $derived.by(() => {
-		const byGroup = new Map<number, Tag[]>();
-		for (const tag of tags ?? []) {
-			const list = byGroup.get(tag.collectionGroupId) ?? [];
-			list.push(tag);
-			byGroup.set(tag.collectionGroupId, list);
+	// --- Hub のカタログ（タグ選択を最初に開いたときに読み、「一覧を更新」で読み直す）---
+
+	let hubCatalog = $state<PickerHubCatalog | null>(null);
+	let hubLoading = $state(false);
+	let hubError = $state<string | null>(null);
+	let hubRequested = false;
+	let hubSeq = 0;
+
+	async function reloadHubCatalog(): Promise<void> {
+		const seq = ++hubSeq;
+		hubLoading = true;
+		try {
+			const catalog = await getHubCatalog();
+			if (seq !== hubSeq) return;
+			hubCatalog = { status: catalog.status, tags: catalog.tags, registered: catalog.registered };
+			hubError = null;
+		} catch (err) {
+			if (seq !== hubSeq) return;
+			hubCatalog = null;
+			hubError = errorMessage(err);
+		} finally {
+			if (seq === hubSeq) hubLoading = false;
 		}
-		return [...byGroup.entries()].map(([groupId, list]) => ({
-			label:
-				collectionGroups.find((group) => group.id === groupId)?.name ?? `収集グループ ${groupId}`,
-			tags: [...list].sort((a, b) => a.name.localeCompare(b.name, 'ja'))
-		}));
-	});
+	}
+
+	async function refreshPicker(): Promise<void> {
+		await Promise.all([reloadTags(), reloadHubCatalog()]);
+	}
+
+	/** Hub 接続の下の収集グループ（`hubTag` の登録先の候補）と、登録先の既定。 */
+	const hubGroups = $derived(hubGroupsOf(connections, collectionGroups));
+	const fallbackTarget = $derived(defaultHubTarget(hubGroups));
 
 	function tagLabel(tagId: number): string {
 		return tagsById.get(tagId)?.name ?? `（見つからないタグ ID ${tagId}）`;
@@ -346,8 +396,30 @@
 		draft.kind = kind;
 	}
 
-	function setPenTag(index: number, value: string): void {
-		draft.pens[index].tagId = value === '' ? null : Number(value);
+	// `hubTag` のペンの登録先（下書きの一部）。
+	function setTargetKind(kind: 'existing' | 'new'): void {
+		draft.hubTarget =
+			kind === 'existing'
+				? { kind: 'existing', collectionGroupId: hubGroups[0]?.id ?? null }
+				: { kind: 'new', name: DEFAULT_HUB_GROUP_NAME, periodMs: DEFAULT_PERIOD };
+	}
+
+	function setTargetGroup(value: string): void {
+		const id = Number(value);
+		draft.hubTarget = {
+			kind: 'existing',
+			collectionGroupId: value !== '' && Number.isFinite(id) ? id : null
+		};
+	}
+
+	function setTargetName(name: string): void {
+		const target = draft.hubTarget;
+		if (target?.kind === 'new') draft.hubTarget = { ...target, name };
+	}
+
+	function setTargetPeriod(value: string): void {
+		const target = draft.hubTarget;
+		if (target?.kind === 'new') draft.hubTarget = { ...target, periodMs: Number(value) };
 	}
 
 	function setPenColor(index: number, value: string): void {
@@ -371,11 +443,23 @@
 				target === 'new'
 					? await createDisplayGroup(draftToInput(draft))
 					: await updateDisplayGroup(target, draftToInput(draft, editingRevision));
+			const registered = saved.registeredTags ?? [];
 			toastStore.push(
 				'success',
-				target === 'new' ? `${saved.name} を作成しました` : `${saved.name} を更新しました`
+				(target === 'new' ? `${saved.name} を作成しました` : `${saved.name} を更新しました`) +
+					(registered.length > 0
+						? `。${registered.length} 件を記録項目に登録しました。収集中なら「収集を再起動」で記録が始まります。`
+						: '')
 			);
 			await reloadGroups();
+			if (registered.length > 0) {
+				// 登録された記録項目・収集グループを読み直す（ペンの名前を引けるように）。
+				await reloadTags();
+				if (hubCatalog !== null) {
+					const names = new Set([...hubCatalog.registered, ...registered.map((t) => t.address)]);
+					hubCatalog = { ...hubCatalog, registered: [...names] };
+				}
+			}
 			openGroup(saved);
 			// 作成したら、新規作成中の URL を作ったグループへ置き換える（右ペインは閉じない）。
 			if (target === 'new') forceView({ group: saved.id, tab: view.tab }, { replace: true });
@@ -445,34 +529,81 @@
 	/** 枠（`ThreePaneLayout`）が狭幅か（部品の `bind:narrow`、出力専用）。 */
 	let layoutNarrow = $state(false);
 
-	/** 右ペインを出すか（編集者以上・「ペン」タブ・下書きの用意ができているペン）。 */
+	/**
+	 * 右ペインのタグ選択のモード（`null` = ペンの設定）。`add` = ペンを足す（元に選んでいた
+	 * ペン `selectedPen` は保つ）、`replace` = `selectedPen` のタグを選び直す。
+	 */
+	let pickMode = $state<'add' | 'replace' | null>(null);
+
+	/** 右ペインを出すか（編集者以上・「ペン」タブ・下書きの用意ができていて、タグ選択かペンの設定）。 */
 	const penPaneOpen = $derived(
 		canWrite &&
 			draftReady &&
 			activeTab === 'pens' &&
-			selectedPen !== null &&
-			selectedPen < draft.pens.length
+			(pickMode === 'add' || (selectedPen !== null && selectedPen < draft.pens.length))
 	);
 
-	function openPen(index: number): void {
-		if (!canWrite) return;
-		selectedPen = index;
+	function openRightDrawerIfNarrow(): void {
 		if (layoutNarrow) {
 			listOpen = false;
 			rightDrawerOpen = true;
 		}
 	}
 
+	function openPen(index: number): void {
+		if (!canWrite) return;
+		selectedPen = index;
+		pickMode = null;
+		openRightDrawerIfNarrow();
+	}
+
 	function closeRightPane(): void {
 		selectedPen = null;
+		pickMode = null;
 		rightDrawerOpen = false;
 	}
 
-	function addPenAndOpen(): void {
-		if (!canAddPen(draft)) return;
-		draft = addPen(draft);
-		openPen(draft.pens.length - 1);
+	/** 「タグを追加」: 右ペインをタグ選択（追加）にする。元に選んでいたペンは保つ。 */
+	function openTagPicker(): void {
+		if (!canWrite) return;
+		pickMode = 'add';
+		if (!hubRequested) {
+			hubRequested = true;
+			void reloadHubCatalog();
+		}
+		openRightDrawerIfNarrow();
 	}
+
+	/** 「タグを選び直す」: 選んでいるペンのタグを選び直すタグ選択にする。 */
+	function startReplace(): void {
+		if (selectedPen === null) return;
+		pickMode = 'replace';
+		if (!hubRequested) {
+			hubRequested = true;
+			void reloadHubCatalog();
+		}
+	}
+
+	/** 「戻る」: ペンを選んでいたらそのペンの設定へ、無ければ右ペインを閉じる。 */
+	function backFromPicker(): void {
+		if (pickMode === 'add' && selectedPen === null) closeRightPane();
+		else pickMode = null;
+	}
+
+	function handlePick(rows: PickerRow[]): void {
+		const picks = rows.map(penFromRow);
+		if (pickMode === 'add') {
+			draft = appendPens(draft, picks, fallbackTarget);
+		} else if (pickMode === 'replace' && selectedPen !== null && picks.length === 1) {
+			draft = replacePenTag(draft, selectedPen, picks[0], fallbackTarget);
+			pickMode = null;
+		}
+	}
+
+	/** タグ選択の追加先（固定の見出し）。 */
+	const pickTargetName = $derived(
+		selected === 'new' ? '新しい表示グループ' : (selectedGroup?.name ?? draft.name)
+	);
 
 	function movePenAt(index: number, delta: -1 | 1): void {
 		draft = movePen(draft, index, delta);
@@ -488,7 +619,13 @@
 	}
 
 	/** 右ペインの見出し（と `ThreePaneLayout` の右ペインの名前）。 */
-	const rightPaneTitle = $derived(selectedPen === null ? 'ペン' : `ペン ${selectedPen + 1} の設定`);
+	const rightPaneTitle = $derived(
+		pickMode !== null
+			? 'タグ選択'
+			: selectedPen === null
+				? 'ペン'
+				: `ペン ${selectedPen + 1} の設定`
+	);
 
 	// --- 画面の状態の切り替えと URL ---------------------------------------------
 	//
@@ -733,32 +870,46 @@
 					</button>
 				</div>
 				<div class="detail-pane-body">
-					{#if selectedPen !== null && selectedPen < draft.pens.length}
+					{#if pickMode !== null}
+						<PenTagPicker
+							mode={pickMode}
+							title={pickMode === 'add'
+								? `タグ追加中・追加先: ${pickTargetName}`
+								: `ペン ${(selectedPen ?? 0) + 1} のタグを選び直す`}
+							{connections}
+							{collectionGroups}
+							tags={tags ?? []}
+							hub={hubCatalog}
+							{hubLoading}
+							{hubError}
+							used={tagsUsedByOtherPens(draft, pickMode === 'replace' ? selectedPen : null)}
+							remaining={remainingPens(draft)}
+							max={MAX_PENS}
+							disabled={busy}
+							onpick={handlePick}
+							onback={backFromPicker}
+							onrefresh={() => void refreshPicker()}
+						/>
+					{:else if selectedPen !== null && selectedPen < draft.pens.length}
 						{@const index = selectedPen}
 						{@const pen = draft.pens[index]}
-						{@const used = tagsUsedByOtherPens(draft, index)}
+						{@const summary = describePenTag(pen, tagsById, collectionGroups, connections)}
 						<fieldset class="editor" disabled={busy}>
-							<label class="field">
-								<span>ペン {index + 1} のタグ</span>
-								<select
-									value={pen.tagId === null ? '' : String(pen.tagId)}
-									onchange={(e) => setPenTag(index, e.currentTarget.value)}
-								>
-									<option value="">タグを選択</option>
-									{#if pen.tagId !== null && !tagsById.has(pen.tagId)}
-										<option value={String(pen.tagId)}>{tagLabel(pen.tagId)}</option>
-									{/if}
-									{#each tagOptionGroups as optionGroup (optionGroup.label)}
-										<optgroup label={optionGroup.label}>
-											{#each optionGroup.tags as tag (tag.id)}
-												<option value={String(tag.id)} disabled={used.has(tag.id)}
-													>{tag.name}{tag.unit ? `（${tag.unit}）` : ''}</option
-												>
-											{/each}
-										</optgroup>
-									{/each}
-								</select>
-							</label>
+							<div class="current-tag" data-testid="pen-current-tag">
+								<span class="field-label">ペン {index + 1} のタグ</span>
+								<strong>{summary?.name ?? 'タグ未選択'}</strong>
+								{#if summary?.connection || summary?.group}
+									<span class="meta">
+										{[summary?.connection, summary?.group].filter(Boolean).join(' / ')}
+									</span>
+								{/if}
+								{#if summary?.unregistered}
+									<span class="unreg-badge">未登録（保存で記録に追加）</span>
+								{/if}
+								<button type="button" class="secondary" onclick={startReplace}>
+									タグを選び直す
+								</button>
+							</div>
 							<label class="field">
 								<span>ペン {index + 1} の色</span>
 								<select
@@ -975,10 +1126,11 @@
 													<button
 														type="button"
 														class="secondary"
-														onclick={addPenAndOpen}
-														disabled={busy || !canAddPen(draft) || tags === null}
+														data-testid="display-group-add-tag"
+														onclick={openTagPicker}
+														disabled={busy || tags === null}
 													>
-														ペンを追加
+														タグを追加
 													</button>
 												{/if}
 											</div>
@@ -993,7 +1145,7 @@
 											{/each}
 											{#if draft.pens.length === 0}
 												<p class="note">
-													ペンがありません。{canWrite ? '「ペンを追加」でタグを割り当てます。' : ''}
+													ペンがありません。{canWrite ? '「タグを追加」でタグを割り当てます。' : ''}
 												</p>
 											{:else}
 												<ol class="pen-list">
@@ -1007,7 +1159,14 @@
 															></span>
 															<span class="pen-number">ペン {index + 1}</span>
 															<span class="pen-tag">
-																{pen.tagId === null ? 'タグ未選択' : tagLabel(pen.tagId)}
+																{pen.hubTag !== null
+																	? pen.hubTag.name
+																	: pen.tagId === null
+																		? 'タグ未選択'
+																		: tagLabel(pen.tagId)}
+																{#if pen.hubTag !== null}
+																	<span class="unreg-badge">未登録（保存で記録に追加）</span>
+																{/if}
 															</span>
 															<span
 																class="thresholds"
@@ -1072,6 +1231,74 @@
 														</li>
 													{/each}
 												</ol>
+											{/if}
+											{#if canWrite && hasHubPens(draft)}
+												{@const target = draft.hubTarget ?? fallbackTarget}
+												<fieldset class="hub-target" disabled={busy} data-testid="hub-target">
+													<legend>Hub から新しく記録するタグの登録先</legend>
+													{#if hubGroups.length > 0}
+														<label class="choice">
+															<input
+																type="radio"
+																name="display-group-hub-target"
+																checked={target.kind === 'existing'}
+																onchange={() => setTargetKind('existing')}
+															/>
+															既存の Hub の収集グループ
+														</label>
+														{#if target.kind === 'existing'}
+															<select
+																aria-label="登録先の収集グループ"
+																value={target.collectionGroupId === null
+																	? ''
+																	: String(target.collectionGroupId)}
+																onchange={(e) => setTargetGroup(e.currentTarget.value)}
+															>
+																{#each hubGroups as hubGroup (hubGroup.id)}
+																	<option value={String(hubGroup.id)}>{hubGroup.name}</option>
+																{/each}
+															</select>
+														{/if}
+													{/if}
+													<label class="choice">
+														<input
+															type="radio"
+															name="display-group-hub-target"
+															checked={target.kind === 'new'}
+															onchange={() => setTargetKind('new')}
+														/>
+														新しい収集グループを作る{hubGroups.length === 0
+															? '（Hub 接続も作成します）'
+															: ''}
+													</label>
+													{#if target.kind === 'new'}
+														<div class="new-group">
+															<label class="field">
+																<span>名前</span>
+																<input
+																	type="text"
+																	maxlength="100"
+																	value={target.name}
+																	oninput={(e) => setTargetName(e.currentTarget.value)}
+																/>
+															</label>
+															<label class="field">
+																<span>収集周期</span>
+																<select
+																	value={target.periodMs}
+																	onchange={(e) => setTargetPeriod(e.currentTarget.value)}
+																>
+																	{#each periodOptions as option (option.value)}
+																		<option value={option.value}>{option.label}</option>
+																	{/each}
+																</select>
+															</label>
+														</div>
+													{/if}
+													{#each fieldErrors.hubTagGroup as message, i (i)}
+														<p class="field-error">{message}</p>
+													{/each}
+												</fieldset>
 											{/if}
 											<p class="note">しきい値はタグの設定で、ここでは確認だけできます。</p>
 										</div>
@@ -1380,6 +1607,48 @@
 		margin: 0;
 		color: var(--banto-danger);
 		font-size: 0.8rem;
+	}
+
+	.current-tag {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 0.25rem;
+		font-size: 0.85rem;
+	}
+
+	.current-tag .meta {
+		color: var(--banto-text-muted);
+		font-size: 0.8rem;
+	}
+
+	.unreg-badge {
+		color: var(--banto-warning);
+		font-size: 0.75rem;
+		font-weight: 600;
+	}
+
+	.hub-target {
+		display: flex;
+		flex-direction: column;
+		gap: 0.4rem;
+		margin: 0;
+		padding: 0.5rem 0.75rem;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
+		font-size: 0.85rem;
+	}
+
+	.hub-target .choice {
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
+	}
+
+	.hub-target .new-group {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.75rem;
 	}
 
 	.pens {

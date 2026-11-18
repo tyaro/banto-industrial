@@ -54,6 +54,10 @@ export type HubUnreachableCause =
 /** Mirrors `chronogazer_core::hub::HubTagView`. */
 export interface HubTag {
 	externalName: string;
+	/** Hub 側の接続先名（タグ選択のツリーの階層）。 */
+	connection: string;
+	/** Hub 側の収集グループ名。 */
+	group: string;
 	name: string;
 	dataType: string;
 	unit: string | null;

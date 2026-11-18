@@ -155,6 +155,10 @@ const KEY_HUB_INSTALLATION_ID: &str = "hub.installation_id";
 #[serde(rename_all = "camelCase")]
 pub struct HubTagView {
     pub external_name: String,
+    /// Hub 側の接続先名（タグ選択のツリーの階層。#1179 PR6b）。
+    pub connection: String,
+    /// Hub 側の収集グループ名（同上）。
+    pub group: String,
     pub name: String,
     pub data_type: String,
     pub unit: Option<String>,
@@ -168,6 +172,8 @@ impl From<&CatalogTag> for HubTagView {
     fn from(tag: &CatalogTag) -> Self {
         Self {
             external_name: tag.external_name.clone(),
+            connection: tag.connection.clone(),
+            group: tag.group.clone(),
             name: tag.name.clone(),
             data_type: tag.data_type.clone(),
             unit: tag.unit.clone(),
@@ -3864,6 +3870,19 @@ mod tests {
 
     fn owned(names: &[&str]) -> Vec<String> {
         names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    /// #1179 PR6b: 画面のタグ選択のツリーが使う、Hub 側の接続先名・収集グループ名を
+    /// `HubTagView` が運ぶ（camelCase の `connection` / `group`）。
+    #[test]
+    fn hub_tag_view_carries_connection_and_group() {
+        let snapshot = catalog(&["a"]);
+        let view = HubTagView::from(&snapshot.tags[0]);
+        assert_eq!(view.connection, "line1");
+        assert_eq!(view.group, "fast");
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["connection"], "line1");
+        assert_eq!(json["group"], "fast");
     }
 
     #[test]

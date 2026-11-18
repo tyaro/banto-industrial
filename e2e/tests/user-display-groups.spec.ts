@@ -5,7 +5,8 @@
  *
  * 固定したい受入条件:
  * 1. 表示グループを作成できる（名前・表示種別・トレンドの既定時間窓・ペン 2 本・
- *    ペンの色）。各ペンには記録計の側のしきい値（#532）が読み取り専用で出る（このスペックの
+ *    ペンの色）。ペンのタグは右ペインのタグ選択（検索 → 追加、#1179 PR6b）で入れる。
+ *    各ペンには記録計の側のしきい値（#532）が読み取り専用で出る（このスペックの
  *    タグはしきい値が無いので「しきい値なし」）。
  * 2. 再読み込みしても、作った内容がそのまま開ける（サーバーに保存されている）。
  * 3. 編集（種別の変更・ペンを外す）を保存し、再読み込み後も残る。
@@ -26,13 +27,15 @@
 import { expect, test, type APIRequestContext, type Dialog, type Page } from '@playwright/test';
 import {
 	addGroupButton,
+	addTagBySearch,
 	center as centerPane,
+	closeTagPicker,
 	groupButton,
 	openGroupSettings,
 	openPen,
 	openPensTab,
 	openSettingsTab,
-	penPane
+	tagPicker
 } from './display-groups-page';
 
 const ADMIN_USERNAME = 'e2e-admin';
@@ -193,11 +196,14 @@ test.describe.serial('chronogazer 「表示グループ」ページ（#393）', 
 
 		// ペンは「ペン」タブで追加する。追加したペンの設定が右ペインに開く。
 		await openPensTab(page);
-		await center().getByRole('button', { name: 'ペンを追加' }).click();
-		await penPane(page).getByLabel('ペン 1 のタグ').selectOption({ label: TAG_A });
-		await center().getByRole('button', { name: 'ペンを追加' }).click();
-		await penPane(page).getByLabel('ペン 2 のタグ').selectOption({ label: TAG_B });
-		await penPane(page).getByLabel('ペン 2 の色').selectOption({ label: '色 5' });
+		await addTagBySearch(page, TAG_A);
+		await addTagBySearch(page, TAG_B);
+		await expect(tagPicker(page).getByTestId('pen-tag-picker-title')).toContainText(
+			'追加先: 新しい表示グループ'
+		);
+		await closeTagPicker(page);
+		const pane2 = await openPen(page, 2);
+		await pane2.getByLabel('ペン 2 の色').selectOption({ label: '色 5' });
 		await expect(center().getByText('しきい値: しきい値なし')).toHaveCount(2);
 		await expect(center().locator('.banto-unsaved')).toHaveText('未保存の変更があります');
 
@@ -215,9 +221,9 @@ test.describe.serial('chronogazer 「表示グループ」ページ（#393）', 
 		await expect(center().getByLabel('既定の時間窓')).toHaveValue('1800');
 		await openPensTab(page);
 		const pane1 = await openPen(page, 1);
-		await expect(pane1.getByLabel('ペン 1 のタグ')).toHaveValue(String(tagAId));
+		await expect(pane1.getByTestId('pen-current-tag')).toContainText(TAG_A);
 		const pane2 = await openPen(page, 2);
-		await expect(pane2.getByLabel('ペン 2 のタグ').locator('option:checked')).toHaveText(TAG_B);
+		await expect(pane2.getByTestId('pen-current-tag')).toContainText(TAG_B);
 		await expect(pane2.getByLabel('ペン 2 の色')).toHaveValue('5');
 	});
 
@@ -235,7 +241,7 @@ test.describe.serial('chronogazer 「表示グループ」ページ（#393）', 
 		await expect(center().getByLabel('表示種別')).toHaveValue('gauge');
 		await openPensTab(page);
 		const pane1 = await openPen(page, 1);
-		await expect(pane1.getByLabel('ペン 1 のタグ')).toHaveValue(String(tagAId));
+		await expect(pane1.getByTestId('pen-current-tag')).toContainText(TAG_A);
 		await expect(page.getByTestId('display-group-pen-2')).toHaveCount(0);
 	});
 
@@ -287,8 +293,7 @@ test.describe.serial('chronogazer 「表示グループ」ページ（#393）', 
 		await addGroupButton(page).click();
 		await expect(page).toHaveURL(/\?group=new&tab=settings$/);
 		await openPensTab(page);
-		await center().getByRole('button', { name: 'ペンを追加' }).click();
-		await penPane(page).getByLabel('ペン 1 のタグ').selectOption({ label: TAG_B });
+		await addTagBySearch(page, TAG_B);
 
 		await center().getByRole('button', { name: '作成', exact: true }).click();
 		// サーバーが空の名前を拒み、名前の欄のエラーがあるタブへ移る（URL も追従）。
