@@ -34,7 +34,7 @@ const TAG_B = 'e2e-edit-pane-tag-b';
 
 /**
  * 狭幅フォールバックの判定は従来どおりビューポート（`mobileNavStore.isNarrow`、
- * ≤900px。部品の `narrowBreakpoint` を 0 / 最大値に切り替えてビューポート基準に
+ * ≤900px。部品の `narrowOverride` でビューポート基準に
  * している、2026-11-18 オーナー決定、#1182）。880px のビューポートでは
  * サイドバーがオフキャンバスになり、狭幅に入る。
  *

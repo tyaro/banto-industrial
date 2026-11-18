@@ -265,7 +265,7 @@
 	 * #378（2026-09-16 オーナー決定）: 狭幅で左ツリーを退避したときの開閉状態
 	 * （`ThreePaneLayout` の `leftDrawerOpen`）。#1179 PR2b から、狭幅の判定は従来どおり
 	 * ビューポート（`mobileNavStore.isNarrow`、サイドバーのオフキャンバスと同じ境界）。
-	 * 部品は枠の幅で判定するので、`narrowBreakpoint` を 0 / 最大値に切り替えて
+	 * 部品の既定は枠の幅での判定だが、`narrowOverride` で
 	 * ビューポート基準にしている（2026-11-18 オーナー決定、#1182）。結果を
 	 * `layoutNarrow` へ書き出す。広幅へ戻ると部品が `false` へ戻す。
 	 * タグ登録ページと同じ配線。
@@ -594,11 +594,11 @@
 			<!--
 				#378（2026-09-16 オーナー決定）: 狭幅では左ツリーをドロワーへ退避する。
 				退避・トグル・Esc・フォーカスの出入りは部品が持つ（冒頭コメントの約束）。
-				狭幅の判定はビューポート基準（`narrowBreakpoint` で切り替え）。帯（トグルの隣）には
+				狭幅の判定はビューポート基準（`narrowOverride` で上書き）。帯（トグルの隣）には
 				閉じていても何で絞られているかが分かるよう、現在の選択名を出す。
 			-->
 			<ThreePaneLayout
-				narrowBreakpoint={mobileNavStore.isNarrow ? Number.MAX_SAFE_INTEGER : 0}
+				narrowOverride={mobileNavStore.isNarrow}
 				bind:leftDrawerOpen={treeOpen}
 				bind:narrow={layoutNarrow}
 				messages={{
