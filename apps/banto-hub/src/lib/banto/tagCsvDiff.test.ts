@@ -452,8 +452,6 @@ describe('正規形のアドレスでの比較（解析の API を通す）', ()
 	afterEach(() => {
 		globalThis.fetch = originalFetch;
 	});
-	const groupToConnection = (groupId: number) =>
-		GROUPS.find((g) => g.id === groupId)?.plcConnectionId;
 
 	it('変更の無い CSV は plc(40001 vs 400001)・db・computed・internal のすべてが unchanged で error が 0', async () => {
 		const calls = mockParseApi();
@@ -502,7 +500,7 @@ describe('正規形のアドレスでの比較（解析の API を通す）', ()
 			})
 		];
 
-		const canonical = await resolveCsvCanonicalAddresses(rows, groupToConnection);
+		const canonical = await resolveCsvCanonicalAddresses(rows);
 		const result = classifyCsvUpdate(rows, existing, canonical);
 
 		expect(result.errorCount).toBe(0);
@@ -528,7 +526,7 @@ describe('正規形のアドレスでの比較（解析の API を通す）', ()
 	it('アドレスが本当に違えば、正規形でも changed で、送る行のアドレスは正規形', async () => {
 		mockParseApi();
 		const rows = parsed([csvRow({ name: 'P', address: '40002' })]);
-		const canonical = await resolveCsvCanonicalAddresses(rows, groupToConnection);
+		const canonical = await resolveCsvCanonicalAddresses(rows);
 		const result = classifyCsvUpdate(
 			rows,
 			[makeTag({ id: 1, name: 'P', address: '400001' })],
@@ -541,7 +539,7 @@ describe('正規形のアドレスでの比較（解析の API を通す）', ()
 	it('解析に失敗した行はメッセージつきの error になる', async () => {
 		mockParseApi();
 		const rows = parsed([csvRow({ name: 'P', address: 'zzz' })]);
-		const canonical = await resolveCsvCanonicalAddresses(rows, groupToConnection);
+		const canonical = await resolveCsvCanonicalAddresses(rows);
 		const result = classifyCsvUpdate(
 			rows,
 			[makeTag({ id: 1, name: 'P', address: '400001' })],
@@ -560,7 +558,7 @@ describe('正規形のアドレスでの比較（解析の API を通す）', ()
 			csvRow({ name: 'P', address: '40001' }),
 			csvRow({ name: 'Q', address: '40002' })
 		]);
-		const canonical = await resolveCsvCanonicalAddresses(rows, groupToConnection);
+		const canonical = await resolveCsvCanonicalAddresses(rows);
 		const result = classifyCsvUpdate(
 			rows,
 			[makeTag({ id: 1, name: 'P', address: '400001' })],

@@ -227,6 +227,11 @@ export interface ParsedCsvTagRow {
 	/** CSV ファイル中の行番号（1起点）。ヘッダ行=1、最初のデータ行=2。 */
 	lineNumber: number;
 	connectionName: string;
+	/**
+	 * `connection` 列の名前から読み込み時に解決した接続の id。`tag.collectionGroupId` の
+	 * 属する接続と一致する（接続・グループの一覧を引き直さずに使える）。
+	 */
+	connectionId: number;
 	groupName: string;
 	tag: TagInput;
 }
@@ -491,7 +496,8 @@ export function parseTagsCsv(
 		// internal 以外は toInput() と同じく強制的に false。
 		const retain = tagKind === 'internal' ? retainRaw : false;
 
-		if (rowErrors.length > 0) {
+		// 接続・グループが解決できなければ rowErrors に理由が入っている（`!connection || !group` は型の絞り込み用）。
+		if (rowErrors.length > 0 || !connection || !group) {
 			for (const message of rowErrors) errors.push({ lineNumber, message });
 			return;
 		}
@@ -499,7 +505,7 @@ export function parseTagsCsv(
 		const tag: TagInput = {
 			name,
 			...(comment === undefined ? {} : { comment }),
-			collectionGroupId: group!.id,
+			collectionGroupId: group.id,
 			address,
 			dataType,
 			stringLength: dataType === 'string' ? stringLength : undefined,
@@ -518,7 +524,7 @@ export function parseTagsCsv(
 			expression,
 			retain
 		};
-		rows.push({ lineNumber, connectionName, groupName, tag });
+		rows.push({ lineNumber, connectionName, connectionId: connection.id, groupName, tag });
 	});
 
 	if (errors.length > 0) return { ok: false, errors };
