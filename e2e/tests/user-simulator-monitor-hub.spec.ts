@@ -33,6 +33,7 @@
  */
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
 import { MockHub, type MockHubTag } from '../chronogazer-mock-hub';
+import { openCreateGroup, openCreateRecord, selectTreeNode, treeNode } from './records-page';
 
 const ADMIN_USERNAME = 'e2e-admin';
 const ADMIN_PASSWORD = 'E2eAdminPass1';
@@ -332,11 +333,13 @@ test.describe.serial('chronogazer 監視画面: Hub 経由のタグ（#383 段�
 	});
 	test('5. /tags: Hub 経由のグループを選ぶとタグの作成フォームが Hub 用になり、接続の選択肢は生の protocol 名を出さない', async () => {
 		await page.goto('/tags');
-		const tagForm = page.locator('section.registry-section').nth(2).locator('div.create');
-		await expect(tagForm.getByLabel('デバイスアドレス')).toBeVisible();
-		await expect(tagForm.getByLabel('スケーリング: 生値 下限')).toBeVisible();
-
-		await tagForm.getByLabel('収集グループ').selectOption({ label: COLLECTION_GROUP_NAME });
+		// #1179 PR4b: 接続先には「Hub 経由」の印が付く。記録項目の追加は収集グループを
+		// 選んでから（そのグループが初期値になる）。
+		await expect(treeNode(page, HUB_CONNECTION_NAME)).toHaveAccessibleName(
+			`${HUB_CONNECTION_NAME} Hub 経由`
+		);
+		await selectTreeNode(page, COLLECTION_GROUP_NAME);
+		const tagForm = await openCreateRecord(page);
 		await expect(tagForm.getByLabel('Hub のタグ名（外部名）')).toBeVisible();
 		await expect(tagForm.getByLabel('スケーリング: 生値 下限')).toHaveCount(0);
 		// データ型の 64bit に「Modbusのみ」は付かない。
@@ -344,7 +347,7 @@ test.describe.serial('chronogazer 監視画面: Hub 経由のタグ（#383 段�
 			tagForm.getByLabel('データ型').locator('option', { hasText: 'Modbus' })
 		).toHaveCount(0);
 
-		const groupForm = page.locator('section.registry-section').nth(1).locator('div.create');
+		const groupForm = await openCreateGroup(page);
 		const options = await groupForm.getByLabel('接続').locator('option').allTextContents();
 		expect(options).toContain(`${HUB_CONNECTION_NAME}（Hub 経由）`);
 		expect(options.some((text) => text.includes('（hub）'))).toBe(false);

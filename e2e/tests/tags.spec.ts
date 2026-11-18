@@ -71,13 +71,32 @@
  * の doc comment にある罠と同じ）。`tags` は `smoke` より後、`user-*` より
  * 前に入る（`s` < `t` < `u`）。
  *
- * 3セクションが同じページに同時に描画されるため、ロケータは必ず
- * `section.registry-section`（0=PLC接続, 1=収集グループ, 2=タグ、画面の
- * 描画順どおり）とその中の `div.create`/`div.list` でスコープする -
- * スコープしないと「名前」ラベルの入力欄が3つとも一致して strict mode
- * 違反になる。
+ * 10.（#1179 PR4b）3 ペイン（左ツリー・中央タブ・右の詳細）: ツリーで選ぶと
+ *    一覧が絞られる（`12.`）、URL を開き直すと同じ対象とタブに戻る（`13.`）、
+ *    未保存のままタブ・対象を変えると確認が出てキャンセルで残る（`14.`）、
+ *    900px 以下で左がドロワーになり選択中の名前が帯に残る（`15.`）。
+ *
+ * #1179 PR4b からページは 3 ペイン。右ペイン（作成フォーム・記録項目の詳細）と
+ * 「設定」タブ（接続先・収集グループの編集）は同時に描かれ、どちらにも「名前」欄が
+ * あるので、ロケータは `records-page.ts` の helper（test id）で必ずスコープする。
  */
 import { expect, test, type Page } from '@playwright/test';
+import {
+	detailPane,
+	openCreateConnection,
+	openCreateGroup,
+	openCreateRecord,
+	openListTab,
+	openSettingsTab,
+	recordList,
+	recordTree,
+	recordTreePane,
+	selectTreeNode,
+	settingsPane,
+	treeNode,
+	treeSelection,
+	TREE_PANE_LABEL
+} from './records-page';
 
 // smoke.spec.ts が初回セットアップで作成する唯一の管理者アカウント。
 const ADMIN_USERNAME = 'e2e-admin';
@@ -90,6 +109,9 @@ const VIEWER_PASSWORD = 'E2eViewerPass1';
 const CONNECTION_NAME = 'E2E-PLC1';
 const GROUP_NAME = 'E2Eグループ1';
 const TAG_NAME = 'E2Eタグ1';
+// #1179 PR4b: ツリーの絞り込みを確かめる 2 つ目のグループと記録項目（最後に作る）。
+const GROUP2_NAME = 'E2Eグループ2';
+const TAG2_NAME = 'E2Eタグ2';
 
 async function login(page: Page, username: string, password: string): Promise<void> {
 	await page.goto('/login');
@@ -97,6 +119,20 @@ async function login(page: Page, username: string, password: string): Promise<vo
 	await page.getByLabel('パスワード').fill(password);
 	await page.getByRole('button', { name: 'ログイン' }).click();
 	await expect(page).toHaveURL(/\/monitor$/);
+}
+
+/** 狭幅: 帯のトグルでツリーのドロワーを開き、行を選ぶと閉じる。 */
+async function selectTreeNodeViaDrawer(page: Page, name: string): Promise<void> {
+	const toggle = page.locator(`button[aria-label="${TREE_PANE_LABEL}"]`);
+	const treePane = page.locator(`aside[aria-label="${TREE_PANE_LABEL}"]`);
+	await expect(treePane).toBeHidden();
+	await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+	await toggle.click();
+	await expect(treePane).toBeVisible();
+	// 狭幅は選択がフォーカスに付いてこない（クリック・Enter で選ぶ）。
+	await treeNode(page, name).click();
+	await expect(treePane).toBeHidden();
+	await expect(toggle).toHaveAttribute('aria-expanded', 'false');
 }
 
 test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B）', () => {
@@ -111,24 +147,26 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 		await page.close();
 	});
 
-	test('1. /tags を開くと見出しと3セクションが出る', async () => {
+	test('1. /tags を開くと見出しとツリーが出て、「接続先を追加」でプロトコルごとの欄が出る', async () => {
 		await page.goto('/tags');
 		await expect(page.getByRole('heading', { level: 2, name: '記録' })).toBeVisible();
-		await expect(page.getByRole('heading', { level: 3, name: '接続' })).toBeVisible();
-		await expect(page.getByRole('heading', { level: 3, name: '収集グループ' })).toBeVisible();
-		await expect(page.getByRole('heading', { level: 3, name: 'タグ' })).toBeVisible();
-		const connectionForm = page.locator('section.registry-section').nth(0).locator('div.create');
-		await connectionForm.getByLabel('プロトコル').selectOption('slmp');
-		await expect(connectionForm.getByTestId('driver-field-cpu_type')).toHaveCount(1);
-		await expect(connectionForm.getByTestId('driver-field-unit_id')).toHaveCount(0);
-		await connectionForm.getByLabel('プロトコル').selectOption('modbus-tcp');
-		await expect(connectionForm.getByTestId('driver-field-unit_id')).toHaveCount(1);
-		await expect(connectionForm.getByTestId('driver-field-cpu_type')).toHaveCount(0);
+		await expect(treeNode(page, 'すべて')).toHaveAttribute('aria-selected', 'true');
+		// 「すべて」には「設定」タブが無い（タブ列ごと出さない）。
+		await expect(page.getByRole('tab', { name: '設定' })).toHaveCount(0);
+		// 記録項目の追加は収集グループを選んでいるときだけ。
+		await expect(page.getByRole('button', { name: '記録項目を追加' })).toHaveCount(0);
+		await expect(page.getByTestId('record-add-hint')).toBeVisible();
+		const form = await openCreateConnection(page);
+		await form.getByLabel('プロトコル').selectOption('slmp');
+		await expect(form.getByTestId('driver-field-cpu_type')).toHaveCount(1);
+		await expect(form.getByTestId('driver-field-unit_id')).toHaveCount(0);
+		await form.getByLabel('プロトコル').selectOption('modbus-tcp');
+		await expect(form.getByTestId('driver-field-unit_id')).toHaveCount(1);
+		await expect(form.getByTestId('driver-field-cpu_type')).toHaveCount(0);
 	});
 
-	test('2. PLC接続を作成すると一覧に出る', async () => {
-		const section = page.locator('section.registry-section').nth(0);
-		const form = section.locator('div.create');
+	test('2. 接続先を作成するとツリーに出て、作った接続先が選ばれる', async () => {
+		const form = detailPane(page);
 		await form.getByLabel('名前').fill(CONNECTION_NAME);
 		await form.getByLabel('ホスト').fill('192.168.11.200');
 		let releasePost: () => void = () => {};
@@ -147,27 +185,39 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 			releasePost();
 			await page.unroute('**/api/plc-connections', { behavior: 'wait' });
 		}
-		await expect(section.locator('div.list').getByText(CONNECTION_NAME)).toBeVisible();
+		// 作成に成功したら右ペインは閉じ、作った接続先をツリーで選ぶ。
+		await expect(detailPane(page)).toHaveCount(0);
+		await expect(treeNode(page, CONNECTION_NAME)).toHaveAttribute('aria-selected', 'true');
+		await expect(treeNode(page, CONNECTION_NAME)).toHaveAccessibleName(
+			`${CONNECTION_NAME} PLC 直結`
+		);
+		await expect(page).toHaveURL(/\/tags\?target=connection:\d+$/);
+		// 収集グループが 0 件の接続先は、その下に「収集グループ未登録」。
+		await expect(recordTree(page).getByText('収集グループ未登録')).toBeVisible();
 	});
 
-	test('3. 同名のPLC接続は作れず、「既に使用されています」が名前欄に人間可読で出る', async () => {
-		const section = page.locator('section.registry-section').nth(0);
-		const form = section.locator('div.create');
+	test('3. 同名の接続先は作れず、「既に使用されています」が名前欄に人間可読で出る', async () => {
+		const form = await openCreateConnection(page);
 		await form.getByLabel('名前').fill(CONNECTION_NAME);
 		await form.getByLabel('ホスト').fill('192.168.11.201');
 		await form.getByRole('button', { name: '作成' }).click();
 		await expect(form.getByText('既に使用されています')).toBeVisible();
-		// 重複作成は成立していない - 一覧の行数は増えない。
-		await expect(section.locator('div.list').getByText(CONNECTION_NAME)).toHaveCount(1);
+		// 重複作成は成立していない - ツリーの行は増えない。
+		await expect(treeNode(page, CONNECTION_NAME)).toHaveCount(1);
+		// 入力が残っているので、閉じるときに確かめられる（ここでは破棄する）。
+		page.once('dialog', (dialog) => void dialog.accept());
+		await form.getByRole('button', { name: '閉じる' }).click();
+		await expect(detailPane(page)).toHaveCount(0);
 	});
 
 	test('3a. 保存待ちのドライバ欄は編集できず、非既定設定が保存される', async () => {
-		const section = page.locator('section.registry-section').nth(0);
-		await section
-			.locator('div.list')
-			.getByRole('gridcell', { name: CONNECTION_NAME, exact: true })
-			.click();
-		const detail = section.locator('div.detail');
+		await openSettingsTab(page);
+		const detail = settingsPane(page);
+		await expect(
+			detail.getByRole('heading', { level: 3, name: `${CONNECTION_NAME} を編集` })
+		).toBeVisible();
+		// 以前の一覧の「動作」列の代わり。
+		await expect(detail.getByTestId('record-connection-mode')).toContainText('動作:');
 		await detail.getByLabel('ホスト').fill('192.168.11.202');
 		await detail.getByLabel('ポート').fill('1502');
 		await detail.getByLabel('ユニットID').fill('7');
@@ -190,9 +240,10 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 		await expect(detail.getByLabel('ホスト')).toHaveValue('192.168.11.202');
 		await expect(detail.getByLabel('ポート')).toHaveValue('1502');
 		await expect(detail.getByLabel('ユニットID')).toHaveValue('7');
+		await expect(page).toHaveURL(/\/tags\?target=connection:\d+&tab=settings$/);
 	});
 
-	test('3b. catalog が接続選択より後に届いても保存済み設定を復元する', async () => {
+	test('3b. catalog が接続先の「設定」より後に届いても保存済み設定を復元する', async () => {
 		let releaseCatalog: () => void = () => {};
 		const pendingCatalog = new Promise<void>((resolve) => {
 			releaseCatalog = resolve;
@@ -202,14 +253,13 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 			await route.continue();
 		});
 		try {
+			// URL が対象と「設定」タブを持つので、再読み込みで同じ画面に戻る。
 			await page.reload({ waitUntil: 'domcontentloaded' });
-			const section = page.locator('section.registry-section').nth(0);
-			await section
-				.locator('div.list')
-				.getByRole('gridcell', { name: CONNECTION_NAME, exact: true })
-				.click();
+			const detail = settingsPane(page);
+			await expect(
+				detail.getByRole('heading', { level: 3, name: `${CONNECTION_NAME} を編集` })
+			).toBeVisible();
 			releaseCatalog();
-			const detail = section.locator('div.detail');
 			await expect(detail.getByLabel('ホスト')).toHaveValue('192.168.11.202');
 			await expect(detail.getByLabel('ポート')).toHaveValue('1502');
 			await expect(detail.getByLabel('ユニットID')).toHaveValue('7');
@@ -231,16 +281,9 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 		});
 		try {
 			await page.reload({ waitUntil: 'domcontentloaded' });
-			const section = page.locator('section.registry-section').nth(0);
-			await expect(
-				section.locator('div.create').getByText('ドライバ一覧を読み込めませんでした')
-			).toBeVisible();
-			await section
-				.locator('div.list')
-				.getByRole('gridcell', { name: CONNECTION_NAME, exact: true })
-				.click();
-			await section.locator('div.create').getByRole('button', { name: '再試行' }).click();
-			const detail = section.locator('div.detail');
+			const detail = settingsPane(page);
+			await expect(detail.getByText('ドライバ一覧を読み込めませんでした')).toBeVisible();
+			await detail.getByRole('button', { name: '再試行' }).click();
 			await expect(detail.getByLabel('ホスト')).toHaveValue('192.168.11.202');
 			await expect(detail.getByLabel('ポート')).toHaveValue('1502');
 			await expect(detail.getByLabel('ユニットID')).toHaveValue('7');
@@ -249,35 +292,37 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 		}
 	});
 
-	test('4. 収集グループを作成すると一覧に出る（直前のPLC接続がプルダウンに現れる）', async () => {
-		const section = page.locator('section.registry-section').nth(1);
-		const form = section.locator('div.create');
+	test('4. 収集グループを作成するとツリーに出る（選択中の接続先が初期値）', async () => {
+		const form = await openCreateGroup(page);
+		await expect(form.getByLabel('接続').locator('option:checked')).toHaveText(
+			`${CONNECTION_NAME}（modbus-tcp）`
+		);
 		await form.getByLabel('名前').fill(GROUP_NAME);
-		await form.getByLabel('接続').selectOption({ label: `${CONNECTION_NAME}（modbus-tcp）` });
 		await form.getByRole('button', { name: '作成' }).click();
-		await expect(section.locator('div.list').getByText(GROUP_NAME)).toBeVisible();
+		await expect(detailPane(page)).toHaveCount(0);
+		await expect(treeNode(page, GROUP_NAME)).toHaveAttribute('aria-selected', 'true');
+		await expect(treeNode(page, GROUP_NAME)).toHaveAccessibleName(`${GROUP_NAME} (0) 1s`);
+		await expect(recordTree(page).getByText('収集グループ未登録')).toHaveCount(0);
+		await expect(page).toHaveURL(/\/tags\?target=group:\d+$/);
 	});
 
-	test('5. タグを作成すると一覧に出る（直前の収集グループがプルダウンに現れる）', async () => {
-		const section = page.locator('section.registry-section').nth(2);
-		const form = section.locator('div.create');
+	test('5. 記録項目を作成すると一覧に出る（選択中の収集グループが初期値）', async () => {
+		await expect(page.getByTestId('record-add-hint')).toHaveCount(0);
+		const form = await openCreateRecord(page);
+		await expect(form.getByLabel('収集グループ').locator('option:checked')).toHaveText(GROUP_NAME);
 		await form.getByLabel('名前').fill(TAG_NAME);
-		await form.getByLabel('収集グループ').selectOption({ label: GROUP_NAME });
 		await form.getByLabel('デバイスアドレス').fill('40001');
 		await form.getByRole('button', { name: '作成' }).click();
-		await expect(section.locator('div.list').getByText(TAG_NAME)).toBeVisible();
+		// 保存に成功したら右ペインを閉じ、一覧を読み直す。
+		await expect(detailPane(page)).toHaveCount(0);
+		await expect(recordList(page).getByText(TAG_NAME)).toBeVisible();
+		await expect(treeNode(page, GROUP_NAME)).toHaveAccessibleName(`${GROUP_NAME} (1) 1s`);
 	});
 
 	test('5b. しきい値（記録計の設定）を別に保存でき、再読み込みしても残る。大小関係が崩れると理由が欄に出る。タグの保存はしきい値を消さない（#525 / #532）', async () => {
-		const section = page.locator('section.registry-section').nth(2);
-		await section
-			.locator('div.list')
-			.getByRole('gridcell', { name: TAG_NAME, exact: true })
-			.click();
-		const detail = section.locator('div.detail');
-		await expect(
-			detail.getByRole('heading', { level: 4, name: `${TAG_NAME} を編集` })
-		).toBeVisible();
+		await recordList(page).getByRole('gridcell', { name: TAG_NAME, exact: true }).click();
+		const detail = detailPane(page);
+		await expect(detail.getByRole('heading', { level: 3, name: TAG_NAME })).toBeVisible();
 		const thresholds = detail.locator('div.thresholds-pane');
 		await expect(
 			thresholds.getByRole('heading', { level: 4, name: 'しきい値（記録計の設定）' })
@@ -307,10 +352,7 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 
 		// 再読み込みしても、行を選び直しても値が残る。
 		await page.reload();
-		await section
-			.locator('div.list')
-			.getByRole('gridcell', { name: TAG_NAME, exact: true })
-			.click();
+		await recordList(page).getByRole('gridcell', { name: TAG_NAME, exact: true }).click();
 		await expect(thresholds.getByLabel('しきい値 LL（下下限）', { exact: true })).toHaveValue('5');
 		await expect(thresholds.getByLabel('しきい値 L（下限）', { exact: true })).toHaveValue('10');
 		await expect(thresholds.getByLabel('しきい値 H（上限）', { exact: true })).toHaveValue('80');
@@ -321,8 +363,7 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 	test('5c. 別の画面が先に保存したしきい値を古い版で保存すると、再読み込みを促す案内が出て上書きされない（#525 / #532）', async ({
 		browser
 	}) => {
-		const section = page.locator('section.registry-section').nth(2);
-		const thresholds = section.locator('div.detail div.thresholds-pane');
+		const thresholds = detailPane(page).locator('div.thresholds-pane');
 		// 1 枚目の画面でしきい値のフォームを開いたまま（この時点の版を持っている）。
 		await expect(thresholds.getByLabel('しきい値 H（上限）', { exact: true })).toHaveValue('80');
 
@@ -331,12 +372,8 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 		try {
 			await login(other, ADMIN_USERNAME, ADMIN_PASSWORD);
 			await other.goto('/tags');
-			const otherSection = other.locator('section.registry-section').nth(2);
-			await otherSection
-				.locator('div.list')
-				.getByRole('gridcell', { name: TAG_NAME, exact: true })
-				.click();
-			const otherThresholds = otherSection.locator('div.detail div.thresholds-pane');
+			await recordList(other).getByRole('gridcell', { name: TAG_NAME, exact: true }).click();
+			const otherThresholds = detailPane(other).locator('div.thresholds-pane');
 			await expect(otherThresholds.getByLabel('しきい値 H（上限）', { exact: true })).toHaveValue(
 				'80'
 			);
@@ -354,16 +391,13 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 
 		// 先に保存された 85 が残っている（88 で上書きされていない）。
 		await page.reload();
-		await section
-			.locator('div.list')
-			.getByRole('gridcell', { name: TAG_NAME, exact: true })
-			.click();
+		await recordList(page).getByRole('gridcell', { name: TAG_NAME, exact: true }).click();
 		await expect(thresholds.getByLabel('しきい値 H（上限）', { exact: true })).toHaveValue('85');
 	});
 
 	test('6. スケーリングを部分指定（生値下限だけ）で作成しようとすると、理由が画面に見える', async () => {
-		const section = page.locator('section.registry-section').nth(2);
-		const form = section.locator('div.create');
+		// 右ペインの詳細を開いたままでも、未保存が無ければ確かめずに作成フォームへ替わる。
+		const form = await openCreateRecord(page);
 		const PARTIAL_SCALING_TAG_NAME = 'E2Eスケーリング欠落';
 		await form.getByLabel('名前').fill(PARTIAL_SCALING_TAG_NAME);
 		await form.getByLabel('収集グループ').selectOption({ label: GROUP_NAME });
@@ -380,12 +414,11 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 				.first()
 		).toBeVisible();
 		// 検証エラーで弾かれ、作成は成立していない。
-		await expect(section.locator('div.list').getByText(PARTIAL_SCALING_TAG_NAME)).toHaveCount(0);
+		await expect(recordList(page).getByText(PARTIAL_SCALING_TAG_NAME)).toHaveCount(0);
 	});
 
 	test('6b. Modbus 接続の下に MELSEC 表記のアドレスは保存できず、理由がアドレス欄に見える（#414）', async () => {
-		const section = page.locator('section.registry-section').nth(2);
-		const form = section.locator('div.create');
+		const form = detailPane(page);
 		const MELSEC_TAG_NAME = 'E2E-MELSEC表記';
 		await form.getByLabel('名前').fill(MELSEC_TAG_NAME);
 		await form.getByLabel('収集グループ').selectOption({ label: GROUP_NAME });
@@ -396,18 +429,18 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 		// 登録簿モードが返すドライバの検査理由。
 		await expect(form.getByText(/Modbus の参照番号/)).toBeVisible();
 		// 保存は成立していない。
-		await expect(section.locator('div.list').getByText(MELSEC_TAG_NAME)).toHaveCount(0);
+		await expect(recordList(page).getByText(MELSEC_TAG_NAME)).toHaveCount(0);
 	});
 
-	test('7. 収集グループが残っているPLC接続の削除は具体的な理由で拒否され、データは消えない', async () => {
-		const section = page.locator('section.registry-section').nth(0);
-		await section
-			.locator('div.list')
-			.getByRole('gridcell', { name: CONNECTION_NAME, exact: true })
-			.click();
-		const detail = section.locator('div.detail');
+	test('7. 収集グループが残っている接続先の削除は具体的な理由で拒否され、データは消えない', async () => {
+		// 右ペインの作成フォームに入力が残っているので、対象を変えると確かめる（破棄する）。
+		page.once('dialog', (dialog) => void dialog.accept());
+		await selectTreeNode(page, CONNECTION_NAME);
+		await expect(detailPane(page)).toHaveCount(0);
+		await openSettingsTab(page);
+		const detail = settingsPane(page);
 		await expect(
-			detail.getByRole('heading', { level: 4, name: `${CONNECTION_NAME} を編集` })
+			detail.getByRole('heading', { level: 3, name: `${CONNECTION_NAME} を編集` })
 		).toBeVisible();
 		page.once('dialog', (dialog) => void dialog.accept());
 		await detail.getByRole('button', { name: '削除' }).click();
@@ -416,8 +449,8 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 		await expect(
 			page.getByText('この接続を使用している収集グループが1件あるため削除できません')
 		).toBeVisible();
-		// 削除は成立していない - 一覧からも消えていない。
-		await expect(section.locator('div.list').getByText(CONNECTION_NAME)).toBeVisible();
+		// 削除は成立していない - ツリーからも消えていない。
+		await expect(treeNode(page, CONNECTION_NAME)).toBeVisible();
 	});
 
 	test('8. 閲覧者アカウントを作成する（次のテストの前提）', async () => {
@@ -433,7 +466,7 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 		await expect(page.locator('section.list').getByText(VIEWER_USERNAME).first()).toBeVisible();
 	});
 
-	test('9. viewer は /tags を閲覧のみでき、新規作成フォーム・削除ボタンは出ない', async ({
+	test('9. viewer は /tags を閲覧のみでき、追加の導線・「設定」タブ・右ペイン・削除ボタンは出ない', async ({
 		browser
 	}) => {
 		const viewerPage = await browser.newPage();
@@ -441,18 +474,27 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 			await login(viewerPage, VIEWER_USERNAME, VIEWER_PASSWORD);
 			await viewerPage.goto('/tags');
 			await expect(viewerPage.getByRole('heading', { level: 2, name: '記録' })).toBeVisible();
-			// 一覧（読み取り）はそのまま見える。収集グループ一覧の「PLC接続」列にも
-			// 接続名がそのまま出るため、PLC接続名は PLC接続セクション（0番目）の
-			// 一覧に絞って探す - 絞らないと2箇所に一致して strict mode 違反になる。
-			const plcSection = viewerPage.locator('section.registry-section').nth(0);
-			const groupSection = viewerPage.locator('section.registry-section').nth(1);
-			const tagSection = viewerPage.locator('section.registry-section').nth(2);
-			await expect(plcSection.locator('div.list').getByText(CONNECTION_NAME)).toBeVisible();
-			await expect(groupSection.locator('div.list').getByText(GROUP_NAME)).toBeVisible();
-			await expect(tagSection.locator('div.list').getByText(TAG_NAME)).toBeVisible();
-			// 新規作成・編集・削除の導線は一切出ない。
-			await expect(viewerPage.getByRole('heading', { level: 4, name: '新規作成' })).toHaveCount(0);
+			// ツリーと一覧（読み取り）はそのまま見える。
+			await expect(treeNode(viewerPage, CONNECTION_NAME)).toBeVisible();
+			await expect(treeNode(viewerPage, GROUP_NAME)).toBeVisible();
+			await expect(recordList(viewerPage).getByText(TAG_NAME)).toBeVisible();
+			await selectTreeNode(viewerPage, GROUP_NAME);
+			await expect(recordList(viewerPage).getByText(TAG_NAME)).toBeVisible();
+			// 追加・編集・削除の導線は一切出ない。
+			await expect(viewerPage.getByRole('button', { name: '接続先を追加' })).toHaveCount(0);
+			await expect(viewerPage.getByRole('button', { name: '収集グループを追加' })).toHaveCount(0);
+			await expect(viewerPage.getByRole('button', { name: '記録項目を追加' })).toHaveCount(0);
+			await expect(viewerPage.getByRole('button', { name: 'Hub から追加' })).toHaveCount(0);
+			await expect(viewerPage.getByRole('tab', { name: '設定' })).toHaveCount(0);
+			await recordList(viewerPage).getByRole('gridcell', { name: TAG_NAME, exact: true }).click();
+			await expect(detailPane(viewerPage)).toHaveCount(0);
 			await expect(viewerPage.getByRole('button', { name: '削除' })).toHaveCount(0);
+			// 「設定」タブの URL を直接開いても「記録項目」へ倒れる。
+			const url = new URL(viewerPage.url());
+			url.searchParams.set('tab', 'settings');
+			await viewerPage.goto(`${url.pathname}${decodeURIComponent(url.search)}`);
+			await expect(viewerPage).toHaveURL(/\/tags\?target=group:\d+$/);
+			await expect(viewerPage.getByRole('tab', { name: '設定' })).toHaveCount(0);
 		} finally {
 			await viewerPage.close();
 		}
@@ -465,7 +507,6 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 		// 参照しているため、このDELETEはサーバー側の検証で拒否される
 		// （#391レビューCで固定した既存の拒否経路 - test 7と同じ理由）。
 		await page.goto('/tags');
-		const section = page.locator('section.registry-section').nth(0);
 
 		// `DELETE /api/plc-connections/:id`だけを遅延させ、無効化ウィンドウを
 		// 作る（作法は`e2e/tests-banto-hub/banto-hub-tags-busy.spec.ts`の
@@ -492,13 +533,11 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 		});
 
 		try {
-			await section
-				.locator('div.list')
-				.getByRole('gridcell', { name: CONNECTION_NAME, exact: true })
-				.click();
-			const detail = section.locator('div.detail');
+			await selectTreeNode(page, CONNECTION_NAME);
+			await openSettingsTab(page);
+			const detail = settingsPane(page);
 			await expect(
-				detail.getByRole('heading', { level: 4, name: `${CONNECTION_NAME} を編集` })
+				detail.getByRole('heading', { level: 3, name: `${CONNECTION_NAME} を編集` })
 			).toBeVisible();
 
 			const nameInput = detail.getByLabel('名前');
@@ -532,7 +571,7 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 			await expect(
 				page.getByText('この接続を使用している収集グループが1件あるため削除できません')
 			).toBeVisible();
-			await expect(section.locator('div.list').getByText(CONNECTION_NAME)).toBeVisible();
+			await expect(treeNode(page, CONNECTION_NAME)).toBeVisible();
 
 			// 拒否後は編集操作が再び有効に戻る。
 			await expect(nameInput).toBeEnabled();
@@ -546,8 +585,7 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 	});
 
 	test('11. 一覧の取得に失敗しても「0件」に潰れず、誤った案内を出さない（#394レビュー P1-3）', async () => {
-		const plcSection = page.locator('section.registry-section').nth(0);
-		const groupSection = page.locator('section.registry-section').nth(1);
+		const treePane = recordTreePane(page);
 
 		// `GET /api/plc-connections` だけを落とす（POST や
 		// `/api/plc-connections/{id}` には触れない）。
@@ -566,27 +604,146 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 			// `ProviderError({ kind: 'other', message: 'サーバーに接続できません' })`
 			// に変換するので、その文言がそのまま添えられる。
 			await expect(
-				plcSection.getByText('接続の一覧を読み込めませんでした', { exact: false })
+				treePane.getByText('接続先の一覧を読み込めませんでした', { exact: false })
 			).toBeVisible();
-			await expect(plcSection.getByRole('button', { name: '再試行' }).first()).toBeVisible();
+			await expect(treePane.getByRole('button', { name: '再試行' }).first()).toBeVisible();
 
-			// 0件として描かない: グリッドも、行（既存のPLC接続）も出さない。
-			await expect(plcSection.locator('div.list .grid-wrap')).toHaveCount(0);
+			// 0件として描かない: ツリー（「すべて」だけの木）も出さない。
+			await expect(recordTree(page)).toHaveCount(0);
 
 			// **誤った指示を出さない**（修正前はここが出て、利用者を重複登録へ
-			// 誘導していた）。
-			await expect(page.getByText('先に接続を1件以上作成してください')).toHaveCount(0);
-			// 候補が無いように見える `<select>` も出さない。
-			await expect(groupSection.locator('div.create').getByLabel('接続')).toHaveCount(0);
+			// 誘導していた）。候補が無いように見える `<select>` も出さない。
+			const form = await openCreateGroup(page);
+			await expect(page.getByText('先に接続先を1件以上作成してください')).toHaveCount(0);
+			await expect(form.getByLabel('接続')).toHaveCount(0);
+			await form.getByRole('button', { name: '閉じる' }).click();
+			await expect(detailPane(page)).toHaveCount(0);
 		} finally {
 			await page.unroute('**/api/plc-connections');
 		}
 
 		// route を外して再試行すれば復旧する（失敗は終端状態ではない）。
-		await plcSection.getByRole('button', { name: '再試行' }).first().click();
-		await expect(plcSection.locator('div.list').getByText(CONNECTION_NAME)).toBeVisible();
+		await treePane.getByRole('button', { name: '再試行' }).first().click();
+		await expect(treeNode(page, CONNECTION_NAME)).toBeVisible();
 		await expect(
-			plcSection.getByText('接続の一覧を読み込めませんでした', { exact: false })
+			treePane.getByText('接続先の一覧を読み込めませんでした', { exact: false })
 		).toHaveCount(0);
+	});
+
+	test('12. ツリーで選ぶと記録項目の一覧が絞られる（#1179 PR4b）', async () => {
+		// 2 つ目のグループと記録項目を同じ接続先の下に作る。
+		await selectTreeNode(page, CONNECTION_NAME);
+		const groupForm = await openCreateGroup(page);
+		await groupForm.getByLabel('名前').fill(GROUP2_NAME);
+		await groupForm.getByRole('button', { name: '作成' }).click();
+		await expect(treeNode(page, GROUP2_NAME)).toHaveAttribute('aria-selected', 'true');
+		const tagForm = await openCreateRecord(page);
+		await expect(tagForm.getByLabel('収集グループ').locator('option:checked')).toHaveText(
+			GROUP2_NAME
+		);
+		await tagForm.getByLabel('名前').fill(TAG2_NAME);
+		await tagForm.getByLabel('デバイスアドレス').fill('40002');
+		await tagForm.getByRole('button', { name: '作成' }).click();
+		await expect(detailPane(page)).toHaveCount(0);
+
+		// グループ = そのグループの記録項目だけ。
+		const list = recordList(page);
+		await expect(list.getByText(TAG2_NAME)).toBeVisible();
+		await expect(list.getByText(TAG_NAME, { exact: true })).toHaveCount(0);
+		await selectTreeNode(page, GROUP_NAME);
+		await expect(list.getByText(TAG_NAME, { exact: true })).toBeVisible();
+		await expect(list.getByText(TAG2_NAME)).toHaveCount(0);
+		// 接続先 = 配下のグループの記録項目。すべて = 全件。
+		await selectTreeNode(page, CONNECTION_NAME);
+		await expect(list.getByText(TAG_NAME, { exact: true })).toBeVisible();
+		await expect(list.getByText(TAG2_NAME)).toBeVisible();
+		await selectTreeNode(page, 'すべて');
+		await expect(list.getByText(TAG_NAME, { exact: true })).toBeVisible();
+		await expect(list.getByText(TAG2_NAME)).toBeVisible();
+		await expect(page).toHaveURL(/\/tags$/);
+	});
+
+	test('13. URL を開き直す・戻ると、同じ対象とタブに戻る（#1179 PR4b）', async () => {
+		await selectTreeNode(page, GROUP2_NAME);
+		await openSettingsTab(page);
+		await expect(page).toHaveURL(/\/tags\?target=group:\d+&tab=settings$/);
+		const url = page.url();
+
+		await page.goto('/tags');
+		await expect(treeNode(page, 'すべて')).toHaveAttribute('aria-selected', 'true');
+		await page.goto(url);
+		await expect(treeNode(page, GROUP2_NAME)).toHaveAttribute('aria-selected', 'true');
+		await expect(page.getByRole('tab', { name: '設定' })).toHaveAttribute('aria-selected', 'true');
+		await expect(
+			settingsPane(page).getByRole('heading', { level: 3, name: `${GROUP2_NAME} を編集` })
+		).toBeVisible();
+		await expect(treeSelection(page)).toHaveText(GROUP2_NAME);
+
+		// タブを替えてから戻ると「設定」に戻る。
+		await openListTab(page);
+		await expect(page).toHaveURL(/\/tags\?target=group:\d+$/);
+		await page.goBack();
+		await expect(page.getByRole('tab', { name: '設定' })).toHaveAttribute('aria-selected', 'true');
+		await expect(page).toHaveURL(url);
+
+		// 一覧に無い id は「すべて」・「記録項目」へ倒し、URL も直す。
+		await page.goto('/tags?target=group:999999&tab=settings');
+		await expect(treeNode(page, 'すべて')).toHaveAttribute('aria-selected', 'true');
+		await expect(page).toHaveURL(/\/tags$/);
+		await expect(page.getByText('指定された接続先・収集グループが見つからないため')).toBeVisible();
+	});
+
+	test('14. 未保存のままタブ・対象を変えると確認が出て、キャンセルなら元のまま（#1179 PR4b）', async () => {
+		await selectTreeNode(page, GROUP2_NAME);
+		await openSettingsTab(page);
+		const name = settingsPane(page).getByLabel('名前');
+		await name.fill(`${GROUP2_NAME}-編集中`);
+
+		// タブを変える -> キャンセル -> 「設定」のまま、入力も残る。
+		let asked = '';
+		page.once('dialog', (dialog) => {
+			asked = dialog.message();
+			void dialog.dismiss();
+		});
+		await page.getByRole('tab', { name: '記録項目' }).click();
+		await expect.poll(() => asked).toContain('保存していない変更があります');
+		await expect(page.getByRole('tab', { name: '設定' })).toHaveAttribute('aria-selected', 'true');
+		await expect(name).toHaveValue(`${GROUP2_NAME}-編集中`);
+
+		// ツリーで別の対象を選ぶ -> キャンセル -> 選択も入力も元のまま。
+		page.once('dialog', (dialog) => void dialog.dismiss());
+		await treeNode(page, GROUP_NAME).click();
+		await expect(treeNode(page, GROUP2_NAME)).toHaveAttribute('aria-selected', 'true');
+		await expect(name).toHaveValue(`${GROUP2_NAME}-編集中`);
+		await expect(page).toHaveURL(/\/tags\?target=group:\d+&tab=settings$/);
+
+		// 戻る操作でも確かめる（キャンセルなら残る）。
+		page.once('dialog', (dialog) => void dialog.dismiss());
+		await page.goBack();
+		await expect(name).toHaveValue(`${GROUP2_NAME}-編集中`);
+		await expect(page.getByRole('tab', { name: '設定' })).toHaveAttribute('aria-selected', 'true');
+
+		// 破棄を選ぶと切り替わり、保存済みの値に戻る。
+		page.once('dialog', (dialog) => void dialog.accept());
+		await page.getByRole('tab', { name: '記録項目' }).click();
+		await expect(page.getByRole('tab', { name: '記録項目' })).toHaveAttribute(
+			'aria-selected',
+			'true'
+		);
+		await openSettingsTab(page);
+		await expect(settingsPane(page).getByLabel('名前')).toHaveValue(GROUP2_NAME);
+	});
+
+	test('15. 900px 以下では左がドロワーになり、閉じていても選択中の名前が残る（#1179 PR4b）', async () => {
+		await page.setViewportSize({ width: 800, height: 900 });
+		try {
+			await page.goto('/tags');
+			await selectTreeNodeViaDrawer(page, GROUP_NAME);
+			await expect(treeSelection(page)).toHaveText(GROUP_NAME);
+			await expect(recordList(page).getByText(TAG_NAME, { exact: true })).toBeVisible();
+			await expect(recordList(page).getByText(TAG2_NAME)).toHaveCount(0);
+		} finally {
+			await page.setViewportSize({ width: 1280, height: 720 });
+		}
 	});
 });
