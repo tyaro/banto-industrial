@@ -108,4 +108,4 @@ pub use types::{
     TagClientConnectionState, TagClientState, ValueEntry, ValueQuality, ValueSource,
     ValuesSnapshot,
 };
-pub use write::RequestedValue;
+pub use write::{RequestedValue, WriteOptions, WriteReceipt};

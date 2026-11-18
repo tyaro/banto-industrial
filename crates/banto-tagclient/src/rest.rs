@@ -13,7 +13,7 @@ use crate::handle::{validate_start_requests, TagClientHandle};
 use crate::pinned_tls::PinnedHubTls;
 use crate::secret::SecretApiKey;
 use crate::types::{CatalogSnapshot, ValuesSnapshot};
-use crate::write::{send_write, validate_write_name, RequestedValue};
+use crate::write::{send_write, validate_write_name, RequestedValue, WriteOptions, WriteReceipt};
 use crate::ws_transport::WebSocketConnection;
 
 /// A banto-hub REST client that connects directly to its endpoint, without
@@ -196,8 +196,19 @@ impl RestClient {
     /// right after a rename) is answered by the Hub with 404 and surfaces as
     /// [`ErrorKind::WriteRejected`]. An empty, whitespace-only, or
     /// comma-containing name is rejected before any request is sent
-    /// ([`ErrorKind::InvalidTagSelection`]).
-    pub async fn write_tag(&self, external_name: &str, value: RequestedValue) -> Result<()> {
+    /// ([`ErrorKind::InvalidTagSelection`]); options the Hub would refuse are
+    /// rejected the same way ([`ErrorKind::InvalidWriteOptions`]).
+    ///
+    /// A 200 is a successful write even when its body cannot be read (the
+    /// receipt then has no `audit_id`). A failure after the request was sent
+    /// whose outcome is unknown is [`ErrorKind::WriteUncertain`]; the caller
+    /// decides what to do (tag-server-design.md §6.6).
+    pub async fn write_tag(
+        &self,
+        external_name: &str,
+        value: RequestedValue,
+        options: WriteOptions,
+    ) -> Result<WriteReceipt> {
         validate_write_name(external_name)?;
         send_write(
             &self.http,
@@ -205,6 +216,7 @@ impl RestClient {
             &self.secret,
             external_name,
             value,
+            &options,
         )
         .await
     }
