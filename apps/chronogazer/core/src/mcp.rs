@@ -40,7 +40,9 @@
 //! 収集が読む設定を変えるツール（接続先・収集グループ・記録項目・しきい値）の
 //! 結果には `restartRequired: true` を足す: ChronoGazer はそれらを変えても収集へ
 //! 自動では反映せず、`restart_collection` で反映するため（§5.3）。表示グループは
-//! 表示のための設定で収集は読まないので付けない。収集の操作の結果にも付けない。
+//! 表示のための設定で収集は読まないので付けない - ただし作成・更新でペンの Hub の
+//! タグを記録項目として登録したとき（#1179 PR5、結果の `registeredTags` が空でない）
+//! は記録項目を変えたので付ける。収集の操作の結果にも付けない。
 //! 削除は `confirm: true` を要する（HUB と同じ）。
 //!
 //! 更新のツール（`update_connection`・`update_group`・`update_tag`・
@@ -67,7 +69,9 @@ use serde_json::{json, Value};
 
 use crate::audit::AuditLogService;
 use crate::collect::COLLECT_AUDIT_RESOURCE;
-use crate::display_groups::{DisplayGroupPayload, AUDIT_RESOURCE as DISPLAY_GROUPS_RESOURCE};
+use crate::display_groups::{
+    DisplayGroupPayload, DisplayGroupSaveResponse, AUDIT_RESOURCE as DISPLAY_GROUPS_RESOURCE,
+};
 use crate::ops::{CollectOperation, CollectOps, DisplayGroupOps, RegistryOps, ThresholdOps, Via};
 use crate::rest::actor::{require_mcp_api_key, Actor, ApiKeyGate};
 use crate::rest::{CollectionGroupPayload, PlcConnectionPayload, TagPayload};
@@ -372,19 +376,52 @@ fn display_group_schema(update: bool) -> Value {
             },
             "pens": {
                 "type": "array",
-                "description": "ペン（表示する記録項目）の並び。",
+                "description": "ペン（表示する記録項目）の並び。各ペンは tagId か hubTag のどちらか 1 つを指定する。",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "tagId": { "type": "integer", "description": "記録項目の id。" },
+                        "tagId": {
+                            "type": "integer",
+                            "description": "登録済みの記録項目の id。hubTag と同時には指定できない。",
+                        },
+                        "hubTag": {
+                            "type": "object",
+                            "description": "Hub のカタログのタグ（tagId の代わり）。登録済みの外部名なら既存の記録項目を参照し、未登録なら hubTagGroup の収集グループに記録項目として登録する（表示グループの保存と全部か無しか）。",
+                            "properties": {
+                                "externalName": { "type": "string", "description": "Hub のタグの外部名（同一性の鍵）。" },
+                                "name": { "type": "string", "description": "記録項目の名前（Hub のタグ名）。" },
+                                "dataType": { "type": "string", "description": "データ型（数値と bit だけ登録できる）。" },
+                                "unit": { "type": ["string", "null"], "description": "単位。" },
+                                "decimals": { "type": ["integer", "null"], "description": "小数桁（0〜6 に丸める）。" },
+                            },
+                            "required": ["externalName", "name", "dataType"],
+                            "additionalProperties": false,
+                        },
                         "colorSlot": {
                             "type": ["integer", "null"],
                             "description": "系列色の枠（1〜8）。省略は既定。",
                         },
                     },
-                    "required": ["tagId"],
                     "additionalProperties": false,
                 },
+            },
+            "hubTagGroup": {
+                "type": "object",
+                "description": "未登録の hubTag を登録する先。Hub 接続の既存の収集グループ（collectionGroupId）か新しいグループ（newGroup）のどちらか 1 つ。未登録の hubTag が無ければ使わない。",
+                "properties": {
+                    "collectionGroupId": { "type": "integer", "description": "Hub 接続の下の既存の収集グループの id。" },
+                    "newGroup": {
+                        "type": "object",
+                        "description": "新しく作る収集グループ（Hub 接続が無ければ暗黙に作る）。",
+                        "properties": {
+                            "name": { "type": "string", "description": "収集グループの名前。" },
+                            "periodMs": { "type": "integer", "description": "収集の周期（ミリ秒）。" },
+                        },
+                        "required": ["name", "periodMs"],
+                        "additionalProperties": false,
+                    },
+                },
+                "additionalProperties": false,
             },
         },
         "required": ["name", "kind"],
@@ -547,7 +584,8 @@ fn tool_registry() -> ToolRegistry<McpState, Actor> {
     );
 
     // 設定の変更（config）。収集が読む設定（接続先・収集グループ・記録項目・
-    // しきい値）の結果に restartRequired: true。表示グループには付けない。
+    // しきい値）の結果に restartRequired: true。表示グループには付けない（Hub の
+    // タグを記録項目として登録したときだけ付ける）。
     let r = config_tool!(
         r,
         "create_connection",
@@ -614,14 +652,14 @@ fn tool_registry() -> ToolRegistry<McpState, Actor> {
     let r = config_tool!(
         r,
         "create_display_group",
-        "表示グループを作る（config スコープ）。",
+        "表示グループを作る（config スコープ）。ペンに Hub のカタログのタグ（hubTag）を指定すると、未登録のものは hubTagGroup に記録項目として同じ保存の中で登録する（そのときは結果に registeredTags と restartRequired: true が付き、収集へは restart_collection で反映する）。",
         display_group_schema(false),
         tool_create_display_group
     );
     let r = config_tool!(
         r,
         "update_display_group",
-        "表示グループを更新する（config スコープ。全項目の置き換えで、expectedRevision 以外は省略できない。並び順は reorder_display_groups で変える。表示のための設定で、収集の再起動は要らない）。",
+        "表示グループを更新する（config スコープ。全項目の置き換えで、expectedRevision 以外は省略できない。並び順は reorder_display_groups で変える。表示のための設定で、収集の再起動は要らない。ただし hubTag のペンで記録項目を登録したときは create_display_group と同じく registeredTags と restartRequired: true が付く）。",
         display_group_schema(true),
         tool_update_display_group
     );
@@ -698,6 +736,16 @@ fn reply<T>(result: Result<T, BantoError>, wrap: impl FnOnce(T) -> Value) -> Val
     match result {
         Ok(value) => tool_ok(wrap(value)),
         Err(err) => op_error(&err),
+    }
+}
+
+/// 表示グループの作成・更新の結果: Hub のタグを記録項目として登録したときだけ
+/// `restartRequired: true` を足す（モジュール doc「結果の形」）。
+fn display_group_saved(payload: Value, saved: &DisplayGroupSaveResponse) -> Value {
+    if saved.registered_tags.is_empty() {
+        payload
+    } else {
+        changed(payload)
     }
 }
 
@@ -1003,7 +1051,7 @@ async fn tool_create_display_group(
     let input: DisplayGroupPayload = payload(args, "表示グループ")?;
     Ok(reply(
         state.display_groups.create(actor, via, &input).await,
-        |created| json!({ "created": created }),
+        |created| display_group_saved(json!({ "created": created }), &created),
     ))
 }
 
@@ -1021,7 +1069,7 @@ async fn tool_update_display_group(
     let input: DisplayGroupPayload = payload_without(args, "id", "表示グループ")?;
     Ok(reply(
         state.display_groups.update(actor, via, id, &input).await,
-        |updated| json!({ "updated": updated }),
+        |updated| display_group_saved(json!({ "updated": updated }), &updated),
     ))
 }
 

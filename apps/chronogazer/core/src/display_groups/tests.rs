@@ -77,12 +77,10 @@ pub(crate) fn payload(name: &str, kind: &str, tag_ids: &[i64]) -> DisplayGroupPa
         attributes: Map::new(),
         pens: tag_ids
             .iter()
-            .map(|&tag_id| PenPayload {
-                tag_id,
-                color_slot: None,
-            })
+            .map(|&tag_id| PenPayload::tag(tag_id, None))
             .collect(),
         expected_revision: None,
+        hub_tag_group: None,
     }
 }
 
@@ -121,10 +119,7 @@ fn shape_validation_table() {
             "9 本のペン",
             |p| {
                 p.pens = (1..=9)
-                    .map(|tag_id| PenPayload {
-                        tag_id,
-                        color_slot: None,
-                    })
+                    .map(|tag_id| PenPayload::tag(tag_id, None))
                     .collect()
             },
             vec!["pens"],
@@ -635,4 +630,326 @@ async fn an_implicit_end_position_never_exceeds_the_limit() {
     .await
     .expect_err("CHECK が範囲外を拒否する");
     assert!(err.to_string().contains("CHECK"), "{err}");
+}
+
+// --- #1179 PR5: Hub のタグをペンにする一括保存 ---------------------------------
+
+/// hub 接続を受け付けるレジストリのサービス一式（本番と同じ）。
+fn registrar(pool: &SqlitePool) -> HubTagRegistrar {
+    let drivers = crate::test_support::drivers();
+    HubTagRegistrar {
+        plc_connections: PlcConnectionService::with_registry(pool.clone(), drivers.clone())
+            .accept_hub_connections(),
+        collection_groups: CollectionGroupService::with_registry(pool.clone(), drivers.clone())
+            .accept_hub_connections(),
+        tags: TagService::with_registry(pool.clone(), drivers).accept_hub_connections(),
+    }
+}
+
+fn hub_pen(external_name: &str, name: &str, data_type: &str) -> PenPayload {
+    PenPayload {
+        tag_id: None,
+        hub_tag: Some(HubTagRow {
+            external_name: external_name.to_owned(),
+            name: name.to_owned(),
+            data_type: data_type.to_owned(),
+            unit: None,
+            decimals: None,
+        }),
+        color_slot: None,
+    }
+}
+
+fn new_hub_group(name: &str) -> Option<HubTagGroupPayload> {
+    Some(HubTagGroupPayload {
+        collection_group_id: None,
+        new_group: Some(NewHubGroup {
+            name: name.to_owned(),
+            period_ms: 1000,
+        }),
+    })
+}
+
+/// (タグ, 接続, 収集グループ, 表示グループ) の行数。巻き戻りの確認に使う。
+async fn row_counts(pool: &SqlitePool) -> (i64, i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM tags), (SELECT COUNT(*) FROM plc_connections),          (SELECT COUNT(*) FROM collection_groups), (SELECT COUNT(*) FROM display_groups)",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// 未登録の Hub のタグ 2 本 + 登録済みの記録項目 1 本で作ると、Hub のタグが
+/// 記録項目になり（hub 接続・収集グループも暗黙に作る）、ペンは解決した id を指す。
+/// 応答は `registeredTags` を持ち、GET と同じく本文に送り返せる。更新で既存の
+/// hub の収集グループ（`collectionGroupId`）に足すこともできる。
+#[tokio::test]
+async fn hub_tags_are_registered_and_assigned_in_one_save() {
+    let (svc, _tags, ids) = service_with_tags(1).await;
+    let reg = registrar(&svc.pool);
+    let mut body = payload("L1", "trend", &[ids[0]]);
+    body.pens.insert(0, hub_pen("L.G.a", "a", "f32"));
+    body.pens.push(hub_pen(" L.G.b ", "b", "bit"));
+    body.hub_tag_group = new_hub_group("hub-g");
+
+    let saved = svc
+        .create_with_hub_tags(&reg, &body)
+        .await
+        .expect("一括保存");
+    let registration = saved.registration.clone().expect("登録した");
+    assert!(registration.connection_created && registration.group_created);
+    let by_address: HashMap<&str, i64> = saved
+        .registered_tags()
+        .iter()
+        .map(|tag| (tag.address.as_str(), tag.id))
+        .collect();
+    assert_eq!(by_address.len(), 2);
+    let pen_ids: Vec<i64> = saved.group.pens.iter().map(|pen| pen.tag_id).collect();
+    assert_eq!(
+        pen_ids,
+        vec![by_address["L.G.a"], ids[0], by_address["L.G.b"]]
+    );
+    assert_eq!(
+        crate::hub_tags::registered_external_names(&svc.pool)
+            .await
+            .unwrap(),
+        vec!["L.G.a".to_owned(), "L.G.b".to_owned()]
+    );
+
+    // 応答: `registeredTags` を持ち、そのまま本文に送り返せる（未知の項目は無視）。
+    let json = serde_json::to_value(saved.clone().into_response()).unwrap();
+    assert_eq!(json["registeredTags"].as_array().unwrap().len(), 2);
+    assert_eq!(json["id"], saved.group.id);
+    let back: DisplayGroupPayload = serde_json::from_value(json).unwrap();
+    assert_eq!(back.pens.len(), 3);
+
+    // 更新: 既存の hub の収集グループに 1 本足す。
+    let group_id = registration.collection_group.unwrap().id;
+    let mut edit = payload("L1", "trend", &pen_ids);
+    edit.pens.push(hub_pen("L.G.c", "c", "i16"));
+    edit.expected_revision = Some(saved.group.revision);
+    edit.hub_tag_group = Some(HubTagGroupPayload {
+        collection_group_id: Some(group_id),
+        new_group: None,
+    });
+    let updated = svc
+        .update_with_hub_tags(&reg, saved.group.id, &edit)
+        .await
+        .expect("更新の一括保存");
+    let added = &updated.registration.as_ref().expect("登録した").tags;
+    assert_eq!(added.len(), 1);
+    assert!(!updated.registration.as_ref().unwrap().group_created);
+    assert_eq!(updated.group.pens[3].tag_id, added[0].id);
+    assert_eq!(updated.group.revision, saved.group.revision + 1);
+}
+
+/// 登録済みの外部名の Hub のタグは、新しく登録せずに既存の記録項目を参照する
+/// （二重登録しない）。登録が無いので `hubTagGroup` も要らず、応答に
+/// `registeredTags` は出ない。
+#[tokio::test]
+async fn a_registered_hub_tag_is_referenced_not_registered_again() {
+    let (svc, _tags, _ids) = service_with_tags(0).await;
+    let reg = registrar(&svc.pool);
+    let mut first = payload("L1", "trend", &[]);
+    first.pens.push(hub_pen("L.G.a", "a", "f32"));
+    first.hub_tag_group = new_hub_group("hub-g");
+    let first = svc.create_with_hub_tags(&reg, &first).await.unwrap();
+    let tag_id = first.group.pens[0].tag_id;
+    let before = row_counts(&svc.pool).await;
+
+    let mut second = payload("L2", "bar", &[]);
+    second.pens.push(hub_pen("  L.G.a", "別名", "f32"));
+    let second = svc
+        .create_with_hub_tags(&reg, &second)
+        .await
+        .expect("登録済みは参照だけ");
+    assert!(second.registration.is_none());
+    assert_eq!(second.group.pens[0].tag_id, tag_id);
+    let after = row_counts(&svc.pool).await;
+    assert_eq!((after.0, after.1, after.2), (before.0, before.1, before.2));
+    let json = serde_json::to_value(second.into_response()).unwrap();
+    assert!(json.get("registeredTags").is_none(), "{json}");
+
+    // 同じ記録項目を tagId と hubTag で 2 回指すのは、後ろのペンの hubTag の誤り。
+    let mut twice = payload("L3", "bar", &[tag_id]);
+    twice.pens.push(hub_pen("L.G.a", "a", "f32"));
+    let err = svc.create_with_hub_tags(&reg, &twice).await.unwrap_err();
+    assert_eq!(fields(&err), ["pens[1].hubTag.externalName"]);
+}
+
+/// 未登録の Hub のタグがあるのに登録先が無い（または両方ある）と `hubTagGroup` の
+/// 誤りで、何も書かない。
+#[tokio::test]
+async fn an_unregistered_hub_tag_needs_exactly_one_target() {
+    let (svc, _tags, _ids) = service_with_tags(0).await;
+    let reg = registrar(&svc.pool);
+    let before = row_counts(&svc.pool).await;
+    let mut body = payload("L1", "trend", &[]);
+    body.pens.push(hub_pen("L.G.a", "a", "f32"));
+    let err = svc.create_with_hub_tags(&reg, &body).await.unwrap_err();
+    assert_eq!(fields(&err), ["hubTagGroup"]);
+
+    body.hub_tag_group = Some(HubTagGroupPayload {
+        collection_group_id: Some(1),
+        new_group: Some(NewHubGroup {
+            name: "g".to_owned(),
+            period_ms: 1000,
+        }),
+    });
+    let err = svc.create_with_hub_tags(&reg, &body).await.unwrap_err();
+    assert_eq!(fields(&err), ["hubTagGroup"]);
+
+    // 登録しない経路（`create`）は登録先があっても登録しない。
+    body.hub_tag_group = new_hub_group("g");
+    let err = svc.create(&body).await.unwrap_err();
+    assert_eq!(fields(&err), ["hubTagGroup"]);
+    assert_eq!(row_counts(&svc.pool).await, before);
+}
+
+/// **巻き戻り**: 登録は通るが表示グループの検証で落ちる（名前の重複・ペンが
+/// 9 本）と、登録した記録項目も、暗黙に作った hub 接続・収集グループも残らない。
+///
+/// 反証（2026-11-18 実施）: `save_on` の中で登録の後に `conn` を一度 commit する
+/// （登録を別のトランザクションにする）と、このテストの `row_counts` の比較が落ちる。
+#[tokio::test]
+async fn a_display_group_failure_after_registration_rolls_back_the_registration() {
+    let (svc, _tags, _ids) = service_with_tags(0).await;
+    let reg = registrar(&svc.pool);
+    svc.create(&payload("L1", "trend", &[])).await.unwrap();
+    let before = row_counts(&svc.pool).await;
+
+    let mut clash = payload("L1", "trend", &[]);
+    clash.pens.push(hub_pen("L.G.a", "a", "f32"));
+    clash.hub_tag_group = new_hub_group("hub-g");
+    let err = svc.create_with_hub_tags(&reg, &clash).await.unwrap_err();
+    assert_eq!(fields(&err), ["name"]);
+    assert_eq!(row_counts(&svc.pool).await, before);
+    assert!(crate::hub_tags::registered_external_names(&svc.pool)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let mut nine = payload("L2", "trend", &[]);
+    nine.pens = (0..9)
+        .map(|i| hub_pen(&format!("L.G.{i}"), &format!("t{i}"), "f32"))
+        .collect();
+    nine.hub_tag_group = new_hub_group("hub-g");
+    let err = svc.create_with_hub_tags(&reg, &nine).await.unwrap_err();
+    assert_eq!(fields(&err), ["pens"]);
+    assert_eq!(row_counts(&svc.pool).await, before);
+}
+
+/// 登録の行の誤りはペンの位置（`pens[i].hubTag.*`）、登録先の誤りは
+/// `hubTagGroup.*` に付く。形の誤り（名前）も一緒に返す。
+#[tokio::test]
+async fn registration_errors_are_reported_at_the_pen_and_the_target() {
+    let (svc, _tags, ids) = service_with_tags(1).await;
+    let reg = registrar(&svc.pool);
+    let before = row_counts(&svc.pool).await;
+
+    let mut body = payload("  ", "trend", &[ids[0]]);
+    body.pens.push(hub_pen("L.G.text", "text", "string"));
+    body.hub_tag_group = new_hub_group("hub-g");
+    let err = svc.create_with_hub_tags(&reg, &body).await.unwrap_err();
+    // `stringLength` は banto-tags が文字列型に言う指摘（「Hub から追加」と同じ）。
+    assert_eq!(
+        fields(&err),
+        [
+            "name",
+            "pens[1].hubTag.dataType",
+            "pens[1].hubTag.stringLength"
+        ]
+    );
+
+    body.name = "L1".to_owned();
+    body.pens[1] = hub_pen("L.G.a", "a", "f32");
+    body.hub_tag_group = Some(HubTagGroupPayload {
+        collection_group_id: None,
+        new_group: Some(NewHubGroup {
+            name: "hub-g".to_owned(),
+            period_ms: 1234,
+        }),
+    });
+    let err = svc.create_with_hub_tags(&reg, &body).await.unwrap_err();
+    assert_eq!(fields(&err), ["hubTagGroup.newGroup.periodMs"]);
+
+    // PLC 接続の収集グループは登録先にできない。
+    let plc_group: i64 = sqlx::query_scalar("SELECT id FROM collection_groups LIMIT 1")
+        .fetch_one(&svc.pool)
+        .await
+        .unwrap();
+    body.hub_tag_group = Some(HubTagGroupPayload {
+        collection_group_id: Some(plc_group),
+        new_group: None,
+    });
+    let err = svc.create_with_hub_tags(&reg, &body).await.unwrap_err();
+    assert_eq!(fields(&err), ["hubTagGroup.collectionGroupId"]);
+    assert_eq!(row_counts(&svc.pool).await, before);
+}
+
+/// 更新の `expectedRevision` が古ければ、Hub のタグを登録する前に断る。
+#[tokio::test]
+async fn a_stale_revision_registers_nothing() {
+    let (svc, _tags, _ids) = service_with_tags(0).await;
+    let reg = registrar(&svc.pool);
+    let created = svc.create(&payload("L1", "trend", &[])).await.unwrap();
+    let before = row_counts(&svc.pool).await;
+    let mut edit = payload("L1", "trend", &[]);
+    edit.pens.push(hub_pen("L.G.a", "a", "f32"));
+    edit.hub_tag_group = new_hub_group("hub-g");
+    edit.expected_revision = Some(created.revision + 1);
+    let err = svc
+        .update_with_hub_tags(&reg, created.id, &edit)
+        .await
+        .unwrap_err();
+    assert!(is_revision_conflict(&err), "{err:?}");
+    assert_eq!(row_counts(&svc.pool).await, before);
+
+    let err = svc
+        .update_with_hub_tags(&reg, created.id + 100, &edit)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BantoError::NotFound { .. }), "{err:?}");
+    assert_eq!(row_counts(&svc.pool).await, before);
+}
+
+/// 同じ外部名を 2 本のペンが指すのは後ろのペンの誤り（何も登録しない）。
+#[tokio::test]
+async fn the_same_hub_tag_twice_is_an_error_at_the_later_pen() {
+    let (svc, _tags, _ids) = service_with_tags(0).await;
+    let reg = registrar(&svc.pool);
+    let before = row_counts(&svc.pool).await;
+    let mut body = payload("L1", "trend", &[]);
+    body.pens.push(hub_pen("L.G.a", "a", "f32"));
+    body.pens.push(hub_pen("L.G.b", "b", "f32"));
+    body.pens.push(hub_pen(" L.G.a", "a2", "f32"));
+    body.hub_tag_group = new_hub_group("hub-g");
+    let err = svc.create_with_hub_tags(&reg, &body).await.unwrap_err();
+    assert_eq!(fields(&err), ["pens[2].hubTag.externalName"]);
+    assert_eq!(row_counts(&svc.pool).await, before);
+}
+
+/// ペンは `tagId` か `hubTag` のちょうど 1 つ。両方・どちらも無しは `pens[i]`。
+#[tokio::test]
+async fn a_pen_needs_exactly_one_of_tag_id_and_hub_tag() {
+    let (svc, _tags, ids) = service_with_tags(1).await;
+    let reg = registrar(&svc.pool);
+    let mut both = payload("L1", "trend", &[]);
+    let mut pen = hub_pen("L.G.a", "a", "f32");
+    pen.tag_id = Some(ids[0]);
+    both.pens.push(pen);
+    both.hub_tag_group = new_hub_group("hub-g");
+    assert_eq!(shape_fields(&both), ["pens[0]"]);
+    let err = svc.create_with_hub_tags(&reg, &both).await.unwrap_err();
+    assert_eq!(fields(&err), ["pens[0]"]);
+
+    let neither: DisplayGroupPayload = serde_json::from_value(json!({
+        "name": "L1", "kind": "trend", "pens": [{ "tagId": ids[0] }, { "colorSlot": 2 }]
+    }))
+    .unwrap();
+    assert_eq!(shape_fields(&neither), ["pens[1]"]);
+    let err = svc.create_with_hub_tags(&reg, &neither).await.unwrap_err();
+    assert_eq!(fields(&err), ["pens[1]"]);
+    assert!(svc.list().await.unwrap().is_empty());
 }

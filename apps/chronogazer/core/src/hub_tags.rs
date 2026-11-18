@@ -3,7 +3,8 @@
 //! タグとして登録する。REST（`crate::rest` の `POST /api/tags/from-hub`）と
 //! Tauri（`apps/chronogazer/src-tauri/src/lib.rs` の `tags_register_from_hub`）の
 //! **両方がこのモジュールの [`register_from_hub`] を呼ぶ**（経路で規則が
-//! 割れないように）。
+//! 割れないように）。表示グループの保存（#1179 PR5、`crate::display_groups`）も
+//! 登録の本体 `register_in_tx` を同じトランザクションの中で呼ぶ（規則は同じ）。
 //!
 //! # 登録の規則（H1・H3・H5 と P4 の決定）
 //!
@@ -65,10 +66,13 @@ const MAX_DECIMALS: i64 = 6;
 /// 登録済みの外部名を読む SQL: hub 接続の下の**すべての**タグの `address`
 /// （接続・グループ・タグの有効フラグを問わない - 「登録済み」＝同じ Hub のタグを
 /// 2 本のタグにしない、の判定）。
-const REGISTERED_SQL: &str = "SELECT t.address FROM tags t \
+///
+/// `tags.id` も読むのは、表示グループの保存（`crate::display_groups`、#1179 PR5）が
+/// 登録済みの外部名を既存のタグの id に解決するため（同じ範囲で二重登録しない）。
+const REGISTERED_SQL: &str = "SELECT t.id, t.address FROM tags t \
      JOIN collection_groups g ON g.id = t.collection_group_id \
      JOIN plc_connections c ON c.id = g.plc_connection_id \
-     WHERE c.protocol = ? ORDER BY t.address";
+     WHERE c.protocol = ? ORDER BY t.address, t.id";
 
 /// 購読する外部名を読む SQL: **有効な** hub 接続の下のタグの `address`
 /// （2026-10-11 オーナー決定: 無効にした Hub 接続のタグは購読しない。グループ・
@@ -82,12 +86,14 @@ const SUBSCRIBED_SQL: &str = "SELECT t.address FROM tags t \
 /// ソート・重複なし）。ダイアログの「登録済み」の判定に使う（接続を無効にしても
 /// 登録済みのまま）。
 pub async fn registered_external_names(pool: &SqlitePool) -> Result<Vec<String>, BantoError> {
-    let rows: Vec<String> = sqlx::query_scalar(REGISTERED_SQL)
+    let rows: Vec<(i64, String)> = sqlx::query_as(REGISTERED_SQL)
         .bind(HUB_PROTOCOL)
         .fetch_all(pool)
         .await
         .map_err(banto_storage::storage_error)?;
-    Ok(normalize(rows))
+    Ok(normalize(
+        rows.into_iter().map(|(_, address)| address).collect(),
+    ))
 }
 
 /// `crate::hub::HubService` が購読する外部名: **有効な** hub 接続の下の登録済みの
@@ -105,12 +111,35 @@ pub async fn subscribed_external_names(pool: &SqlitePool) -> Result<Vec<String>,
 async fn registered_external_names_tx(
     connection: &mut SqliteConnection,
 ) -> Result<HashSet<String>, BantoError> {
-    let rows: Vec<String> = sqlx::query_scalar(REGISTERED_SQL)
+    Ok(registered_tag_ids_tx(connection)
+        .await?
+        .into_keys()
+        .collect())
+}
+
+/// 登録済みの hub タグの外部名（前後の空白を除く、空は捨てる）→ `tags.id`。
+/// 範囲は [`registered_external_names`] と同じ（[`REGISTERED_SQL`]）。同じ外部名が
+/// 2 本あれば（通常は無い）id の小さい方。表示グループの保存（#1179 PR5）が、
+/// ペンの `hubTag` を既存のタグに解決するのに使う。
+pub(crate) async fn registered_tag_ids_tx(
+    connection: &mut SqliteConnection,
+) -> Result<HashMap<String, i64>, BantoError> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(REGISTERED_SQL)
         .bind(HUB_PROTOCOL)
         .fetch_all(&mut *connection)
         .await
         .map_err(banto_storage::storage_error)?;
-    Ok(normalize(rows).into_iter().collect())
+    let mut ids = HashMap::new();
+    for (id, address) in rows {
+        let name = address.trim();
+        if name.is_empty() {
+            continue;
+        }
+        ids.entry(name.to_owned())
+            .and_modify(|existing: &mut i64| *existing = (*existing).min(id))
+            .or_insert(id);
+    }
+    Ok(ids)
 }
 
 fn normalize(names: Vec<String>) -> Vec<String> {
@@ -132,9 +161,11 @@ pub fn is_registrable_data_type(data_type: &str) -> bool {
     NUMERIC_DATA_TYPES.contains(&data_type)
 }
 
-/// 登録する 1 行（ダイアログが読んだカタログの行）。
+/// 登録する 1 行（ダイアログが読んだカタログの行）。表示グループのペンの
+/// `hubTag`（#1179 PR5）も同じ形。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub struct HubTagRow {
     pub external_name: String,
     pub name: String,
@@ -148,6 +179,7 @@ pub struct HubTagRow {
 /// 登録先に新しく作る収集グループ（hub 接続の下）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
 pub struct NewHubGroup {
     pub name: String,
     pub period_ms: i64,
@@ -397,7 +429,12 @@ pub async fn register_from_hub(
     }
 }
 
-async fn register_in_tx(
+/// 登録の本体（呼び出し側のトランザクションの中で行う。commit も rollback も
+/// しない）。`registration` の `tags` は空でなく、登録先は `collection_group_id` か
+/// `new_group` のちょうど 1 つであること（[`register_from_hub`] と
+/// `crate::display_groups` の保存が先に確かめる）。`ok: false` のときも書きかけの
+/// 行が残りうるので、呼び出し側は巻き戻す。
+pub(crate) async fn register_in_tx(
     connection: &mut SqliteConnection,
     plc_connections: &PlcConnectionService,
     collection_groups: &CollectionGroupService,
@@ -501,7 +538,7 @@ async fn register_in_tx(
                 Err(other) => return Err(other),
             }
         }
-        (None, None) => unreachable!("register_from_hub checks the target first"),
+        (None, None) => unreachable!("callers check the target first"),
     };
 
     let inputs: Vec<TagInput> = registration
@@ -569,6 +606,16 @@ fn row_errors_of(rows: &[HubTagRow], errors: Vec<Vec<FieldError>>) -> Vec<HubRow
             field_errors,
         })
         .collect()
+}
+
+/// 登録に使うレジストリのサービス一式（#1179 PR5: 表示グループの保存が、Hub の
+/// タグの登録を同じトランザクションで行うのに使う）。サービスは hub 接続を受け
+/// 付けるもの（`accept_hub_connections`）を渡す。
+#[derive(Clone)]
+pub struct HubTagRegistrar {
+    pub plc_connections: PlcConnectionService,
+    pub collection_groups: CollectionGroupService,
+    pub tags: TagService,
 }
 
 /// 監査の `detail`（REST と Tauri で同じもの）。

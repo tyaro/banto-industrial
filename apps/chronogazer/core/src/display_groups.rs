@@ -64,6 +64,27 @@
 //! ことがある）ので、`BEGIN IMMEDIATE` の中で「参照元の確認 → 削除」を行い、
 //! 確認と削除の間にペンが足されないようにしている。
 //!
+//! ## Hub のタグをペンにする一括保存（#1179 PR5）
+//!
+//! ペンは登録済みの記録項目（`tagId`）の代わりに、Hub のカタログのタグ
+//! （`hubTag` = [`HubTagRow`]）を指せる（どちらか 1 つ）。作成・更新は 1 つの
+//! `BEGIN IMMEDIATE` の中で次を行う（[`DisplayGroupService::create_with_hub_tags`]・
+//! [`DisplayGroupService::update_with_hub_tags`]。REST・MCP・Tauri の作成・更新は
+//! すべてここを通る - docs/chronogazer-ui-improvement-proposal.md §4・§8）:
+//!
+//! 1. 更新なら、対象の存在と `expectedRevision`。
+//! 2. `hubTag` の外部名を、hub 接続の下の登録済みのタグ（`crate::hub_tags` の
+//!    「登録済み」と同じ範囲）に解決する。登録済みならその id を参照するだけ
+//!    （二重登録しない）。同じ外部名を 2 本のペンが指すのは後ろのペンの誤り。
+//! 3. 未登録のものがあれば、本文の `hubTagGroup`（既存の hub の収集グループか、
+//!    新しいグループ）に `crate::hub_tags` の登録の本体で登録する（hub 接続の暗黙の
+//!    作成も含む）。行の誤りはペンの位置（`pens[i].hubTag.*`）、登録先の誤りは
+//!    `hubTagGroup.*` に付け替える。未登録のものが無ければ `hubTagGroup` は使わない。
+//! 4. 解決した id のペンで [`validate_display_group`] → 書き込み。
+//!
+//! どこかで失敗すれば何も書かない（登録も巻き戻る）。登録で落ちたときも、形の
+//! 誤り（名前・種別・属性・ペンの数・色）は一緒に返す。
+//!
 //! ## 楽観ロック
 //!
 //! 更新は `expectedRevision` を受け取り、保存されている版と違えば
@@ -73,11 +94,17 @@
 //! （banto-tags の `expected_revision` と同じ扱い。画面は常に送る）。
 
 use banto_core::{BantoError, FieldError};
-use banto_tags::TagService;
+use banto_tags::{Tag, TagService};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sqlx::{SqliteConnection, SqlitePool};
-use std::collections::{BTreeMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+use crate::hub_tags::{
+    register_in_tx, registered_tag_ids_tx, HubRegistrationResult, HubTagRegistrar,
+    HubTagRegistration, HubTagRow, NewHubGroup,
+};
 
 /// 監査の `resource`（REST・Tauri 共通）。
 pub const AUDIT_RESOURCE: &str = "display_groups";
@@ -221,17 +248,93 @@ pub struct DisplayGroupPayload {
     /// 楽観ロック（更新のみ）。編集画面が最後に読んだ `revision`。
     #[serde(default)]
     pub expected_revision: Option<i64>,
+    /// 未登録の `hubTag` のペンを記録項目として登録する先（#1179 PR5、モジュール
+    /// doc）。未登録の `hubTag` が無ければ使わない。
+    #[serde(default)]
+    pub hub_tag_group: Option<HubTagGroupPayload>,
 }
 
-/// ペンの本文。
+/// ペンの本文。`tagId`（登録済みの記録項目）か `hubTag`（Hub のカタログのタグ、
+/// #1179 PR5）の**ちょうど 1 つ**。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[derive(utoipa::ToSchema)]
 pub struct PenPayload {
-    pub tag_id: i64,
+    #[serde(default)]
+    pub tag_id: Option<i64>,
+    #[serde(default)]
+    pub hub_tag: Option<HubTagRow>,
     #[serde(default)]
     pub color_slot: Option<i64>,
 }
+
+impl PenPayload {
+    /// 登録済みの記録項目のペン（`tagId` だけ）。
+    pub fn tag(tag_id: i64, color_slot: Option<i64>) -> Self {
+        Self {
+            tag_id: Some(tag_id),
+            hub_tag: None,
+            color_slot,
+        }
+    }
+}
+
+/// `hubTag` の登録先（#1179 PR5）。hub 接続の下の既存の収集グループ
+/// （`collectionGroupId`）か新しいグループ（`newGroup`）の**どちらか 1 つ**。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
+pub struct HubTagGroupPayload {
+    #[serde(default)]
+    pub collection_group_id: Option<i64>,
+    #[serde(default)]
+    pub new_group: Option<NewHubGroup>,
+}
+
+/// 作成・更新の応答（REST・MCP・Tauri 共通、#1179 PR5）: [`DisplayGroup`] の
+/// 項目に、今回 Hub のタグから登録した記録項目（`registeredTags`、無ければ出さない）を
+/// 足した形。GET の応答と同じ項目を持つので、そのまま本文に送り返せる。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
+pub struct DisplayGroupSaveResponse {
+    #[serde(flatten)]
+    pub group: DisplayGroup,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registered_tags: Vec<Tag>,
+}
+
+/// 保存の結果（サービスの戻り値）。`registration` は今回 Hub のタグを登録した
+/// ときだけ `Some`（監査の `detail` = `crate::hub_tags::registration_audit_detail`）。
+#[derive(Debug, Clone)]
+pub struct DisplayGroupSaved {
+    pub group: DisplayGroup,
+    pub registration: Option<HubRegistrationResult>,
+}
+
+impl DisplayGroupSaved {
+    /// 今回登録した記録項目（無ければ空）。
+    pub fn registered_tags(&self) -> &[Tag] {
+        self.registration
+            .as_ref()
+            .map(|result| result.tags.as_slice())
+            .unwrap_or_default()
+    }
+
+    /// 応答の形にする。
+    pub fn into_response(self) -> DisplayGroupSaveResponse {
+        DisplayGroupSaveResponse {
+            group: self.group,
+            registered_tags: self
+                .registration
+                .map(|result| result.tags)
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// ペンの `tagId`・`hubTag` が両方ある・どちらも無いときの案内。
+pub const PEN_SOURCE_MESSAGE: &str = "tagId か hubTag のどちらか 1 つを指定してください";
 
 /// 並べ替えの本文: 全グループの ID を、新しい並び順で 1 回ずつ。
 #[derive(Debug, Clone, Deserialize)]
@@ -324,9 +427,26 @@ fn validate_attributes(
 }
 
 /// 形の検証（DB を見ない部分）。[`validate_display_group`] の前半で、単体でも
-/// 使える（総当たりのテストのため）。
+/// 使える（総当たりのテストのため）。`hubTag` のペン（まだ記録項目に解決して
+/// いない）は `pens[i].hubTag` の誤りにする - 解決は保存の中で行う（モジュール doc）。
 pub fn validate_shape(payload: &DisplayGroupPayload) -> Result<ValidDisplayGroup, Vec<FieldError>> {
     let mut errors = Vec::new();
+    match check_shape(payload, true, &mut errors) {
+        Some(valid) if errors.is_empty() => Ok(valid),
+        _ => Err(errors),
+    }
+}
+
+/// 形の検証の本体。`report_unresolved` が偽なら、`hubTag` のペンは誤りにせず
+/// 飛ばす（保存の中で、解決の前に形の誤りだけを集めるため）。戻りは誤りも
+/// 未解決のペンも無いときだけ `Some`。
+fn check_shape(
+    payload: &DisplayGroupPayload,
+    report_unresolved: bool,
+    errors: &mut Vec<FieldError>,
+) -> Option<ValidDisplayGroup> {
+    let errors_before = errors.len();
+    let mut unresolved = false;
 
     let name = payload.name.trim().to_string();
     if name.is_empty() {
@@ -349,7 +469,7 @@ pub fn validate_shape(payload: &DisplayGroupPayload) -> Result<ValidDisplayGroup
 
     let kind = DisplayKind::parse(&payload.kind);
     let attributes = match kind {
-        Some(kind) => validate_attributes(kind, &payload.attributes, &mut errors),
+        Some(kind) => validate_attributes(kind, &payload.attributes, errors),
         None => {
             errors.push(field_error(
                 "kind",
@@ -371,11 +491,29 @@ pub fn validate_shape(payload: &DisplayGroupPayload) -> Result<ValidDisplayGroup
     let mut seen = HashSet::new();
     let mut pens = Vec::with_capacity(payload.pens.len());
     for (index, pen) in payload.pens.iter().enumerate() {
-        if !seen.insert(pen.tag_id) {
-            errors.push(field_error(
-                format!("pens[{index}].tagId"),
-                "同じタグを 1 つのグループに 2 回割り当てることはできません",
-            ));
+        match (pen.tag_id, &pen.hub_tag) {
+            (Some(tag_id), None) => {
+                if !seen.insert(tag_id) {
+                    errors.push(field_error(
+                        format!("pens[{index}].tagId"),
+                        "同じタグを 1 つのグループに 2 回割り当てることはできません",
+                    ));
+                }
+                pens.push(Pen {
+                    tag_id,
+                    color_slot: pen.color_slot,
+                });
+            }
+            (None, Some(_)) => {
+                unresolved = true;
+                if report_unresolved {
+                    errors.push(field_error(
+                        format!("pens[{index}].hubTag"),
+                        "Hub のタグは表示グループの保存（作成・更新）のときに記録項目へ解決します",
+                    ));
+                }
+            }
+            _ => errors.push(field_error(format!("pens[{index}]"), PEN_SOURCE_MESSAGE)),
         }
         if let Some(slot) = pen.color_slot {
             if !(1..=COLOR_SLOTS).contains(&slot) {
@@ -385,21 +523,17 @@ pub fn validate_shape(payload: &DisplayGroupPayload) -> Result<ValidDisplayGroup
                 ));
             }
         }
-        pens.push(Pen {
-            tag_id: pen.tag_id,
-            color_slot: pen.color_slot,
-        });
     }
 
-    match (kind, errors.is_empty()) {
-        (Some(kind), true) => Ok(ValidDisplayGroup {
+    match kind {
+        Some(kind) if errors.len() == errors_before && !unresolved => Some(ValidDisplayGroup {
             name,
             sort_order: payload.sort_order,
             kind,
             attributes,
             pens,
         }),
-        _ => Err(errors),
+        _ => None,
     }
 }
 
@@ -452,15 +586,19 @@ pub async fn validate_display_group(
     }
 
     for (index, pen) in payload.pens.iter().enumerate() {
+        // `tagId` だけのペン（それ以外は形の誤り）。
+        let (Some(tag_id), None) = (pen.tag_id, &pen.hub_tag) else {
+            continue;
+        };
         let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM tags WHERE id = ?")
-            .bind(pen.tag_id)
+            .bind(tag_id)
             .fetch_optional(&mut *conn)
             .await
             .map_err(banto_storage::storage_error)?;
         if exists.is_none() {
             errors.push(field_error(
                 format!("pens[{index}].tagId"),
-                format!("タグ（ID {}）が見つかりません", pen.tag_id),
+                format!("タグ（ID {tag_id}）が見つかりません"),
             ));
         }
     }
@@ -622,34 +760,19 @@ impl DisplayGroupService {
         validate_display_group(&mut conn, payload, target_id).await
     }
 
+    /// 作成（Hub のタグの登録はしない。`hubTag` のペンは登録済みのものだけ解決する）。
+    /// 経路（REST・MCP・Tauri）は [`Self::create_with_hub_tags`] を使う。
     pub async fn create(&self, payload: &DisplayGroupPayload) -> Result<DisplayGroup, BantoError> {
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(storage)?;
-        let valid = validate_display_group(&mut tx, payload, None).await?;
-        let sort_order = match valid.sort_order {
-            Some(order) => order,
-            None => end_sort_order(&mut tx).await?,
-        };
-        let attributes = serde_json::to_string(&valid.attributes)
-            .map_err(|err| BantoError::Other(err.to_string()))?;
-        let id: i64 = sqlx::query_scalar(
-            "INSERT INTO display_groups (name, sort_order, kind, attributes) \
-             VALUES (?, ?, ?, ?) RETURNING id",
-        )
-        .bind(&valid.name)
-        .bind(sort_order)
-        .bind(valid.kind.as_str())
-        .bind(&attributes)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(map_write_error)?;
-        insert_pens(&mut tx, id, &valid.pens).await?;
-        let created = get_on(&mut tx, id, None).await?;
-        tx.commit().await.map_err(storage)?;
-        Ok(created)
+        Ok(self.save(None, None, payload).await?.group)
+    }
+
+    /// 作成の一括保存（モジュール doc「Hub のタグをペンにする一括保存」）。
+    pub async fn create_with_hub_tags(
+        &self,
+        registrar: &HubTagRegistrar,
+        payload: &DisplayGroupPayload,
+    ) -> Result<DisplayGroupSaved, BantoError> {
+        self.save(Some(registrar), None, payload).await
     }
 
     /// 内容（名前・種別・属性・ペン）の全項目の置き換え。**`sortOrder` は本文に
@@ -659,53 +782,43 @@ impl DisplayGroupService {
     /// だけ。拒否ではなく無視にしたのは、GET の応答をそのまま送り返せる往復の形を
     /// 保つため）。
     /// `expectedRevision` が保存されている版と違えば [`revision_conflict_error`]。
+    /// Hub のタグの登録はしない（[`Self::create`] と同じ。経路は
+    /// [`Self::update_with_hub_tags`]）。
     pub async fn update(
         &self,
         id: i64,
         payload: &DisplayGroupPayload,
     ) -> Result<DisplayGroup, BantoError> {
+        Ok(self.save(None, Some(id), payload).await?.group)
+    }
+
+    /// 更新の一括保存（[`Self::update`] の規則に、モジュール doc の Hub のタグの
+    /// 解決・登録を足したもの）。
+    pub async fn update_with_hub_tags(
+        &self,
+        registrar: &HubTagRegistrar,
+        id: i64,
+        payload: &DisplayGroupPayload,
+    ) -> Result<DisplayGroupSaved, BantoError> {
+        self.save(Some(registrar), Some(id), payload).await
+    }
+
+    /// 作成・更新の共通の入口: 1 つの `BEGIN IMMEDIATE` で [`save_on`] を行い、
+    /// 成功したときだけ commit する（失敗は drop で巻き戻る）。
+    async fn save(
+        &self,
+        registrar: Option<&HubTagRegistrar>,
+        target_id: Option<i64>,
+        payload: &DisplayGroupPayload,
+    ) -> Result<DisplayGroupSaved, BantoError> {
         let mut tx = self
             .pool
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(storage)?;
-        let current: Option<i64> =
-            sqlx::query_scalar("SELECT revision FROM display_groups WHERE id = ?")
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(storage)?;
-        let Some(revision) = current else {
-            return Err(not_found(id));
-        };
-        if let Some(expected) = payload.expected_revision {
-            if expected != revision {
-                return Err(revision_conflict_error());
-            }
-        }
-        let valid = validate_display_group(&mut tx, payload, Some(id)).await?;
-        let attributes = serde_json::to_string(&valid.attributes)
-            .map_err(|err| BantoError::Other(err.to_string()))?;
-        sqlx::query(
-            "UPDATE display_groups SET name = ?, kind = ?, attributes = ?, \
-             revision = revision + 1, updated_at = datetime('now') WHERE id = ?",
-        )
-        .bind(&valid.name)
-        .bind(valid.kind.as_str())
-        .bind(&attributes)
-        .bind(id)
-        .execute(&mut *tx)
-        .await
-        .map_err(map_write_error)?;
-        sqlx::query("DELETE FROM display_group_pens WHERE group_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
-        insert_pens(&mut tx, id, &valid.pens).await?;
-        let updated = get_on(&mut tx, id, None).await?;
+        let saved = save_on(&mut tx, registrar, target_id, payload).await?;
         tx.commit().await.map_err(storage)?;
-        Ok(updated)
+        Ok(saved)
     }
 
     /// 削除（ペンは `ON DELETE CASCADE` で一緒に消える）。削除した行を返す
@@ -799,6 +912,278 @@ impl DisplayGroupService {
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+}
+
+/// 作成・更新の本体（呼び出し側のトランザクションの中。commit しない）。
+/// `target_id` が `None` なら作成。`registrar` が `None` なら未登録の Hub のタグは
+/// 登録せず `hubTagGroup` の誤りにする。手順はモジュール doc。
+pub(crate) async fn save_on(
+    conn: &mut SqliteConnection,
+    registrar: Option<&HubTagRegistrar>,
+    target_id: Option<i64>,
+    payload: &DisplayGroupPayload,
+) -> Result<DisplayGroupSaved, BantoError> {
+    if let Some(id) = target_id {
+        let current: Option<i64> =
+            sqlx::query_scalar("SELECT revision FROM display_groups WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(storage)?;
+        let Some(revision) = current else {
+            return Err(not_found(id));
+        };
+        if let Some(expected) = payload.expected_revision {
+            if expected != revision {
+                return Err(revision_conflict_error());
+            }
+        }
+    }
+
+    let (resolved, registration) = resolve_hub_tags(conn, registrar, payload).await?;
+    let valid = validate_display_group(conn, &resolved, target_id)
+        .await
+        .map_err(|err| hub_pen_fields(err, payload))?;
+    let attributes = serde_json::to_string(&valid.attributes)
+        .map_err(|err| BantoError::Other(err.to_string()))?;
+    let id = match target_id {
+        None => {
+            let sort_order = match valid.sort_order {
+                Some(order) => order,
+                None => end_sort_order(conn).await?,
+            };
+            sqlx::query_scalar(
+                "INSERT INTO display_groups (name, sort_order, kind, attributes) \
+                 VALUES (?, ?, ?, ?) RETURNING id",
+            )
+            .bind(&valid.name)
+            .bind(sort_order)
+            .bind(valid.kind.as_str())
+            .bind(&attributes)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(map_write_error)?
+        }
+        Some(id) => {
+            sqlx::query(
+                "UPDATE display_groups SET name = ?, kind = ?, attributes = ?, \
+                 revision = revision + 1, updated_at = datetime('now') WHERE id = ?",
+            )
+            .bind(&valid.name)
+            .bind(valid.kind.as_str())
+            .bind(&attributes)
+            .bind(id)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_write_error)?;
+            sqlx::query("DELETE FROM display_group_pens WHERE group_id = ?")
+                .bind(id)
+                .execute(&mut *conn)
+                .await
+                .map_err(storage)?;
+            id
+        }
+    };
+    insert_pens(conn, id, &valid.pens).await?;
+    let group = get_on(conn, id, None).await?;
+    Ok(DisplayGroupSaved {
+        group,
+        registration,
+    })
+}
+
+/// `hubTagGroup` の誤りのフィールド名。
+pub const HUB_TAG_GROUP_FIELD: &str = "hubTagGroup";
+
+/// `hubTag` のペンを記録項目の id に解決する（必要なら登録する。モジュール doc の
+/// 2・3）。`hubTag` のペンが無ければ本文をそのまま返す。戻りの本文は全部のペンが
+/// `tagId` だけの形。誤りは形の誤り（[`check_shape`]）と一緒に `Validation` で返す。
+async fn resolve_hub_tags<'a>(
+    conn: &mut SqliteConnection,
+    registrar: Option<&HubTagRegistrar>,
+    payload: &'a DisplayGroupPayload,
+) -> Result<(Cow<'a, DisplayGroupPayload>, Option<HubRegistrationResult>), BantoError> {
+    if payload.pens.iter().all(|pen| pen.hub_tag.is_none()) {
+        return Ok((Cow::Borrowed(payload), None));
+    }
+    let mut errors = Vec::new();
+    // 形の誤りを先に集める（登録で落ちても一緒に返す）。タグの存在は解決の後。
+    check_shape(payload, false, &mut errors);
+
+    let registered = registered_tag_ids_tx(conn).await?;
+    let mut resolved: Vec<Option<i64>> = vec![None; payload.pens.len()];
+    let mut seen: HashSet<String> = HashSet::new();
+    // 登録する行と、その行のペンの位置（同じ並び）。
+    let mut rows: Vec<HubTagRow> = Vec::new();
+    let mut row_pens: Vec<usize> = Vec::new();
+    for (index, pen) in payload.pens.iter().enumerate() {
+        let (None, Some(hub_tag)) = (pen.tag_id, &pen.hub_tag) else {
+            continue;
+        };
+        let external_name = hub_tag.external_name.trim();
+        if !external_name.is_empty() {
+            if !seen.insert(external_name.to_owned()) {
+                errors.push(field_error(
+                    format!("pens[{index}].hubTag.externalName"),
+                    "同じタグを 1 つのグループに 2 回割り当てることはできません",
+                ));
+                continue;
+            }
+            if let Some(&tag_id) = registered.get(external_name) {
+                // 登録済み: 参照するだけ（二重登録しない）。
+                resolved[index] = Some(tag_id);
+                continue;
+            }
+        }
+        // 空の外部名も登録の事前検証に任せる（行の誤りとして返る）。
+        rows.push(hub_tag.clone());
+        row_pens.push(index);
+    }
+
+    let mut registration = None;
+    if !rows.is_empty() {
+        match (registration_target(payload), registrar) {
+            (Err(error), _) => errors.push(error),
+            (Ok(_), None) => errors.push(field_error(
+                HUB_TAG_GROUP_FIELD,
+                "この経路では Hub のタグを記録項目として登録できません",
+            )),
+            (Ok((collection_group_id, new_group)), Some(registrar)) => {
+                let request = HubTagRegistration {
+                    collection_group_id,
+                    new_group,
+                    tags: rows,
+                };
+                let outcome = register_in_tx(
+                    conn,
+                    &registrar.plc_connections,
+                    &registrar.collection_groups,
+                    &registrar.tags,
+                    &request,
+                )
+                .await;
+                match outcome {
+                    Ok(result) if result.ok => {
+                        let by_name: HashMap<&str, usize> = request
+                            .tags
+                            .iter()
+                            .zip(&row_pens)
+                            .map(|(row, &pen)| (row.external_name.trim(), pen))
+                            .collect();
+                        for tag in &result.tags {
+                            if let Some(&pen) = by_name.get(tag.address.trim()) {
+                                resolved[pen] = Some(tag.id);
+                            }
+                        }
+                        registration = Some(result);
+                    }
+                    Ok(result) => {
+                        errors.extend(result.field_errors.into_iter().map(|error| {
+                            field_error(hub_tag_group_field(&error.field), error.message)
+                        }));
+                        for row_error in result.row_errors {
+                            let Some(&pen) = row_pens.get(row_error.index) else {
+                                continue;
+                            };
+                            errors.extend(row_error.field_errors.into_iter().map(|error| {
+                                field_error(
+                                    format!(
+                                        "pens[{pen}].hubTag.{}",
+                                        hub_tag_row_field(&error.field)
+                                    ),
+                                    error.message,
+                                )
+                            }));
+                        }
+                    }
+                    Err(BantoError::Validation { field_errors }) => {
+                        errors.extend(field_errors.into_iter().map(|error| {
+                            field_error(hub_tag_group_field(&error.field), error.message)
+                        }));
+                    }
+                    Err(other) => return Err(other),
+                }
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        return Err(BantoError::Validation {
+            field_errors: errors,
+        });
+    }
+    let mut out = payload.clone();
+    for (pen, tag_id) in out.pens.iter_mut().zip(resolved) {
+        if pen.hub_tag.is_some() {
+            let Some(tag_id) = tag_id else {
+                return Err(BantoError::Other(
+                    "Hub のタグを記録項目に解決できませんでした".to_owned(),
+                ));
+            };
+            pen.tag_id = Some(tag_id);
+            pen.hub_tag = None;
+        }
+    }
+    out.hub_tag_group = None;
+    Ok((Cow::Owned(out), registration))
+}
+
+/// `hubTagGroup` を登録先（`collectionGroupId` か `newGroup` のちょうど 1 つ）にする。
+fn registration_target(
+    payload: &DisplayGroupPayload,
+) -> Result<(Option<i64>, Option<NewHubGroup>), FieldError> {
+    let message = "Hub のタグを記録項目として登録する先（hubTagGroup の collectionGroupId か newGroup のどちらか 1 つ）を指定してください";
+    match &payload.hub_tag_group {
+        Some(HubTagGroupPayload {
+            collection_group_id: Some(id),
+            new_group: None,
+        }) => Ok((Some(*id), None)),
+        Some(HubTagGroupPayload {
+            collection_group_id: None,
+            new_group: Some(group),
+        }) => Ok((None, Some(group.clone()))),
+        _ => Err(field_error(HUB_TAG_GROUP_FIELD, message)),
+    }
+}
+
+/// 登録の行に属さない誤り（`crate::hub_tags` のダイアログの欄の名前）を、本文の
+/// `hubTagGroup` の位置に載せ替える。
+fn hub_tag_group_field(field: &str) -> String {
+    match field {
+        "collectionGroupId" => "hubTagGroup.collectionGroupId".to_owned(),
+        "newGroupName" => "hubTagGroup.newGroup.name".to_owned(),
+        "newGroupPeriodMs" => "hubTagGroup.newGroup.periodMs".to_owned(),
+        _ => HUB_TAG_GROUP_FIELD.to_owned(),
+    }
+}
+
+/// 登録の行の誤りのフィールド名を `hubTag` の項目名にする（タグの `address` は
+/// 外部名そのもの）。
+fn hub_tag_row_field(field: &str) -> &str {
+    match field {
+        "address" => "externalName",
+        other => other,
+    }
+}
+
+/// 解決した本文の検証で出た `pens[i].tagId` の誤りを、もとが `hubTag` のペンなら
+/// `pens[i].hubTag.externalName` に付け替える（利用者が送った項目の名前で返す）。
+fn hub_pen_fields(err: BantoError, payload: &DisplayGroupPayload) -> BantoError {
+    let BantoError::Validation { field_errors } = err else {
+        return err;
+    };
+    let field_errors = field_errors
+        .into_iter()
+        .map(|mut error| {
+            for (index, pen) in payload.pens.iter().enumerate() {
+                if pen.hub_tag.is_some() && error.field == format!("pens[{index}].tagId") {
+                    error.field = format!("pens[{index}].hubTag.externalName");
+                }
+            }
+            error
+        })
+        .collect();
+    BantoError::Validation { field_errors }
 }
 
 async fn insert_pens(

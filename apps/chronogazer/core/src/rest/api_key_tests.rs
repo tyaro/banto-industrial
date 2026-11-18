@@ -623,3 +623,61 @@ async fn an_admin_issues_lists_revokes_and_deletes_keys_and_each_is_audited() {
         assert!(!detail.to_string().contains(&key));
     }
 }
+
+/// #1179 PR5: 表示グループの保存でペンの Hub のタグを登録できる（汎用の
+/// `POST /api/tags` で Hub 接続のグループにタグを作れるのと同じ扱い）。`config` の
+/// キーでは通り、記録項目の `create` もキーの主体で監査される。`read` のキーでは
+/// 403（`denied`）で、何も登録しない。
+#[tokio::test]
+async fn a_config_key_saves_a_display_group_with_hub_tags_and_a_read_key_cannot() {
+    let fx = fixture().await;
+    let body = json!({
+        "name": "L1", "kind": "trend",
+        "pens": [{ "hubTag": { "externalName": "L.G.a", "name": "a", "dataType": "f32" } }],
+        "hubTagGroup": { "newGroup": { "name": "hub-g", "periodMs": 1000 } },
+    });
+
+    let (reader, reader_label) = fx.issue("reader", &["read"], None).await;
+    let (status, _) = fx
+        .send(key_req(
+            "POST",
+            "/api/display-groups",
+            &reader,
+            Some(body.clone()),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let rows = fx.audit_rows().await;
+    let denied = rows
+        .iter()
+        .find(|r| r.resource == "display_groups" && r.action == "denied")
+        .unwrap_or_else(|| panic!("no denied entry: {rows:?}"));
+    assert_eq!(
+        denied.actor_username.as_deref(),
+        Some(reader_label.as_str())
+    );
+    let (status, tags) = fx.send(key_req("GET", "/api/tags", &reader, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tags, json!([]), "nothing was registered");
+
+    let (key, label) = fx.issue("agent", &["config"], None).await;
+    let (status, created) = fx
+        .send(key_req("POST", "/api/display-groups", &key, Some(body)))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    assert_eq!(created["registeredTags"][0]["address"], "L.G.a");
+    assert_eq!(
+        created["pens"][0]["tagId"],
+        created["registeredTags"][0]["id"]
+    );
+    let rows = fx.audit_rows().await;
+    for resource in ["tags", "display_groups"] {
+        let entry = rows
+            .iter()
+            .find(|r| r.resource == resource && r.action == "create")
+            .unwrap_or_else(|| panic!("no create entry for {resource}: {rows:?}"));
+        assert_eq!(entry.actor_username.as_deref(), Some(label.as_str()));
+        assert_eq!(entry.actor_role.as_deref(), Some("api_key"));
+        assert_eq!(entry.origin, "rest");
+    }
+}

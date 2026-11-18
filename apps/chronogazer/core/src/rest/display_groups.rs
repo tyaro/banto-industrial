@@ -3,10 +3,10 @@
 //! | Method | Path                        | Body                    | Response |
 //! |--------|-----------------------------|-------------------------|----------|
 //! | GET    | `/api/display-groups`       | -                       | `DisplayGroup[]`（viewer 以上、並び順） |
-//! | POST   | `/api/display-groups`       | `DisplayGroupPayload`   | `DisplayGroup`（editor 以上） |
+//! | POST   | `/api/display-groups`       | `DisplayGroupPayload`   | `DisplayGroupSaveResponse`（editor 以上） |
 //! | PUT    | `/api/display-groups/order` | `{ ids: number[] }`     | `DisplayGroup[]`（editor 以上、並べ替え） |
 //! | GET    | `/api/display-groups/{id}`  | -                       | `DisplayGroup`（viewer 以上） |
-//! | PUT    | `/api/display-groups/{id}`  | `DisplayGroupPayload`   | `DisplayGroup`（editor 以上。版の食い違いは `409`。本文の `sortOrder` は無視 - 並びは `/order` だけで変える） |
+//! | PUT    | `/api/display-groups/{id}`  | `DisplayGroupPayload`   | `DisplayGroupSaveResponse`（editor 以上。版の食い違いは `409`。本文の `sortOrder` は無視 - 並びは `/order` だけで変える） |
 //! | DELETE | `/api/display-groups/{id}`  | -                       | 204（editor 以上） |
 //!
 //! 作法は親モジュールの `tag_registry_router` と同じ: 読み取りはルーター全体の
@@ -17,6 +17,11 @@
 //! `record_write` から置き換えた - キーの主体も残せるように）。読み取りは監査しない。
 //! 検証は `crate::display_groups::validate_display_group` だけで、Tauri の
 //! `display_groups_*` コマンドも同じサービス・同じ検証を通る。
+//!
+//! 作成・更新はペンに Hub のカタログのタグ（`hubTag`）を指せ、未登録のものは
+//! 同じ保存の中で記録項目として登録する（#1179 PR5、`crate::display_groups` の
+//! モジュール doc）。応答は `DisplayGroup` の項目に、今回登録した記録項目
+//! （`registeredTags`、無ければ出さない）を足した形。
 //!
 //! 版の食い違い（`expectedRevision`）だけ `409 Conflict` にし、本文は他の検証
 //! エラーと同じ `ErrorBody` 形（`kind: "validation"`、`field_errors` の
@@ -32,8 +37,11 @@ use banto_server::{ApiError, AuthState};
 use super::{require_session_or_api_key, Actor, RevisionConflictRejection};
 use crate::audit::AuditLogService;
 use crate::display_groups::{
-    DisplayGroup, DisplayGroupPayload, DisplayGroupService, ReorderPayload,
+    DisplayGroup, DisplayGroupPayload, DisplayGroupSaveResponse, DisplayGroupService,
+    ReorderPayload,
 };
+use crate::hub::HubService;
+use crate::hub_tags::HubTagRegistrar;
 use crate::ops::{DisplayGroupOps, Via};
 
 /// #1161 PR5a: 書き込みの本体（権限の確かめ・監査）は [`DisplayGroupOps`] の
@@ -89,10 +97,10 @@ pub(super) async fn get_one(
     tag = "display-groups",
     operation_id = "display_groups_create",
     summary = "表示グループの作成",
-    description = "表示グループを作る。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。",
+    description = "表示グループを作る。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。ペンは `tagId`（登録済みの記録項目）か `hubTag`（Hub のカタログのタグ）のどちらか 1 つ。未登録の `hubTag` は `hubTagGroup` の収集グループに記録項目として同じ保存の中で登録し（全部か無しか）、応答の `registeredTags` に返す。登録済みの `hubTag` は既存の記録項目を参照する。",
     request_body = DisplayGroupPayload,
     responses(
-        (status = 200, description = "作成した表示グループ", body = DisplayGroup),
+        (status = 200, description = "作成した表示グループ（今回登録した記録項目があれば `registeredTags`）", body = DisplayGroupSaveResponse),
         (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
         (status = 403, description = "`read` キー（`config` スコープが無い）、または editor 未満のロール"),
         (status = 422, description = "入力の検証エラー（`field_errors` に項目ごとの理由）"),
@@ -103,7 +111,7 @@ pub(super) async fn create(
     State(state): State<DisplayGroupsState>,
     actor: Actor,
     Json(payload): Json<DisplayGroupPayload>,
-) -> Result<Json<DisplayGroup>, ApiError> {
+) -> Result<Json<DisplayGroupSaveResponse>, ApiError> {
     let created = state
         .create(
             &actor,
@@ -123,11 +131,11 @@ pub(super) async fn create(
     tag = "display-groups",
     operation_id = "display_groups_update",
     summary = "表示グループの更新",
-    description = "表示グループを更新する（全項目を送る。本文の `sortOrder` は無視され、並びは `/api/display-groups/order` だけで変える）。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。",
+    description = "表示グループを更新する（全項目を送る。本文の `sortOrder` は無視され、並びは `/api/display-groups/order` だけで変える）。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。ペンの `hubTag`・`hubTagGroup` は作成と同じ。",
     params(("id" = i64, Path, description = "対象の id")),
     request_body = DisplayGroupPayload,
     responses(
-        (status = 200, description = "更新後の表示グループ", body = DisplayGroup),
+        (status = 200, description = "更新後の表示グループ（今回登録した記録項目があれば `registeredTags`）", body = DisplayGroupSaveResponse),
         (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
         (status = 403, description = "`read` キー（`config` スコープが無い）、または editor 未満のロール"),
         (status = 404, description = "指定の id が無い"),
@@ -141,7 +149,7 @@ pub(super) async fn update(
     actor: Actor,
     Path(id): Path<i64>,
     Json(payload): Json<DisplayGroupPayload>,
-) -> Result<Json<DisplayGroup>, RevisionConflictRejection> {
+) -> Result<Json<DisplayGroupSaveResponse>, RevisionConflictRejection> {
     let updated = state
         .update(
             &actor,
@@ -227,11 +235,15 @@ pub(super) async fn reorder(
 /// `/api/display-groups/*` のルーター（モジュール doc の表）。
 pub(super) fn display_groups_router(
     display_groups: DisplayGroupService,
+    registrar: HubTagRegistrar,
+    hub: HubService,
     audit: AuditLogService,
     auth: AuthState,
 ) -> Router {
     let state = DisplayGroupsState {
         display_groups,
+        registrar,
+        hub,
         audit,
     };
     Router::new()
@@ -540,5 +552,131 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    /// `(resource, action, origin)` を古い順に（記録項目と表示グループの監査の順を
+    /// 確かめる）。
+    async fn audit_rows_of(
+        pool: &sqlx::SqlitePool,
+        resources: &[&str],
+    ) -> Vec<(String, String, String)> {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT resource, action, origin FROM audit_log WHERE result = 'ok' ORDER BY id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        rows.into_iter()
+            .filter(|(resource, _, _)| resources.contains(&resource.as_str()))
+            .collect()
+    }
+
+    /// **#1179 PR5（REST）**: 作成でペンの Hub のタグを登録する一括保存。応答に
+    /// `registeredTags`、監査は記録項目の `create`（`detail` は「Hub から追加」と
+    /// 同じ形）→ 表示グループの `create` の順。登録先が無ければ 422 で何も書かず、
+    /// 古い版の更新は 409 で何も登録しない。登録の無い保存の応答に
+    /// `registeredTags` は出ない。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn display_group_save_registers_hub_tags_over_rest() {
+        let (router, _admin, editor, _viewer, pool) = router_with_role_tokens_and_pool().await;
+        let (_tags, ids) = seed_tags(&pool, 1).await;
+        let hub_pen = |external_name: &str, name: &str| json!({ "hubTag": { "externalName": external_name, "name": name, "dataType": "f32" } });
+
+        let missing_target = json!({
+            "name": "L1", "kind": "trend",
+            "pens": [hub_pen("L.G.a", "a")],
+        });
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/api/display-groups",
+            &editor,
+            Some(missing_target),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["field_errors"][0]["field"], "hubTagGroup", "{body}");
+        assert!(audit_rows_of(&pool, &["tags", "display_groups"])
+            .await
+            .is_empty());
+
+        let create = json!({
+            "name": "L1", "kind": "trend",
+            "pens": [hub_pen("L.G.a", "a"), { "tagId": ids[0] }, hub_pen("L.G.b", "b")],
+            "hubTagGroup": { "newGroup": { "name": "hub-g", "periodMs": 1000 } },
+        });
+        let (status, created) = send(
+            &router,
+            "POST",
+            "/api/display-groups",
+            &editor,
+            Some(create),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let registered = created["registeredTags"]
+            .as_array()
+            .expect("registeredTags");
+        assert_eq!(registered.len(), 2);
+        assert_eq!(created["pens"][0]["tagId"], registered[0]["id"]);
+        assert_eq!(created["pens"][1]["tagId"], ids[0]);
+        assert_eq!(created["pens"][2]["tagId"], registered[1]["id"]);
+        assert_eq!(
+            audit_rows_of(&pool, &["tags", "display_groups"]).await,
+            [("tags", "create"), ("display_groups", "create")].map(|(r, a)| (
+                r.to_string(),
+                a.to_string(),
+                "rest".to_string()
+            ))
+        );
+        let detail: String = sqlx::query_scalar(
+            "SELECT detail FROM audit_log WHERE resource = 'tags' AND action = 'create'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let detail: Value = serde_json::from_str(&detail).unwrap();
+        assert_eq!(detail["source"], "hub");
+        assert_eq!(detail["count"], 2);
+        assert_eq!(detail["groupCreated"], true);
+
+        // 古い版: 409、何も登録しない。
+        let id = created["id"].as_i64().unwrap();
+        let mut stale = created.clone();
+        stale["expectedRevision"] = json!(created["revision"].as_i64().unwrap() + 5);
+        stale["pens"]
+            .as_array_mut()
+            .unwrap()
+            .push(hub_pen("L.G.c", "c"));
+        stale["hubTagGroup"] = json!({ "newGroup": { "name": "hub-g2", "periodMs": 1000 } });
+        let (status, body) = send(
+            &router,
+            "PUT",
+            &format!("/api/display-groups/{id}"),
+            &editor,
+            Some(stale),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let tag_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(tag_count, 3, "1 本 + 登録した 2 本のまま");
+
+        // 応答をそのまま送り返す更新（登録なし）: `registeredTags` は出ない。
+        let mut round_trip = created.clone();
+        round_trip["expectedRevision"] = created["revision"].clone();
+        let (status, updated) = send(
+            &router,
+            "PUT",
+            &format!("/api/display-groups/{id}"),
+            &editor,
+            Some(round_trip),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert!(updated.get("registeredTags").is_none(), "{updated}");
+        assert_eq!(updated["pens"], created["pens"]);
     }
 }

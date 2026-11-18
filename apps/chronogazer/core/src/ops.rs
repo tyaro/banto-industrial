@@ -56,9 +56,11 @@ use crate::audit::AuditLogService;
 use crate::collect::{CollectOutcome, CollectorService, COLLECT_AUDIT_RESOURCE};
 use crate::display_groups::{
     audit_detail as display_group_audit_detail, DisplayGroup, DisplayGroupPayload,
-    DisplayGroupService, AUDIT_RESOURCE as DISPLAY_GROUPS_RESOURCE,
+    DisplayGroupSaveResponse, DisplayGroupSaved, DisplayGroupService,
+    AUDIT_RESOURCE as DISPLAY_GROUPS_RESOURCE,
 };
 use crate::hub::HubService;
+use crate::hub_tags::{registration_audit_detail, HubTagRegistrar};
 use crate::rest::actor::Actor;
 use crate::rest::{
     plc_connection_audit_detail, reject_disallowed_connection_protocol, update_plc_connection,
@@ -401,11 +403,18 @@ impl RegistryOps {
     }
 }
 
-/// 表示グループの操作（REST `/api/display-groups/*`）。収集の対象ではないので
-/// `registry_changed` は呼ばない（PR5a より前の REST と同じ）。
+/// 表示グループの操作（REST `/api/display-groups/*`）。表示グループ自体は収集の
+/// 対象ではないので `registry_changed` は呼ばない（PR5a より前の REST と同じ）。
+/// ただし作成・更新でペンの Hub のタグを記録項目として登録したとき（#1179 PR5、
+/// `crate::display_groups` のモジュール doc）は、`POST /api/tags/from-hub` と同じく
+/// 呼ぶ。
 #[derive(Clone)]
 pub(crate) struct DisplayGroupOps {
     pub(crate) display_groups: DisplayGroupService,
+    /// #1179 PR5: ペンの Hub のタグを同じトランザクションで登録するサービス一式。
+    pub(crate) registrar: HubTagRegistrar,
+    /// #1179 PR5: 登録したら購読に反映し、移行前の選択の消去を予約する。
+    pub(crate) hub: HubService,
     pub(crate) audit: AuditLogService,
 }
 
@@ -416,20 +425,14 @@ impl DisplayGroupOps {
         actor: &Actor,
         via: &Via<'_>,
         payload: &DisplayGroupPayload,
-    ) -> Result<DisplayGroup, BantoError> {
+    ) -> Result<DisplayGroupSaveResponse, BantoError> {
         require_configure(actor, &self.audit, via, DISPLAY_GROUPS_RESOURCE).await?;
-        let created = self.display_groups.create(payload).await?;
-        actor
-            .record(
-                &self.audit,
-                via.origin(),
-                "create",
-                DISPLAY_GROUPS_RESOURCE,
-                Some(&created.id.to_string()),
-                Some(display_group_audit_detail(&created)),
-            )
-            .await;
-        Ok(created)
+        let saved = self
+            .display_groups
+            .create_with_hub_tags(&self.registrar, payload)
+            .await?;
+        self.after_save(actor, via, "create", &saved).await;
+        Ok(saved.into_response())
     }
 
     /// 更新（REST `PUT /api/display-groups/{id}`、MCP `update_display_group`）。
@@ -439,20 +442,53 @@ impl DisplayGroupOps {
         via: &Via<'_>,
         id: i64,
         payload: &DisplayGroupPayload,
-    ) -> Result<DisplayGroup, BantoError> {
+    ) -> Result<DisplayGroupSaveResponse, BantoError> {
         require_configure(actor, &self.audit, via, DISPLAY_GROUPS_RESOURCE).await?;
-        let updated = self.display_groups.update(id, payload).await?;
+        let saved = self
+            .display_groups
+            .update_with_hub_tags(&self.registrar, id, payload)
+            .await?;
+        self.after_save(actor, via, "update", &saved).await;
+        Ok(saved.into_response())
+    }
+
+    /// 作成・更新の後処理（Tauri の `display_groups_save_after` と同じ順）: 登録が
+    /// あれば先に記録項目の `create` の監査（`POST /api/tags/from-hub` と同じ
+    /// `detail`）→ 表示グループの監査 → 登録があれば `registry_changed` と移行前の
+    /// 選択の消去の予約（待たない）。
+    async fn after_save(
+        &self,
+        actor: &Actor,
+        via: &Via<'_>,
+        action: &str,
+        saved: &DisplayGroupSaved,
+    ) {
+        if let Some(registration) = &saved.registration {
+            actor
+                .record(
+                    &self.audit,
+                    via.origin(),
+                    "create",
+                    TAGS_RESOURCE,
+                    None,
+                    Some(registration_audit_detail(registration)),
+                )
+                .await;
+        }
         actor
             .record(
                 &self.audit,
                 via.origin(),
-                "update",
+                action,
                 DISPLAY_GROUPS_RESOURCE,
-                Some(&id.to_string()),
-                Some(display_group_audit_detail(&updated)),
+                Some(&saved.group.id.to_string()),
+                Some(display_group_audit_detail(&saved.group)),
             )
             .await;
-        Ok(updated)
+        if saved.registration.is_some() {
+            self.hub.registry_changed().await;
+            self.hub.schedule_legacy_selection_clear();
+        }
     }
 
     /// 削除（REST `DELETE /api/display-groups/{id}`、MCP `delete_display_group`）。

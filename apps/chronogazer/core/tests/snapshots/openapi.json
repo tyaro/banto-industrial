@@ -557,6 +557,16 @@
               "null"
             ]
           },
+          "hubTagGroup": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HubTagGroupPayload"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "kind": {
             "type": "string"
           },
@@ -582,6 +592,24 @@
           "kind"
         ],
         "type": "object"
+      },
+      "DisplayGroupSaveResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/DisplayGroup"
+          },
+          {
+            "properties": {
+              "registeredTags": {
+                "items": {
+                  "$ref": "#/components/schemas/Tag"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        ]
       },
       "DisplayKind": {
         "enum": [
@@ -741,6 +769,76 @@
         ],
         "type": "object"
       },
+      "HubTagGroupPayload": {
+        "properties": {
+          "collectionGroupId": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "newGroup": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NewHubGroup"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "HubTagRow": {
+        "properties": {
+          "dataType": {
+            "type": "string"
+          },
+          "decimals": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "externalName": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "unit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "externalName",
+          "name",
+          "dataType"
+        ],
+        "type": "object"
+      },
+      "NewHubGroup": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "periodMs": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "periodMs"
+        ],
+        "type": "object"
+      },
       "Pen": {
         "properties": {
           "colorSlot": {
@@ -769,14 +867,24 @@
               "null"
             ]
           },
+          "hubTag": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HubTagRow"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "tagId": {
             "format": "int64",
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
-        "required": [
-          "tagId"
-        ],
         "type": "object"
       },
       "PlcConnectionPayload": {
@@ -2141,7 +2249,7 @@
         ]
       },
       "post": {
-        "description": "表示グループを作る。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。",
+        "description": "表示グループを作る。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。ペンは `tagId`（登録済みの記録項目）か `hubTag`（Hub のカタログのタグ）のどちらか 1 つ。未登録の `hubTag` は `hubTagGroup` の収集グループに記録項目として同じ保存の中で登録し（全部か無しか）、応答の `registeredTags` に返す。登録済みの `hubTag` は既存の記録項目を参照する。",
         "operationId": "display_groups_create",
         "requestBody": {
           "content": {
@@ -2158,11 +2266,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DisplayGroup"
+                  "$ref": "#/components/schemas/DisplayGroupSaveResponse"
                 }
               }
             },
-            "description": "作成した表示グループ"
+            "description": "作成した表示グループ（今回登録した記録項目があれば `registeredTags`）"
           },
           "401": {
             "description": "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"
@@ -2321,7 +2429,7 @@
         ]
       },
       "put": {
-        "description": "表示グループを更新する（全項目を送る。本文の `sortOrder` は無視され、並びは `/api/display-groups/order` だけで変える）。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。",
+        "description": "表示グループを更新する（全項目を送る。本文の `sortOrder` は無視され、並びは `/api/display-groups/order` だけで変える）。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。ペンの `hubTag`・`hubTagGroup` は作成と同じ。",
         "operationId": "display_groups_update",
         "parameters": [
           {
@@ -2350,11 +2458,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DisplayGroup"
+                  "$ref": "#/components/schemas/DisplayGroupSaveResponse"
                 }
               }
             },
-            "description": "更新後の表示グループ"
+            "description": "更新後の表示グループ（今回登録した記録項目があれば `registeredTags`）"
           },
           "401": {
             "description": "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"

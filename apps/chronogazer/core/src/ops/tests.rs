@@ -42,12 +42,24 @@ async fn fixture() -> Fixture {
                 .accept_hub_connections(),
             tags: TagService::with_registry(pool.clone(), drivers.clone()).accept_hub_connections(),
             display_groups: display_groups.clone(),
-            hub,
+            hub: hub.clone(),
             audit: audit.clone(),
             drivers: drivers.clone(),
         },
         display_groups: DisplayGroupOps {
             display_groups,
+            registrar: crate::hub_tags::HubTagRegistrar {
+                plc_connections: PlcConnectionService::with_registry(pool.clone(), drivers.clone())
+                    .accept_hub_connections(),
+                collection_groups: CollectionGroupService::with_registry(
+                    pool.clone(),
+                    drivers.clone(),
+                )
+                .accept_hub_connections(),
+                tags: TagService::with_registry(pool.clone(), drivers.clone())
+                    .accept_hub_connections(),
+            },
+            hub,
             audit: audit.clone(),
         },
         thresholds: ThresholdOps {
