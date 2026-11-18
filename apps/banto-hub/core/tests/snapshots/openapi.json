@@ -2074,7 +2074,7 @@
             "description": "write_unsupported_protocol"
           },
           "502": {
-            "description": "write_failed(監査の行を作った後の失敗なので、本文に `audit_id` が付く)"
+            "description": "write_failed(送って失敗が確定した)または write_uncertain(送ったあとで結果が分からない。効いているかもしれないので自動で再送しない)。監査の行を作った後の失敗なので、本文に `audit_id` が付く"
           },
           "503": {
             "description": "writes_disabled / collection_not_running"

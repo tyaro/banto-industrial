@@ -265,7 +265,8 @@ fn to_proto_value_batch(
 /// | 422 | `INVALID_ARGUMENT` |
 /// | 429 | `RESOURCE_EXHAUSTED` |
 /// | 501 | `UNIMPLEMENTED` |
-/// | 502 | `UNAVAILABLE` |
+/// | 502 `write_failed` | `UNAVAILABLE` |
+/// | 502 `write_uncertain`(#1201。結果不明なので再試行してよい合図にしない) | `UNKNOWN` |
 /// | 503 | `UNAVAILABLE`(collection_not_running) / `FAILED_PRECONDITION`(writes_disabled) |
 /// | 500(監査書き込み失敗等、防御的分岐) | `INTERNAL` |
 ///
@@ -293,6 +294,8 @@ fn write_rejection_status(
         | WriteRejection::ValueOutOfRange(_)
         | WriteRejection::InvalidAddress(_) => tonic::Code::InvalidArgument,
         WriteRejection::WriteFailed(_) => tonic::Code::Unavailable,
+        // #1201: 結果不明は再試行してよい合図(UNAVAILABLE)にしない。
+        WriteRejection::WriteUncertain(_) => tonic::Code::Unknown,
         WriteRejection::AuditWriteFailed | WriteRejection::Internal(_) => tonic::Code::Internal,
         // T20-3a: `execute_write`(単票、この関数が変換する唯一の呼び出し
         // 元)は `BatchAborted`/`DuplicateTagInBatch` を絶対に返さない -
@@ -1464,5 +1467,30 @@ mod tests {
         );
         assert_eq!(status.code(), tonic::Code::Unavailable);
         assert!(status.message().contains("collection_not_running"));
+    }
+
+    /// #1201: 確定した失敗は `UNAVAILABLE`、結果不明は `UNKNOWN`(再試行してよい
+    /// 合図にしない)。どちらも `audit-id`・`correlation-id` の metadata が付く。
+    #[test]
+    fn write_failed_is_unavailable_and_write_uncertain_is_unknown() {
+        for (rejection, code, name) in [
+            (
+                WriteRejection::WriteFailed("x".into()),
+                tonic::Code::Unavailable,
+                "write_failed",
+            ),
+            (
+                WriteRejection::WriteUncertain("x".into()),
+                tonic::Code::Unknown,
+                "write_uncertain",
+            ),
+        ] {
+            let status = write_rejection_status(rejection, Some(7), Some("c-1"));
+            assert_eq!(status.code(), code, "{name}");
+            assert_eq!(status.message(), format!("{name}: x"));
+            let meta = status.metadata();
+            assert_eq!(meta.get("audit-id").unwrap().to_str().unwrap(), "7");
+            assert_eq!(meta.get("correlation-id").unwrap().to_str().unwrap(), "c-1");
+        }
     }
 }

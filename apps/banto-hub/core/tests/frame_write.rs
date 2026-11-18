@@ -336,7 +336,7 @@ async fn run(mode: Mode) {
         assert_eq!(result, "ok");
     } else {
         assert!(
-            matches!(written, Err(WriteRejection::WriteFailed(_))),
+            matches!(written, Err(WriteRejection::WriteUncertain(_))),
             "{written:?}"
         );
         if let Err(error) = &read {
@@ -630,7 +630,7 @@ async fn fc22_hint_run() {
     )
     .await
     .result;
-    let Err(WriteRejection::WriteFailed(message)) = single else {
+    let Err(WriteRejection::WriteUncertain(message)) = single else {
         panic!("{single:?}");
     };
     assert!(hinted(&message), "{message}");
@@ -652,7 +652,7 @@ async fn fc22_hint_run() {
     .await;
     assert_eq!(batch.len(), 2);
     let message_of = |tag: &str| match &batch.iter().find(|o| o.tag == tag).unwrap().result {
-        Err(WriteRejection::WriteFailed(message)) => message.clone(),
+        Err(WriteRejection::WriteUncertain(message)) => message.clone(),
         other => panic!("{tag}: {other:?}"),
     };
     assert!(hinted(&message_of("line.slow.bit")));

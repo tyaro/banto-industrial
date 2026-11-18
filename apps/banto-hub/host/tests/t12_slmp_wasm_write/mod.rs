@@ -1190,7 +1190,7 @@ async fn hub_api_timeout_then_explicit_recovery_and_revoked_key_rejection() {
     // This is an explicit second request, distinguishable from a replay of v=9.
     let recovery_write = if matches!(
         &first_write,
-        Ok((super::StatusCode::BAD_GATEWAY, body)) if body["error"] == "write_failed"
+        Ok((super::StatusCode::BAD_GATEWAY, body)) if body["error"] == "write_uncertain"
     ) && matches!(
         &read_after_reconnect,
         Ok(Ok(values)) if values == &vec![Ok(DriverValue::F64(7.0))]
@@ -1311,7 +1311,7 @@ async fn hub_api_timeout_then_explicit_recovery_and_revoked_key_rejection() {
         super::StatusCode::BAD_GATEWAY,
         "{write_body:?}"
     );
-    assert_eq!(write_body["error"], "write_failed");
+    assert_eq!(write_body["error"], "write_uncertain");
     let timeout_reason = write_body["detail"].as_str().unwrap();
     assert!(timeout_reason.contains(&FatalError::Timeout.to_string()));
     let (recovery_status, recovery_body) = recovery_write

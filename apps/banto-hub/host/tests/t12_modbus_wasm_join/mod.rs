@@ -997,7 +997,7 @@ async fn fc22_exception_is_per_item_and_a_mask_mismatch_is_uncertain_without_rep
     fixture.fc22.store(FC22_BAD_MASK, Ordering::SeqCst);
     let result = post(&app, &key, bit, false).await;
     assert_eq!(result.0, super::StatusCode::BAD_GATEWAY, "{:?}", result.1);
-    assert_eq!(result.1["error"], "write_failed", "{:?}", result.1);
+    assert_eq!(result.1["error"], "write_uncertain", "{:?}", result.1);
     let detail = result.1["detail"].as_str().unwrap();
     assert!(
         detail.contains("write acknowledgement mismatch"),

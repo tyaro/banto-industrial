@@ -24,7 +24,7 @@
 //!    T8-2 で追加した検証）で旧構成を維持する（§4.3 の all-or-nothing、
 //!    `last_config_error` に現れる）
 //! 4. 確認読み不一致: `Simulator::corrupt_after_next_write` で PLC 側の
-//!    競合書き込みを再現 -> write API が 502 `write_failed` を返し、監査行の
+//!    競合書き込みを再現 -> write API が 502 `write_uncertain` を返し、監査行の
 //!    `result` は `uncertain`(送ったあと、#902)、
 //!    `write_audit` の `detail` に「書き戻し競合の可能性」が記録される
 //!    （`banto_plc_write::error::PlcWriteError::BitWriteVerificationFailed`
@@ -739,10 +739,10 @@ async fn a_confirmation_read_mismatch_is_502_and_recorded_in_write_audit() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body:?}");
-    assert_eq!(body["error"], "write_failed");
+    assert_eq!(body["error"], "write_uncertain");
     let response_detail = body["detail"]
         .as_str()
-        .expect("write_failed must carry a detail explaining the mismatch");
+        .expect("write_uncertain must carry a detail explaining the mismatch");
     assert!(
         response_detail.contains("書き戻し競合の可能性"),
         "response detail should mention the possible race: {response_detail}"

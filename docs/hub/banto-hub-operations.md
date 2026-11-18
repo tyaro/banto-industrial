@@ -926,13 +926,13 @@ REST（上の #431 の例外）から行ってください。MCP（API キー）
     **`uncertain` は PLC 側で書き込みが効いている可能性があります**。
     banto-hub は自動では送り直さないので、必要なら値を読み戻して確かめて
     から、改めて書いてください。画面「書き込み監査」の「結果」で絞り込めます。
-    書き込みの応答は `failed` と同じ（HTTP 502 `write_failed`）です。
+    書き込みの応答は HTTP 502 `write_uncertain`（gRPC は `UNKNOWN`）です。`failed` は 502 `write_failed`（gRPC は `UNAVAILABLE`）で、分けて返ります（#1201）。
     Modbus の保持レジスタのビット（`4xxxx.N`、WASM の Modbus ドライバが FC22
     Mask Write Register 1 本で送る）の書込みが、機器の無応答（応答タイムアウト）
     で失敗したときは、失敗の文言（応答の `detail` と監査の `detail`）に
     「機器が FC22 に対応していない可能性があります」というヒントが付きます
-    （#899、2026-10-28 オーナー決定。結果は `uncertain`、HTTP 502 `write_failed`
-    のまま変わりません。FC22 に非対応の機器が例外応答を返すときは、ヒントの
+    （#899、2026-10-28 オーナー決定。結果は `uncertain`、HTTP 502 `write_uncertain`
+    です。FC22 に非対応の機器が例外応答を返すときは、ヒントの
     無い `failed` です）。
 - エラーコード `simulation_write_rejected`（HTTP 503 / gRPC `UNAVAILABLE`）は
   **返らなくなりました**。このコードを分岐に使っている外部クライアントが
