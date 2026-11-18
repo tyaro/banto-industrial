@@ -7,6 +7,33 @@
 	 * 8 ペン（タグの割り当て）と、トレンド / デジタル / バー / 計器の表示種別を
 	 * 持つ。監視画面での描画は R1-D（段階 2）で、この画面は定義の編集だけ。
 	 *
+	 * **3 ペイン（#1179 PR6a、2026-11-18、docs/chronogazer-ui-improvement-proposal.md
+	 * §2.1・§4）**: 「記録」ページ（`tags/+page.svelte`）と同じ banto 系の型にした。
+	 * - 左 = 表示グループの一覧（1 階層。選択・並べ替え・追加・上限 16 の案内・
+	 *   読み込み誤り）。枠は `@banto/ui` の `ThreePaneLayout`（狭幅では左右が
+	 *   ドロワー。狭幅の判定はビューポート = `mobileNavStore.isNarrow`）。
+	 *   上のツールバーに「表示グループを追加」。
+	 * - 中央 = `@banto/ui` の `Tabs`。「ペン」（ペンの一覧 = 色の見本・タグ名・
+	 *   しきい値の読み取り表示と、追加・削除・順番変更。行を選ぶと右ペインに
+	 *   そのペンの設定を出す）と「設定」（名前・表示種別・既定の時間窓・削除）。
+	 *   保存・取り消し・未保存の表示・楽観ロックの「最新の内容を読み込む」は、
+	 *   どちらのタブでも見えるよう中央の上に置く。
+	 * - 右 = 選んだペンの設定（タグの選択と色）。編集者以上のときだけ開く。
+	 *   Hub のカタログからのタグ選択は次の PR（PR6b）で、今は登録済みの記録項目の
+	 *   `<select>` のまま。
+	 * - **下書き（`draft`）はグループ単位で一つ**。ペンの編集（右ペイン）も
+	 *   名前などの編集（「設定」タブ）も同じ下書きを書き換え、保存も一回。
+	 *   だからタブの切り替えやペンの選択・右ペインを閉じる操作では、未保存の
+	 *   確認は要らない。確かめるのは、別のグループへ移る（または新規作成へ移る）とき。
+	 * - 選んだグループとタブは URL（`?group=<id>&tab=settings`、`#lib/banto/groupsView.ts`）
+	 *   に持ち、再読み込み・戻る操作で同じ画面に戻る。新規作成中は
+	 *   `?group=new&tab=settings`（下書きは URL に持たない）。グループ・タブを
+	 *   変えると右ペインは閉じる。
+	 * - 汎用の離脱の確認（`guardUnsavedChanges`）は、ページの中の移動
+	 *   （`goto`・戻る・進む）では黙らせる（`leaveGuardMuted`。確認は
+	 *   `confirmViewChange` が済ませる）。ページの `beforeNavigate` は
+	 *   `NavigationGate.svelte` から登録する（tyaro/banto#675 の回避。「記録」ページと同じ）。
+	 *
 	 * - **しきい値は読み取り専用**で、各ペンのタグの値（LL / L / H / HH）を
 	 *   出すだけ。しきい値はタグ定義の属性で、保存はタグ定義の経路（記録）で
 	 *   行う（§3.7.1・§3.7.6、2026-10-08 オーナー決定）。
@@ -16,18 +43,18 @@
 	 *   どの欄にも出せないものはトーストへ - 黙って捨てない）。
 	 * - 更新は楽観ロック（`expectedRevision`）。先に別の人が更新していたら
 	 *   保存を拒否し、入力は残したまま「最新の内容を読み込む」を出す。
-	 * - 未保存の入力の確認（#508 の `guardUnsavedChanges`）: 編集中の下書きが
-	 *   読み込み時と違えば、画面の移動・別グループの選択の前に確かめる。
-	 * - viewer は閲覧のみ（一覧と各グループの中身は見えるが、入力欄は無効）。
+	 * - viewer は閲覧のみ（一覧と各グループの中身は見えるが、入力欄は無効で、
+	 *   右ペインは開かない）。
 	 */
+	import { untrack } from 'svelte';
+	import { page } from '$app/state';
+	import { afterNavigate, goto, type BeforeNavigate } from '$app/navigation';
 	import { UnsavedChangesNotice } from '@banto/forms';
+	import { Tabs, ThreePaneLayout } from '@banto/ui';
 	import { isProviderError } from '@banto/admin-core';
-	import {
-		guardUnsavedChanges,
-		UNSAVED_CONFIRM_LEAVE,
-		UNSAVED_DISCARD,
-		UNSAVED_NOTICE
-	} from '#lib/unsavedChanges.js';
+	import { guardUnsavedChanges, UNSAVED_DISCARD, UNSAVED_NOTICE } from '#lib/unsavedChanges.js';
+	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
+	import NavigationGate from '#lib/components/NavigationGate.svelte';
 	import { toastStore } from '#lib/toast.svelte.js';
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { canWriteResources } from '#lib/permissions.js';
@@ -50,6 +77,16 @@
 		type DisplayGroup,
 		type DisplayKind
 	} from '#lib/banto/displayGroupsAdmin.js';
+	import {
+		MISSING_GROUP_MESSAGE,
+		groupsViewSearch,
+		parseGroupsView,
+		resolveGroupsView,
+		sameGroupsView,
+		type GroupsSelection,
+		type GroupsTab,
+		type GroupsView
+	} from '#lib/banto/groupsView.js';
 	import {
 		COLOR_SLOTS,
 		KIND_OPTIONS,
@@ -163,10 +200,24 @@
 		return tagsById.get(tagId)?.name ?? `（見つからないタグ ID ${tagId}）`;
 	}
 
+	// --- 画面の状態（URL に持つもの）-------------------------------------------
+
+	/** 左の一覧で選んでいるグループとタブ（URL の `group`・`tab`）。 */
+	let view = $state<GroupsView>({ group: null, tab: 'pens' });
+	/** `'new'` = 新規作成中、数値 = 編集中のグループの ID、`null` = 未選択。 */
+	const selected = $derived<GroupsSelection>(view.group);
+	const activeTab = $derived<GroupsTab>(view.tab);
+	/** 一覧を読み終えたか（URL のグループの存在を判定してよいか）。 */
+	const groupsLoaded = $derived(groups !== null);
+
+	function applyView(next: GroupsView): void {
+		if (!sameGroupsView(view, next)) view = { ...next };
+	}
+
 	// --- 編集 -----------------------------------------------------------------
 
-	/** `'new'` = 新規作成中、数値 = 編集中のグループの ID、`null` = 未選択。 */
-	let selected = $state<'new' | number | null>(null);
+	/** 下書きが今どのグループのものか（`null` = 下書きなし）。`selected` と揃ったら描く。 */
+	let draftOwner = $state<GroupsSelection>(null);
 	let editingRevision = $state<number | undefined>(undefined);
 	let draft = $state<GroupDraft>(emptyDraft());
 	let baseline = $state<GroupDraft>(emptyDraft());
@@ -184,66 +235,65 @@
 	 */
 	let editGeneration = 0;
 
-	const dirty = $derived(selected !== null && isDraftDirty(draft, baseline));
+	const dirty = $derived(draftOwner !== null && isDraftDirty(draft, baseline));
 	const busy = $derived(saving || deleting || reordering || reloadingLatest);
+	/** 下書きが選択中のグループのものとして用意できているか。 */
+	const draftReady = $derived(selected !== null && draftOwner === selected);
 	const selectedGroup = $derived(
 		typeof selected === 'number' ? (groups ?? []).find((group) => group.id === selected) : undefined
 	);
 	const atGroupLimit = $derived((groups?.length ?? 0) >= MAX_DISPLAY_GROUPS);
 
-	guardUnsavedChanges({
-		isDirty: () => dirty,
-		isSaving: () => saving || deleting
-	});
-
 	function cloneDraft(value: GroupDraft): GroupDraft {
 		return JSON.parse(JSON.stringify(value)) as GroupDraft;
-	}
-
-	/** 未保存の入力を捨ててよいか（無ければ聞かない）。 */
-	function confirmDiscard(): boolean {
-		return !dirty || window.confirm(UNSAVED_CONFIRM_LEAVE);
 	}
 
 	function openGroup(group: DisplayGroup): void {
 		editGeneration += 1;
 		latestReloadError = null;
-		selected = group.id;
+		draftOwner = group.id;
 		editingRevision = group.revision;
 		baseline = draftFromGroup(group);
 		draft = cloneDraft(baseline);
 		fieldErrors = emptyFieldErrors();
 	}
 
-	function selectGroup(group: DisplayGroup): void {
-		if (busy || selected === group.id) return;
-		if (!confirmDiscard()) return;
-		openGroup(group);
-	}
-
-	function startNew(): void {
-		if (busy || !confirmDiscard()) return;
+	function openNewDraft(): void {
 		editGeneration += 1;
 		latestReloadError = null;
-		selected = 'new';
+		draftOwner = 'new';
 		editingRevision = undefined;
 		baseline = emptyDraft();
 		draft = emptyDraft();
 		fieldErrors = emptyFieldErrors();
 	}
 
-	function closeEditor(): void {
-		if (busy || !confirmDiscard()) return;
-		editGeneration += 1;
-		latestReloadError = null;
-		selected = null;
-		fieldErrors = emptyFieldErrors();
-	}
+	// 選んだグループ（`selected`）に下書きを合わせる。グループの切り替え（確認は
+	// `confirmViewChange` が済ませてある）・URL からの復元・一覧の読み込み完了で
+	// 走る。同じグループの下書きは作り直さない（入力中の値を消さない）。
+	$effect(() => {
+		const target = selected;
+		const rows = groups;
+		untrack(() => {
+			if (target === null) {
+				draftOwner = null;
+				return;
+			}
+			if (draftOwner === target) return;
+			if (target === 'new') {
+				openNewDraft();
+				return;
+			}
+			const row = rows?.find((group) => group.id === target);
+			if (row) openGroup(row);
+		});
+	});
 
 	function discardChanges(): void {
 		editGeneration += 1;
 		draft = cloneDraft(baseline);
 		fieldErrors = emptyFieldErrors();
+		if (selectedPen !== null && selectedPen >= draft.pens.length) closeRightPane();
 	}
 
 	/**
@@ -269,13 +319,15 @@
 				case 'open':
 					groups = outcome.groups;
 					groupsError = null;
+					closeRightPane();
 					openGroup(outcome.group);
 					break;
 				case 'deleted':
 					groups = outcome.groups;
 					groupsError = null;
 					editGeneration += 1;
-					selected = null;
+					closeRightPane();
+					forceView({ group: null, tab: 'pens' });
 					toastStore.push('error', 'このグループは削除されています');
 					break;
 				case 'failed':
@@ -302,7 +354,7 @@
 	}
 
 	async function save(): Promise<void> {
-		if (busy || selected === null) return;
+		if (busy || selected === null || !draftReady) return;
 		const problems = draftProblems(draft);
 		if (problems.length > 0) {
 			for (const problem of problems) toastStore.push('error', problem);
@@ -323,6 +375,8 @@
 			);
 			await reloadGroups();
 			openGroup(saved);
+			// 作成したら、新規作成中の URL を作ったグループへ置き換える（右ペインは閉じない）。
+			if (target === 'new') forceView({ group: saved.id, tab: view.tab }, { replace: true });
 		} catch (err) {
 			if (isProviderError(err) && err.body.kind === 'validation') {
 				fieldErrors = sortFieldErrors(err.body.field_errors);
@@ -344,7 +398,8 @@
 		try {
 			await deleteDisplayGroup(selected);
 			toastStore.push('success', `${name} を削除しました`);
-			selected = null;
+			closeRightPane();
+			forceView({ group: null, tab: 'pens' });
 			await reloadGroups();
 		} catch (err) {
 			toastStore.push('error', errorMessage(err));
@@ -368,12 +423,280 @@
 		}
 	}
 
+	// --- 右ペイン（選んだペンの設定）--------------------------------------------
+
+	/** 右ペインで設定しているペンの番号（`null` = 閉じている）。 */
+	let selectedPen = $state<number | null>(null);
+	/** 狭幅で右ペイン（ドロワー）が開いているか（`ThreePaneLayout` の `rightDrawerOpen`）。 */
+	let rightDrawerOpen = $state(false);
+	/** 狭幅で左の一覧（ドロワー）が開いているか（`ThreePaneLayout` の `leftDrawerOpen`）。 */
+	let listOpen = $state(false);
+	/** 枠（`ThreePaneLayout`）が狭幅か（部品の `bind:narrow`、出力専用）。 */
+	let layoutNarrow = $state(false);
+
+	/** 右ペインを出すか（編集者以上・「ペン」タブ・下書きの用意ができているペン）。 */
+	const penPaneOpen = $derived(
+		canWrite &&
+			draftReady &&
+			activeTab === 'pens' &&
+			selectedPen !== null &&
+			selectedPen < draft.pens.length
+	);
+
+	function openPen(index: number): void {
+		if (!canWrite) return;
+		selectedPen = index;
+		if (layoutNarrow) {
+			listOpen = false;
+			rightDrawerOpen = true;
+		}
+	}
+
+	function closeRightPane(): void {
+		selectedPen = null;
+		rightDrawerOpen = false;
+	}
+
+	function addPenAndOpen(): void {
+		if (!canAddPen(draft)) return;
+		draft = addPen(draft);
+		openPen(draft.pens.length - 1);
+	}
+
+	function movePenAt(index: number, delta: -1 | 1): void {
+		draft = movePen(draft, index, delta);
+		// 右ペインで開いているペンは、並べ替えても同じペンを指し続ける。
+		if (selectedPen === index) selectedPen = index + delta;
+		else if (selectedPen === index + delta) selectedPen = index;
+	}
+
+	function removePenAt(index: number): void {
+		draft = removePen(draft, index);
+		if (selectedPen === index) closeRightPane();
+		else if (selectedPen !== null && selectedPen > index) selectedPen -= 1;
+	}
+
+	/** 右ペインの見出し（と `ThreePaneLayout` の右ペインの名前）。 */
+	const rightPaneTitle = $derived(selectedPen === null ? 'ペン' : `ペン ${selectedPen + 1} の設定`);
+
+	// --- 画面の状態の切り替えと URL ---------------------------------------------
+	//
+	// 「記録」ページ（`tags/+page.svelte`）と同じ作り:
+	// - 状態の持ち主は `view`。ユーザーの操作は `requestView`（確認 → 状態を変える →
+	//   URL を `goto` で追従）、戻る・進む・再読み込みは下の `$effect`（URL → 状態）。
+	//   ページ内の `goto` が終わるまでその `$effect` を止める（`viewNavsInFlight`）。
+	// - 未保存の確認は `confirmViewChange`: **別のグループへ移るときだけ**（タブの
+	//   切り替えは同じ下書きのままなので確かめない）。キャンセルなら何も変えない。
+	// - ページの中の移動では汎用の離脱の確認（`guardUnsavedChanges`）を出さない
+	//   （`leaveGuardMuted`）。ページ内の `goto` は呼ぶ前から、戻る・進むは
+	//   `handleBeforeNavigate` で確かめてからその移動が終わるまで黙らせる。
+	//   `handleBeforeNavigate` はテンプレートの一番最初の `NavigationGate` から呼び、
+	//   子の guard より先に走らせる。
+	// - グループ・タブを変えると右ペインは閉じる（右ペインの中身は前のグループの
+	//   ペンだったため）。ただし作成が成功して URL を作ったグループへ置き換える
+	//   `forceView` は閉じない（同じ下書きが続くため）。
+
+	/** 未保存の下書きを捨てて切り替えてよいかの確認文。 */
+	const DISCARD_CONFIRM = '保存していない変更があります。変更を破棄して切り替えますか？';
+
+	/**
+	 * 画面の状態を変えてよいか確かめる（キャンセルなら `false`。そのときは何も
+	 * 変えない）。保存中は変えさせない。
+	 */
+	function confirmViewChange(next: GroupsView): boolean {
+		if (sameGroupsView(view, next)) return true;
+		if (busy) return false;
+		if (view.group !== next.group && dirty && !window.confirm(DISCARD_CONFIRM)) return false;
+		closeRightPane();
+		return true;
+	}
+
+	/** ページ内の `goto`（`requestView`・URL の正規化）の行き先。`beforeNavigate` は確認を飛ばす。 */
+	const viewNavHrefs = new Set<string>();
+	/** 進行中のページ内の `goto` の数。0 になったら URL から状態を決め直す。 */
+	let viewNavsInFlight = $state(0);
+
+	/** 画面の状態を `next` にする。未保存の確認でキャンセルされたら `false`。 */
+	function requestView(next: GroupsView): boolean {
+		if (sameGroupsView(view, next)) return true;
+		if (!confirmViewChange(next)) return false;
+		applyView(next);
+		void navigateToView(next, { replace: false });
+		return true;
+	}
+
+	/** 確認なしで画面の状態を変える（削除・作成の成功の後。右ペインはここでは触らない）。 */
+	function forceView(next: GroupsView, options: { replace?: boolean } = {}): void {
+		applyView(next);
+		void navigateToView(next, { replace: options.replace === true });
+	}
+
+	async function navigateToView(next: GroupsView, options: { replace: boolean }): Promise<void> {
+		const url = new URL(page.url.href);
+		url.search = groupsViewSearch(next);
+		// 先の `goto` がまだ終わっていない間は `page.url` が古いので、同じに見えても省かない。
+		if (url.href === page.url.href && viewNavsInFlight === 0) return;
+		const href = url.href;
+		viewNavHrefs.add(href);
+		viewNavsInFlight += 1;
+		// 離脱の確認は `goto` を呼ぶ**前に**黙らせる（`leaveGuardMuted` の説明）。
+		leaveGuardMuted += 1;
+		try {
+			// `reset: false`: フォーカスとスクロールを動かさない（同じページの中の切り替え）。
+			await goto(url, { replace: options.replace, reset: false });
+		} catch {
+			// 失敗しても、下の `$effect` がその時点の URL へ状態を戻す。
+		} finally {
+			viewNavHrefs.delete(href);
+			viewNavsInFlight -= 1;
+			leaveGuardMuted -= 1;
+		}
+	}
+
+	/**
+	 * URL から画面の状態を決める（戻る・進む・再読み込み・リンク、とページ内の
+	 * `goto` が取り消された場合）。一覧を読み終えたら、読めない値・一覧に無い id は
+	 * 未選択へ倒し、URL も正規化した形へ置き換える（`replace`）。案内は URL から
+	 * 来たグループが見つからないときだけ（一度は見つかったグループが消えたときは出さない）。
+	 */
+	let lastFoundGroup: GroupsSelection = null;
+	$effect(() => {
+		const search = page.url.search;
+		const loaded = groupsLoaded;
+		const rows = groups ?? [];
+		const canCreate = canWrite;
+		if (viewNavsInFlight > 0) return;
+		const parsed = parseGroupsView(new URLSearchParams(search));
+		const resolved = resolveGroupsView(parsed, rows, { loaded, canCreate });
+		untrack(() => {
+			if (loaded && !resolved.missingGroup) lastFoundGroup = resolved.view.group;
+			const wasFound = typeof parsed.group === 'number' && parsed.group === lastFoundGroup;
+			if (loaded && resolved.missingGroup && !wasFound) {
+				toastStore.push('info', MISSING_GROUP_MESSAGE);
+			}
+			if (!sameGroupsView(view, resolved.view)) {
+				closeRightPane();
+				applyView(resolved.view);
+			}
+			if (loaded && search !== groupsViewSearch(resolved.view)) {
+				void navigateToView(resolved.view, { replace: true });
+			}
+		});
+	});
+
+	/**
+	 * 進行中の「ページの中の移動」の数。0 より大きい間は、離脱の確認
+	 * （`guardUnsavedChanges`）を黙らせる。ページの中の移動（ページ内の `goto`、
+	 * 戻る・進む・リンクでクエリだけが変わる）は `confirmViewChange` で確かめ済みなので、
+	 * 汎用の離脱の確認を二重に出さない（`tags/+page.svelte` の同名の説明を参照）。
+	 * `$state` にしない（`isDirty` を読むのは guard のコールバックだけ）。
+	 */
+	let leaveGuardMuted = 0;
+	/** 戻る・進むなどで上げた分を下げる関数（`afterNavigate` の備えのため控える）。 */
+	const pendingLeaveGuardReleases = new Set<() => void>();
+
+	function muteLeaveGuardUntil(complete: Promise<void> | undefined): void {
+		leaveGuardMuted += 1;
+		let released = false;
+		const release = () => {
+			if (released) return;
+			released = true;
+			leaveGuardMuted -= 1;
+			pendingLeaveGuardReleases.delete(release);
+		};
+		pendingLeaveGuardReleases.add(release);
+		if (complete) {
+			complete.then(release, release);
+		} else {
+			queueMicrotask(release);
+		}
+	}
+
+	afterNavigate(() => {
+		for (const release of [...pendingLeaveGuardReleases]) release();
+	});
+
+	/**
+	 * ページの `beforeNavigate`。テンプレートの一番最初の `NavigationGate` から
+	 * 呼ばれるので、このページの中のどの guard よりも先に走る。
+	 */
+	function handleBeforeNavigate(nav: BeforeNavigate): void {
+		const to = nav.to?.url;
+		if (!to) return;
+		// ページ内の `goto`: `navigateToView` が呼ぶ前から黙らせている。
+		if (viewNavHrefs.has(to.href)) return;
+		if (!nav.willUnload && to.pathname === page.url.pathname) {
+			const next = resolveGroupsView(parseGroupsView(to.searchParams), groups ?? [], {
+				loaded: groupsLoaded,
+				canCreate: canWrite
+			}).view;
+			// 取り消すときも黙らせる（後に続く guard のコールバックは、取り消された
+			// 移動にも呼ばれるので、黙らせないと二度目の確認が出る）。
+			muteLeaveGuardUntil(nav.complete);
+			if (!confirmViewChange(next)) nav.cancel();
+		}
+		// 別のページ・再読み込みは guard に任せる。
+	}
+
+	// 未保存の入力の確認（banto #214 の流儀、ChronoGazer #508）: 編集中の下書きが
+	// 読み込み時と違えば、別のページへ移る・再読み込みの前に確かめる。
+	guardUnsavedChanges({
+		isDirty: () => leaveGuardMuted === 0 && dirty,
+		isSaving: () => leaveGuardMuted === 0 && (saving || deleting)
+	});
+
+	function setActiveTab(id: string | undefined): void {
+		requestView({ group: view.group, tab: id === 'settings' ? 'settings' : 'pens' });
+	}
+
+	function selectGroup(group: DisplayGroup): void {
+		const moved = requestView({ group: group.id, tab: view.tab });
+		// 狭幅では、選んだら一覧のドロワーを閉じて中央を見せる。
+		if (moved && layoutNarrow) listOpen = false;
+	}
+
+	function startNew(): void {
+		if (busy || !canWrite || atGroupLimit || groups === null) return;
+		const moved = requestView({ group: 'new', tab: 'settings' });
+		if (moved && layoutNarrow) listOpen = false;
+	}
+
+	function cancelNew(): void {
+		requestView({ group: null, tab: 'pens' });
+	}
+
+	/** 一覧を閉じていても何を開いているか分かるよう、枠の帯に出す名前。 */
+	const listSelectionLabel = $derived.by((): string => {
+		if (selected === 'new') return '新しい表示グループ';
+		return selectedGroup?.name ?? '表示グループ';
+	});
+
+	/** 左ペインとそのトグルの名前。 */
+	const LIST_PANE_LABEL = '表示グループ';
+
+	/** 中央のタブ。 */
+	const viewTabs = [
+		{ id: 'pens', label: 'ペン' },
+		{ id: 'settings', label: '設定' }
+	];
+
+	// 層の約束（`@banto/ui` の `layering.ts`）: 下位の層（枠の中のドロワー）を開くなら
+	// 上位の層（サイドバー）を先に畳む（「記録」ページと同じ。開いた遷移で畳む）。
+	$effect(() => {
+		if (!listOpen) return;
+		untrack(() => {
+			if (mobileNavStore.open) mobileNavStore.closeNav();
+		});
+	});
+
 	$effect(() => {
 		if (!available) return;
 		void reloadGroups();
 		void reloadTags();
 	});
 </script>
+
+<NavigationGate onbeforenavigate={handleBeforeNavigate} />
 
 <div class="page">
 	<h2>表示グループ</h2>
@@ -383,297 +706,409 @@
 			{DEMO_MODE_MESSAGE}。単体ブラウザのデモモードにはDBが無いため、この機能はTauriアプリまたはLANアクセス（組み込みサーバー）でのみ利用できます。
 		</p>
 	{:else}
-		<p class="note">
-			表示グループは監視画面の表示の単位です（収集グループとは別物）。1 グループに最大 {MAX_PENS} 本のペン（タグ）と表示種別を設定します。グループは最大
-			{MAX_DISPLAY_GROUPS} 個です。しきい値はタグの設定で、ここでは確認だけできます。
-		</p>
-
-		<section class="groups-section" aria-label="表示グループの一覧">
-			<div class="section-head">
-				<h3>表示グループ</h3>
-				{#if canWrite}
-					<button
-						type="button"
-						class="primary"
-						onclick={startNew}
-						disabled={busy || atGroupLimit || groups === null}
-					>
-						新規グループ
+		<!--
+			#1179 PR6a: 右ペイン = 選んだペンの設定（タグの選択と色）。編集者以上の
+			ときだけ開く。ペンの編集は中央の下書きを直接書き換える（保存は中央の上）。
+		-->
+		{#snippet rightPaneContent()}
+			<div class="detail-pane" data-testid="display-group-pen-pane">
+				<div class="detail-pane-header">
+					<h3>{rightPaneTitle}</h3>
+					<button type="button" class="pane-close" onclick={closeRightPane} aria-label="閉じる">
+						×
 					</button>
-				{/if}
-			</div>
-			{#if canWrite && atGroupLimit}
-				<p class="note">
-					表示グループは {MAX_DISPLAY_GROUPS} 個までです。新しく作るには不要なグループを削除してください。
-				</p>
-			{/if}
-
-			{#if groups === null && groupsError === null}
-				<p class="loading">読み込み中…</p>
-			{:else if groups === null}
-				<p class="load-error" role="alert">
-					表示グループの一覧を読み込めませんでした（{groupsError}）。登録が0件という意味ではありません。
-					<button type="button" onclick={() => void reloadGroups()} disabled={groupsLoading}
-						>再試行</button
-					>
-				</p>
-			{:else}
-				{#if groupsError !== null}
-					<p class="load-error" role="alert">
-						一覧を更新できませんでした（{groupsError}）。表示は最後に読み込めた内容です。
-						<button type="button" onclick={() => void reloadGroups()} disabled={groupsLoading}
-							>再試行</button
-						>
-					</p>
-				{/if}
-				{#if groups.length === 0}
-					<p class="note">表示グループはまだありません。</p>
-				{:else}
-					<ul class="group-list">
-						{#each groups as group, index (group.id)}
-							<li class:selected={selected === group.id}>
-								<button
-									type="button"
-									class="group-open"
-									onclick={() => selectGroup(group)}
-									disabled={busy}
-								>
-									<span class="group-name">{group.name}</span>
-									<span class="group-meta"
-										>{kindLabel(group.kind)}・ペン {group.pens.length} 本</span
-									>
-								</button>
-								{#if canWrite}
-									<button
-										type="button"
-										class="icon"
-										aria-label={`${group.name} を上へ`}
-										onclick={() => void moveGroup(group.id, -1)}
-										disabled={busy || index === 0}
-									>
-										↑
-									</button>
-									<button
-										type="button"
-										class="icon"
-										aria-label={`${group.name} を下へ`}
-										onclick={() => void moveGroup(group.id, 1)}
-										disabled={busy || index === groups.length - 1}
-									>
-										↓
-									</button>
-								{/if}
-							</li>
-						{/each}
-					</ul>
-				{/if}
-			{/if}
-		</section>
-
-		{#if selected !== null}
-			<section class="editor-section" aria-label="表示グループの編集">
-				<div class="section-head">
-					<h3>
-						{selected === 'new'
-							? '新しい表示グループ'
-							: canWrite
-								? `${selectedGroup?.name ?? ''} を編集`
-								: (selectedGroup?.name ?? '')}
-					</h3>
-					<UnsavedChangesNotice pending={dirty} label={UNSAVED_NOTICE} />
 				</div>
-
-				{#if fieldErrors.revision.length > 0}
-					<p class="load-error" role="alert">
-						{fieldErrors.revision.join(' / ')}
-						<button type="button" onclick={() => void reloadLatest()} disabled={busy}>
-							{reloadingLatest ? '読み込み中…' : '最新の内容を読み込む（入力を破棄）'}
-						</button>
-					</p>
-					{#if latestReloadError !== null}
-						<p class="load-error" role="alert">
-							最新の内容を読み込めませんでした（{latestReloadError}）。入力はそのまま残っています。
-						</p>
-					{/if}
-				{/if}
-
-				<fieldset class="editor" disabled={!canWrite || busy}>
-					<label class="field">
-						<span>名前</span>
-						<input type="text" maxlength="100" bind:value={draft.name} />
-						{#each fieldErrors.name as message, i (i)}
-							<span class="field-error">{message}</span>
-						{/each}
-					</label>
-
-					<label class="field">
-						<span>表示種別</span>
-						<select
-							value={draft.kind}
-							onchange={(e) => setKind(e.currentTarget.value as DisplayKind)}
-						>
-							{#each KIND_OPTIONS as option (option.value)}
-								<option value={option.value}>{option.label}</option>
-							{/each}
-						</select>
-						{#each fieldErrors.kind as message, i (i)}
-							<span class="field-error">{message}</span>
-						{/each}
-					</label>
-
-					{#if draft.kind === 'trend'}
-						<label class="field">
-							<span>既定の時間窓</span>
-							<select
-								value={String(draft.timeWindowSec)}
-								onchange={(e) => (draft.timeWindowSec = Number(e.currentTarget.value))}
-							>
-								{#each TIME_WINDOW_OPTIONS as option (option.value)}
-									<option value={String(option.value)}>{option.label}</option>
-								{/each}
-							</select>
-							{#each fieldErrors.timeWindowSec as message, i (i)}
-								<span class="field-error">{message}</span>
-							{/each}
-						</label>
-					{/if}
-
-					<div class="pens">
-						<div class="pens-head">
-							<span class="pens-title">ペン（{draft.pens.length} / {MAX_PENS}）</span>
-							{#if canWrite}
-								<button
-									type="button"
-									onclick={() => (draft = addPen(draft))}
-									disabled={!canAddPen(draft) || tags === null}
+				<div class="detail-pane-body">
+					{#if selectedPen !== null && selectedPen < draft.pens.length}
+						{@const index = selectedPen}
+						{@const pen = draft.pens[index]}
+						{@const used = tagsUsedByOtherPens(draft, index)}
+						<fieldset class="editor" disabled={busy}>
+							<label class="field">
+								<span>ペン {index + 1} のタグ</span>
+								<select
+									value={pen.tagId === null ? '' : String(pen.tagId)}
+									onchange={(e) => setPenTag(index, e.currentTarget.value)}
 								>
-									ペンを追加
-								</button>
-							{/if}
-						</div>
-						{#if tagsError !== null}
-							<p class="load-error" role="alert">
-								タグの一覧を読み込めませんでした（{tagsError}）。
-								<button type="button" onclick={() => void reloadTags()}>再試行</button>
-							</p>
-						{/if}
-						{#each fieldErrors.pens as message, i (i)}
+									<option value="">タグを選択</option>
+									{#if pen.tagId !== null && !tagsById.has(pen.tagId)}
+										<option value={String(pen.tagId)}>{tagLabel(pen.tagId)}</option>
+									{/if}
+									{#each tagOptionGroups as optionGroup (optionGroup.label)}
+										<optgroup label={optionGroup.label}>
+											{#each optionGroup.tags as tag (tag.id)}
+												<option value={String(tag.id)} disabled={used.has(tag.id)}
+													>{tag.name}{tag.unit ? `（${tag.unit}）` : ''}</option
+												>
+											{/each}
+										</optgroup>
+									{/each}
+								</select>
+							</label>
+							<label class="field">
+								<span>ペン {index + 1} の色</span>
+								<select
+									value={pen.colorSlot === null ? '' : String(pen.colorSlot)}
+									onchange={(e) => setPenColor(index, e.currentTarget.value)}
+								>
+									<option value="">既定（色 {defaultColorSlot(index)}）</option>
+									{#each Array.from({ length: COLOR_SLOTS }, (_, i) => i + 1) as colorSlot (colorSlot)}
+										<option value={String(colorSlot)}>色 {colorSlot}</option>
+									{/each}
+								</select>
+							</label>
+						</fieldset>
+						{#each fieldErrors.penRows[index] ?? [] as message, i (i)}
 							<p class="field-error">{message}</p>
 						{/each}
-						{#if draft.pens.length === 0}
-							<p class="note">ペンがありません。「ペンを追加」でタグを割り当てます。</p>
-						{:else}
-							<ol class="pen-list">
-								{#each draft.pens as pen, index (index)}
-									{@const used = tagsUsedByOtherPens(draft, index)}
-									{@const slot = effectiveColorSlot(pen, index)}
-									<li class="pen">
-										<span class="swatch" style:background={colorSlotVar(slot)} aria-hidden="true"
-										></span>
-										<label class="pen-field">
-											<span>ペン {index + 1} のタグ</span>
-											<select
-												value={pen.tagId === null ? '' : String(pen.tagId)}
-												onchange={(e) => setPenTag(index, e.currentTarget.value)}
-											>
-												<option value="">タグを選択</option>
-												{#if pen.tagId !== null && !tagsById.has(pen.tagId)}
-													<option value={String(pen.tagId)}>{tagLabel(pen.tagId)}</option>
-												{/if}
-												{#each tagOptionGroups as optionGroup (optionGroup.label)}
-													<optgroup label={optionGroup.label}>
-														{#each optionGroup.tags as tag (tag.id)}
-															<option value={String(tag.id)} disabled={used.has(tag.id)}
-																>{tag.name}{tag.unit ? `（${tag.unit}）` : ''}</option
-															>
-														{/each}
-													</optgroup>
-												{/each}
-											</select>
-										</label>
-										<label class="pen-field color">
-											<span>ペン {index + 1} の色</span>
-											<select
-												value={pen.colorSlot === null ? '' : String(pen.colorSlot)}
-												onchange={(e) => setPenColor(index, e.currentTarget.value)}
-											>
-												<option value="">既定（色 {defaultColorSlot(index)}）</option>
-												{#each Array.from({ length: COLOR_SLOTS }, (_, i) => i + 1) as colorSlot (colorSlot)}
-													<option value={String(colorSlot)}>色 {colorSlot}</option>
-												{/each}
-											</select>
-										</label>
-										<span
-											class="thresholds"
-											title="しきい値は「記録」ページの「しきい値（記録計の設定）」で変更します"
-										>
-											しきい値: {penThresholdText(
-												pen.tagId,
-												pen.tagId !== null && tagsById.has(pen.tagId),
-												thresholdsByTag,
-												thresholdsError !== null
-											)}
-										</span>
-										{#if canWrite}
-											<span class="pen-actions">
-												<button
-													type="button"
-													class="icon"
-													aria-label={`ペン ${index + 1} を上へ`}
-													onclick={() => (draft = movePen(draft, index, -1))}
-													disabled={index === 0}
-												>
-													↑
-												</button>
-												<button
-													type="button"
-													class="icon"
-													aria-label={`ペン ${index + 1} を下へ`}
-													onclick={() => (draft = movePen(draft, index, 1))}
-													disabled={index === draft.pens.length - 1}
-												>
-													↓
-												</button>
-												<button
-													type="button"
-													class="icon"
-													aria-label={`ペン ${index + 1} を外す`}
-													onclick={() => (draft = removePen(draft, index))}
-												>
-													×
-												</button>
-											</span>
-										{/if}
-										{#each fieldErrors.penRows[index] ?? [] as message, i (i)}
-											<span class="field-error pen-error">{message}</span>
-										{/each}
-									</li>
-								{/each}
-							</ol>
-						{/if}
-					</div>
-				</fieldset>
-
-				<div class="actions">
-					{#if canWrite}
-						<button type="button" class="primary" onclick={() => void save()} disabled={busy}>
-							{selected === 'new' ? '作成' : '保存'}
-						</button>
-						<button type="button" onclick={discardChanges} disabled={busy || !dirty}>
-							{UNSAVED_DISCARD}
-						</button>
-						{#if typeof selected === 'number'}
-							<button type="button" class="danger" onclick={() => void remove()} disabled={busy}>
-								削除
-							</button>
-						{/if}
-					{:else}
-						<p class="note">閲覧のみ（編集には編集者以上の権限が必要です）。</p>
+						<p class="note">変更は下書きに入り、中央の上の「保存」で確定します。</p>
 					{/if}
-					<button type="button" onclick={closeEditor} disabled={busy}>閉じる</button>
 				</div>
-			</section>
-		{/if}
+			</div>
+		{/snippet}
+
+		<!--
+			#1179 PR6a: 左の一覧・中央のタブ・右のペイン設定の 3 ペイン（`@banto/ui` の
+			`ThreePaneLayout`）。狭幅の判定はビューポート（`mobileNavStore.isNarrow`）。
+			帯には、一覧を閉じていても何を開いているか分かるよう、選択中の名前を出す。
+		-->
+		<div class="groups-frame">
+			<ThreePaneLayout
+				narrowOverride={mobileNavStore.isNarrow}
+				bind:leftDrawerOpen={listOpen}
+				bind:rightDrawerOpen
+				bind:narrow={layoutNarrow}
+				right={penPaneOpen ? rightPaneContent : undefined}
+				messages={{
+					threePaneLeft: () => LIST_PANE_LABEL,
+					threePaneResizeLeft: () => `${LIST_PANE_LABEL}の幅`,
+					threePaneRight: () => rightPaneTitle,
+					threePaneResizeRight: () => `${rightPaneTitle}の幅`
+				}}
+			>
+				{#snippet left()}
+					<div class="list-pane" data-testid="display-group-list-pane">
+						{#if canWrite}
+							<div class="list-toolbar">
+								<button
+									type="button"
+									class="secondary"
+									onclick={startNew}
+									disabled={busy || atGroupLimit || groups === null}
+								>
+									表示グループを追加
+								</button>
+							</div>
+						{/if}
+						{#if canWrite && atGroupLimit}
+							<p class="note">
+								表示グループは {MAX_DISPLAY_GROUPS} 個までです。新しく作るには不要なグループを削除してください。
+							</p>
+						{/if}
+
+						<section class="group-list-section" aria-label="表示グループの一覧">
+							{#if groups === null && groupsError === null}
+								<p class="loading">読み込み中…</p>
+							{:else if groups === null}
+								<p class="load-error" role="alert">
+									表示グループの一覧を読み込めませんでした（{groupsError}）。登録が0件という意味ではありません。
+									<button type="button" onclick={() => void reloadGroups()} disabled={groupsLoading}
+										>再試行</button
+									>
+								</p>
+							{:else}
+								{#if groupsError !== null}
+									<p class="load-error" role="alert">
+										一覧を更新できませんでした（{groupsError}）。表示は最後に読み込めた内容です。
+										<button
+											type="button"
+											onclick={() => void reloadGroups()}
+											disabled={groupsLoading}>再試行</button
+										>
+									</p>
+								{/if}
+								{#if groups.length === 0}
+									<p class="note">表示グループはまだありません。</p>
+								{:else}
+									<ul class="group-list">
+										{#each groups as group, index (group.id)}
+											<li class:selected={selected === group.id}>
+												<button
+													type="button"
+													class="group-open"
+													aria-current={selected === group.id ? 'true' : undefined}
+													onclick={() => selectGroup(group)}
+													disabled={busy}
+												>
+													<span class="group-name">{group.name}</span>
+													<span class="group-meta"
+														>{kindLabel(group.kind)}・ペン {group.pens.length} 本</span
+													>
+												</button>
+												{#if canWrite}
+													<button
+														type="button"
+														class="icon"
+														aria-label={`${group.name} を上へ`}
+														onclick={() => void moveGroup(group.id, -1)}
+														disabled={busy || index === 0}
+													>
+														↑
+													</button>
+													<button
+														type="button"
+														class="icon"
+														aria-label={`${group.name} を下へ`}
+														onclick={() => void moveGroup(group.id, 1)}
+														disabled={busy || index === groups.length - 1}
+													>
+														↓
+													</button>
+												{/if}
+											</li>
+										{/each}
+									</ul>
+								{/if}
+							{/if}
+						</section>
+					</div>
+				{/snippet}
+				{#snippet titleContent()}
+					<span class="list-selection" data-testid="display-group-selection">
+						{listSelectionLabel}
+					</span>
+				{/snippet}
+
+				<div class="center-pane" data-testid="display-group-center">
+					{#if selected === null}
+						<p class="note">
+							{canWrite
+								? '左の一覧から表示グループを選ぶか、「表示グループを追加」で作ります。'
+								: '左の一覧から表示グループを選んでください。'}
+						</p>
+					{:else if !draftReady}
+						<p class="loading">読み込み中…</p>
+					{:else}
+						<!--
+							保存・取り消し・未保存の表示・楽観ロックの案内は、どちらのタブでも見える
+							ようタブの外（中央の上）に置く。下書きはグループ単位で一つ。
+						-->
+						<div class="edit-bar">
+							<div class="edit-bar-head">
+								<h3>
+									{selected === 'new' ? '新しい表示グループ' : (selectedGroup?.name ?? '')}
+								</h3>
+								<UnsavedChangesNotice pending={dirty} label={UNSAVED_NOTICE} />
+							</div>
+
+							{#if fieldErrors.revision.length > 0}
+								<p class="load-error" role="alert">
+									{fieldErrors.revision.join(' / ')}
+									<button type="button" onclick={() => void reloadLatest()} disabled={busy}>
+										{reloadingLatest ? '読み込み中…' : '最新の内容を読み込む（入力を破棄）'}
+									</button>
+								</p>
+								{#if latestReloadError !== null}
+									<p class="load-error" role="alert">
+										最新の内容を読み込めませんでした（{latestReloadError}）。入力はそのまま残っています。
+									</p>
+								{/if}
+							{/if}
+
+							<div class="actions">
+								{#if canWrite}
+									<button type="button" class="primary" onclick={() => void save()} disabled={busy}>
+										{selected === 'new' ? '作成' : '保存'}
+									</button>
+									<button type="button" onclick={discardChanges} disabled={busy || !dirty}>
+										{UNSAVED_DISCARD}
+									</button>
+									{#if selected === 'new'}
+										<button type="button" onclick={cancelNew} disabled={busy}>やめる</button>
+									{/if}
+								{:else}
+									<p class="note">閲覧のみ（編集には編集者以上の権限が必要です）。</p>
+								{/if}
+							</div>
+						</div>
+
+						<div class="view-tabs">
+							<Tabs
+								tabs={viewTabs}
+								bind:value={() => activeTab, setActiveTab}
+								label="表示の切り替え"
+							>
+								{#snippet panel(id)}
+									{#if id === 'pens'}
+										<div class="pens">
+											<div class="pens-head">
+												<span class="pens-title">ペン（{draft.pens.length} / {MAX_PENS}）</span>
+												{#if canWrite}
+													<button
+														type="button"
+														class="secondary"
+														onclick={addPenAndOpen}
+														disabled={busy || !canAddPen(draft) || tags === null}
+													>
+														ペンを追加
+													</button>
+												{/if}
+											</div>
+											{#if tagsError !== null}
+												<p class="load-error" role="alert">
+													タグの一覧を読み込めませんでした（{tagsError}）。
+													<button type="button" onclick={() => void reloadTags()}>再試行</button>
+												</p>
+											{/if}
+											{#each fieldErrors.pens as message, i (i)}
+												<p class="field-error">{message}</p>
+											{/each}
+											{#if draft.pens.length === 0}
+												<p class="note">
+													ペンがありません。{canWrite ? '「ペンを追加」でタグを割り当てます。' : ''}
+												</p>
+											{:else}
+												<ol class="pen-list">
+													{#each draft.pens as pen, index (index)}
+														{@const slot = effectiveColorSlot(pen, index)}
+														{#snippet penSummary()}
+															<span
+																class="swatch"
+																style:background={colorSlotVar(slot)}
+																aria-hidden="true"
+															></span>
+															<span class="pen-number">ペン {index + 1}</span>
+															<span class="pen-tag">
+																{pen.tagId === null ? 'タグ未選択' : tagLabel(pen.tagId)}
+															</span>
+															<span
+																class="thresholds"
+																title="しきい値は「記録」ページの「しきい値（記録計の設定）」で変更します"
+															>
+																しきい値: {penThresholdText(
+																	pen.tagId,
+																	pen.tagId !== null && tagsById.has(pen.tagId),
+																	thresholdsByTag,
+																	thresholdsError !== null
+																)}
+															</span>
+														{/snippet}
+														<li class="pen" class:selected={penPaneOpen && selectedPen === index}>
+															{#if canWrite}
+																<button
+																	type="button"
+																	class="pen-open"
+																	data-testid={`display-group-pen-${index + 1}`}
+																	aria-current={penPaneOpen && selectedPen === index
+																		? 'true'
+																		: undefined}
+																	onclick={() => openPen(index)}
+																>
+																	{@render penSummary()}
+																</button>
+																<span class="pen-actions">
+																	<button
+																		type="button"
+																		class="icon"
+																		aria-label={`ペン ${index + 1} を上へ`}
+																		onclick={() => movePenAt(index, -1)}
+																		disabled={busy || index === 0}
+																	>
+																		↑
+																	</button>
+																	<button
+																		type="button"
+																		class="icon"
+																		aria-label={`ペン ${index + 1} を下へ`}
+																		onclick={() => movePenAt(index, 1)}
+																		disabled={busy || index === draft.pens.length - 1}
+																	>
+																		↓
+																	</button>
+																	<button
+																		type="button"
+																		class="icon"
+																		aria-label={`ペン ${index + 1} を外す`}
+																		onclick={() => removePenAt(index)}
+																		disabled={busy}
+																	>
+																		×
+																	</button>
+																</span>
+															{:else}
+																<div class="pen-open static">{@render penSummary()}</div>
+															{/if}
+															{#each fieldErrors.penRows[index] ?? [] as message, i (i)}
+																<span class="field-error pen-error">{message}</span>
+															{/each}
+														</li>
+													{/each}
+												</ol>
+											{/if}
+											<p class="note">しきい値はタグの設定で、ここでは確認だけできます。</p>
+										</div>
+									{:else}
+										<fieldset class="editor" disabled={!canWrite || busy}>
+											<label class="field">
+												<span>名前</span>
+												<input type="text" maxlength="100" bind:value={draft.name} />
+												{#each fieldErrors.name as message, i (i)}
+													<span class="field-error">{message}</span>
+												{/each}
+											</label>
+
+											<label class="field">
+												<span>表示種別</span>
+												<select
+													value={draft.kind}
+													onchange={(e) => setKind(e.currentTarget.value as DisplayKind)}
+												>
+													{#each KIND_OPTIONS as option (option.value)}
+														<option value={option.value}>{option.label}</option>
+													{/each}
+												</select>
+												{#each fieldErrors.kind as message, i (i)}
+													<span class="field-error">{message}</span>
+												{/each}
+											</label>
+
+											{#if draft.kind === 'trend'}
+												<label class="field">
+													<span>既定の時間窓</span>
+													<select
+														value={String(draft.timeWindowSec)}
+														onchange={(e) => (draft.timeWindowSec = Number(e.currentTarget.value))}
+													>
+														{#each TIME_WINDOW_OPTIONS as option (option.value)}
+															<option value={String(option.value)}>{option.label}</option>
+														{/each}
+													</select>
+													{#each fieldErrors.timeWindowSec as message, i (i)}
+														<span class="field-error">{message}</span>
+													{/each}
+												</label>
+											{/if}
+										</fieldset>
+										{#if canWrite && typeof selected === 'number'}
+											<div class="actions">
+												<button
+													type="button"
+													class="danger"
+													onclick={() => void remove()}
+													disabled={busy}
+												>
+													削除
+												</button>
+											</div>
+										{/if}
+									{/if}
+								{/snippet}
+							</Tabs>
+						</div>
+					{/if}
+				</div>
+			</ThreePaneLayout>
+		</div>
 	{/if}
 </div>
 
@@ -681,8 +1116,9 @@
 	.page {
 		display: flex;
 		flex-direction: column;
-		gap: 1.25rem;
-		max-width: 860px;
+		gap: 0.75rem;
+		height: calc(100vh - var(--banto-shell-header-height) - 2.5rem);
+		min-height: 0;
 	}
 
 	h2 {
@@ -695,26 +1131,88 @@
 		font-size: 0.95rem;
 	}
 
-	.groups-section,
-	.editor-section {
+	/* 3 ペインの枠が残りの高さを埋める。 */
+	.groups-frame {
+		flex: 1;
+		min-height: 360px;
 		display: flex;
 		flex-direction: column;
-		gap: 0.75rem;
 		background: var(--banto-surface);
 		border: 1px solid var(--banto-border);
 		border-radius: calc(var(--banto-radius) * 2);
-		padding: 1rem 1.25rem;
+		overflow: hidden;
 	}
 
-	.section-head {
+	.list-pane {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+		height: 100%;
+		min-height: 0;
+		box-sizing: border-box;
+		padding: 0.5rem;
+		overflow-y: auto;
+	}
+
+	.list-toolbar {
+		flex: 0 0 auto;
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.5rem;
+	}
+
+	.list-toolbar button {
+		font-size: 0.78rem;
+		padding: 0 0.6rem;
+	}
+
+	.list-selection {
+		font-weight: 600;
+	}
+
+	.center-pane {
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
+		height: 100%;
+		min-height: 0;
+		box-sizing: border-box;
+		padding: 0.75rem 1rem;
+		overflow-y: auto;
+	}
+
+	.edit-bar {
+		flex: 0 0 auto;
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+	}
+
+	.edit-bar-head {
 		display: flex;
 		align-items: center;
 		gap: 0.75rem;
 		flex-wrap: wrap;
 	}
 
-	.section-head h3 {
+	.edit-bar-head h3 {
 		margin-right: auto;
+	}
+
+	.view-tabs {
+		display: flex;
+		flex-direction: column;
+		flex: 1;
+		min-height: 0;
+	}
+
+	.view-tabs > :global(.banto-tabs__panel:not([hidden])) {
+		display: flex;
+		flex-direction: column;
+		flex: 1;
+		min-height: 0;
+		gap: 0.75rem;
+		max-width: 48rem;
 	}
 
 	.note {
@@ -753,6 +1251,10 @@
 		cursor: not-allowed;
 	}
 
+	button.secondary:hover:not(:disabled) {
+		background: color-mix(in srgb, var(--banto-primary) 8%, transparent);
+	}
+
 	button.primary {
 		background: var(--banto-primary-solid);
 		border-color: var(--banto-primary-solid);
@@ -769,6 +1271,12 @@
 	button.icon {
 		width: var(--banto-control-height);
 		padding: 0;
+	}
+
+	.group-list-section {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
 	}
 
 	.group-list {
@@ -788,11 +1296,18 @@
 
 	.group-open {
 		flex: 1;
+		min-width: 0;
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
 		gap: 0.75rem;
 		text-align: left;
+	}
+
+	.group-name {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 
 	.group-list li.selected .group-open {
@@ -802,6 +1317,7 @@
 	.group-meta {
 		color: var(--banto-text-muted);
 		font-size: 0.8rem;
+		flex: none;
 	}
 
 	.editor {
@@ -813,8 +1329,7 @@
 		padding: 0;
 	}
 
-	.field,
-	.pen-field {
+	.field {
 		display: flex;
 		flex-direction: column;
 		gap: 0.25rem;
@@ -822,8 +1337,7 @@
 	}
 
 	.field input,
-	.field select,
-	.pen-field select {
+	.field select {
 		height: var(--banto-control-height);
 		box-sizing: border-box;
 		padding: 0 0.5rem;
@@ -863,40 +1377,67 @@
 		list-style: none;
 		display: flex;
 		flex-direction: column;
-		gap: 0.5rem;
+		gap: 0.35rem;
 	}
 
 	.pen {
 		display: flex;
-		align-items: flex-end;
-		gap: 0.75rem;
+		align-items: center;
+		gap: 0.5rem;
 		flex-wrap: wrap;
-		padding: 0.5rem 0;
-		border-top: 1px solid var(--banto-border);
+	}
+
+	.pen-open {
+		flex: 1;
+		min-width: 0;
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		text-align: left;
+	}
+
+	.pen-open.static {
+		height: var(--banto-control-height);
+		box-sizing: border-box;
+		padding: 0 0.75rem;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius-md);
+	}
+
+	.pen.selected .pen-open {
+		border-color: var(--banto-primary);
 	}
 
 	.swatch {
 		width: 1rem;
 		height: 1rem;
 		border-radius: 50%;
-		align-self: center;
 		flex: none;
 	}
 
-	.pen-field.color select {
-		max-width: 10rem;
+	.pen-number {
+		font-weight: 600;
+		font-size: 0.85rem;
+		flex: none;
+	}
+
+	.pen-tag {
+		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 
 	.thresholds {
 		font-size: 0.8rem;
 		color: var(--banto-text-muted);
-		align-self: center;
+		flex: none;
 	}
 
 	.pen-actions {
 		display: flex;
 		gap: 0.25rem;
-		margin-left: auto;
 	}
 
 	.pen-error {
@@ -908,5 +1449,55 @@
 		align-items: center;
 		gap: 0.5rem;
 		flex-wrap: wrap;
+	}
+
+	.detail-pane {
+		display: flex;
+		flex-direction: column;
+		height: 100%;
+		min-height: 0;
+	}
+
+	.detail-pane-header {
+		flex: 0 0 auto;
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.75rem;
+		padding: 0.75rem 1rem;
+		border-bottom: 1px solid var(--banto-border);
+	}
+
+	.detail-pane-header h3 {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.pane-close {
+		border: none;
+		background: none;
+		color: var(--banto-text-muted);
+		font-size: 1.25rem;
+		line-height: 1;
+		height: auto;
+		padding: 0.15rem 0.4rem;
+		cursor: pointer;
+		border-radius: var(--banto-radius);
+	}
+
+	.pane-close:hover {
+		color: var(--banto-text);
+		background: color-mix(in srgb, var(--banto-primary) 8%, transparent);
+	}
+
+	.detail-pane-body {
+		flex: 1;
+		min-height: 0;
+		overflow-y: auto;
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+		padding: 0.75rem 1rem 1.25rem;
 	}
 </style>
