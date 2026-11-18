@@ -115,8 +115,9 @@ export function resolvePresetConnectionId(
 }
 
 /**
- * `?groupId=` クエリ（またはツリー選択のグループ ID）を検証し、有効な実
- * 収集グループ（接続が virtual でない）の ID のみ返す。`calc`/`mem` 配下の
+ * ツリー選択のグループ ID（文字列）を検証し、有効な実収集グループ（接続が
+ * virtual でない）の ID のみ返す（以前はタグ登録の `?groupId=` クエリにも使った。
+ * #1179 PR3a で URL は `?target=group:<id>`（`tagsView.ts`）に変わった）。`calc`/`mem` 配下の
  * グループは「選ばせない」（実装指示）ため、ここで弾く。
  */
 export function resolvePresetGroupId(

@@ -29,7 +29,15 @@
 	import { deferredDelete, UNDO_WINDOW_MS } from '#lib/banto/deferredDelete.svelte.js';
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
-	import { pruneTreeFilter } from '#lib/banto/treeFilterPrune.js';
+	import {
+		parseTagsView,
+		resolveTagsView,
+		sameTagsView,
+		sameTreeTarget,
+		tagsViewSearch,
+		type TagsTab,
+		type TagsView
+	} from '#lib/banto/tagsView.js';
 	import {
 		canRestoreFocusTo,
 		Drawer,
@@ -37,6 +45,7 @@
 		hasVisibleLayerAbove,
 		Modal,
 		restoreFocus,
+		Tabs,
 		ThreePaneLayout
 	} from '@banto/ui';
 	import { canWriteResources } from '#lib/permissions.js';
@@ -89,7 +98,8 @@
 		type BatchTagFieldError,
 		type ParseAddressItem,
 		type ParsedAddress,
-		parseTagAddresses
+		parseTagAddresses,
+		isVirtualConnection
 	} from '#lib/banto/tagRegistryAdmin.js';
 	import {
 		buildBulkEnableRows,
@@ -183,7 +193,6 @@
 	} from '#lib/banto/writableDefault.js';
 	import {
 		monitorHref,
-		resolvePresetGroupId,
 		resolveRegistrationTarget,
 		type RegistrationTarget,
 		type TreeSelectionForPreset
@@ -199,7 +208,7 @@
 		resolveTreeContextMenuItemsForRole,
 		type TreeContextMenuItemAction
 	} from '#lib/banto/tagTreeContextMenu.js';
-	import { beforeNavigate } from '$app/navigation';
+	import { afterNavigate, beforeNavigate, goto } from '$app/navigation';
 	import {
 		checkExpression,
 		fetchExpressionFunctions,
@@ -3113,8 +3122,27 @@
 	// または dirty で確認をキャンセルされた）場合は遷移そのものを止める。
 	// T18-3e: 保留中のセル編集がある場合も同様に確認する（Drawer は開いて
 	// いなくても、表編集の保留バッファは未保存の変更のため）。
+	//
+	// #1179 PR3a: このページの中の移動（URL のクエリだけが変わる - 戻る・進む・
+	// 同じページへのリンク）は、ページを離れないので、対象・タブの切り替えと同じ
+	// `confirmViewChange` で確かめる（表編集の保留はページに残るので確かめない）。
+	// ページ内の操作の `goto`（`viewNavHrefs`）は `requestView` が確かめ済み。
+	// ページを離れるときは、「設定」タブのフォームの未保存も確かめる。
 	beforeNavigate((nav) => {
 		if (nav.shallow) return;
+		const to = nav.to?.url;
+		if (to && viewNavHrefs.has(to.href)) return;
+		if (to && !nav.willUnload && to.pathname === page.url.pathname) {
+			const next = resolveTagsView(parseTagsView(to.searchParams), connections, groups, {
+				loaded: registryLoaded
+			}).view;
+			if (!confirmViewChange(next)) nav.cancel();
+			return;
+		}
+		if (!requestDiscardSettingsForm()) {
+			nav.cancel();
+			return;
+		}
 		if (drawerMode !== null && !confirmDiscardIfNeeded()) {
 			nav.cancel();
 			return;
@@ -3141,6 +3169,240 @@
 		if (treeFilter.type === 'connection') return `conn:${treeFilter.id}`;
 		return `group:${treeFilter.id}`;
 	});
+
+	// --- #1179 PR3a: 中央のタブと URL の状態 ---------------------------------
+	//
+	// docs/banto-hub-ui-improvement-proposal.md §HUB への当てはめ（2026-11-17
+	// オーナー決定）: 中央はタブで「タグ一覧」と「設定」を切り替える（「すべて」に
+	// 「設定」は無い）。選択中の対象（`treeFilter`）とタブ（`activeTab`）は URL の
+	// クエリに持ち（形は `#lib/banto/tagsView.ts`）、再読み込み・戻る・進むで同じ
+	// 画面に戻る。
+	//
+	// - **画面の操作（ツリー・タブ）は状態を先に同期で変え、URL は後から追う**
+	//   （`requestView`）。BantoTree は `selection` の制御で「呼び出しの直後の値」を
+	//   正とし、違えば元の行へフォーカスごと戻す（banto の `BantoTree` の
+	//   `selection` の doc）。URL の更新（`goto`）は非同期なので、URL から状態を
+	//   決めると上下キーの移動のたびに元の行へ引き戻される。
+	// - **URL から状態を決めるのは、戻る・進む・再読み込み・リンク**（下の
+	//   `$effect`）。ページ内の `goto` が終わるまではその `$effect` を止める
+	//   （`viewNavsInFlight`） - 途中の `reload()` で一覧が変わっても、古い URL で
+	//   状態を巻き戻さない。取り消された・失敗した `goto` は、終わった時点の URL へ
+	//   状態を戻す（同じ `$effect`）。
+	// - **未保存の確認**は `confirmViewChange` の 1 か所（ページ内の操作は
+	//   `requestView` から、戻る・進む・リンクは `beforeNavigate` から）。
+
+	/** 中央のタブ（URL の `tab`）。「すべて」のときは常に `'list'`。 */
+	let activeTab: TagsTab = $state('list');
+
+	function currentView(): TagsView {
+		return { target: treeFilter, tab: activeTab };
+	}
+
+	function applyView(view: TagsView): void {
+		if (!sameTreeTarget(treeFilter, view.target)) treeFilter = view.target;
+		if (activeTab !== view.tab) activeTab = view.tab;
+	}
+
+	/**
+	 * 画面の状態を変えてよいか確かめる（キャンセルなら `false`）。確かめる前には
+	 * 何も変えない（2 つ目の確認でキャンセルされても、1 つ目の破棄は起きない）。
+	 *
+	 * - 「設定」タブのフォーム: タブを離れる・対象が変わる（別の対象のフォームに
+	 *   作り直す）ときに、部品の `requestDiscard`（Drawer の `×` と同じ判定・文言）。
+	 * - 右の編集ペイン（#375）: 「設定」タブへ移るときは閉じる（オーナー決定）ので
+	 *   `confirmDiscardIfNeeded`。**対象だけが変わるときは確かめず、ペインも閉じない**
+	 *   （従来どおり）: ペインは非モーダルで、ツリーで対象を変えても入力は消えない
+	 *   （提案書「未保存のまま別のタグやグループを選んだ場合は、入力を失わせない」）。
+	 *   式の編集中にツリーで別のグループへ移り、一覧のタグを式へ挿入する流れ
+	 *   （#342 段階C）もこれに頼っている。戻る・進むで対象だけが変わるときも同じ。
+	 * - 表編集の保留（`pendingCellEdits`）はページの状態で、対象・タブを変えても
+	 *   消えない（グリッドの絞り込みが変わるだけ）ので、ここでは確かめない。
+	 */
+	function confirmViewChange(next: TagsView): boolean {
+		const current = currentView();
+		const targetChanges = !sameTreeTarget(current.target, next.target);
+		if (!targetChanges && current.tab === next.tab) return true;
+		if (current.tab === 'settings' && !requestDiscardSettingsForm()) return false;
+		const closePane = drawerMode !== null && next.tab === 'settings';
+		if (closePane && !confirmDiscardIfNeeded()) return false;
+		if (closePane) closeDrawer();
+		return true;
+	}
+
+	/** ページ内の `goto`（`requestView`・URL の正規化）の行き先。`beforeNavigate` は確認を飛ばす。 */
+	const viewNavHrefs = new Set<string>();
+	/** 進行中のページ内の `goto` の数。0 になったら URL から状態を決め直す。 */
+	let viewNavsInFlight = $state(0);
+	/**
+	 * いまの履歴の項目が、ツリーの上下キーなどの移動（BantoTree は選択が
+	 * フォーカスに付いてくる）で積んだものか。続けてキーで動かす間は同じ項目を
+	 * 置き換える（`replace`）。
+	 *
+	 * **履歴の積み方**: クリック・Enter・Space での対象の選択とタブの切り替えは
+	 * 1 回ごとに積む（戻るで 1 つ前の対象・タブへ戻れる - ブラウザの戻ると同じ
+	 * 「1 操作 = 1 歩」）。キーの移動は途中の行を全部積むと、戻るで 1 行ずつ
+	 * 遡ることになり、目的の画面まで何度も押させるので、続いた移動は 1 項目に
+	 * まとめる（移動を始める前の画面へは 1 回の戻るで戻る）。
+	 */
+	let viewEntryFromKeyNavigation = false;
+
+	/**
+	 * 画面の状態を `next` にする（ツリー・タブ・設定の中のグループのリンク）。
+	 * 未保存の確認でキャンセルされたら `false` で、状態も URL も変えない。
+	 */
+	function requestView(next: TagsView, options: { keyNavigation?: boolean } = {}): boolean {
+		if (sameTagsView(currentView(), next)) return true;
+		if (!confirmViewChange(next)) return false;
+		const keyNavigation = options.keyNavigation === true;
+		const replace = keyNavigation && viewEntryFromKeyNavigation;
+		viewEntryFromKeyNavigation = keyNavigation;
+		applyView(next);
+		void navigateToView(next, { replace });
+		return true;
+	}
+
+	async function navigateToView(view: TagsView, options: { replace: boolean }): Promise<void> {
+		const url = new URL(page.url.href);
+		url.search = tagsViewSearch(view);
+		if (url.href === page.url.href) return;
+		const href = url.href;
+		viewNavHrefs.add(href);
+		viewNavsInFlight += 1;
+		try {
+			// `reset: false`: フォーカスとスクロールを動かさない（同じページの中の切り替え）。
+			await goto(url, { replace: options.replace, reset: false });
+		} catch {
+			// 失敗しても、下の `$effect` がその時点の URL へ状態を戻す。
+		} finally {
+			viewNavHrefs.delete(href);
+			viewNavsInFlight -= 1;
+		}
+	}
+
+	/**
+	 * URL から画面の状態を決める（戻る・進む・再読み込み・リンク、とページ内の
+	 * `goto` が取り消された場合）。一覧を読み終えたら、読めない値・一覧に無い id
+	 * （存在しない、または削除された）は「すべて」へ倒し、URL も正規化した形
+	 * （`tagsViewSearch`）へ置き換える（`replace` - 開けない画面を履歴に残さない）。
+	 * **案内は URL から来た対象が見つからないときだけ**: 一度は一覧で見つかった
+	 * 対象が消えた場合（選んでいた対象の削除、`lastFoundTarget`）は、削除の結果
+	 * なので案内しない。読み込み前に URL から仮に当てた対象は「見つかった」に
+	 * 数えない（再読み込みで存在しない id を開いたときも案内する）。
+	 */
+	let lastFoundTarget: TreeFilter = { type: 'all' };
+	$effect(() => {
+		const search = page.url.search;
+		const loaded = registryLoaded;
+		const currentConnections = connections;
+		const currentGroups = groups;
+		if (viewNavsInFlight > 0) return;
+		const parsed = parseTagsView(new URLSearchParams(search));
+		const resolved = resolveTagsView(parsed, currentConnections, currentGroups, { loaded });
+		untrack(() => {
+			if (loaded && !resolved.missingTarget) lastFoundTarget = resolved.view.target;
+			if (!sameTagsView(currentView(), resolved.view)) {
+				const wasFound = parsed.target !== null && sameTreeTarget(parsed.target, lastFoundTarget);
+				if (loaded && resolved.missingTarget && !wasFound) {
+					toastStore.push(
+						'info',
+						'指定された接続先・収集グループが見つからないため、すべてのタグを表示します'
+					);
+				}
+				applyView(resolved.view);
+			}
+			if (loaded && search !== tagsViewSearch(resolved.view)) {
+				void navigateToView(resolved.view, { replace: true });
+			}
+		});
+	});
+
+	afterNavigate((nav) => {
+		// 戻る・進むで来た項目は、どの操作で積んだものか分からない。
+		if (nav.type === 'popstate') viewEntryFromKeyNavigation = false;
+	});
+
+	/** 中央のタブ。「すべて」には「設定」が無い（タブ列ごと出さない - `.view-tabs.single`）。 */
+	const viewTabs = $derived(
+		treeFilter.type === 'all'
+			? [{ id: 'list', label: 'タグ一覧' }]
+			: [
+					{ id: 'list', label: 'タグ一覧' },
+					{ id: 'settings', label: '設定' }
+				]
+	);
+
+	/**
+	 * `Tabs` の `value` の関数バインディングの setter。タブを押すと呼ばれ、未保存の
+	 * 確認でキャンセルされたら `activeTab` は変わらず、getter が元のタブを返す。
+	 */
+	function setActiveTabFromTabs(id: string | undefined): void {
+		const tab: TagsTab = id === 'settings' ? 'settings' : 'list';
+		requestView({ target: treeFilter, tab });
+	}
+
+	/** 「設定」タブに埋め込んだ接続先・収集グループのフォーム（`requestDiscard` を呼ぶため）。 */
+	let connectionSettingsForm: ReturnType<typeof ConnectionDrawer> | undefined = $state();
+	let groupSettingsForm: ReturnType<typeof CollectionGroupDrawer> | undefined = $state();
+
+	const settingsConnection = $derived.by((): PlcConnection | null => {
+		if (treeFilter.type !== 'connection') return null;
+		const id = treeFilter.id;
+		return connections.find((c) => c.id === id) ?? null;
+	});
+	const settingsGroup = $derived.by((): CollectionGroup | null => {
+		if (treeFilter.type !== 'group') return null;
+		const id = treeFilter.id;
+		return groups.find((g) => g.id === id) ?? null;
+	});
+	/** 接続先の「設定」に出す、配下の収集グループ。 */
+	const settingsChildGroups = $derived.by((): CollectionGroup[] => {
+		const connection = settingsConnection;
+		return connection ? groups.filter((g) => g.plcConnectionId === connection.id) : [];
+	});
+
+	/** 「設定」タブのフォームを捨ててよいか（タブが「設定」でなければ確かめない）。 */
+	function requestDiscardSettingsForm(): boolean {
+		if (activeTab !== 'settings') return true;
+		const form = treeFilter.type === 'connection' ? connectionSettingsForm : groupSettingsForm;
+		return form ? form.requestDiscard() : true;
+	}
+
+	/** 「設定」タブに `kind`・`id` のフォームが出ているか。 */
+	function isSettingsFormFor(kind: 'connection' | 'group', id: number): boolean {
+		return activeTab === 'settings' && treeFilter.type === kind && treeFilter.id === id;
+	}
+
+	/**
+	 * 「設定」タブに `kind`・`id` のフォームが出ていれば、ツリーの
+	 * 右クリックの「再設定」「詳細を表示」は Drawer を重ねて開かず、そのフォームへ
+	 * フォーカスを移す（同じ接続先・グループを 2 つのフォームで同時に編集させない -
+	 * Drawer で保存すると、埋め込みのフォームは古い値のまま残る）。
+	 */
+	function focusSettingsFormFor(kind: 'connection' | 'group', id: number): boolean {
+		if (!isSettingsFormFor(kind, id)) return false;
+		const focusForm = () => {
+			const host = document.querySelector<HTMLElement>('[data-testid="tag-settings-pane"]');
+			const first = host ? focusablesIn(host)[0] : undefined;
+			// 閲覧者の読み取り専用のフォームは入力が disabled で、保存・削除も無いので
+			// `focusablesIn` が空になりうる。そのときはペイン自体（`tabindex="-1"`）へ。
+			(first ?? host)?.focus();
+		};
+		if (layoutNarrow && treeOpen) {
+			// 狭幅でツリーのドロワーが開いている間、部品は中央を `inert` にしている
+			// のでフォーカスが入らない。ドロワーを閉じ、(1) 部品が `inert` を外す
+			// DOM 更新、(2) 部品の `tick()` 後の `restoreFocus`（開く前の要素かトグル
+			// へ戻す）、(3) メニューを閉じた直後の `restoreFocus`（ツリーのノードへ
+			// 戻そうとする）がすべて終わった**後**に移す。先に移すと後続の戻し処理に
+			// 奪われる。2 回の `tick()` ＋ `requestAnimationFrame` で最後に走らせる。
+			treeOpen = false;
+			void tick()
+				.then(() => tick())
+				.then(() => requestAnimationFrame(focusForm));
+			return true;
+		}
+		focusForm();
+		return true;
+	}
 
 	/**
 	 * #378（2026-09-16 オーナー決定）: 狭幅で左ツリーを退避したときの開閉状態
@@ -3173,18 +3435,13 @@
 		return host.querySelector<HTMLElement>(`button[aria-controls="${CSS.escape(pane.id)}"]`);
 	}
 
-	/**
+	/*
 	 * #381 レビュー対応3回目: **選択中の接続・収集グループが消えたら「すべて」へ
-	 * 戻す。** `reload()` はカタログを取り直すだけで `treeFilter` を見ていなかった
-	 * ため、削除された id で絞られたまま（＝グリッドが常に空）になり、#378 で
-	 * 足した選択中表示はその id の名前を引けずに「すべて」と出て食い違っていた。
-	 * 判定は依存ゼロの純関数 `pruneTreeFilter`（`#lib/banto/treeFilterPrune.ts`、
-	 * vitest 済み）で、同一参照を返してくれるので変わったときだけ書き戻す。
+	 * 戻す**（削除された id で絞られたまま＝グリッドが常に空、を防ぐ）。#1179 PR3a
+	 * から、判定は URL から画面を決める `$effect`（下の「URL と画面の状態」）の
+	 * `resolveTagsView` が `pruneTreeFilter` を通して行う - 消えた対象は URL ごと
+	 * 「すべて」へ置き換える。
 	 */
-	$effect(() => {
-		const pruned = pruneTreeFilter(treeFilter, connections, groups, { loaded: registryLoaded });
-		if (pruned !== treeFilter) treeFilter = pruned;
-	});
 
 	/**
 	 * #381 レビュー対応8回目（層の約束・項目6、`@banto/ui` の `layering.ts`）: **下位の層を
@@ -3223,16 +3480,27 @@
 		return 'すべて';
 	});
 
+	/** ツリーのノードが指す対象（`treeFilter` の形）。 */
+	function treeTargetOf(data: ConnectionTreeNodeData): TreeFilter {
+		if (data.kind === 'all') return { type: 'all' };
+		if (data.kind === 'connection') return { type: 'connection', id: data.connection.id };
+		return { type: 'group', id: data.group.id };
+	}
+
 	/**
-	 * ツリー選択（`treeFilter`）の更新だけを行う。**退避パネルの開閉には
-	 * 触れない** - 右クリック（`handleTreeContextMenu`）もノード選択を伴うが、
-	 * そちらでは閉じてはいけないため（#381 レビュー対応C、下記）。
+	 * ツリー選択（`treeFilter`）を変える（#1179 PR3a から URL・未保存の確認を通す
+	 * `requestView`）。開いていたタブは保つ（「すべて」は「タグ一覧」だけ）。
+	 * **退避パネルの開閉には触れない** - 右クリック（`handleTreeContextMenu`）も
+	 * ノード選択を伴うが、そちらでは閉じてはいけないため（#381 レビュー対応C、下記）。
+	 * 未保存の確認でキャンセルされたら `false`（選択は変わらず、BantoTree は
+	 * `selection` の制御で元の行へ戻る）。
 	 */
-	function applyTreeSelection(data: ConnectionTreeNodeData): void {
-		if (data.kind === 'all') treeFilter = { type: 'all' };
-		else if (data.kind === 'connection')
-			treeFilter = { type: 'connection', id: data.connection.id };
-		else treeFilter = { type: 'group', id: data.group.id };
+	function applyTreeSelection(
+		data: ConnectionTreeNodeData,
+		options: { keyNavigation?: boolean } = {}
+	): boolean {
+		const target = treeTargetOf(data);
+		return requestView({ target, tab: target.type === 'all' ? 'list' : activeTab }, options);
 	}
 
 	/**
@@ -3244,7 +3512,7 @@
 		data: ConnectionTreeNodeData,
 		{ navigation }: { navigation: boolean }
 	): void {
-		applyTreeSelection(data);
+		if (!applyTreeSelection(data, { keyNavigation: navigation })) return;
 		// #378: 狭幅では「選んだ」時点（クリック・Space・Enter）で退避パネルを
 		// 閉じる（`Sidebar.svelte` のリンククリックで `closeNav()` するのと同じ
 		// 「閉じる契機」）。上下キーなどのフォーカス移動に付いてきた選択
@@ -3334,7 +3602,12 @@
 		// メニューはツリーの上に重なって出るので、開いたままで問題ない
 		// （メニューの項目を選んで Drawer 等へ進む経路では、その Drawer が
 		// パネルより手前に出る）。
-		applyTreeSelection(data);
+		// #1179 PR3a: 未保存の確認でキャンセルされたらメニューも出さない（選択が
+		// 変わっていないノードのメニューを出すと、項目の対象が食い違う）。
+		if (!applyTreeSelection(data)) {
+			treeContextMenu = null;
+			return;
+		}
 		const items = resolveTreeContextMenuItemsForRole(data, canWrite);
 		if (items.length === 0) {
 			treeContextMenu = null;
@@ -3494,6 +3767,7 @@
 	}
 
 	function openConnectionEditDrawer(connectionId: number): boolean {
+		if (focusSettingsFormFor('connection', connectionId)) return true;
 		if (blockedByOtherResourceDrawer('connection')) return false;
 		const target = connections.find((c) => c.id === connectionId);
 		if (!target) return false; // 通常起きない（右クリック直後は必ず存在する）が、念のため無視する。
@@ -3518,6 +3792,7 @@
 	 * と同じ理由）。
 	 */
 	function openConnectionViewDrawer(connectionId: number): boolean {
+		if (focusSettingsFormFor('connection', connectionId)) return true;
 		if (blockedByOtherResourceDrawer('connection')) return false;
 		const target = connections.find((c) => c.id === connectionId);
 		if (!target) return false;
@@ -3542,6 +3817,10 @@
 		if (blockedByOtherResourceDrawer('connection')) return false;
 		const target = connections.find((c) => c.id === connectionId);
 		if (!target) return false;
+		// #1179 PR3a: 「設定」タブで同じ接続先を編集中なら、削除の前にその未保存を確かめる。
+		if (isSettingsFormFor('connection', connectionId) && !requestDiscardSettingsForm()) {
+			return false;
+		}
 		if (!confirmDiscardIfNeeded()) return false;
 		closeDrawer();
 		connectionDrawerTarget = target;
@@ -3587,6 +3866,7 @@
 	}
 
 	function openGroupEditDrawer(groupId: number): boolean {
+		if (focusSettingsFormFor('group', groupId)) return true;
 		if (blockedByOtherResourceDrawer('group')) return false;
 		const target = groups.find((g) => g.id === groupId);
 		if (!target) return false;
@@ -3607,6 +3887,7 @@
 	 * （calc/mem）配下のグループでも制限しない。
 	 */
 	function openGroupViewDrawer(groupId: number): boolean {
+		if (focusSettingsFormFor('group', groupId)) return true;
 		if (blockedByOtherResourceDrawer('group')) return false;
 		const target = groups.find((g) => g.id === groupId);
 		if (!target) return false;
@@ -3631,6 +3912,8 @@
 		if (blockedByOtherResourceDrawer('group')) return false;
 		const target = groups.find((g) => g.id === groupId);
 		if (!target) return false;
+		// #1179 PR3a: 「設定」タブで同じグループを編集中なら、削除の前にその未保存を確かめる。
+		if (isSettingsFormFor('group', groupId) && !requestDiscardSettingsForm()) return false;
 		if (!confirmDiscardIfNeeded()) return false;
 		closeDrawer();
 		groupDrawerTarget = target;
@@ -3676,6 +3959,9 @@
 		let opened = false;
 		switch (action.kind) {
 			case 'createTag':
+				// #1179 PR3a: 右ペイン（タグの詳細）は「タグ一覧」のときだけ出す（「設定」
+				// タブへ移ると閉じる、の裏返し）。「設定」タブからは先に「タグ一覧」へ戻す。
+				if (activeTab === 'settings' && !requestView({ target: treeFilter, tab: 'list' })) break;
 				opened = openCreateDrawer();
 				break;
 			case 'createConnection':
@@ -3715,26 +4001,11 @@
 		if (opened) lastTreeMenuNodeEl = node;
 	}
 
-	/**
-	 * T18-2d（TAG-UX-A、collection-groups ページの「次へ: タグを登録」CTA の
-	 * 受け側）: `/tags?groupId=` で渡された収集グループをツリー選択へ反映
-	 * する（一度だけ - `onboardingQueryApplied` で guard、`reload()` は
-	 * 作成/削除のたびにも呼ばれるため `groups`/`connections` の参照は何度も
-	 * 変わる）。ツリー選択に反映するだけで Drawer は自動で開かない -
-	 * ツリーがグループを選択した状態になれば、`registrationTarget` が非
-	 * `null` になり「新規登録」ボタンが現れる - 押した時点で `openCreateDrawer()`
-	 * がこの選択を登録先として確定する（同関数の doc comment 参照）。
-	 * calc/mem 配下や無効な ID は `resolvePresetGroupId` が弾くのでツリー
-	 * 選択は変えない。
+	/*
+	 * T18-2d の `/tags?groupId=` の受け側は #1179 PR3a で `?target=group:<id>`
+	 * （`#lib/banto/tagsView.ts`）に置き換えた。旧い形は受け付けない（オーナー方針
+	 * 「破壊的変更してよい」）。
 	 */
-	let onboardingQueryApplied = $state(false);
-	$effect(() => {
-		if (onboardingQueryApplied) return;
-		if (connections.length === 0 && groups.length === 0) return;
-		onboardingQueryApplied = true;
-		const id = resolvePresetGroupId(page.url.searchParams.get('groupId'), groups, connections);
-		if (id !== null) treeFilter = { type: 'group', id };
-	});
 
 	const filteredTags = $derived.by((): Tag[] => {
 		let list = visibleTags;
@@ -6683,602 +6954,744 @@
 				</span>
 			{/snippet}
 			<div class="right-pane">
-				<div class="toolbar">
-					{#if canWrite}
-						<!--
-								T19 S1-c（UX-33、docs/banto-hub-t19-design.md「タグ登録の
-								起点」、2026-09-02 オーナー決定「グループ選択時に右画面を
-								出し、そのグループに対して登録する」）: 「新規登録」
-								「連続登録」はツリーでグループが選択されているときだけ出す
-								- `registrationTarget`（依存ゼロの純関数
-								`resolveRegistrationTarget`、`tagOnboarding.ts`）が
-								「すべて」ノード・接続ノード選択時は `null` を返す
-								（タグは必ずグループに属するため、これらの選択では登録先が
-								一意に決まらない - 実装指示のとおりの扱い）。`null` の間は
-								ボタンを消すだけでなく案内を出す（実装指示「ただ消えるだけに
-								しないこと」）。
-
-								CSVインポートだけは対象外 - CSV は行ごとに `connection`/
-								`group` 列で対象グループを指定でき、1ファイルが複数グループに
-								またがりうる（`tagCsv.ts::parseCsvRows` 参照）。ツリー選択に
-								紐づけると「選択中のグループにしか取り込めない」という誤解や
-								制約を生むだけなので、従来どおりツリー選択と無関係に常時表示
-								する（2026-09-03 実装判断）。
-							-->
-						{#if registrationTarget}
-							<span class="registration-target" data-testid="tag-registration-target">
-								「{registrationTarget.groupName}」へ登録
-							</span>
-							<button type="button" onclick={openCreateDrawer}>新規登録</button>
-							<button
-								type="button"
-								onclick={openContinuousDrawer}
-								disabled={!registrationTarget.supportsContinuous}
-								title={registrationTarget.supportsContinuous
-									? undefined
-									: '連続登録は PLC アドレスを持つ収集グループでのみ使えます'}
-							>
-								連続登録
-							</button>
-							<!--
-									T20 ②a（docs/banto-hub-t20-design.md §3.2、2026-09-04）:
-									構造体タグ登録の起動導線。連続登録と同じく PLC アドレスの
-									算術前提の機能のため、対象グループの制約も同一。
-								-->
-							<button
-								type="button"
-								data-testid="struct-reg-open"
-								onclick={openStructDrawer}
-								disabled={!registrationTarget.supportsContinuous}
-								title={registrationTarget.supportsContinuous
-									? undefined
-									: '構造体登録は PLC アドレスを持つ収集グループでのみ使えます'}
-							>
-								構造体登録
-							</button>
-						{:else}
-							<span class="registration-hint" data-testid="tag-registration-hint">
-								左のツリーで収集グループを選択すると、ここに新規登録・連続登録の操作が表示されます
-							</span>
-						{/if}
-						<button type="button" onclick={openCsvDrawer}>CSVインポート</button>
-						<!-- T18-3b: 選択列を追加する代わりに、行クリックの意味そのものを
-								「編集を開く」⇔「選択を切り替える」で切り替えるトグル
-								（`selectTag`/`toggleSelectRow` の doc comment 参照）。 -->
-						<button
-							type="button"
-							class="secondary"
-							data-testid="tag-selection-mode-toggle"
-							onclick={toggleSelectionMode}
-						>
-							{selectionMode ? '複数選択を終了' : '複数選択'}
-						</button>
-						<!-- T18-3e: セル編集/TSV貼付の表編集モード。収集停止中、または
-								試運転中（#341）のみ ON にできる（`gridEditAllowed` /
-								`toggleGridEditMode` の doc comment 参照）。ON中は
-								selectionMode と相互排他。 -->
-						<button
-							type="button"
-							class="secondary"
-							data-testid="tag-grid-edit-mode-toggle"
-							disabled={!gridEditMode && !gridEditAllowed}
-							title={!gridEditAllowed ? 'ロックダウン後は収集停止中のみ表編集できます' : undefined}
-							onclick={toggleGridEditMode}
-						>
-							{gridEditMode ? '表編集を終了' : '表編集'}
-						</button>
-					{/if}
-					<!-- T18-3d: 出力範囲（全件/絞り込み結果/選択行）。選択行は
-							選択が1件も無ければ選べない（disabled option）。 -->
-					<select
-						class="csv-export-scope"
-						data-testid="tag-csv-export-scope"
-						bind:value={csvExportScope}
-						title="CSVエクスポートの対象範囲"
-					>
-						<option value="all">全件（{visibleTags.length}件）</option>
-						<option value="filtered">絞り込み結果（{filteredTags.length}件）</option>
-						<option value="selected" disabled={selectedIds.size === 0}>
-							選択行（{selectedIds.size}件）
-						</option>
-					</select>
-					<button type="button" class="secondary" onclick={handleExportCsv}>CSVエクスポート</button>
-					<input
-						type="search"
-						class="search-box"
-						placeholder="名前・アドレスで検索"
-						bind:value={searchQuery}
-					/>
-					<span class="count">{filteredTags.length} / {visibleTags.length} 件</span>
-				</div>
-				{#if canWrite && hubStatus !== null && !gridEditAllowed}
-					<!-- T18-3e: ロックの説明バナー - `hubStatus` 取得前
-							（`null`）は誤って「稼働中」と表示しないよう、取得済みの
-							ときだけ出す（実装指示「稼働中は編集不可で…バナー/無効表示」）。
-							#341: 試運転中は収集中でも表編集できるので、このバナーは
-							ロックダウン済み + 稼働中のときだけ出る。 -->
-					<p class="note" data-testid="tag-grid-edit-locked-note">
-						ロックダウン後は収集稼働中に表編集はできません（収集を停止すると表編集を有効にできます）。
-					</p>
-				{/if}
-				{#if canWrite && gridEditMode && pendingCellEdits.length > 0}
-					<!-- T18-3e: 保留中のセル編集バー（`tag-bulk-bar` と同じ帯パターン）。
-							「保存」は preflight（dry-run）を挟んでから確認パネルを開く
-							（`handleSaveGridEdits`）。件数は「実際に値が変わる行数」
-							（`cellEditBatch.diffRows`）- 元に戻した編集は保留バッファには
-							残るが、この件数には含めない。 -->
-					<div class="onboarding-banner" data-testid="tag-cell-edit-bar">
-						<span>保留中の編集 {cellEditBatch.diffRows.length} 件</span>
-						<button
-							type="button"
-							data-testid="tag-cell-edit-save"
-							disabled={cellEditValidating || cellEditBatch.rows.length === 0}
-							onclick={handleSaveGridEdits}
-						>
-							{cellEditValidating ? '確認中…' : '保存'}
-						</button>
-						<button
-							type="button"
-							class="secondary"
-							data-testid="tag-cell-edit-discard"
-							disabled={cellEditValidating || cellEditApplying}
-							onclick={discardGridEdits}
-						>
-							破棄
-						</button>
-					</div>
-				{/if}
-				{#if canWrite && cellEditPanelOpen}
-					<!-- T18-3e: 保存前の差分確認パネル（`tag-bulk-confirm-panel` と同じ
-							`.confirm-panel`/`.preview-table` を流用）。preflight
-							（`dryRun: true`）の結果はエラー行表示にのみ使い、差分自体は
-							クライアント側の `cellEditBatch.diffRows`（`tagCellEdit.ts`）を
-							表示する。 -->
-					<div class="confirm-panel" data-testid="tag-cell-edit-confirm-panel">
-						<p class="confirm-title">表編集の保存内容を確認</p>
-						<p class="note">対象 {cellEditBatch.diffRows.length} 件</p>
-						<div class="preview-wrap">
-							<table class="preview-table">
-								<thead>
-									<tr>
-										<th>ID</th>
-										<th>名前</th>
-										<th>変更内容</th>
-									</tr>
-								</thead>
-								<tbody>
-									{#each cellEditBatch.diffRows.slice(0, PREVIEW_DISPLAY_LIMIT) as row (row.id)}
-										<tr>
-											<td>{row.id}</td>
-											<td>{row.name}</td>
-											<td>{formatCellEditDiffs(row.diffs)}</td>
-										</tr>
-									{/each}
-								</tbody>
-							</table>
-						</div>
-						{@render previewLimitNote(cellEditBatch.diffRows.length)}
-						{#if cellEditValidationResult}
-							{@render bulkRowErrors(cellEditValidationResult)}
-						{/if}
-						<div class="actions">
-							<button
-								type="button"
-								data-testid="tag-cell-edit-apply"
-								disabled={!cellEditValidatedFresh || cellEditApplying}
-								onclick={handleApplyGridEdits}>この内容で保存を適用</button
-							>
-							<button
-								type="button"
-								class="secondary"
-								data-testid="tag-cell-edit-cancel-confirm"
-								onclick={cancelCellEditConfirm}
-								disabled={cellEditApplying}>閉じる</button
-							>
-						</div>
-					</div>
-				{/if}
-				{#if canWrite && selectedIds.size > 0}
-					<!-- T18-3b: 選択が1件以上のときだけ出す一括操作バー
-							（`monitorCtaHref` バナーと同じ帯パターン）。文言は既存トースト/
-							ボタン名と部分文字列でも被らないものにしてある（PR #135 の教訓、
-							`handleApplyBulk`/成功トーストのコメント参照）。 -->
-					<div class="onboarding-banner" data-testid="tag-bulk-bar">
-						<span>選択 {selectedIds.size} 件</span>
-						<button
-							type="button"
-							data-testid="tag-bulk-enable-open"
-							onclick={() => openBulkPanel('enable')}>一括で有効化</button
-						>
-						<button
-							type="button"
-							class="secondary"
-							data-testid="tag-bulk-disable-open"
-							onclick={() => openBulkPanel('disable')}>一括で無効化</button
-						>
-						<button
-							type="button"
-							class="secondary"
-							data-testid="tag-bulk-move-open"
-							disabled={selectedTagsMixedKind}
-							title={selectedTagsMixedKind
-								? '種別（plc/computed/internal）が混在する選択ではグループ移動できません'
-								: undefined}
-							onclick={() => openBulkPanel('move')}>グループへ一括移動</button
-						>
-						<button
-							type="button"
-							class="secondary"
-							data-testid="tag-bulk-offset-copy-open"
-							onclick={() => openBulkPanel('offset-copy')}>オフセットコピー</button
-						>
-						<button
-							type="button"
-							class="danger"
-							data-testid="tag-bulk-delete-open"
-							onclick={() => openBulkPanel('delete')}>一括で削除</button
-						>
-						<button
-							type="button"
-							class="secondary"
-							data-testid="tag-bulk-clear-selection"
-							onclick={() => (selectedIds = new Set())}>選択解除</button
-						>
-					</div>
-				{/if}
-				{#if canWrite && bulkAction !== null && bulkAction !== 'offset-copy'}
-					{@const actionLabel =
-						bulkAction === 'enable'
-							? '選択タグを一括で有効化'
-							: bulkAction === 'disable'
-								? '選択タグを一括で無効化'
-								: bulkAction === 'move'
-									? '選択タグをグループへ一括移動'
-									: '選択タグを一括削除'}
-					<!-- T18-3b: 適用前に対象件数・差分を確認するパネル。連続登録/CSVの
-							`.preview-table`/`.confirm-panel` をそのまま流用する（既存
-							プレビュー表示との視覚的な一貫性を優先し、新規スタイルは足さない）。
-							T19 S2-c1: `delete` は差分表ではなく確認文言（`formatTagsBulkDeleteConfirmMessage`）
-							を表示するだけ - 対象は選択タグの id そのもので「変更前/変更後」の
-							概念が無いため。 -->
-					<div class="confirm-panel" data-testid="tag-bulk-confirm-panel">
-						<p class="confirm-title">{actionLabel}</p>
-						{#if bulkAction === 'move'}
-							<label class="field">
-								移動先グループ
-								<select bind:value={bulkTargetGroupId} data-testid="tag-bulk-target-group">
-									<option value="" disabled>選択してください</option>
-									{#each bulkMoveGroupOptions as group (group.id)}
-										<option value={String(group.id)}>{group.name}</option>
-									{/each}
-								</select>
-							</label>
-						{/if}
-						{#if bulkAction === 'delete'}
-							<p class="note bulk-delete-message" data-testid="tag-bulk-delete-confirm-message">
-								{formatTagsBulkDeleteConfirmMessage(selectedTags.length)}
-							</p>
-						{:else if bulkSummary}
-							<p class="note">
-								対象 {bulkSummary.targetCount} 件・変更 {bulkSummary.changedCount} 件
-							</p>
-							<div class="preview-wrap">
-								<table class="preview-table">
-									<thead>
-										<tr>
-											<th>ID</th>
-											<th>名前</th>
-											<th>変更前</th>
-											<th>変更後</th>
-										</tr>
-									</thead>
-									<tbody>
-										{#each bulkSummary.rows.slice(0, PREVIEW_DISPLAY_LIMIT) as row (row.id)}
-											<tr>
-												<td>{row.id}</td>
-												<td>{row.name}</td>
-												<td>{bulkFieldDisplay(bulkAction, row.from)}</td>
-												<td>{bulkFieldDisplay(bulkAction, row.to)}</td>
-											</tr>
-										{/each}
-									</tbody>
-								</table>
-							</div>
-							{@render previewLimitNote(bulkSummary.rows.length)}
-						{:else if bulkAction === 'move'}
-							<p class="hint">移動先グループを選択してください。</p>
-						{/if}
-						{#if bulkResult}
-							{@render bulkRowErrors(bulkResult)}
-						{/if}
-						<div class="actions">
-							<button
-								type="button"
-								data-testid="tag-bulk-apply"
-								disabled={bulkApplying || bulkTargetCount === 0}
-								onclick={handleApplyBulk}>この内容で一括反映</button
-							>
-							<button
-								type="button"
-								class="secondary"
-								data-testid="tag-bulk-cancel"
-								onclick={closeBulkPanel}
-								disabled={bulkApplying}>キャンセル</button
-							>
-						</div>
-					</div>
-				{/if}
-				{#if canWrite && bulkAction === 'offset-copy'}
-					<!-- T20 ②b（docs/banto-hub-t20-design.md §3.2）: enable/disable/move/
-							delete の確認パネル（`tag-bulk-confirm-panel`、上記）とは別立ての
-							専用パネル - こちらは「更新」ではなく `createTagsBatch` による
-							「新規作成」で、構造体登録②a（`struct-reg-*`）と同じ
-							「プレビュー→検証(dry-run)→登録」の2段階フローを持つため。 -->
-					<div class="confirm-panel" data-testid="tag-bulk-offset-copy-panel">
-						<p class="confirm-title">選択タグをオフセットコピー</p>
-						<label class="field">
-							オフセット（ワード数）
-							<input
-								type="number"
-								step="1"
-								min="1"
-								bind:value={bulkOffsetWords}
-								placeholder="100"
-								data-testid="tag-bulk-offset-copy-words"
-							/>
-							<span class="hint"
-								>正の整数を指定してください（例: 100 → D3000 起点のタグ群を D3100 起点へ複製）。</span
-							>
-						</label>
-
-						{#if bulkOffsetCopyResult}
-							<h4>プレビュー（{bulkOffsetCopyResult.rows.length}件）</h4>
-							<div class="preview-wrap">
-								<table class="preview-table" data-testid="tag-bulk-offset-copy-preview-table">
-									<thead>
-										<tr>
-											<th>#</th>
-											<th>元の名前</th>
-											<th>元のアドレス</th>
-											<th>コピー先名前</th>
-											<th>コピー先アドレス</th>
-										</tr>
-									</thead>
-									<tbody>
-										{#each bulkOffsetCopyResult.rows.slice(0, PREVIEW_DISPLAY_LIMIT) as row, i (row.sourceId)}
-											<tr
-												class={bulkOffsetCopyResult.errors.some((e) => e.sourceId === row.sourceId)
-													? 'struct-row-collision'
-													: ''}
-											>
-												<td>{i + 1}</td>
-												<td>{row.sourceName}</td>
-												<td>{row.sourceAddress}</td>
-												<td>{row.name}</td>
-												<td>{row.address}</td>
-											</tr>
-										{/each}
-									</tbody>
-								</table>
-							</div>
-							{@render previewLimitNote(bulkOffsetCopyResult.rows.length)}
-
-							{#if bulkOffsetCopyResult.errors.length > 0}
-								<div class="struct-collisions" data-testid="tag-bulk-offset-copy-errors">
-									<p class="err">
-										算出できないアドレス、または名前/アドレスが重複しているタグがあります。修正してください。
-									</p>
-									<ul>
-										{#each bulkOffsetCopyResult.errors as e, i (i)}
-											<li>{e.sourceName}（{e.sourceAddress}）: {e.message}</li>
-										{/each}
-									</ul>
-								</div>
-							{/if}
-						{/if}
-
-						{#if bulkOffsetCopyValidationResult}
-							{@render batchRowErrors(bulkOffsetCopyValidationResult)}
-						{/if}
-
-						<div class="actions">
-							<button
-								type="button"
-								data-testid="tag-bulk-offset-copy-validate"
-								onclick={handleValidateBulkOffsetCopy}
-								disabled={bulkOffsetCopyApplying ||
-									bulkOffsetCopyValidating ||
-									!bulkOffsetIsPositiveInteger ||
-									!bulkOffsetCopyTagInputs}
-								title={bulkOffsetIsPositiveInteger ? undefined : BULK_OFFSET_INVALID_REASON}
-							>
-								検証
-							</button>
-							<button
-								type="button"
-								data-testid="tag-bulk-offset-copy-apply"
-								onclick={handleApplyBulkOffsetCopy}
-								disabled={bulkOffsetCopyApplying ||
-									!bulkOffsetIsPositiveInteger ||
-									!bulkOffsetCopyValidatedFresh}
-								title={bulkOffsetIsPositiveInteger ? undefined : BULK_OFFSET_INVALID_REASON}
-							>
-								この内容でコピー
-							</button>
-							<button
-								type="button"
-								class="secondary"
-								data-testid="tag-bulk-offset-copy-cancel"
-								onclick={closeBulkPanel}
-								disabled={bulkOffsetCopyApplying}>キャンセル</button
-							>
-						</div>
-						{#if bulkOffsetCopyTagInputs && !bulkOffsetCopyValidatedFresh}
-							<span class="hint"
-								>先に「検証」を実行してください（内容を変更すると再検証が必要）。</span
-							>
-						{/if}
-					</div>
-				{/if}
-				{#if monitorCtaHref}
-					<!-- T18-4c（docs/banto-hub-t18-design.md「T18-4c 確認導線」）: 新規/
-							複製/編集/連続登録/CSV取り込み/一括更新のいずれの成功後にも、
-							サイドバー探索なしでその対象タグの値・品質・時刻へ1クリックで
-							移動できるよう案内する。文言はどの成功トースト（`作成しました`
-							`更新しました`/`削除しました`/一括登録・一括更新の件数付き文言）
-							とも部分一致しないようにしてある - `page.getByText('作成しました')`
-							等（`e2e/tests-banto-hub/banto-hub-tags-form.spec.ts`/
-							`banto-hub-tags-p0-2-preflight.spec.ts`）がトーストと二重ヒットして
-							strict mode violation になっていた実測回帰（2026-08-12、PR #135
-							CI）の再発防止。 -->
-					<div class="onboarding-banner">
-						<span>モニタで値・品質・時刻を確認できます。</span>
-						<a class="onboarding-cta" href={monitorCtaHref}>確認: 値・品質・時刻を見る</a>
-						<button type="button" class="secondary" onclick={() => (monitorCtaHref = null)}
-							>閉じる</button
-						>
-					</div>
-				{/if}
-				<p class="note">
-					{#if !canWrite}
-						閲覧のみ（編集には編集者以上の権限が必要です）。
-					{:else if insertArmed}
-						<!--
-									#342 段階C: 「一覧から挿入」が ON の間だけ出す状態表示
-									（トグルはペイン側にあるため、グリッド側にも1つだけ
-									意味が変わっていることを出す）。
-								-->
-						<span class="insert-armed-badge" data-testid="tag-insert-armed-badge">
-							一覧から挿入: 行をクリックすると式欄のキャレット位置にそのタグの完全名が入ります（Esc
-							で解除。淡色の行は自タグ・式で表せない名前・文字列型・循環になる参照で挿入できません）。
-						</span>
-					{:else if gridEditMode}
-						セルをダブルクリックまたは選択して直接編集できます（Excel等からの貼り付けにも対応）。行を開くにはダブルクリックしてください。「保存」を押すまで反映されません。
-					{:else if selectionMode}
-						行をクリックすると選択の切り替えになります（編集は「複数選択を終了」してから）。
-					{:else}
-						行をクリックすると編集パネルが開きます。
-					{/if}
-				</p>
 				<!--
-						T18-1（TAG-UX-C 6点目、docs/banto-hub-desktop-plan.md §9.4）:
-						初期読込中・初期読込失敗・再読込中(stale)・再読込失敗(stale)・
-						真の空・検索/ツリーフィルタ0件・通常表示を区別する。
-						「通信失敗をタグ0件と表示しない」ため、`loadError` が立って
-						いる間は空のBantoGridも「タグがありません」も出さない
-						（stale があれば一覧の上にバナー、無ければ再試行のみ）。
-					-->
-				{#if loading && tags.length === 0 && !loadError}
-					<p class="loading">読み込み中…</p>
-				{:else if loadError && tags.length === 0}
-					<div class="empty-state">
-						<p class="err">{loadError}</p>
-						<button type="button" onclick={() => void reload()} disabled={loading}>
-							{loading ? '再試行中…' : '再試行'}
-						</button>
-					</div>
-				{:else}
-					{#if loading}
-						<p class="loading">再読込中…</p>
-					{:else if loadError}
-						<div class="reload-banner">
-							<span class="err">{loadError}</span>
-							<button type="button" class="secondary" onclick={() => void reload()}>再試行</button>
-							<span class="hint">前回の読込内容を表示しています。</span>
-						</div>
-					{/if}
-					{#if tags.length === 0}
-						<!--
-								T18-2d（TAG-UX-A「空状態を…不足する前工程と移動ボタンを示す」）:
-								連鎖する前工程（PLC接続→収集グループ）のうち欠けているものを
-								案内する。connections/groups が両方揃っていれば通常の空表示。
+					#1179 PR3a（docs/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、
+					2026-11-17 オーナー決定）: 中央はタブで「タグ一覧」と「設定」を切り替える。
+					「すべて」には「設定」が無いので、タブ列ごと隠す（`.view-tabs.single`。
+					banto の `Tabs` にタブ列を出さない指定が無いための最小の回避）。
+					「タグ一覧」のパネルは「すべて」と対象の間で作り直さない（`Tabs` は
+					タブを id の鍵で描くので、同じ `list` のパネルが残る）。「設定」へ移ると
+					グリッドは外れ、戻ると作り直す（絞り込み・選択・表編集の保留はページの状態）。
+					`value` は関数バインディング: 未保存の確認でキャンセルされたら、getter が
+					元のタブを返す（`setActiveTabFromTabs`）。
+				-->
+				<div class="view-tabs" class:single={treeFilter.type === 'all'}>
+					<Tabs
+						tabs={viewTabs}
+						bind:value={() => activeTab, setActiveTabFromTabs}
+						label="表示の切り替え"
+					>
+						{#snippet panel(id)}
+							{#if id === 'list'}
+								<div class="list-pane">
+									<div class="toolbar">
+										{#if canWrite}
+											<!--
+												T19 S1-c（UX-33、docs/banto-hub-t19-design.md「タグ登録の
+												起点」、2026-09-02 オーナー決定「グループ選択時に右画面を
+												出し、そのグループに対して登録する」）: 「新規登録」
+												「連続登録」はツリーでグループが選択されているときだけ出す
+												- `registrationTarget`（依存ゼロの純関数
+												`resolveRegistrationTarget`、`tagOnboarding.ts`）が
+												「すべて」ノード・接続ノード選択時は `null` を返す
+												（タグは必ずグループに属するため、これらの選択では登録先が
+												一意に決まらない - 実装指示のとおりの扱い）。`null` の間は
+												ボタンを消すだけでなく案内を出す（実装指示「ただ消えるだけに
+												しないこと」）。
 
-								T19 S1-d（UX-30、2026-09-03）: 旧 `/plc-connections`・
-								`/collection-groups` 画面の削除に伴い、CTA を画面遷移
-								（`<a href>`）からその場で Drawer を開くボタンへ差し替えた
-								（`openConnectionCreateDrawer`/`openGroupCreateDrawer` は
-								既存のツリー右クリックメニューと同じ関数 - 新しい実装は
-								持たない）。旧画面の「新規作成」ボタンは `canWrite` 限定
-								だった（削除前の `plc-connections/+page.svelte` 参照）ので、
-								ここも `canWrite` で同じ権限に揃える - viewer には作成ボタン
-								を出さず、案内文のみにする（既存の権限判定を緩めない）。
-							-->
-						<div class="empty-state">
-							{#if connections.length === 0}
-								<p class="note">先に PLC接続 を作成してください。</p>
-								{#if canWrite}
-									<button
-										type="button"
-										class="onboarding-cta"
-										onclick={() => openConnectionCreateDrawer()}
-									>
-										PLC接続を作成
-									</button>
-								{/if}
-							{:else if groups.length === 0}
-								<p class="note">先に 収集グループ を作成してください。</p>
-								{#if canWrite}
-									<button
-										type="button"
-										class="onboarding-cta"
-										onclick={() => openGroupCreateDrawer()}
-									>
-										収集グループを作成
-									</button>
-								{/if}
+												CSVインポートだけは対象外 - CSV は行ごとに `connection`/
+												`group` 列で対象グループを指定でき、1ファイルが複数グループに
+												またがりうる（`tagCsv.ts::parseCsvRows` 参照）。ツリー選択に
+												紐づけると「選択中のグループにしか取り込めない」という誤解や
+												制約を生むだけなので、従来どおりツリー選択と無関係に常時表示
+												する（2026-09-03 実装判断）。
+											-->
+											{#if registrationTarget}
+												<span class="registration-target" data-testid="tag-registration-target">
+													「{registrationTarget.groupName}」へ登録
+												</span>
+												<button type="button" onclick={openCreateDrawer}>新規登録</button>
+												<button
+													type="button"
+													onclick={openContinuousDrawer}
+													disabled={!registrationTarget.supportsContinuous}
+													title={registrationTarget.supportsContinuous
+														? undefined
+														: '連続登録は PLC アドレスを持つ収集グループでのみ使えます'}
+												>
+													連続登録
+												</button>
+												<!--
+													T20 ②a（docs/banto-hub-t20-design.md §3.2、2026-09-04）:
+													構造体タグ登録の起動導線。連続登録と同じく PLC アドレスの
+													算術前提の機能のため、対象グループの制約も同一。
+												-->
+												<button
+													type="button"
+													data-testid="struct-reg-open"
+													onclick={openStructDrawer}
+													disabled={!registrationTarget.supportsContinuous}
+													title={registrationTarget.supportsContinuous
+														? undefined
+														: '構造体登録は PLC アドレスを持つ収集グループでのみ使えます'}
+												>
+													構造体登録
+												</button>
+											{:else}
+												<span class="registration-hint" data-testid="tag-registration-hint">
+													左のツリーで収集グループを選択すると、ここに新規登録・連続登録の操作が表示されます
+												</span>
+											{/if}
+											<button type="button" onclick={openCsvDrawer}>CSVインポート</button>
+											<!-- T18-3b: 選択列を追加する代わりに、行クリックの意味そのものを
+												「編集を開く」⇔「選択を切り替える」で切り替えるトグル
+												（`selectTag`/`toggleSelectRow` の doc comment 参照）。 -->
+											<button
+												type="button"
+												class="secondary"
+												data-testid="tag-selection-mode-toggle"
+												onclick={toggleSelectionMode}
+											>
+												{selectionMode ? '複数選択を終了' : '複数選択'}
+											</button>
+											<!-- T18-3e: セル編集/TSV貼付の表編集モード。収集停止中、または
+												試運転中（#341）のみ ON にできる（`gridEditAllowed` /
+												`toggleGridEditMode` の doc comment 参照）。ON中は
+												selectionMode と相互排他。 -->
+											<button
+												type="button"
+												class="secondary"
+												data-testid="tag-grid-edit-mode-toggle"
+												disabled={!gridEditMode && !gridEditAllowed}
+												title={!gridEditAllowed
+													? 'ロックダウン後は収集停止中のみ表編集できます'
+													: undefined}
+												onclick={toggleGridEditMode}
+											>
+												{gridEditMode ? '表編集を終了' : '表編集'}
+											</button>
+										{/if}
+										<!-- T18-3d: 出力範囲（全件/絞り込み結果/選択行）。選択行は
+											選択が1件も無ければ選べない（disabled option）。 -->
+										<select
+											class="csv-export-scope"
+											data-testid="tag-csv-export-scope"
+											bind:value={csvExportScope}
+											title="CSVエクスポートの対象範囲"
+										>
+											<option value="all">全件（{visibleTags.length}件）</option>
+											<option value="filtered">絞り込み結果（{filteredTags.length}件）</option>
+											<option value="selected" disabled={selectedIds.size === 0}>
+												選択行（{selectedIds.size}件）
+											</option>
+										</select>
+										<button type="button" class="secondary" onclick={handleExportCsv}
+											>CSVエクスポート</button
+										>
+										<input
+											type="search"
+											class="search-box"
+											placeholder="名前・アドレスで検索"
+											bind:value={searchQuery}
+										/>
+										<span class="count">{filteredTags.length} / {visibleTags.length} 件</span>
+									</div>
+									{#if canWrite && hubStatus !== null && !gridEditAllowed}
+										<!-- T18-3e: ロックの説明バナー - `hubStatus` 取得前
+											（`null`）は誤って「稼働中」と表示しないよう、取得済みの
+											ときだけ出す（実装指示「稼働中は編集不可で…バナー/無効表示」）。
+											#341: 試運転中は収集中でも表編集できるので、このバナーは
+											ロックダウン済み + 稼働中のときだけ出る。 -->
+										<p class="note" data-testid="tag-grid-edit-locked-note">
+											ロックダウン後は収集稼働中に表編集はできません（収集を停止すると表編集を有効にできます）。
+										</p>
+									{/if}
+									{#if canWrite && gridEditMode && pendingCellEdits.length > 0}
+										<!-- T18-3e: 保留中のセル編集バー（`tag-bulk-bar` と同じ帯パターン）。
+											「保存」は preflight（dry-run）を挟んでから確認パネルを開く
+											（`handleSaveGridEdits`）。件数は「実際に値が変わる行数」
+											（`cellEditBatch.diffRows`）- 元に戻した編集は保留バッファには
+											残るが、この件数には含めない。 -->
+										<div class="onboarding-banner" data-testid="tag-cell-edit-bar">
+											<span>保留中の編集 {cellEditBatch.diffRows.length} 件</span>
+											<button
+												type="button"
+												data-testid="tag-cell-edit-save"
+												disabled={cellEditValidating || cellEditBatch.rows.length === 0}
+												onclick={handleSaveGridEdits}
+											>
+												{cellEditValidating ? '確認中…' : '保存'}
+											</button>
+											<button
+												type="button"
+												class="secondary"
+												data-testid="tag-cell-edit-discard"
+												disabled={cellEditValidating || cellEditApplying}
+												onclick={discardGridEdits}
+											>
+												破棄
+											</button>
+										</div>
+									{/if}
+									{#if canWrite && cellEditPanelOpen}
+										<!-- T18-3e: 保存前の差分確認パネル（`tag-bulk-confirm-panel` と同じ
+											`.confirm-panel`/`.preview-table` を流用）。preflight
+											（`dryRun: true`）の結果はエラー行表示にのみ使い、差分自体は
+											クライアント側の `cellEditBatch.diffRows`（`tagCellEdit.ts`）を
+											表示する。 -->
+										<div class="confirm-panel" data-testid="tag-cell-edit-confirm-panel">
+											<p class="confirm-title">表編集の保存内容を確認</p>
+											<p class="note">対象 {cellEditBatch.diffRows.length} 件</p>
+											<div class="preview-wrap">
+												<table class="preview-table">
+													<thead>
+														<tr>
+															<th>ID</th>
+															<th>名前</th>
+															<th>変更内容</th>
+														</tr>
+													</thead>
+													<tbody>
+														{#each cellEditBatch.diffRows.slice(0, PREVIEW_DISPLAY_LIMIT) as row (row.id)}
+															<tr>
+																<td>{row.id}</td>
+																<td>{row.name}</td>
+																<td>{formatCellEditDiffs(row.diffs)}</td>
+															</tr>
+														{/each}
+													</tbody>
+												</table>
+											</div>
+											{@render previewLimitNote(cellEditBatch.diffRows.length)}
+											{#if cellEditValidationResult}
+												{@render bulkRowErrors(cellEditValidationResult)}
+											{/if}
+											<div class="actions">
+												<button
+													type="button"
+													data-testid="tag-cell-edit-apply"
+													disabled={!cellEditValidatedFresh || cellEditApplying}
+													onclick={handleApplyGridEdits}>この内容で保存を適用</button
+												>
+												<button
+													type="button"
+													class="secondary"
+													data-testid="tag-cell-edit-cancel-confirm"
+													onclick={cancelCellEditConfirm}
+													disabled={cellEditApplying}>閉じる</button
+												>
+											</div>
+										</div>
+									{/if}
+									{#if canWrite && selectedIds.size > 0}
+										<!-- T18-3b: 選択が1件以上のときだけ出す一括操作バー
+											（`monitorCtaHref` バナーと同じ帯パターン）。文言は既存トースト/
+											ボタン名と部分文字列でも被らないものにしてある（PR #135 の教訓、
+											`handleApplyBulk`/成功トーストのコメント参照）。 -->
+										<div class="onboarding-banner" data-testid="tag-bulk-bar">
+											<span>選択 {selectedIds.size} 件</span>
+											<button
+												type="button"
+												data-testid="tag-bulk-enable-open"
+												onclick={() => openBulkPanel('enable')}>一括で有効化</button
+											>
+											<button
+												type="button"
+												class="secondary"
+												data-testid="tag-bulk-disable-open"
+												onclick={() => openBulkPanel('disable')}>一括で無効化</button
+											>
+											<button
+												type="button"
+												class="secondary"
+												data-testid="tag-bulk-move-open"
+												disabled={selectedTagsMixedKind}
+												title={selectedTagsMixedKind
+													? '種別（plc/computed/internal）が混在する選択ではグループ移動できません'
+													: undefined}
+												onclick={() => openBulkPanel('move')}>グループへ一括移動</button
+											>
+											<button
+												type="button"
+												class="secondary"
+												data-testid="tag-bulk-offset-copy-open"
+												onclick={() => openBulkPanel('offset-copy')}>オフセットコピー</button
+											>
+											<button
+												type="button"
+												class="danger"
+												data-testid="tag-bulk-delete-open"
+												onclick={() => openBulkPanel('delete')}>一括で削除</button
+											>
+											<button
+												type="button"
+												class="secondary"
+												data-testid="tag-bulk-clear-selection"
+												onclick={() => (selectedIds = new Set())}>選択解除</button
+											>
+										</div>
+									{/if}
+									{#if canWrite && bulkAction !== null && bulkAction !== 'offset-copy'}
+										{@const actionLabel =
+											bulkAction === 'enable'
+												? '選択タグを一括で有効化'
+												: bulkAction === 'disable'
+													? '選択タグを一括で無効化'
+													: bulkAction === 'move'
+														? '選択タグをグループへ一括移動'
+														: '選択タグを一括削除'}
+										<!-- T18-3b: 適用前に対象件数・差分を確認するパネル。連続登録/CSVの
+											`.preview-table`/`.confirm-panel` をそのまま流用する（既存
+											プレビュー表示との視覚的な一貫性を優先し、新規スタイルは足さない）。
+											T19 S2-c1: `delete` は差分表ではなく確認文言（`formatTagsBulkDeleteConfirmMessage`）
+											を表示するだけ - 対象は選択タグの id そのもので「変更前/変更後」の
+											概念が無いため。 -->
+										<div class="confirm-panel" data-testid="tag-bulk-confirm-panel">
+											<p class="confirm-title">{actionLabel}</p>
+											{#if bulkAction === 'move'}
+												<label class="field">
+													移動先グループ
+													<select
+														bind:value={bulkTargetGroupId}
+														data-testid="tag-bulk-target-group"
+													>
+														<option value="" disabled>選択してください</option>
+														{#each bulkMoveGroupOptions as group (group.id)}
+															<option value={String(group.id)}>{group.name}</option>
+														{/each}
+													</select>
+												</label>
+											{/if}
+											{#if bulkAction === 'delete'}
+												<p
+													class="note bulk-delete-message"
+													data-testid="tag-bulk-delete-confirm-message"
+												>
+													{formatTagsBulkDeleteConfirmMessage(selectedTags.length)}
+												</p>
+											{:else if bulkSummary}
+												<p class="note">
+													対象 {bulkSummary.targetCount} 件・変更 {bulkSummary.changedCount} 件
+												</p>
+												<div class="preview-wrap">
+													<table class="preview-table">
+														<thead>
+															<tr>
+																<th>ID</th>
+																<th>名前</th>
+																<th>変更前</th>
+																<th>変更後</th>
+															</tr>
+														</thead>
+														<tbody>
+															{#each bulkSummary.rows.slice(0, PREVIEW_DISPLAY_LIMIT) as row (row.id)}
+																<tr>
+																	<td>{row.id}</td>
+																	<td>{row.name}</td>
+																	<td>{bulkFieldDisplay(bulkAction, row.from)}</td>
+																	<td>{bulkFieldDisplay(bulkAction, row.to)}</td>
+																</tr>
+															{/each}
+														</tbody>
+													</table>
+												</div>
+												{@render previewLimitNote(bulkSummary.rows.length)}
+											{:else if bulkAction === 'move'}
+												<p class="hint">移動先グループを選択してください。</p>
+											{/if}
+											{#if bulkResult}
+												{@render bulkRowErrors(bulkResult)}
+											{/if}
+											<div class="actions">
+												<button
+													type="button"
+													data-testid="tag-bulk-apply"
+													disabled={bulkApplying || bulkTargetCount === 0}
+													onclick={handleApplyBulk}>この内容で一括反映</button
+												>
+												<button
+													type="button"
+													class="secondary"
+													data-testid="tag-bulk-cancel"
+													onclick={closeBulkPanel}
+													disabled={bulkApplying}>キャンセル</button
+												>
+											</div>
+										</div>
+									{/if}
+									{#if canWrite && bulkAction === 'offset-copy'}
+										<!-- T20 ②b（docs/banto-hub-t20-design.md §3.2）: enable/disable/move/
+											delete の確認パネル（`tag-bulk-confirm-panel`、上記）とは別立ての
+											専用パネル - こちらは「更新」ではなく `createTagsBatch` による
+											「新規作成」で、構造体登録②a（`struct-reg-*`）と同じ
+											「プレビュー→検証(dry-run)→登録」の2段階フローを持つため。 -->
+										<div class="confirm-panel" data-testid="tag-bulk-offset-copy-panel">
+											<p class="confirm-title">選択タグをオフセットコピー</p>
+											<label class="field">
+												オフセット（ワード数）
+												<input
+													type="number"
+													step="1"
+													min="1"
+													bind:value={bulkOffsetWords}
+													placeholder="100"
+													data-testid="tag-bulk-offset-copy-words"
+												/>
+												<span class="hint"
+													>正の整数を指定してください（例: 100 → D3000 起点のタグ群を D3100
+													起点へ複製）。</span
+												>
+											</label>
+
+											{#if bulkOffsetCopyResult}
+												<h4>プレビュー（{bulkOffsetCopyResult.rows.length}件）</h4>
+												<div class="preview-wrap">
+													<table
+														class="preview-table"
+														data-testid="tag-bulk-offset-copy-preview-table"
+													>
+														<thead>
+															<tr>
+																<th>#</th>
+																<th>元の名前</th>
+																<th>元のアドレス</th>
+																<th>コピー先名前</th>
+																<th>コピー先アドレス</th>
+															</tr>
+														</thead>
+														<tbody>
+															{#each bulkOffsetCopyResult.rows.slice(0, PREVIEW_DISPLAY_LIMIT) as row, i (row.sourceId)}
+																<tr
+																	class={bulkOffsetCopyResult.errors.some(
+																		(e) => e.sourceId === row.sourceId
+																	)
+																		? 'struct-row-collision'
+																		: ''}
+																>
+																	<td>{i + 1}</td>
+																	<td>{row.sourceName}</td>
+																	<td>{row.sourceAddress}</td>
+																	<td>{row.name}</td>
+																	<td>{row.address}</td>
+																</tr>
+															{/each}
+														</tbody>
+													</table>
+												</div>
+												{@render previewLimitNote(bulkOffsetCopyResult.rows.length)}
+
+												{#if bulkOffsetCopyResult.errors.length > 0}
+													<div class="struct-collisions" data-testid="tag-bulk-offset-copy-errors">
+														<p class="err">
+															算出できないアドレス、または名前/アドレスが重複しているタグがあります。修正してください。
+														</p>
+														<ul>
+															{#each bulkOffsetCopyResult.errors as e, i (i)}
+																<li>{e.sourceName}（{e.sourceAddress}）: {e.message}</li>
+															{/each}
+														</ul>
+													</div>
+												{/if}
+											{/if}
+
+											{#if bulkOffsetCopyValidationResult}
+												{@render batchRowErrors(bulkOffsetCopyValidationResult)}
+											{/if}
+
+											<div class="actions">
+												<button
+													type="button"
+													data-testid="tag-bulk-offset-copy-validate"
+													onclick={handleValidateBulkOffsetCopy}
+													disabled={bulkOffsetCopyApplying ||
+														bulkOffsetCopyValidating ||
+														!bulkOffsetIsPositiveInteger ||
+														!bulkOffsetCopyTagInputs}
+													title={bulkOffsetIsPositiveInteger
+														? undefined
+														: BULK_OFFSET_INVALID_REASON}
+												>
+													検証
+												</button>
+												<button
+													type="button"
+													data-testid="tag-bulk-offset-copy-apply"
+													onclick={handleApplyBulkOffsetCopy}
+													disabled={bulkOffsetCopyApplying ||
+														!bulkOffsetIsPositiveInteger ||
+														!bulkOffsetCopyValidatedFresh}
+													title={bulkOffsetIsPositiveInteger
+														? undefined
+														: BULK_OFFSET_INVALID_REASON}
+												>
+													この内容でコピー
+												</button>
+												<button
+													type="button"
+													class="secondary"
+													data-testid="tag-bulk-offset-copy-cancel"
+													onclick={closeBulkPanel}
+													disabled={bulkOffsetCopyApplying}>キャンセル</button
+												>
+											</div>
+											{#if bulkOffsetCopyTagInputs && !bulkOffsetCopyValidatedFresh}
+												<span class="hint"
+													>先に「検証」を実行してください（内容を変更すると再検証が必要）。</span
+												>
+											{/if}
+										</div>
+									{/if}
+									{#if monitorCtaHref}
+										<!-- T18-4c（docs/banto-hub-t18-design.md「T18-4c 確認導線」）: 新規/
+											複製/編集/連続登録/CSV取り込み/一括更新のいずれの成功後にも、
+											サイドバー探索なしでその対象タグの値・品質・時刻へ1クリックで
+											移動できるよう案内する。文言はどの成功トースト（`作成しました`
+											`更新しました`/`削除しました`/一括登録・一括更新の件数付き文言）
+											とも部分一致しないようにしてある - `page.getByText('作成しました')`
+											等（`e2e/tests-banto-hub/banto-hub-tags-form.spec.ts`/
+											`banto-hub-tags-p0-2-preflight.spec.ts`）がトーストと二重ヒットして
+											strict mode violation になっていた実測回帰（2026-08-12、PR #135
+											CI）の再発防止。 -->
+										<div class="onboarding-banner">
+											<span>モニタで値・品質・時刻を確認できます。</span>
+											<a class="onboarding-cta" href={monitorCtaHref}>確認: 値・品質・時刻を見る</a>
+											<button
+												type="button"
+												class="secondary"
+												onclick={() => (monitorCtaHref = null)}>閉じる</button
+											>
+										</div>
+									{/if}
+									<p class="note">
+										{#if !canWrite}
+											閲覧のみ（編集には編集者以上の権限が必要です）。
+										{:else if insertArmed}
+											<!--
+													#342 段階C: 「一覧から挿入」が ON の間だけ出す状態表示
+													（トグルはペイン側にあるため、グリッド側にも1つだけ
+													意味が変わっていることを出す）。
+												-->
+											<span class="insert-armed-badge" data-testid="tag-insert-armed-badge">
+												一覧から挿入:
+												行をクリックすると式欄のキャレット位置にそのタグの完全名が入ります（Esc
+												で解除。淡色の行は自タグ・式で表せない名前・文字列型・循環になる参照で挿入できません）。
+											</span>
+										{:else if gridEditMode}
+											セルをダブルクリックまたは選択して直接編集できます（Excel等からの貼り付けにも対応）。行を開くにはダブルクリックしてください。「保存」を押すまで反映されません。
+										{:else if selectionMode}
+											行をクリックすると選択の切り替えになります（編集は「複数選択を終了」してから）。
+										{:else}
+											行をクリックすると編集パネルが開きます。
+										{/if}
+									</p>
+									<!--
+										T18-1（TAG-UX-C 6点目、docs/banto-hub-desktop-plan.md §9.4）:
+										初期読込中・初期読込失敗・再読込中(stale)・再読込失敗(stale)・
+										真の空・検索/ツリーフィルタ0件・通常表示を区別する。
+										「通信失敗をタグ0件と表示しない」ため、`loadError` が立って
+										いる間は空のBantoGridも「タグがありません」も出さない
+										（stale があれば一覧の上にバナー、無ければ再試行のみ）。
+									-->
+									{#if loading && tags.length === 0 && !loadError}
+										<p class="loading">読み込み中…</p>
+									{:else if loadError && tags.length === 0}
+										<div class="empty-state">
+											<p class="err">{loadError}</p>
+											<button type="button" onclick={() => void reload()} disabled={loading}>
+												{loading ? '再試行中…' : '再試行'}
+											</button>
+										</div>
+									{:else}
+										{#if loading}
+											<p class="loading">再読込中…</p>
+										{:else if loadError}
+											<div class="reload-banner">
+												<span class="err">{loadError}</span>
+												<button type="button" class="secondary" onclick={() => void reload()}
+													>再試行</button
+												>
+												<span class="hint">前回の読込内容を表示しています。</span>
+											</div>
+										{/if}
+										{#if tags.length === 0}
+											<!--
+												T18-2d（TAG-UX-A「空状態を…不足する前工程と移動ボタンを示す」）:
+												連鎖する前工程（PLC接続→収集グループ）のうち欠けているものを
+												案内する。connections/groups が両方揃っていれば通常の空表示。
+
+												T19 S1-d（UX-30、2026-09-03）: 旧 `/plc-connections`・
+												`/collection-groups` 画面の削除に伴い、CTA を画面遷移
+												（`<a href>`）からその場で Drawer を開くボタンへ差し替えた
+												（`openConnectionCreateDrawer`/`openGroupCreateDrawer` は
+												既存のツリー右クリックメニューと同じ関数 - 新しい実装は
+												持たない）。旧画面の「新規作成」ボタンは `canWrite` 限定
+												だった（削除前の `plc-connections/+page.svelte` 参照）ので、
+												ここも `canWrite` で同じ権限に揃える - viewer には作成ボタン
+												を出さず、案内文のみにする（既存の権限判定を緩めない）。
+											-->
+											<div class="empty-state">
+												{#if connections.length === 0}
+													<p class="note">先に PLC接続 を作成してください。</p>
+													{#if canWrite}
+														<button
+															type="button"
+															class="onboarding-cta"
+															onclick={() => openConnectionCreateDrawer()}
+														>
+															PLC接続を作成
+														</button>
+													{/if}
+												{:else if groups.length === 0}
+													<p class="note">先に 収集グループ を作成してください。</p>
+													{#if canWrite}
+														<button
+															type="button"
+															class="onboarding-cta"
+															onclick={() => openGroupCreateDrawer()}
+														>
+															収集グループを作成
+														</button>
+													{/if}
+												{:else}
+													<p class="note">
+														タグがありません。上の「新規登録」から追加してください。
+													</p>
+												{/if}
+											</div>
+										{:else if filteredTags.length === 0}
+											<p class="note">条件に一致するタグがありません。</p>
+										{:else}
+											<div class="grid-wrap">
+												<!--
+													T18-3e: `@banto/grid-svelte` の `GridState`
+													（`node_modules/@banto/grid-svelte/src/state.svelte.ts`）は
+													コンストラクタで受け取った `columns` を private フィールドへ
+													一度だけ固定し（`this.order` も初期化時の列 id 一覧のまま）、
+													以後 `columns` prop が差し替わっても再構築しない
+													（`BantoGrid.svelte` の `const gridState = externalState ??
+													new GridState(columns, ...)` は素の `const` - プロパティ変更で
+													再実行されるリアクティブな式ではない）。そのため
+													`gridEditMode` の変化で `columns` の中身（`editable`/
+													`unit`・`decimals` 列の有無）を変えても、BantoGrid 側は
+													初回マウント時の列定義のまま更新されない。
+													`{#key gridEditMode}` でモード切替のたびに BantoGrid
+													自体を作り直し（アンマウント→再マウント）、新しい
+													`columns` で `GridState` を最初から組み立て直させることで
+													回避する - grid-svelte 本体は変更しない制約の中で確実に
+													列定義を反映させる標準的な Svelte パターン。表編集モードの
+													ON/OFF は頻繁な操作ではないため、切替時に列幅ドラッグ・
+													ソート・フィルタ・スクロール位置がリセットされるのは
+													許容できるコストと判断した。
+												-->
+												{#key gridEditMode}
+													<BantoGrid
+														rows={gridDisplayRows}
+														{columns}
+														getRowId={(t) => t.id}
+														onRowClick={canWrite
+															? insertArmed
+																? insertTagRefIntoExpression
+																: selectionMode
+																	? toggleSelectRow
+																	: selectTag
+															: undefined}
+														rowClass={tagRowClass}
+														onCellEdit={canWrite && gridEditMode ? handleGridCellEdit : undefined}
+														onRangePaste={canWrite && gridEditMode
+															? handleGridRangePaste
+															: undefined}
+													/>
+												{/key}
+											</div>
+										{/if}
+									{/if}
+								</div>
 							{:else}
-								<p class="note">タグがありません。上の「新規登録」から追加してください。</p>
+								{@render settingsPane()}
 							{/if}
-						</div>
-					{:else if filteredTags.length === 0}
-						<p class="note">条件に一致するタグがありません。</p>
-					{:else}
-						<div class="grid-wrap">
-							<!--
-									T18-3e: `@banto/grid-svelte` の `GridState`
-									（`node_modules/@banto/grid-svelte/src/state.svelte.ts`）は
-									コンストラクタで受け取った `columns` を private フィールドへ
-									一度だけ固定し（`this.order` も初期化時の列 id 一覧のまま）、
-									以後 `columns` prop が差し替わっても再構築しない
-									（`BantoGrid.svelte` の `const gridState = externalState ??
-									new GridState(columns, ...)` は素の `const` - プロパティ変更で
-									再実行されるリアクティブな式ではない）。そのため
-									`gridEditMode` の変化で `columns` の中身（`editable`/
-									`unit`・`decimals` 列の有無）を変えても、BantoGrid 側は
-									初回マウント時の列定義のまま更新されない。
-									`{#key gridEditMode}` でモード切替のたびに BantoGrid
-									自体を作り直し（アンマウント→再マウント）、新しい
-									`columns` で `GridState` を最初から組み立て直させることで
-									回避する - grid-svelte 本体は変更しない制約の中で確実に
-									列定義を反映させる標準的な Svelte パターン。表編集モードの
-									ON/OFF は頻繁な操作ではないため、切替時に列幅ドラッグ・
-									ソート・フィルタ・スクロール位置がリセットされるのは
-									許容できるコストと判断した。
-								-->
-							{#key gridEditMode}
-								<BantoGrid
-									rows={gridDisplayRows}
-									{columns}
-									getRowId={(t) => t.id}
-									onRowClick={canWrite
-										? insertArmed
-											? insertTagRefIntoExpression
-											: selectionMode
-												? toggleSelectRow
-												: selectTag
-										: undefined}
-									rowClass={tagRowClass}
-									onCellEdit={canWrite && gridEditMode ? handleGridCellEdit : undefined}
-									onRangePaste={canWrite && gridEditMode ? handleGridRangePaste : undefined}
-								/>
-							{/key}
-						</div>
-					{/if}
-				{/if}
+						{/snippet}
+					</Tabs>
+				</div>
 			</div>
 		</ThreePaneLayout>
 	</div>
 </div>
+
+<!--
+	#1179 PR3a: 中央の「設定」タブ（接続先・収集グループ）。フォームは
+	`ConnectionDrawer`/`CollectionGroupDrawer` の再設定フォームを外枠なしで埋め込む
+	（`embedded`） - dirty 判定・読み取り専用（閲覧者は `canWrite` が無いので読み取り
+	専用）・保存（閉じない）・削除（再読込を待ってから `onClose`）は Drawer と同じ
+	実装をそのまま使う。保存・削除の後は Drawer と同じ `reload()`。削除で対象が
+	消えると、URL から状態を決める `$effect` が「すべて」へ戻す。
+	接続先の設定には、配下の収集グループの一覧（押すとそのグループの「設定」へ）と
+	「収集グループを追加」（既存の作成のモーダル）を付ける。グループの公開の
+	トグル（§外部公開）はまだ無い。
+-->
+<!--
+	予約の仮想接続（`calc`/`mem`、`protocol === 'virtual'`）は、編集者でも接続先の
+	設定を読み取り専用にする（右クリックのメニューが再設定・削除を出さないのと同じ。
+	サーバーも予約の接続の更新・削除を断る）。配下の収集グループの一覧と追加は残す。
+-->
+{#snippet settingsPane()}
+	<div class="settings-pane" data-testid="tag-settings-pane" tabindex="-1">
+		{#if settingsConnection}
+			<h3 class="settings-title">接続先「{settingsConnection.name}」の設定</h3>
+			<ConnectionDrawer
+				bind:this={connectionSettingsForm}
+				embedded
+				open
+				connection={settingsConnection}
+				existingNames={connections.map((c) => c.name)}
+				{connections}
+				{groups}
+				{tags}
+				readOnly={!canWrite || isVirtualConnection(settingsConnection)}
+				onClose={() => {}}
+				onSaved={handleConnectionDrawerSaved}
+				onDeleted={handleConnectionDrawerDeleted}
+			/>
+			<section class="settings-groups" aria-labelledby="tag-settings-groups-title">
+				<h4 id="tag-settings-groups-title">収集グループ</h4>
+				{#if settingsChildGroups.length === 0}
+					<p class="hint">この接続先には収集グループがありません。</p>
+				{:else}
+					<ul class="settings-group-list">
+						{#each settingsChildGroups as group (group.id)}
+							<li>
+								<button
+									type="button"
+									class="link-button"
+									onclick={() =>
+										requestView({ target: { type: 'group', id: group.id }, tab: activeTab })}
+								>
+									{group.name}
+								</button>
+								<span class="hint">{group.periodMs}ms{group.enabled ? '' : '・無効'}</span>
+							</li>
+						{/each}
+					</ul>
+				{/if}
+				{#if canWrite}
+					<button
+						type="button"
+						class="secondary"
+						onclick={() => openGroupCreateDrawer(settingsConnection.id)}
+					>
+						収集グループを追加
+					</button>
+				{/if}
+			</section>
+		{:else if settingsGroup}
+			<h3 class="settings-title">収集グループ「{settingsGroup.name}」の設定</h3>
+			<CollectionGroupDrawer
+				bind:this={groupSettingsForm}
+				embedded
+				open
+				group={settingsGroup}
+				existingNames={groups.map((g) => g.name)}
+				{connections}
+				{tags}
+				readOnly={!canWrite}
+				onClose={() => {}}
+				onSaved={handleGroupDrawerSaved}
+				onDeleted={handleGroupDrawerDeleted}
+			/>
+		{:else}
+			<p class="loading">読み込み中…</p>
+		{/if}
+	</div>
+{/snippet}
 
 {#if treeContextMenu}
 	<TreeContextMenu
@@ -8067,8 +8480,94 @@
 		flex-direction: column;
 		height: 100%;
 		min-height: 0;
-		gap: 0.6rem;
 		padding: 1rem 1.25rem;
+	}
+
+	/*
+	 * #1179 PR3a: 中央のタブ。`Tabs` はタブ列とパネルを並べて描くだけなので、
+	 * 表示中のパネルが残りの高さを埋めるようにする（グリッドの高さの基準）。
+	 */
+	.view-tabs {
+		display: flex;
+		flex-direction: column;
+		flex: 1;
+		min-height: 0;
+	}
+
+	.view-tabs > :global(.banto-tabs__panel:not([hidden])) {
+		display: flex;
+		flex-direction: column;
+		flex: 1;
+		min-height: 0;
+	}
+
+	/* 「すべて」には「設定」が無いので、タブ列（「タグ一覧」だけ）を出さない。 */
+	.view-tabs.single > :global(.banto-tabs) {
+		display: none;
+	}
+
+	.view-tabs.single > :global(.banto-tabs__panel) {
+		padding-block-start: 0;
+	}
+
+	.list-pane {
+		display: flex;
+		flex-direction: column;
+		flex: 1;
+		min-height: 0;
+		gap: 0.6rem;
+	}
+
+	.settings-pane {
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
+		overflow: auto;
+		max-width: 48rem;
+	}
+
+	.settings-title {
+		margin: 0;
+		font-size: 1rem;
+	}
+
+	.settings-groups {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 0.5rem;
+		border-top: 1px solid var(--banto-border);
+		padding-top: 0.75rem;
+	}
+
+	.settings-groups h4 {
+		margin: 0;
+		font-size: 0.9rem;
+	}
+
+	.settings-group-list {
+		margin: 0;
+		padding: 0;
+		list-style: none;
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
+	}
+
+	.settings-group-list li {
+		display: flex;
+		align-items: baseline;
+		gap: 0.5rem;
+	}
+
+	.link-button {
+		padding: 0;
+		border: none;
+		background: none;
+		color: var(--banto-primary);
+		text-decoration: underline;
+		cursor: pointer;
+		font: inherit;
 	}
 
 	/*
