@@ -2041,8 +2041,8 @@
 	 * 狭幅では 480/640px のペインを並べる余地が無いので、従来どおり
 	 * オーバーレイの Drawer へフォールバックする。狭幅の判定は従来どおり
 	 * ビューポート（`mobileNavStore.isNarrow`、サイドバーのオフキャンバスと
-	 * 同じ境界）。部品は枠の幅で判定するので、`narrowBreakpoint` を 0 / 最大値に
-	 * 切り替えてビューポート基準にしている（2026-11-18 オーナー決定、#1182。
+	 * 同じ境界）。部品の既定は枠の幅での判定だが、`narrowOverride` で
+	 * ビューポート基準にしている（2026-11-18 オーナー決定、#1182、banto v7.5.0。
 	 * 1366×768・125% でツリーと編集ペインを横並びに保つため）。部品が書き出す
 	 * `narrow`（`layoutNarrow`）はその結果で、ページはこれを見る。
 	 *
@@ -3328,7 +3328,7 @@
 		sharedTreeTarget.set(treeFilter);
 	});
 
-	/** 中央のタブ。「すべて」には「設定」が無い（タブ列ごと出さない - `.view-tabs.single`）。 */
+	/** 中央のタブ。「すべて」には「設定」が無い（タブ列ごと出さない - `hideSingleTab`）。 */
 	const viewTabs = $derived(
 		treeFilter.type === 'all'
 			? [{ id: 'list', label: 'タグ一覧' }]
@@ -3414,7 +3414,7 @@
 	/**
 	 * #378（2026-09-16 オーナー決定）: 狭幅で左ツリーを退避したときの開閉状態
 	 * （`ThreePaneLayout` の `leftDrawerOpen`）。狭幅の判定はビューポート基準
-	 * （`layoutNarrow`、`narrowBreakpoint` で切り替え）で、広幅へ戻ると部品が
+	 * （`layoutNarrow`、`narrowOverride` で上書き）で、広幅へ戻ると部品が
 	 * `false` へ戻す。
 	 */
 	let treeOpen = $state(false);
@@ -3422,24 +3422,16 @@
 	/** 左ペインとそのトグルの名前（`ThreePaneLayout` の `messages.threePaneLeft`）。 */
 	const TREE_PANE_LABEL = '接続とグループ';
 
-	/** 枠（`ThreePaneLayout`）を包む要素。帯のツリーのトグルを引くために持つ。 */
-	let frameHostEl: HTMLDivElement | undefined = $state();
-
 	/**
-	 * #381 レビュー対応5回目: ツリーのトグル本体。コンテキストメニューを
-	 * 閉じたときに戻り先（ツリーノード）が `inert` の中で戻せない場合の
-	 * フォーカスの受け皿にする（`closeTreeContextMenu`）。
-	 *
-	 * #1179 PR2b: トグルは `ThreePaneLayout` の帯の中にあり `bind:this` できない
-	 * ので、ARIA の公開の約束（左ペインの `aria-label` と、それを `aria-controls`
-	 * で指すボタン）で引く（部品の内部のクラス名には頼らない）。
+	 * #381 レビュー対応5回目: ツリーのトグル本体（`ThreePaneLayout` の `bind:leftToggleEl`、
+	 * 読むだけ。#1179、banto v7.5.0）。コンテキストメニューを閉じたときに戻り先
+	 * （ツリーノード）が `inert` の中で戻せない場合のフォーカスの受け皿にする
+	 * （`closeTreeContextMenu`）。
 	 */
+	let treeToggleEl: HTMLElement | undefined = $state();
+
 	function treeToggleElement(): HTMLElement | null {
-		const host = frameHostEl;
-		if (!host) return null;
-		const pane = host.querySelector<HTMLElement>(`aside[aria-label="${TREE_PANE_LABEL}"]`);
-		if (!pane?.id) return null;
-		return host.querySelector<HTMLElement>(`button[aria-controls="${CSS.escape(pane.id)}"]`);
+		return treeToggleEl ?? null;
 	}
 
 	/*
@@ -6856,7 +6848,7 @@
 		<h2>タグ登録</h2>
 	</div>
 
-	<div class="content" bind:this={frameHostEl}>
+	<div class="content">
 		<!--
 			#375: 非モーダルの編集ペイン。**オーバーレイを持たず、
 			`role="dialog"`/`aria-modal` も付けない** - 編集中も左ツリーと
@@ -6904,13 +6896,14 @@
 			#378（2026-09-16 オーナー決定）: 狭幅では左ツリーをドロワーへ退避する
 			（#1179 PR2b から `@banto/ui` の `ThreePaneLayout`。タグモニタと同じ部品）。
 			狭幅の判定は従来どおりビューポート（`mobileNavStore.isNarrow`）。部品は
-			枠の幅で判定するので `narrowBreakpoint` を 0 / 最大値に切り替えて
-			ビューポート基準にし（2026-11-18 オーナー決定、#1182）、`layoutNarrow` へ書き出す。退避・トグル・Esc・スクリム・フォーカスの出入りは部品が持つ
+			枠の幅の判定を `narrowOverride` で上書きして
+			ビューポート基準にし（2026-11-18 オーナー決定、#1182、banto v7.5.0）、`layoutNarrow` へ書き出す。退避・トグル・Esc・スクリム・フォーカスの出入りは部品が持つ
 			（部品の冒頭コメントの約束）。帯のトグルの隣には、閉じていても何で
 			絞り込まれているかが分かるよう、現在のツリー選択名を出す。
 		-->
 		<ThreePaneLayout
-			narrowBreakpoint={mobileNavStore.isNarrow ? Number.MAX_SAFE_INTEGER : 0}
+			narrowOverride={mobileNavStore.isNarrow}
+			bind:leftToggleEl={treeToggleEl}
 			bind:leftDrawerOpen={treeOpen}
 			bind:narrow={layoutNarrow}
 			bind:rightCollapsed={editPaneCollapsed}
@@ -6964,8 +6957,8 @@
 				<!--
 					#1179 PR3a（docs/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、
 					2026-11-17 オーナー決定）: 中央はタブで「タグ一覧」と「設定」を切り替える。
-					「すべて」には「設定」が無いので、タブ列ごと隠す（`.view-tabs.single`。
-					banto の `Tabs` にタブ列を出さない指定が無いための最小の回避）。
+					「すべて」には「設定」が無いので、タブ列ごと隠す（`Tabs` の `hideSingleTab`、banto v7.5.0。
+					`.view-tabs.single` はそのときのパネルの上の余白を詰めるだけ）。
 					「タグ一覧」のパネルは「すべて」と対象の間で作り直さない（`Tabs` は
 					タブを id の鍵で描くので、同じ `list` のパネルが残る）。「設定」へ移ると
 					グリッドは外れ、戻ると作り直す（絞り込み・選択・表編集の保留はページの状態）。
@@ -6975,6 +6968,7 @@
 				<div class="view-tabs" class:single={treeFilter.type === 'all'}>
 					<Tabs
 						tabs={viewTabs}
+						hideSingleTab
 						bind:value={() => activeTab, setActiveTabFromTabs}
 						label="表示の切り替え"
 					>
@@ -8508,11 +8502,7 @@
 		min-height: 0;
 	}
 
-	/* 「すべて」には「設定」が無いので、タブ列（「タグ一覧」だけ）を出さない。 */
-	.view-tabs.single > :global(.banto-tabs) {
-		display: none;
-	}
-
+	/* 「すべて」はタブ列を出さない（`hideSingleTab`）ので、パネルの上の余白を詰める。 */
 	.view-tabs.single > :global(.banto-tabs__panel) {
 		padding-block-start: 0;
 	}
