@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use banto_tagclient::{
     BindingRequest, CatalogSnapshot, CatalogTag, Endpoint, ErrorKind, RequestedValue, RestClient,
-    SecretApiKey, TagClientConnectionState, TagClientState,
+    SecretApiKey, TagClientConnectionState, TagClientState, WriteOptions,
 };
 use tokio::sync::watch;
 use tokio::time::{sleep, timeout, Instant};
@@ -334,13 +334,17 @@ async fn step3_subscribe(
     let trigger_result = match build_client(hub_url, api_key) {
         Ok(trigger_client) => {
             trigger_client
-                .write_tag(&plc_tag.external_name, RequestedValue::Num(trigger_value))
+                .write_tag(
+                    &plc_tag.external_name,
+                    RequestedValue::Num(trigger_value),
+                    WriteOptions::default(),
+                )
                 .await
         }
         Err(error) => Err(error),
     };
     match &trigger_result {
-        Ok(()) => {
+        Ok(_) => {
             println!("  値変化のトリガとして {EXT_PLC_D3000} <- {trigger_value} を書き込みました。")
         }
         Err(error) => println!(
@@ -402,10 +406,14 @@ async fn step4_write(
     };
     let test_value = 4242.0;
     match client
-        .write_tag(&tag.external_name, RequestedValue::Num(test_value))
+        .write_tag(
+            &tag.external_name,
+            RequestedValue::Num(test_value),
+            WriteOptions::default(),
+        )
         .await
     {
-        Ok(()) => {
+        Ok(_) => {
             println!("  書込成功: {EXT_PLC_D3000} <- {test_value}");
             // banto-hub は tag の period_ms（実測1000ms）でPLC/Modbusを
             // ポーリングしてから current 値を更新するため、書込直後の
@@ -473,10 +481,14 @@ async fn step5_forbidden(
         }
     };
     match client
-        .write_tag(&tag.external_name, RequestedValue::Bool(true))
+        .write_tag(
+            &tag.external_name,
+            RequestedValue::Bool(true),
+            WriteOptions::default(),
+        )
         .await
     {
-        Ok(()) => {
+        Ok(_) => {
             println!("  想定外: writable=false のタグへの書込が成功してしまいました。");
             StepResult::from_bool("403確認", false, "書込が成功してしまった（本来403のはず）")
         }
@@ -572,10 +584,14 @@ async fn step6_unavailable(
             let write_client = build_client(hub_url, api_key);
             let (write_ok, write_detail) = match write_client {
                 Ok(client) => match client
-                    .write_tag(&tag.external_name, RequestedValue::Num(1.0))
+                    .write_tag(
+                        &tag.external_name,
+                        RequestedValue::Num(1.0),
+                        WriteOptions::default(),
+                    )
                     .await
                 {
-                    Ok(()) => {
+                    Ok(_) => {
                         println!("  想定外: write-control無効時に書込が成功してしまいました。");
                         (false, "書込が成功してしまった（本来503のはず）".to_owned())
                     }
@@ -615,7 +631,11 @@ async fn step6_unavailable(
             // 復旧確認: 実際に書き込めることを確かめる（あくまで付随情報）。
             let restored = match build_client(hub_url, api_key) {
                 Ok(client) => client
-                    .write_tag(&tag.external_name, RequestedValue::Num(0.0))
+                    .write_tag(
+                        &tag.external_name,
+                        RequestedValue::Num(0.0),
+                        WriteOptions::default(),
+                    )
                     .await
                     .is_ok(),
                 Err(_) => false,

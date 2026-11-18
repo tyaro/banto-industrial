@@ -33,8 +33,8 @@ pub enum ErrorKind {
     RuntimeMetadataMismatch,
     Stopped,
     /// Write rejected with HTTP 403 (`not_writable` / `missing_write_scope` /
-    /// `session_token_cannot_write` / `key_tripped`, tag-server-design.md §6
-    /// gates 2/8). A configuration or credential problem, not a transient
+    /// `session_token_cannot_write`; a 403 `key_tripped` is
+    /// [`Self::KeyTripped`], tag-server-design.md §6 gates 2/8). A configuration or credential problem, not a transient
     /// server state - retrying the same request will not help.
     WriteForbidden,
     /// Write rejected with HTTP 503 (`writes_disabled` /
@@ -52,6 +52,14 @@ pub enum ErrorKind {
     /// constructed cannot succeed; the caller must change the tag, value, or
     /// timing before trying again.
     WriteRejected,
+    /// The write may or may not have reached the device (502
+    /// `write_uncertain` or an unknown 502, 500 `internal`, or a failure after
+    /// the request was sent such as a timeout). The caller must check the
+    /// physical state before writing again; this crate never retries.
+    WriteUncertain,
+    /// The write options (`correlation_id` / `on_behalf_of`) do not satisfy the
+    /// Hub's rules. Nothing was sent.
+    InvalidWriteOptions,
     /// #446: banto-hub closed the stream with close code 1008 and the reason
     /// `api_key_revoked` - an administrator revoked this key. Irreversible:
     /// only a different key helps, so the worker stops instead of
@@ -97,6 +105,8 @@ impl ErrorKind {
             Self::WriteForbidden => "write_forbidden",
             Self::WriteUnavailable => "write_unavailable",
             Self::WriteRejected => "write_rejected",
+            Self::WriteUncertain => "write_uncertain",
+            Self::InvalidWriteOptions => "invalid_write_options",
             Self::KeyRevoked => "key_revoked",
             Self::KeyExpired => "key_expired",
             Self::KeyTripped => "key_tripped",

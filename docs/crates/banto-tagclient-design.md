@@ -1,7 +1,7 @@
 # banto-tagclient 設計
 
 作成日: 2026-08-29
-状態: **2026-11-18: §4.4 の書込みに SCADA 向けの変更（#1177、2026-11-18 オーナー決定、tag-server-design.md §6.6。未実装）を足した。#682（2026-10-31〜11-01、PR-1〜PR-3 で実装。§3.1・§4・§5 は反映済み）: 部分 Binding 解決（未解決名があっても解決できた名前だけで購読し、未解決は個別診断）と、同一世代の catalog / 解決結果 / current を 1 つの snapshot で公開する契約拡張は [banto-tagclient-partial-binding-design.md](banto-tagclient-partial-binding-design.md) が正。本書と食い違う所があれば同書を正とする。**
+状態: **2026-11-19: §4.4 の書込みを SCADA 向けの契約に合わせて実装した（#1202）。2026-11-18: §4.4 の書込みに SCADA 向けの変更（#1177、2026-11-18 オーナー決定、tag-server-design.md §6.6）を足した。#682（2026-10-31〜11-01、PR-1〜PR-3 で実装。§3.1・§4・§5 は反映済み）: 部分 Binding 解決（未解決名があっても解決できた名前だけで購読し、未解決は個別診断）と、同一世代の catalog / 解決結果 / current を 1 つの snapshot で公開する契約拡張は [banto-tagclient-partial-binding-design.md](banto-tagclient-partial-binding-design.md) が正。本書と食い違う所があれば同書を正とする。**
 **2026-09-30 オーナー決定（docs/scada/scada-design.md §9.6）で、bindingと書き込みの同一性を
 Hub内部の数値ID（`StableTagId`）から外部名（`external_name`）に変更した（§3.1・§4.4。
 SDKと呼び出し側は追従済み）。改名でbindingがunresolvedになるのは仕様。**
@@ -291,9 +291,9 @@ shutdownはそのエラーを返す。公開Handleによるcatalog起点の再�
 
 ### 4.4 書き込み（W1、Issue #123、2026-09-01）
 
-`RestClient::write_tag(external_name, value)`は`POST /api/v1/values/{tag}`
-（tag-server-design.md §6「書き込み経路の安全設計」）を1回叩くだけの単一タグ書き込みで
-ある。**catalogは取得しない**。外部名はHubの書き込み契約（パス、write scope）そのものの鍵
+`RestClient::write_tag(external_name, value, options) -> Result<WriteReceipt>`は
+`POST /api/v1/values/{tag}`（tag-server-design.md §6「書き込み経路の安全設計」）を1回叩くだけの
+単一タグ書き込みである（2026-11-19、#1202で`options`と戻り値を足した。下の「SCADA向けの契約」）。**catalogは取得しない**。外部名はHubの書き込み契約（パス、write scope）そのものの鍵
 なので、呼び出し側が渡した名前をそのまま送る。空・空白のみ・カンマを含む名前は
 `fetch_values`と同じ規則で送信前に`invalid_tag_selection`として拒否する。
 
@@ -338,11 +338,12 @@ log-before-write）と衝突する。監査行をバッチ単位でまとめる�
 拒否されずシミュレータへ反映されるようになった）。この2つ
 は意味も呼出側の対処も異なるため、`ErrorKind::WriteForbidden`（403）と
 `ErrorKind::WriteUnavailable`（503）として区別する。それ以外の書き込み時拒否
-（404/409/422/429/501/502）は`ErrorKind::WriteRejected`へ集約する - リクエストの
+（404/409/422/429/501と、502の`write_failed`）は`ErrorKind::WriteRejected`へ集約する - リクエストの
 組み立て自体を直さない限り再試行しても成功しない、という共通の性質でまとめている。
-分類はHTTPステータスのみで行い、応答bodyの`detail`文字列は使わない（`detail`は
-リクエスト由来の文字列を含みうるため、この crate の公開エラー面へ任意のサーバー文字列
-を持ち込まない）。
+分類はHTTPステータスと、応答bodyの`error`コード（Hubが決めた固定の語彙）のみで行い、
+`detail`文字列は使わない・ログにも出さない（`detail`はリクエスト由来の文字列を含みうる
+ため、この crate の公開エラー面へ任意のサーバー文字列を持ち込まない）。bodyは16 KiBまでしか
+読まず、読めない・大きすぎる・知らないコードは下の表の「既定」に落とす。
 
 **`ErrorKind`への3variant追加が既存の再試行判断に与える影響（確認済み、2026-09-01）**:
 #212で`ErrorKind`の細分化を見送った理由は、`worker.rs`の`is_rebindable`/`is_retryable`
@@ -353,12 +354,42 @@ log-before-write）と衝突する。監査行をバッチ単位でまとめる�
 （`Transport`/`ProtocolError`/`CatalogUnavailable`のみ真）にも該当せず、
 両関数の戻り値は不変である。加えて書き込みは`worker.rs`のsupervisorループを一切
 通らない独立経路なので、そもそも呼ばれる機会がない。`ErrorKind`が`#[non_exhaustive]`
-であることも確認済みで、variant追加はコンパイル互換である。
+であることも確認済みで、variant追加はコンパイル互換である。2026-11-19（#1202）に足した
+`WriteUncertain`/`InvalidWriteOptions`も同じ理由で両関数に入らない（`KeyTripped`は#446で
+既存。購読の1008 closeで使う`is_credential_rejection`の対象だが、書き込みの失敗はworkerを
+通らないので影響しない）。
 
-**SCADA の運転操作に向けた変更（#1177、2026-11-18 オーナー決定、未実装）**: 相関 ID と代理の操作者を渡す口、
-`audit_id` を返す戻り値、`ErrorKind::WriteUncertain` の新設、403 の応答ボディの `error` コードで
-`key_tripped` を `KeyTripped` として区別する決定を、tag-server-design.md §6.6 に記録した。実装されるまで本節の
-契約は変えない。
+**SCADA向けの契約（#1177、2026-11-18 オーナー決定、tag-server-design.md §6.6。2026-11-19 #1202で実装済み）**:
+
+- 署名は`write_tag(external_name, value: RequestedValue, options: WriteOptions) -> Result<WriteReceipt>`。
+  `RequestedValue`に`Text(String)`を足した（Hubの文字列タグ向け。`Copy`は外れた）。互換は
+  保っていない（オーナー方針: 破壊的変更してよい）。
+- `WriteOptions`（`#[non_exhaustive]`、`Default`）は`with_correlation_id`（1〜64文字の
+  `[A-Za-z0-9._:-]`）と`with_on_behalf_of`（1〜128文字、制御文字不可）を持つ。Hubと同じ規則で
+  送信前に検証し、合わなければ`ErrorKind::InvalidWriteOptions`を返して何も送らない。値はログに
+  出さない。指定しなければ要求のbodyに乗らない。
+- `WriteReceipt`（`#[non_exhaustive]`）は`audit_id() -> Option<i64>`と`correlation_id()`を持つ。
+  200は書き込み成功なので、bodyが読めない・形が違っても`Ok`（`audit_id`は`None`）にし、warnログだけ出す。
+- 分類（失敗のbodyの`error`コード。「既定」はコードが読めない・知らないとき）:
+
+| ステータス          | コード                                                                                  | `ErrorKind`        |
+| ------------------- | --------------------------------------------------------------------------------------- | ------------------ |
+| 401                 | -                                                                                       | `Unauthorized`     |
+| 403                 | `key_tripped`                                                                           | `KeyTripped`       |
+| 403                 | 上記以外・読めない（`not_writable`/`missing_write_scope`/`session_token_cannot_write`） | `WriteForbidden`   |
+| 404/409/422/429/501 | -                                                                                       | `WriteRejected`    |
+| 502                 | `write_failed`（送って失敗が確定）                                                      | `WriteRejected`    |
+| 502                 | `write_uncertain`・既定（リバースプロキシの502など。届いたか不明なので安全側）          | `WriteUncertain`   |
+| 500                 | `audit_write_failed`（送っていない）                                                    | `Transport`        |
+| 500                 | `internal`・既定（送ったか保証できない）                                                | `WriteUncertain`   |
+| 503                 | -                                                                                       | `WriteUnavailable` |
+| リダイレクト        | -                                                                                       | `InvalidEndpoint`  |
+
+- 送信の失敗（`reqwest::Error`）: `is_connect()`・`is_builder()`（要求を組み立てられず）は送っていないので`Transport`。それ以外
+  （送信後のタイムアウト、応答の途中の切断）は要求を送り始めた後なので`WriteUncertain`。
+  判定に使った性質（timeout/connect）は今までどおりwarnログに出す。
+- 自動の再試行はしない（オーナー決定2のまま）。`WriteUncertain`を受けたら、再送の前に呼出側が
+  物理的な状態を確かめる。
 
 ### 4.5 利用上の注意: 実Hubで確認したHubの挙動（2026-09-01 実機検証、2026-09-06 反映）
 
