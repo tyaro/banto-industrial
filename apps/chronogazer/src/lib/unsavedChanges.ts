@@ -50,6 +50,11 @@ export interface AppUnsavedChangesOptions {
 	isDirty: () => boolean;
 	/** A save is in flight (leaving could drop it). */
 	isSaving?: () => boolean;
+	/**
+	 * クエリだけで状態を持つページが `isSamePath` を渡す。同じパスの中の移動（`?target=&tab=` の
+	 * 切り替え）は同じページの移動とみなし、汎用の離脱の確認を出さない（banto v7.6.0）。
+	 */
+	isSamePage?: (from: URL, to: URL) => boolean;
 }
 
 /** Register the page's guard. Call during component initialisation. */

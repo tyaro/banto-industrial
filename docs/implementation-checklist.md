@@ -178,7 +178,7 @@
 - [ ] **release の Tauri は `windows_subsystem = "windows"` で標準エラー出力が見えない**。`eprintln!` だけの失敗は release で消える。画面の更新・見張り・復旧の失敗は、プロファイルのログのファイルにも残す（#706 の `report_shell_error`）。
 - [ ] **GUI の画面遷移（`navigate`・窓の URL の切り替え）は、モックや偽の部品で全部通っても実機でしか分からなかった**。画面を変える経路は、実機で「止める・外から状態を変える・戻る」を一巡させる（#661 661-5 は単体テスト全緑・レビュー多数でも、サービス停止で窓が真っ黒だった）。
 - [ ] **ソースを grep して「旧い口を使っていない」を固定するテストは、テストのコードを飛ばす範囲を「ファイルの末尾まで」と決めつけない**（2026-10-22、R2b-2b）。`registry_entrances.rs` は最初の `#[cfg(test)] mod … {` で走査をやめていたので、`write_path.rs` の途中のテストのモジュールの後ろにある本番の `TagService::new(` 3 か所が見えず、テストは緑のまま入口を取りこぼした。飛ばすのはそのモジュールの閉じ括弧までにし、途中のモジュールの後ろの呼び出しを見つけるテストを足す。
-- [ ] **SvelteKit の `beforeNavigate` は onMount で登録されるので、子の部品のコールバックが親（ページ）より先に走る**（2026-11-18、#1190）。`@banto/forms` の `guardUnsavedChanges` は最初に走ったコールバックが登録簿の全体に答えるので、ページの `beforeNavigate` で立てた「黙る」印は子の guard（`HubImportDialog` など）に間に合わない。ページ内の `goto` は呼ぶ前に黙らせ、ページの `beforeNavigate` はテンプレートの先頭の部品（ChronoGazer の `NavigationGate.svelte`）から登録する。根本は tyaro/banto#675。
+- [ ] **SvelteKit の `beforeNavigate` は onMount で登録されるので、子の部品のコールバックが親（ページ）より先に走る**（2026-11-18、#1190）。`@banto/forms` の `guardUnsavedChanges` は最初に走ったコールバックが登録簿の全体に答えるので、ページの `beforeNavigate` で立てた「黙る」印は子の guard（`HubImportDialog` など）に間に合わない。ページ内の `goto` は呼ぶ前に黙らせ、ページの `beforeNavigate` はテンプレートの先頭の部品（ChronoGazer の `NavigationGate.svelte`）から登録する。根本は tyaro/banto#675。 **banto v7.6.0（`isSamePage`・`isSamePath`）で解消。クエリで状態を持つページは guard に `isSamePage: isSamePath` を渡し、`NavigationGate` は外した（2026-11-18）。**
 
 ## 6. PR とマージの運用
 

@@ -33,10 +33,9 @@
 	 *   に持ち、再読み込み・戻る操作で同じ画面に戻る。新規作成中は
 	 *   `?group=new&tab=settings`（下書きは URL に持たない）。グループ・タブを
 	 *   変えると右ペインは閉じる。
-	 * - 汎用の離脱の確認（`guardUnsavedChanges`）は、ページの中の移動
-	 *   （`goto`・戻る・進む）では黙らせる（`leaveGuardMuted`。確認は
-	 *   `confirmViewChange` が済ませる）。ページの `beforeNavigate` は
-	 *   `NavigationGate.svelte` から登録する（tyaro/banto#675 の回避。「記録」ページと同じ）。
+	 * - 汎用の離脱の確認（`guardUnsavedChanges`）は、クエリだけが変わるページの中の移動
+	 *   （`goto`・戻る・進む）では `isSamePage: isSamePath`（banto v7.6.0）で対象外にする。
+	 *   確認は `confirmViewChange` が済ませる。戻る・進むは `beforeNavigate` で確かめる。
 	 *
 	 * - **しきい値は読み取り専用**で、各ペンのタグの値（LL / L / H / HH）を
 	 *   出すだけ。しきい値はタグ定義の属性で、保存はタグ定義の経路（記録）で
@@ -52,13 +51,12 @@
 	 */
 	import { untrack } from 'svelte';
 	import { page } from '$app/state';
-	import { afterNavigate, goto, type BeforeNavigate } from '$app/navigation';
-	import { UnsavedChangesNotice } from '@banto/forms';
+	import { beforeNavigate, goto, type BeforeNavigate } from '$app/navigation';
+	import { isSamePath, UnsavedChangesNotice } from '@banto/forms';
 	import { Tabs, ThreePaneLayout } from '@banto/ui';
 	import { isProviderError } from '@banto/admin-core';
 	import { guardUnsavedChanges, UNSAVED_DISCARD, UNSAVED_NOTICE } from '#lib/unsavedChanges.js';
 	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
-	import NavigationGate from '#lib/components/NavigationGate.svelte';
 	import { toastStore } from '#lib/toast.svelte.js';
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { canWriteResources } from '#lib/permissions.js';
@@ -636,10 +634,8 @@
 	// - 未保存の確認は `confirmViewChange`: **別のグループへ移るときだけ**（タブの
 	//   切り替えは同じ下書きのままなので確かめない）。キャンセルなら何も変えない。
 	// - ページの中の移動では汎用の離脱の確認（`guardUnsavedChanges`）を出さない
-	//   （`leaveGuardMuted`）。ページ内の `goto` は呼ぶ前から、戻る・進むは
-	//   `handleBeforeNavigate` で確かめてからその移動が終わるまで黙らせる。
-	//   `handleBeforeNavigate` はテンプレートの一番最初の `NavigationGate` から呼び、
-	//   子の guard より先に走らせる。
+	//   （guard に `isSamePage: isSamePath` を渡す。クエリだけの移動は同じページ）。
+	//   戻る・進むは `handleBeforeNavigate`（`beforeNavigate`）で確かめる。
 	// - グループ・タブを変えると右ペインは閉じる（右ペインの中身は前のグループの
 	//   ペンだったため）。ただし作成が成功して URL を作ったグループへ置き換える
 	//   `forceView` は閉じない（同じ下書きが続くため）。
@@ -687,8 +683,6 @@
 		const href = url.href;
 		viewNavHrefs.add(href);
 		viewNavsInFlight += 1;
-		// 離脱の確認は `goto` を呼ぶ**前に**黙らせる（`leaveGuardMuted` の説明）。
-		leaveGuardMuted += 1;
 		try {
 			// `reset: false`: フォーカスとスクロールを動かさない（同じページの中の切り替え）。
 			await goto(url, { replace: options.replace, reset: false });
@@ -697,7 +691,6 @@
 		} finally {
 			viewNavHrefs.delete(href);
 			viewNavsInFlight -= 1;
-			leaveGuardMuted -= 1;
 		}
 	}
 
@@ -733,64 +726,31 @@
 	});
 
 	/**
-	 * 進行中の「ページの中の移動」の数。0 より大きい間は、離脱の確認
-	 * （`guardUnsavedChanges`）を黙らせる。ページの中の移動（ページ内の `goto`、
-	 * 戻る・進む・リンクでクエリだけが変わる）は `confirmViewChange` で確かめ済みなので、
-	 * 汎用の離脱の確認を二重に出さない（`tags/+page.svelte` の同名の説明を参照）。
-	 * `$state` にしない（`isDirty` を読むのは guard のコールバックだけ）。
-	 */
-	let leaveGuardMuted = 0;
-	/** 戻る・進むなどで上げた分を下げる関数（`afterNavigate` の備えのため控える）。 */
-	const pendingLeaveGuardReleases = new Set<() => void>();
-
-	function muteLeaveGuardUntil(complete: Promise<void> | undefined): void {
-		leaveGuardMuted += 1;
-		let released = false;
-		const release = () => {
-			if (released) return;
-			released = true;
-			leaveGuardMuted -= 1;
-			pendingLeaveGuardReleases.delete(release);
-		};
-		pendingLeaveGuardReleases.add(release);
-		if (complete) {
-			complete.then(release, release);
-		} else {
-			queueMicrotask(release);
-		}
-	}
-
-	afterNavigate(() => {
-		for (const release of [...pendingLeaveGuardReleases]) release();
-	});
-
-	/**
-	 * ページの `beforeNavigate`。テンプレートの一番最初の `NavigationGate` から
-	 * 呼ばれるので、このページの中のどの guard よりも先に走る。
+	 * ページの `beforeNavigate`。戻る・進むなどでグループ・タブが変わるときの
+	 * 未保存の確認（`confirmViewChange`）をする。
 	 */
 	function handleBeforeNavigate(nav: BeforeNavigate): void {
 		const to = nav.to?.url;
 		if (!to) return;
-		// ページ内の `goto`: `navigateToView` が呼ぶ前から黙らせている。
+		// ページ内の `goto`: 呼ぶ前に `requestView` などが確かめ済み。
 		if (viewNavHrefs.has(to.href)) return;
 		if (!nav.willUnload && to.pathname === page.url.pathname) {
 			const next = resolveGroupsView(parseGroupsView(to.searchParams), groups ?? [], {
 				loaded: groupsLoaded,
 				canCreate: canWrite
 			}).view;
-			// 取り消すときも黙らせる（後に続く guard のコールバックは、取り消された
-			// 移動にも呼ばれるので、黙らせないと二度目の確認が出る）。
-			muteLeaveGuardUntil(nav.complete);
 			if (!confirmViewChange(next)) nav.cancel();
 		}
 		// 別のページ・再読み込みは guard に任せる。
 	}
+	beforeNavigate(handleBeforeNavigate);
 
 	// 未保存の入力の確認（banto #214 の流儀、ChronoGazer #508）: 編集中の下書きが
 	// 読み込み時と違えば、別のページへ移る・再読み込みの前に確かめる。
 	guardUnsavedChanges({
-		isDirty: () => leaveGuardMuted === 0 && dirty,
-		isSaving: () => leaveGuardMuted === 0 && (saving || deleting)
+		isDirty: () => dirty,
+		isSaving: () => saving || deleting,
+		isSamePage: isSamePath
 	});
 
 	/** 欄のエラーがあるタブ（保存の帯の要約用。`fieldErrors` から導出する）。 */
@@ -846,8 +806,6 @@
 		void reloadTags();
 	});
 </script>
-
-<NavigationGate onbeforenavigate={handleBeforeNavigate} />
 
 <div class="page">
 	<h2>表示グループ</h2>
