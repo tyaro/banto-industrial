@@ -1,7 +1,7 @@
 # banto-tagclient 設計
 
 作成日: 2026-08-29
-状態: **#682（2026-10-31〜11-01、PR-1〜PR-3 で実装。§3.1・§4・§5 は反映済み）: 部分 Binding 解決（未解決名があっても解決できた名前だけで購読し、未解決は個別診断）と、同一世代の catalog / 解決結果 / current を 1 つの snapshot で公開する契約拡張は [banto-tagclient-partial-binding-design.md](banto-tagclient-partial-binding-design.md) が正。本書と食い違う所があれば同書を正とする。**
+状態: **2026-11-18: §4.4 の書込みに SCADA 向けの変更の案（#1177、オーナー判断待ち、tag-server-design.md §6.6）を足した。#682（2026-10-31〜11-01、PR-1〜PR-3 で実装。§3.1・§4・§5 は反映済み）: 部分 Binding 解決（未解決名があっても解決できた名前だけで購読し、未解決は個別診断）と、同一世代の catalog / 解決結果 / current を 1 つの snapshot で公開する契約拡張は [banto-tagclient-partial-binding-design.md](banto-tagclient-partial-binding-design.md) が正。本書と食い違う所があれば同書を正とする。**
 **2026-09-30 オーナー決定（docs/scada/scada-design.md §9.6）で、bindingと書き込みの同一性を
 Hub内部の数値ID（`StableTagId`）から外部名（`external_name`）に変更した（§3.1・§4.4。
 SDKと呼び出し側は追従済み）。改名でbindingがunresolvedになるのは仕様。**
@@ -354,6 +354,11 @@ log-before-write）と衝突する。監査行をバッチ単位でまとめる�
 両関数の戻り値は不変である。加えて書き込みは`worker.rs`のsupervisorループを一切
 通らない独立経路なので、そもそも呼ばれる機会がない。`ErrorKind`が`#[non_exhaustive]`
 であることも確認済みで、variant追加はコンパイル互換である。
+
+**SCADA の運転操作に向けた変更の案（#1177、2026-11-18、オーナー判断待ち）**: 相関 ID と代理の操作者を渡す口、
+`audit_id` を返す戻り値、`ErrorKind::WriteUncertain` の新設、403 の応答ボディの `error` コードで
+`key_tripped` を `KeyTripped` として区別する案を、tag-server-design.md §6.6 に書いた。決まるまで本節の
+契約は変えない。
 
 ### 4.5 利用上の注意: 実Hubで確認したHubの挙動（2026-09-01 実機検証、2026-09-06 反映）
 
