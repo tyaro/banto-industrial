@@ -221,10 +221,16 @@
 	}
 
 	/**
-	 * 子の無い行の Enter・ダブルクリック（BantoTree の `onActivate`）。選択済みの
-	 * 行でも「確定した」として通知する（狭幅で退避パネルを閉じる契機）。
+	 * 子の無い行の Enter・ダブルクリック（BantoTree の `onActivate`）。
+	 * 広幅（`selectionFollowsFocus=true`）では Enter が選択を通知しないので、
+	 * ここで「確定した」として通知する（選択済みの行でも通知する）。
+	 * 狭幅（`false`）では BantoTree が先に `selectAt` → `onSelectionChange` で
+	 * 通知済み（Enter。選択済みの行でも通知される。ダブルクリックは先の
+	 * クリックで通知済み）なので、ここでも通知すると 1 回の Enter で選択の
+	 * 要求が 2 回出て、未保存の確認が二重に出る。通知しない。
 	 */
 	function handleActivate(node: TreeNode<NodeData>): void {
+		if (!selectionFollowsFocus) return;
 		const data = node.data;
 		if (data) onselect?.(data, { navigation: false });
 	}

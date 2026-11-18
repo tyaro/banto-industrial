@@ -242,6 +242,57 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(treeSelection).toHaveText(GROUP_A);
 	});
 
+	test('2c. 狭幅の Enter は選択の要求を 1 回だけ出す: 未保存の確認を 1 回キャンセルすれば、もう出ない（#1187）', async () => {
+		// 狭幅（`selectionFollowsFocus=false`）の BantoTree は、葉の Enter で
+		// `onSelectionChange` の後に `onActivate` も呼ぶ。両方でページへ通知すると
+		// 確認が同じキー操作で 2 回出て、2 回目の誤承諾で入力を失う。
+		// 前のテストの終わりで GROUP_A が選択中。「設定」タブのフォームを未保存にする。
+		await page.getByRole('tab', { name: '設定' }).click();
+		const nameInput = page.getByLabel('名前', { exact: true });
+		await expect(nameInput).toHaveValue(GROUP_A);
+		await nameInput.fill(`${GROUP_A}-edited`);
+		const urlBefore = page.url();
+
+		const messages: string[] = [];
+		const onDialog = (dialog: Dialog): void => {
+			messages.push(dialog.message());
+			void dialog.dismiss();
+		};
+		page.on('dialog', onDialog);
+		try {
+			await treeToggle.click();
+			await expect(treePane).toBeVisible();
+			await groupNodeByName(page, GROUP_A).focus();
+			await page.keyboard.press('ArrowDown');
+			await expect(groupNodeByName(page, GROUP_B)).toBeFocused();
+			await page.keyboard.press('Enter');
+			await expect.poll(() => messages).toEqual(['変更を破棄しますか？']);
+			// 2 回目が遅れて出ないことを、少し待って確かめる。
+			await page.waitForTimeout(500);
+			expect(messages).toHaveLength(1);
+
+			// 対象・URL・入力・パネルの開閉は元のまま。
+			await expect(treeSelection).toHaveText(GROUP_A);
+			expect(page.url()).toBe(urlBefore);
+			await expect(nameInput).toHaveValue(`${GROUP_A}-edited`);
+			await expect(treePane).toBeVisible();
+			await expect(treeToggle).toHaveAttribute('aria-expanded', 'true');
+		} finally {
+			page.off('dialog', onDialog);
+		}
+
+		// 後片付け: パネルを閉じ、入力を捨てて「タグ一覧」へ戻す（後続の前提）。
+		await page.keyboard.press('Escape');
+		await expect(treePane).toBeHidden();
+		page.once('dialog', (dialog) => void dialog.accept());
+		await page.getByRole('tab', { name: 'タグ一覧' }).click();
+		await expect(page.getByRole('tab', { name: 'タグ一覧' })).toHaveAttribute(
+			'aria-selected',
+			'true'
+		);
+		await expect(treeSelection).toHaveText(GROUP_A);
+	});
+
 	test('3. Esc とバックドロップのクリックで閉じ、フォーカスはボタンへ戻る', async () => {
 		await treeToggle.click();
 		await expect(treePane).toBeVisible();
