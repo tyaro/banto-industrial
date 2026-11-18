@@ -119,6 +119,7 @@
 - [ ] **CI でだけ落ちるフレークは、まず失敗時のアーティファクト（`error-context.md` の DOM・`test-failed-1.png`・trace）で「落ちた瞬間の状態」を見る**。#399 は「共有 page の幅の戻し忘れ」と見立てられていたが、trace のビューポートは 400x800 のままで、実際は**製品のバグ**だった: サイドバーの `visibility` を**開く側でも** 0.2s 遷移させていたため、開いてから最初のアニメーションフレームが進むまで計算値が `hidden` のままになり、Esc の層判定（`escLayering.ts`）がサイドバーを見落とした。遅いランナーでしか踏まず、ローカルのキー入力では 20/20 通る。**開く遷移に `visibility` を載せない**（閉じる側だけ）。再現は「クリック → DOM 反映 → キー」を `page.evaluate` の 1 タスク内で行うと決定的に取れる（テスト 31b）。
 - [ ] **REST の形を変えて E2E を一括で書き換えるときは、spec がどのアプリを叩くかを Playwright の設定（`e2e/*.playwright.config.ts` の `testDir` と起動するサーバー）で確かめる**。`/api/plc-connections` のような同じパスは ChronoGazer にもあり、`e2e/tests-public-viewer/` は ChronoGazer の REST（平らな形のまま）だった。パスの grep だけで対象を決めて書き換え、422 で落ちた（2026-10-24、#813）。
 - [ ] **`page.route` で保留した要求は、`page.unroute` の前に `route.continue()` で流す**。`unroute` は保留中の要求を自分で処理するので、後から `continue()` すると `Route is already handled!` で落ちる。`describe.serial` の組では 1 本の失敗で組ごと最初からやり直すため、`beforeAll` の作成が名前の重複で断られ、先頭のテストまで赤に見える（2026-10-22、R2b-2d の 2.7）。
+- [ ] **`describe.serial` の spec は、保存の PUT/POST の応答を `page.waitForResponse` で待ってから reload へ進み、作るデータの名前は実行ごとに一意にする**。入力欄の値だけ確かめて reload すると PUT が `ERR_ABORTED` になり保存前の値が返る。固定名だと serial の再試行（最初からやり直し・DB はそのまま）で同名が残り 422 になり、右ペインが閉じずに落ちる（tags.spec.ts、#1195 の CI、2026-11-18）。
 - [ ] **実機確認のスクリプトで、外部の exe の出力は `[Console]::OutputEncoding` を UTF-8 にしてから読む**（Rust の exe は UTF-8 で出すが、PowerShell は既定のコードページで読んで文字化けし、文言の判定が外れる）。`[y/N]` を出すコマンドは標準入力で答えを渡す（渡さないと待ち続ける）。判定の NG は、製品の不具合とスクリプトの誤りを分けてから数える（#661 の 1 回目は 4 件が文字化けだった）。
 
 ## 4. docs の同期（PR で docs を触ったら）
