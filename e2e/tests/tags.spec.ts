@@ -116,6 +116,17 @@ const TAG_NAME = `E2Eタグ1-${RUN}`;
 const GROUP2_NAME = `E2Eグループ2-${RUN}`;
 const TAG2_NAME = `E2Eタグ2-${RUN}`;
 
+/**
+ * 接続先の行の直後に出る「収集グループ未登録」。ツリー全体で探すと、serial の
+ * 再試行で前の試行が残した空の接続先の分まで当たるので、今回の接続先の行の隣に絞る
+ * （BantoTree の `emptyChildren` は接続先の treeitem の次の兄弟要素）。
+ */
+function emptyGroupsOf(page: Page, connectionName: string) {
+	return treeNode(page, connectionName)
+		.locator('xpath=following-sibling::*[1]')
+		.getByText('収集グループ未登録');
+}
+
 async function login(page: Page, username: string, password: string): Promise<void> {
 	await page.goto('/login');
 	await page.getByLabel('ユーザー名').fill(username);
@@ -196,7 +207,7 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 		);
 		await expect(page).toHaveURL(/\/tags\?target=connection:\d+$/);
 		// 収集グループが 0 件の接続先は、その下に「収集グループ未登録」。
-		await expect(recordTree(page).getByText('収集グループ未登録')).toBeVisible();
+		await expect(emptyGroupsOf(page, CONNECTION_NAME)).toBeVisible();
 	});
 
 	test('3. 同名の接続先は作れず、「既に使用されています」が名前欄に人間可読で出る', async () => {
@@ -311,7 +322,7 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 		await expect(detailPane(page)).toHaveCount(0);
 		await expect(treeNode(page, GROUP_NAME)).toHaveAttribute('aria-selected', 'true');
 		await expect(treeNode(page, GROUP_NAME)).toHaveAccessibleName(`${GROUP_NAME} (0) 1s`);
-		await expect(recordTree(page).getByText('収集グループ未登録')).toHaveCount(0);
+		await expect(emptyGroupsOf(page, CONNECTION_NAME)).toHaveCount(0);
 		await expect(page).toHaveURL(/\/tags\?target=group:\d+$/);
 	});
 
