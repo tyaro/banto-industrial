@@ -106,12 +106,15 @@ const ADMIN_PASSWORD = 'E2eAdminPass1';
 const VIEWER_USERNAME = 'e2e-tags-viewer';
 const VIEWER_PASSWORD = 'E2eViewerPass1';
 
-const CONNECTION_NAME = 'E2E-PLC1';
-const GROUP_NAME = 'E2Eグループ1';
-const TAG_NAME = 'E2Eタグ1';
+// serial の再試行は同じ DB のまま最初からやり直すので、固定名だと前回の試行が残した
+// 同名の接続先で作成が 422 になる。実行（worker の起動）ごとに一意の接尾辞を付ける。
+const RUN = Date.now().toString(36);
+const CONNECTION_NAME = `E2E-PLC1-${RUN}`;
+const GROUP_NAME = `E2Eグループ1-${RUN}`;
+const TAG_NAME = `E2Eタグ1-${RUN}`;
 // #1179 PR4b: ツリーの絞り込みを確かめる 2 つ目のグループと記録項目（最後に作る）。
-const GROUP2_NAME = 'E2Eグループ2';
-const TAG2_NAME = 'E2Eタグ2';
+const GROUP2_NAME = `E2Eグループ2-${RUN}`;
+const TAG2_NAME = `E2Eタグ2-${RUN}`;
 
 async function login(page: Page, username: string, password: string): Promise<void> {
 	await page.goto('/login');
@@ -229,6 +232,9 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 			if (route.request().method() === 'PUT') await pendingPut;
 			await route.continue();
 		});
+		const putDone = page.waitForResponse(
+			(res) => res.request().method() === 'PUT' && /\/api\/plc-connections\/\d+$/.test(res.url())
+		);
 		try {
 			await detail.getByRole('button', { name: '保存' }).click();
 			await expect(detail.getByTestId('driver-field-host').locator('input')).toBeDisabled();
@@ -237,6 +243,9 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 			releasePut();
 			await page.unroute('**/api/plc-connections/*', { behavior: 'wait' });
 		}
+		// 保存の PUT の完了を待ってから次へ進む（待たずに 3b の reload へ進むと PUT が
+		// ERR_ABORTED になり、保存前の値が返る）。
+		expect((await putDone).ok()).toBe(true);
 		await expect(detail.getByLabel('ホスト')).toHaveValue('192.168.11.202');
 		await expect(detail.getByLabel('ポート')).toHaveValue('1502');
 		await expect(detail.getByLabel('ユニットID')).toHaveValue('7');
