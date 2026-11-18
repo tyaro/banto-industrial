@@ -1,7 +1,7 @@
 # banto-industrial + 記録計アプリ 計画
 
 作成日: 2026-07-12（過去アプリ棚卸しと記録計構想の議論に基づく）
-状態: **進行中。2026-10-16: #201 の診断用 OPC UA Phase 2 を実装。2026-10-14: #589（Hub と sink のサービスが OS のシャットダウンで最終 flush する）を実装。I系（I0〜I6）実装済み（I6 = banto-broker として抽出済み）、
+状態: **進行中。2026-11-19: ChronoGazer の初回セットアップ画面の「続き（未着手）」を実装の現状に直した。2026-10-16: #201 の診断用 OPC UA Phase 2 を実装。2026-10-14: #589（Hub と sink のサービスが OS のシャットダウンで最終 flush する）を実装。I系（I0〜I6）実装済み（I6 = banto-broker として抽出済み）、
 W系（relay-wright）は W5 まで実装済みだったが **2026-09-17 に凍結**（構想の練り直し、§4b）、
 **2026-09-24 に main から外してタグ `archive/relay-wright-2026-09-24` に退避した**。T系（タグサーバー、
 §4c）は T0〜T21 実装済み（試運転モード/ロックダウン・収集開始停止 UI・タグ名
@@ -418,7 +418,8 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
   応答の形の不正も失敗として出す、境界の中の件数が変わったら失効として止める（`collect_events` には削除が
   まだ無いので今は起きない）。wire（Tauri `collect_events_list` / REST `GET /api/collect/events`）は変わらない。
 
-  続き（未着手）: 初回セットアップ画面。手順と
+  続き: 初回セットアップ画面（2026-11-19 確認: `/login` の setup モードとして ChronoGazer の側に実装があり、
+  #392 B2-2 で「この PC からはログインなしで使う」の選択を足した。banto の部品へは寄せていない）。手順と
   wire の変化は [apps/chronogazer/README.md](../apps/chronogazer/README.md)「アカウント・
   監査ログ・バックアップ」「LAN アクセスと閲覧公開」と `apps/chronogazer/core/src/rest.rs` の
   モジュール doc

@@ -1,7 +1,7 @@
 # banto-rtsp 基礎クレート設計
 
 作成日: 2026-08-13
-状態: Draft（Phase 1 実装は main にマージ済み。実機/配布確認待ち）
+状態: Draft（Phase 1 実装は main にマージ済み。実機/配布確認待ち。アプリへの統合（Tauri の配線・配布）の計画は [#1211](https://github.com/tyaro/banto-industrial/issues/1211)、2026-11-19）
 最終検証日: 2026-09-06
 
 ## 位置づけ
