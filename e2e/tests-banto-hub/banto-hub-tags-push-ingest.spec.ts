@@ -231,7 +231,7 @@ test.describe.serial('banto-hub 取り込み口 push（R2a-2e）', () => {
 		expect(startRes.ok(), await startRes.text()).toBe(true);
 		startedCollection = true;
 
-		await page.goto(`/monitor?group=${groupId}`);
+		await page.goto(`/monitor?target=group:${groupId}`);
 		const row = page.locator('tr', { hasText: EXTERNAL_NAME });
 		await expect(row).toBeVisible();
 		// 開始の直後は計画の反映と WS の購読が追いつくまで待つ。送り直しながら待つ

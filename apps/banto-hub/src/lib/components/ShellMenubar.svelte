@@ -19,11 +19,12 @@
 		isNavItemActive,
 		navBarEntries,
 		NAV_GROUP_LABELS,
-		resolveAppPath,
+		navItemHref,
 		visibleNavItems,
 		type NavItem
 	} from '#lib/navigation.js';
 	import { sessionStore } from '#lib/session.svelte.js';
+	import { sharedTreeTarget } from '#lib/treeSelection.svelte.js';
 	import { HeaderNav, type HeaderNavEntry, type HeaderNavLink } from '@banto/ui';
 	import { navIcon } from './navIcons';
 
@@ -39,7 +40,7 @@
 	function toLink(item: NavItem): HeaderNavLink {
 		return {
 			id: item.path,
-			href: resolveAppPath(item.path),
+			href: navItemHref(item.path, sharedTreeTarget.current),
 			label: item.label,
 			icon: navIcon(item.icon),
 			active: isNavItemActive(item, page.url.pathname),

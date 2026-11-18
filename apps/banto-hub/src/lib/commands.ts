@@ -6,7 +6,8 @@
 import { goto } from '$app/navigation';
 import type { PaletteCommand } from '@banto/admin-core';
 import { hubLogout } from './banto/hubLogout';
-import { navItems, resolveAppPath } from './navigation';
+import { navItemHref, navItems, resolveAppPath } from './navigation';
+import { sharedTreeTarget } from './treeSelection.svelte';
 import { settings } from './settings.svelte';
 import { sessionStore } from './session.svelte';
 import { isAdmin } from './permissions';
@@ -21,7 +22,7 @@ function navigationCommands(): PaletteCommand[] {
 		keywords: [item.path],
 		visible: item.adminOnly ? () => isAdmin(sessionStore.role) : undefined,
 		run: () => {
-			void goto(resolveAppPath(item.path));
+			void goto(navItemHref(item.path, sharedTreeTarget.current));
 		}
 	}));
 }

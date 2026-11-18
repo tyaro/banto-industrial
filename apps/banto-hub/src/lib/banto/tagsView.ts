@@ -46,22 +46,46 @@ export interface ParsedTagsView {
 
 const TARGET_PATTERN = /^(connection|group):([1-9][0-9]*)$/;
 
-export function parseTagsView(params: URLSearchParams): ParsedTagsView {
+/**
+ * #1179 PR3b: `target` だけを読む（タグモニタ `(app)/monitor/+page.svelte` と共有）。
+ * 無ければ「すべて」、値はあるが読めなければ `null`。
+ */
+export function parseTreeTarget(params: Pick<URLSearchParams, 'get'>): TreeFilterSelection | null {
 	const rawTarget = params.get(TAGS_VIEW_TARGET_PARAM);
-	let target: TreeFilterSelection | null;
-	if (rawTarget === null) {
-		target = { type: 'all' };
-	} else {
-		const match = TARGET_PATTERN.exec(rawTarget);
-		const id = match ? Number(match[2]) : NaN;
-		target =
-			match && Number.isSafeInteger(id) ? { type: match[1] as 'connection' | 'group', id } : null;
-	}
+	if (rawTarget === null) return { type: 'all' };
+	const match = TARGET_PATTERN.exec(rawTarget);
+	const id = match ? Number(match[2]) : NaN;
+	return match && Number.isSafeInteger(id)
+		? { type: match[1] as 'connection' | 'group', id }
+		: null;
+}
+
+export function parseTagsView(params: URLSearchParams): ParsedTagsView {
+	const target = parseTreeTarget(params);
 	const rawTab = params.get(TAGS_VIEW_TAB_PARAM);
 	const tab: TagsTab | null =
 		rawTab === null || rawTab === 'list' ? 'list' : rawTab === 'settings' ? 'settings' : null;
 	return { target, tab };
 }
+
+/**
+ * #1179 PR3b: URL の `target` を、読み込み済みの一覧に照らして決める（両ページで
+ * 共有）。`missingTarget` は {@link ResolvedTagsView} と同じ意味。
+ */
+export function resolveTreeTarget(
+	parsed: TreeFilterSelection | null,
+	connections: readonly { id: number }[],
+	groups: readonly { id: number }[],
+	options: { loaded: boolean }
+): { target: TreeFilterSelection; missingTarget: boolean } {
+	const target: TreeFilterSelection = parsed ?? { type: 'all' };
+	const pruned = pruneTreeFilter(target, connections, groups, options);
+	return { target: pruned, missingTarget: parsed === null || pruned !== target };
+}
+
+/** URL の対象が見つからないときの案内（両ページで同じ文言）。 */
+export const MISSING_TREE_TARGET_MESSAGE =
+	'指定された接続先・収集グループが見つからないため、すべてのタグを表示します';
 
 export interface ResolvedTagsView {
 	view: TagsView;
@@ -83,22 +107,25 @@ export function resolveTagsView(
 	groups: readonly { id: number }[],
 	options: { loaded: boolean }
 ): ResolvedTagsView {
-	let missingTarget = parsed.target === null;
-	let target: TreeFilterSelection = parsed.target ?? { type: 'all' };
-	const pruned = pruneTreeFilter(target, connections, groups, options);
-	if (pruned !== target) {
-		missingTarget = true;
-		target = pruned;
-	}
+	const { target, missingTarget } = resolveTreeTarget(parsed.target, connections, groups, options);
 	const tab: TagsTab = target.type === 'all' ? 'list' : (parsed.tab ?? 'list');
 	return { view: { target, tab }, missingTarget };
 }
 
+/**
+ * #1179 PR3b: 対象だけのクエリ（先頭の `?` 付き、「すべて」なら空文字）。
+ * タグモニタの URL と、ナビのリンクで対象を引き継ぐときに使う。
+ */
+export function treeTargetSearch(target: TreeFilterSelection): string {
+	if (target.type === 'all') return '';
+	// `URLSearchParams` は `:` を `%3A` にするので手で組む（値は英字・`:`・数字だけ）。
+	return `?${TAGS_VIEW_TARGET_PARAM}=${target.type}:${target.id}`;
+}
+
 /** 画面の状態を URL のクエリ（先頭の `?` 付き、既定だけなら空文字）にする。 */
 export function tagsViewSearch(view: TagsView): string {
-	if (view.target.type === 'all') return '';
-	// `URLSearchParams` は `:` を `%3A` にするので手で組む（値は英字・`:`・数字だけ）。
-	const target = `?${TAGS_VIEW_TARGET_PARAM}=${view.target.type}:${view.target.id}`;
+	const target = treeTargetSearch(view.target);
+	if (target === '') return '';
 	return view.tab === 'settings' ? `${target}&${TAGS_VIEW_TAB_PARAM}=settings` : target;
 }
 

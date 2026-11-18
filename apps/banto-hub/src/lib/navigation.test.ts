@@ -3,6 +3,7 @@ import {
 	ADMIN_GROUP_KEY,
 	isNavItemActive,
 	navBarEntries,
+	navItemHref,
 	navItems,
 	visibleNavItems,
 	type NavItem
@@ -84,5 +85,25 @@ describe('isNavItemActive', () => {
 		expect(isNavItemActive(tags, '/tags')).toBe(true);
 		expect(isNavItemActive(tags, '/tags/x')).toBe(true);
 		expect(isNavItemActive(tags, '/monitor')).toBe(false);
+	});
+});
+
+describe('navItemHref（#1179 PR3b）', () => {
+	const group = { type: 'group', id: 4 } as const;
+
+	it('タグ登録・タグモニタへは共有している対象を ?target= で付ける', () => {
+		expect(navItemHref('/tags', group)).toBe('/tags?target=group:4');
+		expect(navItemHref('/monitor', { type: 'connection', id: 2 })).toBe(
+			'/monitor?target=connection:2'
+		);
+	});
+
+	it('「すべて」なら何も付けない', () => {
+		expect(navItemHref('/tags', { type: 'all' })).toBe('/tags');
+		expect(navItemHref('/monitor', { type: 'all' })).toBe('/monitor');
+	});
+
+	it('ほかのページへは付けない', () => {
+		expect(navItemHref('/status', group)).toBe('/status');
 	});
 });

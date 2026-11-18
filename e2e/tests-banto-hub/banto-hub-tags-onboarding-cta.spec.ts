@@ -94,7 +94,7 @@ test.describe.serial('banto-hub 登録後の確認導線 CTA (T18-4c)', () => {
 		await page.close();
 	});
 
-	test('1. UI でタグ登録すると確認 CTA が出て、href が /monitor?group=...&focus=... になる', async () => {
+	test('1. UI でタグ登録すると確認 CTA が出て、href が /monitor?target=group:...&focus=... になる', async () => {
 		await page.goto('/tags');
 		// T19 S1-c（UX-33）: 「新規登録」はツリーでグループが選択されている
 		// ときしか出ない上、開いた create Drawer は選択中グループへ確定済み
@@ -120,14 +120,14 @@ test.describe.serial('banto-hub 登録後の確認導線 CTA (T18-4c)', () => {
 		const href = await cta.getAttribute('href');
 		expect(href).not.toBeNull();
 		// 対象タグのグループへ絞り、対象タグを focus 対象にした /monitor リンク。
-		expect(href!.startsWith(`/monitor?group=${groupId}`)).toBe(true);
+		expect(href!.startsWith(`/monitor?target=group:${groupId}`)).toBe(true);
 		expect(href).toContain(`focus=${encodeURIComponent(EXTERNAL_NAME)}`);
 	});
 
 	test('2. CTA クリックで /monitor へ遷移し、ConnectionTree がそのグループに絞られる', async () => {
 		await page.getByRole('link', { name: CTA_TEXT }).click();
 
-		await expect(page).toHaveURL(new RegExp(`/monitor\\?group=${groupId}`));
+		await expect(page).toHaveURL(new RegExp(`/monitor\\?target=group:${groupId}&focus=`));
 		// 登録したタグ行が確認対象（focus ハイライト）として出る。
 		await expect(page.getByText(EXTERNAL_NAME)).toBeVisible();
 		const highlighted = page.locator('tr.confirm-target');

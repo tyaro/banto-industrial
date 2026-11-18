@@ -50,6 +50,8 @@ import { resolve } from '$app/paths';
 import type { Path, ResolvedPathname } from '$app/types';
 import { APP_NAME } from '#lib/appName.js';
 import { isAdmin, type Role } from '#lib/permissions.js';
+import { treeTargetSearch } from '#lib/banto/tagsView.js';
+import type { TreeFilterSelection } from '#lib/banto/treeFilterPrune.js';
 
 /**
  * An app route's pathname as written in the nav/category tables: a leading
@@ -166,6 +168,26 @@ export function navBarEntries(items: NavItem[]): NavBarEntry[] {
 export function isNavItemActive(item: NavItem, pathname: string): boolean {
 	const match = resolveAppPath(item.activeMatch ?? item.path);
 	return pathname === match || pathname.startsWith(match + '/');
+}
+
+/**
+ * #1179 PR3b（docs/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、段階 ①）:
+ * ツリーの選択を共有するページ。タグ登録（`/tags`）とタグモニタ（`/monitor`）。
+ */
+export const TREE_TARGET_SHARING_PATHS: readonly AppPath[] = ['/tags', '/monitor'];
+
+/**
+ * ナビ（メニューバー・ドック・サイドバー・コマンドパレット）のリンクの行き先。
+ * ツリーの選択を共有するページへは、最後に選んだ対象（`#lib/treeSelection.svelte.ts`）
+ * を `?target=` で付ける（タブは付けない - タグ登録は「タグ一覧」で開く）。
+ * 行き先の URL が選択を決める（ページは URL だけを見る）ので、戻る・進む・
+ * 再読み込みで別の値に化けない。
+ */
+export function navItemHref(path: AppPath, sharedTarget: TreeFilterSelection): string {
+	const href = resolveAppPath(path);
+	return TREE_TARGET_SHARING_PATHS.includes(path)
+		? `${href}${treeTargetSearch(sharedTarget)}`
+		: href;
 }
 
 export function pageTitle(pathname: string): string {

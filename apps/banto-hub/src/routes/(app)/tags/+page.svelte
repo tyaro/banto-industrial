@@ -29,7 +29,9 @@
 	import { deferredDelete, UNDO_WINDOW_MS } from '#lib/banto/deferredDelete.svelte.js';
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
+	import { sharedTreeTarget } from '#lib/treeSelection.svelte.js';
 	import {
+		MISSING_TREE_TARGET_MESSAGE,
 		parseTagsView,
 		resolveTagsView,
 		sameTagsView,
@@ -3303,10 +3305,7 @@
 			if (!sameTagsView(currentView(), resolved.view)) {
 				const wasFound = parsed.target !== null && sameTreeTarget(parsed.target, lastFoundTarget);
 				if (loaded && resolved.missingTarget && !wasFound) {
-					toastStore.push(
-						'info',
-						'指定された接続先・収集グループが見つからないため、すべてのタグを表示します'
-					);
+					toastStore.push('info', MISSING_TREE_TARGET_MESSAGE);
 				}
 				applyView(resolved.view);
 			}
@@ -3319,6 +3318,12 @@
 	afterNavigate((nav) => {
 		// 戻る・進むで来た項目は、どの操作で積んだものか分からない。
 		if (nav.type === 'popstate') viewEntryFromKeyNavigation = false;
+	});
+
+	// #1179 PR3b: 選んでいる対象をタグモニタと共有する（ナビのリンクが `?target=` に
+	// 付ける、`#lib/treeSelection.svelte.ts`）。タブは共有しない。
+	$effect(() => {
+		sharedTreeTarget.set(treeFilter);
 	});
 
 	/** 中央のタブ。「すべて」には「設定」が無い（タブ列ごと出さない - `.view-tabs.single`）。 */

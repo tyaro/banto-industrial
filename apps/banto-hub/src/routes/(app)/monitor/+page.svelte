@@ -43,9 +43,14 @@
 	 * この画面には書き込み要素が無いため viewer を含む全ロールが無条件で
 	 * 閲覧できる（ゲートすべき対象が無い）。ツリー・検索も同様に読み取り
 	 * 専用の絞り込みでしかないため、権限ゲートは追加しない。
+	 *
+	 * #1179 PR3b（docs/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、段階 ①）:
+	 * ツリーの選択を URL（`?target=`、形はタグ登録と同じ `#lib/banto/tagsView.ts`）に
+	 * 持ち、タグ登録とナビで行き来したときに同じ対象を開く（`#lib/treeSelection.svelte.ts`）。
 	 */
 	import { untrack } from 'svelte';
 	import { page } from '$app/state';
+	import { afterNavigate, goto } from '$app/navigation';
 	import { toastStore } from '#lib/toast.svelte.js';
 	import { resolveAppPath } from '#lib/navigation.js';
 	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
@@ -64,7 +69,14 @@
 		type Tag
 	} from '#lib/banto/tagRegistryAdmin.js';
 	import { filterMonitorRows, type MonitorTreeFilter } from '#lib/banto/monitorFilter.js';
-	import { pruneTreeFilter } from '#lib/banto/treeFilterPrune.js';
+	import {
+		MISSING_TREE_TARGET_MESSAGE,
+		parseTreeTarget,
+		resolveTreeTarget,
+		sameTreeTarget
+	} from '#lib/banto/tagsView.js';
+	import { monitorViewSearch, parseMonitorFocus } from '#lib/banto/monitorView.js';
+	import { sharedTreeTarget } from '#lib/treeSelection.svelte.js';
 	import { subscriptionPatternsFor } from '#lib/banto/monitorSubscription.js';
 	import { applyTagValues, mergeTagValues, type RowValue } from '#lib/banto/monitorValues.js';
 	import {
@@ -193,8 +205,8 @@
 	let adminTags = $state<Tag[]>([]);
 	/**
 	 * #381 レビュー対応19回目: 補助データ（接続/グループ/タグ）を**一度でも
-	 * 読み終えたか**。`pruneTreeFilter` へ渡す（一覧が空かどうかから「未ロード」を
-	 * 推測しない - 同ファイルの doc 参照）。失敗時は立てない。
+	 * 読み終えたか**。`resolveTreeTarget`（`pruneTreeFilter`）へ渡す（一覧が空か
+	 * どうかから「未ロード」を推測しない - 同ファイルの doc 参照）。失敗時は立てない。
 	 */
 	let adminLoaded = $state(false);
 
@@ -261,16 +273,94 @@
 	let treeOpen = $state(false);
 	let layoutNarrow = $state(false);
 
-	/**
-	 * #381 レビュー対応3回目: 選択中の接続・収集グループが消えたら「すべて」へ
-	 * 戻す（タグ登録ページと同じ純関数 `pruneTreeFilter`。理由は同ファイルの
-	 * doc comment 参照 - 消えた id で絞られたままだと一覧が常に空になり、
-	 * #378 の選択中表示とも食い違う）。`treeFilter` は購読範囲
-	 * （`subscriptionPatternsFor`）にも使うので、戻せば購読も全件へ戻る。
-	 */
+	// --- #1179 PR3b: ツリーの選択と URL -----------------------------------
+	//
+	// タグ登録（`(app)/tags/+page.svelte` の #1179 PR3a）と同じ作り（タブと未保存の
+	// 確認が無い分だけ小さい）:
+	//
+	// - **ツリーの操作は状態を先に同期で変え、URL は後から追う**（`requestTarget`）。
+	//   BantoTree は `selection` の制御で「呼び出しの直後の値」を正とするので、
+	//   非同期の `goto` を待ってから状態を変えると上下キーの移動で元の行へ戻される。
+	// - **URL から状態を決めるのは、戻る・進む・再読み込み・リンク**（下の `$effect`）。
+	//   ページ内の `goto` の間（`targetNavsInFlight`）は止める。
+	// - **履歴の積み方**: クリック・Enter・Space での選択は 1 回ごとに積み、上下キー
+	//   などの移動が続く間は同じ項目を置き換える（タグ登録の `viewEntryFromKeyNavigation`
+	//   と同じ理由）。
+	// - 一覧を読み終えたら、読めない値・一覧に無い id は「すべて」へ倒し、URL も
+	//   正規化する（`replace`）。案内は URL から来た対象が見つからないときだけ
+	//   （#381 レビュー対応3回目の「選択中の接続・収集グループが消えたら『すべて』へ
+	//   戻す」も、ここで同じ純関数 `pruneTreeFilter` を通して行う - 消えた id で
+	//   絞られたままだと一覧が常に空になり、購読（`subscriptionPatternsFor`）も
+	//   空のままになる。削除の結果なので案内は出さない）。
+
+	/** 進行中のページ内の `goto` の数。0 になったら URL から状態を決め直す。 */
+	let targetNavsInFlight = $state(0);
+	/** いまの履歴の項目が、ツリーの上下キーなどの移動で積んだものか。 */
+	let entryFromKeyNavigation = false;
+
+	/** ツリーで選んだ対象にする（URL は後から追う）。 */
+	function requestTarget(next: MonitorTreeFilter, options: { keyNavigation: boolean }): void {
+		if (sameTreeTarget(treeFilter, next)) return;
+		const replace = options.keyNavigation && entryFromKeyNavigation;
+		entryFromKeyNavigation = options.keyNavigation;
+		treeFilter = next;
+		void navigateToTarget(next, { replace });
+	}
+
+	async function navigateToTarget(
+		target: MonitorTreeFilter,
+		options: { replace: boolean }
+	): Promise<void> {
+		const url = new URL(page.url.href);
+		// T18-4c の確認対象（`focus`）は選択を変えても残す（`#lib/banto/monitorView.ts`）。
+		url.search = monitorViewSearch(target, parseMonitorFocus(url.searchParams));
+		if (url.href === page.url.href) return;
+		targetNavsInFlight += 1;
+		try {
+			// `reset: false`: フォーカスとスクロールを動かさない（同じページの中の切り替え）。
+			await goto(url, { replace: options.replace, reset: false });
+		} catch {
+			// 失敗しても、下の `$effect` がその時点の URL へ状態を戻す。
+		} finally {
+			targetNavsInFlight -= 1;
+		}
+	}
+
+	/** 一覧で一度は見つかった対象（消えたときに案内しないため、タグ登録と同じ）。 */
+	let lastFoundTarget: MonitorTreeFilter = { type: 'all' };
 	$effect(() => {
-		const pruned = pruneTreeFilter(treeFilter, connections, groups, { loaded: adminLoaded });
-		if (pruned !== treeFilter) treeFilter = pruned;
+		const search = page.url.search;
+		const loaded = adminLoaded;
+		const currentConnections = connections;
+		const currentGroups = groups;
+		if (targetNavsInFlight > 0) return;
+		const params = new URLSearchParams(search);
+		const parsed = parseTreeTarget(params);
+		const resolved = resolveTreeTarget(parsed, currentConnections, currentGroups, { loaded });
+		untrack(() => {
+			if (loaded && !resolved.missingTarget) lastFoundTarget = resolved.target;
+			if (!sameTreeTarget(treeFilter, resolved.target)) {
+				const wasFound = parsed !== null && sameTreeTarget(parsed, lastFoundTarget);
+				if (loaded && resolved.missingTarget && !wasFound) {
+					toastStore.push('info', MISSING_TREE_TARGET_MESSAGE);
+				}
+				treeFilter = resolved.target;
+			}
+			const canonical = monitorViewSearch(resolved.target, parseMonitorFocus(params));
+			if (loaded && search !== canonical) {
+				void navigateToTarget(resolved.target, { replace: true });
+			}
+		});
+	});
+
+	afterNavigate((nav) => {
+		// 戻る・進むで来た項目は、どの操作で積んだものか分からない。
+		if (nav.type === 'popstate') entryFromKeyNavigation = false;
+	});
+
+	// 選んでいる対象をタグ登録と共有する（ナビのリンクが `?target=` に付ける）。
+	$effect(() => {
+		sharedTreeTarget.set(treeFilter);
 	});
 
 	/**
@@ -310,10 +400,13 @@
 		data: ConnectionTreeNodeData,
 		{ navigation }: { navigation: boolean }
 	): void {
-		if (data.kind === 'all') treeFilter = { type: 'all' };
-		else if (data.kind === 'connection')
-			treeFilter = { type: 'connection', id: data.connection.id };
-		else treeFilter = { type: 'group', id: data.group.id };
+		const next: MonitorTreeFilter =
+			data.kind === 'all'
+				? { type: 'all' }
+				: data.kind === 'connection'
+					? { type: 'connection', id: data.connection.id }
+					: { type: 'group', id: data.group.id };
+		requestTarget(next, { keyNavigation: navigation });
 		// #378: 狭幅では「選んだ」時点（クリック・Space・Enter）で退避パネルを
 		// 閉じる（タグ登録ページと同じ）。上下キーなどフォーカス移動に付いてきた
 		// 選択（`navigation`）では閉じない。
@@ -322,60 +415,16 @@
 
 	// --- T18-4c: 確認導線のディープリンク受け口 -----------------------------
 	//
-	// タグ登録ページ（`(app)/tags/+page.svelte`）の CTA（`monitorHref`、
-	// `#lib/banto/tagOnboarding.ts`）から `?group=`/`?connection=`/`?focus=`
-	// 付きで遷移してきたときに、ツリー選択と「確認対象」ハイライトへ反映
-	// する。tags ページの `onboardingQueryApplied` パターン（同ファイル
-	// 1164〜1171行目付近）と同型 - 一度だけ適用し、以後のユーザー操作
-	// （ツリー選択の変更等）を上書きしない。`treeSelectedId` は上の
-	// `$derived.by` が `treeFilter` から自動で追従するため、別途同期する
-	// 必要はない。
+	// タグ登録ページの CTA（`monitorHref`、`#lib/banto/tagOnboarding.ts`）から
+	// `?target=`/`?focus=` 付きで遷移してきたときに、ツリー選択と「確認対象」
+	// ハイライトへ反映する。#1179 PR3b から、対象は上の URL の同期が決め
+	// （以前の `?group=`/`?connection=` は受け付けない）、`focus` も URL から
+	// 読む（ツリーの選択を変えても URL に残すので、強調は保たれる。再読み込みでも戻る）。
+	// T18-4c の当時と同じく、virtual（calc/mem）接続・配下グループも除外しない
+	// （モニタは computed/internal タグも閲覧する読み取り専用画面）。
 
-	/** T18-4c: 上のクエリ適用を一度だけ行うためのガード。 */
-	let confirmQueryApplied = $state(false);
 	/** T18-4c: `?focus=` で渡された external_name の集合。持続的な「確認対象」強調に使う。 */
-	let focusSet = $state<Set<string>>(new Set());
-
-	/**
-	 * T18-4c: `?group=`/`?connection=` の検証は、tags ページの
-	 * `resolvePresetGroupId`/`resolvePresetConnectionId`（`tagOnboarding.ts`）
-	 * とは違い virtual（calc/mem）接続・配下グループを除外しない - あちらは
-	 * 「PLC タグ登録フォームへの親プリセット」用で calc/mem 配下には
-	 * `plc` タグを作らせない制約からの除外だが、モニタは
-	 * computed/internal タグ（calc/mem 配下に存在しうる）も含めて閲覧する
-	 * 読み取り専用画面なので、単純な存在検証だけで十分。
-	 */
-	$effect(() => {
-		if (confirmQueryApplied) return;
-		if (connections.length === 0 && groups.length === 0) return;
-		confirmQueryApplied = true;
-
-		const groupParam = page.url.searchParams.get('group');
-		const connectionParam = page.url.searchParams.get('connection');
-		if (groupParam !== null) {
-			const id = Number(groupParam);
-			if (Number.isInteger(id) && groups.some((g) => g.id === id)) {
-				treeFilter = { type: 'group', id };
-			}
-		} else if (connectionParam !== null) {
-			const id = Number(connectionParam);
-			if (Number.isInteger(id) && connections.some((c) => c.id === id)) {
-				treeFilter = { type: 'connection', id };
-			}
-		}
-
-		// `URLSearchParams.get()` はこの時点で既に1回パーセントデコード
-		// 済みの文字列を返す（`monitorHref` は各要素を `encodeURIComponent`
-		// してからカンマ区切りで連結しているだけ）。ここでさらに
-		// `decodeURIComponent` を掛けると二重デコードになり、external_name
-		// に `%` を含む値（例: `50%開度` のような名前）があると
-		// `URIError: URI malformed` で例外になる（`%` の後続がエスケープの
-		// 数値として解釈できないため）。追加のデコードはしない。
-		const focusParam = page.url.searchParams.get('focus');
-		if (focusParam) {
-			focusSet = new Set(focusParam.split(',').filter((name) => name !== ''));
-		}
-	});
+	const focusSet = $derived(new Set(parseMonitorFocus(page.url.searchParams)));
 
 	// --- T18-4b: WS 接続（1本を維持） --------------------------------------
 	//
@@ -460,8 +509,15 @@
 	// その時点ではソケットがまだ開いていないことが多く `resubscribe()` は
 	// no-op になる（次の onopen が現行の `treeFilter` で購読するので問題
 	// ない）。
+	//
+	// #1179 PR3b: URL（`?target=`）の対象は一覧を読み終える前から当てるので、その間の
+	// 購読は「すべて」（`subscriptionPatternsFor` が引けない id を全件に倒す）。読み終えて
+	// パターンが変わったときにも購読し直すよう、`treeFilter` ではなくパターンを見る。
+	const subscriptionKey = $derived(
+		subscriptionPatternsFor(treeFilter, connections, groups).join('\n')
+	);
 	$effect(() => {
-		void treeFilter;
+		void subscriptionKey;
 		streamResubscribe?.();
 		dispatchStreamView({ type: 'resubscribed' });
 	});
