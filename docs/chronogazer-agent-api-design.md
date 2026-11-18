@@ -1,7 +1,7 @@
 # ChronoGazer の AI エージェント向け API（API キー・MCP・OpenAPI）設計
 
 作成日: 2026-11-17
-状態: **実装済み**（2026-11-17）。§9 の PR1〜PR6（#1166〜#1174）はすべてマージ済み。§2 の決定は 2026-11-17 のオーナー決定。残りは §10 の未決事項と、実際の MCP クライアントでの動作確認。
+状態: **実装済み**（2026-11-17）。§9 の PR1〜PR6（#1166〜#1174）はすべてマージ済み。§2 の決定は 2026-11-17 のオーナー決定。残りは §10 の未決事項と、実際の MCP クライアントでの動作確認。2026-11-18: 表示グループの作成・更新のツールが Hub のタグの登録を含む一括保存になった（§5.3、#1179 PR5）。
 
 関連: [ChronoGazer 画面改善案](chronogazer-ui-improvement-proposal.md) §8（AI エージェントからの設定）・§5.2（LAN の通信）、[HUB の MCP リファレンス](banto-hub-mcp-reference.md)、[HUB の構成補助 MCP（T21）](banto-hub-t21-design.md)、Issue #1161。
 
@@ -157,6 +157,7 @@ HUB の `apps/banto-hub/core/src/mcp.rs` から骨組みを移す。
 - 今の ChronoGazer は、設定を変えても収集へ自動では反映せず、`restart` で反映する。ツールも同じにし、収集が読む設定（接続先・収集グループ・記録項目・しきい値）を変えるツールの結果に `restartRequired: true` を付ける。エージェントは `restart_collection` を呼んで反映する。表示グループは表示のための設定で収集は読まないので付けない。
 - 履歴（`/api/collect/history`）・イベントは初めは入れない（量が大きく、エージェントの設定の用途から外れる）。要るようになったら足す。
 - 改善案 §4 の一括保存を作るときは、同じ処理を呼ぶツールを足す。
+  - 2026-11-18（#1179 PR5）: ツールは足さず、`create_display_group`・`update_display_group` をその一括保存にした（REST の表示グループの作成・更新と同じ処理）。ペンは `tagId` か `hubTag` のどちらか一つで、未登録の Hub のタグは `hubTagGroup` へ登録する。登録があったときだけ結果に `restartRequired: true` を付ける。詳細は改善案 §4。
 
 実装（PR5b、`apps/chronogazer/core/src/mcp.rs`）で決めた細部:
 

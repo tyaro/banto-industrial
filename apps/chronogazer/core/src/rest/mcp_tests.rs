@@ -1107,3 +1107,91 @@ async fn every_changing_tool_is_refused_with_valid_input_for_read_and_scopeless_
     assert_eq!(denied_after - denied_before, changing.len() * 2);
     assert_eq!(config_snapshot(&fx, &config_key).await, before);
 }
+
+/// #1179 PR5: `create_display_group` でペンの Hub のタグを登録したときだけ
+/// `restartRequired: true`（記録項目を変えたツールと同じ扱い、§5.3）。登録の無い
+/// 作成・更新には付かない。監査は記録項目の `create` → 表示グループの `create`
+/// （どちらも `mcp`）。
+#[tokio::test]
+async fn a_config_key_registers_hub_tags_through_create_display_group() {
+    let fx = fixture().await;
+    let (key, _) = fx.issue("agent", &["config"]).await;
+    let hub_pen = json!({ "hubTag": { "externalName": "L.G.a", "name": "a", "dataType": "f32" } });
+
+    let created = fx
+        .call_ok(
+            &key,
+            "create_display_group",
+            json!({
+                "name": "L1", "kind": "trend", "pens": [hub_pen.clone()],
+                "hubTagGroup": { "newGroup": { "name": "hub-g", "periodMs": 1000 } },
+            }),
+        )
+        .await;
+    assert_eq!(created["restartRequired"], true, "{created}");
+    let registered = &created["created"]["registeredTags"];
+    assert_eq!(registered[0]["address"], "L.G.a", "{created}");
+    assert_eq!(created["created"]["pens"][0]["tagId"], registered[0]["id"]);
+
+    // 登録済みの外部名は参照だけ: 登録が無いので付かない。
+    let again = fx
+        .call_ok(
+            &key,
+            "create_display_group",
+            json!({ "name": "L2", "kind": "bar", "pens": [hub_pen] }),
+        )
+        .await;
+    assert!(again.get("restartRequired").is_none(), "{again}");
+    assert!(again["created"].get("registeredTags").is_none(), "{again}");
+    assert_eq!(
+        again["created"]["pens"][0]["tagId"],
+        created["created"]["pens"][0]["tagId"]
+    );
+
+    let mut rows = fx.audit_rows().await;
+    rows.sort_by_key(|row| row.id);
+    let got: Vec<(String, String, String)> = rows
+        .into_iter()
+        .filter(|row| row.result == "ok")
+        .filter(|row| row.resource == "tags" || row.resource == "display_groups")
+        .map(|row| (row.resource, row.action, row.origin))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("tags", "create"),
+            ("display_groups", "create"),
+            ("display_groups", "create"),
+        ]
+        .map(|(r, a)| (r.to_string(), a.to_string(), "mcp".to_string()))
+    );
+}
+
+/// #1179 PR5: `read` のキーでは Hub のタグ付きの作成も断り（`denied`）、何も登録しない。
+#[tokio::test]
+async fn a_read_key_cannot_register_hub_tags_through_create_display_group() {
+    let fx = fixture().await;
+    let (key, _) = fx.issue("reader", &["read"]).await;
+    let result = fx
+        .call(
+            &key,
+            "create_display_group",
+            json!({
+                "name": "L1", "kind": "trend",
+                "pens": [{ "hubTag": { "externalName": "L.G.a", "name": "a", "dataType": "f32" } }],
+                "hubTagGroup": { "newGroup": { "name": "hub-g", "periodMs": 1000 } },
+            }),
+        )
+        .await;
+    assert_eq!(result["isError"], true, "{result}");
+    assert!(result_text(&result).starts_with("forbidden"), "{result}");
+    let rows = fx.audit_rows().await;
+    assert!(rows.iter().any(|r| r.action == "denied"
+        && r.resource == "display_groups"
+        && detail_of(r)["tool"] == "create_display_group"));
+    let tags: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags")
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    assert_eq!(tags, 0, "nothing was registered");
+}

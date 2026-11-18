@@ -54,9 +54,10 @@ use crate::collect::{
     ExclusionView, HistoryPoint, HistorySeries, QualityView, Readout, ValuesResponse,
 };
 use crate::display_groups::{
-    DisplayAttributes, DisplayGroup, DisplayGroupPayload, DisplayKind, Pen, PenPayload,
-    ReorderPayload,
+    DisplayAttributes, DisplayGroup, DisplayGroupPayload, DisplayGroupSaveResponse, DisplayKind,
+    HubTagGroupPayload, Pen, PenPayload, ReorderPayload,
 };
+use crate::hub_tags::{HubTagRow, NewHubGroup};
 use crate::tag_thresholds::{TagThresholds, TagThresholdsPayload};
 
 /// `security(("api_key" = []))` が指す HTTP bearer の定義を足し（`components` は
@@ -187,7 +188,11 @@ impl Modify for SecurityAddon {
         DisplayAttributes,
         Pen,
         PenPayload,
+        HubTagRow,
+        NewHubGroup,
+        HubTagGroupPayload,
         DisplayGroup,
+        DisplayGroupSaveResponse,
         DisplayGroupPayload,
         ReorderPayload,
         TagThresholds,

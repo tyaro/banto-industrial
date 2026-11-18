@@ -107,7 +107,8 @@ use chronogazer_core::collect::{
 // #393: 表示グループ。検証・保存は REST と同じ `DisplayGroupService`。
 use chronogazer_core::display_groups::{
     audit_detail as display_group_audit_detail, DisplayGroup, DisplayGroupPayload,
-    DisplayGroupService, AUDIT_RESOURCE as DISPLAY_GROUPS_RESOURCE,
+    DisplayGroupSaveResponse, DisplayGroupSaved, DisplayGroupService,
+    AUDIT_RESOURCE as DISPLAY_GROUPS_RESOURCE,
 };
 // #392 B1-2: 起動と終了は `banto-serve` と共有のエンジン。
 use chronogazer_core::engine::{
@@ -117,7 +118,8 @@ use chronogazer_core::instance_lock::ChronoGazerHost;
 // #532: 記録計の側のタグごとのしきい値。検証・保存は REST と同じ `TagThresholdService`。
 use chronogazer_core::hub::{HubCatalogView, HubSubscriptionView, HubView};
 use chronogazer_core::hub_tags::{
-    register_from_hub, registration_audit_detail, HubRegistrationResult, HubTagRegistration,
+    register_from_hub, registration_audit_detail, HubRegistrationResult, HubTagRegistrar,
+    HubTagRegistration,
 };
 use chronogazer_core::rest::{
     plc_connection_audit_detail, update_plc_connection, CollectionGroupPayload,
@@ -2739,31 +2741,72 @@ async fn display_groups_get(
     display_groups_service(&state).get(id).await
 }
 
+/// #1179 PR5: ペンの Hub のタグを登録するサービス一式（REST の
+/// `DisplayGroupOps::registrar` と同じもの）。
+fn hub_tag_registrar(state: &AppState) -> HubTagRegistrar {
+    HubTagRegistrar {
+        plc_connections: state.services.plc_connections.clone(),
+        collection_groups: state.services.collection_groups.clone(),
+        tags: state.services.tags.clone(),
+    }
+}
+
+/// 表示グループの作成・更新の後処理（REST・MCP の `DisplayGroupOps::after_save` と
+/// 同じ順、#1179 PR5）: 登録があれば先に記録項目の `create` の監査（
+/// `tags_register_from_hub` と同じ `detail`）→ 表示グループの監査 → 登録があれば
+/// `registry_changed` と移行前の選択の消去の予約（待たない）。
+async fn display_groups_save_after(
+    state: &AppState,
+    actor: &UserIdentity,
+    action: &str,
+    saved: &DisplayGroupSaved,
+) {
+    if let Some(registration) = &saved.registration {
+        record_ok(
+            &state.services.audit,
+            actor,
+            "create",
+            "tags",
+            None,
+            Some(registration_audit_detail(registration)),
+        )
+        .await;
+    }
+    record_display_group_write(
+        state,
+        actor,
+        action,
+        Some(&saved.group.id.to_string()),
+        Some(display_group_audit_detail(&saved.group)),
+    )
+    .await;
+    if saved.registration.is_some() {
+        state.services.hub.registry_changed().await;
+        state.services.hub.schedule_legacy_selection_clear();
+    }
+}
+
 /// `editor`+ (R0 §3.6): 表示グループの作成。検証は REST と同じ
-/// `validate_display_group`（サービスの中）。
+/// `validate_display_group`（サービスの中）。ペンの Hub のタグの登録も REST と
+/// 同じ一括保存（#1179 PR5、`chronogazer_core::display_groups` のモジュール doc）。
 #[tauri::command]
 async fn display_groups_create(
     state: State<'_, AppState>,
     input: DisplayGroupPayload,
-) -> Result<DisplayGroup, BantoError> {
+) -> Result<DisplayGroupSaveResponse, BantoError> {
     display_groups_create_body(&state, input).await
 }
 
 async fn display_groups_create_body(
     state: &AppState,
     input: DisplayGroupPayload,
-) -> Result<DisplayGroup, BantoError> {
+) -> Result<DisplayGroupSaveResponse, BantoError> {
     let actor = require_role(state, Role::Editor, DISPLAY_GROUPS_RESOURCE).await?;
-    let created = display_groups_service(state).create(&input).await?;
-    record_display_group_write(
-        state,
-        &actor,
-        "create",
-        Some(&created.id.to_string()),
-        Some(display_group_audit_detail(&created)),
-    )
-    .await;
-    Ok(created)
+    let saved = display_groups_service(state)
+        .create_with_hub_tags(&hub_tag_registrar(state), &input)
+        .await?;
+    display_groups_save_after(state, &actor, "create", &saved).await;
+    Ok(saved.into_response())
 }
 
 /// `editor`+ (R0 §3.6): 表示グループの更新。版の食い違いは REST の `409` と
@@ -2773,7 +2816,7 @@ async fn display_groups_update(
     state: State<'_, AppState>,
     id: i64,
     input: DisplayGroupPayload,
-) -> Result<DisplayGroup, BantoError> {
+) -> Result<DisplayGroupSaveResponse, BantoError> {
     display_groups_update_body(&state, id, input).await
 }
 
@@ -2781,18 +2824,13 @@ async fn display_groups_update_body(
     state: &AppState,
     id: i64,
     input: DisplayGroupPayload,
-) -> Result<DisplayGroup, BantoError> {
+) -> Result<DisplayGroupSaveResponse, BantoError> {
     let actor = require_role(state, Role::Editor, DISPLAY_GROUPS_RESOURCE).await?;
-    let updated = display_groups_service(state).update(id, &input).await?;
-    record_display_group_write(
-        state,
-        &actor,
-        "update",
-        Some(&id.to_string()),
-        Some(display_group_audit_detail(&updated)),
-    )
-    .await;
-    Ok(updated)
+    let saved = display_groups_service(state)
+        .update_with_hub_tags(&hub_tag_registrar(state), id, &input)
+        .await?;
+    display_groups_save_after(state, &actor, "update", &saved).await;
+    Ok(saved.into_response())
 }
 
 /// `editor`+ (R0 §3.6): 表示グループの削除。
@@ -10374,10 +10412,12 @@ mod tests {
         let created =
             display_groups_create_body(&state, display_group_input("L1", "trend", &tag_ids))
                 .await
-                .expect("create");
+                .expect("create")
+                .group;
         let other = display_groups_create_body(&state, display_group_input("L2", "bar", &[]))
             .await
-            .expect("create other");
+            .expect("create other")
+            .group;
         let err = display_groups_create_body(&state, display_group_input("L1", "gauge", &[]))
             .await
             .expect_err("同名");
@@ -10387,7 +10427,8 @@ mod tests {
         edit.expected_revision = Some(created.revision);
         let updated = display_groups_update_body(&state, created.id, edit.clone())
             .await
-            .expect("update");
+            .expect("update")
+            .group;
         assert_eq!(updated.revision, created.revision + 1);
         let err = display_groups_update_body(&state, created.id, edit)
             .await
@@ -10430,6 +10471,87 @@ mod tests {
             .map(|(action, result)| (
                 action.to_string(),
                 result.to_string(),
+                "tauri".to_string()
+            ))
+        );
+    }
+
+    /// **#1179 PR5（Tauri 経路）**: 表示グループの作成でペンの Hub のタグを登録する
+    /// 一括保存が、REST・MCP と同じ処理・同じ監査の順（記録項目の `create` →
+    /// 表示グループの `create`、origin は `tauri`）で動く。登録先が無ければ
+    /// `hubTagGroup` の検証エラーで、何も書かない。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn display_group_create_registers_hub_tags_over_tauri() {
+        let state = app_state().await;
+        let editor = state
+            .services
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create editor");
+        state.set_session_for_test(Some(DesktopSession::Account(editor)));
+
+        let body = |with_group: bool| -> DisplayGroupPayload {
+            let mut json = serde_json::json!({
+                "name": "L1",
+                "kind": "trend",
+                "pens": [
+                    { "hubTag": { "externalName": "L.G.a", "name": "a", "dataType": "f32" } },
+                ],
+            });
+            if with_group {
+                json["hubTagGroup"] = serde_json::json!({
+                    "newGroup": { "name": "hub-g", "periodMs": 1000 }
+                });
+            }
+            serde_json::from_value(json).expect("DisplayGroupPayload")
+        };
+
+        let err = display_groups_create_body(&state, body(false))
+            .await
+            .expect_err("登録先が無い");
+        assert_eq!(only_field_error(err).field, "hubTagGroup");
+        assert!(display_groups_list_body(&state).await.unwrap().is_empty());
+        assert!(
+            hub_catalog_body(&state)
+                .await
+                .expect("catalog")
+                .registered
+                .is_empty(),
+            "何も登録していない"
+        );
+
+        let saved = display_groups_create_body(&state, body(true))
+            .await
+            .expect("create with hub tag");
+        assert_eq!(saved.registered_tags.len(), 1);
+        assert_eq!(saved.group.pens[0].tag_id, saved.registered_tags[0].id);
+        assert_eq!(
+            hub_catalog_body(&state).await.expect("catalog").registered,
+            vec!["L.G.a".to_owned()]
+        );
+
+        let page = state
+            .services
+            .audit
+            .list(ListParams::default())
+            .await
+            .expect("audit list");
+        let mut rows: Vec<_> = page
+            .rows
+            .into_iter()
+            .filter(|row| row.resource == "tags" || row.resource == "display_groups")
+            .collect();
+        rows.sort_by_key(|row| row.id);
+        let got: Vec<(String, String, String)> = rows
+            .into_iter()
+            .map(|row| (row.resource, row.action, row.origin))
+            .collect();
+        assert_eq!(
+            got,
+            [("tags", "create"), ("display_groups", "create")].map(|(resource, action)| (
+                resource.to_string(),
+                action.to_string(),
                 "tauri".to_string()
             ))
         );

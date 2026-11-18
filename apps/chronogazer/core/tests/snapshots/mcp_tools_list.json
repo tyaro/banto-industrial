@@ -534,12 +534,42 @@
       "name": "delete_tag"
     },
     {
-      "description": "表示グループを作る（config スコープ）。",
+      "description": "表示グループを作る（config スコープ）。ペンに Hub のカタログのタグ（hubTag）を指定すると、未登録のものは hubTagGroup に記録項目として同じ保存の中で登録する（そのときは結果に registeredTags と restartRequired: true が付き、収集へは restart_collection で反映する）。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
           "attributes": {
             "description": "種別ごとの属性（trend の timeWindowSec など）。",
+            "type": "object"
+          },
+          "hubTagGroup": {
+            "additionalProperties": false,
+            "description": "未登録の hubTag を登録する先。Hub 接続の既存の収集グループ（collectionGroupId）か新しいグループ（newGroup）のどちらか 1 つ。未登録の hubTag が無ければ使わない。",
+            "properties": {
+              "collectionGroupId": {
+                "description": "Hub 接続の下の既存の収集グループの id。",
+                "type": "integer"
+              },
+              "newGroup": {
+                "additionalProperties": false,
+                "description": "新しく作る収集グループ（Hub 接続が無ければ暗黙に作る）。",
+                "properties": {
+                  "name": {
+                    "description": "収集グループの名前。",
+                    "type": "string"
+                  },
+                  "periodMs": {
+                    "description": "収集の周期（ミリ秒）。",
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "name",
+                  "periodMs"
+                ],
+                "type": "object"
+              }
+            },
             "type": "object"
           },
           "kind": {
@@ -557,7 +587,7 @@
             "type": "string"
           },
           "pens": {
-            "description": "ペン（表示する記録項目）の並び。",
+            "description": "ペン（表示する記録項目）の並び。各ペンは tagId か hubTag のどちらか 1 つを指定する。",
             "items": {
               "additionalProperties": false,
               "properties": {
@@ -568,14 +598,49 @@
                     "null"
                   ]
                 },
+                "hubTag": {
+                  "additionalProperties": false,
+                  "description": "Hub のカタログのタグ（tagId の代わり）。登録済みの外部名なら既存の記録項目を参照し、未登録なら hubTagGroup の収集グループに記録項目として登録する（表示グループの保存と全部か無しか）。",
+                  "properties": {
+                    "dataType": {
+                      "description": "データ型（数値と bit だけ登録できる）。",
+                      "type": "string"
+                    },
+                    "decimals": {
+                      "description": "小数桁（0〜6 に丸める）。",
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "externalName": {
+                      "description": "Hub のタグの外部名（同一性の鍵）。",
+                      "type": "string"
+                    },
+                    "name": {
+                      "description": "記録項目の名前（Hub のタグ名）。",
+                      "type": "string"
+                    },
+                    "unit": {
+                      "description": "単位。",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "externalName",
+                    "name",
+                    "dataType"
+                  ],
+                  "type": "object"
+                },
                 "tagId": {
-                  "description": "記録項目の id。",
+                  "description": "登録済みの記録項目の id。hubTag と同時には指定できない。",
                   "type": "integer"
                 }
               },
-              "required": [
-                "tagId"
-              ],
               "type": "object"
             },
             "type": "array"
@@ -594,7 +659,7 @@
       "name": "create_display_group"
     },
     {
-      "description": "表示グループを更新する（config スコープ。全項目の置き換えで、expectedRevision 以外は省略できない。並び順は reorder_display_groups で変える。表示のための設定で、収集の再起動は要らない）。",
+      "description": "表示グループを更新する（config スコープ。全項目の置き換えで、expectedRevision 以外は省略できない。並び順は reorder_display_groups で変える。表示のための設定で、収集の再起動は要らない。ただし hubTag のペンで記録項目を登録したときは create_display_group と同じく registeredTags と restartRequired: true が付く）。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -605,6 +670,36 @@
           "expectedRevision": {
             "description": "楽観ロック: get_display_group で読んだ revision。省略すると版を確かめない（これだけ省略できる）。",
             "type": "integer"
+          },
+          "hubTagGroup": {
+            "additionalProperties": false,
+            "description": "未登録の hubTag を登録する先。Hub 接続の既存の収集グループ（collectionGroupId）か新しいグループ（newGroup）のどちらか 1 つ。未登録の hubTag が無ければ使わない。",
+            "properties": {
+              "collectionGroupId": {
+                "description": "Hub 接続の下の既存の収集グループの id。",
+                "type": "integer"
+              },
+              "newGroup": {
+                "additionalProperties": false,
+                "description": "新しく作る収集グループ（Hub 接続が無ければ暗黙に作る）。",
+                "properties": {
+                  "name": {
+                    "description": "収集グループの名前。",
+                    "type": "string"
+                  },
+                  "periodMs": {
+                    "description": "収集の周期（ミリ秒）。",
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "name",
+                  "periodMs"
+                ],
+                "type": "object"
+              }
+            },
+            "type": "object"
           },
           "id": {
             "description": "更新する表示グループの id。",
@@ -625,7 +720,7 @@
             "type": "string"
           },
           "pens": {
-            "description": "ペン（表示する記録項目）の並び。",
+            "description": "ペン（表示する記録項目）の並び。各ペンは tagId か hubTag のどちらか 1 つを指定する。",
             "items": {
               "additionalProperties": false,
               "properties": {
@@ -636,14 +731,49 @@
                     "null"
                   ]
                 },
+                "hubTag": {
+                  "additionalProperties": false,
+                  "description": "Hub のカタログのタグ（tagId の代わり）。登録済みの外部名なら既存の記録項目を参照し、未登録なら hubTagGroup の収集グループに記録項目として登録する（表示グループの保存と全部か無しか）。",
+                  "properties": {
+                    "dataType": {
+                      "description": "データ型（数値と bit だけ登録できる）。",
+                      "type": "string"
+                    },
+                    "decimals": {
+                      "description": "小数桁（0〜6 に丸める）。",
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "externalName": {
+                      "description": "Hub のタグの外部名（同一性の鍵）。",
+                      "type": "string"
+                    },
+                    "name": {
+                      "description": "記録項目の名前（Hub のタグ名）。",
+                      "type": "string"
+                    },
+                    "unit": {
+                      "description": "単位。",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "externalName",
+                    "name",
+                    "dataType"
+                  ],
+                  "type": "object"
+                },
                 "tagId": {
-                  "description": "記録項目の id。",
+                  "description": "登録済みの記録項目の id。hubTag と同時には指定できない。",
                   "type": "integer"
                 }
               },
-              "required": [
-                "tagId"
-              ],
               "type": "object"
             },
             "type": "array"

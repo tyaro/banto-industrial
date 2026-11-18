@@ -2020,6 +2020,12 @@ fn api_key_routes(
         .merge(collect_router(collect, audit.clone(), auth.clone()))
         .merge(display_groups::display_groups_router(
             display_groups.clone(),
+            crate::hub_tags::HubTagRegistrar {
+                plc_connections: plc_connections.clone(),
+                collection_groups: collection_groups.clone(),
+                tags: tags.clone(),
+            },
+            hub.clone(),
             audit.clone(),
             auth.clone(),
         ))
@@ -2172,6 +2178,12 @@ pub fn api_router(
         },
         display_groups: crate::ops::DisplayGroupOps {
             display_groups: display_groups.clone(),
+            registrar: crate::hub_tags::HubTagRegistrar {
+                plc_connections: plc_connections.clone(),
+                collection_groups: collection_groups.clone(),
+                tags: tags.clone(),
+            },
+            hub: hub.clone(),
             audit: audit.clone(),
         },
         thresholds: crate::ops::ThresholdOps {
