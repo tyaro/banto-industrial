@@ -43,6 +43,25 @@
 //! [`CurrentSample`] are unchanged. banto-hub's server tag store tracks
 //! equivalent metadata for computed, internal and DB tags.
 //!
+//! ## Received-good history ([`GoodHistory`]) - a separate lifetime
+//!
+//! `last_good_ms` lives in the cache entry, so it goes with the entry:
+//! [`CurrentValuesHandle::retain`] drops it when a tag leaves the config (a
+//! disabled tag, too), and a restarted collector starts a fresh cache. Some
+//! callers need "has this tag *ever* delivered a usable value" to outlive
+//! both (banto-hub's 「未確認」: kept for the whole Hub process, 2026-11-18
+//! オーナー決定). [`GoodHistory`] is that record: the set of `tag_key`s that
+//! ever got a usable sample (the same condition that advances
+//! `last_good_ms`). The cache adds to it in the same [`CurrentValuesHandle`]
+//! write that advances `last_good_ms`, `retain` never touches it, and a
+//! caller that passes one history to every collector start
+//! ([`crate::Collector::start_in_with_history`]) keeps it across restarts.
+//! Values keep their own (shorter) lifetime. It only grows; its size is
+//! bounded by the number of tags ever configured. Lock order: a cache write
+//! holds the cache's map lock, then takes the history's lock; nothing takes
+//! them the other way round, and readers ([`GoodHistory::contains`]) take
+//! only the history's lock.
+//!
 //! `std::sync::RwLock` (not `tokio::sync::RwLock`): reads come from the
 //! synchronous UI/render path and writes are short, non-`await` critical
 //! sections inside the collection tasks - an async lock would buy nothing and
@@ -119,6 +138,43 @@ struct Entry {
     quality_since_ms: i64,
 }
 
+/// The set of `tag_key`s that have delivered a usable value (module doc
+/// "Received-good history"). Cheaply cloneable; clones share one set. Its
+/// lifetime is the owner's, not a cache entry's: [`CurrentValuesHandle::retain`]
+/// and a collector restart leave it untouched.
+#[derive(Debug, Clone, Default)]
+pub struct GoodHistory {
+    keys: Arc<RwLock<HashSet<String>>>,
+}
+
+impl GoodHistory {
+    /// An empty history.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether `tag_key` has ever delivered a usable value into a cache
+    /// that records into this history.
+    pub fn contains(&self, tag_key: &str) -> bool {
+        self.keys
+            .read()
+            .expect("good-history lock poisoned (a writer panicked)")
+            .contains(tag_key)
+    }
+
+    /// Add `tag_key`. A hot path (every Good sample): an already-recorded
+    /// key costs only a read lock.
+    pub(crate) fn record(&self, tag_key: &str) {
+        if self.contains(tag_key) {
+            return;
+        }
+        self.keys
+            .write()
+            .expect("good-history lock poisoned (a writer panicked)")
+            .insert(tag_key.to_string());
+    }
+}
+
 /// Cheaply-cloneable shared handle onto the current-value cache. Clones share
 /// the same underlying map (recorder-requirements.md §3.2: the collection
 /// engine writes, the display layer reads).
@@ -126,17 +182,35 @@ struct Entry {
 pub struct CurrentValuesHandle {
     map: Arc<RwLock<HashMap<String, Entry>>>,
     clock: Arc<dyn Clock>,
+    /// Module doc "Received-good history". A cache built by [`Self::new`]
+    /// has its own; [`Self::with_good_history`] shares the caller's.
+    good_history: GoodHistory,
 }
 
 impl CurrentValuesHandle {
     /// Build an empty cache. `clock` is the same clock the rest of the
     /// engine uses, so Stale derivation and the sample timestamps agree on
-    /// "now".
+    /// "now". Its [`GoodHistory`] is its own (tests; the collector uses
+    /// [`Self::with_good_history`]).
+    #[cfg(test)]
     pub(crate) fn new(clock: Arc<dyn Clock>) -> Self {
+        Self::with_good_history(clock, GoodHistory::new())
+    }
+
+    /// [`Self::new`], recording usable samples into `good_history` (module
+    /// doc "Received-good history").
+    pub(crate) fn with_good_history(clock: Arc<dyn Clock>, good_history: GoodHistory) -> Self {
         Self {
             map: Arc::new(RwLock::new(HashMap::new())),
             clock,
+            good_history,
         }
+    }
+
+    /// The history this cache records into (module doc "Received-good
+    /// history").
+    pub fn good_history(&self) -> GoodHistory {
+        self.good_history.clone()
     }
 
     /// Invalidate a cached PLC value when a same-session diagnostic proves
@@ -177,6 +251,8 @@ impl CurrentValuesHandle {
             .expect("current-value cache lock poisoned (a writer panicked)");
         let usable = stored_quality == Quality::Good && value.is_some_and(f64::is_finite);
         let last_good_ms = if usable {
+            // Lock order (module doc): map, then history.
+            self.good_history.record(tag_key);
             Some(ptime_ms)
         } else {
             map.get(tag_key).and_then(|previous| previous.last_good_ms)
@@ -336,6 +412,7 @@ impl CurrentValuesHandle {
     /// forever with a slowly-staling last value). Keys are `tag_key`s
     /// (`"tag:<id>"`), the same identity `Self::set`/[`Self::get`] use.
     /// One write-lock pass, same cost class as a single `Self::set` call.
+    /// Leaves [`GoodHistory`] untouched (module doc "Received-good history").
     pub fn retain(&self, keys: &HashSet<String>) {
         let mut map = self
             .map
@@ -553,6 +630,46 @@ mod tests {
         assert_eq!(reading.sample.ptime_ms, 3_000);
         assert_eq!(reading.sample.quality, Quality::Bad);
         assert_eq!(reading.last_good_ms, Some(1_000));
+    }
+
+    #[test]
+    fn good_history_survives_retain_and_a_fresh_cache() {
+        // Module doc "Received-good history": the value goes with retain,
+        // the record that a usable value arrived does not; a new cache
+        // sharing the history (a collector restart) still sees it.
+        let clock = Arc::new(ManualClock::new(1_000, 0));
+        let history = GoodHistory::new();
+        let handle = CurrentValuesHandle::with_good_history(clock.clone(), history.clone());
+        handle.set("t1", Some(1.0), 1_000, Quality::Good, 1_000);
+        assert!(history.contains("t1"));
+        assert!(handle.good_history().contains("t1"));
+
+        handle.retain(&HashSet::new());
+        assert!(handle.get("t1").is_none());
+        assert!(history.contains("t1"));
+
+        let restarted = CurrentValuesHandle::with_good_history(clock, history.clone());
+        restarted.set("t1", None, 2_000, Quality::Bad, 1_000);
+        assert_eq!(last_good(&restarted, "t1"), None);
+        assert!(restarted.good_history().contains("t1"));
+    }
+
+    #[test]
+    fn good_history_ignores_bad_and_unusable_good_samples() {
+        let (handle, _clock) = handle_at(1_000);
+        handle.set("bad", Some(1.0), 1_000, Quality::Bad, 1_000);
+        handle.set("missing", None, 1_000, Quality::Good, 1_000);
+        handle.set("nan", Some(f64::NAN), 1_000, Quality::Good, 1_000);
+        handle.set("stale", Some(1.0), 1_000, Quality::Stale, 1_000);
+        let history = handle.good_history();
+        for key in ["bad", "missing", "nan", "stale"] {
+            assert!(!history.contains(key), "{key} must not count as received");
+        }
+        // A cache built by `new` has its own history, not shared with others.
+        let (other, _clock) = handle_at(1_000);
+        handle.set("t1", Some(1.0), 1_000, Quality::Good, 1_000);
+        assert!(handle.good_history().contains("t1"));
+        assert!(!other.good_history().contains("t1"));
     }
 
     #[test]

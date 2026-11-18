@@ -882,7 +882,7 @@
 	 *
 	 * リセットするタイミング:
 	 * - `openCreateDrawer`（新規に空フォームを開く）: `false` に戻す。
-	 * - `handleCreate` の「登録して次へ」（`carryFormForNext` で名前・
+	 * - `handleCreate` の「保存して次を追加」（`carryFormForNext` で名前・
 	 *   アドレスを空へ戻す）: 次の1件はまた「名前が空」から始まるので
 	 *   `false` に戻す。
 	 * - `openDuplicateDrawer`（タグ複製）: `buildDuplicateFormValues` が
@@ -907,7 +907,7 @@
 	 * リセットするタイミング:
 	 * - `openCreateDrawer`: `false` に戻す（新規タグは常に自動計算から
 	 *   始まる）。
-	 * - `handleCreate` の「登録して次へ」: **触れない** - `carryFormForNext`
+	 * - `handleCreate` の「保存して次を追加」: **触れない** - `carryFormForNext`
 	 *   は `writable` を「直前の入力のまま引き継ぐ」共通値として扱っている
 	 *   （`tagFormCarry.ts` 冒頭コメント参照）。touched もリセットすると、
 	 *   ユーザーが前の1件で手動 OFF にした意図が次の1件で黙って ON に
@@ -929,7 +929,7 @@
 	 *
 	 * `openDuplicateDrawer`（複製）は `false` のまま - 複製元と同じグループに
 	 * 限定する理由が無く、従来どおり任意のグループへ複製できる。
-	 * 「登録して次へ」（`handleCreate`）はこの値に触れない - 連続登録と同じ
+	 * 「保存して次を追加」（`handleCreate`）はこの値に触れない - 連続登録と同じ
 	 * 対象グループのまま次の1件を続けて登録できることを維持する。
 	 */
 	let createGroupLocked = $state(false);
@@ -1068,7 +1068,7 @@
 	 * 前半）: 複製元タグ。`openDuplicateDrawer` が set し、Drawer を閉じたら
 	 * `closeDrawer` が `null` に戻す。`null` の間は create Drawer は通常の
 	 * 新規作成（`openCreateDrawer` 経由）であり、複製元との差分パネルは
-	 * 出さない。「登録して次へ」で複製フォームのまま続けて作成した場合も
+	 * 出さない。「保存して次を追加」で複製フォームのまま続けて作成した場合も
 	 * （`handleCreate` は `duplicateSource` に触れないため）そのまま複製元
 	 * を保持し続ける - 直前の複製に対する差分として引き続き意味がある。
 	 */
@@ -1142,21 +1142,21 @@
 
 	/**
 	 * T18-2c（docs/banto-hub-t18-design.md「T18-2c 登録後分岐と親引継ぎ」、
-	 * TAG-UX-2）: create Drawer の主アクションを「登録して次へ」
-	 * （`closeAfterSave = false`）と「登録して閉じる」（`true`）に分ける。
+	 * TAG-UX-2）: create Drawer の主アクションを「保存して次を追加」
+	 * （`closeAfterSave = false`）と「保存して閉じる」（`true`）に分ける。
 	 * `closeAfterSave` は create フォームの `onsubmit` が
 	 * `SubmitEvent.submitter`（どちらのボタンが送信を起こしたか）から
 	 * 決める - `submitter` が取れない場合（テキスト入力内での Enter
 	 * 実装送信を `submitter` を返さない古いエンジンが処理した場合等）は
 	 * `undefined` になり、`submitter?.id === 'create-register-close'` が
-	 * 自然に `false`（＝「登録して次へ」側）へフォールバックする。これは
-	 * DOM 上も「登録して次へ」ボタンを先に置くことで Enter 押下時の既定
+	 * 自然に `false`（＝「保存して次を追加」側）へフォールバックする。これは
+	 * DOM 上も「保存して次を追加」ボタンを先に置くことで Enter 押下時の既定
 	 * ボタンにしている（`banto-hub-tags-form.spec.ts`
 	 * 1番の Enter 送信テストが前提にしている「保存後も Drawer が開いたまま」
 	 * 挙動と一致させるため）。
 	 *
-	 * 「登録して閉じる」＝保存成功後に `closeDrawer()`（現状の Drawer
-	 * `×`/Esc と同じ後始末）。「登録して次へ」＝保存成功後も Drawer は
+	 * 「保存して閉じる」＝保存成功後に `closeDrawer()`（現状の Drawer
+	 * `×`/Esc と同じ後始末）。「保存して次を追加」＝保存成功後も Drawer は
 	 * 開いたまま、`carryFormForNext`（`#lib/banto/tagFormCarry.ts`）で
 	 * 名前・アドレスだけ空にした次フォームへ差し替える -
 	 * タグ種別・収集グループ（「親設定」）を含むそれ以外のフィールドは
@@ -6665,7 +6665,7 @@
 			<!--
 					T18-3a（docs/banto-hub-t18-design.md「T18-3a タグ複製」）: 起動口。
 					文言は既存トースト「作成しました」/「更新しました」/「削除しました」や
-					ボタン名「新規登録」「登録して次へ」「登録して閉じる」「保存」
+					ボタン名「タグを追加」「保存して次を追加」「保存して閉じる」「保存」
 					「削除」と部分文字列としても被らないものにする（`tagTreeContextMenu.ts`
 					冒頭コメントの教訓、PR #135 CI 回帰と同じ配慮）。
 				-->
@@ -7003,7 +7003,7 @@
 												<span class="registration-target" data-testid="tag-registration-target">
 													「{registrationTarget.groupName}」へ登録
 												</span>
-												<button type="button" onclick={openCreateDrawer}>新規登録</button>
+												<button type="button" onclick={openCreateDrawer}>タグを追加</button>
 												<button
 													type="button"
 													onclick={openContinuousDrawer}
@@ -7032,7 +7032,7 @@
 												</button>
 											{:else}
 												<span class="registration-hint" data-testid="tag-registration-hint">
-													左のツリーで収集グループを選択すると、ここに新規登録・連続登録の操作が表示されます
+													左のツリーで収集グループを選択すると、ここにタグを追加・連続登録の操作が表示されます
 												</span>
 											{/if}
 											<button type="button" onclick={openCsvDrawer}>CSVインポート</button>
@@ -7547,7 +7547,7 @@
 													{/if}
 												{:else}
 													<p class="note">
-														タグがありません。上の「新規登録」から追加してください。
+														タグがありません。上の「タグを追加」から追加してください。
 													</p>
 												{/if}
 											</div>
@@ -7753,7 +7753,7 @@
 	- 複製もここに含む、上の `openDuplicateDrawer` コメント参照）のフォーム
 	本体。広幅では #375 と同じ型で非モーダルの右ペイン（`.edit-pane`）へ、
 	狭幅では従来どおり中央モーダル（下の `<Modal>`）から呼ぶため snippet に
-	切り出した。**中身は移動しただけで無変更** - 「登録して次へ」/「登録して
+	切り出した。**中身は移動しただけで無変更** - 「保存して次を追加」/「登録して
 	閉じる」の挙動・複製元差分パネル・preflight 表示は一切変えていない。
 -->
 {#snippet createFormBody()}
@@ -7764,7 +7764,7 @@
 			// T18-2c: どちらのボタンが送信を起こしたかは
 			// `SubmitEvent.submitter` から判定する - `undefined`/`null`
 			// （submitter を返さない実装での Enter 実装送信等）の場合は
-			// DOM 上で先に置いた「登録して次へ」（closeAfterSave=false）を
+			// DOM 上で先に置いた「保存して次を追加」（closeAfterSave=false）を
 			// 既定にする。`handleCreate` 側のコメントも参照。
 			const submitter = (e as SubmitEvent).submitter;
 			void handleCreate(submitter?.id === 'create-register-close');
@@ -7849,8 +7849,8 @@
 		)}
 		<div class="actions">
 			<!--
-					T18-2c（TAG-UX-2「作成後は『登録して次へ』と『登録して閉じる』を
-					分け…」）: 「登録して次へ」を先に置き、Enter 押下時の既定
+					T18-2c（TAG-UX-2「作成後は『保存して次を追加』と『保存して閉じる』を
+					分け…」）: 「保存して次を追加」を先に置き、Enter 押下時の既定
 					送信ボタンにする（`handleCreate` のコメント参照）。
 				-->
 			<button
@@ -7858,7 +7858,7 @@
 				id="create-register-next"
 				disabled={isDrawerBusy() || groups.length === 0}
 			>
-				登録して次へ
+				保存して次を追加
 			</button>
 			<button
 				type="submit"
@@ -7866,7 +7866,7 @@
 				class="secondary"
 				disabled={isDrawerBusy() || groups.length === 0}
 			>
-				登録して閉じる
+				保存して閉じる
 			</button>
 		</div>
 		{#if groups.length === 0}

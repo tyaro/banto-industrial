@@ -413,6 +413,34 @@ pub fn read_current_view_with_stored(
     server_store: &ServerTagStore,
     now_ms: i64,
 ) -> (CurrentView, Option<Quality>) {
+    let (view, stored, _) = read_current_view_raw(entry, collect, server_store, now_ms);
+    (view, stored)
+}
+
+/// [`read_current_view`]'s view together with whether the **raw** reading
+/// (before the `!entry.enabled` / invalid-value blanking of
+/// [`effective_current_view`]) has a `last_good_ms`, i.e. whether this Hub run
+/// has ever received a good sample for the tag (for a PLC tag, also the
+/// process-lifetime `ServerTagStore::plc_good_history`, which outlives the
+/// cache's `retain` and a collector restart). 「未確認」の判定用: 表示用の
+/// 無効化とは独立に、生の受信履歴で決める。`read_current_view` と同じ読み方で、
+/// 既存の関数の戻り値・意味は変えない。
+pub(crate) fn read_current_view_with_history(
+    entry: &TagEntry,
+    collect: Option<&CurrentValuesHandle>,
+    server_store: &ServerTagStore,
+    now_ms: i64,
+) -> (CurrentView, bool) {
+    let (view, _, received_good) = read_current_view_raw(entry, collect, server_store, now_ms);
+    (view, received_good)
+}
+
+fn read_current_view_raw(
+    entry: &TagEntry,
+    collect: Option<&CurrentValuesHandle>,
+    server_store: &ServerTagStore,
+    now_ms: i64,
+) -> (CurrentView, Option<Quality>, bool) {
     let (reading, stored) = if entry.tag_kind == banto_tags::PLC_TAG_KIND {
         match collect.and_then(|c| c.get_with_stored(&entry.tag_key)) {
             Some((reading, stored)) => (Some(reading), Some(stored)),
@@ -421,10 +449,17 @@ pub fn read_current_view_with_stored(
     } else {
         (server_store.get_reading(&entry.tag_key), None)
     };
+    // 値のキャッシュは無効化・構成の適用で retain され、収集の停止→開始で
+    // 作り直されるので、PLC タグは Hub のプロセスの間ずっと生きる受信履歴
+    // （`ServerTagStore::plc_good_history`）も見る。収集が止まっていて
+    // `collect` が `None` でも読める。
+    let received_good = reading.is_some_and(|r| r.last_good_ms.is_some())
+        || (entry.tag_kind == banto_tags::PLC_TAG_KIND
+            && server_store.plc_received_good(&entry.tag_key));
     let mut view = effective_current_view(entry, reading, now_ms);
     view.quality_since_ms =
         server_store.effective_quality_since(&entry.tag_key, view.quality, view.quality_since_ms);
-    (view, stored)
+    (view, stored, received_good)
 }
 
 /// The wire string for a [`Quality`] - `"good"`/`"bad"`/`"stale"`, identical
@@ -2341,7 +2376,7 @@ impl CollectorManager {
                     Err(err) => Err(err.to_string()),
                 }
             } else {
-                match Collector::start_in(
+                match Collector::start_in_with_history(
                     config,
                     self.place.clone(),
                     self.clock.clone(),
@@ -2349,6 +2384,9 @@ impl CollectorManager {
                     self.options,
                     factory,
                     Some(self.ingest.clone() as Arc<dyn ExternalSource>),
+                    // 「未確認」の記録は収集の停止→開始をまたいで保つ
+                    // （`ServerTagStore::plc_good_history`）。
+                    self.server_store().plc_good_history(),
                 )
                 .await
                 {
@@ -2909,6 +2947,72 @@ mod tests {
             assert_eq!(read(), resumed);
             manager.shutdown().await;
         }
+    }
+
+    /// 「未確認」の記録は値のキャッシュと寿命が別（2026-11-18 オーナー決定）:
+    /// PLC タグで良好値を受けた後、タグを無効にして構成を適用すると
+    /// キャッシュのエントリは retain で消えるが、WS の評価では Bad のまま
+    /// 未確認にならない。収集を止めて（`collect` が `None`）も、再び開始して
+    /// キャッシュが作り直されても同じ。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plc_received_good_outlives_disable_apply_and_collector_restart() {
+        use crate::subscribe_core::{initial_values, TagPattern};
+        let (_dir, manager, pool) = manager_env().await;
+        seed_running_simulation(&pool).await;
+        commit_and_apply(&manager).await.unwrap();
+        let collect = manager.current_values().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !collect
+                .get_reading("tag:1")
+                .is_some_and(|r| r.last_good_ms.is_some())
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("simulation delivers a Good sample");
+        let store = manager.server_store();
+        let read = |current: Option<CurrentValuesHandle>| {
+            let map = manager.tag_map();
+            let (values, _) = initial_values(
+                &[TagPattern::All],
+                &map,
+                current.as_ref(),
+                &store,
+                SystemClock.now_ms(),
+                None,
+            );
+            assert_eq!(values.len(), 1);
+            (values[0].q, values[0].unverified)
+        };
+
+        sqlx::query("UPDATE tags SET enabled=0 WHERE id=1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        commit_and_apply(&manager).await.unwrap();
+        let current = manager.current_values();
+        assert!(
+            current
+                .as_ref()
+                .is_none_or(|c| c.get_reading("tag:1").is_none()),
+            "the disabled tag's cache entry must be gone (the case under test)"
+        );
+        assert_eq!(read(current), (Quality::Bad, false));
+
+        sqlx::query("UPDATE tags SET enabled=1 WHERE id=1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        manager.stop().await;
+        assert!(manager.current_values().is_none());
+        assert_eq!(read(None), (Quality::Bad, false));
+
+        commit_and_apply(&manager).await.unwrap();
+        let restarted = manager.current_values().unwrap();
+        assert!(restarted.good_history().contains("tag:1"));
+        assert!(!read(Some(restarted)).1);
+        manager.shutdown().await;
     }
 
     fn local_today(clock: &dyn Clock) -> banto_tstore::LocalDate {

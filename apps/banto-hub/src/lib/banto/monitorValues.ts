@@ -56,6 +56,8 @@ export interface RowValue {
 	v: number | null;
 	q: string;
 	t: number;
+	/** 未確認（Hub の起動後に一度も良好値を受けていない）。サーバーは未確認のときだけ送る。 */
+	unverified?: boolean;
 }
 
 /** `applyTagValues` が要求する最小限の行の形。`external_name` をキーに
@@ -78,7 +80,12 @@ export function mergeTagValues<V extends { tag: string } & RowValue>(
 ): Map<string, RowValue> {
 	const next = new Map(current);
 	for (const value of values) {
-		next.set(value.tag, { v: value.v, q: value.q, t: value.t });
+		next.set(value.tag, {
+			v: value.v,
+			q: value.q,
+			t: value.t,
+			...(value.unverified ? { unverified: true } : {})
+		});
 	}
 	return next;
 }
@@ -101,7 +108,14 @@ export function applyTagValues<T extends ValueBearingRow>(
 	return rows.map((row) => {
 		const update = values.get(row.external_name);
 		if (!update) return row;
-		if (update.v === row.v && update.q === row.q && update.t === row.t) return row;
-		return { ...row, v: update.v, q: update.q, t: update.t };
+		if (
+			update.v === row.v &&
+			update.q === row.q &&
+			update.t === row.t &&
+			!!update.unverified === !!row.unverified
+		) {
+			return row;
+		}
+		return { ...row, v: update.v, q: update.q, t: update.t, unverified: update.unverified };
 	});
 }

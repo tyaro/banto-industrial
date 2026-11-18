@@ -107,4 +107,17 @@ describe('applyTagValues', () => {
 		expect(result[0]).toMatchObject({ v: 7, q: 'good', t: 500 });
 		expect(result[1]).toMatchObject({ v: null, q: 'stale', t: 0 });
 	});
+
+	it('unverified は true のときだけ畳まれ、変化したら行が差し替わる', () => {
+		const merged = mergeTagValues(new Map(), [
+			{ tag: 'plc1.groupA.D1', v: null, q: 'bad', t: 1, unverified: true },
+			{ tag: 'plc1.groupA.D2', v: 1, q: 'good', t: 1 }
+		]);
+		expect(merged.get('plc1.groupA.D1')).toEqual({ v: null, q: 'bad', t: 1, unverified: true });
+		expect(merged.get('plc1.groupA.D2')).toEqual({ v: 1, q: 'good', t: 1 });
+		const rows = [row('plc1.groupA.D1', { v: null, q: 'bad', t: 1 })];
+		const result = applyTagValues(rows, merged);
+		expect(result[0]).not.toBe(rows[0]);
+		expect(result[0].unverified).toBe(true);
+	});
 });

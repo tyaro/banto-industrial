@@ -87,7 +87,7 @@ test.describe.serial('banto-hub タグ preflight 失敗の可視性 (TAG-P0-2)',
 		// （収集グループの `<select>` が disabled）になる - まずツリーで対象
 		// グループを選ぶ（`groupNodeByName` は `banto-hub-auth.ts` 参照）。
 		await groupNodeByName(page, GROUP_NAME).click();
-		await page.getByRole('button', { name: '新規登録' }).click();
+		await page.getByRole('button', { name: 'タグを追加' }).click();
 		// #342 段階C: 新規作成フォームも広幅では非モーダルの右ペイン
 		// （`<aside aria-label>` = role `complementary`）へ移った（#375 の編集
 		// ペインと同じ型）ため `role="dialog"` では取れない。アクセシブル名
@@ -147,7 +147,7 @@ test.describe.serial('banto-hub タグ preflight 失敗の可視性 (TAG-P0-2)',
 		// T19 S1-c（UX-33）: 前のテストと同じ理由でツリーの対象グループ選択が
 		// 先に必要（`groupNodeByName` doc comment 参照）。
 		await groupNodeByName(page, GROUP_NAME).click();
-		await page.getByRole('button', { name: '新規登録' }).click();
+		await page.getByRole('button', { name: 'タグを追加' }).click();
 		const drawer = page.getByRole('complementary', { name: '新規作成' });
 		await expect(drawer).toBeVisible();
 
@@ -159,7 +159,7 @@ test.describe.serial('banto-hub タグ preflight 失敗の可視性 (TAG-P0-2)',
 		await expect(page.getByText('作成しました')).toBeVisible();
 		await expect(drawer.getByRole('alert')).toHaveCount(0);
 
-		// T18-2c: create Drawer には「登録して閉じる」ボタンも増え、部分一致だと
+		// T18-2c: create Drawer には「保存して閉じる」ボタンも増え、部分一致だと
 		// Drawer 右上の × （aria-label="閉じる"）と二重マッチするため exact 指定。
 		await drawer.getByRole('button', { name: '閉じる', exact: true }).click();
 		await expect(page.getByRole('gridcell', { name: VALID_TAG_NAME, exact: true })).toBeVisible();

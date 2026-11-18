@@ -101,7 +101,7 @@ test.describe.serial('banto-hub 登録後の確認導線 CTA (T18-4c)', () => {
 		// （収集グループの `<select>` が disabled）になる - まずツリーで対象
 		// グループを選ぶ（`groupNodeByName` は `banto-hub-auth.ts` 参照）。
 		await groupNodeByName(page, GROUP_NAME).click();
-		await page.getByRole('button', { name: '新規登録' }).click();
+		await page.getByRole('button', { name: 'タグを追加' }).click();
 		// #342 段階C: 新規作成フォームも広幅では非モーダルの右ペイン
 		// （`<aside aria-label>` = role `complementary`）へ移った（#375 の編集
 		// ペインと同じ型）ため `role="dialog"` では取れない。アクセシブル名
@@ -111,7 +111,7 @@ test.describe.serial('banto-hub 登録後の確認導線 CTA (T18-4c)', () => {
 
 		await drawer.getByLabel('名前').fill(TAG_NAME);
 		await drawer.getByLabel('アドレス').fill('40001');
-		await drawer.getByRole('button', { name: '登録して閉じる' }).click();
+		await drawer.getByRole('button', { name: '保存して閉じる' }).click();
 
 		await expect(page.getByText('作成しました')).toBeVisible();
 

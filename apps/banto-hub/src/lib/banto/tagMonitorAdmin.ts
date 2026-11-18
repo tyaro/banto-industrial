@@ -149,12 +149,13 @@ function fromRawCatalog(raw: RawCatalogResponse): CatalogResponse {
 	};
 }
 
-/** `/api/v1/stream` の `op: "data"` の1タグ分（`{ tag, v, q, t }`）。 */
+/** `/api/v1/stream` の `op: "data"` の1タグ分（`{ tag, v, q, t }`、未確認のときだけ `unverified: true`）。 */
 export interface StreamValue {
 	tag: string;
 	v: number | null;
 	q: string;
 	t: number;
+	unverified?: boolean;
 }
 
 const NETWORK_ERROR_MESSAGE = 'サーバーに接続できません';

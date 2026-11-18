@@ -1,8 +1,8 @@
 /**
  * T18-2c（docs/banto-hub-t18-design.md「T18-2c 登録後分岐と親引継ぎ」、
- * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-2「作成後は『登録して次へ』と
- * 『登録して閉じる』を分け、連続作業では親設定と明示選択した共通値を
- * 保持する」）: タグ単票 create Drawer の「登録して次へ」が使う、依存ゼロの
+ * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-2「作成後は『保存して次を追加』と
+ * 『保存して閉じる』を分け、連続作業では親設定と明示選択した共通値を
+ * 保持する」）: タグ単票 create Drawer の「保存して次を追加」が使う、依存ゼロの
  * 純関数。`tagFormLayout.ts`/`tagFormNumeric.ts` と同じ方針 -
  * `+page.svelte` 側の `FormState` を直接 import せず、構造的部分型
  * （`name`/`address` の2フィールドだけを要求するジェネリック制約）で
@@ -25,7 +25,7 @@ export interface CarryableTagForm {
 }
 
 /**
- * 「登録して次へ」用の次フォーム値を組み立てる。`previous`（直前に保存した
+ * 「保存して次を追加」用の次フォーム値を組み立てる。`previous`（直前に保存した
  * フォームの値そのもの、成功後もまだ `toInput` 送信前の生の文字列群）から
  * `name`/`address` だけを空文字列にし、他フィールドは型 `T` のまま丸ごと
  * 引き継ぐ。ジェネリックにしているのは、呼び出し元（`+page.svelte` の

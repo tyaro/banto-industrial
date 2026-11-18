@@ -159,7 +159,7 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 	test('1. 接続名 + ドットで収集グループの候補が出て、確定すると次の階層まで入る', async () => {
 		await page.goto('/tags');
 		await groupNodeByName(page, CALC_GROUP_NAME).click();
-		await page.getByRole('button', { name: '新規登録' }).click();
+		await page.getByRole('button', { name: 'タグを追加' }).click();
 
 		// 広幅では新規作成も非モーダルの右ペイン（#375 / #342 段階C）。
 		const pane = page.getByRole('complementary', { name: '新規作成' });
@@ -394,7 +394,7 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 		page.once('dialog', (dialog) => {
 			void dialog.accept();
 		});
-		// `exact: true` は必須 - ペインには「登録して閉じる」ボタンもあるため。
+		// `exact: true` は必須 - ペインには「保存して閉じる」ボタンもあるため。
 		await pane.getByRole('button', { name: '閉じる', exact: true }).click();
 
 		await expect(pane).toHaveCount(0);
@@ -404,7 +404,7 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 	test('8. IME 変換の確定後に補完が出る（#380 レビュー対応1）', async () => {
 		// テスト7でペインを閉じたので開き直す。
 		await groupNodeByName(page, CALC_GROUP_NAME).click();
-		await page.getByRole('button', { name: '新規登録' }).click();
+		await page.getByRole('button', { name: 'タグを追加' }).click();
 		const pane = page.getByRole('complementary', { name: '新規作成' });
 		await expect(pane).toBeVisible();
 		const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
@@ -457,7 +457,7 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 
 			await page.goto('/tags');
 			await groupNodeByName(page, CALC_GROUP_NAME).click();
-			await page.getByRole('button', { name: '新規登録' }).click();
+			await page.getByRole('button', { name: 'タグを追加' }).click();
 			const pane = page.getByRole('complementary', { name: '新規作成' });
 			await expect(pane).toBeVisible();
 			const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
@@ -500,7 +500,7 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 
 			await page.goto('/tags');
 			await groupNodeByName(page, CALC_GROUP_NAME).click();
-			await page.getByRole('button', { name: '新規登録' }).click();
+			await page.getByRole('button', { name: 'タグを追加' }).click();
 			const pane = page.getByRole('complementary', { name: '新規作成' });
 			await expect(pane).toBeVisible();
 			const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
@@ -527,7 +527,7 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 		try {
 			await page.goto('/tags');
 			await groupNodeByName(page, CALC_GROUP_NAME).click();
-			await page.getByRole('button', { name: '新規登録' }).click();
+			await page.getByRole('button', { name: 'タグを追加' }).click();
 			const pane = page.getByRole('complementary', { name: '新規作成' });
 			await expect(pane).toBeVisible();
 			const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
@@ -552,7 +552,7 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 			await pane.getByRole('button', { name: '閉じる', exact: true }).click();
 			await expect(pane).toHaveCount(0);
 
-			await page.getByRole('button', { name: '新規登録' }).click();
+			await page.getByRole('button', { name: 'タグを追加' }).click();
 			const reopened = page.getByRole('complementary', { name: '新規作成' });
 			await expect(reopened).toBeVisible();
 			await reopened.getByRole('textbox', { name: /^式（expression）/ }).fill('mi');
@@ -575,7 +575,7 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 		try {
 			await page.goto('/tags');
 			await groupNodeByName(page, CALC_GROUP_NAME).click();
-			await page.getByRole('button', { name: '新規登録' }).click();
+			await page.getByRole('button', { name: 'タグを追加' }).click();
 			const pane = page.getByRole('complementary', { name: '新規作成' });
 			await expect(pane).toBeVisible();
 			const popup = page.getByTestId('expression-completion');
@@ -592,7 +592,7 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 			await pane.getByRole('button', { name: '閉じる', exact: true }).click();
 			await expect(pane).toHaveCount(0);
 
-			await page.getByRole('button', { name: '新規登録' }).click();
+			await page.getByRole('button', { name: 'タグを追加' }).click();
 			const reopened = page.getByRole('complementary', { name: '新規作成' });
 			await expect(reopened).toBeVisible();
 			await reopened.getByRole('textbox', { name: /^式（expression）/ }).fill('mi');

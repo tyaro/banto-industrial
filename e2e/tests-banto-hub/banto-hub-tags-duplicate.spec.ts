@@ -168,7 +168,7 @@ test.describe.serial('banto-hub タグ複製 (T18-3a)', () => {
 	test('2. アドレスを入れて登録すると複製タグが増え、複製元は上書きされない', async () => {
 		const createDrawer = page.getByRole('complementary', { name: '新規作成' });
 		await createDrawer.getByLabel('アドレス').fill(DUPLICATE_ADDRESS);
-		await createDrawer.getByRole('button', { name: '登録して閉じる' }).click();
+		await createDrawer.getByRole('button', { name: '保存して閉じる' }).click();
 
 		await expect(page.getByText('作成しました')).toBeVisible();
 		await expect(createDrawer).toBeHidden();
