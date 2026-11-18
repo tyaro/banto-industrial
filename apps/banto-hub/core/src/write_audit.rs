@@ -216,6 +216,19 @@ pub struct WriteAuditRow {
     pub action: WriteAuditAction,
     pub result: WriteAuditResult,
     pub detail: Option<String>,
+    /// #1201: 呼び出し側が付けた突き合わせ用の ID(0111 より前の行・バッチは `NULL`)。
+    pub correlation_id: Option<String>,
+    /// #1201: 呼び出し側が名乗った操作者(`on_behalf_of`)。**自己申告で、認証された
+    /// 事実ではない**(認証された主体は `api_key_*` の列)。
+    pub operator_claim: Option<String>,
+}
+
+/// #1201: 書込みの要求に付いた自己申告の 2 つ(`correlation_id` / `on_behalf_of`)を
+/// 監査の行へ運ぶ値。検証は入口の `crate::write_path::WriteMeta::parse` が済ませている。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuditClaim {
+    pub correlation_id: Option<String>,
+    pub operator_claim: Option<String>,
 }
 
 impl WriteAuditRow {
@@ -239,7 +252,16 @@ impl WriteAuditRow {
             action,
             result,
             detail: None,
+            correlation_id: None,
+            operator_claim: None,
         }
+    }
+
+    /// #1201: `correlation_id` と `operator_claim` を行に入れる。
+    pub fn with_claim(mut self, claim: &AuditClaim) -> Self {
+        self.correlation_id = claim.correlation_id.clone();
+        self.operator_claim = claim.operator_claim.clone();
+        self
     }
 
     pub fn with_value_requested(mut self, value: f64) -> Self {
@@ -422,6 +444,8 @@ struct PairWindow {
     key_name: Arc<str>,
     key_prefix: Arc<str>,
     tag_id: i64,
+    /// #1201: 窓の最初の拒否の要求が持っていた値(後から来た要求の値では上書きしない)。
+    claim: AuditClaim,
 }
 
 impl PairWindow {
@@ -567,6 +591,7 @@ impl RejectionTable {
         self.open.len() < REJECTION_TABLE_MAX_PAIRS
     }
 
+    #[allow(clippy::too_many_arguments)] // `add` と同じ内部の形
     fn insert_window(
         &mut self,
         key: PairKey,
@@ -575,6 +600,7 @@ impl RejectionTable {
         names: &mut KeyNames<'_>,
         tag_id: i64,
         n: u64,
+        claim: &AuditClaim,
     ) {
         let (key_name, key_prefix) = names.get();
         self.next_generation += 1;
@@ -594,6 +620,7 @@ impl RejectionTable {
                 key_name,
                 key_prefix,
                 tag_id,
+                claim: claim.clone(),
             },
         );
     }
@@ -650,6 +677,7 @@ impl RejectionTable {
         external_name: &str,
         reason: WriteRejectionReason,
         n: u64,
+        claim: &AuditClaim,
     ) {
         let key_id = names.key.id;
         let tag_key: PairKey = (
@@ -661,7 +689,7 @@ impl RejectionTable {
             return;
         }
         if self.budget_allows(key_id, now) && self.make_room(now) {
-            self.insert_window(tag_key, now, wall, names, tag_id, n);
+            self.insert_window(tag_key, now, wall, names, tag_id, n, claim);
             self.spend_budget(key_id, now);
             return;
         }
@@ -670,7 +698,7 @@ impl RejectionTable {
             return;
         }
         if self.make_room(now) {
-            self.insert_window(summary_key, now, wall, names, 0, n);
+            self.insert_window(summary_key, now, wall, names, 0, n, claim);
             return;
         }
         self.overflow = self.overflow.saturating_add(n);
@@ -771,6 +799,7 @@ struct WriteJob {
     key_name: Arc<str>,
     key_prefix: Arc<str>,
     tag_id: i64,
+    claim: AuditClaim,
 }
 
 impl WriteJob {
@@ -784,6 +813,7 @@ impl WriteJob {
             key_name: w.key_name.clone(),
             key_prefix: w.key_prefix.clone(),
             tag_id: w.tag_id,
+            claim: w.claim.clone(),
         }
     }
 
@@ -853,8 +883,8 @@ async fn insert_row_in(pool: &SqlitePool, row: &WriteAuditRow) -> Result<i64, Ba
         "INSERT INTO hub_write_audit (\
             api_key_id, api_key_name_snapshot, api_key_prefix_snapshot, tag_id, \
             external_name_snapshot, value_requested, value_requested_text, action, \
-            result, detail\
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+            result, detail, correlation_id, operator_claim\
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          RETURNING id",
     )
     .bind(row.api_key_id)
@@ -867,6 +897,8 @@ async fn insert_row_in(pool: &SqlitePool, row: &WriteAuditRow) -> Result<i64, Ba
     .bind(row.action.as_str())
     .bind(row.result.as_str())
     .bind(&row.detail)
+    .bind(&row.correlation_id)
+    .bind(&row.operator_claim)
     .fetch_one(pool)
     .await
     .map_err(banto_storage::storage_error)?;
@@ -882,8 +914,8 @@ async fn insert_rejected_row(
     sqlx::query_scalar(
         "INSERT INTO hub_write_audit (\
             ts, api_key_id, api_key_name_snapshot, api_key_prefix_snapshot, tag_id, \
-            external_name_snapshot, action, result, detail\
-         ) VALUES (datetime(?, 'unixepoch'), ?, ?, ?, ?, ?, ?, ?, ?) \
+            external_name_snapshot, action, result, detail, correlation_id, operator_claim\
+         ) VALUES (datetime(?, 'unixepoch'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          RETURNING id",
     )
     .bind(unix_seconds(job.first_at))
@@ -895,6 +927,8 @@ async fn insert_rejected_row(
     .bind(WriteAuditAction::Write.as_str())
     .bind(WriteAuditResult::Rejected.as_str())
     .bind(detail)
+    .bind(&job.claim.correlation_id)
+    .bind(&job.claim.operator_claim)
     .fetch_one(conn)
     .await
 }
@@ -1155,6 +1189,18 @@ impl WriteAuditService {
         self.record_rejections(key, [(tag_id, external_name, reason)]);
     }
 
+    /// [`Self::record_rejection`] に #1201 の自己申告を付ける版(単票の入口が使う)。
+    pub fn record_rejection_claimed(
+        &self,
+        key: RejectingKey<'_>,
+        tag_id: i64,
+        external_name: &str,
+        reason: WriteRejectionReason,
+        claim: &AuditClaim,
+    ) {
+        self.record_rejections_claimed(key, [(tag_id, external_name, reason)], claim);
+    }
+
     /// #945 の総点検: 1 つのキーの拒否(`(tag_id, 外部名, 理由)`)を、表を 1 回だけ
     /// lock して足す。**async ではなく、DB にも async のロックにも触れない**(403・404 を
     /// 監査で遅らせない。要求の future が捨てられても、足し終えた分は欠けない)。
@@ -1165,17 +1211,40 @@ impl WriteAuditService {
         key: RejectingKey<'_>,
         entries: impl IntoIterator<Item = (i64, &'n str, WriteRejectionReason)>,
     ) {
+        self.record_rejections_claimed(key, entries, &AuditClaim::default());
+    }
+
+    /// [`Self::record_rejections`] に #1201 の自己申告を付ける版。窓の最初の拒否の
+    /// 値だけが行に残る(同じ窓に後から足された拒否の値では上書きしない)。
+    pub fn record_rejections_claimed<'n>(
+        &self,
+        key: RejectingKey<'_>,
+        entries: impl IntoIterator<Item = (i64, &'n str, WriteRejectionReason)>,
+        claim: &AuditClaim,
+    ) {
         let now = Instant::now();
-        self.record_rejections_at(now, SystemTime::now(), key, entries);
+        self.record_rejections_claimed_at(now, SystemTime::now(), key, entries, claim);
         self.rejections.check_writer(now);
     }
 
+    #[cfg(test)]
     fn record_rejections_at<'n>(
         &self,
         now: Instant,
         wall: SystemTime,
         key: RejectingKey<'_>,
         entries: impl IntoIterator<Item = (i64, &'n str, WriteRejectionReason)>,
+    ) {
+        self.record_rejections_claimed_at(now, wall, key, entries, &AuditClaim::default());
+    }
+
+    fn record_rejections_claimed_at<'n>(
+        &self,
+        now: Instant,
+        wall: SystemTime,
+        key: RejectingKey<'_>,
+        entries: impl IntoIterator<Item = (i64, &'n str, WriteRejectionReason)>,
+        claim: &AuditClaim,
     ) {
         let mut names = KeyNames { key, shared: None };
         // 同じ(切り詰めた名前, 理由)は lock の前に件数でまとめ、表には 1 回だけ足す
@@ -1194,7 +1263,7 @@ impl WriteAuditService {
         }
         let mut table = self.rejections.table();
         for (tag_id, name, reason, n) in &grouped {
-            table.add(now, wall, &mut names, *tag_id, name, *reason, *n);
+            table.add(now, wall, &mut names, *tag_id, name, *reason, *n, claim);
         }
     }
 
@@ -1697,6 +1766,34 @@ mod rejection_tests {
         assert_eq!(svc.unwritten_rejections(), 1);
     }
 
+    /// #1201: 同じ窓の拒否は 1 行にまとまり、行に残る `correlation_id`・`operator_claim`
+    /// は窓の最初の要求の値(後から来た要求の値では上書きしない)。窓が明ければ新しい行。
+    #[tokio::test]
+    async fn a_window_keeps_the_claims_of_its_first_request() {
+        let svc = service().await;
+        let r = WriteRejectionReason::NotWritable;
+        let claim = |n: &str| AuditClaim {
+            correlation_id: Some(format!("c-{n}")),
+            operator_claim: Some(format!("op-{n}")),
+        };
+        svc.record_rejection_claimed(KEY, 7, "line.t", r, &claim("1"));
+        svc.write_pending().await.unwrap();
+        // 行を書いた後の UPDATE(件数だけ)でも、値は上書きしない。
+        svc.record_rejection_claimed(KEY, 7, "line.t", r, &claim("2"));
+        svc.record_rejection(KEY, 7, "line.t", r);
+        svc.write_pending().await.unwrap();
+        let cols: Vec<(Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT correlation_id, operator_claim FROM hub_write_audit")
+                .fetch_all(&svc.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            cols,
+            vec![(Some("c-1".to_string()), Some("op-1".to_string()))]
+        );
+        assert_eq!(count_of(&rows(&svc).await[0].detail.clone().unwrap()), 3);
+    }
+
     #[tokio::test]
     async fn the_same_pair_100k_times_is_one_row_with_the_total() {
         let svc = service().await;
@@ -2055,6 +2152,7 @@ mod rejection_tests {
                 key_name: Arc::from("k"),
                 key_prefix: Arc::from("p"),
                 tag_id: 0,
+                claim: AuditClaim::default(),
             };
             let key = (
                 5000 + i as i64,

@@ -2616,3 +2616,313 @@ async fn a_resume_whose_client_disconnects_mid_operation_is_still_audited_once()
         write_control::FileStartupState::Enabled
     );
 }
+
+// ---------------------------------------------------------------------------
+// #1201: correlation_id・on_behalf_of・audit_id
+// ---------------------------------------------------------------------------
+
+/// 監査の `(correlation_id, operator_claim)` を id で読む。
+async fn claim_columns(app: &TestApp, audit_id: i64) -> (Option<String>, Option<String>) {
+    sqlx::query_as("SELECT correlation_id, operator_claim FROM hub_write_audit WHERE id = ?")
+        .bind(audit_id)
+        .fetch_one(&app.pool)
+        .await
+        .expect("the audit row must exist")
+}
+
+async fn audit_row_count(app: &TestApp) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM hub_write_audit")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_with_correlation_id_returns_audit_id_and_leaves_the_claims_in_the_audit_row() {
+    let app = test_app("correlation-ok").await;
+    let sim = Simulator::start().await;
+    let (_tag_id, external_name) = make_tag(
+        &app,
+        "line1",
+        "slmp",
+        sim.addr.port(),
+        "temp01",
+        "D100",
+        "u16",
+        true,
+        true,
+    )
+    .await;
+    app.write_control.enable();
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &["write:line1.fast.temp01"],
+    )
+    .await;
+
+    let (status, body) = v1_post(
+        &app.router,
+        &format!("/api/v1/values/{external_name}"),
+        &key,
+        json!({ "v": 42, "correlation_id": "job-7:a.b_c-d", "on_behalf_of": " 山田（ライン 2） " }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"], "ok");
+    assert_eq!(body["correlation_id"], "job-7:a.b_c-d");
+    let audit_id = body["audit_id"].as_i64().expect("audit_id is a number");
+    assert!(audit_id > 0);
+    assert_eq!(
+        claim_columns(&app, audit_id).await,
+        (
+            Some("job-7:a.b_c-d".to_string()),
+            // 前後の空白はそのまま(trim しない)。
+            Some(" 山田（ライン 2） ".to_string())
+        )
+    );
+
+    // 申告が無い要求: correlation_id は応答に出ず、2 列は NULL。
+    let (status, body) = v1_post(
+        &app.router,
+        &format!("/api/v1/values/{external_name}"),
+        &key,
+        json!({ "v": 43, "correlation_id": null }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert!(body.get("correlation_id").is_none(), "{body:?}");
+    let audit_id = body["audit_id"].as_i64().unwrap();
+    assert_eq!(claim_columns(&app, audit_id).await, (None, None));
+    sim.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_correlation_id_or_on_behalf_of_is_422_and_leaves_no_audit_row() {
+    let app = test_app("correlation-invalid").await;
+    let sim = Simulator::start().await;
+    let (_tag_id, external_name) = make_tag(
+        &app,
+        "line1",
+        "slmp",
+        sim.addr.port(),
+        "temp01",
+        "D100",
+        "u16",
+        true,
+        true,
+    )
+    .await;
+    app.write_control.enable();
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &["write:line1.fast.temp01"],
+    )
+    .await;
+    let before = audit_row_count(&app).await;
+
+    let long_id = "a".repeat(65);
+    for (body, code) in [
+        (
+            json!({ "v": 1, "correlation_id": "" }),
+            "invalid_correlation_id",
+        ),
+        (
+            json!({ "v": 1, "correlation_id": long_id }),
+            "invalid_correlation_id",
+        ),
+        (
+            json!({ "v": 1, "correlation_id": "a b" }),
+            "invalid_correlation_id",
+        ),
+        (
+            json!({ "v": 1, "on_behalf_of": "" }),
+            "invalid_on_behalf_of",
+        ),
+        (
+            json!({ "v": 1, "on_behalf_of": "a\nb" }),
+            "invalid_on_behalf_of",
+        ),
+    ] {
+        let (status, got) = v1_post(
+            &app.router,
+            &format!("/api/v1/values/{external_name}"),
+            &key,
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?} {got:?}");
+        assert_eq!(got["error"], code, "{body:?}");
+        assert!(got.get("audit_id").is_none(), "{got:?}");
+    }
+    app.write_audit.write_pending().await.unwrap();
+    assert_eq!(audit_row_count(&app).await, before, "no audit row, no wire");
+    sim.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failure_after_sending_carries_the_audit_id_and_correlation_id() {
+    let app = test_app("correlation-failed").await;
+    let closed_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let (_tag_id, external_name) = make_tag(
+        &app,
+        "line1",
+        "slmp",
+        closed_port,
+        "temp01",
+        "D100",
+        "u16",
+        true,
+        true,
+    )
+    .await;
+    app.write_control.enable();
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &["write:line1.fast.temp01"],
+    )
+    .await;
+
+    let (status, body) = v1_post(
+        &app.router,
+        &format!("/api/v1/values/{external_name}"),
+        &key,
+        json!({ "v": 7, "correlation_id": "c-fail", "on_behalf_of": "鈴木" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body:?}");
+    assert_eq!(body["error"], "write_failed");
+    assert_eq!(body["correlation_id"], "c-fail");
+    let audit_id = body["audit_id"]
+        .as_i64()
+        .expect("audit_id on a post-send failure");
+    assert_eq!(
+        claim_columns(&app, audit_id).await,
+        (Some("c-fail".to_string()), Some("鈴木".to_string()))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rejection_before_sending_has_no_audit_id_and_keeps_the_first_claim_in_the_window() {
+    let app = test_app("correlation-rejected").await;
+    let sim = Simulator::start().await;
+    let (_tag_id, external_name) = make_tag(
+        &app,
+        "line1",
+        "slmp",
+        sim.addr.port(),
+        "temp01",
+        "D100",
+        "u16",
+        false,
+        true,
+    )
+    .await;
+    app.write_control.enable();
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &["write:line1.fast.temp01"],
+    )
+    .await;
+    for id in ["first", "second", "third"] {
+        let (status, body) = v1_post(
+            &app.router,
+            &format!("/api/v1/values/{external_name}"),
+            &key,
+            json!({ "v": 1, "correlation_id": id, "on_behalf_of": format!("op-{id}") }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body:?}");
+        assert_eq!(body["error"], "not_writable");
+        assert!(body.get("audit_id").is_none(), "{body:?}");
+        assert_eq!(body["correlation_id"], id);
+    }
+    app.write_audit.write_pending().await.unwrap();
+    let rows: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT correlation_id, operator_claim FROM hub_write_audit WHERE result = 'rejected'",
+    )
+    .fetch_all(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![(Some("first".to_string()), Some("op-first".to_string()))],
+        "the window keeps the first request's claims"
+    );
+    sim.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_404_for_an_unknown_tag_keeps_its_shape_and_carries_the_correlation_id() {
+    let app = test_app("correlation-404").await;
+    app.write_control.enable();
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &["write:nope.nope.nope"],
+    )
+    .await;
+
+    let (status, body) = v1_post(
+        &app.router,
+        "/api/v1/values/nope.nope.nope",
+        &key,
+        json!({ "v": 1, "correlation_id": "c-404" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body:?}");
+    assert_eq!(body["kind"], "not_found", "{body:?}");
+    assert_eq!(body["resource"], "tags");
+    assert_eq!(body["id"], "nope.nope.nope");
+    assert_eq!(body["correlation_id"], "c-404");
+
+    // 申告が無いときは今まで通り(欄は出ない)。
+    let (status, body) = v1_post(
+        &app.router,
+        "/api/v1/values/nope.nope.nope",
+        &key,
+        json!({ "v": 1 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.get("correlation_id").is_none(), "{body:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_write_scope_403_carries_the_correlation_id() {
+    let app = test_app("correlation-403").await;
+    app.write_control.enable();
+    let (key, _id) = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
+
+    let (status, body) = v1_post(
+        &app.router,
+        "/api/v1/values/line1.fast.temp01",
+        &key,
+        json!({ "v": 1, "correlation_id": "c-403" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body:?}");
+    assert_eq!(body["error"], "missing_write_scope");
+    assert_eq!(body["correlation_id"], "c-403");
+
+    let (status, body) = v1_post(
+        &app.router,
+        "/api/v1/values/line1.fast.temp01",
+        &key,
+        json!({ "v": 1 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body.get("correlation_id").is_none(), "{body:?}");
+}

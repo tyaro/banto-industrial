@@ -477,6 +477,14 @@ fn tool_registry() -> ToolRegistry<McpState, ApiKeyContext> {
                         "value": {
                             "description": "書き込む工学値。数値タグには数値、bit タグには真偽値。",
                         },
+                        "correlation_id": {
+                            "type": "string",
+                            "description": "任意。突き合わせ用の ID(1〜64 文字、英数字と . _ : - のみ)。監査の行に残り、結果に返る。",
+                        },
+                        "on_behalf_of": {
+                            "type": "string",
+                            "description": "任意。名乗る操作者(1〜128 文字、制御文字不可)。自己申告で、認証された事実ではない。監査に残る。",
+                        },
                     },
                     "required": ["tag", "value"],
                     "additionalProperties": false,
@@ -1542,6 +1550,13 @@ async fn tool_write_tag_value(
         return Ok(tool_error(write_tag_value_advisory(&tag, &value)));
     }
 
+    // #1201: 自己申告の 2 つの形を入口で検証する(不正なら本文付きのエラー、監査に残さない)。
+    // 文字列でも null でもない値は、形が合わないものとして同じく断る。
+    let meta = match write_meta_from_arguments(&arguments) {
+        Ok(meta) => meta,
+        Err(rejection) => return Ok(tool_error(rejection.to_json().to_string())),
+    };
+
     // ロックダウン前: REST の `v1_write_value` と同一の事前段
     // (`write:{tag}`の完全一致)。
     if !ctx.has_write_scope(&tag) {
@@ -1551,10 +1566,16 @@ async fn tool_write_tag_value(
             &state.write_audit,
             ctx,
             &tag,
+            &meta,
         );
-        return Ok(tool_error(format!(
+        let mut message = format!(
             "missing_write_scope: タグ '{tag}' への write:{{tag}} スコープを持つ API キーが必要です。"
-        )));
+        );
+        // #1201: 検証済みの `correlation_id` は拒否にも返す(本文は文章のまま、末尾に足す)。
+        if let Some(id) = meta.correlation_id() {
+            message.push_str(&format!(" correlation_id: {id}"));
+        }
+        return Ok(tool_error(message));
     }
 
     let requested = parse_requested_value(&value);
@@ -1571,10 +1592,53 @@ async fn tool_write_tag_value(
     // §3.7・実装指示 「絶対」: ゲート(catalog/writable/enabled/simulation/
     // protocol/write_enabled/rate limit/値変換)は一切再実装せず、REST/gRPC
     // と同じこの1関数へそのまま委譲する。
-    match execute_write(&deps, ctx, &tag, requested).await {
-        Ok(ok) => Ok(tool_ok(json!({ "tag": ok.tag, "result": "ok" }))),
-        Err(rejection) => Ok(tool_error(rejection.to_json().to_string())),
+    let outcome = execute_write(&deps, ctx, &tag, requested, &meta).await;
+    match outcome.result {
+        Ok(ok) => {
+            let mut result = json!({
+                "tag": ok.tag,
+                "result": "ok",
+                // 成功は必ず log-before-write の行を作っている。
+                "audit_id": outcome.audit_id.unwrap_or_default(),
+            });
+            if let (Some(id), Some(map)) = (meta.correlation_id(), result.as_object_mut()) {
+                map.insert("correlation_id".to_string(), json!(id));
+            }
+            Ok(tool_ok(result))
+        }
+        Err(rejection) => {
+            // #1201: 監査の行を作った後の失敗は `audit_id` を、受けていれば
+            // `correlation_id` を本文へ足す(REST のエラー本文と同じ形)。
+            let mut body = rejection.to_json();
+            if let Some(map) = body.as_object_mut() {
+                if let Some(id) = outcome.audit_id {
+                    map.insert("audit_id".to_string(), json!(id));
+                }
+                if let Some(id) = meta.correlation_id() {
+                    map.insert("correlation_id".to_string(), json!(id));
+                }
+            }
+            Ok(tool_error(body.to_string()))
+        }
     }
+}
+
+/// `write_tag_value` の `arguments` から #1201 の 2 つを取り出して検証する。
+/// 欄が無い・`null` は「無し」、文字列以外は形が合わないものとして断る。
+fn write_meta_from_arguments(
+    arguments: &Value,
+) -> Result<crate::write_path::WriteMeta, crate::write_path::WriteRejection> {
+    use crate::write_path::{WriteMeta, WriteRejection};
+    let field = |name: &str, bad: WriteRejection| -> Result<Option<String>, WriteRejection> {
+        match arguments.get(name) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(text)) => Ok(Some(text.clone())),
+            Some(_) => Err(bad),
+        }
+    };
+    let correlation_id = field("correlation_id", WriteRejection::InvalidCorrelationId)?;
+    let on_behalf_of = field("on_behalf_of", WriteRejection::InvalidOnBehalfOf)?;
+    WriteMeta::parse(correlation_id, on_behalf_of)
 }
 
 /// ロックダウン後の`write_tag_value`が返す助言文言(実装指示の文言の趣旨を

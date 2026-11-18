@@ -13,7 +13,7 @@ use banto_hub_core::{
     hub::CollectorManager,
     write_audit::WriteAuditService,
     write_control::WriteControl,
-    write_path::{execute_write, RequestedValue, WriteDeps, WriteRejection},
+    write_path::{execute_write, RequestedValue, WriteDeps, WriteMeta, WriteRejection},
     write_rate::{WriteRateLimitConfig, WriteRateLimiter},
 };
 
@@ -235,9 +235,11 @@ async fn run(mode: Mode) {
             &deps,
             &ctx,
             "line.slow.bit",
-            Some(RequestedValue::Bool(true))
+            Some(RequestedValue::Bool(true)),
+            &WriteMeta::default()
         )
-        .await,
+        .await
+        .result,
         Err(WriteRejection::WritesDisabled)
     ));
     assert!(
@@ -251,9 +253,11 @@ async fn run(mode: Mode) {
             &deps,
             &ctx,
             "line.slow.bit",
-            Some(RequestedValue::Bool(true))
+            Some(RequestedValue::Bool(true)),
+            &WriteMeta::default()
         )
-        .await,
+        .await
+        .result,
         Err(WriteRejection::AuditWriteFailed)
     ));
     assert!(
@@ -264,12 +268,18 @@ async fn run(mode: Mode) {
         .execute(&pool)
         .await
         .unwrap();
-    let write = execute_write(
-        &deps,
-        &ctx,
-        "line.slow.bit",
-        Some(RequestedValue::Bool(true)),
-    );
+    let meta = WriteMeta::default();
+    let write = async {
+        execute_write(
+            &deps,
+            &ctx,
+            "line.slow.bit",
+            Some(RequestedValue::Bool(true)),
+            &meta,
+        )
+        .await
+        .result
+    };
     tokio::pin!(write);
     let first = tokio::select! { biased; result = &mut write => panic!("write returned before RMW response: {result:?}"), frame = wire_rx.recv() => frame.unwrap() };
     assert_eq!(first.0[1], b'R');
@@ -616,8 +626,10 @@ async fn fc22_hint_run() {
         &ctx,
         "line.slow.bit",
         Some(RequestedValue::Bool(true)),
+        &WriteMeta::default(),
     )
-    .await;
+    .await
+    .result;
     let Err(WriteRejection::WriteFailed(message)) = single else {
         panic!("{single:?}");
     };

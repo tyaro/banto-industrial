@@ -1147,6 +1147,8 @@ async fn write_value_happy_path_reaches_the_simulator() {
             WriteValueRequest {
                 tag: external_name,
                 value: Some(write_value_request::Value::Num(1234.0)),
+                correlation_id: Some("job-1:a".to_string()),
+                on_behalf_of: Some("山田".to_string()),
             },
             &key,
         ))
@@ -1154,6 +1156,9 @@ async fn write_value_happy_path_reaches_the_simulator() {
         .expect("write_value should succeed")
         .into_inner();
     assert_eq!(response.result, "ok");
+    // #1201: 成功には監査の行の id と、受けた correlation_id が返る。
+    assert!(response.audit_id > 0);
+    assert_eq!(response.correlation_id.as_deref(), Some("job-1:a"));
 
     assert!(
         wait_until(Duration::from_secs(10), || async {
@@ -1197,6 +1202,7 @@ async fn write_value_not_writable_is_permission_denied() {
             WriteValueRequest {
                 tag: external_name,
                 value: Some(write_value_request::Value::Num(1.0)),
+                ..Default::default()
             },
             &key,
         ))
@@ -1261,6 +1267,7 @@ async fn write_value_writes_disabled_is_failed_precondition_and_audited() {
             WriteValueRequest {
                 tag: external_name,
                 value: Some(write_value_request::Value::Num(1.0)),
+                ..Default::default()
             },
             &key,
         ))
@@ -1314,6 +1321,7 @@ async fn write_value_without_write_scope_is_permission_denied() {
             WriteValueRequest {
                 tag: external_name,
                 value: Some(write_value_request::Value::Num(1.0)),
+                ..Default::default()
             },
             &key,
         ))
@@ -1322,6 +1330,108 @@ async fn write_value_without_write_scope_is_permission_denied() {
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
 
     sim.stop();
+}
+
+/// #1201: write スコープの無い鍵の拒否にも、検証済みの `correlation_id` が metadata で付く。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_value_missing_scope_rejection_carries_the_correlation_id_metadata() {
+    let app = test_app("write-no-scope-correlation").await;
+    let sim = Simulator::start().await;
+    let (_tag_id, external_name) = make_tag(
+        &app,
+        "line1",
+        sim.addr.port(),
+        "temp01",
+        "D100",
+        "u16",
+        true,
+        true,
+    )
+    .await;
+    app.write_control.enable();
+
+    let (key, _id) = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
+    let (_port, mut client) = start_grpc_and_connect(&app.grpc_server).await;
+
+    let err = client
+        .write_value(bearer_request(
+            WriteValueRequest {
+                tag: external_name,
+                value: Some(write_value_request::Value::Num(1.0)),
+                correlation_id: Some("g-403".to_string()),
+                on_behalf_of: None,
+            },
+            &key,
+        ))
+        .await
+        .expect_err("a read-only key should not be able to write");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert_eq!(err.message(), "missing_write_scope");
+    assert_eq!(
+        err.metadata()
+            .get("correlation-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("g-403")
+    );
+
+    sim.stop();
+}
+
+/// #1201: 送った後の失敗には metadata `audit-id` と `correlation-id` が付く。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_value_failure_after_sending_carries_audit_id_and_correlation_id_metadata() {
+    let app = test_app("write-failed-metadata").await;
+    let closed_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let (_tag_id, external_name) = make_tag(
+        &app,
+        "line1",
+        closed_port,
+        "temp01",
+        "D100",
+        "u16",
+        true,
+        true,
+    )
+    .await;
+    app.write_control.enable();
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &["write:line1.fast.temp01"],
+    )
+    .await;
+    let (_port, mut client) = start_grpc_and_connect(&app.grpc_server).await;
+
+    let err = client
+        .write_value(bearer_request(
+            WriteValueRequest {
+                tag: external_name,
+                value: Some(write_value_request::Value::Num(7.0)),
+                correlation_id: Some("g-fail".to_string()),
+                on_behalf_of: None,
+            },
+            &key,
+        ))
+        .await
+        .expect_err("the broker is unreachable");
+    assert_eq!(err.code(), tonic::Code::Unavailable, "{err:?}");
+    assert_eq!(
+        err.metadata()
+            .get("correlation-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("g-fail")
+    );
+    let audit_id: i64 = err
+        .metadata()
+        .get("audit-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .expect("audit-id metadata");
+    assert!(audit_id > 0);
 }
 
 // ---------------------------------------------------------------------------

@@ -57,6 +57,14 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "correlation_id": {
+            "description": "任意。突き合わせ用の ID(1〜64 文字、英数字と . _ : - のみ)。監査の行に残り、結果に返る。",
+            "type": "string"
+          },
+          "on_behalf_of": {
+            "description": "任意。名乗る操作者(1〜128 文字、制御文字不可)。自己申告で、認証された事実ではない。監査に残る。",
+            "type": "string"
+          },
           "tag": {
             "description": "外部名 {connection}.{group}.{tag}",
             "type": "string"
