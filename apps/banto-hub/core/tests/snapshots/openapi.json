@@ -1480,6 +1480,22 @@
       "WriteValueRequest": {
         "description": "`POST /api/v1/values/{tag}` の request body（設計 §5.1「body\n`{ \"v\": <number|bool> }`」、T20 ①a で文字列を追加 - docs/hub/banto-hub-t20-design.md\n§3.1）。`v` は `serde_json::Value` のまま保持し、[`parse_requested_value`]\nで数値/真偽値/文字列のみを受理する（配列・オブジェクトは 422）—\n`bool`/`number`/`string` を1つの Rust 型に素直にマップする serde 表現が\nなく、utoipa の untagged enum サポートも弱いため、検証はハンドラ内で行う。",
         "properties": {
+          "correlation_id": {
+            "description": "#1201: 呼び出し側が付ける突き合わせ用の ID(1〜64 文字、`[A-Za-z0-9._:-]`)。\n監査の行に残り、応答にそのまま返る。形が合わなければ 422 `invalid_correlation_id`。",
+            "example": "job-2026-11-18-001",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "on_behalf_of": {
+            "description": "#1201: 呼び出し側が名乗る操作者(1〜128 文字、制御文字不可、前後の空白はそのまま)。\n**自己申告で、認証された事実ではない**(監査の `operator_claim` 列に残る)。\n形が合わなければ 422 `invalid_on_behalf_of`。",
+            "example": "山田（ライン 2）",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "v": {
             "description": "書き込む工学値。数値タグには数値、bit タグには真偽値、string タグ\nには文字列（T20 ①a）。（2026-08-06〜: 型が data_type と一致しない\n場合は 422 `unsupported_value_type` - 暗黙の型変換はしない）。",
             "example": 1,
@@ -1495,6 +1511,18 @@
       "WriteValueResponse": {
         "description": "`POST /api/v1/values/{tag}` の成功応答（設計 §6 実装指示 §5「応答\n`{ \"tag\", \"result\": \"ok\" }`」）。gRPC の `WriteValueResponse`\n（`crate::grpc`）も同じ2フィールドの型付き版。",
         "properties": {
+          "audit_id": {
+            "description": "#1201: この書込みの監査の行の `id`(管理画面の書込み監査と突き合わせられる)。",
+            "format": "int64",
+            "type": "integer"
+          },
+          "correlation_id": {
+            "description": "#1201: 要求で受けた `correlation_id`(受けたときだけ)。",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "result": {
             "type": "string"
           },
@@ -1504,7 +1532,8 @@
         },
         "required": [
           "tag",
-          "result"
+          "result",
+          "audit_id"
         ],
         "type": "object"
       }
@@ -2024,7 +2053,7 @@
                 }
               }
             },
-            "description": "書き込み成功"
+            "description": "書き込み成功(`audit_id` = 監査の行の id、`correlation_id` は要求で受けたときだけ)"
           },
           "403": {
             "description": "not_writable / missing_write_scope / session_token_cannot_write / key_tripped"
@@ -2036,7 +2065,7 @@
             "description": "tag_disabled"
           },
           "422": {
-            "description": "unsupported_value_type / value_out_of_range"
+            "description": "unsupported_value_type / value_out_of_range / invalid_correlation_id / invalid_on_behalf_of(後ろ 2 つは監査に残さず、PLC へも送らない)"
           },
           "429": {
             "description": "rate_limited"
@@ -2045,7 +2074,7 @@
             "description": "write_unsupported_protocol"
           },
           "502": {
-            "description": "write_failed"
+            "description": "write_failed(監査の行を作った後の失敗なので、本文に `audit_id` が付く)"
           },
           "503": {
             "description": "writes_disabled / collection_not_running"

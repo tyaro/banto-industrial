@@ -2,7 +2,10 @@
 
 banto-industrial のリリースノート。日付は JST。バージョンは [SemVer](https://semver.org/lang/ja/) 準拠（`publish = false` のワークスペースで、タグはリポジトリ状態の目印）。
 
-## 未リリース
+## v0.3.0-alpha.3 — 2026-11-18（アルファ）
+
+- **Hub の単票の書込みに、呼び出し側の突き合わせ用の `correlation_id` と、名乗る操作者の `on_behalf_of` を足しました（#1201 PR1、#1177 の契約の 1・2）。** REST `POST /api/v1/values/{tag}`・gRPC `WriteValue`・MCP `write_tag_value` で共通です。`correlation_id` は 1〜64 文字の `[A-Za-z0-9._:-]`、`on_behalf_of` は 1〜128 文字で制御文字不可（前後の空白はそのまま）。形が合わなければ 422 `invalid_correlation_id` / `invalid_on_behalf_of`（gRPC は `INVALID_ARGUMENT`）で、監査に残さず PLC へも送りません。空文字列は不正です。監査表 `hub_write_audit` に `correlation_id`・`operator_claim` の 2 列を足しました（migration `0111`、NULL 可）。`operator_claim` は**自己申告**で、認証された主体ではありません。定義上の拒否（`rejected`）の集約行には窓の最初の要求の値だけが残ります。バッチ書込みはこの 2 列が NULL のままです。
+- **書込みの成功応答に `audit_id`（監査の行の id）と、受けたときだけ `correlation_id` を足しました。** gRPC は `WriteValueResponse` の `audit_id`・`correlation_id`、MCP は結果の JSON です。PLC へ送った後の失敗（502 `write_failed` など）は、REST のエラー本文・MCP のエラー本文に `audit_id`（と受けていれば `correlation_id`）が付き、gRPC は Status の metadata `audit-id`・`correlation-id` に載ります。送る前の拒否には `audit_id` は付きません。
 
 - **Hub の接続名・収集グループ名に `.` を使えなくしました（2026-11-12 オーナー決定、#635 の続き）。** 外部名 `接続.グループ.タグ` を最初の 2 つの `.` で一意に分けられるようにするためです（タグ名の `.` は引き続き使えます）。作成と `.` を含む名前への改名は、REST・未適用キューの適用・MCP・画面のどれも `name` の入力エラーで断ります。**既存の DB の `.` を含む名前はそのまま動き**、起動・一覧は拒否せず、名前を変えない更新（他の項目の編集）も通ります。設定パッケージの取り込みは、新しく作る接続・グループの名前に `.` があると名前を示して書き込む前に断ります。`banto-tags` の規則なので ChronoGazer の接続・グループにも同じく当たります。
 - ChronoGazer の画面名を「タグ設定」→「記録」、「グループ設定」→「表示グループ」に改めた（#1179 PR4a、2026-11-17 オーナー決定）。URL（`/tags`・`/groups`）と API は変えていない。

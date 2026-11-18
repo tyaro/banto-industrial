@@ -53,6 +53,17 @@ pub(super) struct WriteValueRequest {
     /// 場合は 422 `unsupported_value_type` - 暗黙の型変換はしない）。
     #[schema(value_type = f64, example = 1)]
     v: serde_json::Value,
+    /// #1201: 呼び出し側が付ける突き合わせ用の ID(1〜64 文字、`[A-Za-z0-9._:-]`)。
+    /// 監査の行に残り、応答にそのまま返る。形が合わなければ 422 `invalid_correlation_id`。
+    #[serde(default)]
+    #[schema(example = "job-2026-11-18-001")]
+    correlation_id: Option<String>,
+    /// #1201: 呼び出し側が名乗る操作者(1〜128 文字、制御文字不可、前後の空白はそのまま)。
+    /// **自己申告で、認証された事実ではない**(監査の `operator_claim` 列に残る)。
+    /// 形が合わなければ 422 `invalid_on_behalf_of`。
+    #[serde(default)]
+    #[schema(example = "山田（ライン 2）")]
+    on_behalf_of: Option<String>,
 }
 
 /// `POST /api/v1/values/{tag}` の成功応答（設計 §6 実装指示 §5「応答
@@ -62,6 +73,11 @@ pub(super) struct WriteValueRequest {
 pub(super) struct WriteValueResponse {
     tag: String,
     result: String,
+    /// #1201: この書込みの監査の行の `id`(管理画面の書込み監査と突き合わせられる)。
+    audit_id: i64,
+    /// #1201: 要求で受けた `correlation_id`(受けたときだけ)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    correlation_id: Option<String>,
 }
 
 /// リクエスト body の `v` を [`crate::write_path::RequestedValue`] に正規化
@@ -98,7 +114,15 @@ pub(crate) fn parse_requested_value(
 /// 情報）から機械的に HTTP ステータスを割り当てる - 対応表は
 /// `crate::write_path::WriteRejection` の doc comment に列挙したものと一致
 /// させる。
-fn write_rejection_response(tag: String, rejection: crate::write_path::WriteRejection) -> Response {
+///
+/// #1201: `audit_id`(監査の行を作った後の失敗だけ `Some`)と、受けていれば
+/// `correlation_id` をエラー本文へ足す。
+fn write_rejection_response(
+    tag: String,
+    rejection: crate::write_path::WriteRejection,
+    audit_id: Option<i64>,
+    correlation_id: Option<&str>,
+) -> Response {
     use crate::write_path::WriteRejection;
 
     if matches!(rejection, WriteRejection::NotFound) {
@@ -118,6 +142,8 @@ fn write_rejection_response(tag: String, rejection: crate::write_path::WriteReje
         WriteRejection::WritesDisabled => StatusCode::SERVICE_UNAVAILABLE,
         WriteRejection::RateLimited => StatusCode::TOO_MANY_REQUESTS,
         WriteRejection::UnsupportedValueType(_)
+        | WriteRejection::InvalidCorrelationId
+        | WriteRejection::InvalidOnBehalfOf
         | WriteRejection::ValueOutOfRange(_)
         | WriteRejection::InvalidAddress(_) => StatusCode::UNPROCESSABLE_ENTITY,
         WriteRejection::WriteFailed(_) => StatusCode::BAD_GATEWAY,
@@ -146,7 +172,16 @@ fn write_rejection_response(tag: String, rejection: crate::write_path::WriteReje
             )
         }
     };
-    (status, Json(rejection.to_json())).into_response()
+    let mut body = rejection.to_json();
+    if let Some(map) = body.as_object_mut() {
+        if let Some(id) = audit_id {
+            map.insert("audit_id".to_string(), serde_json::json!(id));
+        }
+        if let Some(id) = correlation_id {
+            map.insert("correlation_id".to_string(), serde_json::json!(id));
+        }
+    }
+    (status, Json(body)).into_response()
 }
 
 /// [`v1_write_value`] とその周辺(レート制限・受付・監査)が必要とする状態
@@ -202,14 +237,14 @@ pub(super) struct WriteState {
     params(("tag" = String, Path, description = "外部名 {connection}.{group}.{tag}")),
     request_body = WriteValueRequest,
     responses(
-        (status = 200, description = "書き込み成功", body = WriteValueResponse),
+        (status = 200, description = "書き込み成功(`audit_id` = 監査の行の id、`correlation_id` は要求で受けたときだけ)", body = WriteValueResponse),
         (status = 403, description = "not_writable / missing_write_scope / session_token_cannot_write / key_tripped"),
         (status = 404, description = "catalog に存在しない外部名"),
         (status = 409, description = "tag_disabled"),
-        (status = 422, description = "unsupported_value_type / value_out_of_range"),
+        (status = 422, description = "unsupported_value_type / value_out_of_range / invalid_correlation_id / invalid_on_behalf_of(後ろ 2 つは監査に残さず、PLC へも送らない)"),
         (status = 429, description = "rate_limited"),
         (status = 501, description = "write_unsupported_protocol"),
-        (status = 502, description = "write_failed"),
+        (status = 502, description = "write_failed(監査の行を作った後の失敗なので、本文に `audit_id` が付く)"),
         (status = 503, description = "writes_disabled / collection_not_running"),
     ),
     tag = "tag-space",
@@ -226,6 +261,11 @@ pub(super) async fn v1_write_value(
     let Some(Extension(ctx)) = ctx else {
         return session_token_cannot_write_response();
     };
+    // #1201: 自己申告の 2 つの形を入口で検証する(不正なら 422、監査に残さない)。
+    let meta = match crate::write_path::WriteMeta::parse(body.correlation_id, body.on_behalf_of) {
+        Ok(meta) => meta,
+        Err(rejection) => return write_rejection_response(tag, rejection, None, None),
+    };
     // 事前段(b): write:{tag} スコープの完全一致(read スコープでは書けない)。
     if !ctx.has_write_scope(&tag) {
         // #711: スコープ外の拒否も書込み監査に残す。
@@ -234,6 +274,7 @@ pub(super) async fn v1_write_value(
             &state.write_audit,
             &ctx,
             &tag,
+            &meta,
         );
         return missing_write_scope_response();
     }
@@ -249,13 +290,19 @@ pub(super) async fn v1_write_value(
         events: &state.events,
     };
 
-    match crate::write_path::execute_write(&deps, &ctx, &tag, requested).await {
+    let outcome = crate::write_path::execute_write(&deps, &ctx, &tag, requested, &meta).await;
+    match outcome.result {
         Ok(ok) => Json(WriteValueResponse {
             tag: ok.tag,
             result: "ok".to_string(),
+            // 成功は必ず log-before-write の行を作っている。
+            audit_id: outcome.audit_id.unwrap_or_default(),
+            correlation_id: meta.correlation_id().map(str::to_string),
         })
         .into_response(),
-        Err(rejection) => write_rejection_response(tag, rejection),
+        Err(rejection) => {
+            write_rejection_response(tag, rejection, outcome.audit_id, meta.correlation_id())
+        }
     }
 }
 

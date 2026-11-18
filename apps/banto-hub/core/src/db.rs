@@ -52,6 +52,9 @@
 //! - `0110_hub_clock_sync.sql`（H2、tyaro/banto-industrial#1053、2026-11-07）は、
 //!   PLC の時計合わせの接続ごとの設定（`enabled`・時刻表）の表 `hub_clock_sync`
 //!   を足したもの（新しい表だけ。既存の表は変えない。`crate::clock_sync`）。
+//! - `0111_hub_write_audit_correlation.sql`（#1201、2026-11-18）は、`hub_write_audit` に
+//!   `correlation_id`・`operator_claim` を足したもの（`ADD COLUMN`。CHECK を変えない
+//!   ので表は作り直さない。テスト `an_existing_audit_row_survives_the_0111_columns`）。
 //!
 //! ## なぜ `sqlx::migrate!` に戻せたか
 //!
@@ -432,7 +435,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             versions,
-            vec![2, 3, 4, 5, 7, 8, 10, 12, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110]
+            vec![2, 3, 4, 5, 7, 8, 10, 12, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111]
         );
     }
 
@@ -560,7 +563,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             versions,
-            vec![2, 3, 4, 5, 7, 8, 10, 12, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110]
+            vec![2, 3, 4, 5, 7, 8, 10, 12, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111]
         );
         let pending_id: Option<String> =
             sqlx::query_scalar("SELECT pending_id FROM audit_log WHERE action = 'probe'")
@@ -646,6 +649,7 @@ mod tests {
             if name_text.starts_with("0107_")
                 || name_text.starts_with("0108_")
                 || name_text.starts_with("0109_")
+                || name_text.starts_with("0111_")
             {
                 continue;
             }
@@ -746,7 +750,9 @@ mod tests {
         for entry in std::fs::read_dir(&source).unwrap() {
             let entry = entry.unwrap();
             let name = entry.file_name();
-            if name.to_string_lossy().starts_with("0109_") {
+            // 0111 は 0109 の作り直しより後に当てる(先に当てると列が写らず消える)。
+            let name_text = name.to_string_lossy();
+            if name_text.starts_with("0109_") || name_text.starts_with("0111_") {
                 continue;
             }
             std::fs::copy(entry.path(), old_set.join(&name)).unwrap();
@@ -804,6 +810,68 @@ mod tests {
             indexes,
             vec!["idx_hub_write_audit_tag", "idx_hub_write_audit_ts"]
         );
+        pool.close().await;
+    }
+
+    /// #1201: `0111` は `hub_write_audit` に `correlation_id`・`operator_claim` を
+    /// 足すだけ(`ADD COLUMN`)。0110 までを適用済みの DB が 0111 を取り、既存の行が
+    /// 残って 2 列が `NULL` になること、新しい行には値が入ることを確かめる。
+    #[tokio::test]
+    async fn an_existing_audit_row_survives_the_0111_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_set = dir.path().join("migrations-before-0111");
+        std::fs::create_dir(&old_set).unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations-sqlite");
+        for entry in std::fs::read_dir(&source).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("0111_") {
+                continue;
+            }
+            std::fs::copy(entry.path(), old_set.join(&name)).unwrap();
+        }
+
+        let db_path = dir.path().join("registry.sqlite3");
+        let pool = banto_storage::connect_sqlite(&db_path).await.unwrap();
+        let mut old = sqlx::migrate::Migrator::new(old_set.as_path())
+            .await
+            .unwrap();
+        old.dangerous_set_table_name(MIGRATIONS_TABLE);
+        old.run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO hub_write_audit (api_key_id, api_key_name_snapshot, tag_id, \
+             external_name_snapshot, action, result) VALUES (1, 'k', 10, 'line.t', 'write', 'ok')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let pool = init_db(&db_path)
+            .await
+            .expect("an existing DB must take 0111 on the next startup");
+        let old_row: (i64, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT id, correlation_id, operator_claim FROM hub_write_audit WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(old_row, (1, None, None));
+        sqlx::query(
+            "INSERT INTO hub_write_audit (api_key_id, api_key_name_snapshot, tag_id, \
+             external_name_snapshot, action, result, correlation_id, operator_claim) \
+             VALUES (1, 'k', 10, 'line.t', 'write', 'ok', 'c-1', '山田')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let new_row: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT correlation_id, operator_claim FROM hub_write_audit WHERE id = 2",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(new_row, (Some("c-1".to_string()), Some("山田".to_string())));
         pool.close().await;
     }
 

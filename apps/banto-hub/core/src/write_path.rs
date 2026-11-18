@@ -199,7 +199,7 @@ use crate::computed::upsert_retained_value;
 use crate::controller::{CollectionController, CollectionState, RunMode};
 use crate::hub::{CollectorManager, TagMap};
 use crate::write_audit::{
-    RejectingKey, WriteAuditAction, WriteAuditResult, WriteAuditRow, WriteAuditService,
+    AuditClaim, RejectingKey, WriteAuditAction, WriteAuditResult, WriteAuditRow, WriteAuditService,
     WriteRejectionReason,
 };
 use crate::write_control::WriteControl;
@@ -309,6 +309,82 @@ impl ConvertedValue {
     }
 }
 
+/// #1201: 単票の書込みの要求に付けられる自己申告の 2 つ。入口(REST・gRPC・MCP)が
+/// [`WriteMeta::parse`] で検証してから [`execute_write`] へ渡す。
+///
+/// - `correlation_id`: 呼び出し側が自分の記録と突き合わせるための ID。1〜64 文字、
+///   `[A-Za-z0-9._:-]` のみ。
+/// - `on_behalf_of`: 呼び出し側が名乗る操作者。1〜128 文字(char 数)、制御文字不可、
+///   前後の空白はそのまま(trim しない)。**自己申告で、認証された事実ではない**
+///   (認証された主体は API キー)。
+///
+/// 空文字列は「無し」ではなく不正(欄が無い・`null` のときだけ無し)。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WriteMeta {
+    correlation_id: Option<String>,
+    on_behalf_of: Option<String>,
+}
+
+/// `correlation_id` の最大文字数。
+pub const MAX_CORRELATION_ID_CHARS: usize = 64;
+/// `on_behalf_of` の最大文字数(char 数)。
+pub const MAX_ON_BEHALF_OF_CHARS: usize = 128;
+
+impl WriteMeta {
+    /// 形を検証して作る。合わなければ [`WriteRejection::InvalidCorrelationId`] /
+    /// [`WriteRejection::InvalidOnBehalfOf`](どちらも不正なら `correlation_id` を先に断る)。
+    /// 断った要求は監査に残さず、PLC へも送らない(呼び出し側がここで止める)。
+    pub fn parse(
+        correlation_id: Option<String>,
+        on_behalf_of: Option<String>,
+    ) -> Result<Self, WriteRejection> {
+        if let Some(id) = &correlation_id {
+            let len = id.chars().count();
+            let allowed = id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'));
+            if len == 0 || len > MAX_CORRELATION_ID_CHARS || !allowed {
+                return Err(WriteRejection::InvalidCorrelationId);
+            }
+        }
+        if let Some(who) = &on_behalf_of {
+            let len = who.chars().count();
+            if len == 0 || len > MAX_ON_BEHALF_OF_CHARS || who.chars().any(char::is_control) {
+                return Err(WriteRejection::InvalidOnBehalfOf);
+            }
+        }
+        Ok(Self {
+            correlation_id,
+            on_behalf_of,
+        })
+    }
+
+    pub fn correlation_id(&self) -> Option<&str> {
+        self.correlation_id.as_deref()
+    }
+
+    pub fn on_behalf_of(&self) -> Option<&str> {
+        self.on_behalf_of.as_deref()
+    }
+
+    /// 監査の行へ運ぶ形(`on_behalf_of` は列 `operator_claim` に入る)。
+    pub fn claim(&self) -> AuditClaim {
+        AuditClaim {
+            correlation_id: self.correlation_id.clone(),
+            operator_claim: self.on_behalf_of.clone(),
+        }
+    }
+}
+
+/// #1201: [`execute_write`] の結果。`audit_id` は監査の行(log-before-write の
+/// `insert_pending`)を作ったときだけ `Some` — つまり成功と、PLC へ送った後の失敗
+/// (`write_failed` など)。送る前の拒否(ゲート 1〜7・検証)と集約される `rejected` は `None`。
+#[derive(Debug, Clone, PartialEq)]
+pub struct WriteOutcome {
+    pub audit_id: Option<i64>,
+    pub result: Result<WriteOk, WriteRejection>,
+}
+
 /// 書き込み成功時の結果 - `tag` は呼び出し元がそのままエコーバックできる
 /// よう外部名を持つ(REST の `WriteValueResponse`/gRPC の
 /// `WriteValueResponse` いずれも `{ tag, result: "ok" }` 形)。
@@ -343,6 +419,12 @@ pub enum WriteRejection {
     /// body/request の値が型として受理できない、または文字列タグ
     /// (REST: 422, gRPC: INVALID_ARGUMENT)。
     UnsupportedValueType(Option<String>),
+    /// #1201: `correlation_id` の形が不正([`WriteMeta::parse`]。REST: 422,
+    /// gRPC: INVALID_ARGUMENT)。監査に残さず、PLC へも送らない。
+    InvalidCorrelationId,
+    /// #1201: `on_behalf_of` の形が不正([`WriteMeta::parse`]。REST: 422,
+    /// gRPC: INVALID_ARGUMENT)。監査に残さず、PLC へも送らない。
+    InvalidOnBehalfOf,
     /// gate 7: 数値範囲外(REST: 422, gRPC: INVALID_ARGUMENT)。
     ValueOutOfRange(String),
     /// gate 7: catalog のアドレスが SLMP としてパースできない(防御的分岐 -
@@ -880,11 +962,17 @@ fn record_gate_rejection(
     ctx: &ApiKeyContext,
     tag: &str,
     rejection: &WriteRejection,
+    meta: &WriteMeta,
 ) {
     if let Some(reason) = gate_rejection_reason(rejection) {
         let tag_id = rejection_tag_id(&deps.manager.tag_map(), tag);
-        deps.write_audit
-            .record_rejection(rejecting_key(ctx), tag_id, tag, reason);
+        deps.write_audit.record_rejection_claimed(
+            rejecting_key(ctx),
+            tag_id,
+            tag,
+            reason,
+            &meta.claim(),
+        );
     }
 }
 
@@ -897,8 +985,16 @@ pub fn record_missing_write_scope(
     write_audit: &WriteAuditService,
     ctx: &ApiKeyContext,
     tag: &str,
+    meta: &WriteMeta,
 ) {
-    record_missing_write_scopes(manager, write_audit, ctx, &[tag]);
+    let map = manager.tag_map();
+    write_audit.record_rejection_claimed(
+        rejecting_key(ctx),
+        rejection_tag_id(&map, tag),
+        tag,
+        WriteRejectionReason::MissingWriteScope,
+        &meta.claim(),
+    );
 }
 
 /// [`record_missing_write_scope`] のバッチ版。`tag_map()` は 1 回だけ取り、拒否の表は
@@ -958,7 +1054,24 @@ pub async fn execute_write(
     ctx: &ApiKeyContext,
     tag: &str,
     requested: Option<RequestedValue>,
+    meta: &WriteMeta,
+) -> WriteOutcome {
+    let mut audit_id = None;
+    let result = execute_write_gated(deps, ctx, tag, requested, meta, &mut audit_id).await;
+    WriteOutcome { audit_id, result }
+}
+
+/// [`execute_write`] の本体。監査の行(`insert_pending`)を作ったら `audit_id` に入れる
+/// (失敗で返るときも、呼び出し側が応答へ載せられるように)。
+async fn execute_write_gated(
+    deps: &WriteDeps<'_>,
+    ctx: &ApiKeyContext,
+    tag: &str,
+    requested: Option<RequestedValue>,
+    meta: &WriteMeta,
+    audit_id_out: &mut Option<i64>,
 ) -> Result<WriteOk, WriteRejection> {
+    let claim = meta.claim();
     let collection_mode = if let Some(controller) = deps.collection_controller {
         let status = controller.status();
         let state = status.state;
@@ -973,7 +1086,7 @@ pub async fn execute_write(
     let resolved = match resolve_write_target(deps, collection_mode, tag, requested).await {
         Ok(resolved) => resolved,
         Err(rejection) => {
-            record_gate_rejection(deps, ctx, tag, &rejection);
+            record_gate_rejection(deps, ctx, tag, &rejection, meta);
             return Err(rejection);
         }
     };
@@ -994,7 +1107,8 @@ pub async fn execute_write(
             WriteAuditResult::SuppressedDisabled,
         )
         .with_value_requested_opt(resolved.requested.as_audit_value())
-        .with_value_requested_text(resolved.requested.as_audit_text());
+        .with_value_requested_text(resolved.requested.as_audit_text())
+        .with_claim(&claim);
         if let Err(err) = deps.write_audit.insert_row(&row).await {
             eprintln!("banto-hub: 書き込み監査(suppressed_disabled)の記録に失敗しました: {err}");
         }
@@ -1027,6 +1141,7 @@ pub async fn execute_write(
         )
         .with_value_requested_opt(resolved.requested.as_audit_value())
         .with_value_requested_text(resolved.requested.as_audit_text())
+        .with_claim(&claim)
         .with_detail(detail);
         if let Err(err) = deps.write_audit.insert_row(&row).await {
             eprintln!("banto-hub: 書き込み監査(rate_limit_tripped)の記録に失敗しました: {err}");
@@ -1071,7 +1186,8 @@ pub async fn execute_write(
         WriteAuditResult::Ok,
     )
     .with_value_requested_opt(converted.as_audit_value())
-    .with_value_requested_text(converted.as_audit_text());
+    .with_value_requested_text(converted.as_audit_text())
+    .with_claim(&claim);
     let audit_id = match deps.write_audit.insert_pending(&pending_row).await {
         Ok(id) => id,
         Err(err) => {
@@ -1079,6 +1195,7 @@ pub async fn execute_write(
             return Err(WriteRejection::AuditWriteFailed);
         }
     };
+    *audit_id_out = Some(audit_id);
 
     // record はゲート通過後・物理書き込み前(§6 実装指示、
     // `crate::write_rate` のモジュール doc comment 参照)。
@@ -2102,6 +2219,8 @@ impl WriteRejection {
             WriteRejection::WritesDisabled => "writes_disabled",
             WriteRejection::RateLimited => "rate_limited",
             WriteRejection::UnsupportedValueType(_) => "unsupported_value_type",
+            WriteRejection::InvalidCorrelationId => "invalid_correlation_id",
+            WriteRejection::InvalidOnBehalfOf => "invalid_on_behalf_of",
             WriteRejection::ValueOutOfRange(_) => "value_out_of_range",
             WriteRejection::InvalidAddress(_) => "invalid_address",
             WriteRejection::WriteFailed(_) => "write_failed",
@@ -2116,6 +2235,12 @@ impl WriteRejection {
     pub fn detail(&self) -> Option<String> {
         match self {
             WriteRejection::UnsupportedValueType(detail) => detail.clone(),
+            WriteRejection::InvalidCorrelationId => Some(format!(
+                "correlation_id は 1〜{MAX_CORRELATION_ID_CHARS} 文字の英数字と . _ : - だけにしてください"
+            )),
+            WriteRejection::InvalidOnBehalfOf => Some(format!(
+                "on_behalf_of は 1〜{MAX_ON_BEHALF_OF_CHARS} 文字で、制御文字を含めないでください"
+            )),
             WriteRejection::ValueOutOfRange(detail)
             | WriteRejection::InvalidAddress(detail)
             | WriteRejection::WriteFailed(detail)
@@ -2148,6 +2273,79 @@ impl WriteRejection {
 mod tests {
     use super::*;
     use crate::controller::CollectionState;
+
+    /// #1201: `correlation_id` は 1〜64 文字の `[A-Za-z0-9._:-]`。
+    #[test]
+    fn write_meta_correlation_id_boundaries() {
+        let ok = |s: &str| WriteMeta::parse(Some(s.to_string()), None);
+        assert!(ok("a").is_ok());
+        assert!(ok(&"a".repeat(64)).is_ok());
+        assert!(ok("Az09._:-").is_ok());
+        assert_eq!(
+            ok(&"a".repeat(65)),
+            Err(WriteRejection::InvalidCorrelationId)
+        );
+        assert_eq!(ok(""), Err(WriteRejection::InvalidCorrelationId));
+        for bad in ["a b", "a/b", "a\n", "あ", "a,b", "a@b"] {
+            assert_eq!(
+                ok(bad),
+                Err(WriteRejection::InvalidCorrelationId),
+                "{bad:?}"
+            );
+        }
+        let meta = WriteMeta::parse(None, None).unwrap();
+        assert_eq!(meta.correlation_id(), None);
+        assert_eq!(meta.claim(), AuditClaim::default());
+    }
+
+    /// #1201: `on_behalf_of` は 1〜128 文字(char 数)、制御文字不可、trim しない。
+    #[test]
+    fn write_meta_on_behalf_of_boundaries() {
+        let parse = |s: &str| WriteMeta::parse(None, Some(s.to_string()));
+        assert!(parse("a").is_ok());
+        assert!(parse(&"a".repeat(128)).is_ok());
+        // マルチバイトは char 数で数える(バイト数ではない)。
+        assert!(parse(&"あ".repeat(128)).is_ok());
+        assert_eq!(
+            parse(&"あ".repeat(129)),
+            Err(WriteRejection::InvalidOnBehalfOf)
+        );
+        assert_eq!(
+            parse(&"a".repeat(129)),
+            Err(WriteRejection::InvalidOnBehalfOf)
+        );
+        assert_eq!(parse(""), Err(WriteRejection::InvalidOnBehalfOf));
+        for bad in ["a\nb", "a\tb", "a\u{0}b", "a\u{7f}b", "\u{85}"] {
+            assert_eq!(
+                parse(bad),
+                Err(WriteRejection::InvalidOnBehalfOf),
+                "{bad:?}"
+            );
+        }
+        // 前後の空白はそのまま、空白だけでも不正ではない。
+        let meta = parse("  山田 ").unwrap();
+        assert_eq!(meta.on_behalf_of(), Some("  山田 "));
+        assert!(parse(" ").is_ok());
+        assert_eq!(meta.claim().operator_claim.as_deref(), Some("  山田 "));
+        // 両方不正なら correlation_id を先に断る。
+        assert_eq!(
+            WriteMeta::parse(Some(String::new()), Some(String::new())),
+            Err(WriteRejection::InvalidCorrelationId)
+        );
+    }
+
+    #[test]
+    fn invalid_meta_rejections_map_to_422_codes() {
+        assert_eq!(
+            WriteRejection::InvalidCorrelationId.rest_error_code(),
+            "invalid_correlation_id"
+        );
+        assert_eq!(
+            WriteRejection::InvalidOnBehalfOf.rest_error_code(),
+            "invalid_on_behalf_of"
+        );
+        assert!(WriteRejection::InvalidCorrelationId.detail().is_some());
+    }
 
     #[test]
     fn collection_not_running_uses_shared_rest_mapping() {

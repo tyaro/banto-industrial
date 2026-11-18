@@ -1147,6 +1147,8 @@ async fn write_value_happy_path_reaches_the_simulator() {
             WriteValueRequest {
                 tag: external_name,
                 value: Some(write_value_request::Value::Num(1234.0)),
+                correlation_id: Some("job-1:a".to_string()),
+                on_behalf_of: Some("山田".to_string()),
             },
             &key,
         ))
@@ -1154,6 +1156,9 @@ async fn write_value_happy_path_reaches_the_simulator() {
         .expect("write_value should succeed")
         .into_inner();
     assert_eq!(response.result, "ok");
+    // #1201: 成功には監査の行の id と、受けた correlation_id が返る。
+    assert!(response.audit_id > 0);
+    assert_eq!(response.correlation_id.as_deref(), Some("job-1:a"));
 
     assert!(
         wait_until(Duration::from_secs(10), || async {
@@ -1197,6 +1202,7 @@ async fn write_value_not_writable_is_permission_denied() {
             WriteValueRequest {
                 tag: external_name,
                 value: Some(write_value_request::Value::Num(1.0)),
+                ..Default::default()
             },
             &key,
         ))
@@ -1261,6 +1267,7 @@ async fn write_value_writes_disabled_is_failed_precondition_and_audited() {
             WriteValueRequest {
                 tag: external_name,
                 value: Some(write_value_request::Value::Num(1.0)),
+                ..Default::default()
             },
             &key,
         ))
@@ -1314,6 +1321,7 @@ async fn write_value_without_write_scope_is_permission_denied() {
             WriteValueRequest {
                 tag: external_name,
                 value: Some(write_value_request::Value::Num(1.0)),
+                ..Default::default()
             },
             &key,
         ))

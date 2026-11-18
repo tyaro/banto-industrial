@@ -1373,6 +1373,83 @@ async fn write_before_lockdown_success_lands_on_the_wire_through_execute_write()
     sim.stop();
 }
 
+/// #1201: `write_tag_value` の結果に監査の行の `audit_id` と受けた `correlation_id` が付き、
+/// 形が不正な申告は監査に残さず・書かずに断る。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_tag_value_returns_audit_id_and_rejects_a_bad_correlation_id() {
+    let app = test_app("write-correlation").await;
+    let sim = Simulator::start().await;
+    let (_tag_id, external_name) = make_tag(
+        &app,
+        "line1",
+        sim.addr.port(),
+        "temp01",
+        "D100",
+        "u16",
+        true,
+        true,
+    )
+    .await;
+    app.write_control.enable();
+    let key = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &["write:line1.fast.temp01"],
+    )
+    .await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call(
+            "write_tag_value",
+            json!({
+                "tag": external_name,
+                "value": 11,
+                "correlation_id": "mcp-1",
+                "on_behalf_of": "山田",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let result: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(result["correlation_id"], "mcp-1");
+    let audit_id = result["audit_id"].as_i64().expect("audit_id");
+    let claims: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT correlation_id, operator_claim FROM hub_write_audit WHERE id = ?")
+            .bind(audit_id)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        claims,
+        (Some("mcp-1".to_string()), Some("山田".to_string()))
+    );
+
+    let rows_before = write_audit_row_count(&app).await;
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call(
+            "write_tag_value",
+            json!({ "tag": external_name, "value": 12, "correlation_id": "bad id" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("invalid_correlation_id"), "{text}");
+    assert_eq!(write_audit_row_count(&app).await, rows_before);
+    assert_eq!(sim.get_word(SlmpDevice::D, 100), 11, "nothing was sent");
+
+    sim.stop();
+}
+
 /// T20 ①a (docs/hub/banto-hub-t20-design.md §3.1): `write_tag_value` は文字列
 /// タグへの書き込みでも(数値と同様に)`execute_write`をそのまま通り、
 /// シミュレータのワイヤへ UTF-8 バイト列が届く。MCP がゲートを独自実装

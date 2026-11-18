@@ -271,7 +271,14 @@ fn to_proto_value_batch(
 ///
 /// message は常に `"{rest_error_code}: {detail}"`(detail が無ければ
 /// `rest_error_code` のみ)- 設計「detail 文字列でコード名を併記」の実現。
-fn write_rejection_status(rejection: WriteRejection) -> Status {
+///
+/// #1201: `audit_id`(監査の行を作った後の失敗だけ `Some`)は metadata `audit-id`、
+/// 受けていれば `correlation_id` は metadata `correlation-id` に載せる。
+fn write_rejection_status(
+    rejection: WriteRejection,
+    audit_id: Option<i64>,
+    correlation_id: Option<&str>,
+) -> Status {
     let code = match &rejection {
         WriteRejection::CollectionNotRunning(_) => tonic::Code::Unavailable,
         WriteRejection::NotFound => tonic::Code::NotFound,
@@ -281,6 +288,8 @@ fn write_rejection_status(rejection: WriteRejection) -> Status {
         WriteRejection::WritesDisabled => tonic::Code::FailedPrecondition,
         WriteRejection::RateLimited => tonic::Code::ResourceExhausted,
         WriteRejection::UnsupportedValueType(_)
+        | WriteRejection::InvalidCorrelationId
+        | WriteRejection::InvalidOnBehalfOf
         | WriteRejection::ValueOutOfRange(_)
         | WriteRejection::InvalidAddress(_) => tonic::Code::InvalidArgument,
         WriteRejection::WriteFailed(_) => tonic::Code::Unavailable,
@@ -305,7 +314,17 @@ fn write_rejection_status(rejection: WriteRejection) -> Status {
         Some(detail) => format!("{rest_code}: {detail}"),
         None => rest_code.to_string(),
     };
-    Status::new(code, message)
+    let mut status = Status::new(code, message);
+    if let Some(id) = audit_id {
+        if let Ok(value) = id.to_string().parse() {
+            status.metadata_mut().insert("audit-id", value);
+        }
+    }
+    // metadata の値は ASCII のみ。`correlation_id` は検証済みで必ず ASCII。
+    if let Some(Ok(value)) = correlation_id.map(str::parse) {
+        status.metadata_mut().insert("correlation-id", value);
+    }
+    status
 }
 
 // --- 認証 ---------------------------------------------------------------------
@@ -920,6 +939,12 @@ impl TagServiceTrait for GrpcService {
         let ctx = self.authenticate(&request, RequireScope::None).await?;
         let req = request.into_inner();
 
+        // #1201: 自己申告の 2 つの形を入口で検証する(不正なら INVALID_ARGUMENT、
+        // 監査に残さない)。proto3 の `optional string` なので、欄が無いときだけ無し。
+        let meta =
+            write_path::WriteMeta::parse(req.correlation_id.clone(), req.on_behalf_of.clone())
+                .map_err(|rejection| write_rejection_status(rejection, None, None))?;
+
         // REST の事前段(b)と同じ規律: write:{tag} の完全一致(設計「write
         // scope 完全一致」)。
         if !ctx.has_write_scope(&req.tag) {
@@ -929,6 +954,7 @@ impl TagServiceTrait for GrpcService {
                 &self.write_audit,
                 &ctx,
                 &req.tag,
+                &meta,
             );
             return Err(Status::permission_denied("missing_write_scope"));
         }
@@ -954,12 +980,20 @@ impl TagServiceTrait for GrpcService {
             events: &self.events,
         };
 
-        match write_path::execute_write(&deps, &ctx, &req.tag, requested).await {
+        let outcome = write_path::execute_write(&deps, &ctx, &req.tag, requested, &meta).await;
+        match outcome.result {
             Ok(ok) => Ok(Response::new(WriteValueResponse {
                 tag: ok.tag,
                 result: "ok".to_string(),
+                // 成功は必ず log-before-write の行を作っている。
+                audit_id: outcome.audit_id.unwrap_or_default(),
+                correlation_id: meta.correlation_id().map(str::to_string),
             })),
-            Err(rejection) => Err(write_rejection_status(rejection)),
+            Err(rejection) => Err(write_rejection_status(
+                rejection,
+                outcome.audit_id,
+                meta.correlation_id(),
+            )),
         }
     }
 }
@@ -1418,9 +1452,11 @@ mod tests {
 
     #[test]
     fn stopped_collection_rejection_maps_to_unavailable() {
-        let status = write_rejection_status(WriteRejection::CollectionNotRunning(
-            CollectionState::Stopped,
-        ));
+        let status = write_rejection_status(
+            WriteRejection::CollectionNotRunning(CollectionState::Stopped),
+            None,
+            None,
+        );
         assert_eq!(status.code(), tonic::Code::Unavailable);
         assert!(status.message().contains("collection_not_running"));
     }

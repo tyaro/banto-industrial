@@ -177,15 +177,26 @@ message Event {
 // `tag`: 外部名。`value`: 工学値(`num`)、または bit タグ向けの真偽値
 // (`flag` - REST の `bool` → 1.0/0.0 正規化と同じ扱い、設計「external_name +
 // oneof value(num|bool)」)。
+//
+// #1201: `correlation_id`(1〜64 文字、`[A-Za-z0-9._:-]`。監査の行に残り、応答に返る)と
+// `on_behalf_of`(1〜128 文字、制御文字不可。**自己申告の操作者**で、認証された事実では
+// ない)は任意。欄が無いときだけ「無し」で、空文字列は不正(INVALID_ARGUMENT)。
 message WriteValueRequest {
   string tag = 1;
   oneof value {
     double num = 2;
     bool flag = 3;
   }
+  optional string correlation_id = 4;
+  optional string on_behalf_of = 5;
 }
 
+// `audit_id` は書込み監査の行の id。`correlation_id` は要求で受けたときだけ。
+// 失敗で監査の行を作った後(PLC へ送った後の UNAVAILABLE など)は、Status の metadata
+// `audit-id`・`correlation-id` に載る。
 message WriteValueResponse {
   string tag = 1;
   string result = 2;
+  int64 audit_id = 3;
+  optional string correlation_id = 4;
 }
