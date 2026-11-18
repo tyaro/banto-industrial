@@ -11,11 +11,15 @@
 //! ## スキーマの出所（DB スキーマの整理、2026-10-02 オーナー決定）
 //!
 //! この app 自身のテーブルは banto の admin-template と**同じ形**にする。
-//! `migrations-sqlite/` の `0002`〜`0008` の 6 本は、当面
+//! `migrations-sqlite/` の `0002`〜`0008`・`0010`・`0012` の 8 本は、当面
 //! `banto apps/admin-template/core/migrations-sqlite/<同じファイル名>`
 //! を **byte 等価**でコピーしたもの（`0002`〜`0007` は v2.1.1、`0008` は
 //! v6.5.0 = 監査の保留の `audit_log.pending_id`、banto ADR-0019。ChronoGazer は
 //! まだ保留を有効にしていないが、banto-hub と同じ集合に揃えておく - #437。
+//! `0012` は v7.4.0 = users の楽観ロック `users.version`（banto#651）。上流の
+//! `0009`・`0011`（items の索引・version）はこの app が items を使わないので写さない。
+//! `0010` = 監査の記録単位の生成列（上流の監査一覧が recordResource/recordId で絞れる列。
+//! 無いとその指定で SQL エラーになるので写す）。
 //! banto 側には手を入れない。番号の飛び - `0001_items`・`0006_attachments` が
 //! 無い - は上流の番号をそのまま残しているため）。`0008` は `0101`・`0102` を
 //! 適用済みの既存 DB には「若い番号が後から来る」形になるが、`sqlx` 0.9 の
@@ -412,7 +416,7 @@ mod tests {
     }
 
     /// スキーマ整理（2026-10-02）: 記録テーブルは migrator ごとに分かれ、共有の `_sqlx_migrations`
-    /// は作られない。この app の分は上流 admin-template の 6 本 + この app 固有。
+    /// は作られない。この app の分は上流 admin-template の 8 本 + この app 固有。
     #[tokio::test]
     async fn migrations_are_recorded_in_per_migrator_tables() {
         let pool = init_db_memory().await.unwrap();
@@ -436,9 +440,9 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        // 2〜8 は admin-template のコピー、101 からはこの app 固有（#393 の表示グループ、
+        // 2〜12 は admin-template のコピー（9・11 は除く）、101 からはこの app 固有（#393 の表示グループ、
         // #532 の記録計の側のタグごとの設定、#1161 PR4 の API キー）。
-        assert_eq!(versions, vec![2, 3, 4, 5, 7, 8, 101, 102, 103]);
+        assert_eq!(versions, vec![2, 3, 4, 5, 7, 8, 10, 12, 101, 102, 103]);
         let has_auth_epoch: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'auth_epoch'",
         )
@@ -517,7 +521,7 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(versions, vec![2, 3, 4, 5, 7, 8, 101, 102, 103]);
+        assert_eq!(versions, vec![2, 3, 4, 5, 7, 8, 10, 12, 101, 102, 103]);
         let after: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pragma_table_info('audit_log') WHERE name = 'pending_id'",
         )
@@ -525,6 +529,56 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(after, 1);
+        pool.close().await;
+    }
+
+    /// banto v7.4.0 の `0012_users_version.sql`（users の楽観ロック、banto#651）は、
+    /// 既存 DB には次の起動で入り、既存の行は version 1 から始まる。0010・0012 を除いた
+    /// 集合で作った DB に users の行を入れ、今の集合で起動し直して確かめる。
+    #[tokio::test]
+    async fn an_existing_db_without_0010_and_0012_gets_them_on_the_next_startup() {
+        let dir = crate::test_support::TempDir::new();
+        let old_set = dir.path().join("migrations-before-0010-0012");
+        std::fs::create_dir(&old_set).unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations-sqlite");
+        for entry in std::fs::read_dir(&source).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("0010_")
+                || name.to_string_lossy().starts_with("0012_")
+            {
+                continue;
+            }
+            std::fs::copy(entry.path(), old_set.join(&name)).unwrap();
+        }
+
+        let db_path = dir.path().join("chronogazer.sqlite3");
+        let pool = banto_storage::connect_sqlite(&db_path).await.unwrap();
+        let mut old = sqlx::migrate::Migrator::new(old_set.as_path())
+            .await
+            .unwrap();
+        old.dangerous_set_table_name(MIGRATIONS_TABLE);
+        old.run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (username, password_hash, display_name) VALUES ('probe', 'x', 'Probe')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let pool = init_db(&db_path)
+            .await
+            .expect("an existing DB must take 0010 and 0012 on the next startup");
+        let version: i64 = sqlx::query_scalar("SELECT version FROM users WHERE username = 'probe'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, 1, "an existing row starts at version 1");
+        sqlx::query("SELECT record_resource, record_id FROM audit_log")
+            .fetch_all(&pool)
+            .await
+            .expect("0010 must add the generated audit_log columns");
         pool.close().await;
     }
 
