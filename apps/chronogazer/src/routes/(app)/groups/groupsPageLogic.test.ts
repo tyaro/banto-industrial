@@ -9,6 +9,7 @@ import {
 	draftFromGroup,
 	draftProblems,
 	draftToInput,
+	fieldErrorTabs,
 	effectiveColorSlot,
 	emptyDraft,
 	isDraftDirty,
@@ -197,6 +198,42 @@ describe('サーバーの検証エラーの振り分け', () => {
 			revision: ['先に更新されました'],
 			other: ['使えない項目', '16 個まで']
 		});
+	});
+});
+
+describe('欄のエラーがあるタブ', () => {
+	it('設定の欄とペンの欄を分け、無ければどちらも false', () => {
+		expect(fieldErrorTabs(sortFieldErrors([]))).toEqual({ settings: false, pens: false });
+		expect(fieldErrorTabs(sortFieldErrors([{ field: 'name', message: 'a' }]))).toEqual({
+			settings: true,
+			pens: false
+		});
+		expect(
+			fieldErrorTabs(sortFieldErrors([{ field: 'attributes.timeWindowSec', message: 'a' }]))
+		).toEqual({ settings: true, pens: false });
+		expect(fieldErrorTabs(sortFieldErrors([{ field: 'pens[1].tagId', message: 'a' }]))).toEqual({
+			settings: false,
+			pens: true
+		});
+		expect(
+			fieldErrorTabs(
+				sortFieldErrors([
+					{ field: 'pens', message: 'a' },
+					{ field: 'kind', message: 'b' }
+				])
+			)
+		).toEqual({ settings: true, pens: true });
+	});
+
+	it('版の食い違い・その他だけならどちらでもない（それぞれ別の所に出る）', () => {
+		expect(
+			fieldErrorTabs(
+				sortFieldErrors([
+					{ field: 'expectedRevision', message: 'a' },
+					{ field: 'x', message: 'b' }
+				])
+			)
+		).toEqual({ settings: false, pens: false });
 	});
 });
 

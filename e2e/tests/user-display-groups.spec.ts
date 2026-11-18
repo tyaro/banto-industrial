@@ -1,5 +1,7 @@
 /**
  * 「表示グループ」ページ（`/groups`、#393 = #524 の段階 1）の E2E 固定。
+ * 画面は 3 ペイン（#1179 PR6a: 左の一覧・中央の「ペン」「設定」タブ・右のペン設定）。操作は
+ * `display-groups-page.ts` の helper に寄せてある。
  *
  * 固定したい受入条件:
  * 1. 表示グループを作成できる（名前・表示種別・トレンドの既定時間窓・ペン 2 本・
@@ -22,6 +24,16 @@
  * グループを先に消さないとタグを消せない（4 の拒否）ので、掃除もその順。
  */
 import { expect, test, type APIRequestContext, type Dialog, type Page } from '@playwright/test';
+import {
+	addGroupButton,
+	center as centerPane,
+	groupButton,
+	openGroupSettings,
+	openPen,
+	openPensTab,
+	openSettingsTab,
+	penPane
+} from './display-groups-page';
 
 const ADMIN_USERNAME = 'e2e-admin';
 const ADMIN_PASSWORD = 'E2eAdminPass1';
@@ -162,15 +174,7 @@ test.describe.serial('chronogazer 「表示グループ」ページ（#393）', 
 		answer = 'leave';
 	});
 
-	const editor = () => page.getByRole('region', { name: '表示グループの編集' });
-	const list = () => page.getByRole('region', { name: '表示グループの一覧' });
-	// 行の「上へ」「下へ」もグループ名を含むので、開くボタンだけに絞る。
-	const groupButton = () => list().locator('button.group-open', { hasText: GROUP_NAME });
-
-	async function openGroup(): Promise<void> {
-		await groupButton().click();
-		await expect(editor().getByLabel('名前')).toHaveValue(GROUP_NAME);
-	}
+	const center = () => centerPane(page);
 
 	test('1. 表示グループを作成できる（ペン 2 本・種別・時間窓・色、しきい値は読み取り専用）', async () => {
 		await page
@@ -180,45 +184,59 @@ test.describe.serial('chronogazer 「表示グループ」ページ（#393）', 
 		await expect(page).toHaveURL(/\/groups$/);
 		await expect(page.getByRole('heading', { level: 2, name: '表示グループ' })).toBeVisible();
 
-		await list().getByRole('button', { name: '新規グループ' }).click();
-		await editor().getByLabel('名前').fill(GROUP_NAME);
-		await editor().getByLabel('表示種別').selectOption({ label: 'トレンド' });
-		await editor().getByLabel('既定の時間窓').selectOption({ label: '30 分' });
-		await editor().getByRole('button', { name: 'ペンを追加' }).click();
-		await editor().getByRole('button', { name: 'ペンを追加' }).click();
-		await editor().getByLabel('ペン 1 のタグ').selectOption({ label: TAG_A });
-		await editor().getByLabel('ペン 2 のタグ').selectOption({ label: TAG_B });
-		await editor().getByLabel('ペン 2 の色').selectOption({ label: '色 5' });
-		await expect(editor().getByText('しきい値: しきい値なし')).toHaveCount(2);
-		await expect(editor().locator('.banto-unsaved')).toHaveText('未保存の変更があります');
+		// 追加を押すと、中央に新規作成の下書きが「設定」タブで開く（URL は ?group=new&tab=settings）。
+		await addGroupButton(page).click();
+		await expect(page).toHaveURL(/\?group=new&tab=settings$/);
+		await center().getByLabel('名前').fill(GROUP_NAME);
+		await center().getByLabel('表示種別').selectOption({ label: 'トレンド' });
+		await center().getByLabel('既定の時間窓').selectOption({ label: '30 分' });
 
-		await editor().getByRole('button', { name: '作成' }).click();
-		await expect(groupButton()).toContainText('トレンド・ペン 2 本');
-		await expect(editor().locator('.banto-unsaved')).toHaveCount(0);
+		// ペンは「ペン」タブで追加する。追加したペンの設定が右ペインに開く。
+		await openPensTab(page);
+		await center().getByRole('button', { name: 'ペンを追加' }).click();
+		await penPane(page).getByLabel('ペン 1 のタグ').selectOption({ label: TAG_A });
+		await center().getByRole('button', { name: 'ペンを追加' }).click();
+		await penPane(page).getByLabel('ペン 2 のタグ').selectOption({ label: TAG_B });
+		await penPane(page).getByLabel('ペン 2 の色').selectOption({ label: '色 5' });
+		await expect(center().getByText('しきい値: しきい値なし')).toHaveCount(2);
+		await expect(center().locator('.banto-unsaved')).toHaveText('未保存の変更があります');
+
+		await center().getByRole('button', { name: '作成', exact: true }).click();
+		await expect(groupButton(page, GROUP_NAME)).toContainText('トレンド・ペン 2 本');
+		await expect(center().locator('.banto-unsaved')).toHaveCount(0);
+		// 作ったグループが選ばれ、URL は ?group=<id> に置き換わる。
+		await expect(page).toHaveURL(/\?group=\d+$/);
 	});
 
 	test('2. 再読み込みしても作った内容のまま開ける', async () => {
 		await page.reload();
-		await openGroup();
-		await expect(editor().getByLabel('表示種別')).toHaveValue('trend');
-		await expect(editor().getByLabel('既定の時間窓')).toHaveValue('1800');
-		await expect(editor().getByLabel('ペン 1 のタグ')).toHaveValue(String(tagAId));
-		await expect(editor().getByLabel('ペン 2 のタグ').locator('option:checked')).toHaveText(TAG_B);
-		await expect(editor().getByLabel('ペン 2 の色')).toHaveValue('5');
+		await openGroupSettings(page, GROUP_NAME);
+		await expect(center().getByLabel('表示種別')).toHaveValue('trend');
+		await expect(center().getByLabel('既定の時間窓')).toHaveValue('1800');
+		await openPensTab(page);
+		const pane1 = await openPen(page, 1);
+		await expect(pane1.getByLabel('ペン 1 のタグ')).toHaveValue(String(tagAId));
+		const pane2 = await openPen(page, 2);
+		await expect(pane2.getByLabel('ペン 2 のタグ').locator('option:checked')).toHaveText(TAG_B);
+		await expect(pane2.getByLabel('ペン 2 の色')).toHaveValue('5');
 	});
 
 	test('3. 編集（種別を計器へ・ペン 2 を外す）を保存し、再読み込み後も残る', async () => {
-		await editor().getByLabel('表示種別').selectOption({ label: '計器' });
-		await expect(editor().getByLabel('既定の時間窓')).toHaveCount(0);
-		await editor().getByRole('button', { name: 'ペン 2 を外す' }).click();
-		await editor().getByRole('button', { name: '保存' }).click();
-		await expect(groupButton()).toContainText('計器・ペン 1 本');
+		await openSettingsTab(page);
+		await center().getByLabel('表示種別').selectOption({ label: '計器' });
+		await expect(center().getByLabel('既定の時間窓')).toHaveCount(0);
+		await openPensTab(page);
+		await center().getByRole('button', { name: 'ペン 2 を外す' }).click();
+		await center().getByRole('button', { name: '保存', exact: true }).click();
+		await expect(groupButton(page, GROUP_NAME)).toContainText('計器・ペン 1 本');
 
 		await page.reload();
-		await openGroup();
-		await expect(editor().getByLabel('表示種別')).toHaveValue('gauge');
-		await expect(editor().getByLabel('ペン 1 のタグ')).toHaveValue(String(tagAId));
-		await expect(editor().getByLabel('ペン 2 のタグ')).toHaveCount(0);
+		await openGroupSettings(page, GROUP_NAME);
+		await expect(center().getByLabel('表示種別')).toHaveValue('gauge');
+		await openPensTab(page);
+		const pane1 = await openPen(page, 1);
+		await expect(pane1.getByLabel('ペン 1 のタグ')).toHaveValue(String(tagAId));
+		await expect(page.getByTestId('display-group-pen-2')).toHaveCount(0);
 	});
 
 	test('4. ペンに割り当てたタグは削除できず、参照元のグループ名が理由に出る', async () => {
@@ -237,29 +255,50 @@ test.describe.serial('chronogazer 「表示グループ」ページ（#393）', 
 
 	test('5. 編集中に別の画面へ移ると確認が出て、「留まる」で入力が残る', async () => {
 		answer = 'stay';
-		await editor().getByLabel('名前').fill(`${GROUP_NAME}-未保存`);
+		await openSettingsTab(page);
+		await center().getByLabel('名前').fill(`${GROUP_NAME}-未保存`);
 		await page.locator('aside nav').getByRole('link', { name: /監視/ }).click();
 		await expect.poll(() => dialogs).toEqual([CONFIRM_MESSAGE]);
-		await expect(page).toHaveURL(/\/groups$/);
-		await expect(editor().getByLabel('名前')).toHaveValue(`${GROUP_NAME}-未保存`);
+		await expect(page).toHaveURL(/\/groups\?group=\d+&tab=settings$/);
+		await expect(center().getByLabel('名前')).toHaveValue(`${GROUP_NAME}-未保存`);
 
-		await editor().getByRole('button', { name: '変更を取り消す' }).click();
-		await expect(editor().getByLabel('名前')).toHaveValue(GROUP_NAME);
-		await expect(editor().locator('.banto-unsaved')).toHaveCount(0);
+		await center().getByRole('button', { name: '変更を取り消す' }).click();
+		await expect(center().getByLabel('名前')).toHaveValue(GROUP_NAME);
+		await expect(center().locator('.banto-unsaved')).toHaveCount(0);
 	});
 
 	test('6. 削除すると一覧から消え、再読み込みしても戻らない。外したタグは消せる', async () => {
 		answer = 'leave';
-		await editor().getByRole('button', { name: '削除' }).click();
-		await expect(groupButton()).toHaveCount(0);
+		await openSettingsTab(page);
+		await center().getByRole('button', { name: '削除', exact: true }).click();
+		await expect(groupButton(page, GROUP_NAME)).toHaveCount(0);
 		expect(dialogs).toEqual([`${GROUP_NAME} を削除しますか？`]);
 
 		await page.reload();
 		await expect(page.getByRole('heading', { level: 2, name: '表示グループ' })).toBeVisible();
-		await expect(list().getByRole('button', { name: '新規グループ' })).toBeEnabled();
-		await expect(groupButton()).toHaveCount(0);
+		await expect(addGroupButton(page)).toBeEnabled();
+		await expect(groupButton(page, GROUP_NAME)).toHaveCount(0);
 
 		const res = await page.request.delete(`/api/tags/${tagAId}`, { headers });
 		expect(res.status(), await res.text()).toBe(204);
+	});
+
+	test('7. 名前が空のまま「ペン」タブから作成すると、エラーのある「設定」タブへ切り替わる', async () => {
+		await addGroupButton(page).click();
+		await expect(page).toHaveURL(/\?group=new&tab=settings$/);
+		await openPensTab(page);
+		await center().getByRole('button', { name: 'ペンを追加' }).click();
+		await penPane(page).getByLabel('ペン 1 のタグ').selectOption({ label: TAG_B });
+
+		await center().getByRole('button', { name: '作成', exact: true }).click();
+		// サーバーが空の名前を拒み、名前の欄のエラーがあるタブへ移る（URL も追従）。
+		await expect(page.getByRole('tab', { name: '設定', exact: true })).toHaveAttribute(
+			'aria-selected',
+			'true'
+		);
+		await expect(page).toHaveURL(/\?group=new&tab=settings$/);
+		await expect(center().getByLabel('名前')).toBeVisible();
+		await expect(center().getByTestId('display-group-error-tabs')).toContainText('設定');
+		await expect(center().locator('.field-error').first()).toBeVisible();
 	});
 });
