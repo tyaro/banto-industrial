@@ -432,7 +432,7 @@
             "type": "string"
           },
           "simulation": {
-            "description": "T9-2 (docs/ux-plan.md §1): mirrors `banto_tags::PlcConnection::simulation` -\nlets a monitoring client (or the admin UI) flag a connection whose\nlive values are synthetic, not from a real PLC.",
+            "description": "T9-2 (docs/archive/ux-plan.md §1): mirrors `banto_tags::PlcConnection::simulation` -\nlets a monitoring client (or the admin UI) flag a connection whose\nlive values are synthetic, not from a real PLC.",
             "type": "boolean"
           },
           "status": {
@@ -1180,7 +1180,7 @@
             "description": "T4（設計 §5.4）: gRPC サーバーの設定。"
           },
           "ingest": {
-            "description": "取り込み口 `push`（R2a-2e、docs/banto-hub-ingest-design.md §9）: `push`\n接続ごとの受信の状態。`push` 接続が無ければ空配列。",
+            "description": "取り込み口 `push`（R2a-2e、docs/hub/banto-hub-ingest-design.md §9）: `push`\n接続ごとの受信の状態。`push` 接続が無ければ空配列。",
             "items": {
               "$ref": "#/components/schemas/IngestStatusEntry"
             },
@@ -1237,7 +1237,7 @@
           },
           "system": {
             "$ref": "#/components/schemas/SystemInfoSnapshot",
-            "description": "T19 S3-b（docs/banto-hub-t19-design.md §3.9、UX-46「サーバー状態の\n拡充」）: サーバー自身の CPU 使用率・メモリ使用量。\n`crate::system_info::SystemInfoSampler`のモジュール doc comment\n参照 - プロセス起動直後最初の呼び出しは `cpu_percent` が `0.0`に\nなりうる。"
+            "description": "T19 S3-b（docs/hub/banto-hub-t19-design.md §3.9、UX-46「サーバー状態の\n拡充」）: サーバー自身の CPU 使用率・メモリ使用量。\n`crate::system_info::SystemInfoSampler`のモジュール doc comment\n参照 - プロセス起動直後最初の呼び出しは `cpu_percent` が `0.0`に\nなりうる。"
           },
           "version": {
             "type": "string"
@@ -1348,7 +1348,7 @@
             "type": "string"
           },
           "ids": {
-            "description": "Stable `(connection_id, group_id, tag_id)` - the \"同じ ID なら\nリネームされた/消えたら削除された\" signal design §4.1 calls for.\n\n`#[schema(value_type = Vec<i64>)]` (T0-2, docs/tag-server-design.md\n§10-6 utoipa 採用): utoipa's `ToSchema` derive has no blanket impl for\narbitrary tuples, so the OpenAPI schema for this field is declared as\na 3-element JSON array of integers instead - this is a schema-only\nannotation, it does not touch how `serde` actually serializes the\ntuple (still a bare `[id, id, id]` JSON array either way, so the wire\nformat this crate's tests assert on is unchanged).",
+            "description": "Stable `(connection_id, group_id, tag_id)` - the \"同じ ID なら\nリネームされた/消えたら削除された\" signal design §4.1 calls for.\n\n`#[schema(value_type = Vec<i64>)]` (T0-2, docs/hub/tag-server-design.md\n§10-6 utoipa 採用): utoipa's `ToSchema` derive has no blanket impl for\narbitrary tuples, so the OpenAPI schema for this field is declared as\na 3-element JSON array of integers instead - this is a schema-only\nannotation, it does not touch how `serde` actually serializes the\ntuple (still a bare `[id, id, id]` JSON array either way, so the wire\nformat this crate's tests assert on is unchanged).",
             "items": {
               "format": "int64",
               "type": "integer"
@@ -1367,7 +1367,7 @@
             "type": "boolean"
           },
           "simulation": {
-            "description": "T9-2 (docs/ux-plan.md §1, accident-prevention requirement (b)):\nmirrors the tag's *owning connection's* `simulation` flag\n(`banto_tags::PlcConnection::simulation`), not the tag's own row -\ntags have no such column of their own. External clients (and the\nfuture T10 tag monitor) need this to tell that a tag's live value is\nsynthetic (produced by the value layer's simulated device,\n`banto_driver_engine::sim`/`banto_collect::BrokerSimRegistry`),\nnot read from a real PLC.",
+            "description": "T9-2 (docs/archive/ux-plan.md §1, accident-prevention requirement (b)):\nmirrors the tag's *owning connection's* `simulation` flag\n(`banto_tags::PlcConnection::simulation`), not the tag's own row -\ntags have no such column of their own. External clients (and the\nfuture T10 tag monitor) need this to tell that a tag's live value is\nsynthetic (produced by the value layer's simulated device,\n`banto_driver_engine::sim`/`banto_collect::BrokerSimRegistry`),\nnot read from a real PLC.",
             "type": "boolean"
           },
           "tag_key": {
@@ -1478,7 +1478,7 @@
         "type": "object"
       },
       "WriteValueRequest": {
-        "description": "`POST /api/v1/values/{tag}` の request body（設計 §5.1「body\n`{ \"v\": <number|bool> }`」、T20 ①a で文字列を追加 - docs/banto-hub-t20-design.md\n§3.1）。`v` は `serde_json::Value` のまま保持し、[`parse_requested_value`]\nで数値/真偽値/文字列のみを受理する（配列・オブジェクトは 422）—\n`bool`/`number`/`string` を1つの Rust 型に素直にマップする serde 表現が\nなく、utoipa の untagged enum サポートも弱いため、検証はハンドラ内で行う。",
+        "description": "`POST /api/v1/values/{tag}` の request body（設計 §5.1「body\n`{ \"v\": <number|bool> }`」、T20 ①a で文字列を追加 - docs/hub/banto-hub-t20-design.md\n§3.1）。`v` は `serde_json::Value` のまま保持し、[`parse_requested_value`]\nで数値/真偽値/文字列のみを受理する（配列・オブジェクトは 422）—\n`bool`/`number`/`string` を1つの Rust 型に素直にマップする serde 表現が\nなく、utoipa の untagged enum サポートも弱いため、検証はハンドラ内で行う。",
         "properties": {
           "v": {
             "description": "書き込む工学値。数値タグには数値、bit タグには真偽値、string タグ\nには文字列（T20 ①a）。（2026-08-06〜: 型が data_type と一致しない\n場合は 422 `unsupported_value_type` - 暗黙の型変換はしない）。",
@@ -1511,7 +1511,7 @@
     }
   },
   "info": {
-    "description": "banto-hub の /api/v1/* API（docs/tag-server-design.md §5.1）。catalog（/api/v1/tags）はクライアントとの互換性契約である（§4.1）: 外部名・安定 ID・revision を用いたバインディングを前提に、フィールド名や JSON 形はこのスキーマとコードが常に一致するよう utoipa で自動生成している。書き込み（POST /api/v1/values/{tag}、T2-4・§6）は writable タグのみ・write:{tag} スコープの API キー限定。取り込み（POST /api/v1/ingest/{id}/values、docs/banto-hub-ingest-design.md §6.2）は push 接続へ値を送る口で、ingest:#{id} スコープの API キー限定。PLC の時計合わせ（/api/plc-connections/{id}/clock-sync、H2）と時計の読取り（/api/plc-connections/{id}/clock、H3）は管理系の REST で、editor のセッションと X-Banto-Client ヘッダが要る。",
+    "description": "banto-hub の /api/v1/* API（docs/hub/tag-server-design.md §5.1）。catalog（/api/v1/tags）はクライアントとの互換性契約である（§4.1）: 外部名・安定 ID・revision を用いたバインディングを前提に、フィールド名や JSON 形はこのスキーマとコードが常に一致するよう utoipa で自動生成している。書き込み（POST /api/v1/values/{tag}、T2-4・§6）は writable タグのみ・write:{tag} スコープの API キー限定。取り込み（POST /api/v1/ingest/{id}/values、docs/hub/banto-hub-ingest-design.md §6.2）は push 接続へ値を送る口で、ingest:#{id} スコープの API キー限定。PLC の時計合わせ（/api/plc-connections/{id}/clock-sync、H2）と時計の読取り（/api/plc-connections/{id}/clock、H3）は管理系の REST で、editor のセッションと X-Banto-Client ヘッダが要る。",
     "license": {
       "identifier": "MIT",
       "name": "MIT"
@@ -1878,7 +1878,7 @@
     },
     "/api/v1/values": {
       "get": {
-        "description": "An unknown name in `?tags=` is a `400` enumerating every unresolved name\n(design instructions: 「未知の名前が混ざったら...部分成功で誤解させない」),\nnever a per-row `bad`/`unknown_tag` - the request as a whole is rejected\nso the caller cannot mistake \"misspelled tag\" for \"tag exists but is\ncurrently bad\". (This error body stays a raw `serde_json::Value` - only\nthe *successful* `/api/v1/*` bodies were in scope for the T0-2 typed-struct\nconversion.)\n\nH10 ③(Option B、docs/h10-3-read-scope-proposal.md §5 S4): API キー起因\nの読み取り(`ctx` あり)だけがタグ単位スコープで絞られる。`?tags=`\n省略(暗黙の全件)はスコープ外を**黙って除いた**集合を返す(「聞いても\nいないのに403」を避ける)。`?tags=` で明示的にスコープ外タグを挙げたら\n[`v1_value_single`] と同じ**403**(存在は catalog 経由で既知なので\n404 ではない)。セッション token(`ctx` 無し)は従来どおり全件(管理 UI\n不変)。2026-09-15 オーナー決定（#335 追補、「外部出力を PLC への出力と\n勘違いしていた」）: simulation / derived_simulation / computed をタグ\n単位で除外することはもう無く、run が AllSimulation 中でも無条件で\n値を返す - 外部への**読み取り**出力（REST/WS/gRPC/MQTT）はシミュレー\nションでゲートしない。呼び出し側は`value_source`/`collectionMode`で\n判別する。旧 T15-3 の`test_output`opt-in 機構は #362 で撤去済み\n（`docs/tag-server-design.md` §6.3参照）。",
+        "description": "An unknown name in `?tags=` is a `400` enumerating every unresolved name\n(design instructions: 「未知の名前が混ざったら...部分成功で誤解させない」),\nnever a per-row `bad`/`unknown_tag` - the request as a whole is rejected\nso the caller cannot mistake \"misspelled tag\" for \"tag exists but is\ncurrently bad\". (This error body stays a raw `serde_json::Value` - only\nthe *successful* `/api/v1/*` bodies were in scope for the T0-2 typed-struct\nconversion.)\n\nH10 ③(Option B、docs/archive/h10-3-read-scope-proposal.md §5 S4): API キー起因\nの読み取り(`ctx` あり)だけがタグ単位スコープで絞られる。`?tags=`\n省略(暗黙の全件)はスコープ外を**黙って除いた**集合を返す(「聞いても\nいないのに403」を避ける)。`?tags=` で明示的にスコープ外タグを挙げたら\n[`v1_value_single`] と同じ**403**(存在は catalog 経由で既知なので\n404 ではない)。セッション token(`ctx` 無し)は従来どおり全件(管理 UI\n不変)。2026-09-15 オーナー決定（#335 追補、「外部出力を PLC への出力と\n勘違いしていた」）: simulation / derived_simulation / computed をタグ\n単位で除外することはもう無く、run が AllSimulation 中でも無条件で\n値を返す - 外部への**読み取り**出力（REST/WS/gRPC/MQTT）はシミュレー\nションでゲートしない。呼び出し側は`value_source`/`collectionMode`で\n判別する。旧 T15-3 の`test_output`opt-in 機構は #362 で撤去済み\n（`docs/hub/tag-server-design.md` §6.3参照）。",
         "operationId": "v1_values",
         "parameters": [
           {
@@ -1955,7 +1955,7 @@
     },
     "/api/v1/values/{tag}": {
       "get": {
-        "description": "H10 ③(Option B、docs/h10-3-read-scope-proposal.md §5 S3): タグは\ncatalog に見えている(=存在は既知)ので、per-tag read スコープ外は 404\nではなく**403**(`forbidden_response`)。API キー起因の読み取り\n(`ctx` あり)だけがこの判定を受ける - セッション token(`ctx` 無し)は\n従来どおり全アクセス(管理 UI 不変)。2026-09-15 オーナー決定（#335 追補）:\nsimulation / derived_simulation / computed をタグ単位で隠すことはもう\n無く、run が AllSimulation 中でも無条件で値を返す（外部への読み取り\n出力はシミュレーションでゲートしない - `value_source`で判別させる）。",
+        "description": "H10 ③(Option B、docs/archive/h10-3-read-scope-proposal.md §5 S3): タグは\ncatalog に見えている(=存在は既知)ので、per-tag read スコープ外は 404\nではなく**403**(`forbidden_response`)。API キー起因の読み取り\n(`ctx` あり)だけがこの判定を受ける - セッション token(`ctx` 無し)は\n従来どおり全アクセス(管理 UI 不変)。2026-09-15 オーナー決定（#335 追補）:\nsimulation / derived_simulation / computed をタグ単位で隠すことはもう\n無く、run が AllSimulation 中でも無条件で値を返す（外部への読み取り\n出力はシミュレーションでゲートしない - `value_source`で判別させる）。",
         "operationId": "v1_value_single",
         "parameters": [
           {

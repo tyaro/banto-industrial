@@ -1,5 +1,5 @@
-//! T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P1、
-//! docs/banto-hub-desktop-plan.md §11「データプロファイルと移行」）:
+//! T17-1（docs/hub/banto-hub-t17-design.md §3「T17-1」・P1、
+//! docs/hub/banto-hub-desktop-plan.md §11「データプロファイルと移行」）:
 //! 3ホスト（console `bin/banto-hub.rs`／Windows service
 //! `bin/banto_hub/win_service.rs`／shell `apps/banto-hub/src-tauri`）が
 //! 個別に複製していた `DEFAULT_DB_PATH = "./banto-hub.sqlite3"`／

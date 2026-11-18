@@ -1,4 +1,4 @@
--- T18-1 TAG-UX-C (docs/banto-hub-desktop-plan.md §9.4「revision / ETag で
+-- T18-1 TAG-UX-C (docs/hub/banto-hub-desktop-plan.md §9.4「revision / ETag で
 -- 後勝ち上書きを防ぎ、競合時は差分を表示する」): 楽観的ロック用の行
 -- バージョン。新規行は 1 から始まり、`banto_tags::tag::TagService::update`/
 -- `update_tx` が成功する度に必ず +1 される（`expected_revision` を指定

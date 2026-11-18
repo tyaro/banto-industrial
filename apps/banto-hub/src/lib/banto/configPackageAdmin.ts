@@ -408,7 +408,7 @@ export async function inspectConfigPackage(pkg: ConfigPackage): Promise<ConfigPa
 				)
 				.map(({ incoming }) => incoming.name)
 		],
-		// R2a-2e（docs/banto-hub-ingest-design.md §5.1）: API キーは移らない。
+		// R2a-2e（docs/hub/banto-hub-ingest-design.md §5.1）: API キーは移らない。
 		ingestConnections: pkg.plcConnections
 			.filter((connection) => connection.protocol === 'push')
 			.map((connection) => connection.name)
@@ -537,7 +537,7 @@ async function applyConfigPackageInner(
 			periodMs: group.periodMs,
 			enabled: group.enabled,
 			defaultWritable: group.defaultWritable,
-			// S3（docs/banto-hub-external-db-design.md §4.1・§4.2）: postgres
+			// S3（docs/hub/banto-hub-external-db-design.md §4.1・§4.2）: postgres
 			// 接続配下のグループでは非 undefined、それ以外では `pkg` 側が
 			// 既に省略している（`configPackage.ts::sanitizeGroup`）ので
 			// そのまま渡すだけでよい（「pkg の値をそのまま転記する」扱い）。
@@ -599,7 +599,7 @@ async function applyConfigPackageInner(
 		}
 	}
 
-	// S6（docs/banto-hub-external-db-design.md §5.2・§6 item 6）: sink group
+	// S6（docs/hub/banto-hub-external-db-design.md §5.2・§6 item 6）: sink group
 	// はタグ・接続の両方を参照するため、上の両ループ（`connectionByName`/
 	// `tagByKey`が最新化済み）の**後**に適用する - `collectionGroups`が
 	// `connectionByName`の後に来るのと同じ順序の理由。

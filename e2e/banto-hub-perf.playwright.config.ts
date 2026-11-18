@@ -1,6 +1,6 @@
 /**
  * banto-hub の性能計測ハーネス専用 Playwright config（T18-5a 第2段、
- * docs/banto-hub-t18-design.md §4 決定6「実測ファースト方針」）。
+ * docs/hub/banto-hub-t18-design.md §4 決定6「実測ファースト方針」）。
  *
  * `banto-hub.playwright.config.ts`（T18-1 本体 e2e、CI 対象）をほぼ丸ごと
  * 踏襲した「実サーバーに対する DOM テスト」だが、下記の理由で**完全に

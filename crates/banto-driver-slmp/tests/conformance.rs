@@ -1,5 +1,5 @@
 //! The conformance checks of `banto-driver-conformance` against the R1
-//! MELSEC SLMP driver (docs/banto-driver-api-design.md §7.3, R1-5):
+//! MELSEC SLMP driver (docs/hub/driver/banto-driver-api-design.md §7.3, R1-5):
 //!
 //! - `static_checks` (C1, C2) on [`SlmpDriver`], with fixtures copied from
 //!   `banto-plc/src/slmp/address.rs`'s tests (the grammar) and the
@@ -7,7 +7,7 @@
 //!   (offsets).
 //! - `session::run_all_against` (C1-C8, C12-C15) through the frame-type
 //!   `SlmpDriver` wrapped by the real engine (`FrameSession`, R2b-3d-2,
-//!   docs/banto-hub-driver-io-design.md §11.2), on the R and the Q series,
+//!   docs/hub/driver/banto-hub-driver-io-design.md §11.2), on the R and the Q series,
 //!   against `banto-plc`'s SLMP simulator behind a `FaultProxy`. C14's
 //!   check-read mismatch and C15's refusals are made by the proxy rewriting
 //!   one response. Until R2b-3d-join the same checks also ran through the

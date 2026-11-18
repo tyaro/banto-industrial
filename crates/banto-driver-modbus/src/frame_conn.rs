@@ -1,4 +1,4 @@
-//! The frame-type half of the driver (R2b-3c, docs/banto-hub-driver-io-design.md
+//! The frame-type half of the driver (R2b-3c, docs/hub/driver/banto-hub-driver-io-design.md
 //! §6.1): [`FrameDriver`] for [`ModbusDriver`] and its [`FrameConnection`].
 //! The engine (`banto-driver-engine`) owns the socket; this side only turns
 //! specs into MBAP frames and responses back into values.

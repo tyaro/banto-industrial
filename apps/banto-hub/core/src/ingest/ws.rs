@@ -1,5 +1,5 @@
 //! WebSocket の送信口 `GET /api/v1/ingest/{id}/stream`（R2a-2d、
-//! docs/banto-hub-ingest-design.md §6.1）。常時つなぐ送り手（DB ブリッジ）の口。
+//! docs/hub/banto-hub-ingest-design.md §6.1）。常時つなぐ送り手（DB ブリッジ）の口。
 //! 一括で送るだけの送り手は REST（[`super::rest`]）を使う。
 //!
 //! ## メッセージ（§6.1 の JSON をそのまま実装）

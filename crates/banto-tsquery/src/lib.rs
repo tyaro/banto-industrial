@@ -1,5 +1,5 @@
 //! banto-tsquery: I4 時系列クエリ層 (docs/plan.md I4,
-//! docs/recorder-requirements.md §3.3 "トレンド3モード" のヒストリカル/
+//! docs/chronogazer/recorder-requirements.md §3.3 "トレンド3モード" のヒストリカル/
 //! ハイブリッド、§3.5 "日報帳票").
 //!
 //! [`TsQuery`] answers period queries over a `banto-tstore` (I3a) data

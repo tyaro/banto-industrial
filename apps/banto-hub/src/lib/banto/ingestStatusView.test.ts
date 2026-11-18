@@ -1,5 +1,5 @@
 /**
- * `ingestStatusView.ts`（R2a-2e、docs/banto-hub-ingest-design.md §9）のユニットテスト。
+ * `ingestStatusView.ts`（R2a-2e、docs/hub/banto-hub-ingest-design.md §9）のユニットテスト。
  */
 import { describe, expect, it } from 'vitest';
 import {

@@ -1,5 +1,5 @@
 /**
- * S6（docs/banto-hub-external-db-design.md §5.2・§7 row S6）: DB Sink の
+ * S6（docs/hub/banto-hub-external-db-design.md §5.2・§7 row S6）: DB Sink の
  * `hub_sink_groups` CRUD クライアント（`GET/POST /api/sink/groups`、
  * `GET/PUT/DELETE /api/sink/groups/{id}` - `apps/banto-hub/core/src/rest.rs`
  * の `sink_groups_router`）。`apiKeysAdmin.ts` と同じ httpRequest 雛形を流用

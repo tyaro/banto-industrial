@@ -1,6 +1,6 @@
 [package]
 name = "banto-tsquery"
-description = "I4: 時系列クエリ層 - 期間クエリ + サーバ側 min/max 間引き (docs/plan.md I4, docs/recorder-requirements.md §3.3/§3.5)"
+description = "I4: 時系列クエリ層 - 期間クエリ + サーバ側 min/max 間引き (docs/plan.md I4, docs/chronogazer/recorder-requirements.md §3.3/§3.5)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

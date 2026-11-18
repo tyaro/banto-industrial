@@ -49,7 +49,7 @@ const CONN_B: PlcConnection = {
 	simulation: false,
 	settings: {}
 };
-// S3（docs/banto-hub-external-db-design.md §7 row S3）: postgres（DB
+// S3（docs/hub/banto-hub-external-db-design.md §7 row S3）: postgres（DB
 // Source）接続のフィクスチャ - `tagKind=db` の配置規則テストに使う。
 const CONN_PG: PlcConnection = {
 	id: 3,

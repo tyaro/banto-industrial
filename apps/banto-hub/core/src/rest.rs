@@ -1,4 +1,4 @@
-//! REST surface for banto-hub (docs/tag-server-design.md §5.1「REST（T0）」・
+//! REST surface for banto-hub (docs/hub/tag-server-design.md §5.1「REST（T0）」・
 //! §5.6「認証（全プロトコル共通）」)。
 //!
 //! ## 二系統に分かれたルーター
@@ -171,7 +171,7 @@ pub(crate) use banto_server::routes::bearer_token;
 pub use banto_server::routes::{audited_credential_verifier, user_auth_state, user_session_lookup};
 
 // MQTT・store・gRPC・OPC UA の設定 API は `rest/settings.rs` へ移した
-// （docs/banto-hub-driver-refactor-plan.md §8.1）。`crate::rest::X` のパスは
+// （docs/hub/driver/banto-hub-driver-refactor-plan.md §8.1）。`crate::rest::X` のパスは
 // ここで re-export して保つ（`crate::mcp`・`crate::runtime`・`crate::opcua` が使う）。
 mod settings;
 use settings::{grpc_settings_router, mqtt_settings_router, store_settings_router};
@@ -183,7 +183,7 @@ pub(crate) use settings::{
 
 // API キー管理・書き込み受付トグル・収集ライフサイクル制御・書き込み監査の閲覧 API は
 // `rest/{api_keys,write_control,collection_control,write_audit}.rs` へ移した
-// （docs/banto-hub-driver-refactor-plan.md §8.1）。`crate::rest::X` のパスはここで
+// （docs/hub/driver/banto-hub-driver-refactor-plan.md §8.1）。`crate::rest::X` のパスはここで
 // re-export して保つ（`crate::mcp` が使う）。
 mod api_keys;
 mod collection_control;
@@ -202,7 +202,7 @@ use write_control::{WRITE_CONTROL_DISABLE_OPERATION, WRITE_CONTROL_ENABLE_OPERAT
 
 // I1 CRUD の共通層（収集構成の反映・pending queue への振り分け・変更系エラーの
 // 写像）と PLC 接続の CRUD・接続テストは `rest/{crud,plc_connections}.rs` へ移した
-// （docs/banto-hub-driver-refactor-plan.md §8.1）。`crate::rest::X` のパスはここで
+// （docs/hub/driver/banto-hub-driver-refactor-plan.md §8.1）。`crate::rest::X` のパスはここで
 // re-export して保つ（`crate::mcp` が使う）。
 mod crud;
 mod plc_connections;
@@ -226,7 +226,7 @@ pub use plc_connections::{
 
 // 収集グループとタグの CRUD・一括操作・`tag_registry_router`（と、それぞれの
 // 作成・更新ペイロード）は `rest/{collection_groups,tags}.rs` へ移した
-// （docs/banto-hub-driver-refactor-plan.md §8.1）。`crate::rest::X` のパスは
+// （docs/hub/driver/banto-hub-driver-refactor-plan.md §8.1）。`crate::rest::X` のパスは
 // ここで re-export して保つ（`crate::mcp` が使う）。
 // H2（tyaro/banto-industrial#1053）: `GET`・`PUT`・`POST /api/plc-connections/{id}/clock-sync`
 // （PLC の時計合わせ。`tag_registry_router` に載る）。
@@ -246,7 +246,7 @@ pub use tags::{
 use tags::{TxTestHook, TX_TEST_HOOK};
 
 // 保留中の変更（pending changes）API と外部 DB 連携（Sink）API は
-// `rest/{pending_changes,sink}.rs` へ移した（docs/banto-hub-driver-refactor-plan.md §8.1）。
+// `rest/{pending_changes,sink}.rs` へ移した（docs/hub/driver/banto-hub-driver-refactor-plan.md §8.1）。
 // ルーターは composition から使うのでここで取り込む。
 mod ingest_bridge;
 mod pending_changes;
@@ -255,7 +255,7 @@ use pending_changes::pending_changes_router;
 use sink::{sink_admin_router, sink_groups_router};
 
 // `/api/v1/*` のタグ空間 API・認証、管理系の状態と値、書き込み API は
-// `rest/{tag_space,admin_status,write}.rs` へ移した（docs/banto-hub-driver-refactor-plan.md §8.1）。
+// `rest/{tag_space,admin_status,write}.rs` へ移した（docs/hub/driver/banto-hub-driver-refactor-plan.md §8.1）。
 // `ApiDoc` の `paths(...)`・`schemas(...)` と composition が使う名前はここで取り込む。
 mod admin_status;
 mod tag_space;
@@ -283,7 +283,7 @@ use write::{
 };
 
 // 式チェック・関数表（#342）、OpenAPI（`ApiDoc`）、試運転モード/ロックダウンは
-// `rest/{expression,openapi,commissioning}.rs` へ移した（docs/banto-hub-driver-refactor-plan.md §8.1）。
+// `rest/{expression,openapi,commissioning}.rs` へ移した（docs/hub/driver/banto-hub-driver-refactor-plan.md §8.1）。
 // composition・`tag_registry_router`・`crate::mcp` が使う名前はここで取り込む。
 mod commissioning;
 mod expression;
@@ -775,14 +775,14 @@ fn api_router_with_controller_mode(
     // 見るか ＝ `tag_space_router`/`crate::mcp::mcp_router` へ
     // `!legacy_compat_router` として渡す）に名前を合わせた。
     legacy_compat_router: bool,
-    // T16-2 第三スライス（docs/banto-hub-t16-design.md §5）:
+    // T16-2 第三スライス（docs/hub/banto-hub-t16-design.md §5）:
     // `GET /api/v1/openapi.json`の`info.x-banto-hub-profile-id`に埋め込む
     // この Hub インスタンス自身の profile-id - `HubRuntime::start`
     // （`crate::runtime`）が`HubConfig::profile_id`をそのまま渡す。
     profile_id: String,
 ) -> Router {
     let commissioning_state = commissioning.state();
-    // T19 S3-b（docs/banto-hub-t19-design.md §3.9、UX-46）: 1プロセスにつき
+    // T19 S3-b（docs/hub/banto-hub-t19-design.md §3.9、UX-46）: 1プロセスにつき
     // 1個だけ構築し、`admin_status_router`・`admin_tag_stream_router`・
     // `tag_space_router`の3者へ同じ `Arc` を配る - `mqtt`/`write_control`
     // 等、このファイルの他の共有状態と同じ規律（`SystemInfoSampler`の
@@ -968,7 +968,7 @@ fn api_router_with_controller_mode(
             auth.clone(),
             audit.clone(),
         ))
-        // T19 S5（docs/banto-hub-t19-design.md §3.7、UX-41）: `POST /mcp` -
+        // T19 S5（docs/hub/banto-hub-t19-design.md §3.7、UX-41）: `POST /mcp` -
         // `tag_space_router`と同じ形で、CSRF レイヤー（`admin`）の外側に
         // `.merge()`する。API キー認証（`bh_`のみ、`crate::mcp`のモジュール
         // doc comment「認証」節参照）を自前で持つため、CSRF ヘッダは不要
@@ -992,7 +992,7 @@ fn api_router_with_controller_mode(
             mqtt.clone(),
             system_info.clone(),
             !legacy_compat_router,
-            // T21 S1-b（docs/banto-hub-t21-design.md §5）: 構成補助ツール用
+            // T21 S1-b（docs/hub/banto-hub-t21-design.md §5）: 構成補助ツール用
             // - REST の他ルーターと同じ `audit` をそのまま共有する
             // （このファイルの `.merge` 呼び出し規律と同じ）。
             audit.clone(),
@@ -1022,7 +1022,7 @@ fn api_router_with_controller_mode(
             api_keys.clone(),
             auth.clone(),
         ))
-        // R2a-3b（docs/banto-hub-ingest-design.md §10.2）: DB ブリッジの設定の取得口
+        // R2a-3b（docs/hub/banto-hub-ingest-design.md §10.2）: DB ブリッジの設定の取得口
         // `GET /api/ingest/bridge-config`。ゲートは上の `sink_admin_router` と同じ
         // `require_sink_admin`（admin スコープのキーか admin ロールのセッション、§12 Q13）で、
         // 同じく CSRF のレイヤー（`admin`）の外側。パスワードを平文で返す
@@ -1033,7 +1033,7 @@ fn api_router_with_controller_mode(
             api_keys.clone(),
             auth.clone(),
         ))
-        // R2a-2c（docs/banto-hub-ingest-design.md §6.2）: 取り込み口 `push` の REST の
+        // R2a-2c（docs/hub/banto-hub-ingest-design.md §6.2）: 取り込み口 `push` の REST の
         // 送信口 `POST /api/v1/ingest/{id}/values`。`tag_space_router`（`read` を要求する
         // `require_tag_space_auth`）の下には置かず、専用の認証の層
         // （`crate::ingest::auth::require_ingest_auth`、API キーの `ingest:#{id}` だけ）と、
@@ -1048,7 +1048,7 @@ fn api_router_with_controller_mode(
             audit.clone(),
             manager.detached().clone(),
         ))
-        // R2a-2d（docs/banto-hub-ingest-design.md §6.1）: 同じ取り込み口の WebSocket の
+        // R2a-2d（docs/hub/banto-hub-ingest-design.md §6.1）: 同じ取り込み口の WebSocket の
         // 送信口 `GET /api/v1/ingest/{id}/stream`。REST と同じ認証の層（経路は `ws`）を
         // `route_layer` で被せ、upgrade は層を通った後。`Sec-WebSocket-Protocol` からの
         // トークンの取り出し（`extract_ws_protocol_token`）の対象には入れない。
@@ -1101,11 +1101,11 @@ fn preflight_snapshot(
     // 実行可能」を保証する T14-3 の設計どおり）。
     crate::db_source::build_plan(snapshot, registry)
         .map_err(|err| preflight_api_error(format!("DB Source の検証に失敗しました: {err}")))?;
-    // R2a-1c（docs/banto-hub-ingest-design.md §4.2）: 収集と同じ計画
+    // R2a-1c（docs/hub/banto-hub-ingest-design.md §4.2）: 収集と同じ計画
     // （`push` 接続を受信側から収集する `PushSource::Available`）で検証する。
     // R2a-2a〜R2a-1c の間は厳格版の `build_config_from` で、有効な `push` 接続を
     // `pushSourceUnavailable` で断っていた。
-    // R2b-1d（docs/banto-hub-connection-settings-design.md §4.4・§7）: 収集の計画と同じ
+    // R2b-1d（docs/hub/banto-hub-connection-settings-design.md §4.4・§7）: 収集の計画と同じ
     // レジストリで各接続のドライバ・settings・版も確かめる（計画と preflight がずれない）。
     crate::ingest::build_hub_config(snapshot, registry)
         .map(|_| ())
@@ -1174,7 +1174,7 @@ fn reject_new_external_name_collisions(
     }))
 }
 
-// T21 S1-b（docs/banto-hub-t21-design.md §5）: `pub(crate)` so
+// T21 S1-b（docs/hub/banto-hub-t21-design.md §5）: `pub(crate)` so
 // `crate::mcp`'s config tools (`create_connection`/`delete_connection`) can
 // run the exact same in-transaction preflight REST does. #635 added
 // `before` (read with [`registry_before`] before the write): every write

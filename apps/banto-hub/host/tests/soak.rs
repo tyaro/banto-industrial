@@ -1,7 +1,7 @@
-//! T5-4（docs/t5-handoff.md §3「ソークテスト」・docs/tag-server-design.md
+//! T5-4（docs/archive/t5-handoff.md §3「ソークテスト」・docs/hub/tag-server-design.md
 //! §8「配布・運用」）: 収集 + WebSocket 購読 + MQTT 発行を**同時に**維持した
 //! 連続稼働試験。出荷条件のそもそもの一次ソースは
-//! docs/recorder-requirements.md §4「非機能要件」の
+//! docs/chronogazer/recorder-requirements.md §4「非機能要件」の
 //! 「模擬 PLC 相手に 72 時間連続収集、欠測ゼロ（意図的断線区間を除く）・
 //! メモリ増加なし」（ChronoGazer 向けに定義されたもの）。tag-server-design.md
 //! §8 はこれを banto-hub 向けに拡張し、「収集 24/365 + 外部クライアント購読を
@@ -22,7 +22,7 @@
 //!   既定の実行時間は 60 秒（このセッションで実際に動作確認できる長さ） -
 //!   `SOAK_DURATION_SECS` 環境変数で上書きできる。**本番の 72h ソーク**は
 //!   `SOAK_DURATION_SECS=259200`（72*3600）を指定して明示実行する
-//!   （手順は docs/banto-hub-operations.md「72h 出荷判定ソークテスト」節に
+//!   （手順は docs/hub/banto-hub-operations.md「72h 出荷判定ソークテスト」節に
 //!   も記載 - オーナーが出荷判定として別途実施する。72h 通しの実行自体は
 //!   このタスクのスコープ外）。
 //! - タイミングの許容範囲は banto-collect の雛形と同じく緩め: CI が詰まって
@@ -85,7 +85,7 @@
 //! （60秒程度の走行時間ではアロケータのウォームアップ/断片化の揺らぎを
 //! リーク兆候と誤検知しかねない）。「メモリ増加なし」という出荷条件の
 //! 実際の判定は、72h 本番ソーク走行中にタスクマネージャ/`Get-Process`で
-//! 目視確認する運用手順として docs/banto-hub-operations.md に記載した -
+//! 目視確認する運用手順として docs/hub/banto-hub-operations.md に記載した -
 //! このリポジトリの既存流儀（CI: タイミングの緩い自動チェック / 実機・
 //! 長時間: オーナー実施の手順書）に合わせた判断。
 //!
@@ -1061,15 +1061,15 @@ async fn mini_soak_collect_ws_mqtt_stay_alive_for_several_seconds() {
 /// 環境変数で上書き可能 - **本番の 72h 出荷判定ソーク**は
 /// `SOAK_DURATION_SECS=259200 cargo test -p banto-hub-host --test soak -- \
 /// --ignored --nocapture` で明示実行する(手順は
-/// docs/banto-hub-operations.md「72h 出荷判定ソークテスト」節、判定基準の
-/// 一次ソースは docs/recorder-requirements.md §4・docs/tag-server-design.md
+/// docs/hub/banto-hub-operations.md「72h 出荷判定ソークテスト」節、判定基準の
+/// 一次ソースは docs/chronogazer/recorder-requirements.md §4・docs/hub/tag-server-design.md
 /// §8)。メモリ増加の合否判定はこのテストの自動アサーションでは行わない -
 /// このファイルのモジュール doc comment「メモリ増加の検証」参照。
 /// `SOAK_PROGRESS_SECS`(既定 3600、0 で無効)ごとに途中経過を stdout へ出す。
 #[ignore = "long-running (60s by default) soak; run explicitly with --ignored. \
             Override the duration via SOAK_DURATION_SECS (seconds) - e.g. \
             SOAK_DURATION_SECS=259200 for the real 72h release-gate run \
-            (docs/banto-hub-operations.md). SOAK_PROGRESS_SECS (default 3600, \
+            (docs/hub/banto-hub-operations.md). SOAK_PROGRESS_SECS (default 3600, \
             0 = off) controls the progress lines."]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn long_soak_collect_ws_mqtt_stay_alive() {
@@ -1091,7 +1091,7 @@ async fn long_soak_collect_ws_mqtt_stay_alive() {
     println!(
         "long-soak: RSS start={:?} bytes, end={:?} bytes, min={} max={} ({} samples) \
          (診断用ログ - 合否判定には使わない。\
-         72h 本番ソークでのメモリ増加なしの判定手順は docs/banto-hub-operations.md 参照)",
+         72h 本番ソークでのメモリ増加なしの判定手順は docs/hub/banto-hub-operations.md 参照)",
         report.rss_start_bytes,
         report.rss_end_bytes,
         report.rss.min,

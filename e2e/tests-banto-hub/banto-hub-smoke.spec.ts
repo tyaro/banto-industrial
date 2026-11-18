@@ -1,6 +1,6 @@
 /**
  * banto-hub の Playwright/DOM smoke（T18-1、
- * docs/banto-hub-desktop-plan.md §16.3「banto-hub の Playwright/DOM テスト
+ * docs/hub/banto-hub-desktop-plan.md §16.3「banto-hub の Playwright/DOM テスト
  * 基盤を T18-1 の成果物へ前倒し」）。
  *
  * `e2e/tests/smoke.spec.ts`（ChronoGazer）と同じ設計: 実際の

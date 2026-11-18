@@ -1,5 +1,5 @@
 //! banto-hub 一体インストーラ生成ツール（T5-2 → I1、
-//! docs/banto-hub-installer-design.md §3 案 A・§4）。
+//! docs/hub/banto-hub-installer-design.md §3 案 A・§4）。
 //!
 //! ## 変遷（短縮）
 //!
@@ -13,7 +13,7 @@
 //!   開む薄いシェル（`apps/banto-hub/src-tauri`、`banto-hub-shell`）が
 //!   二次ホストとして追加されたが、このインストーラは対象外のままだった
 //!   （T17 §2.3「パッケージング自体は T17 スコープ」）。
-//! - **I1（本スライス、docs/banto-hub-installer-design.md §6 row I1）**:
+//! - **I1（本スライス、docs/hub/banto-hub-installer-design.md §6 row I1）**:
 //!   シェル・Hub 本体・UAC ヘルパ（`banto-hub-elev.exe`）・DB Sink サイド
 //!   カー（`banto-hub-sink.exe`）の**4 バイナリ**を同じ `$INSTDIR` に揃える
 //!   一体インストーラへ拡張した。方式は変えない（引き続き `tauri-bundler`
@@ -38,12 +38,12 @@
 //! 「インストール後に ${PRODUCTNAME} を実行する」完了ページチェックボックス
 //! が**意味のある動作**になる（T5-2 当時は Hub 単体だったため、oncheck で
 //! コンソール無しの前面プロセスが起動する既知の制約があった -
-//! docs/banto-hub-operations.md §12 参照。この制約自体は I1 で消える）。
+//! docs/hub/banto-hub-operations.md §12 参照。この制約自体は I1 で消える）。
 //!
 //! ## 使い方
 //!
 //! ```powershell
-//! # 1. 先に4つの release バイナリをビルド（docs/banto-hub-installer-design.md §4.6）
+//! # 1. 先に4つの release バイナリをビルド（docs/hub/banto-hub-installer-design.md §4.6）
 //! pnpm --filter banto-hub build
 //! cargo build --release -p banto-hub-host --bin banto-hub --bin banto-hub-elev --features embed-ui
 //! cargo build --release -p banto-hub-shell --features banto-hub-core/embed-ui
@@ -70,7 +70,7 @@
 //! このセッションでは行わない）。
 //!
 //! ## フックの流れ（`hooks/service-hooks.nsh`、
-//! docs/banto-hub-installer-design.md §4.3）
+//! docs/hub/banto-hub-installer-design.md §4.3）
 //!
 //! PREINSTALL でサービス（`BantoHubSink`→`BantoHub`の順）とシェルを止め、
 //! POSTINSTALL で `banto-hub-elev.exe service-install`（Hub のサービス登録
@@ -102,7 +102,7 @@
 //! `=2.9.4` で固定）。当て直しの表（何を当てるか）は製品ごとにこのファイルに置く。
 //! 番号は ChronoGazer の P1〜P6 と対応させてある。
 //!
-//! Hub に当てるもの（決定は docs/banto-hub-installer-design.md §4.1・§4.3）:
+//! Hub に当てるもの（決定は docs/hub/banto-hub-installer-design.md §4.1・§4.3）:
 //!
 //! 1. P1: `PageReinstall` の先頭で `Abort`（頁を出さない = 旧い版の
 //!    アンインストーラを走らせず、**常にその場で上書きする**）。原本は既に
@@ -163,7 +163,7 @@ use nsis_template::{patch_template, TemplatePatch, VENDORED_TEMPLATE};
 /// 既存2アプリの `dev.tyaro.{name}` 命名規則を踏襲
 /// （apps/relay-wright/src-tauri/tauri.conf.json の `identifier` 参照）。
 const BUNDLE_IDENTIFIER: &str = "dev.tyaro.banto-hub";
-/// docs/banto-hub-operations.md 全体で使われている表記に合わせる。
+/// docs/hub/banto-hub-operations.md 全体で使われている表記に合わせる。
 const PRODUCT_NAME: &str = "BantoHub";
 
 /// デスクトップシェル（`apps/banto-hub/src-tauri`、パッケージ名
@@ -467,7 +467,7 @@ fn main() -> Result<()> {
             // main がシェル（WebView を使う Tauri アプリ）になったので、
             // WebView2 ランタイムの導入が必要 - T5-2 時点の `Skip`
             // （Hub 単体はネイティブ WebView を使わないため許されていた）
-            // から変更する（docs/banto-hub-installer-design.md §4.2・
+            // から変更する（docs/hub/banto-hub-installer-design.md §4.2・
             // §7-2 オーナー決定）。工場 PC は Edge 由来の WebView2 が
             // 入っていることがほとんどなので、無い場合だけ取得しに行く
             // `EmbedBootstrapper` を選ぶ（+約2MB、完全オフラインではない）。
@@ -547,7 +547,7 @@ fn installer_manifest_dir() -> PathBuf {
 }
 
 /// リポジトリルートの `target/release/`
-/// （docs/banto-hub-installer-design.md §4.6 記載の既定ビルド出力先）を
+/// （docs/hub/banto-hub-installer-design.md §4.6 記載の既定ビルド出力先）を
 /// 既定の対象ディレクトリとする。
 fn default_binaries_dir(installer_dir: &Path) -> Result<PathBuf> {
     let repo_root = installer_dir

@@ -1,4 +1,4 @@
-//! Owner decision Q4 (docs/banto-hub-driver-io-design.md §13): the frames
+//! Owner decision Q4 (docs/hub/driver/banto-hub-driver-io-design.md §13): the frames
 //! `frame.rs` builds are the frames the `slmp` crate (v0.2.1, the I/O this
 //! driver used until R2b-3d) puts on the wire, byte for byte, for every
 //! combination of series (Q / L / R), command (read / write) and unit (word

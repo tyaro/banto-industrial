@@ -1,4 +1,4 @@
-//! `banto-hub-sink`（外部 DB 連携 S5、docs/banto-hub-external-db-design.md
+//! `banto-hub-sink`（外部 DB 連携 S5、docs/hub/banto-hub-external-db-design.md
 //! §5）: banto-hub のタグ空間を購読し、値を外部 PostgreSQL へ long スキーマ
 //! （§5.3）でバッチ INSERT する**別プロセスのサイドカー**。
 //!
@@ -59,7 +59,7 @@
 //!   バックオフ（1s → 30s、DB Source と同じ定数）を持つ。
 //! - [`status`][]: グループ単位の運転状態（`running`/`backoff`/`error`）と
 //!   Hub への push 本体。
-//! - [`source`][]: **DB ブリッジ**（R2a-3b、docs/banto-hub-ingest-design.md §10.3）。
+//! - [`source`][]: **DB ブリッジ**（R2a-3b、docs/hub/banto-hub-ingest-design.md §10.3）。
 //!   Hub のブリッジの `push` 接続ごとに PostgreSQL へ問い合わせ、取り込み口の
 //!   WebSocket（`/api/v1/ingest/{id}/stream`）へ値を送る。設定は
 //!   `GET /api/ingest/bridge-config`。値の変換と品質の梯子は Hub 内の DB Source と同じ

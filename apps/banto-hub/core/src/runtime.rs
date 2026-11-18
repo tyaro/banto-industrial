@@ -1,7 +1,7 @@
-//! T14-1（docs/banto-hub-t14-design.md §3「D1 — HubRuntime ライブラリ化」・
+//! T14-1（docs/archive/banto-hub-t14-design.md §3「D1 — HubRuntime ライブラリ化」・
 //! §12「T14-1」）: banto-hub の起動〜シャットダウンの共通シーケンス
 //! （旧 `bin/banto_hub/hub_run.rs` の `run(shutdown)`、
-//! docs/tag-server-design.md §8「常駐」）を、bin 側の composition root から
+//! docs/hub/tag-server-design.md §8「常駐」）を、bin 側の composition root から
 //! この lib クレート（`banto_hub_core`）の再利用可能ランタイムへ抽出した
 //! もの。
 //!
@@ -33,7 +33,7 @@
 //! 読み取りは、旧 `hub_run::run`ではこのシーケンス自身が行っていたが、
 //! T14-1 でホスト側（`bin/banto-hub.rs`・`bin/banto_hub/win_service.rs`）へ
 //! 移した - 将来のデスクトップホスト（env なしで設定できる）を見据えた
-//! 設計判断（docs/banto-hub-t14-design.md §3）。**このモジュール自身は
+//! 設計判断（docs/archive/banto-hub-t14-design.md §3）。**このモジュール自身は
 //! 環境変数を一切読まない** - ホストが読み取り結果を[`HubConfig`]に詰めて
 //! 渡す。読み取りロジック自体（既定値・レイヤー順）は現行と1バイトも
 //! 変えていない - 各ホストのモジュール doc 参照。
@@ -43,7 +43,7 @@
 //! 勝つ）が必要なため、この重ね合わせ自体は（settings を読む都合上）
 //! 引き続きこの中で行う（[`HubRuntime::start`]参照）。
 //!
-//! ## T17-1 での唯一の例外（docs/banto-hub-t17-design.md §3「T17-1」・P2）
+//! ## T17-1 での唯一の例外（docs/hub/banto-hub-t17-design.md §3「T17-1」・P2）
 //!
 //! 上記の「このモジュール自身は環境変数を一切読まない」原則に対し、
 //! [`HubRuntime::start`]は profile 排他（[`crate::profile_lock`]）の
@@ -66,13 +66,13 @@
 //!
 //! init_db → 各サービス構築 → `HubSessions` 構築（T2-2、設計 §6-5。
 //! `CollectorManager` の外で生存するブローカーセッション directory）→
-//! `BrokerSimRegistry` 構築（T9-2、docs/ux-plan.md §1。同じく
+//! `BrokerSimRegistry` 構築（T9-2、docs/archive/ux-plan.md §1。同じく
 //! `CollectorManager` の外で生存する broker シミュレータ registry）→
 //! `CollectorManager::commit_catalog`（起動時1回、catalog だけ。収集の開始は
 //! ホストが [`RunningHub::controller`] から行う - T14-3）→ tstore 剪定
 //! （起動時1回 + 24h 周期、設計 §3.3・保持既定7日）→ 監査ログ剪定
 //! （起動時1回 + tstore と同じ24h周期タスクに相乗り、
-//! docs/banto-hub-remaining-plan.md P3-a 追補・2026-08-12。banto-hub は
+//! docs/hub/banto-hub-remaining-plan.md P3-a 追補・2026-08-12。banto-hub は
 //! 24/7 常駐のヘッドレスサーバーで、chronogazer/relay-wright のような
 //! 「人間が頻繁に再起動するデスクトップアプリ」ではないため、
 //! chronogazer/relay-wright と同じ「起動時 + list実行時 opportunistic の
@@ -121,7 +121,7 @@
 //! オーナー決定）。閉じる手順と `ingest_disconnected`（`reason: server_shutdown`）の記録は
 //! 残りの停止と並んで進み、この待ちが終わりを待つ。
 //!
-//! **DB Source の位置**（S2、docs/banto-hub-external-db-design.md §4.2）:
+//! **DB Source の位置**（S2、docs/hub/banto-hub-external-db-design.md §4.2）:
 //! eval/prune ループの abort と同じ「消費者を先に止める」区画に置く -
 //! DB Source のタスクは `ServerTagStore`（`manager` が
 //! `computed_engine` 越しに共有するもの）へ値を書く**書き手**なので、
@@ -227,7 +227,7 @@ use crate::write_control::{load_startup_decision, WriteControl};
 use crate::write_rate::{WriteRateLimitConfig, WriteRateLimiter};
 
 /// 旧 `BANTO_DB`未設定時の相対既定 DB パス（後方互換・ドキュメント用）。
-/// T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P1）以降、3ホストの
+/// T17-1（docs/hub/banto-hub-t17-design.md §3「T17-1」・P1）以降、3ホストの
 /// 既定パスの正は[`crate::profile_paths::resolve_profile_paths`] /
 /// [`crate::profile_paths::build_hub_config_from_env`]が返す絶対パスであり、
 /// この定数はホストの`HubConfig`組み立てでは使わない。
@@ -242,7 +242,7 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// - このモジュール doc の「環境変数の読み取り位置」節参照。
 #[derive(Debug, Clone)]
 pub struct HubConfig {
-    /// 注入されるドライバ一式（R1-3b、docs/banto-driver-api-design.md §6.4）。
+    /// 注入されるドライバ一式（R1-3b、docs/hub/driver/banto-driver-api-design.md §6.4）。
     /// ホスト（bin・shell・テスト）が `banto_drivers::builtin()` から組み立てる。
     pub drivers: crate::broker_glue::HubDrivers,
     /// DB ファイルパス。旧 `BANTO_DB` env（既定 [`DEFAULT_DB_PATH`]）。
@@ -258,7 +258,7 @@ pub struct HubConfig {
     pub bind_override: Option<String>,
     /// settings の `data.dir`を上書きする値。旧 `BANTO_HUB_DATA` env。
     pub data_dir_override: Option<PathBuf>,
-    /// T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P1）: この起動が
+    /// T17-1（docs/hub/banto-hub-t17-design.md §3「T17-1」・P1）: この起動が
     /// 使う profile id（`crate::profile_paths::DEFAULT_PROFILE_ID`が既定）。
     /// `skip_profile_lock`が`false`の場合、`start`冒頭でこの id と
     /// （env から再解決した）root から profile ディレクトリを組み立てて
@@ -334,10 +334,10 @@ pub enum HubStartError {
     /// DB スキーマの整理（2026-10-02 オーナー決定）: 旧形式（整理より前）の DB を開こうと
     /// した - 自動移行はせず起動を拒否する（`crate::db` のモジュール doc
     /// 「旧形式の DB の拒否」）。メッセージ自体に DB のパスと対処（削除
-    /// または退避して起動し直す、手順は docs/banto-hub-operations.md）を含む。
+    /// または退避して起動し直す、手順は docs/hub/banto-hub-operations.md）を含む。
     #[error("banto-hub: {0}")]
     LegacyDatabase(LegacyDatabase),
-    /// R2b-1d（docs/banto-hub-connection-settings-design.md §6.3）: 戻せない移行
+    /// R2b-1d（docs/hub/banto-hub-connection-settings-design.md §6.3）: 戻せない移行
     /// （`banto-tags` の 0025）の写しでの予行が、新しい検証を通らない接続（`rows`）や
     /// 行に結び付かない問題（`problems`: 秘密値の行の数の食い違い・写しへの migrate の
     /// 失敗）を見つけた - 移行せずに起動を断る。DB は一切変わっていない。メッセージに
@@ -366,7 +366,7 @@ pub enum HubStartError {
     /// `banto_server::start`失敗（旧: `"server should start"`で `expect`）。
     #[error("banto-hub: サーバーの起動に失敗しました: {source}")]
     ServerStart { port: u16, source: BantoError },
-    /// T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P2）:
+    /// T17-1（docs/hub/banto-hub-t17-design.md §3「T17-1」・P2）:
     /// `crate::profile_lock::try_acquire_profile_lock`失敗（既に別プロセスが
     /// この profile を保持している、または profile ディレクトリ・lock
     /// ファイルの I/O エラー）。DB init より前に検出するため、この4つの中で
@@ -482,7 +482,7 @@ impl HubRuntime {
                 None => default_tls.map(TlsPlan::Default),
             };
 
-        // T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P2）: DB init を
+        // T17-1（docs/hub/banto-hub-t17-design.md §3「T17-1」・P2）: DB init を
         // 含む一切のリソース確保より前に profile 排他を取る - 失敗した場合
         // DB を一度も開かずに即座に安全側で起動を拒否する（設計 §1 P2）。
         // このモジュール doc「T17-1 での唯一の例外」節参照: ここだけ env を
@@ -554,7 +554,7 @@ impl HubRuntime {
             None => (db_path, None),
         };
 
-        // R2b-1d（docs/banto-hub-connection-settings-design.md §6.1）: 2-a〜2-c。レジストリは
+        // R2b-1d（docs/hub/banto-hub-connection-settings-design.md §6.1）: 2-a〜2-c。レジストリは
         // `drivers` を `HubSessions` へ渡す前に写しておく（予行の preflight・入口の
         // `with_registry`・予約接続が使う）。
         let registry = drivers.registry.clone();
@@ -689,7 +689,7 @@ impl HubRuntime {
         let upkeep = crate::upgrade::secrets_upkeep(&pool, &connection_secrets).await;
         crate::upgrade::log_upkeep(&upkeep);
 
-        // T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): auto-provision the
+        // T6-2 (docs/hub/tag-server-design.md §4.2/§4.3(a)): auto-provision the
         // reserved `calc`/`mem` virtual connections BEFORE the startup
         // catalog commit below, so an operator can start creating computed/internal tags
         // immediately - the registry's own `UNIQUE` constraint on `name` is
@@ -810,7 +810,7 @@ impl HubRuntime {
         // レビュー指摘）。最後に失敗しうる手順（サーバー起動）の後で起こす。
         let auth = user_auth_state(users.clone(), audit.clone());
 
-        // 試運転モードとロックダウン（docs/tag-server-design.md §5.6・
+        // 試運転モードとロックダウン（docs/hub/tag-server-design.md §5.6・
         // 2026-08-30 オーナー決定）: DB の永続状態からロックダウン済みかを
         // 解決する（`CommissioningService::load`・`crate::commissioning`の
         // モジュール doc 参照 - フラグ未設定は常に試運転モード、ユーザーの
@@ -846,12 +846,12 @@ impl HubRuntime {
                 "banto-hub: [WARN] 試運転モード: この PC からはログインなしで（試運転の grant で）\
                  管理 UI / 管理 REST を操作できます。運用に入る前に管理 UI からロックダウンを\
                  実行してください\
-                 （docs/tag-server-design.md §5.6「試運転モードとロックダウン」）。",
+                 （docs/hub/tag-server-design.md §5.6「試運転モードとロックダウン」）。",
             );
         }
 
         let clock = Arc::new(SystemClock);
-        // T2-2 (docs/tag-server-design.md §6-5): constructed here, OUTSIDE
+        // T2-2 (docs/hub/tag-server-design.md §6-5): constructed here, OUTSIDE
         // `CollectorManager`, so a broker-managed session (SLMP, Modbus TCP)
         // survives every catalog commit and run apply
         // (`CollectorManager::commit_catalog`/`apply_run`) - see
@@ -861,7 +861,7 @@ impl HubRuntime {
         // `manager.shutdown()` on the way out - see this module's doc
         // comment ("シャットダウン順序").
         //
-        // R2b-3a-2 (docs/banto-hub-driver-io-design.md §4.2): the broker opens
+        // R2b-3a-2 (docs/hub/driver/banto-hub-driver-io-design.md §4.2): the broker opens
         // a connection's secrets (only its driver's `secret_keys()`) just
         // before each dial, through this opener over the same database.
         let sessions = Arc::new(HubSessions::with_secret_opener(
@@ -873,7 +873,7 @@ impl HubRuntime {
             )),
         ));
 
-        // T9-2 (docs/ux-plan.md §1): constructed here, OUTSIDE
+        // T9-2 (docs/archive/ux-plan.md §1): constructed here, OUTSIDE
         // `CollectorManager`, for the same reason `sessions` is - a
         // simulator started for a `simulation = true` broker-routed
         // connection must survive every run apply
@@ -884,7 +884,7 @@ impl HubRuntime {
         // for why that is AFTER `sessions.shutdown()`.
         let sim_registry = Arc::new(BrokerSimRegistry::new());
 
-        // T6-2 (docs/tag-server-design.md §4.2): constructed here, OUTSIDE
+        // T6-2 (docs/hub/tag-server-design.md §4.2): constructed here, OUTSIDE
         // `CollectorManager`, for the same reason `sessions` is - the
         // computed engine's plan and `ServerTagStore`'s values must outlive
         // every single catalog commit, and the background evaluation loop below
@@ -977,7 +977,7 @@ impl HubRuntime {
         // 唯一の挙動変化").
         prune_once(&settings, &manager, clock.as_ref()).await;
 
-        // Audit-log retention sweep (docs/banto-hub-remaining-plan.md
+        // Audit-log retention sweep (docs/hub/banto-hub-remaining-plan.md
         // P3-a): startup-once, same as the tstore sweep above - see
         // [`audit_prune_once`]'s doc comment for why this rides along on
         // the tstore sweep's existing 24h loop below rather than staying
@@ -1012,7 +1012,7 @@ impl HubRuntime {
         let tags = TagService::with_registry(pool.clone(), registry.clone());
         let api_keys = ApiKeysService::new(pool.clone());
 
-        // T2-4 (docs/tag-server-design.md §6-6)。2026-09-09 オーナー決定
+        // T2-4 (docs/hub/tag-server-design.md §6-6)。2026-09-09 オーナー決定
         // (#340) で「起動時は必ず disabled」ルールを撤回し、永続値を復元する。
         // #433 (2026-09-24): 停止の状態は DB とデータディレクトリ内の状態
         // ファイルの 2 か所に記録し、起動時は「どちらか一方でも停止（または
@@ -1040,7 +1040,7 @@ impl HubRuntime {
         let controller = Arc::new(CollectionController::new(manager.clone()));
         let write_audit = WriteAuditService::new(pool.clone());
 
-        // T3 (docs/tag-server-design.md §5.3): construct stopped, then
+        // T3 (docs/hub/tag-server-design.md §5.3): construct stopped, then
         // apply the persisted settings - `enabled` comes straight from
         // settings (`SettingsService::mqtt_config`, applied a few lines
         // below), read fresh on every startup. MQTT publish has no
@@ -1059,7 +1059,7 @@ impl HubRuntime {
         });
         mqtt.apply(&mqtt_settings).await;
 
-        // T4 (docs/tag-server-design.md §5.4): gRPC は既定
+        // T4 (docs/hub/tag-server-design.md §5.4): gRPC は既定
         // disabled(§8「grpc.enabled(既定 false)」) - MqttPublisher と同じ
         // 「停止状態で構築 → 永続設定を apply」パターン。`rate_limiter` は
         // REST の書き込みハンドラ (`crate::rest::WriteState`)と**同一の**
@@ -1318,7 +1318,7 @@ impl HubRuntime {
         }
         if grpc_settings.enabled {
             log_line(&format!(
-                "banto-hub: gRPC (docs/tag-server-design.md §5.4) listening on port {}",
+                "banto-hub: gRPC (docs/hub/tag-server-design.md §5.4) listening on port {}",
                 grpc_settings.port
             ));
         } else {
@@ -1474,7 +1474,7 @@ pub struct RunningHub {
     /// （`crate::hub::CollectorManager` が所有する `Arc` の複製 -
     /// [`RunningHub::shutdown`] が接続タスクを止めるために持つ）。
     db_source: Arc<crate::db_source::DbSourceEngine>,
-    /// T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P2）: 保持するだけの
+    /// T17-1（docs/hub/banto-hub-t17-design.md §3「T17-1」・P2）: 保持するだけの
     /// フィールド - `RunningHub`（延いては[`RunningHub::shutdown`]消費後の
     /// `self`）が drop される時点で`ProfileLockGuard`自身の`Drop`が
     /// Windows mutex handle の`CloseHandle`／非 Windows lock file の fd
@@ -1791,7 +1791,7 @@ fn is_profile_dir(path: &Path, dir: &banto_safe_root::ManagedDir) -> bool {
     path == dir.path() || path == dir.final_path()
 }
 
-/// T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): create the reserved
+/// T6-2 (docs/hub/tag-server-design.md §4.2/§4.3(a)): create the reserved
 /// `"virtual"`-protocol connection named `name` if no connection with that
 /// name exists yet - idempotent across restarts (checked by name first
 /// rather than relying on the registry's `UNIQUE` constraint to reject a
@@ -1904,7 +1904,7 @@ async fn prune_once(
     }
 }
 
-/// One audit-log retention sweep (docs/banto-hub-remaining-plan.md P3-a
+/// One audit-log retention sweep (docs/hub/banto-hub-remaining-plan.md P3-a
 /// 追補、2026-08-12): read the configured retention policy (days/rows) and
 /// call [`AuditLogService::prune`]. Mirrors [`prune_once`]'s shape
 /// (best-effort - a settings-read failure or a prune failure is only
@@ -1981,7 +1981,7 @@ fn listening_urls(addr: std::net::SocketAddr) -> Vec<String> {
 /// 広げた CSP を普通のブラウザが受け取っても、`ipc:` は扱えない scheme で、
 /// `http://ipc.localhost` は**閲覧者自身の** loopback の 80/443 番を指すだけ
 /// （外への持ち出し先にはならない）。運用条件（プロキシは `Host` を保つ、
-/// 共有キャッシュは `Host` ごとに分ける）は docs/banto-hub-operations.md §6・
+/// 共有キャッシュは `Host` ごとに分ける）は docs/hub/banto-hub-operations.md §6・
 /// tag-server-design.md §5.6、banto の `security_headers.rs` 冒頭の doc を参照。
 pub(crate) fn hub_security_headers() -> SecurityHeaders {
     SecurityHeaders::new()
@@ -3951,7 +3951,7 @@ Host: {addr}
         hub.shutdown().await;
     }
 
-    /// T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P2）: `skip_profile_lock:
+    /// T17-1（docs/hub/banto-hub-t17-design.md §3「T17-1」・P2）: `skip_profile_lock:
     /// false`で、対象 profile を既に別のガードが保持している場合、
     /// `HubRuntime::start`は DB を一度も開かずに`HubStartError::ProfileLock`
     /// で失敗する（設計 §1 P2「失敗時は安全側で起動拒否」）。
@@ -4004,7 +4004,7 @@ Host: {addr}
         }
     }
 
-    /// P3-a 追補（2026-08-12、docs/banto-hub-remaining-plan.md）:
+    /// P3-a 追補（2026-08-12、docs/hub/banto-hub-remaining-plan.md）:
     /// [`audit_prune_once`] is the exact function [`HubRuntime::start`]
     /// calls both once at startup and on every tick of the 24h
     /// `prune_handle` loop (see that closure's body above) - the periodic
@@ -4090,7 +4090,7 @@ Host: {addr}
         assert_eq!(remaining, 1);
     }
 
-    // --- T19 S2-d (docs/banto-hub-t19-design.md §5.1、UX-39):
+    // --- T19 S2-d (docs/hub/banto-hub-t19-design.md §5.1、UX-39):
     // `prune_once`が`StoreSettings.retention_days`の`Option<i64>`化に
     // 追従していること（`Some`は従来どおり剪定、`None`＝無制限は剪定
     // しない）を、`audit_prune_once`の上の2テストと対になる形で固定する。

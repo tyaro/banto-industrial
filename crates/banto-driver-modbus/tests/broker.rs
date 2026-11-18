@@ -1,6 +1,6 @@
-//! Modbus TCP through the broker (R1-4a, docs/banto-driver-api-design.md
+//! Modbus TCP through the broker (R1-4a, docs/hub/driver/banto-driver-api-design.md
 //! §4.4): this was one of `banto-broker`'s own unit tests while the Modbus
-//! driver lived there. R2b-3a-2 (docs/banto-hub-driver-io-design.md §4.2):
+//! driver lived there. R2b-3a-2 (docs/hub/driver/banto-hub-driver-io-design.md §4.2):
 //! the broker dials through a `DriverRegistry` holding this crate's
 //! `driver()` as a session-type entry and speaks `TagSpec` / `WriteItem`.
 //! R2b-3c: the entry is frame-type now (`DriverEntry::frame`), wrapped by the

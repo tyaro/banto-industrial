@@ -1,5 +1,5 @@
 //! `PlcError` / `PlcWriteError` -> `banto-driver-api`'s `ItemError` /
-//! `FatalError` (docs/banto-driver-api-design.md §3.4, R1-4b).
+//! `FatalError` (docs/hub/driver/banto-driver-api-design.md §3.4, R1-4b).
 //!
 //! The flat `banto-plc` / `banto-plc-write` enums decide fatality with
 //! `is_connection_fatal()` (fatal by default). The API makes the same

@@ -1,5 +1,5 @@
 /**
- * `tagDataTypeOptions.ts`（R2b-6d-2b、docs/banto-hub-driver-ui-design.md §7）のユニットテスト。
+ * `tagDataTypeOptions.ts`（R2b-6d-2b、docs/hub/driver/banto-hub-driver-ui-design.md §7）のユニットテスト。
  * ホストの表の各場合と、偽のドライバ（SLMP 風・Modbus 風）の `supportedKinds` を固定する。
  */
 import { describe, expect, it } from 'vitest';

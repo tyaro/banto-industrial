@@ -1,6 +1,6 @@
 //! Admin-UI resource-change event plumbing (`banto_server::ServerEvent`,
 //! consumed by `banto_server::sse_route`) - **not** to be confused with
-//! `banto_collect::CollectEvent` (docs/tag-server-design.md §4.1's
+//! `banto_collect::CollectEvent` (docs/hub/tag-server-design.md §4.1's
 //! `config_changed`/collector lifecycle events), which is a different type
 //! flowing over a different channel (see `hub.rs`). This module just owns
 //! the app-wide broadcast channel `ServerEvent` rides on, so every resource

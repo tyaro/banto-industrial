@@ -1,4 +1,4 @@
-//! 書き込み監査 (docs/tag-server-design.md §6-3「log-before-write」)。
+//! 書き込み監査 (docs/hub/tag-server-design.md §6-3「log-before-write」)。
 //! `hub_write_audit` テーブル (`migrations-sqlite/0103_hub_write_audit.sql`) の
 //! 唯一のアクセス経路。relay-wright の `engine/write_audit.rs` と同じ
 //! **log-before-write** 規律を、hub の書き込みエンドポイント
@@ -247,7 +247,7 @@ impl WriteAuditRow {
         self
     }
 
-    /// T20 ①a(docs/banto-hub-t20-design.md §3.1): the `Option`-taking twin of
+    /// T20 ①a(docs/hub/banto-hub-t20-design.md §3.1): the `Option`-taking twin of
     /// [`Self::with_value_requested`], for callers whose value may be a
     /// string - `value_requested` is a `REAL` column that cannot hold text,
     /// so a string write's audit row leaves it `NULL` (`None`) rather than a
@@ -1307,7 +1307,7 @@ impl WriteAuditService {
     /// [`Self::insert_pending`] した行の `result` を確定させる
     /// (`broker.write` 成功なら `Ok`、確かに効いていなければ `Failed`、
     /// 送ったあとで結果が分からなければ `Uncertain` - #898)。`detail` は
-    /// 失敗理由の説明文(T8-2、docs/tag-server-design.md §6.1、
+    /// 失敗理由の説明文(T8-2、docs/hub/tag-server-design.md §6.1、
     /// 2026-08-06: 例えば T8 の RMW 確認読み不一致
     /// `PlcWriteError::BitWriteVerificationFailed`
     /// (`ItemError::VerificationFailed`)の「書き戻し競合の可能性があります」)- `crate::write_path::execute_write`
@@ -1492,7 +1492,7 @@ mod tests {
         assert_eq!(after, "ok");
     }
 
-    /// T8-2 (docs/tag-server-design.md §6.1, 2026-08-06): `set_result` also
+    /// T8-2 (docs/hub/tag-server-design.md §6.1, 2026-08-06): `set_result` also
     /// records a failure detail, so a T8 RMW confirmation-read mismatch's
     /// 「書き戻し競合の可能性があります」ends up on the confirmed audit row,
     /// not just the pending one this test's sibling

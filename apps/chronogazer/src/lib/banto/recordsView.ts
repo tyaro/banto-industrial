@@ -1,5 +1,5 @@
 /**
- * #1179 PR4b（docs/chronogazer-ui-improvement-proposal.md §2.1、2026-11-18）:
+ * #1179 PR4b（docs/chronogazer/chronogazer-ui-improvement-proposal.md §2.1、2026-11-18）:
  * 「記録」ページ（`(app)/tags/+page.svelte`）の「左ツリーで選んだ対象」と
  * 「中央のタブ」を URL のクエリと行き来させる純関数。HUB のタグページの
  * `apps/banto-hub/src/lib/banto/tagsView.ts`（#1179 PR3a）と同じ形にしてある。

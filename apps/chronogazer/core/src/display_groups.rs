@@ -70,7 +70,7 @@
 //! （`hubTag` = [`HubTagRow`]）を指せる（どちらか 1 つ）。作成・更新は 1 つの
 //! `BEGIN IMMEDIATE` の中で次を行う（[`DisplayGroupService::create_with_hub_tags`]・
 //! [`DisplayGroupService::update_with_hub_tags`]。REST・MCP・Tauri の作成・更新は
-//! すべてここを通る - docs/chronogazer-ui-improvement-proposal.md §4・§8）:
+//! すべてここを通る - docs/chronogazer/chronogazer-ui-improvement-proposal.md §4・§8）:
 //!
 //! 1. 更新なら、対象の存在と `expectedRevision`。
 //! 2. `hubTag` の外部名を、hub 接続の下の登録済みのタグ（`crate::hub_tags` の

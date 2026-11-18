@@ -1,4 +1,4 @@
-//! T7-2 の E2E テスト（docs/tag-server-design.md §4.3、実装指示のテスト計画
+//! T7-2 の E2E テスト（docs/hub/tag-server-design.md §4.3、実装指示のテスト計画
 //! 1・2・3・5 に対応 - 4「不正変更の all-or-nothing 維持」は
 //! `tests/integration.rs::an_invalid_config_keeps_the_old_collector_and_surfaces_last_config_error`
 //! が新実装（`apply_config` 経由の再反映）下でも通り続けることで確認済み
@@ -211,7 +211,7 @@ struct TestApp {
     token: String,
     pool: SqlitePool,
     manager: Arc<CollectorManager>,
-    /// T2-2/T7-2 (docs/tag-server-design.md §6-5/§4.3): exposed so a test can
+    /// T2-2/T7-2 (docs/hub/tag-server-design.md §6-5/§4.3): exposed so a test can
     /// check broker-side session bookkeeping directly (e.g.
     /// `HubSessions::connection_count`) without going through REST.
     sessions: Arc<HubSessions>,
@@ -500,7 +500,7 @@ fn str_array_contains(value: &Value, needle: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// 1. 本命: 無関係接続の無停止 (docs/tag-server-design.md §4.3(c))
+// 1. 本命: 無関係接続の無停止 (docs/hub/tag-server-design.md §4.3(c))
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -701,7 +701,7 @@ async fn unrelated_connection_is_uninterrupted_by_a_partial_reconfigure() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. 演算タグのみの変更 (docs/tag-server-design.md §4.3(a))
+// 2. 演算タグのみの変更 (docs/hub/tag-server-design.md §4.3(a))
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

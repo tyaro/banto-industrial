@@ -2,7 +2,7 @@
 //! `tag_registry_router`（接続・グループ・タグの I1 ルーター）、およびタグの
 //! 作成・更新ペイロード（`TagPayload`）。
 //!
-//! `rest.rs` から中身を変えずに移したもの（docs/banto-hub-driver-refactor-plan.md §8.1、
+//! `rest.rs` から中身を変えずに移したもの（docs/hub/driver/banto-hub-driver-refactor-plan.md §8.1、
 //! P0-1 の手順 4）。I1 CRUD の共通層は `rest/crud.rs` にあり、認証・ガード・監査の補助は
 //! 親の `rest.rs` にある。どちらも `use super::{...}` で使う。外から使われるパス
 //! （`crate::rest::X`）は親の re-export で保つ。
@@ -73,7 +73,7 @@ pub struct TagPayload {
     pub data_type: String,
     #[serde(default)]
     pub string_length: Option<i64>,
-    /// T20 ①a（docs/banto-hub-t20-design.md §3.1、2026-09-04 オーナー決定
+    /// T20 ①a（docs/hub/banto-hub-t20-design.md §3.1、2026-09-04 オーナー決定
     /// 「文字コードは既定 UTF-8、タグ単位で Shift-JIS も選択可」）。
     /// `#[serde(default = "default_tag_string_encoding")]`（= `"utf8"`）
     /// なので既存クライアントのペイロードは無変更で通る（`writable`等と
@@ -107,7 +107,7 @@ pub struct TagPayload {
     pub threshold_ll: Option<f64>,
     #[serde(default)]
     pub enabled: bool,
-    /// T2-3 (docs/tag-server-design.md §10-2/§6 item 1): `#[serde(default)]`
+    /// T2-3 (docs/hub/tag-server-design.md §10-2/§6 item 1): `#[serde(default)]`
     /// (= `false`) so an existing API client's payload (written before this
     /// field existed) still deserializes and creates a non-writable tag,
     /// exactly the pre-T2 behaviour (design §10-2: "既存の API クライアント
@@ -120,7 +120,7 @@ pub struct TagPayload {
     pub expression: Option<String>,
     #[serde(default)]
     pub retain: bool,
-    /// T18-1（docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目「revision /
+    /// T18-1（docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目「revision /
     /// ETag で後勝ち上書きを防ぐ」）: 編集画面が最後に取得した
     /// `Tag::revision`。`#[serde(default)]`（= `None`）なので既存クライアント
     /// のペイロードは無変更で通る（revision チェック無しの互換動作 -
@@ -196,7 +196,7 @@ async fn tags_list(State(state): State<TagRegistryState>) -> Result<Json<Vec<Tag
     Ok(Json(state.tags.list(ListParams::default()).await?.rows))
 }
 
-/// `POST /api/tags/list`（T18-5a 第2段、docs/banto-hub-t18-design.md §4
+/// `POST /api/tags/list`（T18-5a 第2段、docs/hub/banto-hub-t18-design.md §4
 /// 決定6「薄い部品の先行配線」）: `write_audit_list`/banto の `audit_log_list` と同型の
 /// 素通しハンドラ - `ListParams` をそのままサービスへ渡し `ListResult<Tag>`
 /// を返すだけ。認可は `GET /api/tags` と同じくルーター全体の
@@ -277,7 +277,7 @@ struct ParseAddressesResponse {
     items: Vec<ParseAddressResult>,
 }
 
-/// `POST /api/tags/parse-addresses`（R2b-2d、docs/banto-hub-driver-address-design.md §7.1）:
+/// `POST /api/tags/parse-addresses`（R2b-2d、docs/hub/driver/banto-hub-driver-address-design.md §7.1）:
 /// 保存と**同じ**関数（[`banto_tags::parse_tag_address`] = 項目の検証 →
 /// `normalize_tag_address`）に、保存の入口が使うのと同じドライバのレジストリ
 /// （`CollectorManager::registry()`。`CollectorManager::tags()` が `TagService::with_registry`
@@ -382,7 +382,7 @@ struct OffsetAddressesRequest {
     items: Vec<OffsetAddressItem>,
 }
 
-/// `POST /api/tags/offset-addresses`（R2b-6d-1、docs/banto-hub-driver-ui-design.md §4.3）:
+/// `POST /api/tags/offset-addresses`（R2b-6d-1、docs/hub/driver/banto-hub-driver-ui-design.md §4.3）:
 /// 各項目の接続のドライバでアドレスを `n` 点（`points`、連続登録）または `n` ワード
 /// （`words`、オフセットコピー・構造体登録）動かす。検証と動かした後の再検証は保存と同じ
 /// 関数（[`banto_tags::offset_tag_address`] → [`banto_tags::parse_tag_address`]）で、応答は
@@ -734,7 +734,7 @@ async fn tags_delete(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-// --- T11-1 一括登録 API (docs/ux-plan.md §3): 連続登録 UI と T11-2 の CSV
+// --- T11-1 一括登録 API (docs/archive/ux-plan.md §3): 連続登録 UI と T11-2 の CSV
 // インポートが共有する基盤 - transaction内検証 → all-or-nothing 適用 →
 // catalog commit 1回。
 // パターン展開（名前パターン/連続アドレス生成）はクライアント側（TS、
@@ -1394,7 +1394,7 @@ pub(super) fn tag_registry_router(
                 .put(plc_connections_update)
                 .delete(plc_connections_delete),
         )
-        // T12 (docs/ux-plan.md §4): 保存前の接続テスト - `{id}` の下ではなく
+        // T12 (docs/archive/ux-plan.md §4): 保存前の接続テスト - `{id}` の下ではなく
         // 固定パスなので `/api/plc-connections/{id}` と衝突しない
         // (下の `/api/tags/batch` と同型のパス設計)。
         .route("/api/plc-connections/test", post(plc_connections_test))
@@ -1411,7 +1411,7 @@ pub(super) fn tag_registry_router(
         )
         // H3: PLC の時計の読取り（何も書かない。直近の結果を 5 秒使い回す）。
         .route("/api/plc-connections/{id}/clock", get(plc_clock_get))
-        // S1a (docs/banto-hub-external-db-design.md §4.6): 保存済み接続の
+        // S1a (docs/hub/banto-hub-external-db-design.md §4.6): 保存済み接続の
         // 接続テスト - `{id}` の下の固定サブパスなので
         // `/api/plc-connections/{id}` の GET/PUT/DELETE とは axum のルート
         // マッチングで衝突しない。
@@ -1429,7 +1429,7 @@ pub(super) fn tag_registry_router(
                 .put(collection_groups_update)
                 .delete(collection_groups_delete),
         )
-        // S3（docs/banto-hub-external-db-design.md §7 row S3）: 保存済み
+        // S3（docs/hub/banto-hub-external-db-design.md §7 row S3）: 保存済み
         // グループの `query_sql` describe - `{id}` の下の固定サブパスなので
         // `/api/collection-groups/{id}` の GET/PUT/DELETE とは axum の
         // ルートマッチングで衝突しない（`/api/plc-connections/{id}/test`
@@ -1443,7 +1443,7 @@ pub(super) fn tag_registry_router(
             "/api/tags/{id}",
             get(tags_get).put(tags_update).delete(tags_delete),
         )
-        // T11-1 (docs/ux-plan.md §3): 一括登録 - `/api/tags/{id}` の下では
+        // T11-1 (docs/archive/ux-plan.md §3): 一括登録 - `/api/tags/{id}` の下では
         // なく `/api/tags` の下の固定パスなので、`{id}` (i64) パラメータと
         // 衝突しない。
         .route("/api/tags/batch", post(tags_batch))
@@ -1454,7 +1454,7 @@ pub(super) fn tag_registry_router(
         // パス（`/api/tags/batch`・`/api/tags/batch-update` と衝突しない
         // 別セグメント）。
         .route("/api/tags/batch-delete", post(tags_batch_delete))
-        // T18-5a 第2段 (docs/banto-hub-t18-design.md §4 決定6): `ListParams`
+        // T18-5a 第2段 (docs/hub/banto-hub-t18-design.md §4 決定6): `ListParams`
         // 素通しのページング付き一覧 - `/api/tags/batch`・`/api/tags/batch-update`
         // と同じ理由で `/api/tags/{id}` (i64 パラメータ) と衝突しない固定
         // セグメント (axum の matchit は静的セグメント優先 - 統合テストで
@@ -1466,7 +1466,7 @@ pub(super) fn tag_registry_router(
         // `tags_parse_addresses` の doc comment 参照）。
         .route("/api/tags/parse-addresses", post(tags_parse_addresses))
         .route("/api/tags/offset-addresses", post(tags_offset_addresses))
-        // R2b-6b（docs/banto-hub-driver-ui-design.md §4.1）: ドライバの一覧。読み取りなので
+        // R2b-6b（docs/hub/driver/banto-hub-driver-ui-design.md §4.1）: ドライバの一覧。読み取りなので
         // `require_session` だけ（`rest/drivers.rs` の doc）。
         .route("/api/drivers", get(drivers_list))
         // #342 段階A: 保存前の式検証（エラー位置・参照タグ解決・循環判定・

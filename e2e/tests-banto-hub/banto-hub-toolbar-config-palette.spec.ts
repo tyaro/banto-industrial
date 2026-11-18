@@ -1,5 +1,5 @@
 /**
- * T19 S4（UX-42、docs/banto-hub-t19-design.md §8.1/§7.6）: 構成パッケージの
+ * T19 S4（UX-42、docs/hub/banto-hub-t19-design.md §8.1/§7.6）: 構成パッケージの
  * export/import をコマンドパレット（Ctrl+K）に登録した配線を固定する。
  * ロジック自体（`loadConfigPackage`/`serializeConfigPackage`/
  * `applyConfigPackage`）は既存のユニットテストで検証済みなので、ここでは

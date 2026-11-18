@@ -1,4 +1,4 @@
-//! T19 S5 の統合テスト（docs/banto-hub-t19-design.md §3.7・UX-41）:
+//! T19 S5 の統合テスト（docs/hub/banto-hub-t19-design.md §3.7・UX-41）:
 //! `POST /mcp`（自前の最小 JSON-RPC 2.0）の E2E。
 //!
 //! `tests/write.rs`と同じ`TestApp`パターン（`api_router`で完全な
@@ -377,7 +377,7 @@ async fn make_tag(
     (tag.id, format!("{conn_name}.fast.{tag_name}"))
 }
 
-/// [`make_tag`]の string タグ版(T20 ①a、docs/banto-hub-t20-design.md
+/// [`make_tag`]の string タグ版(T20 ①a、docs/hub/banto-hub-t20-design.md
 /// §3.1)。`writable`/`enabled`は常に true。
 async fn make_string_tag(
     app: &TestApp,
@@ -1373,7 +1373,7 @@ async fn write_before_lockdown_success_lands_on_the_wire_through_execute_write()
     sim.stop();
 }
 
-/// T20 ①a (docs/banto-hub-t20-design.md §3.1): `write_tag_value` は文字列
+/// T20 ①a (docs/hub/banto-hub-t20-design.md §3.1): `write_tag_value` は文字列
 /// タグへの書き込みでも(数値と同様に)`execute_write`をそのまま通り、
 /// シミュレータのワイヤへ UTF-8 バイト列が届く。MCP がゲートを独自実装
 /// していない証拠(既存の数値テストと対になる)。
@@ -1868,7 +1868,7 @@ async fn write_recipe_one_bad_entry_aborts_the_whole_batch_with_no_audit_rows_an
 }
 
 // ---------------------------------------------------------------------------
-// 9. T21 S1-b（docs/banto-hub-t21-design.md §3・§4）: 構成補助ツール（接続
+// 9. T21 S1-b（docs/hub/banto-hub-t21-design.md §3・§4）: 構成補助ツール（接続
 //    CRUD）。`admin` スコープ必須・不可逆操作(delete)は confirm 必須・
 //    全操作を origin="mcp" で監査する、の3点を固定する。
 // ---------------------------------------------------------------------------
@@ -2257,7 +2257,7 @@ async fn delete_connection_with_confirm_deletes_and_audits() {
     );
 }
 
-/// #341（オーナー決定 2026-09-09、docs/tag-server-design.md §4.3）:
+/// #341（オーナー決定 2026-09-09、docs/hub/tag-server-design.md §4.3）:
 /// **ロックダウン済み**のときだけ pending queue を経由する - `test_app` は
 /// 試運転モード（未ロックダウン）が既定なので、このテストは明示的に
 /// `lock_down()` してからでないと queue の挙動を検証できない（試運転中の
@@ -2325,7 +2325,7 @@ async fn create_connection_while_collection_running_is_queued_not_applied() {
 }
 
 // ---------------------------------------------------------------------------
-// 10. T21 S1-c（docs/banto-hub-t21-design.md §3・§4）: 構成補助ツール第二弾
+// 10. T21 S1-c（docs/hub/banto-hub-t21-design.md §3・§4）: 構成補助ツール第二弾
 //    （接続 update/test・グループ CRUD）。9節（S1-b・接続 create/delete）と
 //    同じ3点を確認する - `admin` スコープ必須・不可逆操作(delete)は confirm
 //    必須・全操作を origin="mcp" で監査する。
@@ -2683,7 +2683,7 @@ async fn update_connection_missing_field_is_rejected_and_row_unchanged() {
     );
 }
 
-// --- S1 (docs/banto-hub-external-db-design.md §4.1・§4.6・§6): PostgreSQL
+// --- S1 (docs/hub/banto-hub-external-db-design.md §4.1・§4.6・§6): PostgreSQL
 // 接続エンティティ・接続テスト API の MCP 面 -------------------------------
 
 /// `create_connection`で`protocol: "postgres"`を作成すると、応答に
@@ -2959,7 +2959,7 @@ async fn test_saved_connection_against_a_real_postgresql_returns_the_server_vers
     eprintln!("test_saved_connection -> {server_version}");
 }
 
-/// 外部 DB 連携 S2（docs/banto-hub-external-db-design.md §4.1・§4.2）:
+/// 外部 DB 連携 S2（docs/hub/banto-hub-external-db-design.md §4.1・§4.2）:
 /// `update_group` の必須キー一覧に `querySql` が入った（PUT 置換の既存規約
 /// 「全項目必須 + null 許容」どおり）ことの回帰テスト -
 /// [`update_group_missing_field_is_rejected_and_row_unchanged`] の
@@ -3253,7 +3253,7 @@ async fn delete_group_with_confirm_cascades_and_audits() {
     );
 }
 
-/// #341（オーナー決定 2026-09-09、docs/tag-server-design.md §4.3）:
+/// #341（オーナー決定 2026-09-09、docs/hub/tag-server-design.md §4.3）:
 /// **ロックダウン済み**のときだけ pending queue を経由する - `test_app` は
 /// 試運転モード（未ロックダウン）が既定なので、このテストは明示的に
 /// `lock_down()` してからでないと queue の挙動を検証できない（試運転中の
@@ -3889,7 +3889,7 @@ async fn test_connection_without_admin_scope_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// 12. T21 S1-d（docs/banto-hub-t21-design.md §3・§4）: 構成補助ツール第三弾
+// 12. T21 S1-d（docs/hub/banto-hub-t21-design.md §3・§4）: 構成補助ツール第三弾
 //    （タグ CRUD）。9節・10節（S1-b/S1-c）と同じ3点を確認する - `admin`
 //    スコープ必須・不可逆操作(delete)は confirm 必須・全操作を
 //    origin="mcp" で監査する。加えて `update_tag`固有の2点
@@ -4476,7 +4476,7 @@ async fn delete_tag_with_confirm_deletes_and_audits() {
     );
 }
 
-/// #341（オーナー決定 2026-09-09、docs/tag-server-design.md §4.3）:
+/// #341（オーナー決定 2026-09-09、docs/hub/tag-server-design.md §4.3）:
 /// **ロックダウン済み**のときだけ pending queue を経由する - `test_app` は
 /// 試運転モード（未ロックダウン）が既定なので、このテストは明示的に
 /// `lock_down()` してからでないと queue の挙動を検証できない（試運転中の
@@ -5085,7 +5085,7 @@ async fn starting_collection_does_not_change_write_enabled() {
 // いるので、ここでは「set→get で往復する・監査行が残る・validation は
 // tool_error で拒否され状態は変わらない」ことだけを確認する（apply
 // 副作用そのものの検証は REST 側テストのスコープ、
-// `docs/banto-hub-t21-design.md`実装指示参照）。
+// `docs/hub/banto-hub-t21-design.md`実装指示参照）。
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5475,7 +5475,7 @@ async fn set_grpc_settings_rejects_invalid_bind_and_leaves_settings_unchanged() 
 }
 
 // ---------------------------------------------------------------------------
-// T21 S3（docs/banto-hub-t21-design.md、構成補助 MCP の最終スライス）:
+// T21 S3（docs/hub/banto-hub-t21-design.md、構成補助 MCP の最終スライス）:
 // API キー発行/一覧/失効・ロックダウン。ここまでの構成補助ツールと同じく
 // `admin` スコープ必須・不可逆操作(revoke/lock_down)は confirm 必須・
 // 全操作を origin="mcp" で監査する。`create_api_key`は admin を含む任意の
@@ -5727,7 +5727,7 @@ async fn list_api_keys_returns_issued_keys_without_plaintext_or_hash() {
     }
 }
 
-/// R2a-2b（docs/banto-hub-ingest-design.md §5「キーの作成」「キーの一覧」）:
+/// R2a-2b（docs/hub/banto-hub-ingest-design.md §5「キーの作成」「キーの一覧」）:
 /// MCP で `ingest:#{id}` のキーを発行でき（接続名では断る）、`list_api_keys`
 /// の `ingestTargets` が今の名前（改名に追従）と「（削除済み #id）」を出す。
 /// `ingest:` だけのキーは MCP でも値を読めず、構成も触れない（直交性）。
@@ -6109,7 +6109,7 @@ async fn after_lock_down_config_tools_still_work_but_writes_become_advisory() {
 }
 
 // ---------------------------------------------------------------------------
-// 外部 DB 連携 S4（docs/banto-hub-external-db-design.md §5.2）: DB Sink の
+// 外部 DB 連携 S4（docs/hub/banto-hub-external-db-design.md §5.2）: DB Sink の
 // Hub 側構成補助ツール5本。他の構成 CRUD ツールと同じ2点(admin スコープ
 // 必須・全操作を origin="mcp" で監査する)を固定する - pending queue は
 // 関与しないため、稼働中/停止中の分岐は無い(§6-13)。
@@ -6518,7 +6518,7 @@ async fn create_tag_rejects_a_dotted_external_name_collision() {
     assert_eq!(tags_row_count(&app).await, before_rows);
 }
 
-// --- push 接続の settings（docs/banto-hub-ingest-design.md §3.1・§3.2） -----------
+// --- push 接続の settings（docs/hub/banto-hub-ingest-design.md §3.1・§3.2） -----------
 
 /// 読み先の postgres 接続を 1 つ作り、その id を返す（ブリッジの `db_connection_id`）。
 async fn create_bridge_source_postgres(app: &TestApp, name: &str) -> i64 {
@@ -6925,7 +6925,7 @@ async fn connection_tool_schemas_advertise_the_settings_shape() {
 }
 
 // ---------------------------------------------------------------------------
-// R2b-1e（docs/banto-hub-connection-settings-design.md §5.3・§6.5・§8 の 1・§9）: MCP の
+// R2b-1e（docs/hub/banto-hub-connection-settings-design.md §5.3・§6.5・§8 の 1・§9）: MCP の
 // 入口（即時の作成・キューに積む作成と更新）から送ったパスワードは、キューに平文で載らず
 // （積む時点で封印した `sealedPassword` だけ）、Windows では起動時の後処理と VACUUM の後に
 // DB・WAL のバイト列に残らない（本物の DPAPI。偽の protector で全 OS の同じ確かめは core の

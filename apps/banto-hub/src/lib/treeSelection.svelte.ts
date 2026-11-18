@@ -1,5 +1,5 @@
 /**
- * #1179 PR3b（docs/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、段階 ①
+ * #1179 PR3b（docs/hub/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、段階 ①
  * 「2 つのページでツリーの選択を共有する」）: タグ登録（`/tags`）とタグモニタ
  * （`/monitor`）で最後に選んだツリーの対象。
  *

@@ -1,7 +1,7 @@
-//! T17-2 スライス2（docs/banto-hub-t17-design.md §3「T17-2」）:
+//! T17-2 スライス2（docs/hub/banto-hub-t17-design.md §3「T17-2」）:
 //! UAC 昇格ヘルパー `banto-hub-elev.exe` にだけ `requireAdministrator`
 //! マニフェスト（`banto-hub-elev.manifest`）を埋め込む。R1-7a
-//! （docs/banto-driver-api-design.md §2.4）で bin と一緒に `banto-hub-core` の
+//! （docs/hub/driver/banto-driver-api-design.md §2.4）で bin と一緒に `banto-hub-core` の
 //! `build.rs` から移した（core の `build.rs` には proto のコード生成だけが残る）。
 //! 移動で埋め込みが落ちないことは `src/manifest_tests.rs` が確かめる。
 //!

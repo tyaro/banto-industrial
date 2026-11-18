@@ -63,7 +63,7 @@
 //!
 //! Hub のデスクトップ版は LocalSystem でも管理者でもないので、`%ProgramData%\BantoHub\tls\` を
 //! 作れない。デスクトップ版は**利用者ごとの置き場**の鍵と証明書で 8723 を待ち受け、ChronoGazer
-//! はサービスの置き場と利用者の置き場の両方を pin として読む（docs/hub-desktop-tls-design.md
+//! はサービスの置き場と利用者の置き場の両方を pin として読む（docs/hub/hub-desktop-tls-design.md
 //! §4.1・§4.4）。その置き場と確かめが `user` モジュール:
 //!
 //! - **差し替えの口は 1 つ**（[`UserTlsPlace`]）。4 つの置き場（[`UserPlaceKind`]: `tls\`・

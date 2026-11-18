@@ -1,5 +1,5 @@
 /**
- * R2a-2b（docs/banto-hub-ingest-design.md §5・§11）: `apiKeyScopes.ts` の
+ * R2a-2b（docs/hub/banto-hub-ingest-design.md §5・§11）: `apiKeyScopes.ts` の
  * `ingest:#{id}` の組み立て・読み取りと、一覧の表示（今の名前の解決・削除
  * 済み）のテスト。文法の表は `apps/banto-hub/core/src/api_keys.rs` の
  * `ingest_scope_grammar_table` と同じ並び、文言は `mcp.rs` の

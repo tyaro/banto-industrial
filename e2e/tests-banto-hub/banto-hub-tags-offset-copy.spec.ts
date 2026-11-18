@@ -1,5 +1,5 @@
 /**
- * T20 機能②b オフセットコピー（docs/banto-hub-t20-design.md §3.2、2026-09-05
+ * T20 機能②b オフセットコピー（docs/hub/banto-hub-t20-design.md §3.2、2026-09-05
  * オーナー決定「命名ルール」）の実 DOM 受け入れテスト。
  *
  * 純関数の割付・命名・衝突検出ロジック自体は `offsetCopy.test.ts`（vitest）

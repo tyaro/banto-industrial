@@ -481,7 +481,7 @@ async fn issuing_with_invalid_scope_syntax_is_rejected() {
     assert_eq!(body["kind"], "validation");
 }
 
-/// R2a-2b（docs/banto-hub-ingest-design.md §5・§11 の監査「直交性」）:
+/// R2a-2b（docs/hub/banto-hub-ingest-design.md §5・§11 の監査「直交性」）:
 /// `ingest:#{id}` は REST で発行でき、`ingest:` だけのキーはタグ空間
 /// （catalog・値の読み取り・書き込み）にも、`admin` を要求するサイドカーの
 /// 口にも入れない。接続名で指した `ingest:Bridge1` は発行で断る。
@@ -678,7 +678,7 @@ async fn openapi_json_is_public_and_lists_tag_space_paths() {
     ] {
         assert!(paths.contains_key(path), "missing path: {path}");
     }
-    // T16-2 第三スライス（docs/banto-hub-t16-design.md §5）:
+    // T16-2 第三スライス（docs/hub/banto-hub-t16-design.md §5）:
     // `crate::http_hub_health::HttpHubHealthProbe`がワイヤ上で profile-id
     // を確認できるようにするための拡張フィールド。
     assert_eq!(
@@ -805,7 +805,7 @@ fn route_list_from_debug(router: &Router) -> Vec<String> {
 /// 全一覧を、コミット済みスナップショット（`tests/snapshots/routes.txt`、
 /// ソート済み・1 行 1 ルート）と完全一致で比較する。rest.rs を子モジュールへ
 /// 分割する間に、ルートが増減・変更していないことを検知するためのテスト
-/// （docs/banto-hub-driver-refactor-plan.md §8.1）。`HEAD` は axum が `GET`
+/// （docs/hub/driver/banto-hub-driver-refactor-plan.md §8.1）。`HEAD` は axum が `GET`
 /// から暗黙に扱うので一覧には出ない。再生成は
 /// `UPDATE_ROUTES_SNAPSHOT=1 cargo test -p banto-hub-core routes_snapshot`。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

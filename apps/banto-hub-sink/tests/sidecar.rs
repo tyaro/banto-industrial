@@ -1,4 +1,4 @@
-//! 外部 DB 連携 S5 の統合テスト（docs/banto-hub-external-db-design.md §7 の
+//! 外部 DB 連携 S5 の統合テスト（docs/hub/banto-hub-external-db-design.md §7 の
 //! スライス表「S5 の完了条件: interval / on_change・DB 停止中のキュー上限・
 //! 復帰後の flush・停止時の flush・Hub 再起動への追従」）。
 //!
@@ -110,10 +110,10 @@ struct PgTarget {
 }
 
 /// R1-3b: the built-in drivers as the `HubDrivers` `HubSessions::new` takes
-/// (docs/banto-driver-api-design.md §6.4).
+/// (docs/hub/driver/banto-driver-api-design.md §6.4).
 fn banto_drivers_helper() -> banto_hub_core::broker_glue::HubDrivers {
     let builtin = banto_drivers::builtin();
-    // R2b-1d (docs/banto-hub-connection-settings-design.md §10): the Hub's entrances,
+    // R2b-1d (docs/hub/banto-hub-connection-settings-design.md §10): the Hub's entrances,
     // plan and preflight read the registry now, so the host-provided protocols
     // (`push` / `postgres` / `virtual`) join the built-ins exactly as the real hosts'
     // `hub_drivers()` do - without them every postgres / push connection here would be
@@ -882,7 +882,7 @@ async fn sidecar_writes_rows_recovers_from_a_missing_table_and_pushes_a_final_st
 }
 
 /// `on_change` モード: 値が変わらない間は行が増えない（設計 §5.2 の
-/// 「変化時」と `docs/banto-tagclient-design.md` §4.5「静止した環境では
+/// 「変化時」と `docs/crates/banto-tagclient-design.md` §4.5「静止した環境では
 /// フレームが来ない」の組み合わせ）。DB Source が定数 `SELECT 42.5` を
 /// 返し続けるので、最初の 1 行の後は増えないのが正しい。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1158,7 +1158,7 @@ async fn starting_without_a_hub_waits_instead_of_exiting() {
         .expect("run() should end cleanly");
 }
 
-/// R2b-1d (docs/banto-hub-connection-settings-design.md §5.4・§9 「読めない」): when the
+/// R2b-1d (docs/hub/banto-hub-connection-settings-design.md §5.4・§9 「読めない」): when the
 /// Hub cannot read a `postgres` connection's password (here its sealed row is gone), the
 /// sidecar must **not** connect to that DB - not with an empty password either (a `trust`
 /// DB would accept it). Runs without `BANTO_TEST_PG_URL`: the "DB" is a plain TCP

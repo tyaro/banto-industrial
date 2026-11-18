@@ -2,7 +2,7 @@
 //! (`tests/*.rs`, pulled in via `mod common;` - the standard
 //! `tests/common/mod.rs` pattern).
 //!
-//! R2b-0 (docs/banto-driver-api-design.md §2.4): the integration tests that
+//! R2b-0 (docs/hub/driver/banto-driver-api-design.md §2.4): the integration tests that
 //! run real SLMP / Modbus sessions through the hub (simulators, the
 //! one-socket check, broker routing) moved here from
 //! `apps/banto-hub/core/tests/`, because `banto-hub-core` no longer depends on
@@ -23,7 +23,7 @@ mod core_common;
 pub use core_common::*;
 
 /// The built-in drivers as the `HubDrivers` an integration test injects into
-/// `HubSessions::new` / `HubConfig` (docs/banto-driver-api-design.md §6.4).
+/// `HubSessions::new` / `HubConfig` (docs/hub/driver/banto-driver-api-design.md §6.4).
 pub fn hub_drivers() -> banto_hub_core::broker_glue::HubDrivers {
     let builtin = banto_drivers::builtin();
     // R2b-1a: the host-provided protocols join the built-ins, as a host does.

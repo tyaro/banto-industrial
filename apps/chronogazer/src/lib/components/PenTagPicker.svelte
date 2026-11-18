@@ -1,6 +1,6 @@
 <script lang="ts">
 	/**
-	 * #1179 PR6b（docs/chronogazer-ui-improvement-proposal.md §4、2026-11-18）:
+	 * #1179 PR6b（docs/chronogazer/chronogazer-ui-improvement-proposal.md §4、2026-11-18）:
 	 * 「表示グループ」ページの右ペイン「タグ選択」。ペンに割り当てるタグを、
 	 * 接続先 → 収集グループのツリーか検索から選ぶ。判断（木の組み立て・行の状態・
 	 * 検索と打ち切り・上限）は `penTagPicker.ts` の純関数（unit test あり）で、

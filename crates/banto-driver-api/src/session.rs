@@ -1,5 +1,5 @@
 //! Session-type drivers: the driver owns its I/O
-//! (docs/banto-driver-api-design.md §5).
+//! (docs/hub/driver/banto-driver-api-design.md §5).
 //!
 //! For protocols whose client library does framing and I/O together (OPC UA,
 //! a database, the `push` receiver of external-db-design §9.5), the driver

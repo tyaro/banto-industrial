@@ -1,4 +1,4 @@
--- #1161 PR4（docs/chronogazer-agent-api-design.md §3.1）: AI エージェントなどの
+-- #1161 PR4（docs/chronogazer/chronogazer-agent-api-design.md §3.1）: AI エージェントなどの
 -- 機械クライアントが `/api/*` を使うための API キー。列は banto-hub の
 -- `0101_api_keys.sql` と同じ（発行・照合の SQL は共有 crate `banto-api-keys` が
 -- 一つだけ持つため）。列の意味は共有 crate の doc を参照（`last_used_at`・

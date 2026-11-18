@@ -1,5 +1,5 @@
 //! 設定モード ⇔ 運用モードの切り替えの、SCM の扱いと待ち方（#623 PR-4。設計は
-//! `docs/chronogazer-service-design.md` §5 の「設定モード ⇔ 運用モード」と、PR-1 設計書の
+//! `docs/chronogazer/chronogazer-service-design.md` §5 の「設定モード ⇔ 運用モード」と、PR-1 設計書の
 //! §3.6・§3.9・§8 の PR-4）。
 //!
 //! シェル（`src-tauri` の `shell`）が切り替えの画面から呼ぶ。ここは Tauri に触れず、SCM は
@@ -477,7 +477,7 @@ pub fn handoff_args(wait_pid: u32) -> [String; 2] {
 // ---------------------------------------------------------------------------
 
 /// インストーラが動いているシェルに「確認を出さずに後始末を通して終わる」ことを頼む引数
-/// （`docs/chronogazer-service-design.md` §4「インストーラによるシェルの停止」）。シェルが
+/// （`docs/chronogazer/chronogazer-service-design.md` §4「インストーラによるシェルの停止」）。シェルが
 /// 動いていれば single-instance でそのプロセスへ渡り、動いていなければ何も始めずに 0 で
 /// 終わる（`src-tauri` の `run()`）。
 pub const QUIT_FOR_UPDATE_ARG: &str = "--quit-for-update";

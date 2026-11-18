@@ -1,5 +1,5 @@
 /**
- * T19 S3-b（docs/banto-hub-t19-design.md §3.9、UX-46「サーバー状態の拡充」）:
+ * T19 S3-b（docs/hub/banto-hub-t19-design.md §3.9、UX-46「サーバー状態の拡充」）:
  * `hubStatus.ts` の `StatusResponse.system`（CPU%・バイト単位のメモリ値）を
  * 状態画面（`(app)/status/+page.svelte`）で人間可読に整形する純関数。
  *

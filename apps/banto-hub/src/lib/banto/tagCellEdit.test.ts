@@ -1,5 +1,5 @@
 /**
- * `tagCellEdit.ts`（T18-3e、docs/banto-hub-t18-design.md「T18-3e BantoGrid
+ * `tagCellEdit.ts`（T18-3e、docs/hub/banto-hub-t18-design.md「T18-3e BantoGrid
  * セル編集/TSV貼付の接続」）に対するユニットテスト。`tagBulkOps.test.ts` と
  * 同じスタイル（describe/it、依存ゼロの純関数を直接 import）。
  */

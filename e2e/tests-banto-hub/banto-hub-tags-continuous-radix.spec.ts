@@ -1,5 +1,5 @@
 /**
- * 連続登録の基数/bit 連番（T18-3c、docs/banto-hub-t18-design.md
+ * 連続登録の基数/bit 連番（T18-3c、docs/hub/banto-hub-t18-design.md
  * 「T18-3c 連続登録の基数/bit 連番」、TAG-UX-D）の実 DOM 受け入れテスト。
  * 受け入れ条件: `X1E→X1F→X20`（16進デバイス番号の桁上がり）、
  * `D100.E→D100.F→D101.0`（ワード内 bit 連番。bit サフィックスは T20-④で

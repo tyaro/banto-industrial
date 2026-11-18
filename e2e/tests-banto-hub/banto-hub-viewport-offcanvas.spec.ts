@@ -1,5 +1,5 @@
 /**
- * T19 S3-a（UX-43、docs/banto-hub-t19-design.md §8.2「案C・banto-hub のみ」）:
+ * T19 S3-a（UX-43、docs/hub/banto-hub-t19-design.md §8.2「案C・banto-hub のみ」）:
  * ≤900px オフキャンバスサイドバーの実 DOM 固定。
  *
  * ファイル名について: `banto-hub-auth.ts` の doc comment のとおり、

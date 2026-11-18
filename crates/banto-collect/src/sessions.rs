@@ -1,5 +1,5 @@
 //! [`BrokerSessions`]: the broker sessions a collector reads through, for a
-//! host that has no broker of its own (R2b-3a-3, docs/banto-hub-driver-io-design.md
+//! host that has no broker of its own (R2b-3a-3, docs/hub/driver/banto-hub-driver-io-design.md
 //! §8: ChronoGazer). One `banto_broker::BrokerSupervisor` dialing through the
 //! host's driver registry, plus the [`BrokerSimRegistry`] that substitutes a
 //! simulator's address for a `simulation = true` connection before its session

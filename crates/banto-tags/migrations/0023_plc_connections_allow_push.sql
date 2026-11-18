@@ -1,4 +1,4 @@
--- R2a-2a（docs/banto-hub-ingest-design.md §3.1・§3.2・§5.1、2026-10-21 オーナー決定
+-- R2a-2a（docs/hub/banto-hub-ingest-design.md §3.1・§3.2・§5.1、2026-10-21 オーナー決定
 -- Q6 = (a)「1 回の再構築で `push` と `settings` 列」）: plc_connections.protocol の
 -- CHECK に 'push' を足し、同じ再構築で列 `settings`（JSON、NULL 可）を足す。
 --

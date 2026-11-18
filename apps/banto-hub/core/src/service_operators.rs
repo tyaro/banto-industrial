@@ -1,8 +1,8 @@
-//! T17-2 スライス1（docs/banto-hub-t17-design.md §3「T17-2」・P3、
-//! docs/banto-hub-desktop-plan.md §8.3）: ローカルグループ
+//! T17-2 スライス1（docs/hub/banto-hub-t17-design.md §3「T17-2」・P3、
+//! docs/hub/banto-hub-desktop-plan.md §8.3）: ローカルグループ
 //! `BantoHub Operators` へのメンバーシップ判定。
 //!
-//! `host_switch`（T17-3、`docs/banto-hub-t17-design.md` §9「T17-2 スタブ」）
+//! `host_switch`（T17-3、`docs/hub/banto-hub-t17-design.md` §9「T17-2 スタブ」）
 //! は `HostSwitchConfig::can_operate_service: bool` を UAC helper が来るまでの
 //! 仮値（常に`false`）で受け取っていた - このモジュールはその判定を実際の
 //! Windows API 呼び出しで置き換えるための関数を提供する。
@@ -38,7 +38,7 @@
 //! 全環境を含む）では、[`is_current_process_operator`]は Windows API
 //! エラーにはせず、安全側で `Ok(false)` を返す（関数のドキュメント参照）。
 //!
-//! ## 既知の未検証事項（要 Windows 実機、`docs/banto-hub-t17-design.md` §5）
+//! ## 既知の未検証事項（要 Windows 実機、`docs/hub/banto-hub-t17-design.md` §5）
 //!
 //! `CheckTokenMembership` は **Administrators のような管理者グループ**に
 //! ついては、UAC 昇格前の split token（フィルタ済み標準トークン）で
@@ -56,7 +56,7 @@
 //! を双方要求する」・§16.3 の意図どおり、`BantoHub Operators`
 //! メンバーシップだけでなく Windows ローカル Administrators グループの
 //! メンバーシップでもサービス操作系トレイ項目を表示できるようにする
-//! （T16-2 第一スライスの既知の gap - `docs/banto-hub-t16-design.md` §5
+//! （T16-2 第一スライスの既知の gap - `docs/hub/banto-hub-t16-design.md` §5
 //! 「サービス操作系トレイ項目が Operators のみに限定されており、
 //! ローカル管理者が誤って隠される」）。
 //!
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn operators_group_name_matches_design_decision() {
-        // docs/banto-hub-desktop-plan.md §8.3 / docs/banto-hub-t17-design.md
+        // docs/hub/banto-hub-desktop-plan.md §8.3 / docs/hub/banto-hub-t17-design.md
         // P3 で確定した表記そのもの - 表記揺れがあるとインストーラ（slice 2）
         // が作るグループ名と実行時の判定がずれる。
         assert_eq!(OPERATORS_GROUP_NAME, "BantoHub Operators");

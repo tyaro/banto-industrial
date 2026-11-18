@@ -1,5 +1,5 @@
 //! host が自分で I/O を持つプロトコルのレジストリ項目（R2b-1a、
-//! docs/banto-hub-connection-settings-design.md §4.1）。
+//! docs/hub/banto-hub-connection-settings-design.md §4.1）。
 //!
 //! `push`（取り込み、[`crate::ingest::driver::PushDriver`]）・`postgres`
 //! （[`crate::db_source::driver::PostgresDriver`]）・`virtual`

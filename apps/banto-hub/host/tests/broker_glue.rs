@@ -4,7 +4,7 @@
 //! `#[cfg(test)] mod tests`. It checks the SLMP frame itself (the simulator's
 //! last subcommand: R = `0x0002`, Q = `0x0000`), which needs the real
 //! `banto-driver-slmp` - and `banto-hub-core` no longer depends on
-//! `banto-drivers` (docs/banto-driver-api-design.md §2.4). Everything it
+//! `banto-drivers` (docs/hub/driver/banto-driver-api-design.md §2.4). Everything it
 //! touches (`HubSessions`, `BrokerSimRegistry`) is public, so it moved here
 //! unchanged apart from the paths. The other `broker_glue` unit tests stayed in
 //! core on its fake drivers (`crate::test_support::test_drivers`).

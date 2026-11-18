@@ -1,7 +1,7 @@
 //! Hub 側のサイドカー専用 API（設計 §5.2・§6-15）へのクライアント:
 //! `GET /api/sink/config`（設定の取得）と `PUT /api/sink/status`（運転状態の
 //! push）、R2a-3b の DB ブリッジの `GET /api/ingest/bridge-config`
-//! （docs/banto-hub-ingest-design.md §10.2、[`BridgeConfig`]）。どれも
+//! （docs/hub/banto-hub-ingest-design.md §10.2、[`BridgeConfig`]）。どれも
 //! `Authorization: Bearer <api_key>` の admin スコープ限定
 //! （`banto_hub_core::rest::require_sink_admin`、ブリッジの設定も同じゲート - §12 Q13）。
 //!
@@ -53,7 +53,7 @@ pub struct SinkConfig {
     pub generated_at: i64,
     pub groups: Vec<SinkConfigGroup>,
     pub connections: Vec<SinkConfigConnection>,
-    /// R2b-1d（docs/banto-hub-connection-settings-design.md §5.4）: Hub がパスワードを
+    /// R2b-1d（docs/hub/banto-hub-connection-settings-design.md §5.4）: Hub がパスワードを
     /// 読めないので `connections` に載せなかった接続。この接続を引くグループは繋がずに
     /// 「Hub でパスワードを読めません」を状態に出す。古い Hub は返さない（空）。
     #[serde(default)]
@@ -93,7 +93,7 @@ pub struct SinkConfigGroup {
 /// （`connection_id` / `group_id` / `tag_id`）は `banto_tagclient::StableTagId`
 /// と同じ意味で、**DB 行（`ts, tag_id, external_name, value, quality`）用**。
 /// **購読は `external_name` で行う**（2026-09-30 オーナー決定、
-/// docs/scada-design.md §9.6）。
+/// docs/scada/scada-design.md §9.6）。
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SinkConfigTag {
@@ -143,7 +143,7 @@ impl fmt::Debug for SinkConfigConnection {
     }
 }
 
-/// `GET /api/ingest/bridge-config` の応答（R2a-3b、docs/banto-hub-ingest-design.md
+/// `GET /api/ingest/bridge-config` の応答（R2a-3b、docs/hub/banto-hub-ingest-design.md
 /// §10.2。Hub 側 `rest/ingest_bridge.rs` の `BridgeConfigResponse`）。
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -484,7 +484,7 @@ mod tests {
         assert_eq!(parsed.generated_at, 1000);
     }
 
-    /// R2b-1d (docs/banto-hub-connection-settings-design.md §5.4): `unavailableConnections`
+    /// R2b-1d (docs/hub/banto-hub-connection-settings-design.md §5.4): `unavailableConnections`
     /// / `unavailableSources` are read when present and default to empty (an older Hub
     /// does not send them); an unavailable connection is never in `connections`.
     #[test]

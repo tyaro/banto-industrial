@@ -47,7 +47,7 @@ export interface ConnectionStatusEntry {
 	 * T19 S2-a（UX-48、2026-09-03）: `unused` は「有効な収集グループが
 	 * 1つも無い接続」（=収集側もセッションを張らない）を表す。`stopped`
 	 * （無効化・未同期・実際に切れている等）とは意図的に区別する - 見た目
-	 * が同じだと「壊れている」と誤解される（`docs/banto-hub-t19-design.md`
+	 * が同じだと「壊れている」と誤解される（`docs/hub/banto-hub-t19-design.md`
 	 * §3.8）。
 	 */
 	status: 'connected' | 'reconnecting' | 'stopped' | 'unused';
@@ -71,7 +71,7 @@ export interface GrpcStatusEntry {
 }
 
 /**
- * `GET /api/status` の `system`（T19 S3-b、docs/banto-hub-t19-design.md
+ * `GET /api/status` の `system`（T19 S3-b、docs/hub/banto-hub-t19-design.md
  * §3.9、UX-46「サーバー状態の拡充」）。単位はいずれもサーバー側の生値
  * （バイト・パーセント） - MB/GB 表記やゲージ表示への整形は
  * `systemInfoFormat.ts` の純関数が担う（このファイルでは行わない）。
@@ -87,7 +87,7 @@ export interface SystemInfoEntry {
 }
 
 /**
- * S3（docs/banto-hub-external-db-design.md §7 row S3、実装指示8）: `GET
+ * S3（docs/hub/banto-hub-external-db-design.md §7 row S3、実装指示8）: `GET
  * /api/status` の `dbSource` 配列1件の中の `groups` 配列1件分 - mirrors
  * `banto_hub_core::rest::AdminDbSourceGroupStatusEntry`。`row_count_last`
  * は生成 SQL が `LIMIT 2` を付けるため `2` は「2行以上」を意味する
@@ -127,7 +127,7 @@ export interface DbSourceStatusEntry {
 }
 
 /**
- * S6（docs/banto-hub-external-db-design.md §5.2・§5.5・§7 row S6）: `GET
+ * S6（docs/hub/banto-hub-external-db-design.md §5.2・§5.5・§7 row S6）: `GET
  * /api/status` の `sink.groups` 配列1件分 - mirrors
  * `banto_hub_core::rest::AdminSinkGroupStatusEntry`（サイドカーが最後に
  * `PUT /api/sink/status` で push した内容をそのまま映す）。
@@ -159,7 +159,7 @@ export interface SinkStatusEntry {
 }
 
 /**
- * R2a-2e（docs/banto-hub-ingest-design.md §9）: `GET /api/status` の `ingest`
+ * R2a-2e（docs/hub/banto-hub-ingest-design.md §9）: `GET /api/status` の `ingest`
  * 配列の送り手 1 つ - mirrors `AdminIngestSenderStatusEntry`。`transport` は
  * `ws`（開いている WS、`connected_at` は開いた時刻）か `rest`（最後に受け付けた
  * 要求、`last_seen_at`）。API キーは名前だけ（値は来ない）。
@@ -250,11 +250,11 @@ export interface StatusResponse {
 	last_runtime_error: string | null;
 	/** T19 S3-b（UX-46）: サーバー自身の CPU 使用率・メモリ使用量。 */
 	system: SystemInfoEntry;
-	/** S3（docs/banto-hub-external-db-design.md §7 row S3）: DB Source の接続ごとの運転状態。 */
+	/** S3（docs/hub/banto-hub-external-db-design.md §7 row S3）: DB Source の接続ごとの運転状態。 */
 	db_source: DbSourceStatusEntry[];
-	/** R2a-2e（docs/banto-hub-ingest-design.md §9）: `push` 接続ごとの受信の状態。 */
+	/** R2a-2e（docs/hub/banto-hub-ingest-design.md §9）: `push` 接続ごとの受信の状態。 */
 	ingest: IngestStatusEntry[];
-	/** S6（docs/banto-hub-external-db-design.md §5.2・§5.5・§7 row S6）: DB Sink サイドカーの運転状態。 */
+	/** S6（docs/hub/banto-hub-external-db-design.md §5.2・§5.5・§7 row S6）: DB Sink サイドカーの運転状態。 */
 	sink: SinkStatusEntry;
 	/** R2b-1e（接続設定の設計 §5.8・§6.5）: 秘密値の保存方式と警告。古いサーバーは返さない。 */
 	secret_storage?: SecretStorageEntry;

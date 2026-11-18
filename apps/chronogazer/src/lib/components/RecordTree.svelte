@@ -1,6 +1,6 @@
 <script lang="ts">
 	/**
-	 * #1179 PR4b（docs/chronogazer-ui-improvement-proposal.md §2.1、2026-11-18）:
+	 * #1179 PR4b（docs/chronogazer/chronogazer-ui-improvement-proposal.md §2.1、2026-11-18）:
 	 * 「記録」ページの左ツリー。接続先 → 収集グループの 2 階層を banto の
 	 * `@banto/tree-svelte` の `BantoTree` に流し込む、アプリ側コンポーネント。
 	 * 手本は HUB の `apps/banto-hub/src/lib/components/ConnectionTree.svelte`

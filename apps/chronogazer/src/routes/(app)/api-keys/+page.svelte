@@ -1,6 +1,6 @@
 <script lang="ts">
 	/**
-	 * API キー管理画面（#1161 PR4b、docs/chronogazer-agent-api-design.md §3.3・§3.4・§7）。`admin` のみ到達
+	 * API キー管理画面（#1161 PR4b、docs/chronogazer/chronogazer-agent-api-design.md §3.3・§3.4・§7）。`admin` のみ到達
 	 * （+page.ts が非 admin を監視へ）。AI エージェントなどの外部クライアントが `Authorization: Bearer` で
 	 * `/api/*` を呼ぶためのキーを発行・失効・削除する。
 	 *

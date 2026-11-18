@@ -1,6 +1,6 @@
 //! banto-driver-api: the driver boundary of banto-hub / ChronoGazer - types
-//! and traits only (docs/banto-driver-api-design.md,
-//! docs/banto-hub-driver-refactor-plan.md §4 R1).
+//! and traits only (docs/hub/driver/banto-driver-api-design.md,
+//! docs/hub/driver/banto-hub-driver-refactor-plan.md §4 R1).
 //!
 //! This crate is the one place a PLC/instrument driver and the host (Hub's
 //! engine, ChronoGazer's collector) agree on vocabulary. It is published to
@@ -8,7 +8,7 @@
 //! here is therefore chosen to be stable, dependency-free, and free of
 //! logic.
 //!
-//! ## Design rules (docs/banto-driver-api-design.md §0, §2.1, §9)
+//! ## Design rules (docs/hub/driver/banto-driver-api-design.md §0, §2.1, §9)
 //!
 //! - **Types and traits only.** No planning, decoding, word-order math, I/O,
 //!   tokio or `thiserror`: `Display` is written by hand. The only dependency
@@ -60,7 +60,7 @@
 //! - [`schema`]: the description of a driver's connection settings
 //!   ([`SettingsSchema`]) and the names of the tag kinds it reads
 //!   ([`KindName`]), from which the Hub builds its generic forms (R2b-6a,
-//!   docs/banto-hub-driver-ui-design.md §3)
+//!   docs/hub/driver/banto-hub-driver-ui-design.md §3)
 //! - [`session`]: session-type drivers, which own their I/O
 //!   ([`SessionDriver`] / [`Session`], [`BoxFuture`]; R1-2, design §5)
 //! - [`clock`]: the optional PLC clock set ([`CivilTime`],
@@ -74,7 +74,7 @@
 //! ## Traits: what the built-in drivers implement
 //!
 //! Modbus TCP and SLMP are [`FrameDriver`]s registered as
-//! [`DriverKind::Frame`] (R2b-3c / 3d, docs/banto-hub-driver-io-design.md
+//! [`DriverKind::Frame`] (R2b-3c / 3d, docs/hub/driver/banto-hub-driver-io-design.md
 //! §6): the driver only builds and parses bytes, and the engine
 //! (`banto-driver-engine`, R2b-3b) owns the transport, the time limits and
 //! the request-response procedure, in `banto-broker`'s tasks. R1's

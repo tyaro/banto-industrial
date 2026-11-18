@@ -1,6 +1,6 @@
 /**
- * T18-2a（docs/banto-hub-t18-design.md「T18-2a 単票フォーム刷新」、
- * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-B）: `tags/+page.svelte` の
+ * T18-2a（docs/hub/banto-hub-t18-design.md「T18-2a 単票フォーム刷新」、
+ * docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-B）: `tags/+page.svelte` の
  * 単票 create/edit フォーム（`tagFields` スニペット）刷新に必要な、
  * 依存ゼロの純関数・定数だけを切り出す。`tagFormNumeric.ts`/
  * `tagDeleteImpact.ts`/`formDirty.ts` と同じ方針 — Svelte 側は `$state`/
@@ -23,7 +23,7 @@
  *    `groupsFor` 等に依存させないため、ここでは素の文字列・真偽値だけを
  *    受け取る）。
  * 3. **詳細セクションの「値設定済み」インジケータ**（T19 S1-b UX-36、
- *    docs/banto-hub-t19-design.md §2「スケーリング・閾値は詳細設定に
+ *    docs/hub/banto-hub-t19-design.md §2「スケーリング・閾値は詳細設定に
  *    格納。既定は閉じた状態。値が設定されているときは、閉じていても
  *    それが分かるようにする」、2026-09-02 オーナー決定）:
  *    {@link hasAnyFieldValue} と、インジケータ対象のフィールド集合定数

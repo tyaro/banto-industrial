@@ -10,7 +10,7 @@
 //! （デスクトップ／headless の `chronogazer-server`／Windows サービス）に増える
 //! ので、組み立てをこのモジュールの [`EngineRuntime`] 1 か所に寄せる
 //! （banto-hub の `HubRuntime` と同じ型。計画は
-//! docs/chronogazer-service-design.md §3.1(a)）。
+//! docs/chronogazer/chronogazer-service-design.md §3.1(a)）。
 //!
 //! # 起動の順序（[`EngineRuntime::open`] → [`OpenedEngine::start`]）
 //!
@@ -197,7 +197,7 @@
 //! メインの画面を出してから対処の窓に切り替えないため）。
 //!
 //! B1-1 より前のデスクトップとの差（どれも観測できる挙動を変えないと判断した。
-//! 理由は docs/chronogazer-service-design.md §4 の B1-2 の実装メモ）:
+//! 理由は docs/chronogazer/chronogazer-service-design.md §4 の B1-2 の実装メモ）:
 //! (a) 自動ログイン（監査に `login` を書く）が Hub と収集の組み立ての後になる
 //! （どちらも spawn して投げっぱなしで、Tauri のコマンドはまだ受けない）、
 //! (b) LAN の listener の bind が自動開始の spawn より前になる（serve は後。上の 7.）、
@@ -269,7 +269,7 @@ pub struct EngineConfig {
     /// 設定 DB のファイル。A1 の排他の単位でもある。
     pub db_path: PathBuf,
     /// 収集の計画を組み、broker のセッションがダイヤルするドライバ（R2b-3a-3、
-    /// docs/banto-hub-driver-io-design.md §8）。host が `banto_drivers::builtin().registry`
+    /// docs/hub/driver/banto-hub-driver-io-design.md §8）。host が `banto_drivers::builtin().registry`
     /// を詰める（このクレートは組み込みのドライバを名指ししない）。
     pub drivers: Arc<banto_driver_api::DriverRegistry>,
     /// `data.dir` の相対パスの基準（[`resolve_data_dir`]）。デスクトップは

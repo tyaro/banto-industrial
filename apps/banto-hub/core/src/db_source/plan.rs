@@ -1,4 +1,4 @@
-//! DB Source の実行計画（docs/banto-hub-external-db-design.md §4.2「実行
+//! DB Source の実行計画（docs/hub/banto-hub-external-db-design.md §4.2「実行
 //! モデル」・§4.5「稼働中の設定変更」）。
 //!
 //! [`crate::computed::build_plan`] と全く同じ立ち位置の**純関数**
@@ -21,7 +21,7 @@
 //! [`banto_collect::RegistrySnapshot`] を受け取り、`tag_key`
 //! （`"tag:{id}"`）だけを `crate::hub` と同じ規約で自前に組み立てる。
 //!
-//! ## パスワードの扱い（R2b-1e、docs/banto-hub-connection-settings-design.md §5.2・§5.4）
+//! ## パスワードの扱い（R2b-1e、docs/hub/banto-hub-connection-settings-design.md §5.2・§5.4）
 //!
 //! [`DbConnectionPlan`] は平文のパスワードを**持たない**。持つのは封印した行
 //! （[`crate::secrets::SealedSecret`]、参照・方式・blob）だけで、ポーリングタスクが接続を
@@ -50,7 +50,7 @@ pub struct DbSourcePlan {
     /// `(id, name)`。タスクは起動しないが、状態表示で `disabled` として
     /// 見せるために持ち回る（[`crate::db_source::status`]）。
     pub disabled: Vec<(i64, String)>,
-    /// R2b-1d（docs/banto-hub-connection-settings-design.md §5.4・§5.5）: 有効で回す
+    /// R2b-1d（docs/hub/banto-hub-connection-settings-design.md §5.4・§5.5）: 有効で回す
     /// グループもあるが、**パスワードを読めない**接続（秘密値の行が無い・この PC で
     /// 開けない）。タスクを起動せず（再試行でも繋ぎに行かない）、状態表示はその接続だけ
     /// `error`「パスワード: 読めません」、配下のタグは Bad（[`crate::db_source::DbSourceEngine`]

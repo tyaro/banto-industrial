@@ -1,5 +1,5 @@
 //! 接続の秘密値（R2b-1 の時点では `postgres` の `password` だけ）の封印と開封
-//! （R2b-1b、docs/banto-hub-connection-settings-design.md §5）。
+//! （R2b-1b、docs/hub/banto-hub-connection-settings-design.md §5）。
 //!
 //! # 何をするか
 //!
@@ -626,7 +626,7 @@ pub fn open_connection_secret(
 }
 
 /// broker がダイヤルの直前に接続の秘密値を開く口（R2b-3a-2、
-/// docs/banto-hub-driver-io-design.md §4.2、connection-settings 設計 §3.5）。
+/// docs/hub/driver/banto-hub-driver-io-design.md §4.2、connection-settings 設計 §3.5）。
 /// broker（`banto-broker`）は Hub の封印と DB に依存できないので、Hub が
 /// [`banto_broker::SecretOpener`] として注入する（`crate::runtime` が
 /// `HubSessions::with_secret_opener` に渡す）。broker はドライバの

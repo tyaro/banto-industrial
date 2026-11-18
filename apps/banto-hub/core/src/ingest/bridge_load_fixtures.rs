@@ -1,4 +1,4 @@
-//! ブリッジの送る量の見積もり（`banto_tags::bridge_load`、docs/banto-hub-ingest-design.md
+//! ブリッジの送る量の見積もり（`banto_tags::bridge_load`、docs/hub/banto-hub-ingest-design.md
 //! §7.1）の表を、画面の見積もり（`apps/banto-hub/src/lib/banto/bridgeLoad.ts`、R2a-2e）と
 //! **同じ fixtures**（`apps/banto-hub/src/lib/banto/bridgeLoad.fixtures.json`）で確かめる。
 //!

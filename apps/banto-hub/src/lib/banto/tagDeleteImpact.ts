@@ -1,5 +1,5 @@
 /**
- * T18-1（TAG-UX-C 5点目、docs/banto-hub-desktop-plan.md §9.4「削除前に演算
+ * T18-1（TAG-UX-C 5点目、docs/hub/banto-hub-desktop-plan.md §9.4「削除前に演算
  * タグ等の参照影響と完全な外部名を表示する」）: タグ削除前の確認ダイアログ
  * 用ヘルパー。フロントのみの実装で新規 API/DB変更はない — サーバー側の
  * 削除 preflight（`apps/banto-hub/core/src/rest.rs::tags_delete` →

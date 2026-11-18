@@ -60,7 +60,7 @@ pub enum PlcError {
     /// connection-fatal. Its producer, the public bridge
     /// `Address::from_driver_address`, is gone since R2b-3a-3; the variant
     /// stays in the drivers' classification tables until 3c / 3d remove this
-    /// crate's I/O (docs/banto-hub-driver-io-design.md §6).
+    /// crate's I/O (docs/hub/driver/banto-hub-driver-io-design.md §6).
     #[error("ドライバ {0:?} のアドレスは banto-plc では扱えません")]
     UnsupportedDriver(String),
 
@@ -149,7 +149,7 @@ impl PlcError {
     /// any wire traffic), [`Self::InvalidAddress`] and
     /// [`Self::UnsupportedDriver`] (one tag's address cannot be understood -
     /// since R2b-2a that is a per-tag verdict, never a reason to drop the
-    /// socket; design docs/banto-hub-driver-address-design.md §6, Q5).
+    /// socket; design docs/hub/driver/banto-hub-driver-address-design.md §6, Q5).
     ///
     /// Note the default is *fatal*: a variant added later is treated as
     /// "stop using this socket" until someone deliberately lists it here,

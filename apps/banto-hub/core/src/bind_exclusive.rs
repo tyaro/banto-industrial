@@ -1,4 +1,4 @@
-//! 待ち受けソケットの bind（#1121 PR2a、docs/hub-desktop-tls-design.md §4.5 の 2.）。
+//! 待ち受けソケットの bind（#1121 PR2a、docs/hub/hub-desktop-tls-design.md §4.5 の 2.）。
 //!
 //! Windows では bind の前に `SO_EXCLUSIVEADDRUSE` を付ける。効き方はアドレスで違う
 //! （この PC の Windows 11 で同じ利用者のソケットを使って確かめた結果）:
@@ -17,7 +17,7 @@
 //! 閉じた後に接続が残っても再 bind できる（この PC の Windows 11 で、サーバー側 TIME_WAIT・
 //! FIN_WAIT_2・未送信のデータが残った FIN_WAIT_1・接続が開いたまま listener だけ閉じた場合を確かめた。試験
 //! `rebind_after_*` / `rebind_while_*`）。証明書の差し替えは待ち受けを閉じずに TLS の設定だけを
-//! 替える設計（docs/hub-desktop-tls-design.md §4.2・§4.5）。再 bind に失敗したときは、今までどおり
+//! 替える設計（docs/hub/hub-desktop-tls-design.md §4.2・§4.5）。再 bind に失敗したときは、今までどおり
 //! 8723 の TLS 無しで起動して理由をログに出す（#644 のオーナー決定 B）。
 //!
 //! 文字列（`host:port`）の解決は `TcpListener::bind` と同じく `lookup_host` の結果を順に

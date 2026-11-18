@@ -1,4 +1,4 @@
-//! 送信口の認証の層 [`require_ingest_auth`]（R2a-2c、docs/banto-hub-ingest-design.md
+//! 送信口の認証の層 [`require_ingest_auth`]（R2a-2c、docs/hub/banto-hub-ingest-design.md
 //! §5・§6）。REST の `POST /api/v1/ingest/{id}/values`（[`super::rest`]）と R2a-2d の
 //! WebSocket `GET /api/v1/ingest/{id}/stream` が、同じこの層を
 //! `Router::route_layer` で被せる（経路は [`IngestAuthState::transport`] で区別し、

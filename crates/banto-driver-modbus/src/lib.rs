@@ -1,5 +1,5 @@
-//! `banto-driver-modbus`: the Modbus TCP driver (docs/banto-driver-api-design.md
-//! §2.3, §4.4; docs/banto-hub-driver-io-design.md §4).
+//! `banto-driver-modbus`: the Modbus TCP driver (docs/hub/driver/banto-driver-api-design.md
+//! §2.3, §4.4; docs/hub/driver/banto-hub-driver-io-design.md §4).
 //!
 //! ## What this crate is
 //!

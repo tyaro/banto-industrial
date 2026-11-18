@@ -1,5 +1,5 @@
 -- Widen plc_connections.protocol's CHECK to accept 'virtual' alongside
--- 'modbus-tcp'/'slmp' (docs/tag-server-design.md §4.2/§4.3(a), T6-2,
+-- 'modbus-tcp'/'slmp' (docs/hub/tag-server-design.md §4.2/§4.3(a), T6-2,
 -- 2026-08-05 決定: 演算タグ/内部タグの予約セグメント calc/mem は
 -- protocol='virtual' の予約接続として実現する - see this crate's
 -- `plc_connection.rs` module doc for the full rationale).

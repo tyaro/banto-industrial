@@ -1,5 +1,5 @@
 /**
- * R2b-1e（docs/banto-hub-connection-settings-design.md §5.5・§5.8・§6.5）:
+ * R2b-1e（docs/hub/banto-hub-connection-settings-design.md §5.5・§5.8・§6.5）:
  * 接続の秘密値（パスワード）まわりの表示文言の純関数。依存ゼロ
  * （`auditSpoolWarning.ts` と同じく vitest の最小構成で読めるようにしている）。
  *

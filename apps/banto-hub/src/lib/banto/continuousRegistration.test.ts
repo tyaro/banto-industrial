@@ -3,7 +3,7 @@
  * 対するユニットテスト（`tagFormNumeric.test.ts` と同じ describe/it スタイル）。
  * R2b-6d-2a 以降、アドレスの計算は REST の結果を受け取る純関数になったので、REST の結果は偽で与える。
  *
- * 回帰本体（TAG-P0-1、docs/banto-hub-desktop-plan.md §9）: Svelte 5 の
+ * 回帰本体（TAG-P0-1、docs/hub/banto-hub-desktop-plan.md §9）: Svelte 5 の
  * `<input type="number" bind:value>` は `continuousForm.count` へ
  * `number | null` を代入するが、旧 `continuousParams()` は
  * `form.count.trim()` を呼んでいたため `TypeError: count.trim is not a

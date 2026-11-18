@@ -9,7 +9,7 @@
 //! - **MELSEC device codes** ([`Address::parse_slmp`], I2a) - `D100`, `M50`,
 //!   `X1A`, `ZR0`. Parsed by [`crate::slmp::address`], which also owns the
 //!   bit-vs-word and decimal-vs-hex rules that notation needs.
-//! - **Bit-in-word notation** (T8, docs/tag-server-design.md §6.1) - a single
+//! - **Bit-in-word notation** (T8, docs/hub/tag-server-design.md §6.1) - a single
 //!   bit of a *word* device/area, named as a `.N` suffix on either notation
 //!   above: `D100.5` (SLMP) or `40001.3` (Modbus holding register), `N` in
 //!   `0..=15`, always decimal (see [`crate::slmp::address::parse`]'s doc
@@ -97,7 +97,7 @@ pub enum Address {
     /// would not fit (reference numbers above `xxxxx6` = offset 65536 do not
     /// exist in Modbus's 16-bit address space).
     ///
-    /// `bit` (T8, docs/tag-server-design.md §6.1) is `Some(0..=15)` for the
+    /// `bit` (T8, docs/hub/tag-server-design.md §6.1) is `Some(0..=15)` for the
     /// `"40001.3"` bit-in-word notation - a single bit within the register at
     /// `offset`, valid only for [`AddressArea::InputRegister`]/
     /// [`AddressArea::HoldingRegister`] (a coil/discrete-input address is
@@ -116,7 +116,7 @@ pub enum Address {
     ///
     /// Bit-vs-word is *not* a field here for the *device*: it is a property
     /// of `device` ([`SlmpDevice::access`]), so the two can never disagree.
-    /// `bit` (T8, docs/tag-server-design.md §6.1) is the separate, optional
+    /// `bit` (T8, docs/hub/tag-server-design.md §6.1) is the separate, optional
     /// bit-*in-word* notation (`"D100.5"`) - `Some(0..=15)` naming one bit of
     /// the word at `number`, valid only when `device` is a word device
     /// ([`crate::slmp::address::parse`] rejects a `.N` suffix on a bit device
@@ -149,7 +149,7 @@ impl Address {
     /// rename would be a breaking change to a crate I2a does not otherwise
     /// touch, bought with nothing but tidiness.
     ///
-    /// T8 (docs/tag-server-design.md §6.1) additionally accepts an optional
+    /// T8 (docs/hub/tag-server-design.md §6.1) additionally accepts an optional
     /// bit-in-word suffix: `.` followed by 1-2 **decimal** digits naming a
     /// bit position `0..=15` (`"40001.3"`). The suffix is only meaningful at
     /// [`AddressArea::InputRegister`]/[`AddressArea::HoldingRegister`] - a
@@ -546,7 +546,7 @@ mod tests {
         }
     }
 
-    // --- T8, docs/tag-server-design.md §6.1: Modbus bit-in-word notation --
+    // --- T8, docs/hub/tag-server-design.md §6.1: Modbus bit-in-word notation --
 
     #[test]
     fn parses_bit_in_word_notation_at_a_register_area() {

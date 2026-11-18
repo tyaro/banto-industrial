@@ -1,6 +1,6 @@
 //! `chronogazer-server` の Windows サービス（#392 B3-2b、2026-10-15。#623 PR-3 で
 //! 設定モード ⇔ 運用モードの ACL の付け替えを当てはめた - 設計は
-//! docs/chronogazer-service-design.md §5 と #623 の PR-1 の設計 §3）。**このファイル
+//! docs/chronogazer/chronogazer-service-design.md §5 と #623 の PR-1 の設計 §3）。**このファイル
 //! 全体が Windows だけ**（`chronogazer-server.rs` が `#[cfg(windows)]` で読み込む）。
 //!
 //! - [`run_service_dispatcher`]（`run-service`）: 共有ランナー

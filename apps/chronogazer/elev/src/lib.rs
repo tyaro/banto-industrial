@@ -1,5 +1,5 @@
 //! ChronoGazer の UAC 昇格ヘルパー `chronogazer-elev.exe` の中身（#392 B3-3b、
-//! 2026-10-16。設計は docs/chronogazer-service-design.md §3.3・§4 の B3-3b の実装メモ、
+//! 2026-10-16。設計は docs/chronogazer/chronogazer-service-design.md §3.3・§4 の B3-3b の実装メモ、
 //! 計画の承認は 2026-10-16 のオーナー決定 O1〜O4）。
 //!
 //! **ここは昇格の境界**（管理者として動くプロセスが、昇格していない呼び出し元から

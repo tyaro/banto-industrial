@@ -1,5 +1,5 @@
 /**
- * ChronoGazer R1-A smoke E2E (docs/r1-plan.md R1-A "CI に frontend/E2E
+ * ChronoGazer R1-A smoke E2E (docs/archive/r1-plan.md R1-A "CI に frontend/E2E
  * ジョブ追加").
  *
  * Runs against a real `banto-serve --features embed-ui` (chronogazer-core's

@@ -56,7 +56,7 @@ const KEY_RETENTION_DAYS: &str = "retention.days";
 const DEFAULT_DATA_DIR: &str = "./data";
 
 /// 時系列データの既定の保持期間（日）。**90 日**
-/// （docs/recorder-requirements.md §3.4「保持期間既定 90 日（設定可）」）。
+/// （docs/chronogazer/recorder-requirements.md §3.4「保持期間既定 90 日（設定可）」）。
 ///
 /// banto-hub の既定は 7 日だが、あれは**Hub のローカル記録**の話なので
 /// 真似しない。ChronoGazer は記録計そのものであり、要件の 90 日が正。
@@ -85,7 +85,7 @@ fn parse_retention(raw: Option<String>, default: Option<i64>) -> Option<i64> {
 ///   倣って `"./data"`。**相対パスの解決先**は
 ///   [`crate::collect::resolve_data_dir`]（アプリのデータディレクトリ基準）。
 /// * `retention_days`: 保持期間。既定 **90 日**
-///   （docs/recorder-requirements.md §3.4）。`None` は「無制限」
+///   （docs/chronogazer/recorder-requirements.md §3.4）。`None` は「無制限」
 ///   （[`AuditSettings`] と同じ約束 - [`parse_retention`]）。
 ///
 /// # 削除は `crate::retention` が行う
@@ -252,7 +252,7 @@ mod tests {
         );
     }
 
-    /// 既定は `./data`・**90 日**（docs/recorder-requirements.md §3.4）。
+    /// 既定は `./data`・**90 日**（docs/chronogazer/recorder-requirements.md §3.4）。
     /// banto-hub の 7 日を真似していないことを固定する。
     #[tokio::test]
     async fn store_config_defaults_when_unset() {

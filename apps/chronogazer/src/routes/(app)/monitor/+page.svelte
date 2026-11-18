@@ -1,6 +1,6 @@
 <script lang="ts">
 	/**
-	 * 監視画面（R1-D の D-1・D-2・D-3b、docs/r1-plan.md）。ログイン後の既定ページ
+	 * 監視画面（R1-D の D-1・D-2・D-3b、docs/archive/r1-plan.md）。ログイン後の既定ページ
 	 * （`routes/+page.ts`、`routes/login/+page.svelte`）。閲覧公開のセッションにも
 	 * 開いている（`navigation.ts` の `publicViewer: true`）。
 	 *

@@ -1,5 +1,5 @@
 //! PostgreSQL への接続オプションの唯一の組み立て点と、エラーの文言の整形
-//! （docs/banto-hub-external-db-design.md §4.2・§4.6・§2.2）。
+//! （docs/hub/banto-hub-external-db-design.md §4.2・§4.6・§2.2）。
 //!
 //! 元は `banto-hub-core` の `db_source/mod.rs`。Hub の接続テスト・ポーリング
 //! タスクと DB ブリッジ（R2a-3b）が同じ設定で繋ぎ、同じ文言で失敗を返す

@@ -213,7 +213,7 @@ describe('httpRequest の通常成功パス（200/201）は 202 分岐追加の�
 	});
 });
 
-describe('T18-5a 第2段（docs/banto-hub-t18-design.md §4 決定6）: listTagsPaged / listTagGroupCounts の配線', () => {
+describe('T18-5a 第2段（docs/hub/banto-hub-t18-design.md §4 決定6）: listTagsPaged / listTagGroupCounts の配線', () => {
 	it('listTagsPaged は POST /api/tags/list に params をそのまま渡し ListResult<Tag> を resolve する', async () => {
 		const listResult = { rows: [tagResource], totalCount: 1 };
 		mockFetchOnce({ status: 200, ok: true, body: listResult });
@@ -250,7 +250,7 @@ describe('T18-5a 第2段（docs/banto-hub-t18-design.md §4 決定6）: listTags
 	});
 });
 
-describe('T19 S2-c2（UX-40、docs/banto-hub-t19-design.md §3.10）: httpRequest の deferredDelete.flush() フック', () => {
+describe('T19 S2-c2（UX-40、docs/hub/banto-hub-t19-design.md §3.10）: httpRequest の deferredDelete.flush() フック', () => {
 	beforeEach(() => {
 		deferredDeleteFlush.mockClear();
 	});

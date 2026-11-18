@@ -1,4 +1,4 @@
-//! T2-2 (docs/tag-server-design.md §6-5, 2026-08-05 決定): wires banto-hub's
+//! T2-2 (docs/hub/tag-server-design.md §6-5, 2026-08-05 決定): wires banto-hub's
 //! SLMP collection reads through the shared `banto-broker` (I6) session
 //! instead of banto-collect opening its own socket, so a later write (T2-4)
 //! can share that same session ("読み書き単一セッション").
@@ -40,7 +40,7 @@
 //!   which `crate::hub::CollectorManager` hands to the collector through
 //!   `banto_collect::broker_client_factory` over the handles of this
 //!   directory - SLMP since T2-2, Modbus TCP since #337. R2b-3a-3
-//!   (docs/banto-hub-driver-io-design.md §4.3) moved that client - with #344's
+//!   (docs/hub/driver/banto-hub-driver-io-design.md §4.3) moved that client - with #344's
 //!   `connect` semantics (it reports the broker session's real state and waits
 //!   `banto_collect::BROKER_RECONNECT_GRACE` for a reconnecting one) - and
 //!   [`BrokerSimRegistry`] into `banto-collect`, so ChronoGazer, which reads
@@ -82,7 +82,7 @@
 //!
 //! ## T9-1/T9-2 note: broker-managed connections' simulation mode, wired via [`BrokerSimRegistry`]
 //!
-//! docs/ux-plan.md §1 (2026-08-06, 「接続単位のシミュレーションモード」) adds
+//! docs/archive/ux-plan.md §1 (2026-08-06, 「接続単位のシミュレーションモード」) adds
 //! `banto_tags::PlcConnection::simulation`. Until R2b-3a-3 a connection that
 //! bypassed this broker (any non-hub `banto-collect` caller) had
 //! `banto_collect::Collector` start an in-process simulator itself at
@@ -147,7 +147,7 @@ use tokio::sync::{watch, Mutex as AsyncMutex};
 pub use banto_collect::BrokerSimRegistry;
 
 /// The drivers the host injects into the engine (R1-3b,
-/// docs/banto-driver-api-design.md §6.4): the driver registry, which the
+/// docs/hub/driver/banto-driver-api-design.md §6.4): the driver registry, which the
 /// broker dials through since R2b-3a-2 (collection included since R2b-3a-3,
 /// which removed the direct collection client factory this used to carry).
 ///
@@ -160,7 +160,7 @@ pub use banto_collect::BrokerSimRegistry;
 /// drivers since R2b-3a-2) plus the Hub's own host-provided protocols. Its
 /// session-type entries are exactly the broker-managed protocols
 /// ([`HubSessions::is_broker_managed`]); the former side table `broker`
-/// (`banto_broker::DriverTable`) is gone (docs/banto-hub-driver-io-design.md
+/// (`banto_broker::DriverTable`) is gone (docs/hub/driver/banto-hub-driver-io-design.md
 /// §4.2).
 #[derive(Clone, Debug)]
 pub struct HubDrivers {
@@ -176,7 +176,7 @@ impl HubDrivers {
     /// connection is rejected by the broker as
     /// [`BrokerError::UnsupportedProtocol`]).
     ///
-    /// R2b-1d (docs/banto-hub-connection-settings-design.md §4.2): the registry still
+    /// R2b-1d (docs/hub/banto-hub-connection-settings-design.md §4.2): the registry still
     /// holds the Hub's own host-provided protocols (`push` / `postgres` / `virtual`,
     /// [`crate::host_provided::register_host_provided`]) - their I/O is the Hub's, not a
     /// driver's, and without `virtual` the Hub could not even create its reserved
@@ -202,7 +202,7 @@ impl HubDrivers {
 /// ## Session sync policy: additive + removal (T7-2, 2026-08-05 更新)
 ///
 /// T2-2 originally left this one-directional (`ensure_connection`-only, see
-/// this struct's git history / docs/tag-server-design.md §6-5's "不要分の
+/// this struct's git history / docs/hub/tag-server-design.md §6-5's "不要分の
 /// 放置" note for the original 2026-08-05 判断記録): every enabled SLMP
 /// connection the registry currently has gets [`HubSessions::ensure_connection`]'d
 /// (spawns a fresh broker task on first sight, returns the existing handle -
@@ -249,7 +249,7 @@ impl HubDrivers {
 /// until the commit replaces it; no sibling session is touched. See
 /// `CollectorManager::sync_broker_sessions_from`'s doc comment.
 ///
-/// **T19 S2-a addendum (UX-48, docs/banto-hub-t19-design.md §3.8,
+/// **T19 S2-a addendum (UX-48, docs/hub/banto-hub-t19-design.md §3.8,
 /// 2026-09-03)**: "every currently-enabled connection whose protocol the
 /// broker manages" above got one more condition - the connection also needs
 /// at least one *enabled collection group* (`banto_collect::
@@ -290,7 +290,7 @@ impl HubSessions {
     /// later) rebuild.
     ///
     /// R1-3b: the driver table comes from the composition root as part of
-    /// `drivers` (docs/banto-driver-api-design.md §6.4), not from this crate.
+    /// `drivers` (docs/hub/driver/banto-driver-api-design.md §6.4), not from this crate.
     pub fn new(backoff: banto_broker::BackoffConfig, drivers: HubDrivers) -> Self {
         Self::with_options(
             drivers,
@@ -409,7 +409,7 @@ impl HubSessions {
     }
 
     /// `connection_id` の broker セッションが既に生きていれば、その読み取り
-    /// 専用ハンドルを返す(新規に起動はしない) - T12(docs/ux-plan.md §4)の
+    /// 専用ハンドルを返す(新規に起動はしない) - T12(docs/archive/ux-plan.md §4)の
     /// 接続テストが、収集稼働中の SLMP 接続に対して2本目をダイヤルしてしまう
     /// 誤診(実機R08ENCPUは対象ポートが既に使用中だと同じポートへの2本目を
     /// 受け付けない、このモジュールの doc comment参照)を避けるための
@@ -418,7 +418,7 @@ impl HubSessions {
         self.directory.handle(connection_id).map(|h| h.read_only())
     }
 
-    /// Non-spawning write-capable peek (T15-4, docs/banto-hub-desktop-plan.md
+    /// Non-spawning write-capable peek (T15-4, docs/hub/banto-hub-desktop-plan.md
     /// T15 節): `connection_id` のセッションが既に生きていれば、その
     /// **書き込み可能な**フル [`banto_broker::BrokerHandle`] をそのまま返す
     /// (`Self::handle_for` と異なり `read_only()` へ絞らない) - なければ

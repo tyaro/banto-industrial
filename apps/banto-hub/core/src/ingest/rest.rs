@@ -1,5 +1,5 @@
 //! REST の送信口 `POST /api/v1/ingest/{id}/values`（R2a-2c、
-//! docs/banto-hub-ingest-design.md §6.2）。値を一括で送る送り手（スクリプト等）の口。
+//! docs/hub/banto-hub-ingest-design.md §6.2）。値を一括で送る送り手（スクリプト等）の口。
 //! 常時つなぐ送り手（DB ブリッジ）は R2a-2d の WebSocket を使う。
 //!
 //! ## 1 要求の流れ

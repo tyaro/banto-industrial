@@ -1,7 +1,7 @@
 //! The MELSEC MC / SLMP write side of this crate (I5): the write planner
 //! ([`planning`]) and the in-process read+write [`simulator`].
 //!
-//! R2b-3d-join (docs/banto-hub-driver-io-design.md §6.2): the I/O that used to
+//! R2b-3d-join (docs/hub/driver/banto-hub-driver-io-design.md §6.2): the I/O that used to
 //! live here - `SlmpWriteClient`, `execute_slmp_writes` (and with it the
 //! bit-in-word read-modify-write-confirm sequence over a borrowed
 //! `slmp::SLMPClient`) - is gone. `banto-driver-slmp`'s `FrameDriver` carries
@@ -25,7 +25,7 @@
 //!
 //! A write has a side effect, so [`planning`] merges only exactly-adjacent
 //! targets (the read planner tolerates a small gap to save round trips). See
-//! its module doc. For the bit-in-word RMW (docs/tag-server-design.md §6.1) the
+//! its module doc. For the bit-in-word RMW (docs/hub/tag-server-design.md §6.1) the
 //! plan is a mask-composed recipe ([`planning::SlmpPlannedBitWrite`]), and every
 //! [`planning::BitWriteMapping`] entry's own bit is checked independently
 //! against its own requested value by the confirming read - a mismatch is
@@ -163,7 +163,7 @@ mod tests {
 
     /// Same mapping table as `banto-plc`'s `classify_slmp_error_splits_fatal_from_per_request`,
     /// returning [`PlcWriteError`] instead - a plain structural `match`, no
-    /// message-text parsing (H9, docs/h9-slmp-structured-error-spec.md).
+    /// message-text parsing (H9, docs/hub/driver/h9-slmp-structured-error-spec.md).
     #[test]
     fn classify_slmp_error_splits_fatal_from_per_request() {
         let classify_for_test = |err| PlcWriteError::from(banto_plc::classify_slmp(err));

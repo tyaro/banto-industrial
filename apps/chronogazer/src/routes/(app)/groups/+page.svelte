@@ -7,7 +7,7 @@
 	 * 8 ペン（タグの割り当て）と、トレンド / デジタル / バー / 計器の表示種別を
 	 * 持つ。監視画面での描画は R1-D（段階 2）で、この画面は定義の編集だけ。
 	 *
-	 * **3 ペイン（#1179 PR6a、2026-11-18、docs/chronogazer-ui-improvement-proposal.md
+	 * **3 ペイン（#1179 PR6a、2026-11-18、docs/chronogazer/chronogazer-ui-improvement-proposal.md
 	 * §2.1・§4）**: 「記録」ページ（`tags/+page.svelte`）と同じ banto 系の型にした。
 	 * - 左 = 表示グループの一覧（1 階層。選択・並べ替え・追加・上限 16 の案内・
 	 *   読み込み誤り）。枠は `@banto/ui` の `ThreePaneLayout`（狭幅では左右が

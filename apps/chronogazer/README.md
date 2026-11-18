@@ -4,7 +4,7 @@
 データ保存 + リアルタイム/ヒストリカル/ハイブリッドトレンド + 計器表示を
 1台に統合する、banto-industrial 最初の製品アプリ（docs/plan.md §4）。
 要件定義は
-[../../docs/recorder-requirements.md](../../docs/recorder-requirements.md)。
+[../../docs/chronogazer/recorder-requirements.md](../../docs/chronogazer/recorder-requirements.md)。
 banto テンプレート（Tauri + SvelteKit）由来。SvelteKit 3・TypeScript 6（banto v4.0.0 の admin-template に
 追従、2026-10-05〜）。アプリ内の import は `#lib/...`（`package.json` の `imports`。`.ts` は `.js` を付けて
 書く、`.svelte` はそのまま）で、SvelteKit の設定は `vite.config.ts` の `sveltekit({...})` にある
@@ -28,7 +28,7 @@ URL にするときは `resolveAppPath()`（`src/lib/navigation.ts`）を通す�
   収集ランタイム統合は R1-C、実データでの監視画面は R1-D で入る予定
 
 今後の実施計画（R1-B 設定CRUD → R1-C 収集ランタイム統合 → R1-D 監視画面）は
-[../../docs/r1-plan.md](../../docs/r1-plan.md) を参照。
+[../../docs/archive/r1-plan.md](../../docs/archive/r1-plan.md) を参照。
 
 ## 起動方法
 
@@ -135,7 +135,7 @@ target\debug\chronogazer-server.exe        # Ctrl-C で停止
   別の ChronoGazer（デスクトップ版・`banto-serve` など）が使用中、3 その他の起動の失敗（理由と、
   手で行う対処をコンソールとログに出す。自動では何も直さない）。起動の途中で Ctrl-C・ウィンドウを閉じると、
   DB を開く・エンジンを始めるといった段の切れ目で起動を中止する（終了コード 3）。
-- **既知の制限**（設計は [docs/chronogazer-service-design.md](../../docs/chronogazer-service-design.md) §4 の
+- **既知の制限**（設計は [docs/chronogazer/chronogazer-service-design.md](../../docs/chronogazer/chronogazer-service-design.md) §4 の
   B1-5）: Ctrl-C の後始末が 4 秒を超えている最中にウィンドウを閉じる・ログオフすると、OS の猶予（約 5 秒）の
   ため最終の書き出しが切れうる。起動の直後（PLC に接続中）にウィンドウを閉じると、`collection_stopped` が
   残らないことがある（行は失わない）。コンソールの文字を選択して出力が止まっていると、コンソールへの写しだけ
@@ -253,7 +253,7 @@ Copy-Item target\release\chronogazer-elev.exe 'C:\Program Files\ChronoGazer\'
 サービスの ACL・データの ACL。登録は手動開始）まで行う。作り方は `scripts/build-release-chronogazer.ps1`
 （フロントエンド → 3 つの release ビルド → `apps/chronogazer/installer`（Hub と同じ xtask）→ `dist/chronogazer/<version>/`。
 `SHA256SUMS.txt` はその実行で置いたファイルだけを載せ、残っているほかのファイルは警告する）。
-設計は [docs/chronogazer-service-design.md](../../docs/chronogazer-service-design.md) §3.3 と §4 の B3-4 の実装メモ。
+設計は [docs/chronogazer/chronogazer-service-design.md](../../docs/chronogazer/chronogazer-service-design.md) §3.3 と §4 の B3-4 の実装メモ。
 
 - **上書きインストール**: 動いているシェルには `chronogazer.exe --quit-for-update` で正常終了を頼み（確認なしで
   最終 flush と `collection_stopped` を残して終わる）、プロセスが無くなるまで最大 90 秒待つ。超えても強制終了は
@@ -562,7 +562,7 @@ Hub 経由のタグを banto-hub から購読しているとき、Hub が
 | 理由を判別できない         | Hub の管理者に確認してください                                                                   | 2 分おきに自動で確かめる                                                                         |
 
 トリップ中は接続の状態も「キーがトリップ中」になり、キーの入力欄は出さない（キーを捨てさせない）。
-詳しくは [../../docs/banto-hub-client-bootstrap.md](../../docs/banto-hub-client-bootstrap.md) §5 / §10.6。
+詳しくは [../../docs/hub/banto-hub-client-bootstrap.md](../../docs/hub/banto-hub-client-bootstrap.md) §5 / §10.6。
 
 ## PLC 側の設定（SLMP、三菱 iQ-R）
 
@@ -588,6 +588,6 @@ ChronoGazer は接続ごとに SLMP の 1 ポートへ TCP でつなぐ。2026-1
 
 ## 関連ドキュメント
 
-- 要件定義: [../../docs/recorder-requirements.md](../../docs/recorder-requirements.md)
-- 実施計画（R1-A〜R1-D）: [../../docs/r1-plan.md](../../docs/r1-plan.md)
+- 要件定義: [../../docs/chronogazer/recorder-requirements.md](../../docs/chronogazer/recorder-requirements.md)
+- 実施計画（R1-A〜R1-D）: [../../docs/archive/r1-plan.md](../../docs/archive/r1-plan.md)
 - 全体計画（R系マイルストーン）: [../../docs/plan.md](../../docs/plan.md) §4

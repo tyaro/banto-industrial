@@ -1,5 +1,5 @@
 /**
- * BantoGrid セル編集/TSV貼付の接続（T18-3e、docs/banto-hub-t18-design.md
+ * BantoGrid セル編集/TSV貼付の接続（T18-3e、docs/hub/banto-hub-t18-design.md
  * 「T18-3e BantoGrid セル編集/TSV貼付の接続」、TAG-UX-D 後半）の実 DOM
  * 受け入れテスト。
  *

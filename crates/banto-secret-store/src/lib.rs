@@ -1,7 +1,7 @@
 //! `banto-secret-store`（#392 B1-3、H10）: 秘密（Hub の API キーなど）を、
 //! DPAPI で守ったファイルとして保護されたディレクトリに保存する共有 crate。
 //!
-//! 設計は docs/chronogazer-service-design.md §3.1(c)・§3.3・§5 の決定 4・§6。
+//! 設計は docs/chronogazer/chronogazer-service-design.md §3.1(c)・§3.3・§5 の決定 4・§6。
 //!
 //! # なぜ OS キーリングではないか
 //!

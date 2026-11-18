@@ -1,4 +1,4 @@
-# T6-1（docs/tag-server-design.md §4.2・§10-12、2026-08-05 決定の文法）:
+# T6-1（docs/hub/tag-server-design.md §4.2・§10-12、2026-08-05 決定の文法）:
 # 演算タグ（tag_kind = "computed"）の式を評価する依存ゼロの純粋クレート。
 # hub への配線（評価ループ・タグ空間統合・レジストリとの existence/型
 # 突き合わせ）は次スライス T6-2 の担当 - このクレートは式言語の字句・構文・
@@ -6,7 +6,7 @@
 # まだ参照されない）。
 [package]
 name = "banto-expr"
-description = "T6-1: 演算タグの式評価エンジン - 自前の再帰下降パーサ + 型検査 + 純関数評価器 + DAG 検証 (docs/tag-server-design.md §4.2, §10-12)"
+description = "T6-1: 演算タグの式評価エンジン - 自前の再帰下降パーサ + 型検査 + 純関数評価器 + DAG 検証 (docs/hub/tag-server-design.md §4.2, §10-12)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

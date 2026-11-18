@@ -1,4 +1,4 @@
-//! banto-hub の domain/service 層 (docs/tag-server-design.md, 特に §3〜§5)。
+//! banto-hub の domain/service 層 (docs/hub/tag-server-design.md, 特に §3〜§5)。
 //!
 //! banto-hub は「タグサーバー」— I1（banto-tags）のタグレジストリと
 //! I3b（banto-collect）の収集エンジンを1プロセスに束ね、REST でタグ空間
@@ -82,14 +82,14 @@
 //!   直近の結果
 //! - [`clock_read`]: H3（同 #1053）。PLC の時計の読取りの結果の分類・PLC と PC の
 //!   時刻の差・REST の GET と MCP の使い回し（実行は [`clock_sync::ClockSync`]）
-//! - [`runtime`]: T14-1（docs/banto-hub-t14-design.md §3「D1」）。
+//! - [`runtime`]: T14-1（docs/archive/banto-hub-t14-design.md §3「D1」）。
 //!   composition root（[`runtime::HubRuntime::start`]/
 //!   [`runtime::RunningHub::shutdown`]）- DB初期化〜各サービス構築〜
 //!   axumサーバー起動〜シャットダウン順序を1箇所に持ち、`bin/banto-hub.rs`
 //!   （コンソール）と `bin/banto_hub/win_service.rs`（Windows サービス）の
 //!   両ホストから呼ばれる薄い composition root。以前は bin 側の
 //!   `hub_run::run(shutdown)` だった
-//! - [`mcp`]: T19 S5（docs/banto-hub-t19-design.md §3.7、UX-41）。MCP
+//! - [`mcp`]: T19 S5（docs/hub/banto-hub-t19-design.md §3.7、UX-41）。MCP
 //!   （Model Context Protocol）サーバー - 既存の axum サーバーへ `POST /mcp`
 //!   （自前の最小 JSON-RPC 2.0、新規クレート依存なし）として統合する。
 //!   認証は既存の `bh_` API キー機構を流用し、書き込みツールは
@@ -102,14 +102,14 @@
 //!   `println!`/`eprintln!` の薄いラッパーで、Windows サービスモードの
 //!   間だけ同じ内容をファイルにもミラーする（[`hub_log`] のモジュール doc
 //!   参照）
-//! - [`service_manager`]: T17-0（docs/banto-hub-t17-design.md §3/§4）。
+//! - [`service_manager`]: T17-0（docs/hub/banto-hub-t17-design.md §3/§4）。
 //!   SCM 状態取得＋start/stop/restart/autostart 操作のホスト非依存ロジック
 //!   層（[`service_manager::ServiceManager`] trait）。テスト用の
 //!   [`service_manager::MockServiceManager`]（常に利用可能）と実 SCM を
 //!   叩く`WindowsServiceManager`（`#[cfg(windows)]`）の2実装を持つ。
 //!   `bin/banto_hub/win_service.rs`の既存`install`/`uninstall`CLI 自体は
 //!   このモジュールに置き換えていない（挙動不変、モジュール doc 参照）
-//! - [`profile_paths`]: T17-1（docs/banto-hub-t17-design.md §3「T17-1」・
+//! - [`profile_paths`]: T17-1（docs/hub/banto-hub-t17-design.md §3「T17-1」・
 //!   P1）。3ホスト共通の profile 絶対パス解決（`{root}/profiles/
 //!   <profile-id>/{config,data,logs}`、desktop-plan §11）と、それを使う
 //!   [`profile_paths::build_hub_config_from_env`]（`bin/banto-hub.rs`・
@@ -125,9 +125,9 @@
 //! - [`profile_mode`]・[`profile_owners`]: #661 661-2。サービスが profile を運用モードの
 //!   形に締めてから動き、止めたら緩める段の判定・文言（純関数）と、緩めるときに「変更」を
 //!   戻す相手の HKLM の記録（REG_MULTI_SZ）の読み書き（661-3 の昇格ヘルパーも使う）
-//! - [`profile_grant`]: profile ACL（docs/banto-hub-desktop-plan.md §11）。
+//! - [`profile_grant`]: profile ACL（docs/hub/banto-hub-desktop-plan.md §11）。
 //!   LocalSystem（Windows サービス）が先に作成した profile ディレクトリ・DB が
-//!   対話ユーザーから readonly になる実機不具合（docs/banto-hub-t16-design.md
+//!   対話ユーザーから readonly になる実機不具合（docs/hub/banto-hub-t16-design.md
 //!   §3 実機メモ「attempt to write a readonly database」）を、profile owner への
 //!   「変更」で解消する。#626（2026-10-16）で昇格の境界として作り直した: 確かめ
 //!   （profile-id の許可リスト・利用者の SID と`SidTypeUser`・マシンの環境だけの
@@ -148,13 +148,13 @@
 //!   `BANTO_HUB_TLS_*` が無ければ、ここを書き込みなしで確かめて読み（[`hub_tls_prepare::load`]、
 //!   #644 PR1b）、127.0.0.1:8723 で TLS を待ち受ける（読めない・8723 を取れないときは TLS 無しで
 //!   起動してサービスログに理由と対処を出す）
-//! - [`hub_health`]: T17-3（docs/banto-hub-t17-design.md §3「T17-3」・§4）。
+//! - [`hub_health`]: T17-3（docs/hub/banto-hub-t17-design.md §3「T17-3」・§4）。
 //!   設計 §4 に記述だけがあった[`hub_health::HubHealthProbe`] trait を実装
 //!   した - fallback UI（T16-2）が「別 profile/version」「mutex 所有者不明」
 //!   等を判定するための health/所有権確認。テスト用の
 //!   [`hub_health::MockHubHealthProbe`]を持つ（実 HTTP probe は
 //!   [`http_hub_health`]、T16-2 で追加）
-//! - [`http_hub_health`]: T16-2（docs/banto-hub-t16-design.md §3
+//! - [`http_hub_health`]: T16-2（docs/hub/banto-hub-t16-design.md §3
 //!   「T16-2」）。[`hub_health::HubHealthProbe`]の実 HTTP 実装
 //!   （[`http_hub_health::HttpHubHealthProbe`]）- `GET /api/v1/openapi.json`
 //!   への素朴な TCP/HTTP 往復（新規クレート依存なし）＋期待 profile の
@@ -169,7 +169,7 @@
 //!   を型で表現し、二重接続を起こさないことをテストで固定する。進行状態の
 //!   所有者はシェル（ネイティブ側）- このモジュール自身はタイマー・スレッドを
 //!   持たない（モジュール doc 参照）
-//! - [`service_operators`]: T17-2 スライス1（docs/banto-hub-t17-design.md
+//! - [`service_operators`]: T17-2 スライス1（docs/hub/banto-hub-t17-design.md
 //!   §3「T17-2」・P3）。ローカルグループ`BantoHub Operators`
 //!   （[`service_operators::OPERATORS_GROUP_NAME`]）へのメンバーシップ判定
 //!   （[`service_operators::is_current_process_operator`]）- T16-2/
@@ -201,9 +201,9 @@
 //! - [`upgrade`]: R2b-1d・R2b-1e。戻せない移行（`banto-tags` の 0025）の前の残り物の掃除・
 //!   写しでの予行と preflight・パスワードを除いたバックアップと、毎回の起動の秘密値の後処理
 //!   （Windows での `plain-v1` の封印し直し・未適用キューの封印・履歴の行からの除去・清掃待ちの
-//!   印を見た `VACUUM`）と整合の確認（docs/banto-hub-connection-settings-design.md §6.1〜§6.5・
+//!   印を見た `VACUUM`）と整合の確認（docs/hub/banto-hub-connection-settings-design.md §6.1〜§6.5・
 //!   §5.3）。
-//! - [`ingest`]: R2a（docs/banto-hub-ingest-design.md）。取り込み口 `push`
+//! - [`ingest`]: R2a（docs/hub/banto-hub-ingest-design.md）。取り込み口 `push`
 //!   （外の送り手が Hub へ値を送り込む接続）。静的な部分の
 //!   [`ingest::driver::PushDriver`]（`DriverBase`。R2b-1a から host が `HostProvided` でレジストリに登録する、[`host_provided`]）と、
 //!   受信側の [`ingest::IngestHub`]（保持値・Live の判定・epoch。Hub の収集の
@@ -213,7 +213,7 @@
 //!   [`ingest::audit`]）は R2a-2c。WebSocket の送信口
 //!   `GET /api/v1/ingest/{id}/stream`（[`ingest::ws`]、1 接続に 1 本・再検証・背圧）は
 //!   R2a-2d
-//! - [`secrets`]: R2b-1b（docs/banto-hub-connection-settings-design.md §5）。接続の秘密値の
+//! - [`secrets`]: R2b-1b（docs/hub/banto-hub-connection-settings-design.md §5）。接続の秘密値の
 //!   封印と開封（[`secrets::ConnectionSecrets`]。Windows は `banto-secret-store` の
 //!   `DpapiMachine` で `dpapi-machine-v1`、それ以外は `plain-v1`）。entropy に参照とキーを
 //!   入れ、`Debug`・エラーに平文と blob を出さない。R2b-1d で DB・REST・MCP・キュー・読む側へ
@@ -280,7 +280,7 @@ pub mod system_info;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod tls_listener;
-/// R2b-1d（docs/banto-hub-connection-settings-design.md §6.1〜§6.4）: 戻せない移行
+/// R2b-1d（docs/hub/banto-hub-connection-settings-design.md §6.1〜§6.4）: 戻せない移行
 /// （`banto-tags` の 0025）の前の掃除・写しでの予行と preflight・バックアップ・
 /// 起動時の秘密値の整合の確認。
 pub mod upgrade;

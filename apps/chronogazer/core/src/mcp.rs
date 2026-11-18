@@ -1,4 +1,4 @@
-//! ChronoGazer の MCP（`POST /mcp`、#1161 PR5b、docs/chronogazer-agent-api-design.md
+//! ChronoGazer の MCP（`POST /mcp`、#1161 PR5b、docs/chronogazer/chronogazer-agent-api-design.md
 //! §5.3）。
 //!
 //! JSON-RPC の受け付け・`initialize`・`ping`・`tools/list`・`tools/call` の形は

@@ -1,6 +1,6 @@
 /**
- * T18-2d（docs/banto-hub-t18-design.md「T18-2d 初回導線チェックリスト」、
- * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A「初回導線と親設定の引継ぎ」）
+ * T18-2d（docs/hub/banto-hub-t18-design.md「T18-2d 初回導線チェックリスト」、
+ * docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-A「初回導線と親設定の引継ぎ」）
  * で導入した、ツリー選択/URLクエリからのフォームプリセット決定を担う、
  * 依存ゼロの純関数群。`tagFormCarry.ts`/`tagDeleteImpact.ts` と同じ方針 -
  * Svelte 側（`tags/+page.svelte`）は `$state`/`$effect`/DOM 組み立てに
@@ -13,7 +13,7 @@
  * `resolveAppPath()`（SvelteKit の `resolve()`）を通す方針に揃えた
  * （banto-hub は `base` を使わないので URL は変わらない）。
  *
- * T19 S1-d（docs/banto-hub-t19-design.md UX-44、2026-09-03）: 初回
+ * T19 S1-d（docs/hub/banto-hub-t19-design.md UX-44、2026-09-03）: 初回
  * チェックリスト本体（PLC接続作成→収集グループ作成→タグ登録→収集開始→
  * モニタで値確認の完了判定・次工程算出、`computeOnboardingSteps`/
  * `nextOnboardingStep`/`isOnboardingComplete`/`connectionAwaitingGroup`/
@@ -42,7 +42,7 @@ function isVirtual(connection: Pick<PlcConnection, 'protocol'>): boolean {
 }
 
 /**
- * S3（docs/banto-hub-external-db-design.md §4.1）: `PlcConnection.protocol
+ * S3（docs/hub/banto-hub-external-db-design.md §4.1）: `PlcConnection.protocol
  * === "postgres"`（DB Source）かどうか。`isVirtual`と同じ「依存ゼロ」方針で
  * `tagRegistryAdmin.isDbSourceConnection`は呼ばず同じ判定をここに複製する -
  * {@link resolveRegistrationTarget}がグループの`tagKind`を`'db'`へ確定
@@ -61,8 +61,8 @@ const CALC_CONNECTION_NAME = 'calc';
 const MEM_CONNECTION_NAME = 'mem';
 
 /**
- * T18-4c（docs/banto-hub-t18-design.md「T18-4c 確認導線」、
- * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-H「新規／変更タグを『確認対象』
+ * T18-4c（docs/hub/banto-hub-t18-design.md「T18-4c 確認導線」、
+ * docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-H「新規／変更タグを『確認対象』
  * として値・品質・時刻へ1クリックで移動できるようにする」）: タグ登録
  * ページの各成功ハンドラから `/monitor` へ渡す遷移先を組み立てる。
  *
@@ -157,7 +157,7 @@ export function resolveGroupIdFromTreeSelection(
 }
 
 /**
- * T19 S1-c（UX-33、docs/banto-hub-t19-design.md「タグ登録の起点」、2026-09-02
+ * T19 S1-c（UX-33、docs/hub/banto-hub-t19-design.md「タグ登録の起点」、2026-09-02
  * オーナー決定「グループ選択時に右画面を出し、そのグループに対して登録する」）:
  * 現在のツリー選択から、タグ登録操作（新規登録・連続登録）を提示してよいか、
  * 提示するなら対象グループは何かを1つの値にまとめる。`null` は「提示しない」

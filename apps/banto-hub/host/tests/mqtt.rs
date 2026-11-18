@@ -1,4 +1,4 @@
-//! T3 の統合テスト（docs/tag-server-design.md §5.3）: 実際の axum `Router`
+//! T3 の統合テスト（docs/hub/tag-server-design.md §5.3）: 実際の axum `Router`
 //! と Modbus TCP シミュレータ（`tests/integration.rs`と同じ）、そして
 //! **in-process MQTT ブローカー（`rumqttd`）**を使った E2E。`tests/write.rs`/
 //! `tests/stream.rs`と同じ理由で `fast_options`/`wait_until`等をこのファイル

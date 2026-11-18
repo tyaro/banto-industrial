@@ -1,4 +1,4 @@
--- 外部 DB 連携 S2（docs/banto-hub-external-db-design.md §4.1・§4.2・§6-4、
+-- 外部 DB 連携 S2（docs/hub/banto-hub-external-db-design.md §4.1・§4.2・§6-4、
 -- 2026-09-06 オーナー決定「案A: 既存 3 階層の流用」）: DB Source 本体が要求
 -- する2つのスキーマ変更を1本にまとめる。
 --

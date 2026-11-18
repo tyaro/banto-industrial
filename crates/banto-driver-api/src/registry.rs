@@ -1,10 +1,10 @@
 //! [`DriverRegistry`]: driver id → implementation
-//! (docs/banto-driver-api-design.md §6.1).
+//! (docs/hub/driver/banto-driver-api-design.md §6.1).
 //!
 //! A plain `BTreeMap` lookup plus the registration order (`ids()` follows it,
-//! not the id order; R2b-6, docs/banto-hub-driver-ui-design.md §4.1); no logic. The host builds it (the
+//! not the id order; R2b-6, docs/hub/driver/banto-hub-driver-ui-design.md §4.1); no logic. The host builds it (the
 //! `banto-drivers` assembler plus the host's own [`DriverKind::HostProvided`]
-//! protocols). Since R2b-3a-2 (docs/banto-hub-driver-io-design.md §4.2) it is
+//! protocols). Since R2b-3a-2 (docs/hub/driver/banto-hub-driver-io-design.md §4.2) it is
 //! also what the broker dials through: a [`DriverKind::Frame`] (run on the
 //! `banto-driver-engine` engine; Modbus TCP and SLMP since R2b-3c / 3d) or
 //! [`DriverKind::Session`] entry is a protocol the broker manages;
@@ -39,7 +39,7 @@ pub enum DriverKind {
     Frame(Arc<dyn FrameDriver>),
     /// A session-type driver: it owns its I/O.
     Session(Arc<dyn SessionDriver>),
-    /// **A permanent kind** (R2b-1a, docs/banto-hub-connection-settings-design.md
+    /// **A permanent kind** (R2b-1a, docs/hub/banto-hub-connection-settings-design.md
     /// §4.1). A protocol the *host* implements itself - banto-hub's `push`
     /// (ingest), `postgres` (DB source) and `virtual` (computed) - whose
     /// identification, settings validation, secret keys and address
@@ -52,7 +52,7 @@ pub enum DriverKind {
     /// R1 also had a `HostBound` kind (a built-in whose I/O the host wired
     /// through the side table `banto_broker::DriverTable`); R2b-3a-2 moved
     /// the built-ins to [`Session`](Self::Session) and removed it (a 0.x
-    /// minor break, design §9.1, docs/banto-hub-driver-io-design.md §10),
+    /// minor break, design §9.1, docs/hub/driver/banto-hub-driver-io-design.md §10),
     /// and R2b-3c / 3d then moved them on to [`Frame`](Self::Frame).
     /// `HostProvided` stays: it is how a host registers a protocol that is
     /// not a device driver at all, so that settings validation and address

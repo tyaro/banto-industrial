@@ -13,7 +13,7 @@
 //!
 //! **Bindings and writes are keyed by `external_name`
 //! (`{connection}.{group}.{tag}`), never by the Hub's numeric
-//! [`StableTagId`]** (2026-09-30 owner decision, docs/scada-design.md §9.6).
+//! [`StableTagId`]** (2026-09-30 owner decision, docs/scada/scada-design.md §9.6).
 //! Every Hub public contract (WebSocket subscribe, `POST /api/v1/values/{tag}`,
 //! the write scope, MQTT) already speaks names, and a numeric ID changes on
 //! delete-and-recreate or a CSV re-import and cannot be carried across
@@ -38,7 +38,7 @@
 //! (`TagClientState::snapshot`) that holds the catalog, the
 //! [`BindingResolution`], and the values of the same attempt, so a caller
 //! never pairs values with a catalog from another generation
-//! (docs/banto-tagclient-partial-binding-design.md §6, R1-R7). The three parts
+//! (docs/crates/banto-tagclient-partial-binding-design.md §6, R1-R7). The three parts
 //! are separate `Arc`s, so cloning the state out of `state_watch` is O(1)
 //! however large the catalog is. `generation` is a process-wide counter
 //! (unique across every handle, so a new `start` after `shutdown` never reuses
@@ -67,7 +67,7 @@
 //! `config_changed` while `Unbound` rebinds (and goes `Live` once a requested
 //! name exists). Reaching `Unbound` starts a new rebind budget but does not
 //! reset the reconnect backoff, which only `Live` data does
-//! (docs/banto-tagclient-partial-binding-design.md §5.1 / §7).
+//! (docs/crates/banto-tagclient-partial-binding-design.md §5.1 / §7).
 //!
 //! The DTOs mirror the machine-facing snake_case `/api/v1/tags` and
 //! `/api/v1/values` responses. Unknown mode, source, and quality strings are

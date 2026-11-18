@@ -1,5 +1,5 @@
 //! シェルがサービスの health を確かめる probe（#392 段階 B の B2-4a、
-//! `docs/chronogazer-service-design.md` §3.2・2026-10-14 オーナー決定 O8）。
+//! `docs/chronogazer/chronogazer-service-design.md` §3.2・2026-10-14 オーナー決定 O8）。
 //!
 //! 起動判定（[`crate::shell_launch::decide`]）が SCM の `Running` を見たときだけ
 //! 呼ぶ（[`crate::shell_launch::needs_probe`]）。手順:

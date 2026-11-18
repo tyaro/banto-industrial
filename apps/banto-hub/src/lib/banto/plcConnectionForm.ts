@@ -14,14 +14,14 @@
  * 2. **新規作成時の連番名プリフィル**（TAG-UX-8「空欄で出さず
  *    `connection1` のように、既存の接続名と衝突しない最小の連番を初期値に
  *    入れる」）: {@link nextConnectionName}。
- * 3. **ドライバの接続設定**（R2b-6c、docs/banto-hub-driver-ui-design.md §6）: 機器の
+ * 3. **ドライバの接続設定**（R2b-6c、docs/hub/driver/banto-hub-driver-ui-design.md §6）: 機器の
  *    ドライバ（`GET /api/drivers`）の欄はスキーマから組み立てる。既定値・検査・送る
  *    `settings`・ドライバを替えたときの引き継ぎは `driverSettingsForm.ts`（このモジュールは
  *    それを `driver` の欄として持つだけ）。プロトコルごとの既定ポート・既定のワード順の表は
  *    持たない（スキーマの `default` が正）。
  * 4. **ホストの接続 `postgres` の設定**: `settings` の `host`・`port`・`database`・
  *    `username` と秘密の `password`（tri-state: {@link passwordForSubmit}）。
- * 5. **取り込み口 `push` の設定**（R2a-2e、docs/banto-hub-ingest-design.md
+ * 5. **取り込み口 `push` の設定**（R2a-2e、docs/hub/banto-hub-ingest-design.md
  *    §3.2・§7.1）: `stale_timeout_ms` とブリッジの区画（読む `postgres` 接続・
  *    クエリ・列とキーの対応）のフォーム状態と `settings` の JSON の往復
  *    （{@link pushSettingsFromForm}・{@link pushFormFromSettings}）、保存前の
@@ -80,7 +80,7 @@ export function protocolOptions(
 	return [
 		...drivers.map((d) => ({ value: d.id, label: d.displayName })),
 		{ value: POSTGRES_PROTOCOL, label: 'PostgreSQL（DB Source）' },
-		// R2a-2e（docs/banto-hub-ingest-design.md §3.1）: 取り込み口。送り手（DB
+		// R2a-2e（docs/hub/banto-hub-ingest-design.md §3.1）: 取り込み口。送り手（DB
 		// ブリッジ・スクリプト）が Hub へ値を送る接続で、接続先を持たない。
 		{ value: PUSH_PROTOCOL, label: '取り込み（push・送り手が値を送る）' }
 	];
@@ -145,7 +145,7 @@ export function nextConnectionName(
 }
 
 /**
- * S1（docs/banto-hub-external-db-design.md §4.1、`crates/banto-tags/src
+ * S1（docs/hub/banto-hub-external-db-design.md §4.1、`crates/banto-tags/src
  * /plc_connection.rs`の`MAX_DATABASE_LEN`/`MAX_USERNAME_LEN`）: サーバー側
  * バリデーションの上限文字数をそのままミラーする。{@link validatePostgresFields}
  * が使う。
@@ -337,7 +337,7 @@ export function passwordForSubmit(
 }
 
 /**
- * S1（docs/banto-hub-external-db-design.md §4.1）: クライアント側の事前
+ * S1（docs/hub/banto-hub-external-db-design.md §4.1）: クライアント側の事前
  * 検証 - サーバー側`validate_plc_connection_input`の postgres 必須ルール
  * （`database`/`username`が trim 後空でないこと、`MAX_DATABASE_LEN`/
  * `MAX_USERNAME_LEN`以内であること）だけをミラーする。他プロトコルでは
@@ -487,7 +487,7 @@ export function driverFieldsOnLoad(
 	return rebuilt ? { driver: rebuilt } : null;
 }
 
-// --- R2a-2e: 取り込み口 `push` の設定（docs/banto-hub-ingest-design.md §3.2・§7.1） ---
+// --- R2a-2e: 取り込み口 `push` の設定（docs/hub/banto-hub-ingest-design.md §3.2・§7.1） ---
 
 /** {@link parseBridgeColumns} の結果。`error` は最初に見つけた行の誤り（無ければ `null`）。 */
 export interface ParsedBridgeColumns {

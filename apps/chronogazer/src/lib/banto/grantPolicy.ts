@@ -1,5 +1,5 @@
 /**
- * 資格情報なしで入る口の順序（#392 B2-2、設計書 docs/chronogazer-service-design.md
+ * 資格情報なしで入る口の順序（#392 B2-2、設計書 docs/chronogazer/chronogazer-service-design.md
  * §3.2・§4 の B2-2 の実装メモ）。`(app)` のガード（`routes/(app)/+layout.ts`）が、
  * 確定した `none` のときにこれを呼ぶ。
  *

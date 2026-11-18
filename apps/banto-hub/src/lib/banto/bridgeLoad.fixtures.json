@@ -1,5 +1,5 @@
 {
-  "description": "R2a-2e（docs/banto-hub-ingest-design.md §7.1）: ブリッジの送る量の見積もり bridge_load の表。Rust（apps/banto-hub/core/src/ingest/bridge_load_fixtures.rs が banto_tags::bridge_load に掛ける）と TS（bridgeLoad.test.ts が bridgeLoad.ts に掛ける）が同じ expected を出すことを確かめる。keys は配列（そのままのキー）か { count, template（{i} を 0 始まりの番号に置き換える）, padStart・padChar（左を埋める）, repeat・times（1 文字を times 回）}。expected は Rust の UPDATE_BRIDGE_LOAD_FIXTURES=1 で作り直せる",
+  "description": "R2a-2e（docs/hub/banto-hub-ingest-design.md §7.1）: ブリッジの送る量の見積もり bridge_load の表。Rust（apps/banto-hub/core/src/ingest/bridge_load_fixtures.rs が banto_tags::bridge_load に掛ける）と TS（bridgeLoad.test.ts が bridgeLoad.ts に掛ける）が同じ expected を出すことを確かめる。keys は配列（そのままのキー）か { count, template（{i} を 0 始まりの番号に置き換える）, padStart・padChar（左を埋める）, repeat・times（1 文字を times 回）}。expected は Rust の UPDATE_BRIDGE_LOAD_FIXTURES=1 で作り直せる",
   "cases": [
     {
       "name": "1,000 件は 1 メッセージ",

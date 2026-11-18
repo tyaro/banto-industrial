@@ -1,6 +1,6 @@
 /**
  * タグ更新の楽観的ロック + 競合時の差分表示 UI（T18-1、TAG-UX-C 4点目、
- * docs/banto-hub-desktop-plan.md §9.4「revision / ETag で後勝ち上書きを
+ * docs/hub/banto-hub-desktop-plan.md §9.4「revision / ETag で後勝ち上書きを
  * 防ぎ、競合時は差分を表示する」）の実 DOM 受け入れテスト。検出（revision
  * + HTTP 409）は `cursor/t18-1-tags-revision-e3cb` 済み。本 spec は続く
  * `cursor/t18-1-tags-conflict-diff-e3cb` で追加した差分表示 UI（フィールド

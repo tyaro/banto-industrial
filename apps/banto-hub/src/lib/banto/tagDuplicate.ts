@@ -1,6 +1,6 @@
 /**
- * T18-3a（docs/banto-hub-t18-design.md「T18-3a タグ複製」、
- * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-D 前半「『このタグを複製』、
+ * T18-3a（docs/hub/banto-hub-t18-design.md「T18-3a タグ複製」、
+ * docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-D 前半「『このタグを複製』、
  * 型/単位/スケーリング/しきい値を引継ぎ名前とアドレスのみ変更する」）:
  * タグ単票の「複製」Drawer が使う、依存ゼロの純関数。`tagFormCarry.ts`/
  * `tagFormLayout.ts` と同じ方針 - `+page.svelte` 側の `FormState` を直接

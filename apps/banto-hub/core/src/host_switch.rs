@@ -1,5 +1,5 @@
-//! T17-3（docs/banto-hub-t17-design.md §3「T17-3」、
-//! docs/banto-hub-desktop-plan.md §9.9「タスクトレイと停止時 fallback」・
+//! T17-3（docs/hub/banto-hub-t17-design.md §3「T17-3」、
+//! docs/hub/banto-hub-desktop-plan.md §9.9「タスクトレイと停止時 fallback」・
 //! §16.3「desktop⇔service 切替の中間状態を追加」）: Desktop↔Service 切替
 //! トランザクションの状態機械。
 //!

@@ -2,7 +2,7 @@
 //! status の GET 系と、`/api/v1/*` 認証（API キー + セッション bearer 併用、
 //! 設計 §5.6・T0-2）のミドルウェア・`tag_space_router`。
 //!
-//! `rest.rs` から中身を変えずに移したもの（docs/banto-hub-driver-refactor-plan.md §8.1、
+//! `rest.rs` から中身を変えずに移したもの（docs/hub/driver/banto-hub-driver-refactor-plan.md §8.1、
 //! P0-1 の手順 7）。OpenAPI の `ApiDoc` と `openapi_router` は親の `rest.rs` に残り、
 //! ハンドラと応答型は `use` で取り込んで `#[utoipa::path]` の名前解決を保つ。
 //! 外から使われるパス（`crate::rest::X`）は親の re-export で保つ。
@@ -47,7 +47,7 @@ pub(crate) struct TagSpaceState {
     pub(crate) write_control: Arc<WriteControl>,
     /// T3（設計 §5.3）: `GET /api/v1/status` の `mqtt.connected` のため。
     pub(crate) mqtt: Arc<MqttPublisher>,
-    /// T19 S3-b（docs/banto-hub-t19-design.md §3.9、UX-46）: `GET
+    /// T19 S3-b（docs/hub/banto-hub-t19-design.md §3.9、UX-46）: `GET
     /// /api/v1/status`・`GET /api/status` の `system`（CPU%・メモリ）の
     /// ため。`admin_status_router`・`admin_tag_stream_router`・
     /// `tag_space_router`のいずれも[`api_router_with_controller_mode`]が
@@ -296,7 +296,7 @@ impl SingleValueResponse {
 /// the *successful* `/api/v1/*` bodies were in scope for the T0-2 typed-struct
 /// conversion.)
 ///
-/// H10 ③(Option B、docs/h10-3-read-scope-proposal.md §5 S4): API キー起因
+/// H10 ③(Option B、docs/archive/h10-3-read-scope-proposal.md §5 S4): API キー起因
 /// の読み取り(`ctx` あり)だけがタグ単位スコープで絞られる。`?tags=`
 /// 省略(暗黙の全件)はスコープ外を**黙って除いた**集合を返す(「聞いても
 /// いないのに403」を避ける)。`?tags=` で明示的にスコープ外タグを挙げたら
@@ -308,7 +308,7 @@ impl SingleValueResponse {
 /// 値を返す - 外部への**読み取り**出力（REST/WS/gRPC/MQTT）はシミュレー
 /// ションでゲートしない。呼び出し側は`value_source`/`collectionMode`で
 /// 判別する。旧 T15-3 の`test_output`opt-in 機構は #362 で撤去済み
-/// （`docs/tag-server-design.md` §6.3参照）。
+/// （`docs/hub/tag-server-design.md` §6.3参照）。
 #[utoipa::path(
     get,
     path = "/api/v1/values",
@@ -454,7 +454,7 @@ pub(super) fn build_values_response(
 /// しない外部名のみ」) - an undefined-but-uncollected tag is `200` with
 /// `q: "bad"`.
 ///
-/// H10 ③(Option B、docs/h10-3-read-scope-proposal.md §5 S3): タグは
+/// H10 ③(Option B、docs/archive/h10-3-read-scope-proposal.md §5 S3): タグは
 /// catalog に見えている(=存在は既知)ので、per-tag read スコープ外は 404
 /// ではなく**403**(`forbidden_response`)。API キー起因の読み取り
 /// (`ctx` あり)だけがこの判定を受ける - セッション token(`ctx` 無し)は
@@ -512,7 +512,7 @@ async fn v1_value_single(
 }
 
 /// `GET /api/v1/values/{tag}/read-now` の応答(T20 ①b、
-/// docs/banto-hub-t20-design.md §3.1)。[`SingleValueResponse`](cache 読み)
+/// docs/hub/banto-hub-t20-design.md §3.1)。[`SingleValueResponse`](cache 読み)
 /// と違い `v` は `serde_json::Value` - 数値・真偽値・文字列のいずれも
 /// 表せる(文字列タグはこの経路でしか読めない - このモジュールの
 /// [`v1_value_read_now`] doc comment参照)。`SingleValueResponse` 自体は
@@ -548,7 +548,7 @@ impl ReadNowResponse {
 }
 
 /// `GET /api/v1/values/{tag}/read-now` - T20 ①b(案A、
-/// docs/banto-hub-t20-design.md §3.1「その場読み」)。`GET
+/// docs/hub/banto-hub-t20-design.md §3.1「その場読み」)。`GET
 /// /api/v1/values/{tag}`(cache 読み、[`v1_value_single`]、
 /// current_values/tstore 経由)とは別経路 - **この経路は毎回 PLC から直接
 /// 読み、収集キャッシュ(current_values/tstore)には一切触れない**
@@ -646,7 +646,7 @@ pub(super) struct ConnectionStatusEntry {
     pub(super) id: i64,
     pub(super) status: String,
     pub(super) attempt: Option<u32>,
-    /// T9-2 (docs/ux-plan.md §1): mirrors `banto_tags::PlcConnection::simulation` -
+    /// T9-2 (docs/archive/ux-plan.md §1): mirrors `banto_tags::PlcConnection::simulation` -
     /// lets a monitoring client (or the admin UI) flag a connection whose
     /// live values are synthetic, not from a real PLC.
     pub(super) simulation: bool,
@@ -705,7 +705,7 @@ impl From<ApplyReport> for LastApplyEntry {
 }
 
 /// `GET /api/v1/status` の `db_source`（外部 DB 連携 S2、
-/// docs/banto-hub-external-db-design.md §4.2・§4.3）: DB Source の接続ごとの
+/// docs/hub/banto-hub-external-db-design.md §4.2・§4.3）: DB Source の接続ごとの
 /// 運転状態。`crate::db_source::status` のプロセス内メモリをそのまま写した
 /// もので、**秘密は含まない**（`last_error` は
 /// `crate::db_source::sanitize_postgres_error` を通した文字列だけ）ため、
@@ -728,7 +728,7 @@ pub(super) struct DbSourceStatusEntry {
     pub(super) restarts: u32,
     pub(super) last_restart_reason: Option<String>,
     pub(super) groups: Vec<DbSourceGroupStatusEntry>,
-    /// R2b-1e（docs/banto-hub-connection-settings-design.md §5.5）: パスワードを読めない接続の
+    /// R2b-1e（docs/hub/banto-hub-connection-settings-design.md §5.5）: パスワードを読めない接続の
     /// 理由（`crate::db_source::DbConnectionStatus::password_unreadable`）。**`/api/v1/status`
     /// には出さない**（機械クライアント向けの形は R2b-7 まで変えない。`last_error` に文言は
     /// 載る）。管理系の `GET /api/status` だけが `passwordState`・`passwordUnreadableReason`
@@ -777,7 +777,7 @@ impl From<crate::db_source::DbConnectionStatus> for DbSourceStatusEntry {
 }
 
 /// `GET /api/v1/status` の `ingest`（取り込み口 `push`、R2a-2e、
-/// docs/banto-hub-ingest-design.md §9）: `push` 接続ごとの受信の状態。
+/// docs/hub/banto-hub-ingest-design.md §9）: `push` 接続ごとの受信の状態。
 /// `crate::ingest::IngestHub::status` のプロセス内メモリを写したもので、
 /// **資格情報と値は含まない**（送り手は API キーの名前・接続元・時刻だけ、保持値は
 /// 数だけ。`sender_status` は送り手の `status` を制御文字を落として 1 KiB に
@@ -970,10 +970,10 @@ pub(crate) struct StatusResponse {
     /// 外部 DB 連携 S2（§4.2・§4.3）: DB Source の接続ごとの運転状態。
     /// `postgres` 接続が1つも無い通常構成では空配列。
     pub(super) db_source: Vec<DbSourceStatusEntry>,
-    /// 取り込み口 `push`（R2a-2e、docs/banto-hub-ingest-design.md §9）: `push`
+    /// 取り込み口 `push`（R2a-2e、docs/hub/banto-hub-ingest-design.md §9）: `push`
     /// 接続ごとの受信の状態。`push` 接続が無ければ空配列。
     pub(super) ingest: Vec<IngestStatusEntry>,
-    /// T19 S3-b（docs/banto-hub-t19-design.md §3.9、UX-46「サーバー状態の
+    /// T19 S3-b（docs/hub/banto-hub-t19-design.md §3.9、UX-46「サーバー状態の
     /// 拡充」）: サーバー自身の CPU 使用率・メモリ使用量。
     /// `crate::system_info::SystemInfoSampler`のモジュール doc comment
     /// 参照 - プロセス起動直後最初の呼び出しは `cpu_percent` が `0.0`に
@@ -992,7 +992,7 @@ pub(crate) struct StatusResponse {
 /// を組み立てる。Connection names come from the registry directly (not the
 /// catalog) so a connection with zero tags still appears.
 ///
-/// T2-2/#131 (docs/tag-server-design.md §6-5, 2026-08-05 決定): a
+/// T2-2/#131 (docs/hub/tag-server-design.md §6-5, 2026-08-05 決定): a
 /// broker-managed connection's status (per `HubSessions::is_broker_managed`;
 /// `"slmp"` and, as of #131, 2026-09-01, `"modbus-tcp"` too) comes from
 /// [`crate::hub::CollectorManager::broker_status`] (the broker's own
@@ -1365,7 +1365,7 @@ pub(super) fn tag_space_router(
     // `WriteState`/`GrpcService` へ同じ `Arc` を配る。
     rate_limiter: Arc<AsyncMutex<WriteRateLimiter>>,
     enforce_collection_state: bool,
-    // T19 S3-b（docs/banto-hub-t19-design.md §3.9、UX-46）: `GET
+    // T19 S3-b（docs/hub/banto-hub-t19-design.md §3.9、UX-46）: `GET
     // /api/v1/status` の `system` のため - `admin_status_router`/
     // `admin_tag_stream_router`へ渡すものと**同じ** `Arc`（上記
     // `mqtt`/`write_control`と同じ共有規律）。
@@ -1405,7 +1405,7 @@ pub(super) fn tag_space_router(
         .route("/api/v1/tags", get(v1_tags))
         .route("/api/v1/values", get(v1_values))
         .route("/api/v1/values/{tag}", get(v1_value_single))
-        // T20 ①b(docs/banto-hub-t20-design.md §3.1): read-on-demand -
+        // T20 ①b(docs/hub/banto-hub-t20-design.md §3.1): read-on-demand -
         // 静的セグメント `read-now` は axum(matchit)のルーティングで
         // `{tag}`より深い階層なので `/api/v1/values/{tag}` とは衝突しない
         // (T20-3a の `/api/v1/values/batch` と同じ「静的セグメント優先」の

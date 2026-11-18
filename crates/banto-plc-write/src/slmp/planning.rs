@@ -24,7 +24,7 @@
 //! proven encodable, so a bad value costs one target its write, never its
 //! batch-mates theirs (and never reaches the CPU as a truncated number).
 //!
-//! ## T8 bit-in-word writes (docs/tag-server-design.md §6.1)
+//! ## T8 bit-in-word writes (docs/hub/tag-server-design.md §6.1)
 //!
 //! [`BatchWriteRequest::BitInWord`] cannot be planned as an ordinary word
 //! write: SLMP has no bit-in-word write command, so the *value* to put on
@@ -74,7 +74,7 @@
 //! grouping ever sees it, so a plain word write to `D100` and a bit write to
 //! `D100.5` in the same batch are always two independent operations, never
 //! coalesced into one. Execution order between the two kinds when they
-//! target the very same word (docs/tag-server-design.md §6.1: "通常のワード
+//! target the very same word (docs/hub/tag-server-design.md §6.1: "通常のワード
 //! 書き込みとビット書き込みが同一バッチに混在した場合の順序・独立性") is
 //! the plainest possible answer given that independence: `execute_slmp_writes`
 //! runs every ordinary [`SlmpPlannedWrite`] first, then every
@@ -157,7 +157,7 @@ pub struct SlmpPlannedWrite {
 /// group's word it wants, and at what value - the RMW twin of the read
 /// side's `SlmpMappedRequest`, and what lets `execute_slmp_writes`'s
 /// confirmation read verify (and report) each request's own bit
-/// independently of its batch-mates (T8, docs/tag-server-design.md §6.1:
+/// independently of its batch-mates (T8, docs/hub/tag-server-design.md §6.1:
 /// "確認値の該当ビットが期待値なら Ok、不一致なら該当要求 WriteResult::Bad").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BitWriteMapping {
@@ -166,7 +166,7 @@ pub struct BitWriteMapping {
     pub value: bool,
 }
 
-/// One planned RMW operation (T8, docs/tag-server-design.md §6.1): read the
+/// One planned RMW operation (T8, docs/hub/tag-server-design.md §6.1): read the
 /// word at `device`/`number`, apply `set_mask`/`clear_mask`, write it back,
 /// then confirm. `set_mask`/`clear_mask` are always disjoint (a bit is never
 /// in both - see [`plan_slmp_write_batch`]'s conflict handling, which routes
@@ -273,7 +273,7 @@ pub fn plan_slmp_writes(requests: &[WriteRequest], word_order: WordOrder) -> Slm
 /// spans with no special casing: an exactly-adjacent numeric target still
 /// merges into the same `bulk_write`, and a gap still splits.
 ///
-/// ## T8 bit-in-word requests (docs/tag-server-design.md §6.1)
+/// ## T8 bit-in-word requests (docs/hub/tag-server-design.md §6.1)
 ///
 /// A [`BatchWriteRequest::BitInWord`] is validated here exactly like every
 /// other request (address must be SLMP, device must be a **word** device,
@@ -939,7 +939,7 @@ mod tests {
         assert_eq!(seen, (0..requests.len()).collect::<Vec<_>>());
     }
 
-    // --- T8, docs/tag-server-design.md §6.1: bit-in-word RMW planning ------
+    // --- T8, docs/hub/tag-server-design.md §6.1: bit-in-word RMW planning ------
 
     fn bwreq(raw: &str, value: bool) -> BatchWriteRequest {
         BatchWriteRequest::BitInWord {

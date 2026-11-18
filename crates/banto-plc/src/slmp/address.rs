@@ -378,7 +378,7 @@ pub(crate) fn parse_bit_suffix(
 /// - a number no greater than [`MAX_DEVICE_NUMBER`]
 /// - optionally, a bit-in-word suffix: `.` followed by exactly one
 ///   **hexadecimal** digit (`0-9`, `A-F`/`a-f`) naming a bit position
-///   `0x0..=0xF` (T8, docs/tag-server-design.md §6.1) - `"D100.5"` is word
+///   `0x0..=0xF` (T8, docs/hub/tag-server-design.md §6.1) - `"D100.5"` is word
 ///   device `D100`, bit 5, and `"D100.F"` is bit 15
 ///
 /// ## Why the bit suffix is hexadecimal
@@ -682,7 +682,7 @@ mod tests {
         assert!(matches!(parse(&too_big), Err(PlcError::InvalidAddress(_))));
     }
 
-    // --- T8, docs/tag-server-design.md §6.1: bit-in-word notation ----------
+    // --- T8, docs/hub/tag-server-design.md §6.1: bit-in-word notation ----------
     // T20-④ (2026-09-04 owner decision): the bit suffix is hexadecimal
     // (`.0`-`.F`), correcting an earlier decimal-only implementation that
     // was based on a factual mistake about MELSEC tooling conventions.

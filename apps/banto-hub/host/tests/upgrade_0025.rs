@@ -1,4 +1,4 @@
-//! R2b-1d（docs/banto-hub-connection-settings-design.md §6.3・§9「予行と preflight」）:
+//! R2b-1d（docs/hub/banto-hub-connection-settings-design.md §6.3・§9「予行と preflight」）:
 //! 本物のドライバ（`banto_drivers::builtin()` + host-provided、`tests/common::hub_drivers()`
 //! と bin・shell と同じ組み立て）で、alpha.33 の形の DB を `HubRuntime::start` に渡す。
 //!

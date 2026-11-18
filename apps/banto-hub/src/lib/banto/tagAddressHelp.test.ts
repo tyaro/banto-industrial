@@ -1,5 +1,5 @@
 /**
- * `tagAddressHelp.ts`（T18-2b、R2b-6d-2b、docs/banto-hub-driver-ui-design.md §7）に対する
+ * `tagAddressHelp.ts`（T18-2b、R2b-6d-2b、docs/hub/driver/banto-hub-driver-ui-design.md §7）に対する
  * ユニットテスト。`tagFormLayout.test.ts` と同じスタイル（describe/it、依存ゼロの純関数を
  * 直接 import）。ドライバは `configPackageTestDrivers.ts` の偽の記述子に `addressHelp` を足す。
  */

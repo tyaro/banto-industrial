@@ -1,4 +1,4 @@
-//! `push` 接続の純粋な規則（R2a-2a、docs/banto-hub-ingest-design.md §3.2・§3.3・
+//! `push` 接続の純粋な規則（R2a-2a、docs/hub/banto-hub-ingest-design.md §3.2・§3.3・
 //! §7・§7.1）: 受信の上限の定数 [`PUSH_LIMITS`]、接続の `settings`（JSON）の検証
 //! [`validate_push_settings`]、タグのキーの検証 [`validate_push_key`]、ブリッジの
 //! 送る量の見積もり [`bridge_load`]。

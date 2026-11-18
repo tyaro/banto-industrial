@@ -1,6 +1,6 @@
 /**
  * R1-C の完了条件「シミュレータ相手に、設定 → 収集開始 → データファイル生成 →
- * イベント記録まで一巡」の実 DOM 固定（C-4、2026-09-23。docs/r1-plan.md）。
+ * イベント記録まで一巡」の実 DOM 固定（C-4、2026-09-23。docs/archive/r1-plan.md）。
  *
  * 相手の PLC は `playwright.config.ts` の 2 つ目の `webServer` が起動する
  * **開発用 PLC**（`apps/chronogazer/core/examples/dev_plc.rs`、Modbus TCP、

@@ -1,5 +1,5 @@
 //! Frame-type drivers: the driver builds and parses bytes, the host's engine
-//! owns the transport (docs/banto-driver-api-design.md §4.2, §4.2.1; the
+//! owns the transport (docs/hub/driver/banto-driver-api-design.md §4.2, §4.2.1; the
 //! native mirror of WIT §6.2's `connection` / `read` / `write`).
 //!
 //! A frame-type driver never touches a socket. The engine sends each

@@ -1,4 +1,4 @@
-//! #916（docs/banto-hub-driver-io-design.md §7.6）: SLMP の 4E フレームを UDP で、本物の
+//! #916（docs/hub/driver/banto-hub-driver-io-design.md §7.6）: SLMP の 4E フレームを UDP で、本物の
 //! エンジン（`FrameSession` + `UdpTransport`）に通す結合試験。相手は `banto-plc` の SLMP
 //! シミュレータの `respond`（要求のバイト列 → 応答のバイト列）を UDP で返す偽の機器。
 //!

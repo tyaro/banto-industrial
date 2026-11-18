@@ -1,4 +1,4 @@
-//! banto-hub-shell — T16-0（docs/banto-hub-t16-design.md §4「T16-0 設計」）の
+//! banto-hub-shell — T16-0（docs/hub/banto-hub-t16-design.md §4「T16-0 設計」）の
 //! 薄いデスクトップシェル。
 //!
 //! ## この crate がやること・やらないこと
@@ -10,7 +10,7 @@
 //! コマンドは一切持たない** - タグ CRUD・収集開始/停止などの「運転 API」は
 //! Hub の REST/WS を管理 UI (SvelteKit) 側から叩くものであり、この crate が
 //! 二重実装することはない（実装指示「二重 UI / invoke による運転 API は
-//! 作らない」、`docs/tag-server-design.md` §3.1 T0 の 2026-08-09 追記
+//! 作らない」、`docs/hub/tag-server-design.md` §3.1 T0 の 2026-08-09 追記
 //! 「フル Tauri アプリ（独自 frontendDist + invoke 面）にはしない」）。
 //!
 //! ヘッドレス bin `banto-hub`（`apps/banto-hub/host/src/bin/banto-hub.rs`）
@@ -103,7 +103,7 @@
 //! 移した（振る舞いは変えていない）。トレイのメニュー・状態の文言・終了処理の
 //! 中身はこの crate に残る。
 //!
-//! ## T16-2 で追加したもの（docs/banto-hub-t16-design.md §3「T16-2」）
+//! ## T16-2 で追加したもの（docs/hub/banto-hub-t16-design.md §3「T16-2」）
 //!
 //! - [`decide_startup`]: `#[cfg(windows)]`で SCM（`BantoHub`サービス）の状態を
 //!   [`banto_hub_core::service_manager::WindowsServiceManager`]で問い合わせ、
@@ -133,7 +133,7 @@
 //! これらは全てデスクトップホスト（アプリがランタイムを所有する場合）専用。
 //! サービス接続時のホスト表示・fallback メニューは T16-2 の対象。
 //!
-//! ## T16-2 第二スライスで追加したもの（docs/banto-hub-t16-design.md §5
+//! ## T16-2 第二スライスで追加したもの（docs/hub/banto-hub-t16-design.md §5
 //! 「T16-2 第一スライスの既知の gap」への対応）
 //!
 //! 第一スライスの`decide_startup`（初回起動判定の決定木）自体は変えず、
@@ -321,12 +321,12 @@ mod sink_service_ipc;
 mod tray_status;
 
 /// R1-3b: このシェルが組み立てて `HubConfig.drivers` に注入する組み込みドライバ一式。
-/// コアは具体的なドライバを知らない（docs/banto-driver-api-design.md §6.4）。
+/// コアは具体的なドライバを知らない（docs/hub/driver/banto-driver-api-design.md §6.4）。
 fn hub_drivers() -> HubDrivers {
     let builtin = banto_drivers::builtin();
     // R2b-1a: `modbus-tcp` / `slmp`（R2b-3a-2 からセッション型）に、host が I/O を持つ `push` /
     // `postgres` / `virtual`（`HostProvided`）を足す。R2b-1d から Hub の入口・収集の計画・
-    // 移行の preflight がこのレジストリを正にする（docs/banto-hub-connection-settings-design.md §4）。
+    // 移行の preflight がこのレジストリを正にする（docs/hub/banto-hub-connection-settings-design.md §4）。
     let mut registry = builtin.registry;
     banto_hub_core::register_host_provided(&mut registry)
         .expect("host-provided driver ids are distinct from the built-ins");
@@ -1132,7 +1132,7 @@ fn expected_probe_target() -> ProbeTarget {
     }
 }
 
-/// T16-2 第二スライス（実装指示 3.、docs/banto-hub-t16-design.md §5 既知の
+/// T16-2 第二スライス（実装指示 3.、docs/hub/banto-hub-t16-design.md §5 既知の
 /// gap「navigate 先を`127.0.0.1`固定にしている」）: navigate/probe 先ホストを
 /// `BANTO_BIND`から解決する。
 ///
@@ -3038,7 +3038,7 @@ pub fn run() {
             host_switch_ipc::restore_setting_mode,
             // #706 レビュー: Fallback の窓の [再試行]。
             host_switch_ipc::retry_startup,
-            // S6（docs/banto-hub-external-db-design.md §5.5・§7 row S6）:
+            // S6（docs/hub/banto-hub-external-db-design.md §5.5・§7 row S6）:
             // 「サービス」一覧の BantoHubSink 側（`sink_service_ipc`のモジュール
             // doc参照）。
             sink_service_ipc::sink_service_status,

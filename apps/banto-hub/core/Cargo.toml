@@ -1,6 +1,6 @@
 [package]
 name = "banto-hub-core"
-description = "banto-hub domain/service layer (docs/tag-server-design.md T0): headless axum tag server - registry (I1) + collector (I3b) lifecycle + REST read API, no Tauri shell"
+description = "banto-hub domain/service layer (docs/hub/tag-server-design.md T0): headless axum tag server - registry (I1) + collector (I3b) lifecycle + REST read API, no Tauri shell"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,7 +12,7 @@ default = []
 # the binary via rust-embed. Off by default, same reasoning as chronogazer/
 # relay-wright's `embed-ui`: the workspace must build on a fresh clone
 # without requiring `pnpm --filter banto-hub build` to have run first. T0
-# ships no admin-UI frontend yet (docs/tag-server-design.md T0 scope) - this
+# ships no admin-UI frontend yet (docs/hub/tag-server-design.md T0 scope) - this
 # feature flag/`assets.rs` module is only the placeholder wiring for when one
 # lands. R1-7a: the `banto-hub` binary lives in `banto-hub-host`, whose own
 # `embed-ui` feature forwards here (`cargo build -p banto-hub-host --bin
@@ -33,7 +33,7 @@ banto-server = { workspace = true }
 # （パスワードのハッシュは `UsersService` の中）。
 banto-admin-services = { workspace = true }
 # I1: tag registry (PlcConnection/CollectionGroup/Tag) - hub's own SQLite
-# DB doubles as the registry DB (docs/tag-server-design.md §3.2 table).
+# DB doubles as the registry DB (docs/hub/tag-server-design.md §3.2 table).
 banto-tags = { path = "../../../crates/banto-tags" }
 # #1161 PR3: API キーのアプリに依らない部分（キーの形式・SHA-256・照合の順・表
 # `api_keys` への SQL・拒否の HTTP 応答）は ChronoGazer と共有する crate に置く
@@ -80,7 +80,7 @@ banto-hub-tls-trust = { path = "../../../crates/banto-hub-tls-trust" }
 # 以前から dev-dependencies と `banto-secret-store` 経由で依存木に持っていた crate で、
 # Cargo.lock に新しい package は増えない。
 banto-tagclient = { path = "../../../crates/banto-tagclient" }
-# R2b-1b（docs/banto-hub-connection-settings-design.md §5.1・§5.2）: `src/secrets.rs` が接続の
+# R2b-1b（docs/hub/banto-hub-connection-settings-design.md §5.1・§5.2）: `src/secrets.rs` が接続の
 # 秘密値を封印する部品（`Protector`・Windows の `DpapiMachine`・`MAX_SECRET_LEN`）を使う。
 # 保存先のファイル（`FileSecretStore`）は使わない - blob は DB に置く（設計 §5.1 の Q1 (c)）。
 # 以前は ACL の部品のために `banto-safe-root` だけに依存していた。`banto-secret-store` に
@@ -107,7 +107,7 @@ banto-tstore = { path = "../../../crates/banto-tstore" }
 # I3b: the collection engine itself - hub.rs::CollectorManager owns its
 # lifecycle (start at boot, full rebuild on registry writes).
 banto-collect = { path = "../../../crates/banto-collect" }
-# I6 (T2-2, docs/tag-server-design.md §6-5): the PLC access broker -
+# I6 (T2-2, docs/hub/tag-server-design.md §6-5): the PLC access broker -
 # broker_glue.rs wraps it as the SLMP-side banto_collect::PlcClient the
 # ClientFactory injection seam hands out, and HubSessions owns the session
 # directory outside CollectorManager.
@@ -116,18 +116,18 @@ banto-broker = { path = "../../../crates/banto-broker" }
 # R2b-6b: `serde` は `GET /api/drivers`（`rest/drivers.rs`）が設定のスキーマとデータ型の
 # 一覧をそのままの JSON で返すため。
 banto-driver-api = { path = "../../../crates/banto-driver-api", version = "0.3.0", features = ["serde"] }
-# I5 (T2-4, docs/tag-server-design.md §6): the write primitive - rest.rs's
+# I5 (T2-4, docs/hub/tag-server-design.md §6): the write primitive - rest.rs's
 # POST /api/v1/values/{tag} builds a banto_plc_write::BatchWriteRequest and
 # submits it through banto_broker::BrokerHandle::write (which itself depends
 # on banto-plc-write internally, but the wire types cross this crate's own
 # public API too, so a direct dependency is needed here as well).
 banto-plc-write = { path = "../../../crates/banto-plc-write" }
-# T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): computed.rs's ComputedEngine
+# T6-2 (docs/hub/tag-server-design.md §4.2/§4.3(a)): computed.rs's ComputedEngine
 # compiles/evaluates computed-tag expressions with this crate (T6-1) - the
 # expression engine itself has no registry/tokio dependency, hub wires it to
 # the tag space.
 banto-expr = { path = "../../../crates/banto-expr" }
-# S1 (docs/banto-hub-external-db-design.md §3.1, 2026-09-06): PostgreSQL
+# S1 (docs/hub/banto-hub-external-db-design.md §3.1, 2026-09-06): PostgreSQL
 # driver for the DB Source/Sink. TLS は `tls-rustls-ring-native-roots` -
 # `tls-rustls` の `webpki-roots`（CDLA-Permissive-2.0）は cargo-deny の
 # license allow list に無く落ちる、native-tls は Linux CI に OpenSSL を
@@ -136,16 +136,16 @@ banto-expr = { path = "../../../crates/banto-expr" }
 # sources`/`advisories` が deny.toml 無改造で green と確認済み。
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "macros", "migrate", "postgres", "tls-rustls-ring-native-roots"] }
 serde = { workspace = true }
-# R2a-2c（docs/banto-hub-ingest-design.md §6.3）: `float_roundtrip` - 取り込み口
+# R2a-2c（docs/hub/banto-hub-ingest-design.md §6.3）: `float_roundtrip` - 取り込み口
 # `push` の値（`src/ingest/validate.rs`）の浮動小数を往復で一致させる。既定の解析は
 # 最後の桁がずれうるので、DB ブリッジと Hub 内の Source の値の一致（§10.4）の前提。
 # 新しい crate は増えない（serde_json の feature だけ）。
 serde_json = { workspace = true, features = ["float_roundtrip"] }
-# T14-1 (docs/banto-hub-t14-design.md §3「D1」): runtime.rs の
+# T14-1 (docs/archive/banto-hub-t14-design.md §3「D1」): runtime.rs の
 # `HubStartError` - 既存クレート（banto-collect 等）と同じ thiserror 由来の
 # 列挙型エラーに揃える。
 thiserror = { workspace = true }
-# T1（docs/tag-server-design.md §5.2）: `GET /api/v1/stream` の WebSocket
+# T1（docs/hub/tag-server-design.md §5.2）: `GET /api/v1/stream` の WebSocket
 # アップグレード(`axum::extract::ws`)。workspace 既定の axum features に
 # `ws` を足すだけで新規依存は増えない(axum が既に `dep:tokio-tungstenite`
 # を optional で持っている - `ws` はそれを有効化するだけ)。
@@ -153,7 +153,7 @@ axum = { workspace = true, features = ["ws"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
 rust-embed = { workspace = true, optional = true }
 futures-util = { workspace = true }
-# T0-2 (docs/tag-server-design.md §5.6): api_keys.rs のキー生成・ハッシュ照合。
+# T0-2 (docs/hub/tag-server-design.md §5.6): api_keys.rs のキー生成・ハッシュ照合。
 getrandom = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
@@ -164,17 +164,17 @@ utoipa = { workspace = true }
 # ブラウザで閲覧・試打できる Swagger UI の同梱（rest.rs の
 # `openapi_router` 参照）。
 utoipa-swagger-ui = { workspace = true }
-# T3（docs/tag-server-design.md §5.3）: mqtt.rs の MqttPublisher が使う MQTT
+# T3（docs/hub/tag-server-design.md §5.3）: mqtt.rs の MqttPublisher が使う MQTT
 # クライアント。
 rumqttc = { workspace = true }
-# T4（docs/tag-server-design.md §5.4）: grpc.rs の tonic サーバー + build.rs
+# T4（docs/hub/tag-server-design.md §5.4）: grpc.rs の tonic サーバー + build.rs
 # が生成する型のランタイム依存（tonic-prost はコーデック、prost はメッセージ
 # 型そのもの）。
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
 prost = { workspace = true }
 tokio-stream = { workspace = true }
-# T19 S3-b（docs/banto-hub-t19-design.md §3.9、UX-46）: system_info.rs の
+# T19 S3-b（docs/hub/banto-hub-t19-design.md §3.9、UX-46）: system_info.rs の
 # CPU/メモリサンプラー。
 sysinfo = { workspace = true }
 # H2（tyaro/banto-industrial#1053）: `clock_sync.rs` が PLC の時計合わせに渡す
@@ -202,7 +202,7 @@ x509-cert = { version = "0.3.0" }
 ring = { version = "0.17.14" }
 
 [build-dependencies]
-# T4（docs/tag-server-design.md §5.4）: build.rs が proto/tagserver/v1/*.proto
+# T4（docs/hub/tag-server-design.md §5.4）: build.rs が proto/tagserver/v1/*.proto
 # をビルド時にコード生成する（生成先は OUT_DIR、リポジトリにはコミットしない
 # - 実装指示どおり）。
 tonic-prost-build = { workspace = true }
@@ -217,12 +217,12 @@ protoc-bin-vendored = { workspace = true }
 percent-encoding = "2.3.2"
 # banto-opcua v0.2.0 の固定と同じ rev に揃える（#1046）
 async-opcua = { git = "https://github.com/tyaro/async-opcua", rev = "9daa957a0ccf425bcb61bc488e828ccf2495c302", default-features = false, features = ["client"] }
-# T3（docs/tag-server-design.md §5.3）: `net`は元は tests/mqtt.rs のポート探索
+# T3（docs/hub/tag-server-design.md §5.3）: `net`は元は tests/mqtt.rs のポート探索
 # （空きポートへ bind → drop → その番号で rumqttd を起動）と起動確認用の
 # TCP プローブ接続のため - `axum`側の推移的依存で実質的にはこれまでも
 # unify されていたが、明示しておく。R2b-0 で tests/mqtt.rs は `banto-hub-host` へ
 # 移ったが、`src/test_support.rs` の偽ドライバ（TCP の接続だけをする）が使う。
-# 外部 DB 連携 S2b（docs/banto-hub-external-db-design.md §4.8・§6-17）:
+# 外部 DB 連携 S2b（docs/hub/banto-hub-external-db-design.md §4.8・§6-17）:
 # `test-util` は `#[tokio::test(start_paused = true)]` の仮想時計のため -
 # `crate::db_source::supervisor` のバックオフ（1s → 30s）と「60 秒以上
 # 動いたら連続回数を戻す」を実時間ゼロで検証する。**dev 限定**なので
@@ -249,20 +249,20 @@ tokio-tungstenite = { workspace = true }
 # （`banto_tagclient::PinnedHubTls::from_pem`）で読み、`tls_listener` の読み込みと TLS の
 # 握手ができることを確かめる（`src/hub_tls_prepare/tests.rs`）。#644 PR4 から通常の依存
 # （[dependencies] の banto-tagclient）にも入ったので、テストもそちらを使う。
-# R2a-2a（docs/banto-hub-ingest-design.md §2・§11）: `src/ingest/driver.rs` の `PushDriver` を
+# R2a-2a（docs/hub/banto-hub-ingest-design.md §2・§11）: `src/ingest/driver.rs` の `PushDriver` を
 # 適合テストの静的な部分（`static_checks`、C1・C2）に掛ける。適合テスト一式は
 # `banto-driver-api` にだけ依存する公開 crate なので、下の「`banto-drivers` には dev でも
 # 依存しない」は崩れない（CI では conformance の変更で core も走るようになる。
 # `.github/scripts/ci-changes.test.mjs` の G に辺を足した）。
 banto-driver-conformance = { path = "../../../crates/banto-driver-conformance", version = "0.3.0" }
-# R2b-0（docs/banto-driver-api-design.md §2.4）: `banto-drivers`（実ドライバ）は dev でも
+# R2b-0（docs/hub/driver/banto-driver-api-design.md §2.4）: `banto-drivers`（実ドライバ）は dev でも
 # 持たない。ドライバだけの変更で core が CI に選ばれないようにするため。`src` の単体
 # テストは `src/test_support.rs::test_drivers`（偽のドライバ表）、`tests/` に残った統合
 # テストは `HubDrivers::none()` で動く。実ドライバとシミュレータ（`banto-plc` /
 # `banto-plc-write` の `simulator` feature）・組み込み MQTT ブローカー（`rumqttd`）を
 # 使う統合テストは `apps/banto-hub/host/tests/` へ移した（dev-dependency も同じく）。
 
-# T5-4（docs/t5-handoff.md §3「ソークテスト」）: tests/soak.rs の RSS
+# T5-4（docs/archive/t5-handoff.md §3「ソークテスト」）: tests/soak.rs の RSS
 # サンプリング（`GetProcessMemoryInfo`）専用だった（R2b-0 で tests/soak.rs は
 # `banto-hub-host` へ移り、`Win32_System_ProcessStatus` は向こうでも持つ。Windows で
 # 確かめるまでここからは外していない）。新規の依存ノードは増えない -
@@ -283,7 +283,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 
-# T5-1（docs/tag-server-design.md §8「常駐」・docs/t5-handoff.md §3）の
+# T5-1（docs/hub/tag-server-design.md §8「常駐」・docs/archive/t5-handoff.md §3）の
 # Windows サービス化で使っていた `windows-service` クレートは、#392 B3-1 で
 # 直接の依存から外した: SCM の状態操作（B2-3）・サービス本体のランナーと
 # 登録・解除（B3-1）はすべて共有 crate `banto-service-control`（上の依存）が
@@ -295,7 +295,7 @@ windows-sys = { version = "0.61", features = [
 # #1121 PR2a: `bind_exclusive.rs` が bind の前に `SO_EXCLUSIVEADDRUSE` を付ける
 # （socket2 0.6 に専用の関数は無いので windows-sys の `setsockopt`、feature `Win32_Networking_WinSock`）。socket2 0.6 は tokio が既に Cargo.lock に持つ（新しい crate は増えない）。
 socket2 = "0.6"
-# T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P2）: `profile_lock.rs`が
+# T17-1（docs/hub/banto-hub-t17-design.md §3「T17-1」・P2）: `profile_lock.rs`が
 # `Global\BantoHub.<profile-id>`named mutex（`CreateMutexW`/`CloseHandle`/
 # `GetLastError`/`ERROR_ALREADY_EXISTS`）で Desktop/Service 間の排他を取る。
 # `CreateMutexW`系 API は`Win32_Security`feature を要求する
@@ -303,7 +303,7 @@ socket2 = "0.6"
 # 既に`[target.'cfg(windows)'.dev-dependencies]`が同じ 0.61 系を使っている
 # （tests/soak.rs）ので新規バージョン系列は増えない。
 #
-# T17-2 スライス2（docs/banto-hub-t17-design.md §3「T17-2」）: `service_elevated.rs`
+# T17-2 スライス2（docs/hub/banto-hub-t17-design.md §3「T17-2」）: `service_elevated.rs`
 # が UAC 昇格ヘルパー用に4 feature 追加した -
 # `Win32_NetworkManagement_NetManagement`（`NetLocalGroupAdd`/
 # `NetLocalGroupAddMembers`、ローカルグループ`BantoHub Operators`の作成・
@@ -317,7 +317,7 @@ socket2 = "0.6"
 # `Win32_NetworkManagement_NetManagement`・`Win32_System_Services`を外した
 # （`Win32_System_WindowsProgramming`は`GetUserNameW`がまだ使う）。
 #
-# profile ACL 追加スライス（docs/banto-hub-desktop-plan.md §11）で
+# profile ACL 追加スライス（docs/hub/banto-hub-desktop-plan.md §11）で
 # `src/profile_acl.rs`のために足した`Win32_Security_Authorization`・
 # `Win32_Storage_FileSystem`は、#626（2026-10-16）でその実装を消して
 # `banto-safe-root`に寄せたので外した（`src/profile_grant/win.rs`が使うのは
@@ -326,7 +326,7 @@ socket2 = "0.6"
 # 持つ（`CreateFileW`・`GetFileInformationByHandle`・`GetFinalPathNameByHandleW`）
 # ために`Win32_Storage_FileSystem`を戻した。
 #
-# ロックダウン回復アクション追加（docs/tag-server-design.md §5.6、
+# ロックダウン回復アクション追加（docs/hub/tag-server-design.md §5.6、
 # `service_elevated.rs`の`reset-password`/`revert-to-commissioning`）:
 # `Win32_System_Console`を追加した - `GetStdHandle`/`GetConsoleMode`/
 # `SetConsoleMode`/`ENABLE_ECHO_INPUT`（`reset-password`が新しいパスワードを

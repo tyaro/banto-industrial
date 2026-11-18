@@ -1,7 +1,7 @@
 //! サービスの失効の記録（`crate::service_revocation`、#1121 PR2b）を偽物の
 //! [`ServiceRevocationOps`] で確かめる（全 OS）: 読み口の「無い」「読めた」と使えない 3 種類の
 //! 分け方、無ければ作る（置き換えない）、壊れた記録の作り直しと一時ファイルの片付け。
-//! docs/hub-desktop-tls-design.md §4.4.2 の場面の番号を試験の名前に入れる。elev とサービスの
+//! docs/hub/hub-desktop-tls-design.md §4.4.2 の場面の番号を試験の名前に入れる。elev とサービスの
 //! Hub からの手順は banto-hub-core の `hub_tls_prepare/tests.rs`・`tests/load.rs`。
 
 use std::cell::RefCell;

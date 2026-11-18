@@ -117,7 +117,7 @@ impl RebindTracker {
 
 /// `established` is `was_live || reached_unbound`: an attempt that went
 /// `Live` or `Unbound` settled a generation, so the next rebind starts a new
-/// budget (#682 PR-3, docs/banto-tagclient-partial-binding-design.md §7).
+/// budget (#682 PR-3, docs/crates/banto-tagclient-partial-binding-design.md §7).
 fn next_rebind_mode(
     tracker: &mut RebindTracker,
     mode: AttemptMode,
@@ -537,7 +537,7 @@ async fn run_generation_inner(
 }
 
 /// The `Unbound` branch of one attempt (#682 PR-3,
-/// docs/banto-tagclient-partial-binding-design.md §5.1 / §5.2 / §7).
+/// docs/crates/banto-tagclient-partial-binding-design.md §5.1 / §5.2 / §7).
 ///
 /// The order is load-bearing:
 /// 1. `ping` (stop-interruptible like `subscribe_on_change`), then wait for

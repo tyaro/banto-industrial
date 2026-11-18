@@ -1,4 +1,4 @@
-//! T11-1 の統合テスト（docs/ux-plan.md §3「一括登録 API」）:
+//! T11-1 の統合テスト（docs/archive/ux-plan.md §3「一括登録 API」）:
 //! `POST /api/tags/batch` の all-or-nothing 検証・単一トランザクション
 //! 適用・catalog の commit 1回・dry run・重複名検出を、実際の `CollectorManager` +
 //! axum ルーター経由で確認する。

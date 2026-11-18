@@ -1,7 +1,7 @@
 //! PLC 接続の CRUD（`/api/plc-connections`）と接続テスト（保存前の疎通確認・保存済み
 //! 接続のテスト）。
 //!
-//! `rest.rs` から中身を変えずに移したもの（docs/banto-hub-driver-refactor-plan.md §8.1、
+//! `rest.rs` から中身を変えずに移したもの（docs/hub/driver/banto-hub-driver-refactor-plan.md §8.1、
 //! P0-1 の手順 3）。I1 CRUD の共通層は `rest/crud.rs` にあり、認証・ガード・監査の補助は
 //! 親の `rest.rs` にある。どちらも `use super::{...}` で使う。外から使われるパス
 //! （`crate::rest::X`）は親の re-export で保つ。
@@ -16,7 +16,7 @@ use super::{
 };
 use banto_driver_api::{keys, ConnectContext, FatalError, ItemError, Settings, TagSpec, Value};
 
-/// R2b-6b（docs/banto-hub-driver-ui-design.md §5、Q2）: `/api/plc-connections` の作成・更新の
+/// R2b-6b（docs/hub/driver/banto-hub-driver-ui-design.md §5、Q2）: `/api/plc-connections` の作成・更新の
 /// 形 `{ name, protocol, enabled, simulation, settings }`。平らな欄（`host`・`port`・`unitId`・
 /// `password` …）は受けない（`deny_unknown_fields`。使用者無しの前提で古い形は断る、
 /// 2026-10-22 オーナー）。MCP の `create_connection` / `update_connection` も同じ形を直接
@@ -613,7 +613,7 @@ pub(super) async fn plc_connections_delete(
             return Err(err.into());
         }
     };
-    // 外部 DB 連携 S4（docs/banto-hub-external-db-design.md §5.2、
+    // 外部 DB 連携 S4（docs/hub/banto-hub-external-db-design.md §5.2、
     // `crate::sink`のモジュール doc comment「FK を張らない理由」参照）:
     // この接続を参照する sink group が1件でもあれば削除を拒否する
     // （RESTRICT 相当）。`banto_tags`はこの接続の下にある Hub 専用
@@ -623,7 +623,7 @@ pub(super) async fn plc_connections_delete(
         let _ = tx.rollback().await;
         return Err(ApiError(err).into());
     }
-    // T19 S2-b（UX-38、docs/banto-hub-t19-design.md §3.4・§7.5、2026-09-02
+    // T19 S2-b（UX-38、docs/hub/banto-hub-t19-design.md §3.4・§7.5、2026-09-02
     // オーナー決定）: 「タグがあってもグループ・接続を削除可。定義のみ削除
     // し、履歴は残す」- `delete_tx`（子が居れば拒否）ではなく
     // `cascade_delete_tx`（配下のグループ・タグごと1トランザクションで削除、
@@ -672,7 +672,7 @@ pub(super) async fn plc_connections_delete(
 }
 
 /// `POST /api/plc-connections/{id}/test` - S1a
-/// （docs/banto-hub-external-db-design.md §4.6・§7 スライス表「S1」:
+/// （docs/hub/banto-hub-external-db-design.md §4.6・§7 スライス表「S1」:
 /// 「接続テストが `SELECT 1`〈実際は `SELECT version()`〉と列一覧を
 /// 返す」の PostgreSQL 側実装。**保存済み**の接続 `id` を対象にする点で
 /// T12 の `POST /api/plc-connections/test`（保存前のフォーム値を直接
@@ -726,7 +726,7 @@ pub(super) async fn plc_connections_test_saved(
     Ok((StatusCode::OK, Json(outcome)).into_response())
 }
 
-// --- T12 (docs/ux-plan.md §4): 保存前の接続テスト ---------------------------
+// --- T12 (docs/archive/ux-plan.md §4): 保存前の接続テスト ---------------------------
 //
 // `POST /api/plc-connections/test` は保存不要でホスト/ポート/プロトコルの
 // 疎通を確認する - TCP 接続だけでなく実プロトコルで軽い読み出し1回
@@ -747,7 +747,7 @@ pub(super) async fn plc_connections_test_saved(
 // セッションが生きていればそれを再利用して読み、無い場合のみ直接ダイヤル
 // する([`test_connection`]参照)。
 //
-// R2b-3a-2(docs/banto-hub-driver-io-design.md §4.2・Q11): プロトコル別の
+// R2b-3a-2(docs/hub/driver/banto-hub-driver-io-design.md §4.2・Q11): プロトコル別の
 // `test_modbus_connection`/`test_slmp_connection`(`ModbusTcpClient`/
 // `SlmpClient` を直接ダイヤルし、固定のリテラル `40001`/`D0` を読む)を
 // ドライバに依らない [`test_connection`] にまとめた。読む 1 点はドライバの
@@ -1065,7 +1065,7 @@ fn probe_outcome(results: Vec<Result<Value, ItemError>>) -> (bool, Option<PlcCon
     }
 }
 
-/// 接続テストの本体(R2b-3a-2、docs/banto-hub-driver-io-design.md Q11)。
+/// 接続テストの本体(R2b-3a-2、docs/hub/driver/banto-hub-driver-io-design.md Q11)。
 /// 機器ドライバで共通の経路（PostgreSQL は専用のプローブを使う）。
 ///
 /// 1. 試す設定を作る([`requested_settings`])。
@@ -1222,7 +1222,7 @@ async fn test_connection(
 /// 共有セッションが切断中のときの文言。
 const SHARED_SESSION_DOWN: &str = "この接続の共有セッションは現在切断中です(再接続待機中)。PLCの電源やネットワーク、または他アプリとのセッション競合を確認してください。";
 
-/// `POST /api/plc-connections/test` - T12(docs/ux-plan.md §4)。保存前に
+/// `POST /api/plc-connections/test` - T12(docs/archive/ux-plan.md §4)。保存前に
 /// host/port/protocol の疎通確認(実プロトコルでの軽い読み出し1回まで)を
 /// 行う。**意図的に** `#[utoipa::path]`を付けず`ApiDoc::paths(...)`にも
 /// 加えない - utoipa がドキュメント対象にしているのは`/api/v1/*`の機械
@@ -1242,7 +1242,7 @@ const SHARED_SESSION_DOWN: &str = "この接続の共有セッションは現在
 ///
 /// 疎通確認そのもの(virtual/simulation の即時拒否・ドライバによるダイヤル・
 /// 所要時間計測)は[`run_plc_connection_test`]へ切り出してある - T21
-/// S1-c（docs/banto-hub-t21-design.md）の MCP `test_connection`ツール
+/// S1-c（docs/hub/banto-hub-t21-design.md）の MCP `test_connection`ツール
 /// ([`crate::mcp`]の`tool_test_connection`)がこの REST ハンドラと**全く同じ
 /// 疎通確認**を行うために共有する(二重実装しない、このファイル冒頭
 /// 「§3.7」節と同じ規律)。

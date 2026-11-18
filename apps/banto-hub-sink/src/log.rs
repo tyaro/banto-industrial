@@ -17,7 +17,7 @@
 //! `warn`、復帰時に `info` を 1 行）は呼び出し側が持つ（設計 §5.5）。
 //!
 //! ## サービスログファイルの置き場（I4 追従、
-//! docs/banto-hub-installer-design.md §8.2、2026-09-07）
+//! docs/hub/banto-hub-installer-design.md §8.2、2026-09-07）
 //!
 //! 旧仕様は exe と同じディレクトリ（`Program Files\BantoHub\` 配下）
 //! 固定だった。ここは管理者権限でしか書けない上、サービス実行中はファイル

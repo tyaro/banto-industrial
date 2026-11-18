@@ -1,4 +1,4 @@
-//! トリップワイヤ 3（R2b-1a、docs/banto-hub-connection-settings-design.md §4.1）:
+//! トリップワイヤ 3（R2b-1a、docs/hub/banto-hub-connection-settings-design.md §4.1）:
 //! Hub のレジストリの id の集合 == Hub の収集が計画できるプロトコルの集合。
 //!
 //! Hub の収集が計画できるのは、broker が管理するセッション型（`modbus-tcp`・`slmp`。
@@ -10,7 +10,7 @@
 //!
 //! 既存のトリップワイヤ（`crates/banto-drivers/src/lib.rs`）: 1 は
 //! `banto_drivers::builtin()` の registry ⊆ `ALLOWED_PROTOCOLS`、2 は R2b-3a-2
-//! （docs/banto-hub-driver-io-design.md §4.2）から「`builtin()` の項目はすべて `Frame` か
+//! （docs/hub/driver/banto-hub-driver-io-design.md §4.2）から「`builtin()` の項目はすべて `Frame` か
 //! `Session`」（broker の表と `HostBound` が無くなったため）。ここは host が組み立てた
 //! 後の Hub のレジストリを見る（`tests/common` の `hub_drivers()` は `banto-hub` の bin・
 //! `src-tauri` と同じ手順で組み立てる）。

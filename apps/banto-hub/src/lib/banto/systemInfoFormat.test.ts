@@ -1,5 +1,5 @@
 /**
- * T19 S3-b（docs/banto-hub-t19-design.md §3.9、UX-46）: `systemInfoFormat.ts`
+ * T19 S3-b（docs/hub/banto-hub-t19-design.md §3.9、UX-46）: `systemInfoFormat.ts`
  * の純関数（`formatBytes`/`formatPercent`）のユニットテスト。
  */
 import { describe, expect, it } from 'vitest';

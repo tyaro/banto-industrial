@@ -9,7 +9,7 @@ use axum::http::Request as HttpRequest;
 use tower::ServiceExt;
 
 // --- H10 ③: per-tag read スコープ(Option B、
-// docs/h10-3-read-scope-proposal.md §5・§6) ------------------------------
+// docs/archive/h10-3-read-scope-proposal.md §5・§6) ------------------------------
 
 /// S1/S3/S4(案 B): `read:line1.fast.temp01` キーは catalog は全タグ
 /// (line2 のタグ含む)を見られるが、値は自分のタグしか読めない - 単一は
@@ -745,7 +745,7 @@ async fn tags_batch_non_dry_run_while_running_is_accepted_and_queued() {
     assert_eq!(queued_count, 1);
 }
 
-/// #341（オーナー決定 2026-09-09、docs/tag-server-design.md §4.3）: 上の
+/// #341（オーナー決定 2026-09-09、docs/hub/tag-server-design.md §4.3）: 上の
 /// `*_while_running_is_accepted_and_queued` 3本の**試運転中の兄弟** -
 /// 同じ「収集中」でも、ロックダウン前（`test_env_unlocked`）なら pending
 /// queue を経由せずその場で反映される。202 ではなく 200、

@@ -1,5 +1,5 @@
 /**
- * #1179 PR3a（docs/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、
+ * #1179 PR3a（docs/hub/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、
  * 2026-11-17 オーナー決定「選択中の対象とタブを URL に持ち、再読み込みや
  * 戻る操作で同じ画面に戻る」）: タグ登録ページ（`(app)/tags/+page.svelte`）の
  * 「左ツリーで選んだ対象」と「中央のタブ」を URL のクエリと行き来させる純関数。

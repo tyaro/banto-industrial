@@ -1,4 +1,4 @@
-//! DB Sink（docs/banto-hub-external-db-design.md #229・§5）: タグ空間を外部
+//! DB Sink（docs/hub/banto-hub-external-db-design.md #229・§5）: タグ空間を外部
 //! PostgreSQL へ記録する仕組みの **Hub 側**（S4）。エンジン本体（購読・
 //! バッチ INSERT・キュー管理・テーブル検査）は Hub とは別プロセスの
 //! サイドカー `banto-hub-sink`（S5、`apps/banto-hub-sink`・未実装）が持つ -

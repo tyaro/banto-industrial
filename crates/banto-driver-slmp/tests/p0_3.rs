@@ -1,5 +1,5 @@
-//! P0-3 (docs/banto-hub-driver-refactor-plan.md §8.3), rows 3 and 6 of
-//! docs/banto-hub-driver-io-design.md §11.1, and the other behaviours of the
+//! P0-3 (docs/hub/driver/banto-hub-driver-refactor-plan.md §8.3), rows 3 and 6 of
+//! docs/hub/driver/banto-hub-driver-io-design.md §11.1, and the other behaviours of the
 //! removed `SlmpClient` / `SlmpWriteClient` tests (§11.1 note), on the new I/O:
 //! the real `banto-driver-engine` (`FrameSession`) over a real TCP socket to
 //! `banto-plc`'s SLMP simulator, driving the frame-type `SlmpDriver`
@@ -349,7 +349,7 @@ async fn normal_batch_reads_every_data_type_correctly() {
     sim.stop();
 }
 
-/// T8 (docs/tag-server-design.md §6.1) end to end: `D100.5` reads the same
+/// T8 (docs/hub/tag-server-design.md §6.1) end to end: `D100.5` reads the same
 /// word `D100` an ordinary numeric tag would, decoded down to one bit, and a
 /// plain numeric read of the same register is unaffected by a bit-in-word tag
 /// sharing its group.
@@ -636,7 +636,7 @@ async fn request_frames_for_q_and_r_match_the_hand_written_wire_bytes() {
 /// half drives a bare `slmp::SLMPClient` (the reference implementation, a
 /// dev-dependency) against the same injected end code and asserts it comes back
 /// as `SlmpError::Device { .. }` - the tripwire for the wrapped crate's own
-/// classification (H9, docs/h9-slmp-structured-error-spec.md).
+/// classification (H9, docs/hub/driver/h9-slmp-structured-error-spec.md).
 #[tokio::test]
 async fn slmp_end_code_is_bad_not_fatal() {
     let sim = Simulator::start().await;
@@ -1139,7 +1139,7 @@ async fn an_over_cap_string_is_unsupported_without_blocking_batch_mates() {
     sim.stop();
 }
 
-// --- T20 ①b: StringEncoding::Utf8 read (docs/banto-hub-t20-design.md §3.1) ---
+// --- T20 ①b: StringEncoding::Utf8 read (docs/hub/banto-hub-t20-design.md §3.1) ---
 
 /// The load-bearing UTF-8 read proof: seed the wire directly with UTF-8 bytes
 /// (`Simulator::set_string` is Shift-JIS-only by design) and read them back with
@@ -2070,7 +2070,7 @@ async fn mixed_numeric_and_string_batch_round_trips_in_single_calls() {
     sim.stop();
 }
 
-// --- T8, docs/tag-server-design.md §6.1: bit-in-word RMW writes --------------
+// --- T8, docs/hub/tag-server-design.md §6.1: bit-in-word RMW writes --------------
 
 /// 0x1234's bit positions: bits 2, 4, 5, 9, 12 are set; every other position
 /// in 0..=15 is clear.

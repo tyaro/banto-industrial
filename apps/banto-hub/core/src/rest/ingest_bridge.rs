@@ -1,5 +1,5 @@
 //! DB ブリッジの設定の取得口 `GET /api/ingest/bridge-config`（R2a-3b、
-//! docs/banto-hub-ingest-design.md §10.2）。
+//! docs/hub/banto-hub-ingest-design.md §10.2）。
 //!
 //! DB ブリッジ（`banto-hub-sink` の `source/`、§10.3）は、`settings.bridge`
 //! （`kind: "db"`）を持つ `push` 接続ごとに、参照先の `postgres` 接続へ問い合わせて
@@ -74,7 +74,7 @@ struct BridgeConfigState {
 
 /// `GET /api/ingest/bridge-config` の応答（§10.2）。
 ///
-/// R2b-1d（docs/banto-hub-connection-settings-design.md §5.4、追加だけ）: 読み先の
+/// R2b-1d（docs/hub/banto-hub-connection-settings-design.md §5.4、追加だけ）: 読み先の
 /// `postgres` 接続のパスワードを読めない source は `sources` に**載せず**、
 /// `unavailable_sources` に理由つきで出す（`password: null` では返さない。古いブリッジは
 /// 載っていない source を引かない）。`ingestAllowed: false` の source は今どおり開封も
@@ -352,7 +352,7 @@ async fn bridge_config_get(State(state): State<BridgeConfigState>, headers: Head
         eprintln!(
             "banto-hub: warn: GET {BRIDGE_CONFIG_PATH} はブリッジが読む DB 接続のパスワードを平文で返します。\
              ブリッジ（banto-hub-sink）は Hub と同一マシンからのループバック接続のみを前提とします\
-             （docs/banto-hub-ingest-design.md §10.2、docs/banto-hub-external-db-design.md §2.2・§6-15）。"
+             （docs/hub/banto-hub-ingest-design.md §10.2、docs/hub/banto-hub-external-db-design.md §2.2・§6-15）。"
         );
     });
     build_response(&state, caller.as_ref()).await

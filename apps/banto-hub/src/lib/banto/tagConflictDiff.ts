@@ -1,5 +1,5 @@
 /**
- * T18-1（TAG-UX-C 4点目「差分表示 UI」、docs/banto-hub-desktop-plan.md
+ * T18-1（TAG-UX-C 4点目「差分表示 UI」、docs/hub/banto-hub-desktop-plan.md
  * §9.4「revision / ETag で後勝ち上書きを防ぎ、競合時は差分を表示する」）:
  * revision 競合検出（`cursor/t18-1-tags-revision-e3cb`）に続く後半部分 -
  * ローカルの編集内容とサーバー最新値をフィールド単位で比較する純関数。

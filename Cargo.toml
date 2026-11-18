@@ -5,38 +5,38 @@
 # read/write 単一セッション、relay-wright W3-A から抽出), R1-A:
 # apps/chronogazer/{core,src-tauri}, W1: apps/relay-wright/{core,src-tauri},
 # T0: apps/banto-hub/core (headless タグサーバー、
-# docs/tag-server-design.md), T6-1: crates/banto-expr (演算タグの式評価
+# docs/hub/tag-server-design.md), T6-1: crates/banto-expr (演算タグの式評価
 # エンジン、依存ゼロの純粋クレート。hub への配線は T6-2), T16-0:
 # apps/banto-hub/src-tauri (薄いデスクトップシェル `banto-hub-shell` -
 # HubRuntime を埋め込み Hub 自身の localhost UI を WebView で開くだけ、
-# 独自 frontendDist/invoke は持たない。docs/banto-hub-t16-design.md) -
+# 独自 frontendDist/invoke は持たない。docs/hub/banto-hub-t16-design.md) -
 # see docs/plan.md /
-# docs/r1-plan.md /
+# docs/archive/r1-plan.md /
 # the relay-wright plan `luminous-discovering-goblet.md` /
-# docs/tag-server-design.md, R1-B: crates/banto-rtsp (RTSP基礎値・JPEG
+# docs/hub/tag-server-design.md, R1-B: crates/banto-rtsp (RTSP基礎値・JPEG
 # parser・再接続方針、ネットワークI/Oなし). banto crates are consumed via git-tag references
 # (banto docs/publishing.md). T19 S1-b0: crates/banto-plc-address (AddressArea
 # の書き込み可否を1箇所で定義する依存ゼロ crate。banto-plc/banto-tags/
 # banto-plc-write が共有する - crates/banto-plc-address/src/lib.rs のモジュール
 # doc 参照). 外部 DB 連携 S5: apps/banto-hub-sink (DB Sink サイドカー -
 # banto-tagclient SDK で Hub を購読し外部 PostgreSQL へ long スキーマで
-# バッチ INSERT する別プロセス. docs/banto-hub-external-db-design.md §5).
+# バッチ INSERT する別プロセス. docs/hub/banto-hub-external-db-design.md §5).
 # #332: crates/banto-hub-bootstrap (Hub への自動接続 bootstrap - 試運転中の
 # 自己発行 → OS keyring → banto-tagclient への供給。keyring と設定保存は
-# trait で外出しし、アプリ非依存に保つ. docs/banto-hub-client-bootstrap.md).
+# trait で外出しし、アプリ非依存に保つ. docs/hub/banto-hub-client-bootstrap.md).
 # #392 A2: crates/banto-desktop-tray (トレイ常駐の窓・終了まわりの共通部分 -
 # × で隠す・初回通知・終了の確認・終了の二重実行防止。banto-hub-shell と
 # ChronoGazer が共有する). #392 B1-3: crates/banto-secret-store (DPAPI の machine
 # スコープで守ったファイルを、保護された DACL のディレクトリに置く秘密の保存先。
 # `banto_hub_bootstrap::KeyStore` を実装し、サービスとデスクトップの両方の host が
-# 同じ Hub のキーを使う. docs/chronogazer-service-design.md §3.1(c)).
+# 同じ Hub のキーを使う. docs/chronogazer/chronogazer-service-design.md §3.1(c)).
 # #392 B3-3a: crates/banto-service-elev (製品ごとの昇格ヘルパーが使う Win32 の
 # 部品 - ローカルグループ・サービス DACL の ACE・トークンのメンバーシップ・
 # runas の起動。昇格の境界（アクションと引数の検証）は製品の elev が持つ.
-# docs/chronogazer-service-design.md §4 の B3-3a). #392 B3-3b: apps/chronogazer/elev
+# docs/chronogazer/chronogazer-service-design.md §4 の B3-3a). #392 B3-3b: apps/chronogazer/elev
 # (`chronogazer-elev.exe` - ChronoGazer の UAC 昇格ヘルパー。固定の 7 アクションで
 # サービスの登録・Operators・サービス DACL の ACE・データと secrets の ACL・自動開始.
-# docs/chronogazer-service-design.md §4 の B3-3b).
+# docs/chronogazer/chronogazer-service-design.md §4 の B3-3b).
 # #623 PR-1a: crates/banto-safe-root (banto-secret-store の `acl`・`guard` を移した。
 # 利用者が触れうるフォルダの木を LocalSystem が辿らずに扱う、製品に依らない部品。
 # 本番の依存は windows-sys・thiserror だけ).
@@ -45,20 +45,20 @@
 # `hub_tls_prepare` から移し、Hub のサービスとクライアント（ChronoGazer）が同じ確かめを使う).
 # R1-1: crates/banto-driver-api (ドライバの境界の型だけを持つ、crates.io へ公開する
 # crate。独自の版 0.1.0 と `publish = true`。banto-plc が共通の型をここから再輸出する.
-# docs/banto-driver-api-design.md §2.1).
+# docs/hub/driver/banto-driver-api-design.md §2.1).
 # R1-2: crates/banto-driver-conformance (banto-driver-api のドライバの適合テスト一式。
 # API と同じく crates.io へ公開する crate で、独自の版 0.1.0。API には path + version で
-# 依存する. docs/banto-driver-api-design.md §2.2・§7).
+# 依存する. docs/hub/driver/banto-driver-api-design.md §2.2・§7).
 # R1-3b: crates/banto-drivers (ホストが注入する組み込みドライバ一式 `builtin()`。
-# 内部 crate. docs/banto-driver-api-design.md §6).
+# 内部 crate. docs/hub/driver/banto-driver-api-design.md §6).
 # R1-4a: crates/banto-driver-slmp, crates/banto-driver-modbus (banto-broker から
 # SLMP / Modbus TCP のドライバ（`BrokerSession` の実装と `dial`）を移した内部 crate。
-# broker はこれらに依存しない. docs/banto-driver-api-design.md §2.3・§4.4).
+# broker はこれらに依存しない. docs/hub/driver/banto-driver-api-design.md §2.3・§4.4).
 # R2a-3a: crates/banto-db-source (Hub 内の DB Source（apps/banto-hub/core の
 # db_source）が持っていた「列→f64 の変換 SQL・列の解決・品質の梯子（純関数の状態機械）・
 # PostgreSQL の接続オプションとエラー文言」を、DB ブリッジ（R2a-3b、banto-hub-sink）と
 # 共有するために切り出した内部 crate。依存は sqlx（postgres）だけ.
-# docs/banto-hub-ingest-design.md §10.1).
+# docs/hub/banto-hub-ingest-design.md §10.1).
 [workspace]
 resolver = "2"
 members = [
@@ -143,7 +143,7 @@ tokio = { version = "1" }
 # shared dependency so I5 picks up the same version by construction rather
 # than by remembering to match it.
 #
-# H9 (docs/h9-slmp-structured-error-spec.md, 2026-08-12 オーナー決定): 0.2.0
+# H9 (docs/hub/driver/h9-slmp-structured-error-spec.md, 2026-08-12 オーナー決定): 0.2.0
 # はオーナーのフォーク(tyaro/slmp)で、構造化エラー(`SlmpError::{Device,
 # Framing,Timeout,NotConnected,Io}`)を公開する - crates.io 0.1.x が
 # `std::io::Error` 一本化で終了コードをメッセージ文字列でしか露出しなかった
@@ -155,7 +155,7 @@ tokio = { version = "1" }
 # 再現性方針)。
 # 2026-10-19: v0.2.1 へ上げた（応答が TCP で分割して届いても 1 フレームとして
 # 読む。それまでは単発の read() で受けていたため、分割すると Framing の致命
-# エラーで切断・再接続していた。docs/banto-hub-driver-refactor-plan.md §8.3）。
+# エラーで切断・再接続していた。docs/hub/driver/banto-hub-driver-refactor-plan.md §8.3）。
 slmp = { git = "https://github.com/tyaro/slmp", tag = "v0.2.1" }
 # S1 (relay-wright plan, 文字列タグ): Shift-JIS encode/decode for MELSEC string
 # devices - banto-plc's string read decode and banto-plc-write's string write
@@ -185,7 +185,7 @@ window-vibrancy = "0.8"
 # Dev-only: isolated temp dirs for filesystem-touching tests (backup
 # service, etc. - mirrors banto's own reasoning for this dependency).
 tempfile = "3"
-# T0-2 (docs/tag-server-design.md §5.6): API キーの secret 部分(32バイト)を
+# T0-2 (docs/hub/tag-server-design.md §5.6): API キーの secret 部分(32バイト)を
 # 生成する CSPRNG。0.4 系を直接指定する: `uuid`(tauri-utils 経由)や
 # `rand` 0.10(tokio-tungstenite 経由)が既に `getrandom` 0.3/0.4 系を木に
 # 持っており、0.2 系(`password-hash` → `rand_core` 0.6.4 経由)に揃えても
@@ -207,7 +207,7 @@ hex = "0.4"
 # の汎用エンコーダ。`sqlx-core` 等が既に 0.22 系を木に持っている。
 base64 = "0.23"
 # T0-2 / 設計 §5.1・§10-6: `/api/v1/openapi.json` の自動生成(utoipa 採用は
-# 2026-08-04 オーナー決定 - docs/tag-server-design.md §10 の6番)。catalog が
+# 2026-08-04 オーナー決定 - docs/hub/tag-server-design.md §10 の6番)。catalog が
 # クライアントとの互換性契約(§4.1)であるため、コードとスキーマを単一
 # ソース化する。axum 統合は使わず(パラメータは `#[utoipa::path]` に手で
 # 記述する)最小構成で導入 - `apps/banto-hub/core` のみが使う。
@@ -235,7 +235,7 @@ utoipa-swagger-ui = { version = "10.0.2", default-features = false, features = [
     "axum",
     "vendored",
 ] }
-# T1（docs/tag-server-design.md §5.2）: `GET /api/v1/stream` の WS 統合テスト
+# T1（docs/hub/tag-server-design.md §5.2）: `GET /api/v1/stream` の WS 統合テスト
 # 用クライアント（dev-dependency のみ - サーバー側は axum 自身の `ws`
 # feature で足りる）。axum 0.8.9 が内部で使っているのと同じ 0.29 系を選び、
 # Cargo.lock に無関係な第2系統を増やさない。
@@ -249,7 +249,7 @@ banto-server = { git = "https://github.com/tyaro/banto.git", tag = "v7.5.0" }
 # Cargo.lock にパッケージは増えない。`apps/chronogazer/core` と、I3'
 # （2026-10-04）で同じく置き換えた `apps/banto-hub/core` が使う。
 banto-admin-services = { git = "https://github.com/tyaro/banto.git", tag = "v7.5.0" }
-# T3（docs/tag-server-design.md §5.3）: banto-hub の MQTT publish（外部ブロー
+# T3（docs/hub/tag-server-design.md §5.3）: banto-hub の MQTT publish（外部ブロー
 # カーへ接続するクライアントモードのみ - 組み込みブローカーは §10-4 の判断
 # 待ち）。plan.md §3 で保留になっていた「MQTT クライアント（rumqttc +
 # タグバインド）」行をここで回収する。`apps/banto-hub/core` のみが使う。
@@ -257,7 +257,7 @@ banto-admin-services = { git = "https://github.com/tyaro/banto.git", tag = "v7.5
 # 閉域 LAN 前提」（TLS 終端はリバースプロキシに委譲）で TLS 接続はスコープ外
 # のため、rustls 一式を Cargo.lock の依存木に増やさない。
 rumqttc = { version = "0.25", default-features = false }
-# T4（docs/tag-server-design.md §5.4）: gRPC タグ空間 API。tonic 0.13 以降は
+# T4（docs/hub/tag-server-design.md §5.4）: gRPC タグ空間 API。tonic 0.13 以降は
 # prost 統合が本体から `tonic-prost`（実行時コーデック）/
 # `tonic-prost-build`（ビルド時コード生成）へ分離されたため、この2つと
 # `prost`（メッセージ型のランタイム）を個別に宣言する。既定 feature
@@ -284,7 +284,7 @@ protoc-bin-vendored = "3"
 # （`ReceiverStream`）。tonic 自身が `server`/`transport` feature 経由で
 # 既に木に持っている 0.1 系と同じバージョンを明示する。
 tokio-stream = "0.1"
-# T19 S3-b（docs/banto-hub-t19-design.md §3.9、UX-46 サーバー状態の拡充）:
+# T19 S3-b（docs/hub/banto-hub-t19-design.md §3.9、UX-46 サーバー状態の拡充）:
 # 状態画面（GET /api/status・GET /api/v1/status）に載せる CPU 使用率・
 # メモリ使用量のクロスプラットフォーム取得。`default-features = false` +
 # `system` feature のみを有効にする - CPU/メモリ/プロセス情報だけが必要で、

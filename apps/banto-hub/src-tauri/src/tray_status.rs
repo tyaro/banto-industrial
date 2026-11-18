@@ -1,5 +1,5 @@
-//! T16-1（`docs/banto-hub-t16-design.md` §3「T16-1」・
-//! `docs/banto-hub-desktop-plan.md` §9.7 状態表示表 / §9.9 トレイ表）:
+//! T16-1（`docs/hub/banto-hub-t16-design.md` §3「T16-1」・
+//! `docs/hub/banto-hub-desktop-plan.md` §9.7 状態表示表 / §9.9 トレイ表）:
 //! 収集状態 → トレイ表示（ラベル・tooltip・メニュー構成）への変換だけを
 //! 行う純粋関数の集まり。
 //!
@@ -13,7 +13,7 @@
 //! だけだったので、tooltip のホスト名部分は常に「アプリ」固定だった
 //! （サービス接続時の識別は T16-2 で追加）。
 //!
-//! ## T16-2 で追加したもの（docs/banto-hub-t16-design.md §3「T16-2」）
+//! ## T16-2 で追加したもの（docs/hub/banto-hub-t16-design.md §3「T16-2」）
 //!
 //! - [`service_status_label`]/[`service_tooltip_text`]: `HostKind::Service`
 //!   （サービスへ接続中）のトレイ表示。

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <!--
-  T17-2 スライス2（docs/banto-hub-t17-design.md §3「T17-2」）: UAC 昇格ヘルパー
+  T17-2 スライス2（docs/hub/banto-hub-t17-design.md §3「T17-2」）: UAC 昇格ヘルパー
   `banto-hub-elev.exe`専用のアプリケーションマニフェスト。
 
   `requestedExecutionLevel level="requireAdministrator"` により、OS はこの

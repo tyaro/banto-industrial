@@ -1,7 +1,7 @@
 //! MQTT・store・gRPC・OPC UA の設定 API（`/api/mqtt-settings`・`/api/store-settings`・
 //! `/api/grpc-settings`・`/api/opcua-settings`）。
 //!
-//! `rest.rs` から中身を変えずに移したもの（docs/banto-hub-driver-refactor-plan.md §8.1、
+//! `rest.rs` から中身を変えずに移したもの（docs/hub/driver/banto-hub-driver-refactor-plan.md §8.1、
 //! P0-1 の手順 1）。共通部品（認証・ガード・監査の補助）は親の `rest.rs` にあり、
 //! `use super::{...}` で使う。外から使われるパス（`crate::rest::X`）は親の re-export で
 //! 保つ。
@@ -34,7 +34,7 @@ struct MqttSettingsAdminState {
 
 /// `GET/PUT /api/mqtt-settings`の request/response body。admin-UI 向け
 /// リソースの流儀（`ApiKeySummary`等）に合わせて camelCase。
-// T21 S2-b（docs/banto-hub-t21-design.md、構成補助 MCP の設定 get/set）:
+// T21 S2-b（docs/hub/banto-hub-t21-design.md、構成補助 MCP の設定 get/set）:
 // `crate::mcp`が同じ入力検証・apply 挙動を再利用するため、この型と
 // `validate_mqtt_settings_request`を`pub(crate)`にしてある - REST/MCP で
 // 設定の validation/response 形を二重実装しないための共有（このモジュールの
@@ -230,7 +230,7 @@ pub(super) fn mqtt_settings_router(
         ))
 }
 
-// --- 履歴保持 (T19 S2-d、docs/banto-hub-t19-design.md §5.1、UX-39): admin
+// --- 履歴保持 (T19 S2-d、docs/hub/banto-hub-t19-design.md §5.1、UX-39): admin
 // 限定、CSRF + bearer -----------------------------------------------------
 //
 // `GET/PUT /api/store-settings` は `mqtt_settings_router`/`audit_log_router`

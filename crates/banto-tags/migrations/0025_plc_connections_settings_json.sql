@@ -1,4 +1,4 @@
--- R2b-1d（docs/banto-hub-connection-settings-design.md §3.1・§3.2・§3.3・§6.2、
+-- R2b-1d（docs/hub/banto-hub-connection-settings-design.md §3.1・§3.2・§3.3・§6.2、
 -- 2026-10-21 オーナー決定 Q1〜Q15）: plc_connections の固定列（host・port・
 -- unit_id・word_order・cpu_type・database・username・password）を JSON の
 -- `settings`（NOT NULL のオブジェクト）へ移し、`settings_version` を足し、

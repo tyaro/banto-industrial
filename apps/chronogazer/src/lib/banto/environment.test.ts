@@ -1,5 +1,5 @@
 /**
- * `isTauri()` の origin の判定（#392 B2-2、設計書 docs/chronogazer-service-design.md
+ * `isTauri()` の origin の判定（#392 B2-2、設計書 docs/chronogazer/chronogazer-service-design.md
  * §3.2）。シェルがサービス（`chronogazer-server`）の HTTP の画面へ navigate すると、
  * Tauri はその窓にも `__TAURI_INTERNALS__` を注入する。内部オブジェクトの有無だけで
  * 判定すると invoke の経路を選んで壊れるので、origin が Tauri 自身のアセットのものかも

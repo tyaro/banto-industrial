@@ -1,9 +1,9 @@
 /**
- * TAG-P0-2「保存成功」と「実行可能」を一致させる（docs/banto-hub-desktop-plan.md
+ * TAG-P0-2「保存成功」と「実行可能」を一致させる（docs/hub/banto-hub-desktop-plan.md
  * §9.3）の実 DOM 受け入れテスト。
  *
  * R2b-2b 以降、アドレスの不正は保存の層（`TagService`、接続のドライバの
- * `parse_address`、docs/banto-hub-driver-address-design.md §3）が preflight より
+ * `parse_address`、docs/hub/driver/banto-hub-driver-address-design.md §3）が preflight より
  * 先に `address` の項目エラー（422）で断る。画面ではアドレス欄の直下
  * （`#tag-address-err`）にドライバのメッセージが出る。preflight の
  * `field: "configuration"` の全体エラー（`role="alert"`）は、アドレス以外の

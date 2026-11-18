@@ -1,6 +1,6 @@
 //! [`FaultProxy`]: a TCP relay on 127.0.0.1 that puts faults between a
 //! session-type driver and a peer that is already a TCP server (a device
-//! simulator) - docs/banto-driver-api-design.md §7.2, §7.3.
+//! simulator) - docs/hub/driver/banto-driver-api-design.md §7.2, §7.3.
 //!
 //! The driver connects to [`FaultProxy::local_addr`] instead of the peer.
 //! Every accepted connection is relayed to the peer, and on the way back

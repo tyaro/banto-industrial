@@ -1,4 +1,4 @@
-//! T5-1（docs/tag-server-design.md §8「常駐」・docs/t5-handoff.md §3）:
+//! T5-1（docs/hub/tag-server-design.md §8「常駐」・docs/archive/t5-handoff.md §3）:
 //! banto-hub を Windows サービスとして常駐実行するための SCM 連携。
 //! `windows-service`クレート（本実装）を使う - #392 B3-1 以降は直接ではなく、
 //! 共有 crate `banto-service-control` のランナー経由（下の「共有ランナー」）。
@@ -43,7 +43,7 @@
 //! サービス名 `BantoHub`・表示名「banto-hub タグサーバー」。
 //!
 //! **T17-4（P4「Demand 化」、2026-08-10、
-//! docs/banto-hub-t17-design.md §1「P4」・§11）以降、新規インストールの
+//! docs/hub/banto-hub-t17-design.md §1「P4」・§11）以降、新規インストールの
 //! 既定起動種別は手動開始（`ServiceStartType::OnDemand`）**
 //! （`banto_hub_core::service_install::install`参照）- OS 再起動だけで
 //! banto-hub の収集が始まらないようにするための決定で、`Start-Service`
@@ -57,13 +57,13 @@
 //! （`set_delayed_auto_start(true)`）を組み合わせる - banto-hub は起動
 //! 直後に TCP bind と（設定次第で）LAN 上の PLC への接続を試みるため、
 //! OS 起動直後・ネットワークスタック初期化がまだ終わっていないタイミング
-//! で起動が競合する事故を避ける（docs/tag-server-design.md §8 常駐の
+//! で起動が競合する事故を避ける（docs/hub/tag-server-design.md §8 常駐の
 //! 判断）。`OnDemand`には遅延自動開始の概念が無い（Windows API 仕様）ため
 //! `install`ではこの呼び出しを行わない。
 //!
 //! ## 設定モード ⇔ 運用モード（#661 661-2、2026-10-19）
 //!
-//! docs/banto-hub-t17-design.md §1 の「2026-10-19 オーナー決定（#661）」と、ChronoGazer の
+//! docs/hub/banto-hub-t17-design.md §1 の「2026-10-19 オーナー決定（#661）」と、ChronoGazer の
 //! `chronogazer_server/service.rs`（#623 PR-3）を手本にした。サービスが使う profile
 //! （`BANTO_HUB_PROFILE`）の木だけを締める（`{root}` と `profiles\` は開いて本当のパスを
 //! 確かめるだけ）。判定・文言の純関数は `banto_hub_core::profile_mode`、戻す相手の HKLM の
@@ -170,7 +170,7 @@ use banto_safe_root::{
     enable_redirection_guard, open_root, DirAccess, InstallUserSid, ManagedDir, ManagedSpec, Mode,
     ModeAccess, RedirectionGuard, RootSpec, SafeRoot, SafeRootError,
 };
-// T17-0（docs/banto-hub-t17-design.md §3「T17-0」）: サービス名・起動引数は
+// T17-0（docs/hub/banto-hub-t17-design.md §3「T17-0」）: サービス名・起動引数は
 // `banto_hub_core::service_manager`（`WindowsServiceManager`が実 SCM 再登録
 // 時に使う値と同じもの）を単一のソースとして再利用する - このファイルは
 // 以前`SERVICE_NAME`/`RUN_SERVICE_ARG`を自前で定義していたが、値そのものは

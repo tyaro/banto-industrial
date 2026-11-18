@@ -1,4 +1,4 @@
-//! banto-collect: I3b 収集エンジン (docs/plan.md I3b, docs/recorder-requirements.md
+//! banto-collect: I3b 収集エンジン (docs/plan.md I3b, docs/chronogazer/recorder-requirements.md
 //! §3.1 "タグ・収集", §3.5 "イベント・出力", §4 "非機能要件").
 //!
 //! Takes a snapshot of the tag registry's enabled configuration, opens a
@@ -26,7 +26,7 @@
 //!   [`StoreConfig`](banto_tstore::StoreConfig).
 //! - [`collector`]: [`Collector`] - lifecycle (`start`/`stop`), the UI's read
 //!   handles (`current_values`/`status`/`subscribe_events`), and (T7-1,
-//!   docs/tag-server-design.md §4.3) [`Collector::apply_config`] - online
+//!   docs/hub/tag-server-design.md §4.3) [`Collector::apply_config`] - online
 //!   partial reconfiguration that touches only the connections that actually
 //!   changed. See `collector.rs`'s module doc for the safety derivation.
 //! - [`current`]: [`CurrentValuesHandle`]/[`CurrentSample`]/[`Quality`] - the
@@ -39,7 +39,7 @@
 //!   concurrency design (one task per connection, in-task min-deadline
 //!   scheduler, non-blocking reconnect). [`BackoffConfig`] and
 //!   [`ConnectionStatus`] are its public surface.
-//! - [`client`] (R2b-3a-3, docs/banto-hub-driver-io-design.md §4.3): the
+//! - [`client`] (R2b-3a-3, docs/hub/driver/banto-hub-driver-io-design.md §4.3): the
 //!   [`CollectClient`] a task reads through, the [`ClientFactory`] seam
 //!   (connection key -> client), and the one production client,
 //!   [`BrokerReadClient`] (#344's `connect` semantics), with

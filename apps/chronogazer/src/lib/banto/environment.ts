@@ -5,7 +5,7 @@
 // だけを見るが、ChronoGazer のシェルがサービス（`chronogazer-server`）の
 // `http://127.0.0.1:<port>/` へ navigate すると、Tauri はその窓にも
 // `__TAURI_INTERNALS__` を注入するので、invoke の経路を選んで壊れる（設計書
-// docs/chronogazer-service-design.md §0・§3.2）。banto 側にも同じ直しを提案する
+// docs/chronogazer/chronogazer-service-design.md §0・§3.2）。banto 側にも同じ直しを提案する
 // （別 issue）。それ以外は無改変。
 /**
  * Environment detection for the three spec §11.1 runtime environments

@@ -1,6 +1,6 @@
 //! What the broker's job loop runs a connection on: a `banto-driver-api`
 //! [`Session`], dialed by a [`Connector`] (R2b-3a-2,
-//! docs/banto-hub-driver-io-design.md §4.2).
+//! docs/hub/driver/banto-hub-driver-io-design.md §4.2).
 //!
 //! ## History: `BrokerSession` is gone
 //!

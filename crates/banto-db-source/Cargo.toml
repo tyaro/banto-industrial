@@ -1,4 +1,4 @@
-# R2a-3a（docs/banto-hub-ingest-design.md §10.1・§11、2026-10-21）: Hub 内の
+# R2a-3a（docs/hub/banto-hub-ingest-design.md §10.1・§11、2026-10-21）: Hub 内の
 # DB Source（`apps/banto-hub/core/src/db_source`）が持っていた「列 → f64 の
 # 変換」「品質の梯子」「PostgreSQL の接続オプションとエラー文言」を、DB ブリッジ
 # （R2a-3b、`apps/banto-hub-sink`）と共有するために切り出した内部 crate。

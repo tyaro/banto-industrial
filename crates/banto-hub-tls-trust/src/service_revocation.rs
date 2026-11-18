@@ -1,4 +1,4 @@
-//! サービスの失効の記録（#1121 PR2b。docs/hub-desktop-tls-design.md §4.4.1「サービスの記録」・
+//! サービスの失効の記録（#1121 PR2b。docs/hub/hub-desktop-tls-design.md §4.4.1「サービスの記録」・
 //! §4.4.2 の場面 8・11・25・26）: サービスの `tls\` の証明書のうち、二度と使わないものの拇印。
 //!
 //! 置き場は `<ProgramData>\BantoHub\tls-revocations\`（[`SERVICE_REVOCATIONS_DIR`]）（`tls\` の外）の

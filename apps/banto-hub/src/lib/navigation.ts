@@ -8,7 +8,7 @@
  * が正しく収集できているかを見る」ことだからで、ルート `/` からの
  * redirect 先にもなっている（routes/+page.ts）。
  *
- * T19 S1-d（UX-30、docs/banto-hub-t19-design.md、2026-09-03）: 旧
+ * T19 S1-d（UX-30、docs/hub/banto-hub-t19-design.md、2026-09-03）: 旧
  * `PLC接続`（`/plc-connections`）・`収集グループ`（`/collection-groups`）の
  * 2エントリを削除した。設定の入口はタグ画面（`/tags`）へ一本化済み（S1-a〜
  * S1-c）で、両画面の固有機能（接続テスト・シミュレーション切替・
@@ -108,7 +108,7 @@ export const navItems: NavItem[] = [
 	{ path: '/status', label: '状態', icon: '📡' },
 	{ path: '/tags', label: 'タグ登録', icon: '🏷️' },
 	{ path: '/monitor', label: 'タグモニタ', icon: '📈' },
-	// S6（docs/banto-hub-external-db-design.md §5.2・§7 row S6）: DB Sink の
+	// S6（docs/hub/banto-hub-external-db-design.md §5.2・§7 row S6）: DB Sink の
 	// sink group 管理画面。`GET /api/sink/groups`はロール不問（閲覧は
 	// viewer も可）・作成/更新/削除は editor 以上（`require_editor`）と
 	// サーバー側の権限に合わせ、ここでは admin 限定にしない - ページ内の
@@ -171,7 +171,7 @@ export function isNavItemActive(item: NavItem, pathname: string): boolean {
 }
 
 /**
- * #1179 PR3b（docs/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、段階 ①）:
+ * #1179 PR3b（docs/hub/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、段階 ①）:
  * ツリーの選択を共有するページ。タグ登録（`/tags`）とタグモニタ（`/monitor`）。
  */
 export const TREE_TARGET_SHARING_PATHS: readonly AppPath[] = ['/tags', '/monitor'];

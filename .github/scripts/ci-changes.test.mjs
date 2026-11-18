@@ -1103,7 +1103,7 @@ const PR_622 = [
 	'crates/banto-secret-store/src/acl.rs',
 	'crates/banto-service-control/src/install.rs',
 	'docs/README.md',
-	'docs/chronogazer-service-design.md'
+	'docs/chronogazer/chronogazer-service-design.md'
 ];
 const PR_637 = [
 	'apps/chronogazer/elev/Cargo.toml',
@@ -1118,7 +1118,7 @@ const PR_637 = [
 	'crates/banto-secret-store/src/lib.rs',
 	'crates/banto-service-elev/src/lib.rs',
 	'crates/banto-service-elev/src/win.rs',
-	'docs/chronogazer-service-design.md'
+	'docs/chronogazer/chronogazer-service-design.md'
 ];
 
 test('実例 #622: .github・root の Cargo.toml / Cargo.lock を含むので今までどおりフル', () => {

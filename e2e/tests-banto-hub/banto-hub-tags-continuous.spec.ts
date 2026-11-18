@@ -1,6 +1,6 @@
 /**
  * タグ連続登録（T11-1）の実 DOM 受け入れテスト - TAG-P0-1
- * （docs/banto-hub-desktop-plan.md §9「TAG-P0-1: 連続登録の点数変更を
+ * （docs/hub/banto-hub-desktop-plan.md §9「TAG-P0-1: 連続登録の点数変更を
  * 修正する」）の受け入れ条件のうち、`continuousRegistration.test.ts`
  * （vitest、純関数の単体テスト）ではまだ確認できていない「実 DOM から
  * 点数を変更したときにプレビュー件数/エラー表示が正しく追従するか」を
@@ -74,7 +74,7 @@ test.describe.serial('banto-hub タグ連続登録 DOM (TAG-P0-1)', () => {
 		// 対象グループを選ぶ（`groupNodeByName` は `banto-hub-auth.ts`
 		// 参照）。以前は Drawer を開いてから `<select>` で選ぶ実装だった。
 		//
-		// T19 S1-b（UX-35、docs/banto-hub-t19-design.md「連続登録の名前
+		// T19 S1-b（UX-35、docs/hub/banto-hub-t19-design.md「連続登録の名前
 		// パターン — デバイス名を既定とし、開始番号はアドレスから導出」、
 		// 2026-09-02 オーナー決定）で名前パターン/開始番号の既定値が
 		// 「固定値 `temp{n}`/`1`」から「開始アドレスから導出」に変わった。

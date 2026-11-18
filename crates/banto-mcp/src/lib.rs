@@ -1,5 +1,5 @@
 //! MCP（Model Context Protocol）サーバーの骨組み。banto-hub と ChronoGazer
-//! （予定）が共有する（#1161 PR2、設計書 `docs/chronogazer-agent-api-design.md`
+//! （予定）が共有する（#1161 PR2、設計書 `docs/chronogazer/chronogazer-agent-api-design.md`
 //! §5.1）。
 //!
 //! ## 何を持ち、何を持たないか

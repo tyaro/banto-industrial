@@ -5,7 +5,7 @@ use super::common::{
 };
 use banto_tstore::ManualClock;
 
-// --- 外部 DB 連携 S4（docs/banto-hub-external-db-design.md §5.2・§6-13・
+// --- 外部 DB 連携 S4（docs/hub/banto-hub-external-db-design.md §5.2・§6-13・
 // §6-15）: DB Sink の Hub 側（`hub_sink_groups` CRUD、`GET
 // /api/sink/config`、`PUT /api/sink/status`、`GET /api/status`の
 // `sink`節） ------------------------------------------------------------
@@ -409,7 +409,7 @@ async fn sink_config_get_requires_admin_and_carries_password_and_stable_ids() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{body:?}");
 }
 
-/// R2a-3b（docs/banto-hub-ingest-design.md §10.2、§11 のオーナーの監査 (5)）:
+/// R2a-3b（docs/hub/banto-hub-ingest-design.md §10.2、§11 のオーナーの監査 (5)）:
 /// `GET /api/ingest/bridge-config` のゲートは `/api/sink/config` と同じ（admin スコープの
 /// キーか admin ロールのセッション）。`ingest:` だけのキー・`read` だけのキー・viewer は
 /// 断る。パスワードは呼び出し手のキーがその接続の `ingest:#{id}` を持つときだけ返し、

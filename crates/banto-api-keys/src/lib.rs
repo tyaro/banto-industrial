@@ -1,6 +1,6 @@
 //! 機械クライアント向けの API キー（発行・一覧・失効・削除・一時停止・照合）
 //! を、**アプリに依らない部分だけ**まとめた共有 crate。banto-hub（接頭辞
-//! `bh`）が使い、ChronoGazer（`cg`）が続く（docs/chronogazer-agent-api-design.md
+//! `bh`）が使い、ChronoGazer（`cg`）が続く（docs/chronogazer/chronogazer-agent-api-design.md
 //! §3.1・#1161）。もとは banto-hub の `apps/banto-hub/core/src/api_keys.rs` に
 //! あった物で、移すときに挙動（キーの形式・ハッシュ・表・照合の順・応答）は
 //! 変えていない。

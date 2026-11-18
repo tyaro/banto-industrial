@@ -1,5 +1,5 @@
 /**
- * R2a-2e（docs/banto-hub-ingest-design.md §7.1 の 3.「UI に見積もりを出す」）:
+ * R2a-2e（docs/hub/banto-hub-ingest-design.md §7.1 の 3.「UI に見積もりを出す」）:
  * `push` 接続のブリッジの区画が送る量の見積もり。`banto_tags::push::bridge_load`
  * （`crates/banto-tags/src/push.rs`）の式をそのまま写したもので、登録時に
  * サーバーが断る設定（上限の 8 割を超える、§12 Q20）を**保存の前に**画面で

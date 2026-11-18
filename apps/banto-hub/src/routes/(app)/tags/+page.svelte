@@ -4,7 +4,7 @@
 	 * シンプル型を反復した新規作成（実装指示: 「tags 画面は 1737 行版
 	 * （一括/連続登録込み）をコピーしない」）。
 	 *
-	 * T13-1（2026-08-08、docs/ux-plan.md §4b）: master-detail レイアウトへ
+	 * T13-1（2026-08-08、docs/archive/ux-plan.md §4b）: master-detail レイアウトへ
 	 * 刷新。左は ConnectionTree（接続→収集グループの2階層、banto の
 	 * BantoTree を流し込むアプリ側コンポーネント。#1179 PR2a まで自前の TreeView）、右はツールバー
 	 * + 画面全高の BantoGrid。フォームは通常登録・行クリック編集・連続
@@ -268,7 +268,7 @@
 	}
 
 	/**
-	 * T18-5a（docs/banto-hub-t18-design.md「T18-5a 大量タグ性能」第1段）:
+	 * T18-5a（docs/hub/banto-hub-t18-design.md「T18-5a 大量タグ性能」第1段）:
 	 * 一括登録/更新のプレビュー表（連続登録・CSV新規・CSV更新差分・一括操作
 	 * 差分の4箇所）は最大 MAX_CSV_ROWS（10,000行）まで全件を DOM 描画して
 	 * いたため、大規模 CSV では描画が重くなる。検証（dryRun）・適用
@@ -308,7 +308,7 @@
 		decimals: string;
 		enabled: boolean;
 		/**
-		 * 書き込み可（T2-3、docs/tag-server-design.md §6 item 1）。既定 off -
+		 * 書き込み可（T2-3、docs/hub/tag-server-design.md §6 item 1）。既定 off -
 		 * 明示的に opt-in させたタグだけを書き込み対象にする設計（per-tag
 		 * opt-in）に合わせる。`computed` タグではこのチェックボックス自体を
 		 * 隠す（送信時に強制 false - サーバー側も writable=true を拒否する）。
@@ -466,13 +466,13 @@
 	}
 
 	/**
-	 * T6-2 (docs/tag-server-design.md §4.2's table): `computed`/`internal`
+	 * T6-2 (docs/hub/tag-server-design.md §4.2's table): `computed`/`internal`
 	 * tags carry no PLC address at all — send an empty string regardless of
 	 * whatever the (hidden) address field still holds from a prior `plc`
 	 * selection, so switching `tagKind` in the form can never leak a stale
 	 * address into a payload the backend would reject.
 	 *
-	 * S3（docs/banto-hub-external-db-design.md §4.1・§4.4）追記: `db` タグは
+	 * S3（docs/hub/banto-hub-external-db-design.md §4.1・§4.4）追記: `db` タグは
 	 * `address`（結果列名）を持つ点は `plc` と同じ（PLC アドレスと意味が
 	 * 違うだけ）だが、`expression` は禁止・`writable` は常に false・
 	 * `retain` は無意味という点は `computed`/`internal` と同じ扱いにする
@@ -580,7 +580,7 @@
 	}
 
 	/**
-	 * T13-1 (docs/ux-plan.md §4b): 通常登録・行クリック編集・連続登録・
+	 * T13-1 (docs/archive/ux-plan.md §4b): 通常登録・行クリック編集・連続登録・
 	 * CSVインポートの4フローを1つの Drawer に集約する。旧 `Mode`
 	 * （'single' | 'continuous' | 'csv' の表示切替）と旧「選択中タグの
 	 * 編集パネル常時表示」を、この `drawerMode` 1つに統合した -
@@ -594,7 +594,7 @@
 	let tags: Tag[] = $state([]);
 
 	/**
-	 * T19 S2-c2（UX-40、docs/banto-hub-t19-design.md §3.10）: 削除の取り消し
+	 * T19 S2-c2（UX-40、docs/hub/banto-hub-t19-design.md §3.10）: 削除の取り消し
 	 * 猶予中のタグを一覧から隠す。`deferredDelete.pendingIds` に含まれる id は
 	 * まだサーバー上には存在する（削除リクエストを遅延させているだけ）が、
 	 * 画面上は既に削除済みとして扱う - `filteredTags`/`selectedTags`/
@@ -612,7 +612,7 @@
 	 */
 	let registryLoaded = $state(false);
 	/**
-	 * T18-1（TAG-UX-C 6点目、docs/banto-hub-desktop-plan.md §9.4）:
+	 * T18-1（TAG-UX-C 6点目、docs/hub/banto-hub-desktop-plan.md §9.4）:
 	 * 初期読込失敗・再読込失敗を通信エラーとして保持する - `tags` は
 	 * 失敗時も直前の内容を残す（stale 維持、`monitor/+page.svelte` の
 	 * `loadError` と同じパターン）。「通信失敗を『タグ0件』と表示しない」
@@ -622,7 +622,7 @@
 	let loadError = $state<string | null>(null);
 
 	/**
-	 * T18-3e（docs/banto-hub-t18-design.md「T18-3e BantoGrid セル編集/TSV貼付
+	 * T18-3e（docs/hub/banto-hub-t18-design.md「T18-3e BantoGrid セル編集/TSV貼付
 	 * の接続」、実装指示「停止中のみ編集可（停止中ロック）」）: BantoGrid の
 	 * セル編集/TSV貼付は収集停止中（`collection_state === 'stopped'`）のみ
 	 * 許可する。`getHubStatus()`（`GET /api/status`、2026-08-31 オーナー
@@ -654,7 +654,7 @@
 	let commissioningStatus = $state<CommissioningStatus | null>(null);
 
 	/**
-	 * #341（オーナー決定 2026-09-09、`docs/tag-server-design.md` §4.3）:
+	 * #341（オーナー決定 2026-09-09、`docs/hub/tag-server-design.md` §4.3）:
 	 * 表編集を許すかどうか。**停止中、または試運転中（未ロックダウン）**。
 	 * 試運転中はサーバー側が収集中の CRUD をそのまま受け付けて無停止で
 	 * 反映する（`registry_change_should_queue` は「収集中 かつ ロック
@@ -697,7 +697,7 @@
 	 * のみ（`banto_tags::tag::validate_tag_kind_placement` と同じ規則）。
 	 * サーバー側検証の先取りであって、これ自体が正の唯一の判定源ではない。
 	 *
-	 * S3（docs/banto-hub-external-db-design.md §4.1）追記: `db` は
+	 * S3（docs/hub/banto-hub-external-db-design.md §4.1）追記: `db` は
 	 * `protocol === 'postgres'` 接続配下のみ。`plc` 側も postgres 接続配下を
 	 * 除外するよう修正した - 修正前は「calc/mem 以外の接続配下すべて」を
 	 * `plc` の候補にしていたため、S2 で postgres 接続が使えるようになった
@@ -761,7 +761,7 @@
 	});
 
 	/**
-	 * T19 S2-c2（UX-40、docs/banto-hub-t19-design.md §3.10「取り消し猶予中に
+	 * T19 S2-c2（UX-40、docs/hub/banto-hub-t19-design.md §3.10「取り消し猶予中に
 	 * タブを閉じるなどして実行されなかった場合…画面遷移・再読込・次の
 	 * レジストリ操作の直前には猶予を打ち切って即実行する」）: 画面を離れる
 	 * ときは取り消し猶予を打ち切り、遅延させていた削除を確定させる。
@@ -794,7 +794,7 @@
 	let creating = $state(false);
 
 	/**
-	 * #342 段階A（docs/tag-server-design.md §4.2「演算タグの式チェック
+	 * #342 段階A（docs/hub/tag-server-design.md §4.2「演算タグの式チェック
 	 * API」）: create Drawer の式欄（`#tag-expression`、`tagKind === 'computed'`
 	 * のときだけ表示）向けのライブチェック結果。`null` は「未実行/クリア
 	 * 済み」（式が空、またはまだ一度もチェックが返っていない）。
@@ -895,7 +895,7 @@
 	let createNameTouched = $state(false);
 
 	/**
-	 * T19 S1-b（UX-34、docs/banto-hub-t19-design.md §2・§3.3、2026-09-02
+	 * T19 S1-b（UX-34、docs/hub/banto-hub-t19-design.md §2・§3.3、2026-09-02
 	 * オーナー決定「`writable` の既定 ON。ただし収集グループ単位で変更可
 	 * （条件付き適用）」）: create Drawer 専用の「`writable` チェックボックス
 	 * をユーザーが直接編集したか」の追跡フラグ。`createNameTouched` と同じ
@@ -924,7 +924,7 @@
 	 * `true` にする）かどうか。`true` の間、`tagFields` snippet はタグ種別・
 	 * 収集グループの2つの `<select>` を `disabled` にし、対象グループ名を
 	 * 明示するメッセージを出す - 「選択されたグループに対して登録する」
-	 * （実装指示、docs/banto-hub-t19-design.md UX-33）を、プリセットのみに
+	 * （実装指示、docs/hub/banto-hub-t19-design.md UX-33）を、プリセットのみに
 	 * 留めず実際に変更不能にすることで満たす。
 	 *
 	 * `openDuplicateDrawer`（複製）は `false` のまま - 複製元と同じグループに
@@ -1064,7 +1064,7 @@
 	});
 
 	/**
-	 * T18-3a（docs/banto-hub-t18-design.md「T18-3a タグ複製」、TAG-UX-D
+	 * T18-3a（docs/hub/banto-hub-t18-design.md「T18-3a タグ複製」、TAG-UX-D
 	 * 前半）: 複製元タグ。`openDuplicateDrawer` が set し、Drawer を閉じたら
 	 * `closeDrawer` が `null` に戻す。`null` の間は create Drawer は通常の
 	 * 新規作成（`openCreateDrawer` 経由）であり、複製元との差分パネルは
@@ -1094,7 +1094,7 @@
 	});
 
 	/**
-	 * TAG-P0-2（docs/banto-hub-desktop-plan.md §9.3、2026-08-10 実装メモ）:
+	 * TAG-P0-2（docs/hub/banto-hub-desktop-plan.md §9.3、2026-08-10 実装メモ）:
 	 * バックエンドの preflight（`preflight_transaction` →
 	 * `build_config_from`/`build_catalog_from`/`computed::build_plan`、
 	 * `apps/banto-hub/core/src/rest.rs::preflight_api_error`）は
@@ -1117,8 +1117,8 @@
 	}
 
 	/**
-	 * T18-4c（docs/banto-hub-t18-design.md「T18-4c 確認導線」、
-	 * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-H「新規／変更タグを
+	 * T18-4c（docs/hub/banto-hub-t18-design.md「T18-4c 確認導線」、
+	 * docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-H「新規／変更タグを
 	 * 『確認対象』として値・品質・時刻へ1クリックで移動できるようにする」）:
 	 * T18-2d の `showMonitorCta`（新規作成専用の真偽値）を一般化し、新規・
 	 * 複製・編集・連続登録・CSV 新規/更新取り込み・一括更新のすべての成功
@@ -1141,7 +1141,7 @@
 	let monitorCtaHref: string | null = $state(null);
 
 	/**
-	 * T18-2c（docs/banto-hub-t18-design.md「T18-2c 登録後分岐と親引継ぎ」、
+	 * T18-2c（docs/hub/banto-hub-t18-design.md「T18-2c 登録後分岐と親引継ぎ」、
 	 * TAG-UX-2）: create Drawer の主アクションを「保存して次を追加」
 	 * （`closeAfterSave = false`）と「保存して閉じる」（`true`）に分ける。
 	 * `closeAfterSave` は create フォームの `onsubmit` が
@@ -1236,7 +1236,7 @@
 	}
 
 	/**
-	 * T18-3b（docs/banto-hub-t18-design.md「T18-3b 一括操作」）: 複数選択
+	 * T18-3b（docs/hub/banto-hub-t18-design.md「T18-3b 一括操作」）: 複数選択
 	 * された行の id 集合。BantoGrid（`node_modules/@banto/grid-svelte`）は
 	 * 任意セル描画（チェックボックス列等）に対応しておらず、`editable` な
 	 * 列を1つでも足すと `onRowClick` の意味が変わってしまう
@@ -1338,7 +1338,7 @@
 	let editDetailOpen: DetailOpenState = $state(blankDetailOpen());
 
 	/**
-	 * T18-2b（docs/banto-hub-t18-design.md「T18-2b プロトコル別アドレス補助」、
+	 * T18-2b（docs/hub/banto-hub-t18-design.md「T18-2b プロトコル別アドレス補助」、
 	 * TAG-UX-6「入力中に共通 preflight を実行する」）: アドレス入力中の
 	 * デバウンス dry-run 検証状態。新規バックエンドは作らず、連続登録/CSV
 	 * インポートが使っているのと同じ `createTagsBatch(tags, dryRun=true)`
@@ -1364,7 +1364,7 @@
 	let addressPreflightTimer: ReturnType<typeof setTimeout> | undefined;
 
 	/**
-	 * S3（docs/banto-hub-external-db-design.md §7 row S3、実装指示4「列を
+	 * S3（docs/hub/banto-hub-external-db-design.md §7 row S3、実装指示4「列を
 	 * 取得」ボタン）: `db` タグ登録フォームの「結果列名」候補一覧 -
 	 * `POST /api/collection-groups/{id}/describe`（`describeCollectionGroup`）
 	 * の応答をそのまま保持する。`AddressPreflightState` と同じ「create/edit
@@ -1470,7 +1470,7 @@
 	});
 
 	/**
-	 * T18-1（TAG-UX-C 4点目「差分表示 UI」、docs/banto-hub-desktop-plan.md
+	 * T18-1（TAG-UX-C 4点目「差分表示 UI」、docs/hub/banto-hub-desktop-plan.md
 	 * §9.4）: revision 競合発生時のフィールド単位差分。`local` は競合検出
 	 * 時点の編集フォームのスナップショット（以後の入力とは連動しない）、
 	 * `serverForm`/`serverTag` はその時点のサーバー最新値。ユーザーが
@@ -1551,7 +1551,7 @@
 		return classes.length > 0 ? classes.join(' ') : undefined;
 	}
 
-	// --- T18-3e: BantoGrid セル編集/TSV貼付 (docs/banto-hub-t18-design.md
+	// --- T18-3e: BantoGrid セル編集/TSV貼付 (docs/hub/banto-hub-t18-design.md
 	// 「T18-3e BantoGrid セル編集/TSV貼付の接続」) ---------------------------
 	//
 	// 「表編集モード」トグル - selectionMode と同型だが、こちらは ON の間
@@ -1783,7 +1783,7 @@
 			editConflict = null;
 			await reload();
 		} catch (err) {
-			// T18-1（docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目、
+			// T18-1（docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目、
 			// 差分表示 UI）: 他クライアントが先にこのタグを更新済み
 			// （revision 不一致）。「黙って上書きしない」の受け入れ基準どおり
 			// 成功トーストは出さないが、ローカルの未保存編集はもう破棄しない -
@@ -1841,7 +1841,7 @@
 	}
 
 	/**
-	 * T19 S2-c2（UX-40、docs/banto-hub-t19-design.md §3.10）: 削除の取り消し
+	 * T19 S2-c2（UX-40、docs/hub/banto-hub-t19-design.md §3.10）: 削除の取り消し
 	 * 猶予（`UNDO_WINDOW_MS`）を積み、対応する取り消しトーストを出す。
 	 * 単票削除・一括削除の両方から呼ぶ共通処理 - 成功/失敗時の文言だけ
 	 * 呼び出し元（`handleDelete`/`handleApplyBulk`）ごとに変える。
@@ -1898,7 +1898,7 @@
 	}
 
 	/**
-	 * T18-1（TAG-UX-C 5点目、docs/banto-hub-desktop-plan.md §9.4「削除前に
+	 * T18-1（TAG-UX-C 5点目、docs/hub/banto-hub-desktop-plan.md §9.4「削除前に
 	 * 演算タグ等の参照影響と完全な外部名を表示する」）: `tag` の完全外部名
 	 * （`{接続}.{グループ}.{タグ}`）を組み立てる。`groupName`
 	 * は表示用のフォールバック（`#${id}`/`undefined`）を持つが、外部名は
@@ -1997,7 +1997,7 @@
 		});
 	}
 
-	// --- T13-1: Drawer の表示制御 (docs/ux-plan.md §4b) ---------------------
+	// --- T13-1: Drawer の表示制御 (docs/archive/ux-plan.md §4b) ---------------------
 	//
 	// `selected`（編集対象、上で宣言済み）と `createForm`/`createErrors`
 	// （このあと「連続登録」セクションの前の「create」ブロックで宣言 -
@@ -2033,7 +2033,7 @@
 	);
 
 	/**
-	 * #375（2026-09-15 オーナー決定、docs/banto-hub-desktop-plan.md §9.4
+	 * #375（2026-09-15 オーナー決定、docs/hub/banto-hub-desktop-plan.md §9.4
 	 * TAG-UX-C 追補）: タグの「編集」「連続登録」だけを非モーダルの右ペインへ
 	 * 移す。`struct`（構造体展開）と `csv`（CSV 取り込み）は一過性のウィザード
 	 * なのでモーダルの `<Drawer>` のまま。
@@ -2099,7 +2099,7 @@
 	// 設計（T18-6c、`ConnectionTree.svelte` 冒頭 doc）であり、#375 で編集
 	// フォームが非モーダルになってグリッドをそのまま触れるようになった。
 	// そこで**ツリーの3階層化はせず、中央グリッドの行クリックで完全名を
-	// 挿入する**（2026-09-15 オーナー決定、docs/tag-server-design.md §4.2）。
+	// 挿入する**（2026-09-15 オーナー決定、docs/hub/tag-server-design.md §4.2）。
 
 	/**
 	 * 式欄（`#tag-expression`）の `<textarea>` 実体。キャレット位置への挿入
@@ -2888,7 +2888,7 @@
 	}
 
 	/**
-	 * T18-1（TAG-UX-C 一部、docs/banto-hub-desktop-plan.md §9.4）: 現在開いて
+	 * T18-1（TAG-UX-C 一部、docs/hub/banto-hub-desktop-plan.md §9.4）: 現在開いて
 	 * いる Drawer が busy（作成/保存/検証/登録のいずれかを実行中）かどうか。
 	 * `drawerMode` は常に高々1つしか開いていないため、これらのフラグの
 	 * どれか1つでも立っていれば「今開いている Drawer」の処理中とみなせる。
@@ -3011,7 +3011,7 @@
 	}
 
 	/**
-	 * T18-3a（docs/banto-hub-t18-design.md「T18-3a タグ複製」、TAG-UX-D
+	 * T18-3a（docs/hub/banto-hub-t18-design.md「T18-3a タグ複製」、TAG-UX-D
 	 * 前半「『このタグを複製』、型/単位/スケーリング/しきい値を引継ぎ名前と
 	 * アドレスのみ変更する」）: `t` を複製元に create Drawer を開く。
 	 * `openCreateDrawer` を土台にし、`blankForm()` の代わりに「複製元タグ→
@@ -3154,7 +3154,7 @@
 		}
 	});
 
-	// --- T13-1: ツリーフィルタ + 検索 (docs/ux-plan.md §4b) -----------------
+	// --- T13-1: ツリーフィルタ + 検索 (docs/archive/ux-plan.md §4b) -----------------
 	//
 	// ツリー選択（接続 or グループ）と検索ボックス（名前・アドレスの部分
 	// 一致、クライアントサイド）を両方満たす行だけを右ペインの BantoGrid
@@ -3174,7 +3174,7 @@
 
 	// --- #1179 PR3a: 中央のタブと URL の状態 ---------------------------------
 	//
-	// docs/banto-hub-ui-improvement-proposal.md §HUB への当てはめ（2026-11-17
+	// docs/hub/banto-hub-ui-improvement-proposal.md §HUB への当てはめ（2026-11-17
 	// オーナー決定）: 中央はタブで「タグ一覧」と「設定」を切り替える（「すべて」に
 	// 「設定」は無い）。選択中の対象（`treeFilter`）とタブ（`activeTab`）は URL の
 	// クエリに持ち（形は `#lib/banto/tagsView.ts`）、再読み込み・戻る・進むで同じ
@@ -3522,7 +3522,7 @@
 	}
 
 	/**
-	 * T19 S1-c（UX-33、docs/banto-hub-t19-design.md「タグ登録の起点」、
+	 * T19 S1-c（UX-33、docs/hub/banto-hub-t19-design.md「タグ登録の起点」、
 	 * 2026-09-02 オーナー決定「グループ選択時に右画面を出し、そのグループに
 	 * 対して登録する」）: 現在のツリー選択から、タグ登録操作（新規登録・
 	 * 連続登録）のツールバーを出してよいか・対象グループは何かを決める。
@@ -3537,8 +3537,8 @@
 	);
 
 	/**
-	 * T18-2e（docs/banto-hub-t18-design.md「T18-2e T13-3 移管」、
-	 * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A）: ツリーの右クリック
+	 * T18-2e（docs/hub/banto-hub-t18-design.md「T18-2e T13-3 移管」、
+	 * docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-A）: ツリーの右クリック
 	 * （`ConnectionTree`/`BantoTree` の `oncontextmenu` - マウス右クリックと
 	 * `Shift+F10`/メニューキーの両方がここに集約される）から出す、階層に
 	 * 応じたメニュー。常時表示の「新規登録」等の主操作
@@ -3553,7 +3553,7 @@
 	 * DOM 状態（メニューの表示位置・選択ノードの反映）と実行（Drawer 起動）
 	 * だけを担う。
 	 *
-	 * T19 S1-a（docs/banto-hub-t19-design.md §7.1「viewer ロールからの接続・
+	 * T19 S1-a（docs/hub/banto-hub-t19-design.md §7.1「viewer ロールからの接続・
 	 * グループ詳細の閲覧」）追記: 以前はこのハンドラ自体を `canWrite` の
 	 * ときだけ `oncontextmenu` に配線していた（viewer は右クリックしても
 	 * 何も起きなかった）。旧 `plc-connections`/`collection-groups` 画面の
@@ -3695,7 +3695,7 @@
 	/** T18-6d: 「接続を削除」から開いた場合だけ `true`（下の doc comment 参照）。 */
 	let connectionDrawerRequestDelete = $state(false);
 	/**
-	 * T19 S1-a（docs/banto-hub-t19-design.md §7.1「viewer ロールからの接続・
+	 * T19 S1-a（docs/hub/banto-hub-t19-design.md §7.1「viewer ロールからの接続・
 	 * グループ詳細の閲覧」）: viewer の「詳細を表示」から開いた場合だけ
 	 * `true`。`ConnectionDrawer` を読み取り専用モード（`readOnly` prop）で
 	 * 開くためのフラグ - 書き込み系の open系関数（作成/再設定/削除）は
@@ -3844,7 +3844,7 @@
 	}
 
 	/**
-	 * T19 S1-a（docs/banto-hub-t19-design.md §7.1「常時表示の『新規作成』
+	 * T19 S1-a（docs/hub/banto-hub-t19-design.md §7.1「常時表示の『新規作成』
 	 * 入口」）: ツリー上部の常設ボタン「収集グループを追加」から開く場合は
 	 * 所属 PLC 接続を未選択のまま出す（旧 `collection-groups` 画面の常設
 	 * ボタンと同じ挙動）。ツリーの接続ノード右クリック「収集グループを作成」
@@ -4042,7 +4042,7 @@
 			: filteredTags.map((t) => applyTagCellOverrides(t, pendingCellOverridesById.get(t.id)))
 	);
 
-	// --- T11-1: 連続登録 (docs/ux-plan.md §3) ------------------------------
+	// --- T11-1: 連続登録 (docs/archive/ux-plan.md §3) ------------------------------
 	//
 	// 名前パターン・開始番号・開始アドレス・点数・共通設定から
 	// `computeContinuousTags`（#lib/banto/continuousRegistration.ts。アドレスは REST で計算）
@@ -4050,7 +4050,7 @@
 	// アドレスを前提とする機能のため tagKind は常に 'plc'（TagInput 側の
 	// 既定と同じ、フォーム自体に種別選択は出さない）。
 	//
-	// T19 S1-b（UX-35、docs/banto-hub-t19-design.md §2「名前パターンの既定を
+	// T19 S1-b（UX-35、docs/hub/banto-hub-t19-design.md §2「名前パターンの既定を
 	// デバイス名から導出・開始番号は入力不要」、2026-09-02 オーナー決定）:
 	// `namePattern`/`startNumber` はもう固定の初期値（旧 `temp{n}`/`1`）を
 	// 持たず空で始め、開始アドレス欄の入力に追従して
@@ -4327,7 +4327,7 @@
 		}
 	}
 
-	// --- T20 ②a 構造体タグ登録 (docs/banto-hub-t20-design.md §3.2、
+	// --- T20 ②a 構造体タグ登録 (docs/hub/banto-hub-t20-design.md §3.2、
 	// 2026-09-04 オーナー決定「テンプレートの永続保存は不要」「自動割付・
 	// 手動割付の両方を実装」) ------------------------------------------------
 	//
@@ -4601,7 +4601,7 @@
 	}
 
 	// --- T11-2/T18-3d: CSV エクスポート/インポート
-	// (docs/ux-plan.md §3, docs/banto-hub-t18-design.md「T18-3d CSV
+	// (docs/archive/ux-plan.md §3, docs/hub/banto-hub-t18-design.md「T18-3d CSV
 	// 新規/更新分離＋テンプレート」) -------------------------------------
 	//
 	// エクスポートはこのページが Blob/DOM 操作を担当し（`#lib/banto/tagCsv.ts`
@@ -4997,7 +4997,7 @@
 		return diffs.map((d) => `${FIELD_LABELS[d.field] ?? d.field}: ${d.from} → ${d.to}`).join(', ');
 	}
 
-	// --- T18-3b: 一括操作 (docs/banto-hub-t18-design.md「T18-3b 一括操作」) --
+	// --- T18-3b: 一括操作 (docs/hub/banto-hub-t18-design.md「T18-3b 一括操作」) --
 	//
 	// 連続登録・CSVインポートの「プレビュー→確認→適用」の流儀を踏襲するが、
 	// ここでは対象件数・差分の計算はサーバー往復なしのクライアント純関数
@@ -5011,7 +5011,7 @@
 	 * `'delete'`（T19 S2-c1、UX-37）は他の3つと違い `updateTagsBatch` では
 	 * なく `deleteTagsBatch` を叩く - `bulkRows`/`bulkSummary` の「差分」
 	 * 概念を持たず、対象は選択タグの `id` そのもの（`bulkDeleteIds` 参照）。
-	 * `'offset-copy'`（T20 ②b、docs/banto-hub-t20-design.md §3.2）はさらに
+	 * `'offset-copy'`（T20 ②b、docs/hub/banto-hub-t20-design.md §3.2）はさらに
 	 * 別種 - 既存タグの「更新」ではなく `createTagsBatch` による「新規作成」
 	 * のため、`bulkRows`/`bulkSummary`/汎用確認パネル（`tag-bulk-confirm-panel`）
 	 * には乗せず、構造体登録②aと同じ「プレビュー→検証(dry-run)→登録」の
@@ -5202,7 +5202,7 @@
 		}
 	}
 
-	// --- T20 ②b オフセットコピー (docs/banto-hub-t20-design.md §3.2、
+	// --- T20 ②b オフセットコピー (docs/hub/banto-hub-t20-design.md §3.2、
 	// 2026-09-05 オーナー決定「命名ルール」) --------------------------------
 	//
 	// 一括操作バーの追加ボタン。選択済みタグ群を `#lib/banto/offsetCopy.ts`
@@ -5507,7 +5507,7 @@
 	savedDbDataType?: TagDataType
 )}
 	<!--
-		TAG-P0-2（docs/banto-hub-desktop-plan.md §9.3、2026-08-10 実装メモ）:
+		TAG-P0-2（docs/hub/banto-hub-desktop-plan.md §9.3、2026-08-10 実装メモ）:
 		preflight 失敗（field="configuration"）はどの単票フィールドにも
 		属さないフォーム全体エラーのため、個別フィールドの並ぶ form-grid
 		の外（上）に置く。create/edit 両方の form がこの snippet を
@@ -5518,7 +5518,7 @@
 	{/if}
 	{#if groupLocked && form.collectionGroupId !== ''}
 		<!--
-			T19 S1-c（UX-33、docs/banto-hub-t19-design.md「タグ登録の起点」）:
+			T19 S1-c（UX-33、docs/hub/banto-hub-t19-design.md「タグ登録の起点」）:
 			ツリーで選択したグループから開いた新規登録は、そのグループへの
 			登録で確定している - プルダウンを見なくても分かるよう、フォーム
 			先頭でも対象グループ名を明示する（実装指示「どのグループに登録
@@ -5529,7 +5529,7 @@
 		</p>
 	{/if}
 	<!--
-		T18-2a（docs/banto-hub-t18-design.md「T18-2a 単票フォーム刷新」、
+		T18-2a（docs/hub/banto-hub-t18-design.md「T18-2a 単票フォーム刷新」、
 		TAG-UX-B「入力順を『タグ種別 → 接続／グループ → 名前 → アドレス →
 		データ型』とする」）: 常時表示の基本設定。既存フィールドの入力順
 		だけを並べ替えたもので、各フィールドの挙動（`required`・
@@ -5540,7 +5540,7 @@
 			タグ種別
 			{#if form.tagKind === DB_TAG_KIND}
 				<!--
-					S3（docs/banto-hub-external-db-design.md §7 row S3、実装指示4
+					S3（docs/hub/banto-hub-external-db-design.md §7 row S3、実装指示4
 					「tagKind は固定表示（バッジ）にし、select にはしない」）: db
 					タグは postgres 配下のグループを選んだ時点で
 					`resolveRegistrationTarget`（`tagOnboarding.ts`）が種別を確定
@@ -5659,7 +5659,7 @@
 		</label>
 		{#if form.tagKind === 'plc'}
 			<!--
-				T18-2b（docs/banto-hub-t18-design.md「T18-2b プロトコル別アドレス
+				T18-2b（docs/hub/banto-hub-t18-design.md「T18-2b プロトコル別アドレス
 				補助」、TAG-UX-6）: 選択中の収集グループが属する接続の
 				`protocol`（`slmp`/`modbus-tcp`/未選択）と `dataType` から、
 				アドレス例・対応デバイス・占有範囲・bit 指定可否をここで
@@ -5755,7 +5755,7 @@
 		{/if}
 		{#if form.tagKind === DB_TAG_KIND}
 			<!--
-				S3（docs/banto-hub-external-db-design.md §7 row S3、実装指示4）:
+				S3（docs/hub/banto-hub-external-db-design.md §7 row S3、実装指示4）:
 				db タグの `address` は PLC アドレスではなく**結果列名**
 				（グループの `query_sql` が返す列のうちの1つ）。「列を取得」
 				ボタンで `describeCollectionGroup`（`POST
@@ -6230,7 +6230,7 @@
 	</details>
 	{#if form.tagKind !== 'computed' && form.tagKind !== DB_TAG_KIND}
 		<!--
-			S3（docs/banto-hub-external-db-design.md §6-10「v1 は読み取り
+			S3（docs/hub/banto-hub-external-db-design.md §6-10「v1 は読み取り
 			専用」、実装指示4「writable は隠す」）: db タグも computed と
 			同じく「書き込み安全設定」セクション自体を非表示にする -
 			`writableDefaultBlockedReason('db')`が理由文言を持つのは
@@ -6555,7 +6555,7 @@
 
 {#snippet previewLimitNote(totalCount: number)}
 	<!--
-		T18-5a（docs/banto-hub-t18-design.md「T18-5a 大量タグ性能」第1段）:
+		T18-5a（docs/hub/banto-hub-t18-design.md「T18-5a 大量タグ性能」第1段）:
 		連続登録/CSV新規/CSV更新差分/一括操作差分の4プレビュー表で共通の
 		「表示だけ先頭 PREVIEW_DISPLAY_LIMIT 件に絞る」注記。検証・適用・
 		件数サマリ・エラー一覧（batchRowErrors 系）はこの注記と無関係に
@@ -6586,7 +6586,7 @@
 	>
 		{#if editConflict}
 			<!--
-					T18-1（TAG-UX-C 4点目「差分表示 UI」、docs/banto-hub-desktop-plan.md
+					T18-1（TAG-UX-C 4点目「差分表示 UI」、docs/hub/banto-hub-desktop-plan.md
 					§9.4）: revision 競合の差分パネル。フォーム上部に置き、
 					「あなたの入力（editForm、下のフォームにも反映済み）」と
 					「サーバー最新」をフィールド単位で並べる。差分が0件（内容は
@@ -6663,7 +6663,7 @@
 		<div class="actions">
 			<button type="submit" disabled={isDrawerBusy()}>保存</button>
 			<!--
-					T18-3a（docs/banto-hub-t18-design.md「T18-3a タグ複製」）: 起動口。
+					T18-3a（docs/hub/banto-hub-t18-design.md「T18-3a タグ複製」）: 起動口。
 					文言は既存トースト「作成しました」/「更新しました」/「削除しました」や
 					ボタン名「タグを追加」「保存して次を追加」「保存して閉じる」「保存」
 					「削除」と部分文字列としても被らないものにする（`tagTreeContextMenu.ts`
@@ -6920,7 +6920,7 @@
 			{#snippet left()}
 				<div class="tree-pane">
 					<!--
-						T19 S1-a（docs/banto-hub-t19-design.md §7.1「常時表示の
+						T19 S1-a（docs/hub/banto-hub-t19-design.md §7.1「常時表示の
 						『新規作成』入口」）: 接続・グループの作成は右クリック
 						（と Shift+F10）だけが入口だったため、旧 `plc-connections`/
 						`collection-groups` 画面が持っていた常設ボタンに相当する
@@ -6957,7 +6957,7 @@
 			{/snippet}
 			<div class="right-pane">
 				<!--
-					#1179 PR3a（docs/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、
+					#1179 PR3a（docs/hub/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、
 					2026-11-17 オーナー決定）: 中央はタブで「タグ一覧」と「設定」を切り替える。
 					「すべて」には「設定」が無いので、タブ列ごと隠す（`Tabs` の `hideSingleTab`、banto v7.5.0。
 					`.view-tabs.single` はそのときのパネルの上の余白を詰めるだけ）。
@@ -6980,7 +6980,7 @@
 									<div class="toolbar">
 										{#if canWrite}
 											<!--
-												T19 S1-c（UX-33、docs/banto-hub-t19-design.md「タグ登録の
+												T19 S1-c（UX-33、docs/hub/banto-hub-t19-design.md「タグ登録の
 												起点」、2026-09-02 オーナー決定「グループ選択時に右画面を
 												出し、そのグループに対して登録する」）: 「新規登録」
 												「連続登録」はツリーでグループが選択されているときだけ出す
@@ -7015,7 +7015,7 @@
 													連続登録
 												</button>
 												<!--
-													T20 ②a（docs/banto-hub-t20-design.md §3.2、2026-09-04）:
+													T20 ②a（docs/hub/banto-hub-t20-design.md §3.2、2026-09-04）:
 													構造体タグ登録の起動導線。連続登録と同じく PLC アドレスの
 													算術前提の機能のため、対象グループの制約も同一。
 												-->
@@ -7313,7 +7313,7 @@
 										</div>
 									{/if}
 									{#if canWrite && bulkAction === 'offset-copy'}
-										<!-- T20 ②b（docs/banto-hub-t20-design.md §3.2）: enable/disable/move/
+										<!-- T20 ②b（docs/hub/banto-hub-t20-design.md §3.2）: enable/disable/move/
 											delete の確認パネル（`tag-bulk-confirm-panel`、上記）とは別立ての
 											専用パネル - こちらは「更新」ではなく `createTagsBatch` による
 											「新規作成」で、構造体登録②a（`struct-reg-*`）と同じ
@@ -7435,7 +7435,7 @@
 										</div>
 									{/if}
 									{#if monitorCtaHref}
-										<!-- T18-4c（docs/banto-hub-t18-design.md「T18-4c 確認導線」）: 新規/
+										<!-- T18-4c（docs/hub/banto-hub-t18-design.md「T18-4c 確認導線」）: 新規/
 											複製/編集/連続登録/CSV取り込み/一括更新のいずれの成功後にも、
 											サイドバー探索なしでその対象タグの値・品質・時刻へ1クリックで
 											移動できるよう案内する。文言はどの成功トースト（`作成しました`
@@ -7478,7 +7478,7 @@
 										{/if}
 									</p>
 									<!--
-										T18-1（TAG-UX-C 6点目、docs/banto-hub-desktop-plan.md §9.4）:
+										T18-1（TAG-UX-C 6点目、docs/hub/banto-hub-desktop-plan.md §9.4）:
 										初期読込中・初期読込失敗・再読込中(stale)・再読込失敗(stale)・
 										真の空・検索/ツリーフィルタ0件・通常表示を区別する。
 										「通信失敗をタグ0件と表示しない」ため、`loadError` が立って
@@ -7772,7 +7772,7 @@
 	>
 		{#if duplicateSource}
 			<!--
-					T18-3a（docs/banto-hub-t18-design.md「T18-3a タグ複製」、
+					T18-3a（docs/hub/banto-hub-t18-design.md「T18-3a タグ複製」、
 					TAG-UX-D 前半「保存前に複製元との差分と外部名を確認できる」）:
 					複製元タグと複製後フォームのフィールド単位差分。既存の
 					revision 競合パネル（`.conflict-panel`/`.preview-table`、下の
@@ -7884,7 +7884,7 @@
 {/snippet}
 
 <!--
-	T19 S1-b（UX-31、docs/banto-hub-t19-design.md §3.2「作成は前後関係を
+	T19 S1-b（UX-31、docs/hub/banto-hub-t19-design.md §3.2「作成は前後関係を
 	必要としない一方向の作業なので中央モーダルで集中させる」）: タグの
 	新規登録を中央モーダル（`Modal.svelte`）へ切り出した名残。
 
@@ -9043,7 +9043,7 @@
 	}
 
 	/*
-	 * S3（docs/banto-hub-external-db-design.md §7 row S3）: db タグ種別の
+	 * S3（docs/hub/banto-hub-external-db-design.md §7 row S3）: db タグ種別の
 	 * 読み取り専用バッジ（`<select>` の代わり）。`.detail-value-badge` と
 	 * 同じ「primary 系の丸バッジ」の見た目を流用する。
 	 */

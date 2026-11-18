@@ -1,4 +1,4 @@
-//! 書き込みの共有実装 (docs/tag-server-design.md §6「書き込み経路の安全設計」・
+//! 書き込みの共有実装 (docs/hub/tag-server-design.md §6「書き込み経路の安全設計」・
 //! T4 実装指示「WriteValue: REST の POST /api/v1/values/{tag} と同一のゲート・
 //! 監査・レート制限を通す...二重実装は絶対に不可」)。
 //!
@@ -129,7 +129,7 @@
 //! broker 呼び出しの**前**に record する(`crate::write_rate` のモジュール
 //! doc comment参照)。
 //!
-//! ## T20 ①a: 文字列タグへの書き込み(docs/banto-hub-t20-design.md §3.1、案A)
+//! ## T20 ①a: 文字列タグへの書き込み(docs/hub/banto-hub-t20-design.md §3.1、案A)
 //!
 //! [`RequestedValue::Str`] を追加し、gate 7([`convert_value`])が
 //! `data_type == "string"` タグに対して文字列を受け入れる([`ConvertedValue::Str`])。
@@ -218,7 +218,7 @@ pub enum RequestedValue {
     Num(f64),
     /// bit タグ向け(ビットデバイス・T8 のビット付きアドレスとも共通)。
     Bool(bool),
-    /// T20 ①a(docs/banto-hub-t20-design.md §3.1、案A): string タグ向け。
+    /// T20 ①a(docs/hub/banto-hub-t20-design.md §3.1、案A): string タグ向け。
     /// gate 7([`convert_value`])で `data_type == "string"` との対称性を
     /// 検査する(string タグには文字列のみ、他のタグ種別に文字列は 422)。
     Str(String),
@@ -359,7 +359,7 @@ pub enum WriteRejection {
     /// に載っている時点で存在するはずだが、レース(削除)を排除しない -
     /// REST: 元の `BantoError` をそのまま伝播、gRPC: INTERNAL)。
     Internal(String),
-    /// T20-3a(レシピ一括書き込み、docs/banto-hub-t20-design.md §3.3):
+    /// T20-3a(レシピ一括書き込み、docs/hub/banto-hub-t20-design.md §3.3):
     /// このエントリ自身はゲート(1〜4・値型・gate 7)を通過したが、**同じ
     /// バッチ内の他のエントリがゲート NG だった**ため、事前ゲート
     /// all-or-nothing の原則([`execute_write_batch`]のモジュール doc
@@ -532,7 +532,7 @@ fn map_registry_error(err: BantoError) -> WriteRejection {
 
 /// [`resolve_write_target`] の出力: 副作用の無い決定的ゲート(1〜4・値型
 /// present)を通過した1エントリぶんの「対象が確定した」状態(T20-3a、
-/// docs/banto-hub-t20-design.md §3.3)。
+/// docs/hub/banto-hub-t20-design.md §3.3)。
 ///
 /// **gate 7(値変換)はまだ通していない**: `requested` は正規化前の
 /// [`RequestedValue`] のまま持ち回る(2026-09-05 監査対応: 単票
@@ -616,7 +616,7 @@ fn write_target_detail(target: Option<WriteTarget>, failure: Option<&str>) -> Op
 /// 書き込みゲート1〜4・値型 present の本体(このモジュールの doc comment
 /// 参照)。**副作用は一切無い**(監査行 insert・レート制限の trip/record・
 /// broker への書き込みのいずれも行わない - DB からの読み取り
-/// [`PlcConnectionService::get`]のみ)。T20-3a(docs/banto-hub-t20-design.md
+/// [`PlcConnectionService::get`]のみ)。T20-3a(docs/hub/banto-hub-t20-design.md
 /// §3.3)でバッチの事前ゲート all-or-nothing を実現するために
 /// [`execute_write`] から抽出した - 単票・バッチの両方がこの関数を呼ぶこと
 /// で「ゲートを再実装しない」(設計 §3.7)を保つ。
@@ -666,7 +666,7 @@ async fn resolve_write_target(
         return Err(WriteRejection::TagDisabled);
     }
 
-    // 外部 DB 連携 S2（docs/banto-hub-external-db-design.md §6-10「v1 は
+    // 外部 DB 連携 S2（docs/hub/banto-hub-external-db-design.md §6-10「v1 は
     // 読み取り専用」）: `db` タグへの書き込みは常に拒否する。実際には
     // banto-tags 側が `db` タグの `writable` を常に false へ正規化するので
     // gate 2 が既に 403 を返しており、この分岐は**到達しない**はずの二重の
@@ -701,7 +701,7 @@ async fn resolve_write_target(
     // 分岐は将来 broker に未登録のプロトコルが増えた場合や、想定外のデータ
     // に対する防御でもある)。
     //
-    // T6-2 決定(docs/tag-server-design.md §4.2「internal タグ...PLC へ送ら
+    // T6-2 決定(docs/hub/tag-server-design.md §4.2「internal タグ...PLC へ送ら
     // ない」): `internal` タグは PLC 接続を一切経由しないため、このプロト
     // コルゲート自体を丸ごとスキップする(接続行を読みにいく必要すらない)。
     // `computed` タグはそもそもここへ到達しない - gate 2 の
@@ -750,7 +750,7 @@ async fn resolve_write_target(
 /// 無い純関数** - [`resolve_write_target`] から独立させてある理由は、その
 /// doc comment(2026-09-05 監査対応)参照。
 ///
-/// T20 ①a(docs/banto-hub-t20-design.md §3.1、案A): string タグには
+/// T20 ①a(docs/hub/banto-hub-t20-design.md §3.1、案A): string タグには
 /// [`RequestedValue::Str`] のみを受け入れる(拒否ではなく [`ConvertedValue::Str`]
 /// を素通しする)。他の全タグ種別には従来どおり数値/bool の対称性検査のみ -
 /// [`RequestedValue::Str`] が来たら 422(数値/bit タグに文字列は書けない、
@@ -938,7 +938,7 @@ fn rejection_tag_id(map: &TagMap, tag: &str) -> i64 {
 
 /// 書き込みゲート1〜8の本体(このモジュールの doc comment 参照)。
 ///
-/// T20-3a(docs/banto-hub-t20-design.md §3.3)でゲート1〜4・値型 present を
+/// T20-3a(docs/hub/banto-hub-t20-design.md §3.3)でゲート1〜4・値型 present を
 /// [`resolve_write_target`] へ、gate 7 を [`convert_value`] へ抽出した -
 /// この関数自身は「collection-running チェック → [`resolve_write_target`]
 /// → gate 5 → gate 6 → [`convert_value`](元の gate 7 の位置)→ `tag_row`
@@ -1124,7 +1124,7 @@ pub async fn execute_write(
         Err(failure) => failure.audit,
     };
     let outcome = outcome.map_err(|failure| failure.rejection);
-    // T8-2 (docs/tag-server-design.md §6.1, 2026-08-06): carry the
+    // T8-2 (docs/hub/tag-server-design.md §6.1, 2026-08-06): carry the
     // rejection's detail (e.g. `PlcWriteError::BitWriteVerificationFailed`'s,
     // i.e. `ItemError::VerificationFailed` - audited as `uncertain`, #902:
     // 「書き戻し競合の可能性があります」for a T8 RMW confirmation-read
@@ -1161,7 +1161,7 @@ pub struct BatchEntryOutcome {
     pub result: Result<(), WriteRejection>,
 }
 
-/// レシピ一括書き込み(T20-3a、docs/banto-hub-t20-design.md §3.3、
+/// レシピ一括書き込み(T20-3a、docs/hub/banto-hub-t20-design.md §3.3、
 /// 2026-09-04 オーナー承認)の本体。**単票 [`execute_write`] とゲート実装を
 /// 共有する**([`resolve_write_target`]・[`convert_value`])- ゲートを
 /// 迂回しない(設計 §3.7)。
@@ -1761,14 +1761,14 @@ async fn write_plc_tag(
 
 /// gate 8 の PLC タグ分岐(数値/bit)が broker へ渡す [`WriteItem`] の
 /// 組み立て(単票 [`write_plc_tag`] とバッチ [`execute_write_batch`] の
-/// コミット段が**共有する**唯一の場所 - T20-3a、docs/banto-hub-t20-design.md
+/// コミット段が**共有する**唯一の場所 - T20-3a、docs/hub/banto-hub-t20-design.md
 /// §3.3「BatchWriteRequest 構築ロジックを単票と共有する」)。従来どおり
 /// `banto_tags::unscale` → 範囲の検査(`validate_numeric_range`)→ アドレス
 /// 解決(ドライバの `parse_address`、[`crate::read_path::resolve_plc_address`])
 /// の順。**副作用は無い**(broker へは渡さない - 呼び出し元が `handle.write`
 /// を呼ぶ)。
 ///
-/// R2b-3a-2(docs/banto-hub-driver-io-design.md §4.2・§9): 組む先が
+/// R2b-3a-2(docs/hub/driver/banto-hub-driver-io-design.md §4.2・§9): 組む先が
 /// `BatchWriteRequest` から [`WriteItem`] になった。**ビット指定のアドレス
 /// (`"D100.5"`)を読み・変えて・書く(RMW)にするかは、ここではなくドライバが
 /// 決める** - Hub は `bit` つきのアドレスと `Numeric(Bit)` の kind と
@@ -1839,7 +1839,7 @@ fn build_plc_write_item(
 /// A per-item refusal from the driver, as the write's rejection (the audit
 /// detail and the response carry its text: the device's code for
 /// `ItemError::Device`, the RMW confirmation mismatch for `Rejected`,
-/// docs/banto-hub-driver-io-design.md §9).
+/// docs/hub/driver/banto-hub-driver-io-design.md §9).
 fn item_rejection(err: &ItemError) -> WriteRejection {
     WriteRejection::WriteFailed(err.to_string())
 }
@@ -1965,7 +1965,7 @@ fn item_outcome(result: Option<&Result<(), ItemError>>) -> Result<(), PlcWriteFa
     }
 }
 
-/// gate 8 の文字列タグ分岐(T20 ①a、docs/banto-hub-t20-design.md §3.1、
+/// gate 8 の文字列タグ分岐(T20 ①a、docs/hub/banto-hub-t20-design.md §3.1、
 /// 案A「書き込みは write_path 経由（記録計の read/cache には触れない）」)。
 /// 数値タグの [`write_plc_tag`] と並ぶ、string タグ専用の書き込み - broker
 /// handle の取得規律(T15-4、non-spawning peek)は完全に同じ。文字列タグには
@@ -2020,7 +2020,7 @@ pub(crate) fn string_encoding_from_tag(tag_row: &banto_tags::Tag) -> StringEncod
 /// （超過は 422 相当の範囲エラー）」): `banto_plc_write::encode_string_value`
 /// を直接呼んで、ワイヤに渡す前に容量オーバー・表現不能文字を検出する
 /// (ドライバの中でも同じ関数がもう一度呼ばれる二重チェック)。R2b-3a-2:
-/// この検査は関門の一部として Hub に残す(docs/banto-hub-driver-io-design.md §9)。
+/// この検査は関門の一部として Hub に残す(docs/hub/driver/banto-hub-driver-io-design.md §9)。
 fn build_plc_string_write_item(
     registry: &banto_driver_api::DriverRegistry,
     conn: &banto_tags::PlcConnection,
@@ -2046,7 +2046,7 @@ fn build_plc_string_write_item(
     Ok(WriteItem::new(spec, Value::Str(value.to_string())))
 }
 
-/// gate 8 の internal タグ分岐(T6-2、docs/tag-server-design.md §4.2「内部
+/// gate 8 の internal タグ分岐(T6-2、docs/hub/tag-server-design.md §4.2「内部
 /// タグ...タグ空間内で完結」): PLC アドレス・スケーリングは一切関与せず、
 /// `crate::hub::CollectorManager::server_store` へ工学値をそのまま書くだけ
 /// (banto-collect の収集タスクが `CurrentValuesHandle` へ書く値も既にスケー

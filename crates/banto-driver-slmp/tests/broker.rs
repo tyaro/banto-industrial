@@ -1,6 +1,6 @@
-//! SLMP through the broker (R1-4a, docs/banto-driver-api-design.md §4.4):
+//! SLMP through the broker (R1-4a, docs/hub/driver/banto-driver-api-design.md §4.4):
 //! these were `banto-broker`'s own unit tests while the SLMP driver lived
-//! there. R2b-3a-2 (docs/banto-hub-driver-io-design.md §4.2): the broker now
+//! there. R2b-3a-2 (docs/hub/driver/banto-hub-driver-io-design.md §4.2): the broker now
 //! dials through a `DriverRegistry` holding this crate's `driver()` as a
 //! frame-type entry (R2b-3d-join), and speaks `TagSpec` / `WriteItem`; the scenarios and
 //! the assertions on the device are unchanged.
@@ -72,7 +72,7 @@ fn swreq(raw: &str, words: u16, value: &str) -> WriteItem {
     WriteItem::new(sreq(raw, words), Value::Str(value.to_string()))
 }
 
-/// T8 (docs/tag-server-design.md §6.1) bit-in-word write: a `bit` tag at a
+/// T8 (docs/hub/tag-server-design.md §6.1) bit-in-word write: a `bit` tag at a
 /// `.N` address (the driver chooses the read-modify-write, R2b-3a-1).
 fn bwreq(raw: &str, value: bool) -> WriteItem {
     WriteItem::new(rreq(raw, DataType::Bit), Value::Bit(value))
@@ -197,7 +197,7 @@ async fn write_then_read_reflects_the_write_over_the_single_session() {
     supervisor.shutdown().await;
 }
 
-/// T8 E2E (docs/tag-server-design.md §6.1): a `BitInWord` write submitted
+/// T8 E2E (docs/hub/tag-server-design.md §6.1): a `BitInWord` write submitted
 /// through `BrokerHandle::write` - exactly the same entry point
 /// `write_then_read_reflects_the_write_over_the_single_session` above
 /// uses for an ordinary write - runs its full read/modify/write/confirm

@@ -39,7 +39,7 @@
 //! 以前はこの app の分を手書きの冪等 DDL で作っていた。`sqlx` 0.8 の
 //! migration 記録テーブル（`_sqlx_migrations`）は DB に 1 つで名前を変えられず、
 //! 同じ pool で `banto_tags::migrate` の `sqlx::migrate!` と番号が衝突した
-//! （`MigrateError::VersionMismatch`、docs/r1a-readme-gaps.md）ため。
+//! （`MigrateError::VersionMismatch`、docs/archive/r1a-readme-gaps.md）ため。
 //! `sqlx` 0.9 には `Migrator::dangerous_set_table_name` があるので、記録
 //! テーブルを migrator ごとに分けて衝突を無くした:
 //!
@@ -225,7 +225,7 @@ async fn init_db_on(
             path: place.db_path(),
         }));
     }
-    // R2b-1d（docs/banto-hub-connection-settings-design.md §6.7）: 戻せない migration 0025
+    // R2b-1d（docs/hub/banto-hub-connection-settings-design.md §6.7）: 戻せない migration 0025
     // （`banto_tags::migrate` に入っている）の前に、残り物の掃除とバックアップ。
     let prepared = match run_app_migrations(&pool).await {
         Ok(()) => prepare_0025(&pool, place).await,

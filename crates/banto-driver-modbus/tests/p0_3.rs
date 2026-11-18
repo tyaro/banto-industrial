@@ -1,5 +1,5 @@
-//! P0-3 (docs/banto-hub-driver-refactor-plan.md §8.3), rows 1-4 of
-//! docs/banto-hub-driver-io-design.md §11.1, and the other behaviours of the
+//! P0-3 (docs/hub/driver/banto-hub-driver-refactor-plan.md §8.3), rows 1-4 of
+//! docs/hub/driver/banto-hub-driver-io-design.md §11.1, and the other behaviours of the
 //! removed `ModbusTcpClient` / `ModbusWriteClient` tests (§11.1 note), on the
 //! new I/O: the real `banto-driver-engine` (`FrameSession`) over a real TCP
 //! socket to `banto-plc`'s Modbus simulator, driving the frame-type

@@ -1,5 +1,5 @@
 ; ChronoGazer 一体インストーラの NSIS フック（#392 B3-4、
-; docs/chronogazer-service-design.md §3.3「インストーラ」「インストーラによる
+; docs/chronogazer/chronogazer-service-design.md §3.3「インストーラ」「インストーラによる
 ; シェルの停止」・§4 の B3-4 の実装メモ、apps/chronogazer/README.md「インストーラ」）。
 ;
 ; tauri-bundler の NSIS バンドラ（NsisSettings::installer_hooks、
@@ -222,7 +222,7 @@
 ; 資格情報で UAC を通したときはその管理者の HKCU になり、画面を使う利用者の
 ; 旧い版は見つからない（受け入れる制限。案内が出ないだけで害は無い）。
 ;
-; ## シェルの終了（O-5、docs/chronogazer-service-design.md §3.3）
+; ## シェルの終了（O-5、docs/chronogazer/chronogazer-service-design.md §3.3）
 ;
 ; サービスが止まっている間はシェル自身が収集エンジンを持っている（デスクトップ
 ; host）ので、`taskkill /F` では最終 flush と `collection_stopped` を失う。

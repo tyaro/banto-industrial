@@ -1,5 +1,5 @@
 /**
- * T19 S2-d（UX-39、docs/banto-hub-t19-design.md §5.1、2026-09-03 オーナー
+ * T19 S2-d（UX-39、docs/hub/banto-hub-t19-design.md §5.1、2026-09-03 オーナー
  * 決定）: 履歴の保持期間フォームの純関数群（`registryCascadeImpact.ts`/
  * `tagDeleteImpact.ts` と同じ「依存ゼロの純関数を切り出して vitest で
  * テストする」方針）。`+page.svelte`から呼ばれる。

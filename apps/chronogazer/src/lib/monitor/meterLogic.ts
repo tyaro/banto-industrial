@@ -6,7 +6,7 @@
  * しきい値の判定と文言は D-1 の `monitorLogic.ts`（`penView`・`thresholdLevel`）を
  * そのまま使い、ここでは足さない。
  *
- * ## レンジ（2026-10-08 オーナー決定 Q3、docs/r1-plan.md の R1-D）
+ * ## レンジ（2026-10-08 オーナー決定 Q3、docs/archive/r1-plan.md の R1-D）
  *
  * 1. タグの工学値レンジ（`engLo` / `engHi`。スケーリングの 4 項目は全部そろって
  *    いるか全部無いかのどちらか - `banto-tags` の `Scaling::from_parts`）。

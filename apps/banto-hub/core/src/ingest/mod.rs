@@ -1,4 +1,4 @@
-//! 取り込み口 `push`（R2a、docs/banto-hub-ingest-design.md）: 外の送り手（DB
+//! 取り込み口 `push`（R2a、docs/hub/banto-hub-ingest-design.md）: 外の送り手（DB
 //! ブリッジ・スクリプト）が Hub へ値を**送り込む**接続の、Hub 側の置き場
 //! （§12 Q5 = (a)「core の `ingest/`」）。
 //!
@@ -161,7 +161,7 @@ use utoipa::ToSchema;
 /// preflight）がこれを通る - preflight と実際の計画がずれて「保存できたのに収集が
 /// 断る」ことが無いように。
 ///
-/// R2b-1d（docs/banto-hub-connection-settings-design.md §4.4・§7）: Hub のレジストリ
+/// R2b-1d（docs/hub/banto-hub-connection-settings-design.md §4.4・§7）: Hub のレジストリ
 /// （`HubConfig.drivers.registry`）で各接続のドライバ・`settings`・設定の版を確かめる
 /// （`banto_collect::build_config_from_with_registry`）。ドライバが無い（手で書いた
 /// `hub` の行・外したプラグイン）・設定が検証を通らない・版が新しすぎる接続は

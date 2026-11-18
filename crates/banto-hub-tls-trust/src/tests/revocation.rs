@@ -1,5 +1,5 @@
 //! 利用者の失効の記録（`crate::revocation`、#1121 PR1b）を偽物の [`RevocationOps`] で確かめる
-//! （全 OS）。docs/hub-desktop-tls-design.md §4.4.2 の場面のうち、この crate の範囲で表せるもの
+//! （全 OS）。docs/hub/hub-desktop-tls-design.md §4.4.2 の場面のうち、この crate の範囲で表せるもの
 //! （1〜5、7 の記録の部分、9、12〜19、22〜24、27）を、試験の名前の `scene_N` と doc の番号で
 //! 対応させる。最後に、実 Windows で書き込みの部品と手順を確かめる。
 

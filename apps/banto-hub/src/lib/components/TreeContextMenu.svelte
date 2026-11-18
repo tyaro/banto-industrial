@@ -1,7 +1,7 @@
 <script lang="ts">
 	/**
-	 * 汎用部品（T18-2e、docs/banto-hub-t18-design.md「T18-2e T13-3 移管」、
-	 * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A/TAG-UX-G）: ツリー（`BantoTree`）
+	 * 汎用部品（T18-2e、docs/hub/banto-hub-t18-design.md「T18-2e T13-3 移管」、
+	 * docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-A/TAG-UX-G）: ツリー（`BantoTree`）
 	 * の `oncontextmenu`（マウス右クリック・`Shift+F10`/メニューキーのどちらも
 	 * ここに集約済み）が渡す座標に浮かべる、ARIA `menu` パターンの小さな
 	 * ポップアップ。`CommandPalette.svelte`（ウィンドウ外クリックで閉じる・
@@ -22,11 +22,11 @@
 		label: string;
 		onSelect: () => void;
 		/**
-		 * S1（docs/banto-hub-external-db-design.md §3 項目13、実装指示4）で
+		 * S1（docs/hub/banto-hub-external-db-design.md §3 項目13、実装指示4）で
 		 * 導入した汎用フィールド。`true`のとき項目は選択不可（クリック・
 		 * Enter/Spaceのどちらでも`onSelect`を呼ばない - `activate`のガード
 		 * 参照）。項目自体は表示したまま無効化する - 「なぜ無いのか」を
-		 * `title`ツールチップで示すため。S3（docs/banto-hub-external-db-design.md
+		 * `title`ツールチップで示すため。S3（docs/hub/banto-hub-external-db-design.md
 		 * §7 row S3）で唯一の呼び出し元（`tagTreeContextMenu.ts`の
 		 * `createGroup`/postgres接続の無効化）が撤去されたため、現状は
 		 * どの呼び出し元も`disabled: true`を渡さない - コンポーネント自体の

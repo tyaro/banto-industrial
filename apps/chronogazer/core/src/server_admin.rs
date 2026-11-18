@@ -1,5 +1,5 @@
 //! LAN の公開設定と認証の設定（#392 段階 B の B2-1、2026-10-14。設計は
-//! docs/chronogazer-service-design.md §3.2「REST の差分を埋める」・§5 の決定 8・9）。
+//! docs/chronogazer/chronogazer-service-design.md §3.2「REST の差分を埋める」・§5 の決定 8・9）。
 //!
 //! これまで LAN の公開設定（`server_status`/`server_apply`）と認証モード
 //! （`auth_config_get/apply`）はデスクトップの Tauri のコマンドにしか無かった。サービス

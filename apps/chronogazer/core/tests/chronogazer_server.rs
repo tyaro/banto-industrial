@@ -1,5 +1,5 @@
 //! #392 B1-5: できた `chronogazer-server` をプロセスとして動かす統合テスト
-//! （docs/chronogazer-service-design.md §4 の B1-5 の受入条件）。
+//! （docs/chronogazer/chronogazer-service-design.md §4 の B1-5 の受入条件）。
 //!
 //! - 一時ルート（`CHRONOGAZER_ROOT`）で起動 → シミュレータの PLC（Modbus TCP、
 //!   `banto_plc::ramp`。開発用 PLC の `dev_plc` example と同じもの）から

@@ -1,6 +1,6 @@
 //! `banto-hub-elev grant-profile-acl`（と`reset-password`・`revert-to-commissioning`の
 //! 対象の profile の決め方）の中身（#626 PR-B、2026-10-16。計画のオーナー決定は
-//! 論点 1〜11 すべておすすめどおり - docs/banto-hub-t17-design.md §12 の #626 の節）。
+//! 論点 1〜11 すべておすすめどおり - docs/hub/banto-hub-t17-design.md §12 の #626 の節）。
 //!
 //! **ここは昇格の境界**（管理者として動くプロセスが、昇格していない呼び出し元から
 //! 引数を受け、その利用者が中身を変えられるフォルダの DACL を書き直す）。そのため、

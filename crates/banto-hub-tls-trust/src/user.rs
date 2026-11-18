@@ -1,4 +1,4 @@
-//! 利用者ごとの置き場（#1121 PR1a。docs/hub-desktop-tls-design.md §4.1・§4.4.1）: 差し替えの口
+//! 利用者ごとの置き場（#1121 PR1a。docs/hub/hub-desktop-tls-design.md §4.1・§4.4.1）: 差し替えの口
 //! [`UserTlsPlace`]、既定の実装 [`DefaultUserTlsPlace`]、置き場の確かめ [`open_user_place`]、
 //! ChronoGazer 向けの読み取りの入口 [`load_pinned_user_cert`]。書き込み・作成はしない
 //! （crate doc「利用者ごとの置き場」。失効の記録の読み書きは `crate::revocation`）。
@@ -339,7 +339,7 @@ pub(crate) fn user_reasons_text(found: &[Exposure]) -> String {
 /// capability SID（`S-1-15-3-…`）。
 ///
 /// 利用者の置き場の確かめ（[`user_place_problems`]）は、これらへの普通の許可を問題にしない
-/// （2026-11-14 オーナー決定、docs/hub-desktop-tls-design.md §4.1）。AppContainer のトークンの
+/// （2026-11-14 オーナー決定、docs/hub/hub-desktop-tls-design.md §4.1）。AppContainer のトークンの
 /// アクセスは、「ふつうの確かめ（利用者・グループの SID）」と「パッケージ・capability の SID の
 /// 確かめ」の**両方**を通った分の積になり、通常のトークンはこれらの SID を持たない。そのため、
 /// この種の ACE だけでは別のアカウントに権限は付かず、付くのは同じ利用者（信頼の範囲、§3）の

@@ -67,7 +67,7 @@
 //! ## What is deliberately out of scope for this slice (#131 前半)
 //!
 //! - **Bit-in-word writes** (`BatchWriteRequest::BitInWord`,
-//!   docs/tag-server-design.md §6.1): SLMP needs a read/modify/write RMW
+//!   docs/hub/tag-server-design.md §6.1): SLMP needs a read/modify/write RMW
 //!   because it has no bit-in-word write command, but Modbus has FC22 (Mask
 //!   Write Register), which can do the same job *atomically* - no RMW race,
 //!   no confirmation read. Implementing FC22 is left to whenever a caller
@@ -80,7 +80,7 @@
 //!   there.
 //! - **String writes**: MELSEC string devices are an SLMP-specific concept
 //!   (`banto-tags`'s `string` data type exists for MELSEC string devices,
-//!   docs/tag-server-design.md's S1) with no Modbus equivalent in this
+//!   docs/hub/tag-server-design.md's S1) with no Modbus equivalent in this
 //!   system, so there is no Modbus counterpart to
 //!   `crate::slmp::planning::plan_slmp_write_batch`'s string branch. Only the
 //!   numeric+bit [`crate::types::WriteRequest`] shape is planned here.

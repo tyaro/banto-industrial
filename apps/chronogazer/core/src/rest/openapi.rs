@@ -1,4 +1,4 @@
-//! `GET /api/openapi.json`（#1161 PR6、docs/chronogazer-agent-api-design.md §6）。
+//! `GET /api/openapi.json`（#1161 PR6、docs/chronogazer/chronogazer-agent-api-design.md §6）。
 //!
 //! ChronoGazer の REST のうち、**API キーを通すルートの集まり**
 //! （`rest::api_key_routes` が合成する 4 つ: 収集 `collect_router`・表示グループ・
@@ -117,7 +117,7 @@ impl Modify for SecurityAddon {
     info(
         title = "ChronoGazer REST API（API キーで呼べる範囲）",
         version = "v1",
-        description = "ChronoGazer の REST のうち、API キー（`Authorization: Bearer cg_…`）で呼べる操作だけを載せる（docs/chronogazer-agent-api-design.md §6）。\
+        description = "ChronoGazer の REST のうち、API キー（`Authorization: Bearer cg_…`）で呼べる操作だけを載せる（docs/chronogazer/chronogazer-agent-api-design.md §6）。\
 管理系（ユーザー・サーバー設定・HUB 連携・API キーの管理・認証・バックアップ・監査ログ・UI 設定）はキーでは呼べないので載せない。\
 \n\n**認証**: API キーで通った要求には CSRF のヘッダー（`X-Banto-Client`）は要らない。ログインのセッション（Cookie）で呼ぶときは、今までどおり `X-Banto-Client` が要る。\
 \n\n**スコープ**: キーのスコープは `read`（読み取り）と `config`（`read` に加えて、作成・更新・削除と、収集の開始・停止・再起動）。書き込みに `read` のキーで来ると 403。失効・期限切れ・存在しないキーは 401（セッションには落ちない）。\

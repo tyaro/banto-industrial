@@ -1,5 +1,5 @@
 //! Desktop↔Service 切替ウィザード用の最小 Tauri invoke 面
-//! （docs/banto-hub-desktop-plan.md §9.7、docs/banto-hub-t16-design.md）。
+//! （docs/hub/banto-hub-desktop-plan.md §9.7、docs/hub/banto-hub-t16-design.md）。
 //!
 //! ## このモジュールがやること・やらないこと
 //!

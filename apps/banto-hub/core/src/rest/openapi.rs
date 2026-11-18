@@ -1,6 +1,6 @@
 //! OpenAPI 自動生成（`ApiDoc`・`GET /api/v1/openapi.json`・Swagger UI の `openapi_router`）。
 //!
-//! `rest.rs` から中身を変えずに移したもの（docs/banto-hub-driver-refactor-plan.md §8.1、
+//! `rest.rs` から中身を変えずに移したもの（docs/hub/driver/banto-hub-driver-refactor-plan.md §8.1、
 //! P0-1 の手順 8）。`ApiDoc` の `paths(...)`・`schemas(...)` が参照するハンドラ・応答型と、
 //! utoipa が生成する `__path_<fn>` は親の `rest.rs` が `rest/{tag_space,admin_status,write}.rs`
 //! から取り込んでおり、ここでは `use super::{...}` で名前解決する（derive の本文は無変更）。
@@ -14,7 +14,7 @@ use super::{
     Router, SingleValueResponse, State, StatusResponse, SwaggerUi, TagEntry, ValueEntry,
     ValuesResponse, WriteValueRequest, WriteValueResponse,
 };
-// R2a-2c（docs/banto-hub-ingest-design.md §6.2）: 取り込み口の REST の送信口。
+// R2a-2c（docs/hub/banto-hub-ingest-design.md §6.2）: 取り込み口の REST の送信口。
 use crate::ingest::rest::{__path_v1_ingest_values, IngestRejectedItem, IngestValuesResponse};
 use crate::ingest::validate::IngestValuesMessage;
 use crate::ingest::IngestItem;
@@ -41,7 +41,7 @@ use crate::clock_sync::{
     info(
         title = "banto-hub タグ空間 API",
         version = "v1",
-        description = "banto-hub の /api/v1/* API（docs/tag-server-design.md §5.1）。catalog（/api/v1/tags）はクライアントとの互換性契約である（§4.1）: 外部名・安定 ID・revision を用いたバインディングを前提に、フィールド名や JSON 形はこのスキーマとコードが常に一致するよう utoipa で自動生成している。書き込み（POST /api/v1/values/{tag}、T2-4・§6）は writable タグのみ・write:{tag} スコープの API キー限定。取り込み（POST /api/v1/ingest/{id}/values、docs/banto-hub-ingest-design.md §6.2）は push 接続へ値を送る口で、ingest:#{id} スコープの API キー限定。PLC の時計合わせ（/api/plc-connections/{id}/clock-sync、H2）と時計の読取り（/api/plc-connections/{id}/clock、H3）は管理系の REST で、editor のセッションと X-Banto-Client ヘッダが要る。"
+        description = "banto-hub の /api/v1/* API（docs/hub/tag-server-design.md §5.1）。catalog（/api/v1/tags）はクライアントとの互換性契約である（§4.1）: 外部名・安定 ID・revision を用いたバインディングを前提に、フィールド名や JSON 形はこのスキーマとコードが常に一致するよう utoipa で自動生成している。書き込み（POST /api/v1/values/{tag}、T2-4・§6）は writable タグのみ・write:{tag} スコープの API キー限定。取り込み（POST /api/v1/ingest/{id}/values、docs/hub/banto-hub-ingest-design.md §6.2）は push 接続へ値を送る口で、ingest:#{id} スコープの API キー限定。PLC の時計合わせ（/api/plc-connections/{id}/clock-sync、H2）と時計の読取り（/api/plc-connections/{id}/clock、H3）は管理系の REST で、editor のセッションと X-Banto-Client ヘッダが要る。"
     ),
     paths(
         v1_tags,
@@ -102,7 +102,7 @@ pub(super) struct ApiDoc;
 /// もらわないとどんな API か分からない」という鶏卵になり、外部連携の
 /// 導入コストを不必要に上げる。
 ///
-/// T16-2 第三スライス（docs/banto-hub-t16-design.md §5 既知の gap）: 応答
+/// T16-2 第三スライス（docs/hub/banto-hub-t16-design.md §5 既知の gap）: 応答
 /// している Hub インスタンス自身の profile-id を`info.x-banto-hub-profile-id`
 /// 拡張フィールドとして埋め込む。`crate::http_hub_health::HttpHubHealthProbe`
 /// が「lock ファイルの置き場所」だけでなく「ワイヤ応答そのもの」から

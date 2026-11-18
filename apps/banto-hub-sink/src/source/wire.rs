@@ -1,4 +1,4 @@
-//! 取り込み口の WebSocket のメッセージ（docs/banto-hub-ingest-design.md §6.1）の
+//! 取り込み口の WebSocket のメッセージ（docs/hub/banto-hub-ingest-design.md §6.1）の
 //! ブリッジ側の写し。Hub 側は `banto_hub_core::ingest::ws`。
 //!
 //! ```jsonc

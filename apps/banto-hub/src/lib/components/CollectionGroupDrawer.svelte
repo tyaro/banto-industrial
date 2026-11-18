@@ -110,7 +110,7 @@
 		/** PLC接続の選択肢（新規作成・再設定共通、一覧ページから取得済みのものを渡す）。 */
 		connections: PlcConnection[];
 		/**
-		 * T19 S2-b（UX-38、docs/banto-hub-t19-design.md §3.4）: 削除確認
+		 * T19 S2-b（UX-38、docs/hub/banto-hub-t19-design.md §3.4）: 削除確認
 		 * ダイアログで「消えるタグの件数」を出すために必要な、ページが既に
 		 * 読み込み済みのタグ一覧（新規作成時は参照しない）。
 		 * `registryCascadeImpact.ts::countGroupCascadeImpact` へそのまま渡す。
@@ -137,7 +137,7 @@
 		 */
 		requestDelete?: boolean;
 		/**
-		 * T19 S1-a（docs/banto-hub-t19-design.md §7.1「viewer ロールからの
+		 * T19 S1-a（docs/hub/banto-hub-t19-design.md §7.1「viewer ロールからの
 		 * 接続・グループ詳細の閲覧」）: `ConnectionDrawer.svelte` の同名
 		 * prop と同じ考え方 - `true` なら閲覧専用モードで開く（入力は
 		 * すべて `disabled`、保存・削除のボタンは出さない）。常に既存の
@@ -162,7 +162,7 @@
 		 */
 		focusFallback?: () => HTMLElement | null | undefined;
 		/**
-		 * #1179 PR3a（docs/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、
+		 * #1179 PR3a（docs/hub/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、
 		 * 2026-11-17 オーナー決定「中央のタブ『設定』」）: `true` なら再設定
 		 * フォーム（`group` 非 `null`）を `Drawer` の外枠なしで、その場に描く
 		 * （タグページの「設定」タブに埋め込む）。フォーム・dirty 判定・読み取り
@@ -192,7 +192,7 @@
 	}: Props = $props();
 
 	/**
-	 * S3（docs/banto-hub-external-db-design.md §7 row S3）: postgres
+	 * S3（docs/hub/banto-hub-external-db-design.md §7 row S3）: postgres
 	 * （DB Source）接続配下のグループ作成は S2/S2b で解禁済みのため、S1 の
 	 * 選択肢除外ガードは撤去した。接続の選択肢は「すべての接続」（PLC・
 	 * virtual・postgres 問わず）に戻す。
@@ -559,7 +559,7 @@
 		</label>
 		{#if selectedIsDbSource}
 			<!--
-				S3（docs/banto-hub-external-db-design.md §4.1・§4.2、実装指示2）:
+				S3（docs/hub/banto-hub-external-db-design.md §4.1・§4.2、実装指示2）:
 				postgres（DB Source）接続配下のグループだけが `query_sql` を
 				持つ - 「1 グループ = 1 SELECT = N タグ」（§4.2）。PLC グループ
 				では非表示（送信時も `formToGroupInput` が `undefined` にする、
@@ -766,7 +766,7 @@
 		grid-column: 1 / -1;
 	}
 
-	/* S3（docs/banto-hub-external-db-design.md §4.2）: SQL 文は等幅フォントで
+	/* S3（docs/hub/banto-hub-external-db-design.md §4.2）: SQL 文は等幅フォントで
 	   読みやすくする - 入力欄（textarea）と確認パネルの表示（dd）の両方に使う。 */
 	.monospace {
 		font-family:

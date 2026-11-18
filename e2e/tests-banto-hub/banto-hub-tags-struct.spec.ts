@@ -1,5 +1,5 @@
 /**
- * T20 機能②a 構造体タグ登録（docs/banto-hub-t20-design.md §3.2）の実 DOM
+ * T20 機能②a 構造体タグ登録（docs/hub/banto-hub-t20-design.md §3.2）の実 DOM
  * 受け入れテスト。純関数の割付・衝突検出ロジック自体は
  * `structRegistration.test.ts`（vitest）で網羅済みのため、ここでは
  * 「構造体登録パネルを開き、複数フィールドを自動割付で登録すると一覧に

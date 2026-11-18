@@ -1,4 +1,4 @@
-//! Database bootstrap for banto-hub (docs/tag-server-design.md §3.2 table
+//! Database bootstrap for banto-hub (docs/hub/tag-server-design.md §3.2 table
 //! "タグ定義・CRUD | banto-tags | サーバー自身の SQLite に同居"): connect,
 //! refuse a database in the pre-2026-10-02 format, then apply this app's own
 //! migrations (`migrations-sqlite/`), then `banto_tags::migrate` (I1's PLC
@@ -58,7 +58,7 @@
 //! 以前はこの app の分を手書きの冪等 DDL で作っていた。`sqlx` 0.8 の
 //! migration 記録テーブル（`_sqlx_migrations`）は DB に 1 つで名前を変えられず、
 //! 同じ pool で `banto_tags::migrate` の `sqlx::migrate!` と番号が衝突する
-//! （`MigrateError::VersionMismatch`、docs/r1a-readme-gaps.md）ため。
+//! （`MigrateError::VersionMismatch`、docs/archive/r1a-readme-gaps.md）ため。
 //! `sqlx` 0.9 には `Migrator::dangerous_set_table_name` があるので、記録
 //! テーブルを migrator ごとに分けて衝突を無くした:
 //!
@@ -80,7 +80,7 @@
 //! 分からないため。新規の空ファイルと新しい形式の DB は通る。
 //! `crate::runtime::HubRuntime::start` はこれを `HubStartError::LegacyDatabase`
 //! にして既存の起動失敗のログ経路（コンソールの stderr・サービスのログ）に
-//! 乗せる。作り直しの操作は作らず、手順を docs/banto-hub-operations.md に
+//! 乗せる。作り直しの操作は作らず、手順を docs/hub/banto-hub-operations.md に
 //! 書くだけにした（2026-10-02 オーナー決定）。
 
 use banto_core::BantoError;
@@ -113,7 +113,7 @@ impl fmt::Display for LegacyDatabase {
         write!(
             f,
             "この DB は旧形式です。{} を削除または退避して起動し直してください\
-             （アルファ版のため自動移行はありません。手順は docs/banto-hub-operations.md）",
+             （アルファ版のため自動移行はありません。手順は docs/hub/banto-hub-operations.md）",
             self.path.display()
         )
     }
@@ -156,7 +156,7 @@ impl From<InitDbError> for BantoError {
 /// `banto_tags`, then `banto_collect`).
 ///
 /// R2b-1d: **without a driver registry**, so it cannot run the migration preflight
-/// of `banto-tags`' irreversible `0025` (docs/banto-hub-connection-settings-design.md
+/// of `banto-tags`' irreversible `0025` (docs/hub/banto-hub-connection-settings-design.md
 /// §6.1・§6.3). A populated database that still needs `0025` is refused with
 /// [`crate::upgrade::UpgradeError::NeedsHubStartup`] (nothing is migrated) - the Hub's own
 /// start goes through [`init_db_with_registry`]. New databases and already-migrated ones

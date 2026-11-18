@@ -25,12 +25,12 @@ banto-server = { workspace = true }
 banto-admin-services = { workspace = true }
 # #1161 PR4: API キー（形式・ハッシュ・照合・表への SQL・拒否の応答）は HUB と
 # 共有する crate を使う。接頭辞 `cg` とスコープ（`read`・`config`）は
-# `src/api_keys.rs` が決める（docs/chronogazer-agent-api-design.md §3）。
+# `src/api_keys.rs` が決める（docs/chronogazer/chronogazer-agent-api-design.md §3）。
 banto-api-keys = { path = "../../../crates/banto-api-keys" }
 # #1161 PR5b: `POST /mcp` の JSON-RPC の骨組みとツール表は HUB と共有する crate
 # を使う（`src/mcp.rs`、設計書 §5.1）。
 banto-mcp = { path = "../../../crates/banto-mcp" }
-# I-series crates (docs/r1-plan.md R1-A): not wired into any Tauri command or
+# I-series crates (docs/archive/r1-plan.md R1-A): not wired into any Tauri command or
 # REST route yet - that lands in R1-B (registry CRUD)/R1-C (collector
 # runtime)/R1-D (monitor screens). Added now as path deps so the workspace
 # member graph and Cargo.lock settle in R1-A rather than shifting again on
@@ -42,7 +42,7 @@ utoipa = { workspace = true }
 banto-plc = { path = "../../../crates/banto-plc" }
 banto-tstore = { path = "../../../crates/banto-tstore" }
 banto-collect = { path = "../../../crates/banto-collect" }
-# R2b-3a-3（docs/banto-hub-driver-io-design.md §8）: 収集も broker を通す。計画と
+# R2b-3a-3（docs/hub/driver/banto-hub-driver-io-design.md §8）: 収集も broker を通す。計画と
 # セッションのダイヤルに使うドライバの登録簿（`EngineConfig::drivers`）の型と、
 # それを詰める組み込みドライバ。`banto-drivers` を normal で持つのは bin
 # （`banto-serve`）がこの package の中にあるため（Hub の R1-3b の一時の形と同じ、

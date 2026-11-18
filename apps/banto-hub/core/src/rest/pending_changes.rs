@@ -1,7 +1,7 @@
 //! 保留中の変更（pending changes）の閲覧・取り消し・再キュー・適用 API
 //! （`/api/pending-changes*`）と、その適用実行（`execute_pending_apply`）。
 //!
-//! `rest.rs` から中身を変えずに移したもの（docs/banto-hub-driver-refactor-plan.md §8.1、
+//! `rest.rs` から中身を変えずに移したもの（docs/hub/driver/banto-hub-driver-refactor-plan.md §8.1、
 //! P0-1 の手順 5）。I1 CRUD の共通層（キューへの振り分け・秘匿処理）は `rest/crud.rs`
 //! にあり、認証・ガード・監査の補助は親の `rest.rs` にある。どちらも `use super::{...}`
 //! で使う。外から使われるパス（`crate::rest::X`）は親の re-export で保つ。
@@ -50,8 +50,8 @@ struct PendingChangeWithId {
     id: i64,
 }
 
-/// R2b-1e・R2b-6b（docs/banto-hub-connection-settings-design.md §5.3、
-/// docs/banto-hub-driver-ui-design.md §5）: `plc_connections.create` / `.update` のキューの
+/// R2b-1e・R2b-6b（docs/hub/banto-hub-connection-settings-design.md §5.3、
+/// docs/hub/driver/banto-hub-driver-ui-design.md §5）: `plc_connections.create` / `.update` のキューの
 /// ペイロードの `input`。REST の入力の形（[`PlcConnectionPayload`]、`settings` の形）に、
 /// 積む時点で封印した秘密値（`sealedSecrets`: キー → `crate::secrets::sealed_password_json`
 /// の形、`PlcConnectionPayload::queue_form`）が加わる。`sealedSecrets` は**キューの中だけ**の

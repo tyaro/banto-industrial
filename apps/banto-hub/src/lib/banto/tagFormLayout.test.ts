@@ -1,5 +1,5 @@
 /**
- * `tagFormLayout.ts`（T18-2a、docs/banto-hub-desktop-plan.md §9.4 TAG-UX-B）
+ * `tagFormLayout.ts`（T18-2a、docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-B）
  * に対するユニットテスト。`tagFormNumeric.test.ts`/`tagDeleteImpact.test.ts`
  * と同じスタイル（describe/it、依存ゼロの純関数を直接 import）。
  */

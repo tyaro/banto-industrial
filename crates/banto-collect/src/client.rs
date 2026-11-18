@@ -1,5 +1,5 @@
 //! The client a connection task reads through (R2b-3a-3,
-//! docs/banto-hub-driver-io-design.md §4.3 and §13 Q6): [`CollectClient`],
+//! docs/hub/driver/banto-hub-driver-io-design.md §4.3 and §13 Q6): [`CollectClient`],
 //! the [`ClientFactory`] that hands one out per connect attempt, and the one
 //! production implementation, [`BrokerReadClient`] - a read-only handle onto
 //! the shared `banto-broker` session of the connection.

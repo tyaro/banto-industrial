@@ -250,7 +250,7 @@ impl WebSocketConnection {
     /// answers `{"op":"pong"}` only from its request loop, which runs after
     /// it registered its `revision_rx`, so a received `pong` proves later
     /// configuration changes will reach this connection as `config_changed`
-    /// (docs/banto-tagclient-partial-binding-design.md §5.1).
+    /// (docs/crates/banto-tagclient-partial-binding-design.md §5.1).
     pub(crate) async fn send_ping(&mut self) -> Result<()> {
         self.stream
             .send(Message::Text(r#"{"op":"ping"}"#.into()))

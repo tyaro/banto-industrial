@@ -1,9 +1,9 @@
 /**
- * `tagOnboarding.ts`（T18-2d、docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A）
+ * `tagOnboarding.ts`（T18-2d、docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-A）
  * のユニットテスト。`tagFormCarry.test.ts`/`tagDeleteImpact.test.ts` と同じ
  * スタイル（describe/it、依存ゼロの純関数を直接 import）。
  *
- * T19 S1-d（docs/banto-hub-t19-design.md UX-44、2026-09-03）: 初回
+ * T19 S1-d（docs/hub/banto-hub-t19-design.md UX-44、2026-09-03）: 初回
  * チェックリスト本体（`computeOnboardingSteps` 等）を撤去したのに合わせ、
  * その専用テスト（`computeOnboardingSteps`/`nextOnboardingStep・
  * isOnboardingComplete`/`connectionAwaitingGroup・groupAwaitingTag`/
@@ -168,7 +168,7 @@ describe('resolveRegistrationTarget', () => {
 	// T19 S1-c（UX-33）: `resolveGroupIdFromTreeSelection` と違い、virtual
 	// （calc/mem）配下のグループも登録対象として扱う - 右クリック「グループ
 	// 配下にタグを作成」（tagTreeContextMenu.ts）と同じ権限に揃えるため。
-	// S3（docs/banto-hub-external-db-design.md §7 row S3）: postgres（DB
+	// S3（docs/hub/banto-hub-external-db-design.md §7 row S3）: postgres（DB
 	// Source）接続配下のグループも登録対象として扱う - tagKind は 'db' に
 	// 確定し、連続登録は使えない（`db` は PLC アドレスの算術を持たない）。
 	const PG = connection({ id: 5, name: 'pg-a', protocol: 'postgres' });

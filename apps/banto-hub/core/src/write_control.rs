@@ -1,4 +1,4 @@
-//! 書き込み受付状態 (docs/tag-server-design.md §6-6)。[`WriteControl`] は
+//! 書き込み受付状態 (docs/hub/tag-server-design.md §6-6)。[`WriteControl`] は
 //! 「この hub プロセスはいま `/api/v1/values/{tag}` への書き込みを受け付けて
 //! よいか」を持つ、読み取りがロックフリーの薄いフラグ保持者。
 //!

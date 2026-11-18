@@ -1,5 +1,5 @@
 /**
- * R2b-6d-2a（docs/banto-hub-driver-ui-design.md §3.6・§4.3・§7）: アドレスの位置と占有の
+ * R2b-6d-2a（docs/hub/driver/banto-hub-driver-ui-design.md §3.6・§4.3・§7）: アドレスの位置と占有の
  * 比べ方、REST（`parse-addresses` / `offset-addresses`）を呼ぶ薄い層の共通部分。
  *
  * アドレスの文法（デバイス名・基数・ビットの軸）を TS に写さない。連続登録・オフセットコピー・

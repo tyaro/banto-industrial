@@ -62,7 +62,7 @@ fn tag_key(id: i64) -> String {
     format!("tag:{id}")
 }
 
-/// How one connection is collected (R2b-3a-3, docs/banto-hub-driver-io-design.md
+/// How one connection is collected (R2b-3a-3, docs/hub/driver/banto-hub-driver-io-design.md
 /// §4.3): read through its broker session ([`Self::Broker`]), or sampled from an
 /// [`crate::external::ExternalSource`] ([`Self::External`]).
 ///
@@ -73,7 +73,7 @@ fn tag_key(id: i64) -> String {
 /// the driver registry with the connection's `Settings`, so the plan only has
 /// to carry what makes two plans differ.
 ///
-/// `PartialEq` (T7-1, docs/tag-server-design.md §4.3): the building block
+/// `PartialEq` (T7-1, docs/hub/tag-server-design.md §4.3): the building block
 /// [`crate::collector::Collector::apply_config`] uses to tell "this
 /// connection's settings changed" from "identical, leave its task alone".
 ///
@@ -166,7 +166,7 @@ impl ThresholdSource<'_> {
 /// Everything a collection task needs about one tag, resolved once at
 /// build time so the hot loop never re-parses an address or re-validates a
 /// scaling.
-/// `PartialEq` (T7-1, docs/tag-server-design.md §4.3): [`Scaling`] and
+/// `PartialEq` (T7-1, docs/hub/tag-server-design.md §4.3): [`Scaling`] and
 /// [`Thresholds`] are already structurally comparable, so this derive is
 /// exact - part of the [`crate::collector::Collector::apply_config`] diff
 /// chain (`TagPlan` -> [`GroupPlan`] -> [`ConnectionPlan`]).
@@ -186,7 +186,7 @@ pub(crate) struct TagPlan {
 
 /// One collection group: a shared-period batch read against its connection.
 ///
-/// `PartialEq` (T7-1, docs/tag-server-design.md §4.3): compares `requests`
+/// `PartialEq` (T7-1, docs/hub/tag-server-design.md §4.3): compares `requests`
 /// (`PartialEq` on [`TagSpec`]) and `tags` positionally, so
 /// two `GroupPlan`s are equal iff every wire read and every resolved tag
 /// (scaling, thresholds) is identical - any address/type/scaling/threshold
@@ -213,7 +213,7 @@ pub(crate) struct GroupPlan {
 
 /// One PLC connection and the groups collected over its single socket.
 ///
-/// `PartialEq` (T7-1, docs/tag-server-design.md §4.3): the load-bearing
+/// `PartialEq` (T7-1, docs/hub/tag-server-design.md §4.3): the load-bearing
 /// derive for [`crate::collector::Collector::apply_config`]'s diff - two
 /// `ConnectionPlan`s with the same `key` compare equal iff their protocol
 /// config *and* every group/tag are identical, which is precisely "nothing
@@ -228,7 +228,7 @@ pub(crate) struct ConnectionPlan {
     pub key: String,
     pub config: ProtocolConfig,
     pub groups: Vec<GroupPlan>,
-    /// T9-1 (docs/ux-plan.md §1, 2026-08-06 オーナー決定): mirrors
+    /// T9-1 (docs/archive/ux-plan.md §1, 2026-08-06 オーナー決定): mirrors
     /// `banto_tags::PlcConnection::simulation`. Decides whether a tick of
     /// this connection is appended to the store: a simulated value is shown
     /// (current values, thresholds, events) but never recorded as a fact of
@@ -244,7 +244,7 @@ pub(crate) struct ConnectionPlan {
 /// consumes. Opaque by design: build it with [`build_config`] and hand it to the collector;
 /// its internals (the per-connection plans and the derived tstore
 /// [`StoreConfig`]) are this crate's concern.
-/// `PartialEq` (T7-1, docs/tag-server-design.md §4.3): a convenience derive
+/// `PartialEq` (T7-1, docs/hub/tag-server-design.md §4.3): a convenience derive
 /// over the now-`PartialEq` `ConnectionPlan`/`StoreConfig` fields -
 /// [`crate::collector::Collector::apply_config`] itself diffs
 /// connection-by-connection (see `ConnectionPlan`'s doc comment) rather than
@@ -400,7 +400,7 @@ pub struct RegistrySnapshot {
     pub connections: Vec<PlcConnection>,
     pub groups: Vec<CollectionGroup>,
     pub tags: Vec<Tag>,
-    /// R2b-1d (docs/banto-hub-connection-settings-design.md §5.2・§7): the **sealed**
+    /// R2b-1d (docs/hub/banto-hub-connection-settings-design.md §5.2・§7): the **sealed**
     /// secret rows (`plc_connection_secrets`) the connections' `settings` refer to with
     /// `{"$secret": "<ref>"}`, read in the same transaction as the rows above. Never
     /// plaintext: the reader that needs a value (banto-hub's DB Source) opens it in
@@ -541,7 +541,7 @@ pub fn connections_with_collected_groups(groups: &[CollectionGroup]) -> HashSet<
 /// is missing or refuses its settings, or any included tag's stored address
 /// is refused by that driver's `parse_address` or its `data_type` is outside
 /// the known vocabulary. Every tag is read through `drivers` (R2b-3a-3,
-/// docs/banto-hub-driver-io-design.md §4.3): the plan carries the driver's own
+/// docs/hub/driver/banto-hub-driver-io-design.md §4.3): the plan carries the driver's own
 /// `TagSpec`s. On the legacy save path (the plain `TagService::new`,
 /// ChronoGazer) `banto-tags` does not validate the address with the driver, so
 /// this is where such a tag is caught, before any session is opened. Registry
@@ -577,9 +577,9 @@ pub fn build_config_from(
     build_config_from_with_registry(snapshot, PushSource::Unavailable, drivers)
 }
 
-/// R2b-1d (docs/banto-hub-connection-settings-design.md §4.4・§7): the strict build for
+/// R2b-1d (docs/hub/banto-hub-connection-settings-design.md §4.4・§7): the strict build for
 /// a runtime that can (or cannot) collect `"push"` connections
-/// (docs/banto-hub-ingest-design.md §4.1, R2a-1b; [`PushSource::Unavailable`] is
+/// (docs/hub/banto-hub-ingest-design.md §4.1, R2a-1b; [`PushSource::Unavailable`] is
 /// exactly [`build_config_from`]). It checks every collected connection against `registry` first
 /// ([`driver_exclusion`]): a connection whose driver is missing, whose stored
 /// `settings` the driver refuses, or whose settings shape is newer than the driver is
@@ -719,7 +719,7 @@ pub enum ExclusionReason {
     /// `hubSourceNotYetCollected`; P3 added the sampler, so the reason is now
     /// about the runtime, not the crate.)
     HubSourceUnavailable,
-    /// R2a-1b (docs/banto-hub-ingest-design.md §4.1): a `"push"` connection
+    /// R2a-1b (docs/hub/banto-hub-ingest-design.md §4.1): a `"push"` connection
     /// (`banto_tags::PUSH_PROTOCOL`) in a runtime that cannot receive pushed
     /// values ([`PushSource::Unavailable`]: ChronoGazer, and every build that
     /// is not banto-hub's ingest-enabled one). Cascades like
@@ -749,7 +749,7 @@ pub enum ExclusionReason {
         data_type: String,
         issue: TagExclusionCause,
     },
-    /// R2b-1d (docs/banto-hub-connection-settings-design.md §4.4): the connection's
+    /// R2b-1d (docs/hub/banto-hub-connection-settings-design.md §4.4): the connection's
     /// `protocol` is not in the caller's driver registry - a `"hub"` row in banto-hub
     /// (the Hub registers no `hub` driver), or a plugin that was removed. The row is
     /// kept (never deleted or reinterpreted as another protocol, plugin-design §7.5);
@@ -1039,7 +1039,7 @@ pub fn build_config_lenient_with_thresholds(
     )
 }
 
-/// R2a-1b (docs/banto-hub-ingest-design.md §4.1): whether the calling runtime
+/// R2a-1b (docs/hub/banto-hub-ingest-design.md §4.1): whether the calling runtime
 /// can collect `"push"` connections (values pushed into banto-hub by an
 /// external sender, read through an [`crate::external::ExternalSource`]).
 ///
@@ -1100,7 +1100,7 @@ fn build_config_lenient_inner(
     // Deterministic order everywhere (by id) so the derived StoreConfig - and
     // therefore its config hash - is stable across restarts.
     //
-    // T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): a `"virtual"` connection
+    // T6-2 (docs/hub/tag-server-design.md §4.2/§4.3(a)): a `"virtual"` connection
     // (banto-hub's auto-provisioned `calc`/`mem` reserved namespace for
     // computed/internal tags) is excluded from collection here, not treated
     // as a config error - it never has a socket to open, so silently
@@ -1112,7 +1112,7 @@ fn build_config_lenient_inner(
     // `apps/banto-hub/core/src/computed.rs`'s `ComputedEngine`/
     // `ServerTagStore`, never by this recorder pipeline.
     //
-    // S1 (docs/banto-hub-external-db-design.md §4.1・§7 スライス表「S1」,
+    // S1 (docs/hub/banto-hub-external-db-design.md §4.1・§7 スライス表「S1」,
     // 2026-09-06): a `"postgres"` connection ([`PlcConnection::is_db_source`])
     // gets the identical exclusion, for the identical reason - it is not a
     // wire-protocol PLC connection either, and its driver (if any) is not
@@ -1413,7 +1413,7 @@ pub fn config_exclusions(
 /// [`ExclusionReason::DriverUnavailable`] (banto-hub registers no `hub`
 /// driver; its migration report says so).
 /// Every other row is checked against the registry first (R2b-1d,
-/// docs/banto-hub-connection-settings-design.md §4.4・§7: a row the registry
+/// docs/hub/banto-hub-connection-settings-design.md §4.4・§7: a row the registry
 /// does not know - an unknown protocol, a removed plugin -, whose settings the
 /// driver refuses or whose settings shape is newer than the driver is excluded
 /// alone; the row itself is kept), and is then read through the broker when
@@ -1519,7 +1519,7 @@ fn push_external_key(tag: &Tag) -> Result<String, ExclusionReason> {
     Ok(tag.address.trim().to_string())
 }
 
-/// R2b-2c / R2b-3a-3 (docs/banto-hub-driver-io-design.md §4.3): a tag's read as
+/// R2b-2c / R2b-3a-3 (docs/hub/driver/banto-hub-driver-io-design.md §4.3): a tag's read as
 /// the plan carries it - the connection's *driver* parses the address
 /// (`parse_address` with the tag's [`banto_tags::tag_kind`]) and the result is
 /// the [`TagSpec`] itself (the bridge back to `banto_plc::Address` is gone). A
@@ -2025,7 +2025,7 @@ mod tests {
         assert!(matches!(err, CollectError::Config(_)));
     }
 
-    /// T8-2 (docs/tag-server-design.md §6.1, 2026-08-06): a bit-in-word
+    /// T8-2 (docs/hub/tag-server-design.md §6.1, 2026-08-06): a bit-in-word
     /// address (`"40001.3"`) on a tag whose `data_type` is not `"bit"` is a
     /// config error, not silently accepted as a truncated numeric reading.
     #[tokio::test]
@@ -2286,7 +2286,7 @@ mod tests {
         );
     }
 
-    /// T9-1 (docs/ux-plan.md §1): `PlcConnection::simulation` carries through
+    /// T9-1 (docs/archive/ux-plan.md §1): `PlcConnection::simulation` carries through
     /// unchanged into `ConnectionPlan::simulation` - `build_config` itself
     /// never starts a simulator or touches host/port (since R2b-3a-3 the
     /// host's `BrokerSimRegistry` substitutes the address before the broker
@@ -2363,7 +2363,7 @@ mod tests {
         assert!(matches!(err, CollectError::Config(_)));
     }
 
-    /// T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): a `"virtual"` connection
+    /// T6-2 (docs/hub/tag-server-design.md §4.2/§4.3(a)): a `"virtual"` connection
     /// (banto-hub's reserved `calc`/`mem` namespace) contributes nothing to
     /// collection - excluded, not a config error - while an ordinary
     /// connection alongside it still collects normally.
@@ -2428,7 +2428,7 @@ mod tests {
         assert_eq!(config.connections[0].key, format!("conn:{}", real_conn.id));
     }
 
-    /// S1 (docs/banto-hub-external-db-design.md §4.1・§7): the `"postgres"`
+    /// S1 (docs/hub/banto-hub-external-db-design.md §4.1・§7): the `"postgres"`
     /// twin of `a_virtual_connection_is_excluded_from_collection_without_erroring`
     /// - if `"postgres"` were not excluded here, `build_config` would fail
     /// the moment the connection is merely *enabled* (`parse_protocol` has no
@@ -3889,7 +3889,7 @@ mod tests {
         )
     }
 
-    /// R2b-2c (docs/banto-hub-driver-address-design.md §4.2・§9): with a registry the
+    /// R2b-2c (docs/hub/driver/banto-hub-driver-address-design.md §4.2・§9): with a registry the
     /// plan reads each address through the connection's driver. A hand-edited row
     /// (`D3000` on a Modbus tag) leaves **that tag alone** out as `InvalidTag` carrying
     /// the driver's message; the others stay planned. 5-digit (pre-R2b-2) and 6-digit

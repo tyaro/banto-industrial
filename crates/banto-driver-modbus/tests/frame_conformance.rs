@@ -1,4 +1,4 @@
-//! R2b-3c（docs/banto-hub-driver-io-design.md §11.2）: the frame-type
+//! R2b-3c（docs/hub/driver/banto-hub-driver-io-design.md §11.2）: the frame-type
 //! `ModbusDriver` through `banto-driver-conformance`'s `frame::run_all`, which
 //! runs the real `banto-driver-engine` over an in-memory wire on a paused
 //! clock (C3-C7, C9-C12: kinds and order, refusals, broken and split

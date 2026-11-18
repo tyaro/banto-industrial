@@ -37,11 +37,11 @@ import {
 // --- wire types (camelCase, matching the Rust serde shapes) -----------------
 
 /**
- * S1（docs/banto-hub-external-db-design.md §4.1・§6-4）: `'postgres'` は
+ * S1（docs/hub/banto-hub-external-db-design.md §4.1・§6-4）: `'postgres'` は
  * PLC ではなく PostgreSQL への DB Source 接続 - mirrors
  * `banto_tags::plc_connection::POSTGRES_PROTOCOL`。
  *
- * R2a-2e（docs/banto-hub-ingest-design.md §3.1）: `'push'` は取り込み口 -
+ * R2a-2e（docs/hub/banto-hub-ingest-design.md §3.1）: `'push'` は取り込み口 -
  * 外の送り手（DB ブリッジ・スクリプト）が Hub へ値を送り込む接続（mirrors
  * `banto_tags::PUSH_PROTOCOL`）。R2a-2b のキーの画面（`apiKeyScopes.ts`）は
  * 文字列で比べていたので、ここで型に足す。
@@ -59,7 +59,7 @@ export const POSTGRES_PROTOCOL: PlcProtocol = 'postgres';
 export const PUSH_PROTOCOL: PlcProtocol = 'push';
 
 /**
- * R2a-2e（docs/banto-hub-ingest-design.md §3.2）: `push` 接続の `settings` の
+ * R2a-2e（docs/hub/banto-hub-ingest-design.md §3.2）: `push` 接続の `settings` の
  * ブリッジの列の対応 1 つ（wire はサーバーの JSON のまま snake_case）。
  */
 export interface PushBridgeColumnWire {
@@ -95,7 +95,7 @@ export interface PushSettingsWire {
 }
 
 /**
- * T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): the two reserved
+ * T6-2 (docs/hub/tag-server-design.md §4.2/§4.3(a)): the two reserved
  * `protocol: "virtual"` connections `banto-hub` auto-provisions at startup
  * (`bin/banto-hub.rs::ensure_virtual_connection`) — `calc` hosts every
  * `tagKind: "computed"` tag's group, `mem` hosts every `"internal"` tag's
@@ -114,7 +114,7 @@ export function isVirtualConnection(conn: Pick<PlcConnection, 'protocol'>): bool
 }
 
 /**
- * S1（docs/banto-hub-external-db-design.md §4.1）: `protocol === 'postgres'`
+ * S1（docs/hub/banto-hub-external-db-design.md §4.1）: `protocol === 'postgres'`
  * 判定 - mirrors `banto_tags::PlcConnection::is_db_source`。ツリーの DB
  * バッジ・グループ作成禁止・接続 Drawer のフィールド出し分け（database/
  * username/password を出す・unitId/wordOrder/simulation を隠す）が使う。
@@ -129,7 +129,7 @@ export function isPushConnection(conn: Pick<PlcConnection, 'protocol'>): boolean
 }
 
 /**
- * R2b-6b（docs/banto-hub-driver-ui-design.md §5）: 応答の `settings` の秘密のキーの値
+ * R2b-6b（docs/hub/driver/banto-hub-driver-ui-design.md §5）: 応答の `settings` の秘密のキーの値
  * （`{"$secret": "set" | "unreadable"}`）。値・参照は返らない。値が無い秘密のキーは
  * `settings` に載らない - mirrors `banto_hub_core::rest::PlcConnectionResponse`。
  */
@@ -217,7 +217,7 @@ export interface DriverInfo {
 }
 
 /**
- * S1（docs/banto-hub-external-db-design.md §4.6）: `POST
+ * S1（docs/hub/banto-hub-external-db-design.md §4.6）: `POST
  * /api/plc-connections/{id}/test`（保存済み postgres 接続の接続テスト）の
  * 応答 - mirrors `banto_hub_core::db_source::DbConnectionTestOutcome`。
  * T12 の {@link PlcConnectionTestResult}（保存前、PLC 専用）とは別物 -
@@ -262,7 +262,7 @@ export interface CollectionGroup {
 	periodMs: number;
 	enabled: boolean;
 	/**
-	 * T19 S1-b（UX-34、docs/banto-hub-t19-design.md §2、2026-09-02 オーナー
+	 * T19 S1-b（UX-34、docs/hub/banto-hub-t19-design.md §2、2026-09-02 オーナー
 	 * 決定「グループ単位の既定値は DB 列に持つ」）: このグループへ新規タグを
 	 * 登録するときの `writable` チェックボックスの既定値。`tags.writable`
 	 * 自体の検証（computed タグ拒否・Modbus 読み取り専用領域拒否）とは
@@ -271,7 +271,7 @@ export interface CollectionGroup {
 	 */
 	defaultWritable: boolean;
 	/**
-	 * S3（docs/banto-hub-external-db-design.md §4.1・§4.2、2026-09-06
+	 * S3（docs/hub/banto-hub-external-db-design.md §4.1・§4.2、2026-09-06
 	 * オーナー決定「案A」）: このグループが1周期ごとに実行する SELECT 文
 	 * （「1 グループ = 1 SELECT = N タグ」）。`protocol === 'postgres'` の
 	 * 接続配下のグループでは常に非 `null`、それ以外の接続配下では常に
@@ -330,7 +330,7 @@ export const DB_TAG_ALLOWED_DATA_TYPES: readonly TagDataType[] = [
 ];
 
 /**
- * Tag species (T6-2, docs/tag-server-design.md §4.2's table) — mirrors
+ * Tag species (T6-2, docs/hub/tag-server-design.md §4.2's table) — mirrors
  * `banto_tags::ALLOWED_TAG_KINDS`.
  *
  * - `plc` (default/existing): value from the collection task, `address`
@@ -341,7 +341,7 @@ export const DB_TAG_ALLOWED_DATA_TYPES: readonly TagDataType[] = [
  * - `internal`: value from client writes, held entirely in the tag space
  *   (never sent to a PLC); `address`/`expression` both forbidden, `retain`
  *   selects restart persistence.
- * - `db` (S3, docs/banto-hub-external-db-design.md §4.1/§4.4): value from
+ * - `db` (S3, docs/hub/banto-hub-external-db-design.md §4.1/§4.4): value from
  *   the DB Source poll of the group's `query_sql`; `address` is the
  *   **result column name** (not a PLC address, `^[A-Za-z_][A-Za-z0-9_]*$`,
  *   ≤ {@link MAX_DB_COLUMN_NAME_LEN} chars, compared verbatim), `expression`
@@ -399,7 +399,7 @@ export function isValidDbColumnAddress(address: string): boolean {
 }
 
 /**
- * `tags.string_encoding` vocabulary (T20 ①a, docs/banto-hub-t20-design.md
+ * `tags.string_encoding` vocabulary (T20 ①a, docs/hub/banto-hub-t20-design.md
  * §3.1) — mirrors `banto_tags::ALLOWED_STRING_ENCODINGS`.
  */
 export type StringEncoding = 'utf8' | 'shift_jis';
@@ -424,7 +424,7 @@ export interface Tag {
 	 */
 	stringLength: number | null;
 	/**
-	 * T20 ①a (docs/banto-hub-t20-design.md §3.1, 2026-09-04 オーナー決定
+	 * T20 ①a (docs/hub/banto-hub-t20-design.md §3.1, 2026-09-04 オーナー決定
 	 * 「文字コードは既定 UTF-8、タグ単位で Shift-JIS も選択可」): `string`
 	 * タグの書き込みに使うエンコーディング。数値/bit タグでも列自体は
 	 * 常に持つ（既定 `'utf8'`）が、`dataType !== 'string'` では未使用。
@@ -437,7 +437,7 @@ export interface Tag {
 	unit: string | null;
 	decimals: number;
 	enabled: boolean;
-	/** Per-tag write opt-in (T2-3, docs/tag-server-design.md §6 item 1). */
+	/** Per-tag write opt-in (T2-3, docs/hub/tag-server-design.md §6 item 1). */
 	writable: boolean;
 	/** T6-2: tag species — see {@link TagKind}. */
 	tagKind: TagKind;
@@ -446,7 +446,7 @@ export interface Tag {
 	/** T6-2: internal-tag restart-persistence flag. */
 	retain: boolean;
 	/**
-	 * T18-1 (docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目):
+	 * T18-1 (docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目):
 	 * 楽観的ロック用の行バージョン。`update` が成功する度に +1 される。
 	 * 編集フォームを開いた時点の値を保持しておき、保存時に
 	 * {@link TagInput.expectedRevision} として送り返す。
@@ -490,7 +490,7 @@ export interface TagInput {
 	/** T6-2: `#[serde(default)]` (= `false`) on the backend. */
 	retain?: boolean;
 	/**
-	 * T18-1 (docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目):
+	 * T18-1 (docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目):
 	 * 更新時の楽観ロック。編集フォームを開いた時点の
 	 * {@link Tag.revision} を渡す — サーバー側の行が既に進んでいたら
 	 * `updateTag` は {@link TagRevisionConflictError} を投げる。
@@ -552,7 +552,7 @@ interface HttpInit {
 	 */
 	readOnly?: boolean;
 	/**
-	 * T18-1 (docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目):
+	 * T18-1 (docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目):
 	 * エラーレスポンスの body が共通の `ErrorBody`（`kind` タグ）形状を
 	 * していない呼び出し元固有のエラー（例: `tags_update` の 409
 	 * `tag_revision_conflict` — `error`/`message`/`tag` という別形状）を
@@ -564,7 +564,7 @@ interface HttpInit {
 
 async function httpRequest<T>(path: string, init: HttpInit): Promise<T> {
 	/**
-	 * T19 S2-c2 (UX-40, docs/banto-hub-t19-design.md §3.10): 変更系リクエストの
+	 * T19 S2-c2 (UX-40, docs/hub/banto-hub-t19-design.md §3.10): 変更系リクエストの
 	 * 直前で、タグ削除の取り消し猶予（`deferredDelete.svelte.ts`）を打ち切って
 	 * 即時実行する。GET では呼ばない - 猶予中の行は画面側が `pendingIds` で
 	 * 一覧から除外しているので、GET の再読込で行が復活することはない。逆に
@@ -755,7 +755,7 @@ export async function deleteCollectionGroup(id: number): Promise<void> {
 }
 
 /**
- * S3（docs/banto-hub-external-db-design.md §7 row S3）: `POST
+ * S3（docs/hub/banto-hub-external-db-design.md §7 row S3）: `POST
  * /api/collection-groups/{id}/describe` の1列分 - mirrors
  * `banto_hub_core::db_source::DescribeColumnOutcome`。`kind` は
  * `banto_hub_core::db_source::convert::ColumnKind::classify` の3値
@@ -800,7 +800,7 @@ export async function listTags(): Promise<Tag[]> {
 }
 
 /**
- * T18-5a 第2段（docs/banto-hub-t18-design.md §4 決定6「薄い部品の先行配線」）:
+ * T18-5a 第2段（docs/hub/banto-hub-t18-design.md §4 決定6「薄い部品の先行配線」）:
  * `POST /api/tags/list` — フィルタ/ソート/ページングつきのタグ一覧。
  * `listWriteAudit`（`writeAuditAdmin.ts`）と同型の素通し呼び出し。まだどの
  * UI からも使われていない（配線のみ）。
@@ -827,7 +827,7 @@ export async function listTagGroupCounts(): Promise<GroupTagCount[]> {
 }
 
 /**
- * R2b-2d（docs/banto-hub-driver-address-design.md §7.1）: `POST /api/tags/parse-addresses`
+ * R2b-2d（docs/hub/driver/banto-hub-driver-address-design.md §7.1）: `POST /api/tags/parse-addresses`
  * の要求の 1 行。**`tagKind` は必須**（保存と同じ種類ごとの規則をサーバーが当てる）。
  */
 export interface ParseAddressItem {
@@ -910,7 +910,7 @@ export async function createTag(input: TagInput): Promise<Tag> {
 }
 
 /**
- * T18-1 (docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目): `updateTag` が
+ * T18-1 (docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目): `updateTag` が
  * `expectedRevision` を渡した際、サーバー側の行が既に他クライアントの
  * 更新で先に進んでいた場合に投げる — mirrors
  * `banto_hub_core::rest::RegistryMutationError::TagRevisionConflict` の
@@ -954,7 +954,7 @@ export async function deleteTag(id: number): Promise<void> {
 	await httpRequest<void>(`/api/tags/${id}`, { method: 'DELETE', expectNoContent: true });
 }
 
-// --- T11-1 一括登録 (docs/ux-plan.md §3) -------------------------------------
+// --- T11-1 一括登録 (docs/archive/ux-plan.md §3) -------------------------------------
 
 /** Mirrors `banto_hub_core::rest::BatchTagFieldErrorResponse`. */
 export interface BatchTagFieldError {
@@ -1003,7 +1003,7 @@ export async function createTagsBatch(tags: TagInput[], dryRun: boolean): Promis
 	});
 }
 
-// --- T18-3b 一括操作 (docs/banto-hub-t18-design.md「T18-3b 一括操作」) -------
+// --- T18-3b 一括操作 (docs/hub/banto-hub-t18-design.md「T18-3b 一括操作」) -------
 
 /**
  * `POST /api/tags/batch-update` の1行分 - mirrors
@@ -1105,7 +1105,7 @@ export async function deleteTagsBatch(ids: number[]): Promise<BatchTagsDeleteRes
 	});
 }
 
-// --- T12 接続テスト (docs/ux-plan.md §4) -------------------------------------
+// --- T12 接続テスト (docs/archive/ux-plan.md §4) -------------------------------------
 
 /**
  * `POST /api/plc-connections/test` のリクエスト — mirrors
@@ -1148,7 +1148,7 @@ export interface PlcConnectionTestResult {
 
 /**
  * T12: 接続の保存前に疎通確認する。TCP 接続だけでなく実プロトコルでの
- * 軽い読み出し1回まで行う（docs/ux-plan.md §4）。
+ * 軽い読み出し1回まで行う（docs/archive/ux-plan.md §4）。
  */
 export async function testPlcConnection(
 	input: PlcConnectionTestRequest

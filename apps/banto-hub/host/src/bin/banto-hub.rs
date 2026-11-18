@@ -3,12 +3,12 @@
 //! アプリのプレビュー用ではなく banto-hub 自身の**唯一の**起動経路である
 //! （設計 §3.1: 「Tauri は使わない」）。
 //!
-//! T5-1（docs/tag-server-design.md §8「常駐」・docs/t5-handoff.md §3）:
+//! T5-1（docs/hub/tag-server-design.md §8「常駐」・docs/archive/t5-handoff.md §3）:
 //! v1 はコンソール起動のみだったが、Windows サービス化
 //! （`windows-service`クレート、本実装）を追加した。起動〜シャットダウンの
 //! 実処理シーケンス（DB初期化・各サービス構築・`CollectorManager::
 //! rebuild`・MQTT/gRPC起動・axumサーバー起動・シャットダウン順序）は
-//! T14-1（docs/banto-hub-t14-design.md §3「D1」）で lib クレート
+//! T14-1（docs/archive/banto-hub-t14-design.md §3「D1」）で lib クレート
 //! （`banto_hub_core`）側の [`banto_hub_core::runtime::HubRuntime`]へ抽出
 //! された - コンソールモード・サービスモードのどちらもそれを呼ぶ。この
 //! ファイル自身は「どちらのモードで、何を停止トリガーにして呼ぶか」の
@@ -16,7 +16,7 @@
 //! 組み立てる役目だけを持つ（env 読み取りは T14-1 で composition root から
 //! ここ（ホスト側）へ移った）。
 //!
-//! T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P1）で、env 読み取り
+//! T17-1（docs/hub/banto-hub-t17-design.md §3「T17-1」・P1）で、env 読み取り
 //! 自体は3ホスト共通の[`banto_hub_core::profile_paths::build_hub_config_from_env`]
 //! へ一本化した - 以前この関数はこのファイル自身が定義していたが、
 //! `win_service.rs`（サービスホスト）・`apps/banto-hub/src-tauri`
@@ -43,12 +43,12 @@
 //!   動かさずに緩めるだけで止まる（締めたまま残ったときの戻し方。それ以外の
 //!   開始の引数は何も変えずに終了コード 3）
 //!
-//! 実行手順は docs/banto-hub-operations.md 参照。
+//! 実行手順は docs/hub/banto-hub-operations.md 参照。
 //!
 //! ## package（R1-7a）
 //!
 //! このファイルと `banto-hub-elev.rs`・`banto_hub/` は、R1-7a
-//! （docs/banto-driver-api-design.md §2.4）で `banto-hub-core` の `src/bin/` から
+//! （docs/hub/driver/banto-driver-api-design.md §2.4）で `banto-hub-core` の `src/bin/` から
 //! この package（`banto-hub-host`、`apps/banto-hub/host`）へ移した。組み込みドライバ
 //! （`banto-drivers`）を normal で持つのはこの package で、`banto-hub-core` のライブラリは
 //! [`HubDrivers`] を注入で受け取るだけ（§6.4）。ビルドは
@@ -101,12 +101,12 @@ use banto_hub_core::runtime::HubRuntime;
 
 /// R1-3b: この bin が組み立てる組み込みドライバ一式（コンソール・Windows サービス
 /// 共通）。コアは `HubDrivers` を注入で受け取るだけで具体的なドライバを知らない
-/// （docs/banto-driver-api-design.md §6.4）。
+/// （docs/hub/driver/banto-driver-api-design.md §6.4）。
 fn hub_drivers() -> HubDrivers {
     let builtin = banto_drivers::builtin();
     // R2b-1a: `modbus-tcp` / `slmp`（R2b-3a-2 からセッション型）に、host が I/O を持つ `push` /
     // `postgres` / `virtual`（`HostProvided`）を足す。R2b-1d から Hub の入口・収集の計画・
-    // 移行の preflight がこのレジストリを正にする（docs/banto-hub-connection-settings-design.md §4）。
+    // 移行の preflight がこのレジストリを正にする（docs/hub/banto-hub-connection-settings-design.md §4）。
     let mut registry = builtin.registry;
     banto_hub_core::register_host_provided(&mut registry)
         .expect("host-provided driver ids are distinct from the built-ins");

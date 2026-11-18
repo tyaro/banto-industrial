@@ -1,4 +1,4 @@
--- T20 ①a（文字列タグへの書き込み、docs/banto-hub-t20-design.md §3.1、
+-- T20 ①a（文字列タグへの書き込み、docs/hub/banto-hub-t20-design.md §3.1、
 -- 2026-09-04 オーナー決定「文字コードは既定 UTF-8、タグ単位で Shift-JIS も
 -- 選択可」）: `tags.string_encoding` を追加し、`data_type = 'string'` タグが
 -- ワイヤへ書き込まれる際のエンコーディングをタグ単位で選べるようにする。

@@ -1,5 +1,5 @@
 /**
- * タグ複製（T18-3a、docs/banto-hub-t18-design.md「T18-3a タグ複製」、
+ * タグ複製（T18-3a、docs/hub/banto-hub-t18-design.md「T18-3a タグ複製」、
  * TAG-UX-D 前半「『このタグを複製』、型/単位/スケーリング/しきい値を引継ぎ
  * 名前とアドレスのみ変更する」）の実 DOM 受け入れテスト。
  *

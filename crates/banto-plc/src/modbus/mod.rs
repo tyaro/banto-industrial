@@ -5,7 +5,7 @@
 //! `PlcClient` for Modbus TCP), `dial_modbus` and
 //! `execute_modbus_reads`. The broker now reaches Modbus through the
 //! frame-type driver (`banto-driver-modbus`'s `FrameDriver` over
-//! `banto-driver-engine`, docs/banto-hub-driver-io-design.md §6.1), which
+//! `banto-driver-engine`, docs/hub/driver/banto-hub-driver-io-design.md §6.1), which
 //! plans with [`crate::plan_batch_requests`] and decodes with
 //! [`crate::decode`] against [`frame`]'s MBAP primitives; the socket, the
 //! response timeout and the "a timeout is connection-fatal" rule are the
@@ -32,7 +32,7 @@ use crate::decode::WordOrder;
 
 /// Everything needed to reach and speak to one Modbus TCP device.
 ///
-/// `PartialEq` (T7-1, docs/tag-server-design.md §4.3): lets `banto-collect`
+/// `PartialEq` (T7-1, docs/hub/tag-server-design.md §4.3): lets `banto-collect`
 /// diff a connection's config across a config reload (`Collector::apply_config`)
 /// to tell "settings-only change" (host/port edited, same tags/groups - the
 /// writer stays open) from "no change at all" (skip the connection's task

@@ -1,6 +1,6 @@
 [package]
 name = "banto-collect"
-description = "I3b: 収集エンジン - タグレジストリのスナップショットから PLC 群を周期収集し banto-tstore へ書き込み、現在値とイベントを供給 (docs/plan.md I3b, docs/recorder-requirements.md §3.1/§3.5/§4)"
+description = "I3b: 収集エンジン - タグレジストリのスナップショットから PLC 群を周期収集し banto-tstore へ書き込み、現在値とイベントを供給 (docs/plan.md I3b, docs/chronogazer/recorder-requirements.md §3.1/§3.5/§4)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,12 +11,12 @@ publish.workspace = true
 # assemble a CollectorConfig snapshot. This is the one crate that bridges
 # I1/I2/I3a (see plan.md's dependency graph: I3b depends on I1, I2, I3a).
 banto-tags = { path = "../banto-tags" }
-# R2b-1d (docs/banto-hub-connection-settings-design.md §4.4・§7): the strict build can
+# R2b-1d (docs/hub/banto-hub-connection-settings-design.md §4.4・§7): the strict build can
 # check each connection against the host's `DriverRegistry`
 # (`build_config_from_with_registry`). A dependency-free crate; banto-tags already
 # depends on it.
 banto-driver-api = { path = "../banto-driver-api", version = "0.3.0" }
-# R2b-3a-3 (docs/banto-hub-driver-io-design.md §4.3・§8): every PLC connection is
+# R2b-3a-3 (docs/hub/driver/banto-hub-driver-io-design.md §4.3・§8): every PLC connection is
 # read through a broker session - `crate::client::BrokerReadClient` wraps its
 # read-only handle, and `crate::sessions::BrokerSessions` owns a supervisor for
 # a host without a broker of its own (ChronoGazer). banto-broker depends only on
@@ -52,7 +52,7 @@ banto-plc = { path = "../banto-plc", features = ["simulator"] }
 # PLC listener (`tests/integration.rs`).
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util", "net"] }
 banto-storage = { workspace = true, features = ["sqlite"] }
-# T2-2 (docs/tag-server-design.md §6-5): collector.rs's client-factory
+# T2-2 (docs/hub/tag-server-design.md §6-5): collector.rs's client-factory
 # injection unit test needs a throwaway `data_dir` for `TsWriter::open` (no
 # real PLC socket involved - the injected fake client never touches disk
 # beyond the store itself).

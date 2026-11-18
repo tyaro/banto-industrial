@@ -1,5 +1,5 @@
 //! banto-hub のサービスの「設定モード ⇔ 運用モード」の判定と文言（#661 661-2、
-//! docs/banto-hub-t17-design.md §1 の「2026-10-19 オーナー決定（#661）」）。
+//! docs/hub/banto-hub-t17-design.md §1 の「2026-10-19 オーナー決定（#661）」）。
 //!
 //! サービス本体（`bin/banto_hub/win_service.rs`、Windows だけ）が使う**純関数**だけを置く
 //! （どの OS でもテストする）。ファイル・レジストリ・SCM には触れない。手本は ChronoGazer の

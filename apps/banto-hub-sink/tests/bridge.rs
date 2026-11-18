@@ -1,4 +1,4 @@
-//! DB ブリッジ（R2a-3b、docs/banto-hub-ingest-design.md §10.3・§11）の統合テスト。
+//! DB ブリッジ（R2a-3b、docs/hub/banto-hub-ingest-design.md §10.3・§11）の統合テスト。
 //!
 //! ## 何を繋いでいるか
 //!
@@ -264,7 +264,7 @@ fn fast_options() -> CollectorOptions {
 
 fn banto_drivers_helper() -> banto_hub_core::broker_glue::HubDrivers {
     let builtin = banto_drivers::builtin();
-    // R2b-1d (docs/banto-hub-connection-settings-design.md §10): the Hub's entrances,
+    // R2b-1d (docs/hub/banto-hub-connection-settings-design.md §10): the Hub's entrances,
     // plan and preflight read the registry now, so the host-provided protocols
     // (`push` / `postgres` / `virtual`) join the built-ins exactly as the real hosts'
     // `hub_drivers()` do - without them every postgres / push connection here would be

@@ -272,7 +272,7 @@ pub enum TagClientConnectionState {
     Handshaking,
     Live,
     /// No requested binding is in the catalog (#682 PR-3,
-    /// docs/banto-tagclient-partial-binding-design.md §7). The WebSocket is
+    /// docs/crates/banto-tagclient-partial-binding-design.md §7). The WebSocket is
     /// open but nothing is subscribed and there are no values: `snapshot()`
     /// is `Some` with `values: None` and every request in
     /// `resolution.unresolved`, `current()` is `None`. This is a settled
@@ -285,7 +285,7 @@ pub enum TagClientConnectionState {
     /// cause: a disconnect, a transport or protocol error, or a rebind budget
     /// spent on repeated configuration changes / metadata mismatches. The
     /// cause is in [`TagClientState::last_error`] (#682,
-    /// docs/banto-tagclient-partial-binding-design.md §5).
+    /// docs/crates/banto-tagclient-partial-binding-design.md §5).
     Reconnecting,
     Unauthorized,
 }
@@ -307,7 +307,7 @@ impl fmt::Display for TagClientConnectionState {
 }
 
 /// The catalog, binding resolution, and values that one SDK generation
-/// produced together (#682, docs/banto-tagclient-partial-binding-design.md
+/// produced together (#682, docs/crates/banto-tagclient-partial-binding-design.md
 /// §4.1 / §6).
 ///
 /// All three parts come from the same attempt (R1): when `values` is present

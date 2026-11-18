@@ -1,4 +1,4 @@
-//! #341（オーナー決定 2026-09-09 / 2026-09-14、`docs/tag-server-design.md`
+//! #341（オーナー決定 2026-09-09 / 2026-09-14、`docs/hub/tag-server-design.md`
 //! §4.3）の E2E テスト: **走行中の収集を止めずに**構成変更が実行構成へ
 //! 反映されることを、実際に `CollectionController` を `Running`
 //! （`RunMode::AllSimulation`）にした状態で確認する。

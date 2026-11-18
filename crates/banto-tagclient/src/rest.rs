@@ -186,7 +186,7 @@ impl RestClient {
     }
 
     /// Write one tag by its `external_name` (Issue #123, tag-server-design.md
-    /// §6; 2026-09-30 owner decision, docs/scada-design.md §9.6).
+    /// §6; 2026-09-30 owner decision, docs/scada/scada-design.md §9.6).
     ///
     /// This is a single `POST /api/v1/values/{external_name}` and nothing
     /// else - see the `write` module doc for why it is not part of

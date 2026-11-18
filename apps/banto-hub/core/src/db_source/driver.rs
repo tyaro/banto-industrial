@@ -1,4 +1,4 @@
-//! `postgres` の静的な部分（R2b-1a、docs/banto-hub-connection-settings-design.md
+//! `postgres` の静的な部分（R2b-1a、docs/hub/banto-hub-connection-settings-design.md
 //! §3.2・§4.1）: [`PostgresDriver`]（`banto_driver_api::DriverBase`）。
 //!
 //! `postgres` 接続は DB Source / DB Sink が使う外部 PostgreSQL への接続で、PLC では

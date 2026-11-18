@@ -32,7 +32,7 @@ import { nextSequentialName } from './sequentialName';
 import type { CollectionGroup, CollectionGroupInput } from './tagRegistryAdmin';
 
 /**
- * S3（docs/banto-hub-external-db-design.md §4.2、2026-09-06 オーナー決定）:
+ * S3（docs/hub/banto-hub-external-db-design.md §4.2、2026-09-06 オーナー決定）:
  * `querySql` の長さ上限 - mirrors
  * `crates/banto-tags/src/collection_group.rs::MAX_QUERY_SQL_LEN`。この
  * ファイルの「依存ゼロ」方針（`DEFAULT_PERIOD_MS`の doc comment参照）に
@@ -41,7 +41,7 @@ import type { CollectionGroup, CollectionGroupInput } from './tagRegistryAdmin';
 export const MAX_QUERY_SQL_LEN = 8192;
 
 /**
- * T19 S1-b（UX-32、docs/banto-hub-t19-design.md §5.2「現行は
+ * T19 S1-b（UX-32、docs/hub/banto-hub-t19-design.md §5.2「現行は
  * `ALLOWED_PERIOD_MS[0]` = 100ms。UX-32 で 1s へ変更する」、2026-09-02
  * オーナー決定）: 収集グループ新規作成フォームの収集周期の既定値。
  * `crates/banto-tags/src/collection_group.rs::ALLOWED_PERIOD_MS` の並び
@@ -87,7 +87,7 @@ export interface CollectionGroupFormState {
 	 */
 	defaultWritable: boolean;
 	/**
-	 * S3（docs/banto-hub-external-db-design.md §4.1・§4.2）: `protocol ===
+	 * S3（docs/hub/banto-hub-external-db-design.md §4.1・§4.2）: `protocol ===
 	 * 'postgres'` 接続配下のグループが1周期ごとに実行する SELECT 文。
 	 * postgres 以外の接続配下では常に空文字列（未使用）のまま - サーバー側
 	 * `CollectionGroup.querySql` と同じ「postgres でだけ意味を持つ」規約。
@@ -174,7 +174,7 @@ export function formToGroupInput(
 }
 
 /**
- * S3（docs/banto-hub-external-db-design.md §4.2「文の検証はベストエフォート」、
+ * S3（docs/hub/banto-hub-external-db-design.md §4.2「文の検証はベストエフォート」、
  * 実装指示2）: クライアント側の事前検証 - サーバー側
  * `crates/banto-tags/src/collection_group.rs::validate_query_sql` の
  * postgres 配下ルールをミラーする。

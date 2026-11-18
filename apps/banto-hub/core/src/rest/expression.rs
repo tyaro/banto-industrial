@@ -2,7 +2,7 @@
 //! エラー位置・プレビュー）と、組み込み関数表の配布（#342 段階B:
 //! `GET /api/tags/expression/functions`、式欄のセグメント補完用）。
 //!
-//! `rest.rs` から中身を変えずに移したもの（docs/banto-hub-driver-refactor-plan.md §8.1、
+//! `rest.rs` から中身を変えずに移したもの（docs/hub/driver/banto-hub-driver-refactor-plan.md §8.1、
 //! P0-1 の手順 8）。ルーターへの組み込み（`tag_registry_router`）は `rest/tags.rs`、
 //! 認証・ガード・補助は親の `rest.rs` にある。どちらも `use super::{...}` で使う。
 //! 外から使われるパス（`crate::rest::X`）は親の re-export で保つ。

@@ -1,4 +1,4 @@
-//! T17-2 スライス2（docs/banto-hub-t17-design.md §3「T17-2」）: `bin/banto_hub/
+//! T17-2 スライス2（docs/hub/banto-hub-t17-design.md §3「T17-2」）: `bin/banto_hub/
 //! win_service.rs` にあった `install`/`uninstall` の本体をこの lib crate へ
 //! 移設したもの。
 //!
@@ -31,7 +31,7 @@
 //!
 //! [`install`] の既定起動種別を `ServiceStartType::AutoStart`（+
 //! `set_delayed_auto_start(true)`）から `ServiceStartType::OnDemand`
-//! （手動開始）へ変更した（docs/banto-hub-t17-design.md §1「P4」・
+//! （手動開始）へ変更した（docs/hub/banto-hub-t17-design.md §1「P4」・
 //! §11「T17-4 実装メモ」参照）。目的は「OS 再起動だけで収集が始まる」
 //! ことの防止 - サービスが実際に開始したときにサービス本体
 //! （`win_service.rs::HubProgram`）が即座に `Configured` 収集を
@@ -108,7 +108,7 @@ const LABEL: &str = "banto-hub";
 /// `AutoStart` に変更している場合も含む）をそのまま保持する。設定
 /// （実行ファイルパス・起動種別等）を変更したい場合は、先に
 /// [`uninstall`]してから明示的に`install`し直すか、管理 UI /
-/// `sc.exe config`を使うこと（docs/banto-hub-operations.md に手順を記載）。
+/// `sc.exe config`を使うこと（docs/hub/banto-hub-operations.md に手順を記載）。
 ///
 /// 例外は OS シャットダウンの待ち時間（#589）。新規作成でも既設でも
 /// `SERVICE_CONFIG_PRESHUTDOWN_INFO` だけを希望値に揃え、読み戻す。揃え

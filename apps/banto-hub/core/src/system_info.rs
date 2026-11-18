@@ -1,11 +1,11 @@
 //! サーバー自身の CPU/メモリ状態のサンプリング（T19 S3-b、
-//! docs/banto-hub-t19-design.md §3.9、UX-46「サーバー状態の拡充」）。
+//! docs/hub/banto-hub-t19-design.md §3.9、UX-46「サーバー状態の拡充」）。
 //!
 //! 状態画面（`GET /api/status`・`GET /api/v1/status`、`crate::rest`の
 //! `compute_status`）は「サーバーの状態」に属する情報として、接続状態・
 //! pending 変更・各種サービス状態に加えて **CPU 使用率・メモリ使用量** を
 //! 表示する（UX-47 で撤去した「全タグ現在値」の代わりに残す情報 -
-//! docs/banto-hub-t19-design.md §3.9 末尾）。
+//! docs/hub/banto-hub-t19-design.md §3.9 末尾）。
 //!
 //! ## 毎回 `System` を作り直さない理由
 //!

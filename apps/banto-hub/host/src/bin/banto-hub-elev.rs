@@ -1,4 +1,4 @@
-//! T17-2 スライス2（docs/banto-hub-t17-design.md §3「T17-2」）: UAC 昇格
+//! T17-2 スライス2（docs/hub/banto-hub-t17-design.md §3「T17-2」）: UAC 昇格
 //! ヘルパー `banto-hub-elev.exe`。
 //!
 //! `apps/banto-hub/host/banto-hub-elev.manifest`（`build.rs`が

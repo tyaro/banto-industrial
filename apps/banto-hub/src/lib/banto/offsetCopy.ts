@@ -1,5 +1,5 @@
 /**
- * T20 機能②b オフセットコピー（docs/banto-hub-t20-design.md §3.2、
+ * T20 機能②b オフセットコピー（docs/hub/banto-hub-t20-design.md §3.2、
  * 2026-09-04 オーナー決定「テンプレートの永続保存はしないが、既存タグ群
  * （＝構造体1インスタンス）からのオフセットコピーは有用」）。
  *
@@ -11,7 +11,7 @@
  * 再利用し、本ファイルは「コピー先の名前をどう決めるか」（{@link offsetCopyName}）と
  * 「複数selectionを一度に処理する」（{@link computeOffsetCopy}）だけを持つ。
  *
- * **R2b-6d-2a（docs/banto-hub-driver-ui-design.md §4.3・§7・§7.1、2026-10-24）: アドレスの
+ * **R2b-6d-2a（docs/hub/driver/banto-hub-driver-ui-design.md §4.3・§7・§7.1、2026-10-24）: アドレスの
  * 計算はドライバに任せる**。コピー先のアドレスは `POST /api/tags/offset-addresses`
  * （項目ごとの接続・`unit: "words"`）が返す。**ワード内ビット（`D100.5`）は、ワードの部分だけ
  * 進めてビットを保つ**（以前はビットの軸で進めて `D100.6` になっていた。物理的なワードの

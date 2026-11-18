@@ -1,6 +1,6 @@
 //! ランプ波つきのワイヤのシミュレータ(`simulator` feature)。
 //!
-//! R2b-5c(docs/banto-hub-driver-sim-design.md §6): 本番の
+//! R2b-5c(docs/hub/driver/banto-hub-driver-sim-design.md §6): 本番の
 //! `simulation = true` の接続は値の層(`banto_driver_engine::sim` の
 //! `SimDevice`)へ移り、`banto-collect` がワイヤのシミュレータを立てることは
 //! なくなった。ここに残るのは、**ワイヤの先で値が動いていること**が要る所

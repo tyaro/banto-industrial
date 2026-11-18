@@ -1,5 +1,5 @@
 <#
-  ChronoGazer 配布物の一括ビルド（#392 B3-4、docs/chronogazer-service-design.md
+  ChronoGazer 配布物の一括ビルド（#392 B3-4、docs/chronogazer/chronogazer-service-design.md
   §3.3「インストーラ」）。banto-hub の scripts/build-release.ps1 と同じ形:
   フロントエンド → シェル・記録エンジン（サービス）・昇格ヘルパーの 3 バイナリを
   リリースビルド → 一体インストーラ（apps/chronogazer/installer）を生成 →

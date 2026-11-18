@@ -1,6 +1,6 @@
 /**
  * banto-hub タグページの性能計測ハーネス（T18-5a 第2段、
- * docs/banto-hub-t18-design.md §4 決定6「実測ファースト方針」）。
+ * docs/hub/banto-hub-t18-design.md §4 決定6「実測ファースト方針」）。
  *
  * 決定3（同 §4）の性能目標を、10,000 タグ・500 グループを seed した
  * 実サーバー・実 DOM に対して実測する:
@@ -72,7 +72,7 @@ function modbusHoldingAddress(referenceNumber: number): string {
 	return `4${String(referenceNumber).padStart(5, '0')}`;
 }
 
-// 決定3（docs/banto-hub-t18-design.md §4）の性能目標。WARN 表示にのみ使う
+// 決定3（docs/hub/banto-hub-t18-design.md §4）の性能目標。WARN 表示にのみ使う
 // （spec 冒頭の doc comment のとおりハードアサートしない）。
 const TARGET_INITIAL_LOAD_MS = 2000;
 const TARGET_SEARCH_P95_MS = 100;
@@ -421,7 +421,7 @@ test.describe.serial('banto-hub タグページ性能計測 (T18-5a 第2段, opt
 				`(論理コア${results.env.cpuCount}) / ${results.env.totalMemGiB}GiB`
 		);
 		console.log(
-			'※ 決定3（docs/banto-hub-t18-design.md §4）の基準機（Intel Core i5 第11世代・' +
+			'※ 決定3（docs/hub/banto-hub-t18-design.md §4）の基準機（Intel Core i5 第11世代・' +
 				'メモリ8〜16GB）と異なる実行環境の場合、この数値は参考値扱い。'
 		);
 		console.log(

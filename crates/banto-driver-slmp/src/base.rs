@@ -1,11 +1,11 @@
 //! [`SlmpDriver`]: the `banto-driver-api` identity of MELSEC SLMP
-//! (docs/banto-driver-api-design.md §4.1, R1-4b).
+//! (docs/hub/driver/banto-driver-api-design.md §4.1, R1-4b).
 //!
 //! The stateless half of the driver ([`DriverBase`]): who it is, whether a
 //! connection's settings are valid (including the CPU type, #605), and the
 //! address functions. Its I/O is the `FrameDriver` in `frame_conn.rs`
 //! (registered as `DriverEntry::frame` since R2b-3d-join). Since R2b-2
-//! (docs/banto-hub-driver-address-design.md) the address functions are on
+//! (docs/hub/driver/banto-hub-driver-address-design.md) the address functions are on
 //! the production path: the save path of `banto-tags` (built with a
 //! registry) and the Hub's plan, instant read and write paths call
 //! `parse_address`; since R2b-3a-2 the broker carries the resulting
@@ -271,7 +271,7 @@ impl DriverBase for SlmpDriver {
         ))
     }
 
-    /// The connection form's fields (R2b-6a, docs/banto-hub-driver-ui-design.md
+    /// The connection form's fields (R2b-6a, docs/hub/driver/banto-hub-driver-ui-design.md
     /// §3.5): the same keys, ranges and defaults as `validate_config` and
     /// `banto-tags`' normalization (port 5007, CPU `R`, `low_high`).
     fn settings_schema(&self) -> SettingsSchema {
@@ -1035,7 +1035,7 @@ mod tests {
 
     // ------------------------------------------------------------------
     // R2b-2a: canonical table, kind-dependent refusals, the bridge
-    // (docs/banto-hub-driver-address-design.md §1.4, §3.2 Q4, §4.2)
+    // (docs/hub/driver/banto-hub-driver-address-design.md §1.4, §3.2 Q4, §4.2)
     // ------------------------------------------------------------------
 
     #[test]

@@ -1,6 +1,6 @@
 //! 製品ごとの昇格ヘルパー（banto-hub の `banto-hub-elev.exe`、ChronoGazer の
 //! `chronogazer-elev.exe`）が使う **Win32 の部品**を集めた共有 crate
-//! （#392 B3-3a、docs/chronogazer-service-design.md §1.2・§4 の B3-3a の実装メモ）。
+//! （#392 B3-3a、docs/chronogazer/chronogazer-service-design.md §1.2・§4 の B3-3a の実装メモ）。
 //!
 //! ## 設計意図
 //!

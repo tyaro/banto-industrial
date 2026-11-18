@@ -603,7 +603,7 @@ fn plan_bindings(selected: &[String]) -> BindingPlan {
 /// するなら張り直さない。
 ///
 /// タグ集合は **external name のソート済み集合**。SDK は購読も再バインドも
-/// 名前で行う（2026-09-30 オーナー決定、docs/scada-design.md §9.6）ので、Hub
+/// 名前で行う（2026-09-30 オーナー決定、docs/scada/scada-design.md §9.6）ので、Hub
 /// 側でタグを消して同じ名前で作り直して `StableTagId` が変わっても、SDK が次の
 /// 再バインドで名前から解決し直す。したがって fingerprint に ID を含めなくても
 /// 「古い ID に固定されて unresolved のまま復帰しない」（Copilot F4）は起きない。
@@ -1235,7 +1235,7 @@ impl Subscription {
     /// pin した https の世代なら、**`Live` でも毎周期**確かめる: 証明書の作り直しだけでなく、
     /// 置き場が確かめに通らなくなった（ACL だけが変わった）・失効の記録に拇印が足された
     /// ときも、その証明書を pin から外して張り直す必要があり、それは繋がったままの世代でも
-    /// 起きる（docs/hub-desktop-tls-design.md §4.4「毎周期、確かめ直す」）。pin を使わない
+    /// 起きる（docs/hub/hub-desktop-tls-design.md §4.4「毎周期、確かめ直す」）。pin を使わない
     /// 世代では置き場を読まない。
     fn pin_to_recheck(&self) -> Option<u64> {
         self.generation.as_ref()?.pin_marker
@@ -2258,7 +2258,7 @@ impl HubService {
     /// 終わらせ、以後は誰が `resume()` を呼んでも起き上がらない**ようにする。
     ///
     /// 収集エンジンを同じ Tauri プロセスに置くというオーナー決定
-    /// （2026-09-18、`docs/recorder-requirements.md` §4）の下では、プロセスの
+    /// （2026-09-18、`docs/chronogazer/recorder-requirements.md` §4）の下では、プロセスの
     /// 終了が唯一の「止める場所」になる。managed state は Tauri が drop
     /// しないので、ここを呼ばない限り WS は close を送らずに切れる。
     ///

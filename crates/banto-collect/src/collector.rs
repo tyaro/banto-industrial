@@ -4,7 +4,7 @@
 //! plus a clean [`Collector::stop`] that drains every task and flushes the
 //! writer so no buffered row is lost.
 //!
-//! ## T7-1: online partial reconfiguration (docs/tag-server-design.md §4.3)
+//! ## T7-1: online partial reconfiguration (docs/hub/tag-server-design.md §4.3)
 //!
 //! > 実現の土台は現行アーキテクチャに既にある: `banto-collect` は**接続毎に
 //! > 1タスク**なので、(c) の「接続単位の入れ替え」は自然な粒度。必要なのは
@@ -104,7 +104,7 @@
 //! passively (re-borrowing on their own next tick) - this is the whole
 //! mechanism that keeps their collection running without interruption.
 //!
-//! ### T9-1 addendum: simulated connections (docs/ux-plan.md §1)
+//! ### T9-1 addendum: simulated connections (docs/archive/ux-plan.md §1)
 //!
 //! Until R2b-3a-3 a connection whose [`crate::config::ConnectionPlan::simulation`]
 //! was `true` got an in-process simulator started here, in lockstep with its
@@ -113,7 +113,7 @@
 //! ensured before calling this collector, so the simulator's address has to
 //! be known before that - the host's [`crate::BrokerSimRegistry`] starts the
 //! simulator and substitutes its address in the session's settings
-//! (docs/banto-hub-driver-io-design.md §8; [`crate::BrokerSessions`] does it for
+//! (docs/hub/driver/banto-hub-driver-io-design.md §8; [`crate::BrokerSessions`] does it for
 //! ChronoGazer). `simulation` still participates in the plan's `PartialEq` and
 //! still decides whether the connection's ticks are recorded.
 //!
@@ -165,7 +165,7 @@
 //! ### Why no `collection_started`/`collection_stopped` event
 //!
 //! Those two [`EventKind`] variants mean "the whole engine started/stopped"
-//! (docs/recorder-requirements.md §3.5) - `apply_config` is neither; it is a
+//! (docs/chronogazer/recorder-requirements.md §3.5) - `apply_config` is neither; it is a
 //! reconfiguration of a collector that is already running and remains
 //! running. Emitting either would mislead a UI/audit log into thinking
 //! collection paused. The connection-scoped lifecycle events
@@ -478,7 +478,7 @@ impl Collector {
     }
 
     /// Apply a new configuration to an already-running collector, touching
-    /// only what changed (T7-1, docs/tag-server-design.md §4.3 - "変更の
+    /// only what changed (T7-1, docs/hub/tag-server-design.md §4.3 - "変更の
     /// 影響半径 = 触ったものだけ"). See this module's doc comment for the full
     /// safety derivation; in short:
     ///
@@ -985,7 +985,7 @@ mod tests {
         }
     }
 
-    /// T2-2 (docs/tag-server-design.md §6-5): a caller-supplied
+    /// T2-2 (docs/hub/tag-server-design.md §6-5): a caller-supplied
     /// [`crate::ClientFactory`] is what the connection task actually
     /// reconnects with - proven by the cache filling with the injected
     /// [`FakeClient`]'s sentinel.

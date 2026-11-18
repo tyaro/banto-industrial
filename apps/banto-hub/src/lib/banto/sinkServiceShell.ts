@@ -1,5 +1,5 @@
 /**
- * S6（docs/banto-hub-external-db-design.md §5.5・§7 row S6）: デスクトップ
+ * S6（docs/hub/banto-hub-external-db-design.md §5.5・§7 row S6）: デスクトップ
  * シェル（banto-hub-shell）向け「サービス」一覧のうち `BantoHubSink`
  * （外部 DB 連携 S5 のサイドカー）側の薄いラッパー。
  *

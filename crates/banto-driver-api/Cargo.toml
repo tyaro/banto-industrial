@@ -1,4 +1,4 @@
-# R1-1（docs/banto-driver-api-design.md §2.1・§10）: banto-hub / ChronoGazer の
+# R1-1（docs/hub/driver/banto-driver-api-design.md §2.1・§10）: banto-hub / ChronoGazer の
 # ドライバの境界にある型だけを持つ、crates.io へ公開する crate。ワークスペースの
 # 版（`version.workspace`）とは切り離し、0.x の minor を破壊の単位にする
 # （§9.1。alpha は使わない）。必須の依存はゼロ - tokio・thiserror・banto-* に

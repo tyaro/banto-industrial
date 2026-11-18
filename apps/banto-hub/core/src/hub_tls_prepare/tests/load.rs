@@ -454,7 +454,7 @@ fn default_tls_bind_failure_lines_name_the_port_and_the_remedy() {
     assert!(lines[1].contains("netstat"), "{lines:#?}");
 }
 
-// --- サービスの失効の記録（#1121 PR2b。docs/hub-desktop-tls-design.md 場面 8・25・26） ---------
+// --- サービスの失効の記録（#1121 PR2b。docs/hub/hub-desktop-tls-design.md 場面 8・25・26） ---------
 
 /// 場面 25: 記録が無い（#1116 の証明書だけがある PC）。起動のときに空で作って、TLS を使う。
 /// 置き場のフォルダごと無ければ、`tls\` と同じ DACL で作る。`tls\` には書かない。

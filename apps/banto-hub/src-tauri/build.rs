@@ -7,7 +7,7 @@ fn main() {
     // `allow-<command>` permission を自動生成させて capabilities 側から
     // 許可できるようにする。
     //
-    // S6（docs/banto-hub-external-db-design.md §5.5・§7 row S6、2026-09-07）:
+    // S6（docs/hub/banto-hub-external-db-design.md §5.5・§7 row S6、2026-09-07）:
     // `sink_service_status`/`sink_service_start`/`sink_service_stop`
     // （`sink_service_ipc.rs`）を追加した - 既存4コマンドと同じ理由
     // （navigate 後の webview から呼ぶには ACL マニフェストへの宣言が要る、

@@ -1,5 +1,5 @@
 /**
- * T19 S2-c2（UX-40、docs/banto-hub-t19-design.md §3.10）: 削除の取り消しを
+ * T19 S2-c2（UX-40、docs/hub/banto-hub-t19-design.md §3.10）: 削除の取り消しを
  * 実現する状態機械 `DeferredDeleteCore`（`deferredDeleteCore.ts`）のユニット
  * テスト。
  *

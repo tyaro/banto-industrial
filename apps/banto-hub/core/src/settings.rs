@@ -1,4 +1,4 @@
-//! banto-hub 用アプリ設定 (docs/tag-server-design.md §8): `settings` テーブル
+//! banto-hub 用アプリ設定 (docs/hub/tag-server-design.md §8): `settings` テーブル
 //! （`migrations-sqlite/`、key/value）に対する型付きラッパ。
 //!
 //! ## 汎用の key/value は banto のもの（I3'、2026-10-04）
@@ -36,12 +36,12 @@
 //! - `data.dir`（既定 `"./data"`）: tstore ファイルの出力先
 //! - `retention.days`（既定 `7`、設計 §3.3 (a) 決定）: tstore 保持期間
 //!
-//! T3（docs/tag-server-design.md §5.3）で `mqtt.*`（9キー、[`MqttSettings`]）
+//! T3（docs/hub/tag-server-design.md §5.3）で `mqtt.*`（9キー、[`MqttSettings`]）
 //! を追加した。`mqtt.password` は**平文保存** — §5.6「v1 では平文 + 閉域
 //! LAN 前提」と同じ線引きで、[`MqttSettings`] のフィールド doc comment に
 //! 判断根拠を記す。
 //!
-//! T4（docs/tag-server-design.md §5.4）で `grpc.*`（3キー、
+//! T4（docs/hub/tag-server-design.md §5.4）で `grpc.*`（3キー、
 //! [`GrpcSettings`]）を追加した。`grpc.enabled` の既定は `false`（設計
 //! 「grpc.enabled(既定 false)」）- REST/WS と違い gRPC は既定で listen
 //! しない、管理 UI で明示的に有効化する形（`WriteControl` の「起動時
@@ -58,7 +58,7 @@
 //! 揃える。既に gRPC を LAN 公開で運用していた環境は、アップグレード後に
 //! `grpc.bind` の再設定が必要（意図した安全側の破壊的変更）。
 //!
-//! docs/banto-hub-remaining-plan.md P3-a（2026-08-12）で `audit.*`
+//! docs/hub/banto-hub-remaining-plan.md P3-a（2026-08-12）で `audit.*`
 //! （2キー、[`AuditSettings`]）を追加した - `crate::audit::AuditLogService`
 //! の監査ログ retention（保持日数・保持件数の上限）を設定する。I3' からは
 //! banto の `AuditSettings` そのもの（設定形・既定値 90日/100,000件・
@@ -117,7 +117,7 @@ fn parse_retention(raw: Option<String>, default: Option<i64>) -> Option<i64> {
     }
 }
 
-/// hub の既定ポート（docs/tag-server-design.md §8: 「管理 UI + REST + WS =
+/// hub の既定ポート（docs/hub/tag-server-design.md §8: 「管理 UI + REST + WS =
 /// 8722」）。
 pub const DEFAULT_PORT: u16 = 8722;
 /// tstore 保持期間の既定日数（§3.3 (a) 決定: 「保持期間は既定7日」）。
@@ -162,7 +162,7 @@ impl Default for ServerSettings {
 
 /// tstore のデータディレクトリと保持期間（設計 §3.3）。
 ///
-/// `retention_days`: T19 S2-d（UX-39、docs/banto-hub-t19-design.md §5.1）で
+/// `retention_days`: T19 S2-d（UX-39、docs/hub/banto-hub-t19-design.md §5.1）で
 /// `i64` から `Option<i64>` へ変更した。**以前は素の `i64`（既定7）で、
 /// `crate::runtime::prune_once` はこれをそのまま `u32` へキャストして
 /// `banto_tstore::prune_files` に渡していた（`0` は「当日のみ保持」という
@@ -189,7 +189,7 @@ impl Default for StoreSettings {
     }
 }
 
-/// T3（docs/tag-server-design.md §5.3）: MQTT publish の接続/発行設定。
+/// T3（docs/hub/tag-server-design.md §5.3）: MQTT publish の接続/発行設定。
 ///
 /// `password` は settings テーブルに**平文で保存**する（実装指示「settings
 /// テーブルに平文保存 — 閉域 LAN 前提 §5.6 の範囲。doc に明記」）。判断
@@ -233,7 +233,7 @@ impl Default for MqttSettings {
     }
 }
 
-/// T4（docs/tag-server-design.md §5.4）: gRPC サーバーの設定。REST とは
+/// T4（docs/hub/tag-server-design.md §5.4）: gRPC サーバーの設定。REST とは
 /// 別ポートで listen する（設計「ポートは REST と分離」）。
 ///
 /// `bind`（2026-08-08 オーナー決定、docs/improvement-plan.md H3、既定
@@ -750,7 +750,7 @@ mod tests {
         assert_eq!(config.bind, "127.0.0.1");
     }
 
-    // --- 監査ログ retention 設定（docs/banto-hub-remaining-plan.md P3-a）---
+    // --- 監査ログ retention 設定（docs/hub/banto-hub-remaining-plan.md P3-a）---
 
     #[tokio::test]
     async fn audit_config_defaults_when_unset() {

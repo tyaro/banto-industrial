@@ -1,5 +1,5 @@
 /**
- * 登録後の「確認導線」CTA バナー（T18-4c、docs/banto-hub-t18-design.md
+ * 登録後の「確認導線」CTA バナー（T18-4c、docs/hub/banto-hub-t18-design.md
  * 「T18-4c 確認導線」、TAG-UX-H「新規／変更タグを『確認対象』として値・
  * 品質・時刻へ1クリックで移動できるようにする」）の実 DOM 受け入れテスト。
  *

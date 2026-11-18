@@ -12,7 +12,7 @@
 //! タグの本数」で頭打ちになる。SDK 側も `BindingRequest` の `external_name` 重複を
 //! 拒否する（`validate_start_requests`）ので、和集合化は必須でもある。
 //!
-//! ## 値の流れと SDK の性質（`docs/banto-tagclient-design.md` §4.5）
+//! ## 値の流れと SDK の性質（`docs/crates/banto-tagclient-design.md` §4.5）
 //!
 //! - 購読は **on-change 配信**で、値も quality も変わらなければ WS フレーム
 //!   は 1 つも来ない。初期値は SDK が Live 到達時に REST スナップショットで
@@ -31,7 +31,7 @@
 //!
 //! SDK の Binding は購読も書き込みも `external_name` で行い、Hub の安定 ID
 //! （`StableTagId`）は使わない（2026-09-30 オーナー決定、
-//! `docs/scada-design.md` §9.6）。ID は削除→同名再作成や CSV 再取り込みで
+//! `docs/scada/scada-design.md` §9.6）。ID は削除→同名再作成や CSV 再取り込みで
 //! 変わるが、名前は Hub の公開契約（WS subscribe 等）そのものだから。
 //! 安定 ID は DB 行（`ts, tag_id, external_name, value, quality`）用に
 //! [`crate::hub_api::SinkConfigTag`] へ残るだけで、購読には使わない。

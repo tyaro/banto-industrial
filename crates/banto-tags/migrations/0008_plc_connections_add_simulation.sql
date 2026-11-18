@@ -1,4 +1,4 @@
--- T9-1 (docs/ux-plan.md §1, 2026-08-06 オーナー決定「接続単位のシミュレーション
+-- T9-1 (docs/archive/ux-plan.md §1, 2026-08-06 オーナー決定「接続単位のシミュレーション
 -- モード」): add `plc_connections.simulation` - per-connection opt-in to run
 -- against an in-process simulator (banto-collect) instead of the real
 -- host/port, independent of `protocol` (owner's explicit rejection of a

@@ -1,6 +1,6 @@
 /**
  * モニタの Tree/検索統合 + 確認導線ディープリンク（T18-4a/T18-4c、
- * docs/banto-hub-t18-design.md「T18-4a モニタの Tree/検索統合」「T18-4c
+ * docs/hub/banto-hub-t18-design.md「T18-4a モニタの Tree/検索統合」「T18-4c
  * 確認導線」）の実 DOM 受け入れテスト。
  *
  * `banto-hub-tags-*.spec.ts` と同じパターン: 別 `describe.serial` ブロック

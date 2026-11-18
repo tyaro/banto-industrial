@@ -1,6 +1,6 @@
 //! API キー管理 API（`/api/api-keys*`）。
 //!
-//! `rest.rs` から中身を変えずに移したもの（docs/banto-hub-driver-refactor-plan.md §8.1、
+//! `rest.rs` から中身を変えずに移したもの（docs/hub/driver/banto-hub-driver-refactor-plan.md §8.1、
 //! P0-1 の手順 2）。共通部品（認証・ガード・監査の補助）は親の `rest.rs` にあり、
 //! `use super::{...}` で使う。外から使われるパス（`crate::rest::X`）は親の re-export で
 //! 保つ。
@@ -19,7 +19,7 @@ use super::{
 use crate::api_keys::ApiKeyDeleteOutcome;
 use axum::routing::delete;
 
-// --- API キー管理 (docs/tag-server-design.md §5.6・T0-2 実装指示 §1「管理
+// --- API キー管理 (docs/hub/tag-server-design.md §5.6・T0-2 実装指示 §1「管理
 // REST」): admin ロール限定、CSRF + bearer セッション（このルーター自体は
 // `crate::api_keys::ApiKeysService`（発行される bh_ キー）を消費する側では
 // なく、管理 UI セッションから叩く前提 - `/api/v1/*` の API キー認証とは
@@ -37,7 +37,7 @@ struct ApiKeysAdminState {
     manager: Arc<CollectorManager>,
 }
 
-// T21 S3（docs/banto-hub-t21-design.md、構成補助 MCP の
+// T21 S3（docs/hub/banto-hub-t21-design.md、構成補助 MCP の
 // create_api_key）: `crate::mcp`の`create_api_key`ツールが同じ
 // request 型・「現在時刻より未来」検証を再利用する（`GrpcSettingsBody`等と
 // 同じ`pub(crate)`化の理由 - 二重実装しない）。フィールドも

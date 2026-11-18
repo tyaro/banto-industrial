@@ -1,5 +1,5 @@
 //! [`FakeSessionDriver`]: a session-type driver over an in-memory map
-//! (docs/banto-driver-api-design.md §7.4).
+//! (docs/hub/driver/banto-driver-api-design.md §7.4).
 //!
 //! For host-side tests that need "a driver" but no device: the values live
 //! in a map keyed by canonical address that the test fills and inspects,

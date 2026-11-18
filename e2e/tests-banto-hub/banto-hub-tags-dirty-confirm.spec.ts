@@ -1,6 +1,6 @@
 /**
  * タグ編集 Drawer の dirty 追跡・破棄確認（T18-1、TAG-UX-C 一部、
- * docs/banto-hub-desktop-plan.md §9.4「dirty 状態を持ち、Esc、背景、×、
+ * docs/hub/banto-hub-desktop-plan.md §9.4「dirty 状態を持ち、Esc、背景、×、
  * 別行選択、画面移動で同じ破棄確認を行う」）の実 DOM 受け入れテスト。
  * `formDirty.test.ts`（vitest、純関数の単体テスト）ではまだ確認できて
  * いない「実 DOM で `×` を押したときに `window.confirm` が実際に出て、

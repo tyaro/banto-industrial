@@ -13,7 +13,7 @@
 	 * スコープ入力: `read`（全タグ）は常設チェックボックス、
 	 * `write:{connection}.{group}.{tag}` と `read:{connection}.{group}.{tag}`
 	 * / `read:{connection}.{group}.*`（H10 ③、Option B、2026-08-08 オーナー
-	 * 決定・docs/h10-3-read-scope-proposal.md）はそれぞれ改行/カンマ区切りの
+	 * 決定・docs/archive/h10-3-read-scope-proposal.md）はそれぞれ改行/カンマ区切りの
 	 * テキストエリアで複数指定できるようにし（`write:`/`read:` プレフィックス
 	 * は自動付与）、送信直前に配列へ組み立てる（`apiKeysAdmin.ts` の
 	 * `CreateApiKeyInput.scopes` は `string[]` - サーバー側の文法は
@@ -30,7 +30,7 @@
 	 * `null`（無期限、既定・動作不変）。一覧の警告バッジは
 	 * `apiKeysAdmin.ts` の `apiKeyWarnings`（純関数）で判定する。
 	 *
-	 * **S6（docs/banto-hub-external-db-design.md §5.2・§7 row S6、
+	 * **S6（docs/hub/banto-hub-external-db-design.md §5.2・§7 row S6、
 	 * 実装指示3）追記**: DB Sink サイドカー用キーの発行導線として、
 	 * `admin` スコープのチェックボックス（従来 UI に無かった - `admin` は
 	 * `create_sink_group`等の T21 系構成操作専用スコープで、通常の運用者は
@@ -42,7 +42,7 @@
 	 * でしか手に入らないため、遷移元に平文キーを持ち帰らせない設計は
 	 * 変えていない）。
 	 *
-	 * **R2a-2b（docs/banto-hub-ingest-design.md §5・§12 Q9）**: 取り込みの
+	 * **R2a-2b（docs/hub/banto-hub-ingest-design.md §5・§12 Q9）**: 取り込みの
 	 * スコープ `ingest:#{接続 id}` は、`push` 接続の一覧からチェックで選ばせて
 	 * id を詰める（名前ではなく id で縛る - 改名してもキーは通り、削除した
 	 * id は再利用されない）。一覧・発行直後の表示は `describeApiKeyScope` で
@@ -142,7 +142,7 @@
 	/**
 	 * S6（実装指示3）: `admin`スコープ（T21系構成操作専用、DB Sink
 	 * サイドカーが`GET /api/sink/config`・`PUT /api/sink/status`を叩くのに
-	 * 必要 - `docs/banto-hub-external-db-design.md`§5.2「サイドカー用 API
+	 * 必要 - `docs/hub/banto-hub-external-db-design.md`§5.2「サイドカー用 API
 	 * キーには`admin`に加えて`read`スコープも必要」）。既定 `false` -
 	 * 通常の運用者が誤って強い権限を付与しないよう、明示的なチェックを
 	 * 要求する。

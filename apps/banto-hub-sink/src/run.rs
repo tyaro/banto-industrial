@@ -52,7 +52,7 @@
 //! DB ブリッジ（[`crate::source`]、R2a-3b）は同じ停止の合図で並行して止める: 各 source が
 //! close 1000 を送り、問い合わせのタスクの終わりを待つ。待つのは
 //! [`BRIDGE_STOP_CAP`]（OS シャットダウンでは残り時間との短い方）まで。ブリッジには
-//! flush は無い（送れなかった周期は捨てる、docs/banto-hub-ingest-design.md §10.3「停止」）。
+//! flush は無い（送れなかった周期は捨てる、docs/hub/banto-hub-ingest-design.md §10.3「停止」）。
 //! 上限までに止まらなければ、ブリッジは自分のタスクを全部 `abort` して落ちるのを待ってから
 //! 戻る（handle を切り離したまま runtime の終わりに任せない。その待ちも上限の内、
 //! [`crate::source::BridgeSupervisor::shutdown`]）。
@@ -234,7 +234,7 @@ pub fn plan_changes(
             plan.groups_to_start.push(group.clone());
         }
     }
-    // R2b-1d（docs/banto-hub-connection-settings-design.md §5.4）: グループの中身は同じでも、
+    // R2b-1d（docs/hub/banto-hub-connection-settings-design.md §5.4）: グループの中身は同じでも、
     // 引く接続が設定から**消えた**（削除・Hub がパスワードを読めなくなった
     // `unavailableConnections`）か、**現れた**（入れ直して読めるようになった）なら、その
     // グループも作り直す。消えた接続の flusher は止めるので、そのまま走らせると誰も書かない
@@ -775,7 +775,7 @@ impl Engine {
     }
 
     /// 全 sink group の対象タグの和集合（`external_name`、重複除去・ソート済み）。
-    /// 購読の鍵は名前（2026-09-30 オーナー決定、docs/scada-design.md §9.6）で、
+    /// 購読の鍵は名前（2026-09-30 オーナー決定、docs/scada/scada-design.md §9.6）で、
     /// 安定 ID の 3 つ組は DB 行用に `SinkConfigTag` へ残っているだけ。
     fn desired_external_names(&self) -> Vec<String> {
         let mut names = Vec::new();
@@ -1024,7 +1024,7 @@ where
     ));
     if !config.hub_is_loopback() {
         log_err_line(
-            "banto-hub-sink: warn: Hub がループバック以外に設定されています。GET /api/sink/config は DB 接続のパスワードを平文で返すため、Hub と同一マシンでの運用を推奨します（docs/banto-hub-external-db-design.md §2.2・§5.2・§6-15）",
+            "banto-hub-sink: warn: Hub がループバック以外に設定されています。GET /api/sink/config は DB 接続のパスワードを平文で返すため、Hub と同一マシンでの運用を推奨します（docs/hub/banto-hub-external-db-design.md §2.2・§5.2・§6-15）",
         );
     }
 

@@ -1,5 +1,5 @@
 //! banto-drivers: the set of drivers a host (banto-hub's bin, its shell, a
-//! test) injects into the engine (docs/banto-driver-api-design.md §6.3,
+//! test) injects into the engine (docs/hub/driver/banto-driver-api-design.md §6.3,
 //! §6.4, R1-3b).
 //!
 //! ## Why this crate exists
@@ -21,14 +21,14 @@
 //!   `banto-hub` bin lives in `banto-hub-host`, which is the only normal
 //!   dependent on the Hub side; `banto-hub-core` keeps this crate as a
 //!   dev-dependency only (until R2b-0).
-//! - **No copies.** R2b-3a-3 (docs/banto-hub-driver-io-design.md §4.3)
+//! - **No copies.** R2b-3a-3 (docs/hub/driver/banto-hub-driver-io-design.md §4.3)
 //!   removed the collection client factory this crate used to hand out
 //!   (`Builtin::client_factory`, which was `banto_collect::default_client_factory()`;
 //!   both are gone since then. It was fed by the hand-maintained `ClientSpec`
 //!   that dropped fields in #334 / #605): collection reads go
 //!   through the broker too, which dials through [`Builtin::registry`]. So
 //!   this crate no longer depends on `banto-collect`.
-//! - **R2b-3d scope** (docs/banto-hub-driver-io-design.md §6.1, §6.2): `registry`
+//! - **R2b-3d scope** (docs/hub/driver/banto-hub-driver-io-design.md §6.1, §6.2): `registry`
 //!   holds Modbus TCP and SLMP as `DriverKind::Frame` entries (their
 //!   `FrameDriver`s: identity, settings validation, address functions and the
 //!   frames; the engine owns the socket). The broker dials through
@@ -181,7 +181,7 @@ mod tests {
     /// the Hub's source of truth is its registry (`push`/`postgres`/`virtual`
     /// are registered by the host; see `host/tests/registry_tripwire.rs`).
     /// 登録順（`/api/drivers` の並び）: SLMP が先頭、Modbus TCP が次
-    /// （2026-10-24 オーナー決定。docs/banto-hub-driver-ui-design.md §4.1）。
+    /// （2026-10-24 オーナー決定。docs/hub/driver/banto-hub-driver-ui-design.md §4.1）。
     #[test]
     fn builtin_registry_lists_slmp_first() {
         let registry = builtin().registry;
@@ -202,7 +202,7 @@ mod tests {
     }
 
     /// Tripwire 2 (design §6.3; rewritten by R2b-3a-2,
-    /// docs/banto-hub-driver-io-design.md §4.2): every entry `builtin()`
+    /// docs/hub/driver/banto-hub-driver-io-design.md §4.2): every entry `builtin()`
     /// registers is a frame- or session-type driver - one the broker dials
     /// itself (the broker table and `HostBound` are gone, so "the broker's ids
     /// == the registry's HostBound ids" became this), and the broker manages

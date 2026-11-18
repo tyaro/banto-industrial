@@ -1,6 +1,6 @@
 /**
  * タグ削除前の参照影響・完全外部名表示（T18-1、TAG-UX-C 5点目、
- * docs/banto-hub-desktop-plan.md §9.4「削除前に演算タグ等の参照影響と完全な
+ * docs/hub/banto-hub-desktop-plan.md §9.4「削除前に演算タグ等の参照影響と完全な
  * 外部名を表示する」）の実 DOM 受け入れテスト。`tagDeleteImpact.test.ts`
  * （vitest、純関数の単体テスト）ではまだ確認できていない「実 DOM で削除
  * ボタンを押したときに、`window.confirm` のメッセージに完全外部名と
@@ -15,7 +15,7 @@
  * 収集グループにしか作れないため、`GET /api/plc-connections` でその id を
  * 取得してから収集グループを作る。
  *
- * T19 S2-c2（UX-40、docs/banto-hub-t19-design.md §3.10）追記: タグ削除は
+ * T19 S2-c2（UX-40、docs/hub/banto-hub-t19-design.md §3.10）追記: タグ削除は
  * 「削除の遅延実行」になった（confirm 直後は一覧から消えるだけで、実際の
  * `DELETE` は数秒後）。テスト3（confirm OK → 削除完了）は見た目だけでなく
  * 実際の `DELETE` レスポンスを待つよう変更し、取り消しトースト
@@ -217,7 +217,7 @@ test.describe.serial('banto-hub タグ削除前の参照影響表示 (TAG-UX-C)'
 			void dialog.accept();
 		});
 
-		// T19 S2-c2（UX-40、docs/banto-hub-t19-design.md §3.10）: 削除確認 OK
+		// T19 S2-c2（UX-40、docs/hub/banto-hub-t19-design.md §3.10）: 削除確認 OK
 		// 後も、実際の削除は数秒（`UNDO_WINDOW_MS`）遅延実行される - 一覧から
 		// 消える見た目だけでは「サーバー側でも実際に削除された」ことの
 		// 証明にならない（#216 の教訓 - トースト文言だけの待ち合わせは古い

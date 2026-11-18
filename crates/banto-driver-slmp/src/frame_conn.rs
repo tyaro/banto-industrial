@@ -1,4 +1,4 @@
-//! The frame-type half of the driver (R2b-3d, docs/banto-hub-driver-io-design.md
+//! The frame-type half of the driver (R2b-3d, docs/hub/driver/banto-hub-driver-io-design.md
 //! §6.2): [`FrameDriver`] for [`SlmpDriver`] and its [`FrameConnection`].
 //! The engine (`banto-driver-engine`) owns the socket; this side only turns
 //! specs into the 4E frames of `frame.rs` and responses back into values.

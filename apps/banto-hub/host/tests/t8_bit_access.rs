@@ -1,4 +1,4 @@
-//! T8-2 の E2E テスト（docs/tag-server-design.md §6.1、T8 実装指示のテスト
+//! T8-2 の E2E テスト（docs/hub/tag-server-design.md §6.1、T8 実装指示のテスト
 //! 計画1〜4に対応 - 5「既存全テストを壊さない」はこのクレート・
 //! `banto-collect`・`banto-plc`・`banto-plc-write`・`banto-broker` の既存
 //! スイートを流すことで確認する（このファイル自体はそれに寄与しない）)。

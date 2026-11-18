@@ -1,5 +1,5 @@
 /**
- * #375（2026-09-15 オーナー決定、docs/banto-hub-desktop-plan.md §9.4
+ * #375（2026-09-15 オーナー決定、docs/hub/banto-hub-desktop-plan.md §9.4
  * TAG-UX-C 追補）: タグの「編集」「連続登録」を非モーダルの右ペインへ移した
  * ことの実 DOM 受け入れテスト。
  *

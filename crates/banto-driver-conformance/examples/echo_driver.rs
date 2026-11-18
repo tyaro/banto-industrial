@@ -1,5 +1,5 @@
 //! Run the conformance harness against the reference frame-type driver
-//! (docs/banto-driver-api-design.md §4.3).
+//! (docs/hub/driver/banto-driver-api-design.md §4.3).
 //!
 //! `cargo run -p banto-driver-conformance --example echo_driver`
 //!

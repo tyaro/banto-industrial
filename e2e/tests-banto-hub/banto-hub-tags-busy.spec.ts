@@ -1,13 +1,13 @@
 /**
  * タグ編集 Drawer の busy 相互排他（T18-1 続き、TAG-UX-C、
- * docs/banto-hub-desktop-plan.md §9.4「保存、削除、検証、登録、閉じるを
+ * docs/hub/banto-hub-desktop-plan.md §9.4「保存、削除、検証、登録、閉じるを
  * Drawer 単位の busy 状態で相互排他にする」）の実 DOM 受け入れテスト。
  *
  * `banto-hub-tags-dirty-confirm.spec.ts` と同じパターン: 別
  * `describe.serial` ブロック（別 `page`）、認証・前提データ作成は
  * `page.request` で直接 REST を叩く。
  *
- * T19 S2-c2（UX-40、docs/banto-hub-t19-design.md §3.10）で挙動が変わった:
+ * T19 S2-c2（UX-40、docs/hub/banto-hub-t19-design.md §3.10）で挙動が変わった:
  * 削除は「遅延実行」になり、`window.confirm` の OK 直後に
  * （実際の `DELETE` を待たず）ドロワーが閉じるようになった。そのため
  * 「削除実行中は保存ボタンが disabled になり、×でも閉じられない」という
@@ -124,7 +124,7 @@ test.describe.serial('banto-hub タグ Drawer busy 相互排他 (TAG-UX-C)', () 
 		});
 		await drawer.getByRole('button', { name: '削除' }).click();
 
-		// T19 S2-c2（UX-40、docs/banto-hub-t19-design.md §3.10）: 削除は
+		// T19 S2-c2（UX-40、docs/hub/banto-hub-t19-design.md §3.10）: 削除は
 		// 「遅延実行」になり、confirm 直後にドロワーを閉じる・一覧から隠す
 		// （`deleting` busy フラグは削除済み - `isDrawerBusy()` 参照）。
 		// 実際の DELETE がまだ送信すらされていない（`UNDO_WINDOW_MS` 未経過）

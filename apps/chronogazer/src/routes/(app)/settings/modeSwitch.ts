@@ -1,6 +1,6 @@
 /**
  * 「運用モード」カテゴリの文言と操作（#623 PR-4。設計は
- * docs/chronogazer-service-design.md §5 の「設定モード ⇔ 運用モード」と、その PR-4 の
+ * docs/chronogazer/chronogazer-service-design.md §5 の「設定モード ⇔ 運用モード」と、その PR-4 の
  * 実装メモ）。
  *
  * この画面が出るのは Tauri のデスクトップの窓（= この PC の中で記録している設定モード）で、

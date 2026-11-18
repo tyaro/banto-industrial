@@ -38,7 +38,7 @@
 //!
 //! ## 履歴
 //!
-//! banto-hub-core の `service_manager.rs`（T17-0、docs/banto-hub-t17-design.md
+//! banto-hub-core の `service_manager.rs`（T17-0、docs/hub/banto-hub-t17-design.md
 //! §3・§4。S6 でサービス名をコンストラクタ引数へ持ち上げ済み）から、#392
 //! 段階 B の B2-3 で抽出した。挙動は変えていない（banto-hub-core は
 //! `service_manager`モジュールでこの crate を再公開し、`BantoHub`/

@@ -180,7 +180,7 @@
 //!    （実装から導かない）。`all_events` にも足す（約束のテストがその出来事も通す）。
 //! 4. 入り口の側は [`Lifecycle`] の口を 1 つ呼んで判断に従うだけにする（その場で
 //!    別の印を読んで確かめ直さない）。
-//! 5. この doc の表と設計書（`docs/chronogazer-service-design.md` §4 の B2-4c の後の
+//! 5. この doc の表と設計書（`docs/chronogazer/chronogazer-service-design.md` §4 の B2-4c の後の
 //!    メモ）の表に同じ行を足す。
 //!
 //! # ロックと待ち

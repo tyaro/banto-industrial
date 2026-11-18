@@ -1,4 +1,4 @@
-//! R1-7a（docs/banto-driver-api-design.md §2.4）: `banto-hub-elev.exe` の
+//! R1-7a（docs/hub/driver/banto-driver-api-design.md §2.4）: `banto-hub-elev.exe` の
 //! `requireAdministrator` マニフェストの埋め込みを `banto-hub-core` からこの package へ
 //! 移したので、移動で埋め込みが落ちていないことを機械的に確かめる
 //! （ChronoGazer の `apps/chronogazer/elev/src/tests.rs` の

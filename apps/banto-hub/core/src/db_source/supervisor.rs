@@ -1,4 +1,4 @@
-//! 1 DB 接続タスクの supervisor（docs/banto-hub-external-db-design.md §4.8・
+//! 1 DB 接続タスクの supervisor（docs/hub/banto-hub-external-db-design.md §4.8・
 //! §6-17、2026-09-06 オーナー決定「DB task の異常終了は supervisor で
 //! バックオフ付き再生成する」）。
 //!

@@ -5,7 +5,7 @@ use axum::body::Body;
 use axum::http::Request as HttpRequest;
 use tower::ServiceExt;
 
-// --- S1 (docs/banto-hub-external-db-design.md §4.1・§4.6・§6・§7):
+// --- S1 (docs/hub/banto-hub-external-db-design.md §4.1・§4.6・§6・§7):
 // PostgreSQL 接続エンティティ・接続テスト API ------------------------
 
 /// `POST /api/plc-connections` で `protocol: "postgres"` を作成すると、

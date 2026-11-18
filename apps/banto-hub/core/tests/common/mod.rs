@@ -220,7 +220,7 @@ pub fn shutdown_test_app(manager: &CollectorManager, pool: &SqlitePool) {
     }));
 }
 
-/// R2b-1d (docs/banto-hub-connection-settings-design.md §4.2・§4.4): `HubDrivers::none()`
+/// R2b-1d (docs/hub/banto-hub-connection-settings-design.md §4.2・§4.4): `HubDrivers::none()`
 /// (no PLC I/O) whose registry also holds **stand-in** `modbus-tcp` / `slmp` entries.
 /// Since R2b-1d the Hub's entrances, plan and preflight read the registry, and `none()`
 /// carries only the host-provided protocols - a test that merely stores a Modbus / SLMP

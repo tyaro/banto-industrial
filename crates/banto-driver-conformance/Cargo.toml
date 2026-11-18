@@ -1,4 +1,4 @@
-# R1-2（docs/banto-driver-api-design.md §2.2・§7・§10）: `banto-driver-api` の trait を
+# R1-2（docs/hub/driver/banto-driver-api-design.md §2.2・§7・§10）: `banto-driver-api` の trait を
 # 実装したドライバを、Hub なしで確かめる適合テスト一式。crates.io へ公開する。
 # API crate の feature にしない（Q1、決定）: tokio・模擬のピア・`assert` の補助を
 # 持つので、API を依存ゼロに保つため別 crate にした。

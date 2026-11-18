@@ -1,5 +1,5 @@
-//! T5-1（docs/tag-server-design.md §8「常駐」）: banto-hub 全体の出力
-//! ヘルパー。T14-1（docs/banto-hub-t14-design.md §3「D1」）でバイナリクレート
+//! T5-1（docs/hub/tag-server-design.md §8「常駐」）: banto-hub 全体の出力
+//! ヘルパー。T14-1（docs/archive/banto-hub-t14-design.md §3「D1」）でバイナリクレート
 //! （旧 `bin/banto_hub/hub_log.rs`）からこの lib クレート（`banto_hub_core`）
 //! へ移設した - `crate::runtime`（composition root）がこのライブラリ側に
 //! 来たため、バイナリクレート限定だったこのモジュールを参照できなくなった
@@ -29,7 +29,7 @@ use std::sync::{Mutex, OnceLock};
 use banto_tstore::{Clock, LocalDate, SystemClock};
 
 /// サービスログファイルの既定ファイル名（`{data_dir}/banto-hub-service.log`
-/// - docs/banto-hub-operations.md に記載するパスと一致させる）。
+/// - docs/hub/banto-hub-operations.md に記載するパスと一致させる）。
 pub const SERVICE_LOG_FILE_NAME: &str = "banto-hub-service.log";
 
 static SERVICE_LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
@@ -98,7 +98,7 @@ fn enable_service_log_file_checked(
 /// サービスログファイルを格納するディレクトリの解決 - `BANTO_HUB_DATA`
 /// 環境変数を見る、**あえて**簡略化した解決規則。
 ///
-/// T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P1）で既定値を変更した:
+/// T17-1（docs/hub/banto-hub-t17-design.md §3「T17-1」・P1）で既定値を変更した:
 /// 旧既定は素の相対パス `"./data"` だったが、`profile_logs_dir`
 /// （`crate::profile_paths::ProfilePaths::logs_dir` - profile 一本化後の
 /// 絶対パス）を既定にした。`BANTO_HUB_DATA`が設定されていれば従来どおり
@@ -112,7 +112,7 @@ fn enable_service_log_file_checked(
 /// 解決する。両者は `BANTO_HUB_DATA`を設定していれば必ず一致し、設定 DB
 /// だけで `data.dir` をカスタマイズしている運用でのみ食い違う（その場合
 /// ログファイルは profile の`logs_dir`配下に残る -
-/// docs/banto-hub-operations.md に明記）。
+/// docs/hub/banto-hub-operations.md に明記）。
 pub fn resolve_service_log_dir(profile_logs_dir: &Path) -> PathBuf {
     resolve_service_log_dir_from(std::env::var("BANTO_HUB_DATA").ok(), profile_logs_dir)
 }

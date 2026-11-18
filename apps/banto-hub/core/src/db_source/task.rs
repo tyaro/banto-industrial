@@ -1,4 +1,4 @@
-//! 1 DB 接続 = 1 tokio task のポーリング本体（docs/banto-hub-external-db-design.md
+//! 1 DB 接続 = 1 tokio task のポーリング本体（docs/hub/banto-hub-external-db-design.md
 //! §4.2「実行モデル」・§4.3「Quality の変換」）。
 //!
 //! ## 構造

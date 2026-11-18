@@ -1,6 +1,6 @@
 /**
  * フォームの「未保存変更（dirty）」判定（TAG-UX-C 一部、
- * docs/banto-hub-desktop-plan.md §9.4「dirty 状態を持ち、Esc、背景、×、
+ * docs/hub/banto-hub-desktop-plan.md §9.4「dirty 状態を持ち、Esc、背景、×、
  * 別行選択、画面移動で同じ破棄確認を行う」）。
  *
  * `tags/+page.svelte` の `FormState` はプレーンなオブジェクト

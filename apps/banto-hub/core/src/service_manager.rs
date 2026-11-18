@@ -1,4 +1,4 @@
-//! T17-0（docs/banto-hub-t17-design.md §3「T17-0」・§4「T16-2 への引き渡し
+//! T17-0（docs/hub/banto-hub-t17-design.md §3「T17-0」・§4「T16-2 への引き渡し
 //! 契約」）: SCM（Service Control Manager）状態取得＋start/stop/restart/
 //! autostart 操作を、`bin/banto_hub/win_service.rs` から**ホスト非依存の
 //! ロジック層**として抽出したもの。
@@ -31,7 +31,7 @@
 //!   `AutoStart`+遅延自動開始のままなのも含め挙動不変（P4「Demand 化」は
 //!   当時 T17-4 で扱うとして、このファイルでは着手しなかった）。P4 は
 //!   その後 T17-4（2026-08-10、`service_install.rs`のモジュール doc・
-//!   docs/banto-hub-t17-design.md §11 参照）で実装済み - `install`の既定
+//!   docs/hub/banto-hub-t17-design.md §11 参照）で実装済み - `install`の既定
 //!   起動種別は`OnDemand`（手動）になった。[`WindowsServiceManager`]は
 //!   「これから T16-2 等が使う個別操作 API」であって、既存 CLI 経路を
 //!   置き換えるものではない点は変わらない。
@@ -39,7 +39,7 @@
 //!   要求する最小面は query/start/stop/restart/set_auto_start のみ - 実装
 //!   指示のとおり、必須ではない拡張は避けた）。
 //!
-//! ## S6（docs/banto-hub-external-db-design.md §5.5・§7 row S6、2026-09-07）:
+//! ## S6（docs/hub/banto-hub-external-db-design.md §5.5・§7 row S6、2026-09-07）:
 //! サービス名の汎化
 //!
 //! デスクトップシェルの「サービス」一覧（`BantoHub`・`BantoHubSink`の両方の
@@ -90,7 +90,7 @@ pub const SERVICE_DISPLAY_NAME: &str = "banto-hub タグサーバー";
 /// `BantoHub`の SCM 説明文（`install`の新規登録で設定する。#392 B3-1 で
 /// `service_install.rs`から移した）。
 pub const SERVICE_DESCRIPTION: &str =
-    "banto-hub（産業用タグサーバー）を常駐実行します。PLC からタグを収集し、REST/WebSocket/MQTT/gRPC で外部へ公開します。docs/tag-server-design.md 参照。";
+    "banto-hub（産業用タグサーバー）を常駐実行します。PLC からタグを収集し、REST/WebSocket/MQTT/gRPC で外部へ公開します。docs/hub/tag-server-design.md 参照。";
 
 /// `BantoHubSink`（外部 DB 連携 S5 のサイドカー）の SCM サービス名。
 /// `apps/banto-hub-sink/src/service.rs::SERVICE_NAME`と同じ値の複製（モジュール
@@ -212,7 +212,7 @@ mod tests {
         assert_eq!(spec.display_name, "banto-hub タグサーバー");
         assert_eq!(
             spec.description,
-            Some("banto-hub（産業用タグサーバー）を常駐実行します。PLC からタグを収集し、REST/WebSocket/MQTT/gRPC で外部へ公開します。docs/tag-server-design.md 参照。")
+            Some("banto-hub（産業用タグサーバー）を常駐実行します。PLC からタグを収集し、REST/WebSocket/MQTT/gRPC で外部へ公開します。docs/hub/tag-server-design.md 参照。")
         );
         assert_eq!(spec.executable, exe);
         assert_eq!(

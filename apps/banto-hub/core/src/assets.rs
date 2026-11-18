@@ -1,4 +1,4 @@
-//! Embedded frontend assets (docs/tag-server-design.md §3.1: 管理 UI は
+//! Embedded frontend assets (docs/hub/tag-server-design.md §3.1: 管理 UI は
 //! banto テンプレートの SvelteKit 静的ビルドを axum が配信する)。
 //!
 //! T0 のスコープには管理 UI フロントエンドの中身は含まれない（実装指示の

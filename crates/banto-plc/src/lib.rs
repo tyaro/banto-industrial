@@ -1,9 +1,9 @@
-//! banto-plc: I2 PLC通信の共通部分 (docs/plan.md I2, docs/recorder-requirements.md
+//! banto-plc: I2 PLC通信の共通部分 (docs/plan.md I2, docs/chronogazer/recorder-requirements.md
 //! §1 "対象環境", §3.1 "タグ・収集").
 //!
 //! Read-side building blocks shared by the PLC drivers: addresses, the request
 //! planners, the typed decode and the in-process simulators. R2b-3d-join
-//! (docs/banto-hub-driver-io-design.md §6.1, §6.2) removed the I/O this crate
+//! (docs/hub/driver/banto-hub-driver-io-design.md §6.1, §6.2) removed the I/O this crate
 //! used to own - the `PlcClient` trait and its `ModbusTcpClient` /
 //! `SlmpClient` implementations, `dial_modbus` / `dial_slmp` and the
 //! `execute_*_reads` functions. The sockets are owned by `banto-driver-engine`
@@ -37,7 +37,7 @@
 //! ## What this crate deliberately does not do
 //!
 //! - **No writes.** PLC writes are out of scope for the recorder product
-//!   (docs/recorder-requirements.md §7); the write side is the separate
+//!   (docs/chronogazer/recorder-requirements.md §7); the write side is the separate
 //!   `banto-plc-write` crate.
 //! - **No reconnect loop.** Retrying/backing off across PLC-connection drops
 //!   is the collection engine's job (docs/plan.md I2 §2, "再接続ループは

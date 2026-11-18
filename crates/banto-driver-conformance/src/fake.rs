@@ -1,4 +1,4 @@
-//! Drivers to test against, or to copy from (docs/banto-driver-api-design.md
+//! Drivers to test against, or to copy from (docs/hub/driver/banto-driver-api-design.md
 //! §4.3, §7.4).
 //!
 //! - [`echo`]: [`EchoFrameDriver`](echo::EchoFrameDriver), the reference

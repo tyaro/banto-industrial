@@ -7,7 +7,7 @@
 //! `PlcWriteClient` for Modbus TCP) and
 //! `execute_modbus_writes` (a planned batch on a borrowed `TcpStream`). The
 //! broker now reaches Modbus through the frame-type driver
-//! (`banto-driver-modbus` over `banto-driver-engine`, docs/banto-hub-driver-io-design.md
+//! (`banto-driver-modbus` over `banto-driver-engine`, docs/hub/driver/banto-hub-driver-io-design.md
 //! §6.1), which sends one step per planned write with these two functions;
 //! the socket, the response timeout and the "a timeout is fatal" rule are the
 //! engine's. This module reuses the read side's `pub` framing primitives

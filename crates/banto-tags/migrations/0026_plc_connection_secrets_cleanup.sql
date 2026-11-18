@@ -1,4 +1,4 @@
--- R2b-1e（docs/banto-hub-connection-settings-design.md §5.3・§6.5、PR #778 の
+-- R2b-1e（docs/hub/banto-hub-connection-settings-design.md §5.3・§6.5、PR #778 の
 -- レビュー P2）: `plain-v1` の秘密値の行（blob = 平文そのもの）を消す・書き換える
 -- 書き込みは、平文を SQLite の空きページと WAL に追い出す。その書き込みと**同じ
 -- トランザクションで**「清掃が要る」を記録し、Hub の起動時の後処理（§6.5 の 2）が

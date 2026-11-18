@@ -1,4 +1,4 @@
-//! `settings` の形の書き込みの入口（R2b-6b／R2b-7d、docs/banto-hub-driver-r2b7-design.md §6）。
+//! `settings` の形の書き込みの入口（R2b-6b／R2b-7d、docs/hub/driver/banto-hub-driver-r2b7-design.md §6）。
 //!
 //! Hub の REST（`/api/plc-connections`）は R2b-6b から接続を
 //! `{ name, protocol, enabled, simulation, settings }` で受ける。この入口は

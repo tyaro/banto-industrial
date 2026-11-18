@@ -1,5 +1,5 @@
 /**
- * T19 S3-a（UX-43、docs/banto-hub-t19-design.md §8.2「案C・banto-hub の
+ * T19 S3-a（UX-43、docs/hub/banto-hub-t19-design.md §8.2「案C・banto-hub の
  * み」）: ≤900px でサイドバーをオフキャンバス化するための開閉状態を扱う
  * 依存ゼロの純粋ロジック。`$state` を持たないので vitest でそのまま
  * テストできる（`mobileNav.svelte.ts` がこれを runes でラップする）。
@@ -30,7 +30,7 @@ export function applyNarrowChange(state: MobileNavState, isNarrow: boolean): Mob
 export type HamburgerTarget = 'offcanvas' | 'desktop-collapse';
 
 /**
- * ☰ ボタンが何を切り替えるべきかを決める（docs/banto-hub-t19-design.md の
+ * ☰ ボタンが何を切り替えるべきかを決める（docs/hub/banto-hub-t19-design.md の
  * 「ハンバーガーの振り分け」節）: 狭幅（≤900px）ではオフキャンバスの開閉、
  * デスクトップではサイドバーの折り畳み（既存の `settings.toggleSidebar`）。
  */

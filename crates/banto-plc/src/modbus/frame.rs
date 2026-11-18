@@ -23,7 +23,7 @@
 //! `banto-plc-write` (I5, a separate crate) can build and parse Modbus TCP
 //! write frames (FC5/6/15/16) without re-deriving MBAP framing from the spec
 //! a second time - the exact duplication H9
-//! (docs/h9-slmp-structured-error-spec.md) had to clean up after (three
+//! (docs/hub/driver/h9-slmp-structured-error-spec.md) had to clean up after (three
 //! copies of SLMP's connect/dial sequence). This crate stays read-only itself
 //! (see this crate's `lib.rs` - "no write method, on purpose"); exposing
 //! these eight items only lets another crate speak the same *wire format*,

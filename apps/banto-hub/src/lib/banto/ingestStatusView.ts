@@ -1,5 +1,5 @@
 /**
- * R2a-2e（docs/banto-hub-ingest-design.md §9「状態の表示」）: `push` 接続の
+ * R2a-2e（docs/hub/banto-hub-ingest-design.md §9「状態の表示」）: `push` 接続の
  * 受信の状態（`GET /api/status` の `ingest` 節、`hubStatus.ts::IngestStatusEntry`）を
  * 画面の文言にする純関数。`ConnectionDrawer.svelte`（ドロワーの状態）と
  * `status/+page.svelte`（接続の一覧の「送り手待ち」）が使う。

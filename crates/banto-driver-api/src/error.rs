@@ -1,5 +1,5 @@
 //! The connection-fatal / per-item split as types
-//! (docs/banto-driver-api-design.md §3.4).
+//! (docs/hub/driver/banto-driver-api-design.md §3.4).
 //!
 //! `banto_plc::PlcError` / `banto_plc_write::PlcWriteError` carry one flat
 //! enum and decide fatality with `is_connection_fatal()` (default: fatal).

@@ -37,7 +37,7 @@ banto v5.0.0 追従（監査ログ画面の回避策の撤去、実装済み）�
 同日: P5（監視・履歴・しきい値の結合）を実装し、Hub の `value_source` を解釈しない（simulation 系・未知の出所も Good なら
 記録する）オーナー決定を H4・P3 の細部の置き換えとして追記。
 同日: P6（実機確認）を実施（R08ENCPU、Hub 経由 SLMP と直結 SLMP を別ポートで比較。ハーネスの判定は全段 PASS、
-記録は [real-machine-test-2026-10-p6.md](real-machine-test-2026-10-p6.md)）。
+記録は [real-machine-test-2026-10-p6.md](testing/real-machine-test-2026-10-p6.md)）。
 同日: §5 の #392 に A2（ChronoGazer のトレイ常駐。ウィンドウを閉じても収集を止めない）を実装したことと、その実装の細部を追記
 （B1 以降は未）。
 2026-10-12: §5 の #392 に A2 のオーナー決定（トレイの左クリックを両アプリで「窓を戻す」に揃える、banto-hub にも終了の
@@ -49,7 +49,7 @@ banto v5.0.0 追従（監査ログ画面の回避策の撤去、実装済み）�
 同日: 同項に、#587 のレビューでホスト切替そのものを終了の追跡に入れたこと（SCM を呼ぶ前なら取りやめ、呼んだ後は完走させて終了が待つ）を追記。
 同日: 同項に、#588（収集の停止が接続を 1 本ずつ止めていたため、応答しない PLC が多いと終了の予算に収まらなかった。全接続に先に合図を送ってからまとめて待つように直した。実装済み）を追記。
 2026-10-12: §5 の #392 に段階 B（ChronoGazer のサービス化）の計画を確定した（オーナー決定「おすすめで」、未実装。H9 は
-既存の `%APPDATA%` のデータを移行しない、論点 1〜14 は推奨どおり。計画書は [chronogazer-service-design.md](chronogazer-service-design.md)）。
+既存の `%APPDATA%` のデータを移行しない、論点 1〜14 は推奨どおり。計画書は [chronogazer-service-design.md](chronogazer/chronogazer-service-design.md)）。
 同日: §5 の #392 の実装状況に、段階 B の B1-1（起動と終了を `chronogazer_core::engine` の `EngineRuntime` にまとめ、`banto-serve` を乗り換えた。終了はデスクトップと同じ順序になった）を実装したことを追記。
 同日: 同項に B1-2（デスクトップの起動と終了を `EngineRuntime` に乗り換え、終了の 1 回化を共有の `ExitCleanupOnce` に寄せた。挙動は不変）を実装したことを追記し、A2 の項の「ChronoGazer の `exit_cleanup_once` を共有 crate に寄せるかは未」を済みに直した。
 同日: 同項に、起動に失敗したときに panic せずエラーの窓で対処を選ばせるオーナー決定と実装（保存先を選び直す・既定に戻す、バックアップから戻す・作り直す。どれも今の DB や記録を消さない）を追記。
@@ -58,8 +58,8 @@ banto v5.0.0 追従（監査ログ画面の回避策の撤去、実装済み）�
 2026-10-13: §5 の #392 の実装状況に B1-5（画面の無い本番用の host `chronogazer-server` のコンソール版。loopback の常時の待ち受け・DPAPI の KeyStore・日付ごとのログ・コンソールの Ctrl）を実装したことを追記。
 2026-10-14: §5 の #392 の実装状況に B2-1（この PC からの接続を通す grant `localDesktop` と、LAN の公開設定・認証の設定の REST `/api/settings/*`）を実装したことを追記。
 T13〜T18 の詳細と最新の全体像は
-[banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
-[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
+[banto-hub-remaining-plan.md](hub/banto-hub-remaining-plan.md) と
+[banto-hub-desktop-plan.md](hub/banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
 T13-1 までの粒度で、以降は同書へ移管）。Hardening（H1〜H10）は H7 の① 実機 soak
 のみ残（詳細は improvement-plan.md）。docs 全体の
 地図は [README.md](README.md)**（2026-10-11 更新。本文の T 系表は 2026-08-08 時点の
@@ -71,7 +71,7 @@ AI コードレビュー指摘の改善計画（H系）は
 
 banto-hub のアプリ／サービス運転計画（T14〜T18: デスクトップシェル・全 PLC
 シミュレーション・サービス管理・タグ登録 UI/UX 改善）は
-[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) で管理する
+[banto-hub-desktop-plan.md](hub/banto-hub-desktop-plan.md) で管理する
 （2026-08-09 計画確定 + 上位モデル検証反映）。
 
 本計画は banto テンプレートの外側 — **別リポジトリ banto-industrial** —
@@ -192,12 +192,12 @@ Three 判断の経緯は本節と W1〜W5 実装（下表）に集約済み）: 
 
 ## 4c. タグサーバーアプリ banto-hub（T系）— T0〜T21 実装済み・残るは T18-5c/d・実機依存項目（#210/#211/#123）のみ
 
-（詳細と最新の全体像は [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md)・
-[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする。以下の T13 以降を含む表は
+（詳細と最新の全体像は [banto-hub-remaining-plan.md](hub/banto-hub-remaining-plan.md)・
+[banto-hub-desktop-plan.md](hub/banto-hub-desktop-plan.md) を正とする。以下の T13 以降を含む表は
 2026-08-08 時点の粒度のまま保持し、実装状況は更新しない）
 
 FA-Server 型の独立タグサーバー **banto-hub**（2026-08-04 起案・命名、設計詳細は
-[tag-server-design.md](tag-server-design.md)）: I 系クレートを束ねた
+[tag-server-design.md](hub/tag-server-design.md)）: I 系クレートを束ねた
 ヘッドレス axum アプリで、タグ空間（= banto-collect の現在値キャッシュ）を
 **REST / WebSocket / MQTT publish / gRPC / OPC UA（#201 の診断用、既定無効）** で外部公開する。
 外部システム連携（MES・クラウド・自作画面）と、同一 PC 同居時の PLC
@@ -234,7 +234,7 @@ broker のプロトコル抽象化）を新規バックログとする。broker 
 CollectorManager の外で生存」（tag-server-design.md §6-5）。
 
 2026-08-09 決定分（T14〜T18、詳細は
-[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)）: banto-hub を共通 Hub
+[banto-hub-desktop-plan.md](hub/banto-hub-desktop-plan.md)）: banto-hub を共通 Hub
 ランタイムから「アプリホスト」「サービスホスト」の2ホストで駆動し、初回起動は
 収集を開始せず、タグ登録→全 PLC シミュレーション→実機試運転→サービス常時運転化
 までを1つの製品 UI で完結させる。**運転中の構成編集は方針改定済み**（2026-08-09
@@ -243,22 +243,22 @@ CollectorManager の外で生存」（tag-server-design.md §6-5）。
 I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える。下表の T13-1 の
 続きは同計画の T14〜T18 が引き継ぐ。
 
-| #     | 内容                                                                                         | 依存    | 備考                                                                                                                                                                                                                                                                                                                                                                                                             |
-| ----- | -------------------------------------------------------------------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| T0    | 骨格（ヘッドレス axum + レジストリ配線 + banto-collect 組み込み + REST 読み取り + API キー） | I1〜I3b | Tauri なし構成の初例。**実装済み**                                                                                                                                                                                                                                                                                                                                                                               |
-| T1    | WebSocket 購読（on_change / interval、初期スナップショット）                                 | T0      | **実装済み**                                                                                                                                                                                                                                                                                                                                                                                                     |
-| T2    | 書き込み経路（writable フラグ = I1 拡張、監査、ブレーカ、ブローカー統合 = I6 判断）          | T0, I5  | 安全設計レビューを実装前に。**実装済み**                                                                                                                                                                                                                                                                                                                                                                         |
-| T3    | MQTT publish（rumqttc、retain、LWT）                                                         | T0      | §3 保留の MQTT 行を回収。**実装済み**                                                                                                                                                                                                                                                                                                                                                                            |
-| T4    | gRPC（tonic、proto 版管理）                                                                  | T1      | **実装済み**                                                                                                                                                                                                                                                                                                                                                                                                     |
-| T5    | 配布・運用強化（サービス化検討・ソーク・インストーラ）                                       | T0〜T4  | 実機検証（多重クライアント）含む。T5-1(Windows サービス化)/T5-2(NSIS インストーラ)/T5-3(運用ガイド)/T5-4(72h ソークハーネス実装)は実装済み、残るは T5-5(実機での72h soak 実行 + 実機最終サインオフ)。採番は docs/t5-handoff.md の定義（T5-4=ハーネス／T5-5=実機サインオフ）に統一（2026-09-01、banto-hub-desktop-plan.md §16.5 の残件を解消）。docs/banto-hub-operations.md §10/§11/§12、docs/t5-handoff.md 参照 |
-| T6    | 演算タグ・内部タグ（タグ種別 = I1 拡張、式評価器、DAG 検証）                                 | T0      | SCADA 計画次第で前倒し可。**実装済み**                                                                                                                                                                                                                                                                                                                                                                           |
-| T7    | オンライン部分再構成（接続単位の入れ替え = I7）                                              | T0, I7  | 外部契約不変のため後入れ可能。**実装済み（T7-1/T7-2、2026-08-05）**                                                                                                                                                                                                                                                                                                                                              |
-| T8    | ワードデバイスのビットアクセス（アドレス側 `.N` 記法、書き込みは RMW + 確認読み）            | T2, T0  | tag-server-design.md §6.1。**実装済み（T8-1/T8-2、2026-08-06）**                                                                                                                                                                                                                                                                                                                                                 |
-| T9    | 接続単位のシミュレーションモード（実機なしでの開発・検証、ランプ波生成）                     | T0      | ux-plan.md §1。**実装済み（T9-1/T9-2、2026-08-07）**                                                                                                                                                                                                                                                                                                                                                             |
-| T10   | ライブタグモニタ（管理 UI の現在値一覧、WS 購読ベース）                                      | T1      | ux-plan.md §2。**実装済み（2026-08-07）**                                                                                                                                                                                                                                                                                                                                                                        |
-| T11   | タグの一括登録（連続登録 + CSV インポート/エクスポート）                                     | T0      | ux-plan.md §3。**実装済み（T11-1/T11-2、2026-08-07）**                                                                                                                                                                                                                                                                                                                                                           |
-| T12   | PLC 接続テストボタン（保存前の疎通確認）                                                     | T0      | ux-plan.md §4。**実装済み（2026-08-07）**                                                                                                                                                                                                                                                                                                                                                                        |
-| T13-1 | 画面レイアウト刷新: 汎用部品（Drawer/SplitPane/Tree）+ tags ページの master-detail 化        | T0, T11 | ux-plan.md §4b。**実装済み（2026-08-08）**。残 T13-2/T13-3                                                                                                                                                                                                                                                                                                                                                       |
+| #     | 内容                                                                                         | 依存    | 備考                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ----- | -------------------------------------------------------------------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| T0    | 骨格（ヘッドレス axum + レジストリ配線 + banto-collect 組み込み + REST 読み取り + API キー） | I1〜I3b | Tauri なし構成の初例。**実装済み**                                                                                                                                                                                                                                                                                                                                                                                                   |
+| T1    | WebSocket 購読（on_change / interval、初期スナップショット）                                 | T0      | **実装済み**                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| T2    | 書き込み経路（writable フラグ = I1 拡張、監査、ブレーカ、ブローカー統合 = I6 判断）          | T0, I5  | 安全設計レビューを実装前に。**実装済み**                                                                                                                                                                                                                                                                                                                                                                                             |
+| T3    | MQTT publish（rumqttc、retain、LWT）                                                         | T0      | §3 保留の MQTT 行を回収。**実装済み**                                                                                                                                                                                                                                                                                                                                                                                                |
+| T4    | gRPC（tonic、proto 版管理）                                                                  | T1      | **実装済み**                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| T5    | 配布・運用強化（サービス化検討・ソーク・インストーラ）                                       | T0〜T4  | 実機検証（多重クライアント）含む。T5-1(Windows サービス化)/T5-2(NSIS インストーラ)/T5-3(運用ガイド)/T5-4(72h ソークハーネス実装)は実装済み、残るは T5-5(実機での72h soak 実行 + 実機最終サインオフ)。採番は docs/archive/t5-handoff.md の定義（T5-4=ハーネス／T5-5=実機サインオフ）に統一（2026-09-01、banto-hub-desktop-plan.md §16.5 の残件を解消）。docs/hub/banto-hub-operations.md §10/§11/§12、docs/archive/t5-handoff.md 参照 |
+| T6    | 演算タグ・内部タグ（タグ種別 = I1 拡張、式評価器、DAG 検証）                                 | T0      | SCADA 計画次第で前倒し可。**実装済み**                                                                                                                                                                                                                                                                                                                                                                                               |
+| T7    | オンライン部分再構成（接続単位の入れ替え = I7）                                              | T0, I7  | 外部契約不変のため後入れ可能。**実装済み（T7-1/T7-2、2026-08-05）**                                                                                                                                                                                                                                                                                                                                                                  |
+| T8    | ワードデバイスのビットアクセス（アドレス側 `.N` 記法、書き込みは RMW + 確認読み）            | T2, T0  | tag-server-design.md §6.1。**実装済み（T8-1/T8-2、2026-08-06）**                                                                                                                                                                                                                                                                                                                                                                     |
+| T9    | 接続単位のシミュレーションモード（実機なしでの開発・検証、ランプ波生成）                     | T0      | ux-plan.md §1。**実装済み（T9-1/T9-2、2026-08-07）**                                                                                                                                                                                                                                                                                                                                                                                 |
+| T10   | ライブタグモニタ（管理 UI の現在値一覧、WS 購読ベース）                                      | T1      | ux-plan.md §2。**実装済み（2026-08-07）**                                                                                                                                                                                                                                                                                                                                                                                            |
+| T11   | タグの一括登録（連続登録 + CSV インポート/エクスポート）                                     | T0      | ux-plan.md §3。**実装済み（T11-1/T11-2、2026-08-07）**                                                                                                                                                                                                                                                                                                                                                                               |
+| T12   | PLC 接続テストボタン（保存前の疎通確認）                                                     | T0      | ux-plan.md §4。**実装済み（2026-08-07）**                                                                                                                                                                                                                                                                                                                                                                                            |
+| T13-1 | 画面レイアウト刷新: 汎用部品（Drawer/SplitPane/Tree）+ tags ページの master-detail 化        | T0, T11 | ux-plan.md §4b。**実装済み（2026-08-08）**。残 T13-2/T13-3                                                                                                                                                                                                                                                                                                                                                                           |
 
 ## 5. 技術課題メモ（議論済みの設計方向）
 
@@ -296,7 +296,7 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
     0007 → `apps/*/core/migrations-sqlite/`。banto 側には手を入れない）。banto-hub 固有の
     テーブルは `0101_*` 以降に最終形で置く。
   - **banto-hub の旧 DB 拒否はログと手順書だけ**（インストーラ等に作り直しの操作は
-    作らない）。手順は [banto-hub-operations.md](banto-hub-operations.md) §1
+    作らない）。手順は [banto-hub-operations.md](hub/banto-hub-operations.md) §1
     「旧形式の DB で起動を拒否されたとき」、chronogazer は
     [apps/chronogazer/README.md](../apps/chronogazer/README.md)。
 
@@ -304,7 +304,7 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
   分け（`_sqlx_migrations_chronogazer` / `_sqlx_migrations_banto_hub` /
   `_sqlx_migrations_banto_tags`。`banto-collect` は冪等 DDL のまま）、手書きの冪等 DDL を
   `sqlx::migrate!` に戻した。経緯と理由は各アプリの `core/src/db.rs` のモジュール doc と
-  [r1a-readme-gaps.md](r1a-readme-gaps.md)
+  [r1a-readme-gaps.md](archive/r1a-readme-gaps.md)
 
 - **ChronoGazer のサービスと REST ルーターを banto のものに（2026-10-04、実装済み）**:
   banto に寄せる作業の段階名では I2a（§4 の I2a = SLMP 読み取りクライアントとは別物）。
@@ -443,7 +443,7 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
   - **wire・監査の語彙の変化**: `PUT /api/audit-log/config` の成功は `settings_change` / `settings`
     （以前は `update` / `audit_log_config`）、`/api/audit-log/config` の拒否の resource も `settings`。
     監査ログ一覧の応答に `deletionEpoch`（#248 の受け皿）、読めない `asOfId` は JSON の 400。試運転の
-    grant での change-password は 403。詳細は [banto-hub-operations.md](banto-hub-operations.md)
+    grant での change-password は 403。詳細は [banto-hub-operations.md](hub/banto-hub-operations.md)
     §1「初回セットアップの運用」・§9「監査ログに残るもの」と `apps/banto-hub/core/src/rest.rs` の
     モジュール doc。版（v0.2.0-alpha.28）は上げていない。
 
@@ -461,7 +461,7 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
   適用したときと同じ動作をする。汎用画面エディタは入れない（§4 の護り）。旧 industrial-plan §5
   （2026-08-26 議論）の方向を **2026-10-08 オーナー決定で採用**（#517）。PLC 接続・収集グループ・
   タグ定義を対象に含めること、目的、適用の動作は同日のオーナー決定で追加。要件への追補は #524
-  （[recorder-requirements.md](recorder-requirements.md) §3.7。運用の細目も同日オーナー決定で確定し、未決なし）、未実装
+  （[recorder-requirements.md](chronogazer/recorder-requirements.md) §3.7。運用の細目も同日オーナー決定で確定し、未決なし）、未実装
 - **しきい値（HH/H/L/LL）は使う側（記録計・SCADA）が持つ設定**（2026-10-08 オーナー決定、
   #532・#533）。データ点（タグ定義）の性質ではない。Hub（`banto-tags`）はしきい値を持たず、
   警報も判定しない（データを集めて配る役に徹する）。
@@ -476,7 +476,7 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
     `recorder_tag_settings`・`/api/tag-thresholds`、しきい値イベントに判定値 `limit_value`。
     既存のタグの列の値は移さない）→ #533（Hub と `banto-tags` から外す。**2026-10-09 実装** -
     banto-tags の migration 0018 で `tags` のしきい値の列を落とし、Hub の画面・REST・MCP・CSV・
-    設定パッケージから外した。値付きのしきい値は検証エラーで断る。Hub の収集は判定しない）。要件は [recorder-requirements.md](recorder-requirements.md)
+    設定パッケージから外した。値付きのしきい値は検証エラーで断る。Hub の収集は判定しない）。要件は [recorder-requirements.md](chronogazer/recorder-requirements.md)
     §3.1・§3.2・§3.5・§3.7 に反映済み。
 - **#383 段階3（Hub 経由タグの合流・保存・表示）と #392（収集エンジンの UI 独立）（2026-10-10 オーナー決定「おすすめで」。#383 段階3 は P5 まで実装、#392 は A1・A2 を実装）**:
   - **#383 段階3**:
@@ -504,7 +504,7 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
     - 手順: P2（`banto-tags` に `hub` protocol）→ P3（`banto-collect` の Hub サンプラー）→ P4（タグを
       「Hub から」登録）→ P5（監視・履歴・しきい値の結合）→ P6 実機確認（Hub 経由の SLMP と直結 SLMP を別ポートで
       比較）。
-    - **実装状況（2026-10-11）**: P2 は #566 で実装（スキーマと検証。収集は外していた）。P3（`banto-collect` の Hub サンプラー）は 2026-10-11 に実装: `banto-collect` に外部ソース （`ExternalSource`）の接続タスクを足し、ChronoGazer の Hub 購読（`HubService`）がそれを実装する。購読するタグは画面の選択 ∪ 収集の需要（開始のたびにレジストリの hub タグの外部名から作る。**P4 で「登録済みの hub タグ ∪ 需要」に替えた** - 下の「P4 の細部」）、開始時に Hub のタグ一覧と突き合わせて消えた・型が変わったタグを外す。Hub が Live でない間は全タグ Bad + null（イベントは Hub の接続キーの `plc_connected` / `plc_disconnected` / `plc_reconnected` - PLC 接続と同じ意味）、Live + good の定常値は周期ごとに記録して Good のまま、Hub の `stale` は Stale（記録は null - 新しい測定ではないため）、（`simulation`・`derived_simulation` と未知の出所は、この時点では表示するが記録しなかったが、**P5 で替えた** - 下の「P5 の決定」）。Hub を持たない実行形態（`banto-serve`）では `hubSourceUnavailable`、Hub 未接続では `hubNotConfigured` で hub 接続を外す（PLC 直結は動く）。詳細は `crates/banto-collect/src/external.rs` と `apps/chronogazer/core/src/collect.rs` のモジュール doc。P4（登録の導線）も 2026-10-11 に実装（下の「P4 の細部」、規則は `apps/chronogazer/core/src/hub_tags.rs`・購読は `hub.rs` のモジュール doc）。**P5（監視・履歴・しきい値の結合）も 2026-10-11 に実装**（下の「P5 の決定」）。**P6（実機確認）も 2026-10-11 に実施**: R08ENCPU を Hub（SLMP ポート 3101）と ChronoGazer の直結（同 3102）で同じ 25 タグ（i16・u16・i32・bit）を周期 1000 ms で読み、60 秒の定常区間で行数（62 / 62）・null（両側とも開始直後の 1 行だけ）・値（全組一致）が一致、Hub のプロセスの停止中は Hub 経由のタグだけが Bad + null（直結は影響なし）で `plc_disconnected` → `plc_reconnected`。Hub の収集だけを止めたときはリンクが Live のままなのでイベントは出ず、値が Bad + null になる（設計どおり）。値が変化する場合の追従は、PLC へ書き込まない条件のため未確認。ハーネスは `apps/chronogazer/core/examples/hub_p6_compare.rs`、記録は [real-machine-test-2026-10-p6.md](real-machine-test-2026-10-p6.md)。
+    - **実装状況（2026-10-11）**: P2 は #566 で実装（スキーマと検証。収集は外していた）。P3（`banto-collect` の Hub サンプラー）は 2026-10-11 に実装: `banto-collect` に外部ソース （`ExternalSource`）の接続タスクを足し、ChronoGazer の Hub 購読（`HubService`）がそれを実装する。購読するタグは画面の選択 ∪ 収集の需要（開始のたびにレジストリの hub タグの外部名から作る。**P4 で「登録済みの hub タグ ∪ 需要」に替えた** - 下の「P4 の細部」）、開始時に Hub のタグ一覧と突き合わせて消えた・型が変わったタグを外す。Hub が Live でない間は全タグ Bad + null（イベントは Hub の接続キーの `plc_connected` / `plc_disconnected` / `plc_reconnected` - PLC 接続と同じ意味）、Live + good の定常値は周期ごとに記録して Good のまま、Hub の `stale` は Stale（記録は null - 新しい測定ではないため）、（`simulation`・`derived_simulation` と未知の出所は、この時点では表示するが記録しなかったが、**P5 で替えた** - 下の「P5 の決定」）。Hub を持たない実行形態（`banto-serve`）では `hubSourceUnavailable`、Hub 未接続では `hubNotConfigured` で hub 接続を外す（PLC 直結は動く）。詳細は `crates/banto-collect/src/external.rs` と `apps/chronogazer/core/src/collect.rs` のモジュール doc。P4（登録の導線）も 2026-10-11 に実装（下の「P4 の細部」、規則は `apps/chronogazer/core/src/hub_tags.rs`・購読は `hub.rs` のモジュール doc）。**P5（監視・履歴・しきい値の結合）も 2026-10-11 に実装**（下の「P5 の決定」）。**P6（実機確認）も 2026-10-11 に実施**: R08ENCPU を Hub（SLMP ポート 3101）と ChronoGazer の直結（同 3102）で同じ 25 タグ（i16・u16・i32・bit）を周期 1000 ms で読み、60 秒の定常区間で行数（62 / 62）・null（両側とも開始直後の 1 行だけ）・値（全組一致）が一致、Hub のプロセスの停止中は Hub 経由のタグだけが Bad + null（直結は影響なし）で `plc_disconnected` → `plc_reconnected`。Hub の収集だけを止めたときはリンクが Live のままなのでイベントは出ず、値が Bad + null になる（設計どおり）。値が変化する場合の追従は、PLC へ書き込まない条件のため未確認。ハーネスは `apps/chronogazer/core/examples/hub_p6_compare.rs`、記録は [real-machine-test-2026-10-p6.md](testing/real-machine-test-2026-10-p6.md)。
     - **P3 の細部（2026-10-11 オーナー決定「おすすめで」）**: Hub が戻ったときのイベントは PLC と同じ `plc_reconnected`（最初は `plc_connected`）。~~未知の `value_source` は実値として扱わず記録しない~~（**P5 で置き換え**: 未知の出所も Good なら記録する。下の「P5 の決定」）。Hub の `stale` は null で記録する（古い値を新しい測定に見せない）。収集中に画面の選択タグを変えると購読の張り直しで数周期の切断・再接続と Bad が出る件は P4 で扱いを決める（→ P4 で選択を購読から外して解消。下）。開始時に Hub が答えないときは突き合わせをせずに始め（開始の待ちは最大 20 秒）、消えたタグは次の開始まで Bad のまま。
     - **P4 の細部（2026-10-11 オーナー決定「P4進めてください」= 推奨どおり。実装済み）**:
       1. **`hub` 接続の許可**: ChronoGazer の REST・Tauri は `hub` 接続の作成・更新・削除を受け付ける（banto-hub は
@@ -588,7 +588,7 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
     - **H11 更新は「インストーラがサービスを停止 → 置換 → 開始」**（banto-hub の手順を流用）。
     - 手順: A1（プロファイルロックの共有 crate。デスクトップと `banto-serve` の両方）→ A2（トレイ）→
       B1（headless host + KeyStore）→ B2（シェル決定）→ B3（サービス + インストーラ + 実機 24h/72h）。
-    - **実装状況**: A1（2026-10-10、#565）・**A2（2026-10-11）実装済み**。段階 B は 2026-10-12 に計画確定（下の「段階 B の計画」）し、**B1-1（engine 抽出）を実装済み（2026-10-12）**: 起動と終了を `chronogazer_core::engine` の `EngineRuntime` にまとめ、`banto-serve` を乗り換えた（環境変数と既定値は不変。終了はデスクトップと同じ「印 → LAN → 収集（最終 flush）→ Hub → DB」になった）。**B1-2（デスクトップの乗り換え）も実装済み（2026-10-12）**: `src-tauri` の `setup` と終了が `EngineRuntime` を使い、`AppState` はセッションまわりとエンジンのハンドルだけを持つ。終了の 1 回化は banto-hub と共有の `banto_desktop_tray::ExitCleanupOnce` に寄せた（挙動は不変。差の扱いは [chronogazer-service-design.md](chronogazer-service-design.md) §4 の B1-2 の実装メモ）。**起動に失敗したときのエラーの窓と対処の選択も実装済み（2026-10-12 オーナー決定）**: panic で落とさず、保存先（`data.dir`）を読めないなら「フォルダを選び直す・既定の場所に戻す・終了」、DB が壊れている・開けないなら「バックアップから戻す・作り直す（今の DB は `.broken-<日時>` に残す）・終了」を選ばせ、同じプロセスで起動をやり直す。どれも今の DB や記録を消さない。判断は `chronogazer_core::startup_recovery` の純関数（B2 のシェルでも使う）。詳細は同 §4 の追補。**B1-3（`crates/banto-secret-store`）も実装済み（2026-10-13）**: DPAPI の machine スコープで守ったファイルを、継承しない保護された DACL（SYSTEM・Administrators がフル、指定したインストール利用者に「変更」）のディレクトリに 1 アカウント 1 ファイルで置き、`banto_hub_bootstrap::KeyStore` を実装した。既にあるディレクトリの ACL が違えば使わずに失敗する（自動では直さない）。アプリへの配線はまだ（B1-5・B2-4）。詳細は同 §4 の B1-3 の実装メモ。**B1-4（パスと host 種別）も実装済み（2026-10-13）**: `chronogazer_core::paths`（`CHRONOGAZER_ROOT` → `%ProgramData%\ChronoGazer` のルート解決と配置、旧データの場所）、`ChronoGazerHost::{Server, Service}`、未認証の `GET /api/host`（`{product, hostKind, version, scope}` だけ。パスは出さない）、`run\endpoint.json` の原子的な読み書き（古い・壊れたファイルは「無い」扱い）を足した。B1-5 の `chronogazer-server` と B2-4 が使う。詳細は設計書の B1-4 の実装メモ。**B1-5（`chronogazer-server` のコンソール版）も実装済み（2026-10-13）**: 新しい bin。データは `%ProgramData%\ChronoGazer`（`CHRONOGAZER_ROOT`、絶対パスだけ。`%APPDATA%` は読まない）、loopback（`127.0.0.1:<server.port>`、既定 8721）を常に開き LAN はデスクトップと同じ判定のときだけ足す、Hub のキーは DPAPI のファイル（`secrets\hub-keys`）、ログは `logs\chronogazer-server-YYYY-MM-DD.log`（標準エラー出力も向け直す・保持 30 日）、`run\endpoint.json` を書いて終了の最初に消す、Ctrl-C は 15 秒・コンソールのウィンドウを閉じたときは 4 秒で最終 flush まで行う。起動の失敗は理由と手で行う対処を出して終了コード（A1 = 2、その他 = 3）。詳細は設計書の B1-5 の実装メモ。**B2-1（loopback grant と REST の差分）も実装済み（2026-10-14）**: grant `localDesktop`（`chronogazer-server` の常時の listener への、要求ごとに peer と Host の両方が loopback の要求だけ（`0.0.0.0` にまとめても LAN からは閉じる）、未初期化の間は admin・初期化後は設定 `auth.local_grant`（既定 off）、ロールの変更は再起動で反映、監査に `login`（`via: localGrant`））。setup は併存させ同じ要求ごとの確認にした。identity は `localDesktop`。LAN の公開設定と認証の設定の REST（`/api/settings/server`・`/api/settings/auth`、admin、`PUT` はこの PC からだけ）。LAN の listener をその場で入れ替え（常時の listener の形が変わるポート・`0.0.0.0` は次の起動から）、デスクトップの `server_apply` と同じ core の関数。ログイン不要モードは REST では読むだけ。詳細は設計書の B2-1 の実装メモ。B2-2 以降は未。
+    - **実装状況**: A1（2026-10-10、#565）・**A2（2026-10-11）実装済み**。段階 B は 2026-10-12 に計画確定（下の「段階 B の計画」）し、**B1-1（engine 抽出）を実装済み（2026-10-12）**: 起動と終了を `chronogazer_core::engine` の `EngineRuntime` にまとめ、`banto-serve` を乗り換えた（環境変数と既定値は不変。終了はデスクトップと同じ「印 → LAN → 収集（最終 flush）→ Hub → DB」になった）。**B1-2（デスクトップの乗り換え）も実装済み（2026-10-12）**: `src-tauri` の `setup` と終了が `EngineRuntime` を使い、`AppState` はセッションまわりとエンジンのハンドルだけを持つ。終了の 1 回化は banto-hub と共有の `banto_desktop_tray::ExitCleanupOnce` に寄せた（挙動は不変。差の扱いは [chronogazer-service-design.md](chronogazer/chronogazer-service-design.md) §4 の B1-2 の実装メモ）。**起動に失敗したときのエラーの窓と対処の選択も実装済み（2026-10-12 オーナー決定）**: panic で落とさず、保存先（`data.dir`）を読めないなら「フォルダを選び直す・既定の場所に戻す・終了」、DB が壊れている・開けないなら「バックアップから戻す・作り直す（今の DB は `.broken-<日時>` に残す）・終了」を選ばせ、同じプロセスで起動をやり直す。どれも今の DB や記録を消さない。判断は `chronogazer_core::startup_recovery` の純関数（B2 のシェルでも使う）。詳細は同 §4 の追補。**B1-3（`crates/banto-secret-store`）も実装済み（2026-10-13）**: DPAPI の machine スコープで守ったファイルを、継承しない保護された DACL（SYSTEM・Administrators がフル、指定したインストール利用者に「変更」）のディレクトリに 1 アカウント 1 ファイルで置き、`banto_hub_bootstrap::KeyStore` を実装した。既にあるディレクトリの ACL が違えば使わずに失敗する（自動では直さない）。アプリへの配線はまだ（B1-5・B2-4）。詳細は同 §4 の B1-3 の実装メモ。**B1-4（パスと host 種別）も実装済み（2026-10-13）**: `chronogazer_core::paths`（`CHRONOGAZER_ROOT` → `%ProgramData%\ChronoGazer` のルート解決と配置、旧データの場所）、`ChronoGazerHost::{Server, Service}`、未認証の `GET /api/host`（`{product, hostKind, version, scope}` だけ。パスは出さない）、`run\endpoint.json` の原子的な読み書き（古い・壊れたファイルは「無い」扱い）を足した。B1-5 の `chronogazer-server` と B2-4 が使う。詳細は設計書の B1-4 の実装メモ。**B1-5（`chronogazer-server` のコンソール版）も実装済み（2026-10-13）**: 新しい bin。データは `%ProgramData%\ChronoGazer`（`CHRONOGAZER_ROOT`、絶対パスだけ。`%APPDATA%` は読まない）、loopback（`127.0.0.1:<server.port>`、既定 8721）を常に開き LAN はデスクトップと同じ判定のときだけ足す、Hub のキーは DPAPI のファイル（`secrets\hub-keys`）、ログは `logs\chronogazer-server-YYYY-MM-DD.log`（標準エラー出力も向け直す・保持 30 日）、`run\endpoint.json` を書いて終了の最初に消す、Ctrl-C は 15 秒・コンソールのウィンドウを閉じたときは 4 秒で最終 flush まで行う。起動の失敗は理由と手で行う対処を出して終了コード（A1 = 2、その他 = 3）。詳細は設計書の B1-5 の実装メモ。**B2-1（loopback grant と REST の差分）も実装済み（2026-10-14）**: grant `localDesktop`（`chronogazer-server` の常時の listener への、要求ごとに peer と Host の両方が loopback の要求だけ（`0.0.0.0` にまとめても LAN からは閉じる）、未初期化の間は admin・初期化後は設定 `auth.local_grant`（既定 off）、ロールの変更は再起動で反映、監査に `login`（`via: localGrant`））。setup は併存させ同じ要求ごとの確認にした。identity は `localDesktop`。LAN の公開設定と認証の設定の REST（`/api/settings/server`・`/api/settings/auth`、admin、`PUT` はこの PC からだけ）。LAN の listener をその場で入れ替え（常時の listener の形が変わるポート・`0.0.0.0` は次の起動から）、デスクトップの `server_apply` と同じ core の関数。ログイン不要モードは REST では読むだけ。詳細は設計書の B2-1 の実装メモ。B2-2 以降は未。
       A2 で、ChronoGazer の**ウィンドウの × はアプリを終了せずに隠す**（収集・Hub 購読・LAN サーバーは
       動き続ける）ようになり、トレイ（左クリック・「開く」で窓を戻す、右クリックで「収集の状態・開く・終了」）に
       常駐する。収集が止まるのは、トレイの「終了」（確認の後、既存の終了処理 = LAN サーバー → 収集の停止と
@@ -623,7 +623,7 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
          1 回に限るのは終了の後始末だけで、切替の停止・起動は何度でもできる、(4) サービス接続中・fallback の
          終了は SCM を呼ばない。閉じた後は新しい controller が作られないので、#585 の残件「切替で作られた
          新しい controller に終了の印が引き継がれない」も起こらなくなった。詳細は
-         [banto-hub-t16-design.md](banto-hub-t16-design.md) §4.1 の #586 追記。
+         [banto-hub-t16-design.md](hub/banto-hub-t16-design.md) §4.1 の #586 追記。
          ChronoGazer の `exit_cleanup_once`（`tokio::sync::OnceCell`）を共有 crate の `ExitCleanupOnce` に
          寄せるかは未（#392 の残件）。→ **#392 B1-2 で寄せた（2026-10-12、実装済み）**。
          → **#588（2026-10-12、実装済み）**: #587 の実機確認で、応答しない PLC が多いと終了の後始末が予算に
@@ -682,7 +682,7 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
           誰も待たない）。一時的な印はタスク側では見ない（それより前に受け付けた開始は「忙しい」として
           数えられ、トレイが確かめ直すので実行してよい）。
 
-    - **段階 B の計画（2026-10-12 オーナー決定「おすすめで」。詳細は [chronogazer-service-design.md](chronogazer-service-design.md)）**:
+    - **段階 B の計画（2026-10-12 オーナー決定「おすすめで」。詳細は [chronogazer-service-design.md](chronogazer/chronogazer-service-design.md)）**:
       - **順序**: #588（収集の停止の並行化）を先に行い、その後 B1-1 から。
       - **PR 分割**: B1-0 docs（この記録）→ B1-1 engine 抽出（`chronogazer_core::engine`、`banto-serve` を乗り換え）→
         B1-2 Tauri を engine に → B1-3 `banto-secret-store`（DPAPI）→ B1-4 パスと host 種別（`/api/host`）→
@@ -700,7 +700,7 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
         (13) Hub・sink のサービスが SHUTDOWN/PRESHUTDOWN を受けない件は issue #589。2026-10-14 にコードで直した（PRESHUTDOWN 30 秒。共有ランナー B3-1 の全体抽出はまだ）。(14) ファイアウォールの受信規則は作らない。
 
   - **順序**: #383 段階3 を先に進め、#392 の A1 は並行。B1 は P3 の後。
-  - 要件側は [recorder-requirements.md](recorder-requirements.md) §3.1・§4 に反映済み。
+  - 要件側は [recorder-requirements.md](chronogazer/recorder-requirements.md) §3.1・§4 に反映済み。
 
 ## 6. 全体の依存関係
 

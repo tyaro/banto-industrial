@@ -1,4 +1,4 @@
-//! `virtual` の静的な部分（R2b-1a、docs/banto-hub-connection-settings-design.md
+//! `virtual` の静的な部分（R2b-1a、docs/hub/banto-hub-connection-settings-design.md
 //! §3.2・§4.1）: [`VirtualDriver`]（`banto_driver_api::DriverBase`）。
 //!
 //! `virtual` 接続（`calc` / `mem`）は演算タグ・内部タグの置き場で、どこへも繋がない

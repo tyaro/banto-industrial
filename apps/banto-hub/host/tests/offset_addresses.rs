@@ -1,4 +1,4 @@
-//! R2b-6d-1（docs/banto-hub-driver-ui-design.md §4.3）: `POST /api/tags/offset-addresses` と
+//! R2b-6d-1（docs/hub/driver/banto-hub-driver-ui-design.md §4.3）: `POST /api/tags/offset-addresses` と
 //! `POST /api/tags/parse-addresses` の `index` を、**実ドライバ**（SLMP・Modbus。core は
 //! `banto-drivers` に依存できないのでここに置く）で固定する。実際の `CollectorManager` +
 //! axum ルーター経由。`TestApp` は `t12_connection_test.rs` と同じ理由で複製している。

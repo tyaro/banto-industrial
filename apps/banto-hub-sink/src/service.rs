@@ -37,7 +37,7 @@
 //! なく **別の昇格ステップ**（`banto-hub-elev.exe grant-service-acl`、
 //! `apps/banto-hub/core/src/service_elevated.rs` 参照）で付与する。
 //! デスクトップシェルの「サービス」一覧（S6、
-//! `docs/banto-hub-external-db-design.md` §5.5）は
+//! `docs/hub/banto-hub-external-db-design.md` §5.5）は
 //! `WindowsServiceManager::for_service` 経由で `BantoHubSink` の
 //! 起動・停止も扱えるが、`BantoHubSink` にはこの ACE が一切付与されて
 //! いなかった（PR #313 レビュー指摘）ため、Operators（管理者ではない
@@ -88,7 +88,7 @@ use crate::run::{run, SidecarOptions, StopRequest};
 /// SCM 上のサービス名。
 pub const SERVICE_NAME: &str = "BantoHubSink";
 const SERVICE_DISPLAY_NAME: &str = "banto-hub DB Sink サイドカー";
-const SERVICE_DESCRIPTION: &str = "banto-hub のタグ値を外部 PostgreSQL へ記録します（DB Sink）。設定・監視は banto-hub 側にあります。docs/banto-hub-external-db-design.md §5 参照。";
+const SERVICE_DESCRIPTION: &str = "banto-hub のタグ値を外部 PostgreSQL へ記録します（DB Sink）。設定・監視は banto-hub 側にあります。docs/hub/banto-hub-external-db-design.md §5 参照。";
 
 /// ログ行と案内の先頭に付ける製品名。
 const LABEL: &str = "banto-hub-sink";

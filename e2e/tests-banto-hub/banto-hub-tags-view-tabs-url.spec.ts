@@ -1,5 +1,5 @@
 /**
- * #1179 PR3a（docs/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、
+ * #1179 PR3a（docs/hub/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、
  * 2026-11-17 オーナー決定）の実 DOM 受け入れテスト。タグ登録ページの:
  *
  * - 中央のタブ「タグ一覧」「設定」（「すべて」には「設定」が無い）と、「設定」

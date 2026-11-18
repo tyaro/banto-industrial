@@ -1,4 +1,4 @@
-//! T20-3a の統合テスト（docs/banto-hub-t20-design.md §3.3「レシピ一括
+//! T20-3a の統合テスト（docs/hub/banto-hub-t20-design.md §3.3「レシピ一括
 //! 書き込み」）: `POST /api/v1/values/batch` の安全契約を固定する。
 //!
 //! `tests/write.rs`（単票の書き込みゲート網羅）と同じ理由（各
@@ -465,7 +465,7 @@ async fn create_tag(
     (tag.id, format!("{conn_name}.{group_name}.{tag_name}"))
 }
 
-/// [`create_tag`]の string タグ版(T20 ①a、docs/banto-hub-t20-design.md
+/// [`create_tag`]の string タグ版(T20 ①a、docs/hub/banto-hub-t20-design.md
 /// §3.1)。`writable`/`enabled`は常に true。
 #[allow(clippy::too_many_arguments)]
 async fn create_string_tag(
@@ -1518,7 +1518,7 @@ async fn record_only_happens_for_entries_that_actually_reach_insert_pending() {
 }
 
 // ---------------------------------------------------------------------------
-// T20 ①a (docs/banto-hub-t20-design.md §3.1): a recipe batch mixing numeric
+// T20 ①a (docs/hub/banto-hub-t20-design.md §3.1): a recipe batch mixing numeric
 // and string tags on the same connection - one `handle.write` job carries
 // both `BatchWriteRequest::Numeric` and `BatchWriteRequest::String` entries,
 // and both land on the simulator's wire correctly.

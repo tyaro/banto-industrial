@@ -1,4 +1,4 @@
-//! DB Source の運転状態（docs/banto-hub-external-db-design.md §4.2 の再接続・
+//! DB Source の運転状態（docs/hub/banto-hub-external-db-design.md §4.2 の再接続・
 //! §4.3 の Quality 表を、運用者が状態画面で追えるようにしたもの）。
 //!
 //! **プロセス内メモリのみ**（DB にも tstore にも書かない）: 状態は「今この
@@ -83,7 +83,7 @@ pub struct DbConnectionStatus {
     /// リテラル文字列（`expect` のメッセージ等）だけで、資格情報を
     /// 含まない（`crate::db_source` の doc comment「資格情報の扱い」）。
     pub last_restart_reason: Option<String>,
-    /// R2b-1e（docs/banto-hub-connection-settings-design.md §5.5）: パスワードを読めないので
+    /// R2b-1e（docs/hub/banto-hub-connection-settings-design.md §5.5）: パスワードを読めないので
     /// 起こしていない（または開封に失敗した）接続の理由。それ以外は `None`。状態の画面の
     /// `passwordState: "unreadable"`・`passwordUnreadableReason` になる（`crate::rest`）。
     pub password_unreadable: Option<UnreadableReason>,

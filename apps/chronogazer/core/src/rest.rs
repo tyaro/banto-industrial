@@ -89,7 +89,7 @@
 //! (`banto_server::csrf`) and, except for the auth routes themselves, a
 //! valid bearer token (`banto_server::auth::require_auth`).
 //!
-//! ## API キー（#1161 PR4、docs/chronogazer-agent-api-design.md §3・§4）
+//! ## API キー（#1161 PR4、docs/chronogazer/chronogazer-agent-api-design.md §3・§4）
 //!
 //! `Authorization: Bearer cg_…` は API キーとして照合し、通れば主体
 //! （`rest/actor.rs` の `Actor::ApiKey`）を載せる。キーで通った要求には CSRF の
@@ -109,7 +109,7 @@
 //! the route's minimum. Only `admin` can manage other accounts.
 //!
 //! `/api/plc-connections/*`, `/api/collection-groups/*` and `/api/tags/*`
-//! (#383 段階2a / R1-B, `docs/recorder-requirements.md` §3.6) instead follow
+//! (#383 段階2a / R1-B, `docs/chronogazer/recorder-requirements.md` §3.6) instead follow
 //! `viewer`-read / `editor`+-write: unlike the `admin`-only routers above,
 //! their GET routes need only `require_auth` (any role), so read and write
 //! share a path but need different floors - [`tag_registry_router`] uses
@@ -867,7 +867,7 @@ async fn collect_restart_handler(
 /// 床が割れようがないようにするため（[`COLLECT_AUDIT_RESOURCE`] と同じ作法）。
 ///
 /// **なぜ変更が `editor` であって `admin` ではないか**:
-/// docs/recorder-requirements.md §3.6「収集の開始/停止は editor 以上」と、
+/// docs/chronogazer/recorder-requirements.md §3.6「収集の開始/停止は editor 以上」と、
 /// そこに追記された **2026-09-18 のオーナー決定** - 「banto-hub は同種の制御
 /// （自動書き込みエンジンの arm/disarm 等）を admin 限定にしているが、
 /// chronogazer は別プロダクトであり R0 本文のこの決定を継承する。**banto-hub の
@@ -2198,7 +2198,7 @@ pub fn api_router(
     };
     let mcp = crate::mcp::mcp_router(mcp_state, gate.clone());
 
-    // #1161 PR4（docs/chronogazer-agent-api-design.md §3.3・§4.1）: キーを
+    // #1161 PR4（docs/chronogazer/chronogazer-agent-api-design.md §3.3・§4.1）: キーを
     // **通さない**集まり。ユーザー管理・サーバー設定・HUB 連携・バックアップ・
     // 監査ログ・API キー・認証・UI 設定・SSE。集まり全体の `reject_api_key` が
     // キーの主体を 403（`denied` を記録）で止める。

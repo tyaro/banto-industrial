@@ -1,4 +1,4 @@
-//! R2a-2d の完了の確かめ（docs/banto-hub-ingest-design.md §11 の R2a-2d の行）:
+//! R2a-2d の完了の確かめ（docs/hub/banto-hub-ingest-design.md §11 の R2a-2d の行）:
 //! `GET /api/v1/ingest/{id}/stream` を本物のルーター（`api_router`）を TCP で立てて、
 //! `tokio-tungstenite` のクライアントで叩く。
 //!

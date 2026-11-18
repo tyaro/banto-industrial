@@ -13,7 +13,7 @@
 //! into another crate's internals. So this is a standalone fake CPU: it speaks
 //! real SLMP 4E bytes (the whole point - the two things most likely to be wrong
 //! in the write client are whether the wrapped crate's structured
-//! `slmp::SlmpError` classification (H9, docs/h9-slmp-structured-error-spec.md)
+//! `slmp::SlmpError` classification (H9, docs/hub/driver/h9-slmp-structured-error-spec.md)
 //! still holds and the bit-unit nibble *packing*, both of which only real
 //! bytes exercise), keeps state in plain `HashMap`s, and can inject an end
 //! code, a malformed frame, or a hang.
@@ -22,7 +22,7 @@
 //! `slmp` crate builds and validates it: a 15-byte prefix, a 2-byte end code (on
 //! responses), then payload.
 //!
-//! ## T8 additions (docs/tag-server-design.md §6.1, RMW bit-in-word writes)
+//! ## T8 additions (docs/hub/tag-server-design.md §6.1, RMW bit-in-word writes)
 //!
 //! [`Simulator::write_command_count`]/[`Simulator::read_command_count`] let a
 //! test assert on the *number* of wire operations an RMW issued (one write
@@ -68,7 +68,7 @@ struct State {
     /// Emit responses with a corrupted response code (see [`frame`]).
     malformed: bool,
     hang: bool,
-    /// T8 (docs/tag-server-design.md §6.1) RMW test support: how many bulk
+    /// T8 (docs/hub/tag-server-design.md §6.1) RMW test support: how many bulk
     /// read/write commands this simulator has served, for tests that assert
     /// a mask-composed RMW costs exactly one wire write (not one per bit) -
     /// see `write_command_count`/`read_command_count`.
@@ -202,7 +202,7 @@ impl Simulator {
     }
 
     /// How many bulk *write* commands this simulator has served since it
-    /// started - T8 (docs/tag-server-design.md §6.1) test support for
+    /// started - T8 (docs/hub/tag-server-design.md §6.1) test support for
     /// asserting an RMW with several composed bits still costs exactly one
     /// wire write, not one per bit.
     pub fn write_command_count(&self) -> usize {
@@ -222,7 +222,7 @@ impl Simulator {
         self.state.lock().unwrap().last_subcommand
     }
 
-    /// T8 (docs/tag-server-design.md §6.1) RMW race test support: XOR
+    /// T8 (docs/hub/tag-server-design.md §6.1) RMW race test support: XOR
     /// `xor_mask` into `(device, number)`'s word immediately after the next
     /// write that lands there completes, simulating the PLC's own scan
     /// clobbering a bit between our write-back and our confirmation read.
@@ -469,7 +469,7 @@ fn build_write_response(state: &mut State, route: &Route, command: &[u8]) -> Vec
             let number = field.start + i as u32;
             state.words.insert((field.device, number), word);
 
-            // T8 (docs/tag-server-design.md §6.1) RMW race simulation: if a
+            // T8 (docs/hub/tag-server-design.md §6.1) RMW race simulation: if a
             // test armed a corruption for this exact (device, number) via
             // `corrupt_after_next_write`, apply it now - immediately after
             // committing the caller's own write, one-shot - so the *next*

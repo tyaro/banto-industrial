@@ -373,7 +373,7 @@ relay-wright-smoke.spec.ts` で初回セットアップ→ログイン/ログア
 
 ### H8: ドキュメント整合 — 状態: 完了(#58/#59)
 
-- **事実**: `docs/tag-server-design.md` はヘッダが「設計先行(実装未着手)」
+- **事実**: `docs/hub/tag-server-design.md` はヘッダが「設計先行(実装未着手)」
   のまま、同一ファイル §9 の表が T6〜T12 を「実装済み」と記載する自己矛盾。
   `docs/plan.md` の状態行も T8 止まり。root README にはリポジトリ最大の
   アプリである banto-hub の記載が**一切ない**(構成ツリーにも本文にも)。
@@ -398,7 +398,7 @@ relay-wright-smoke.spec.ts` で初回セットアップ→ログイン/ログア
 - **実施記録(2026-08-12)**: オーナーが `tyaro/slmp`(git 依存、tag
   `v0.2.0`)で構造化エラー(`SlmpError::{Device{end_code},Framing,Timeout,
 NotConnected,Io}` + `end_code_name`)を実装したのを受け、banto 側を移行。
-  詳細仕様は docs/h9-slmp-structured-error-spec.md(状態: 実装済みに更新
+  詳細仕様は docs/hub/driver/h9-slmp-structured-error-spec.md(状態: 実装済みに更新
   済み)。
   - workspace `Cargo.toml` の `slmp` を crates.io `0.1.23` から
     `{ git = "https://github.com/tyaro/slmp", tag = "v0.2.0" }` へ差し替え
@@ -515,7 +515,7 @@ Self` で自分の語彙へ写すだけにした。両クレートの
     値の読み取り=単一/バルク/WS・gRPC ストリームのみ絞る。理由「アドレスが
     見えると割り付けミスに気づきやすい」)。文法 `read:{conn}.{group}.{tag}` /
     `read:{conn}.{group}.*`(read 限定ワイルドカード、write は非対称)、素の
-    `read`・セッション認証は不変。詳細は docs/h10-3-read-scope-proposal.md。
+    `read`・セッション認証は不変。詳細は docs/archive/h10-3-read-scope-proposal.md。
     banto-hub-core 273 green
 
 ## 4. フェーズ分け
@@ -556,7 +556,7 @@ Self` で自分の語彙へ写すだけにした。両クレートの
 - `AGENTS.md` / `SECURITY.md` / `CONTRIBUTING.md` の整備(OSS として
   外部コントリビュータを迎える段階になったら)
 - **T17-1 cross-session mutex 診断**（2026-08-10 Windows 実機観察、
-  [banto-hub-t17-design.md](banto-hub-t17-design.md) §8「Windows 実機検証」）:
+  [banto-hub-t17-design.md](hub/banto-hub-t17-design.md) §8「Windows 実機検証」）:
   LocalSystem（Session 0）が profile mutex を保持している間、ユーザーセッション
   から Console 起動すると**起動拒否自体は成功**するが、
   `ProfileLockError::AlreadyHeld`（owner 診断付き）ではなく
