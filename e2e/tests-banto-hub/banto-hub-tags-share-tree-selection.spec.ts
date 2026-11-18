@@ -152,8 +152,13 @@ test.describe.serial('banto-hub タグ登録・タグモニタ: ツリーの選�
 		).toBeVisible();
 		await expect(monitorSelection()).toHaveText('すべて');
 
+		// 読めない値（初めから「すべて」と同じ表示になる）でも案内する。`page.goto` は
+		// 文書の読み込み直しなので、上の案内は残っていない。
 		await page.goto('/monitor?target=bogus');
 		await expect(page).toHaveURL(/\/monitor$/);
+		await expect(
+			page.getByText('指定された接続先・収集グループが見つからないため', { exact: false })
+		).toBeVisible();
 		await expect(monitorSelection()).toHaveText('すべて');
 	});
 

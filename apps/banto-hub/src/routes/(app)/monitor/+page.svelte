@@ -339,13 +339,13 @@
 		const resolved = resolveTreeTarget(parsed, currentConnections, currentGroups, { loaded });
 		untrack(() => {
 			if (loaded && !resolved.missingTarget) lastFoundTarget = resolved.target;
-			if (!sameTreeTarget(treeFilter, resolved.target)) {
-				const wasFound = parsed !== null && sameTreeTarget(parsed, lastFoundTarget);
-				if (loaded && resolved.missingTarget && !wasFound) {
-					toastStore.push('info', MISSING_TREE_TARGET_MESSAGE);
-				}
-				treeFilter = resolved.target;
+			// 案内は、表示が変わるかとは別に判定する（すでに「すべて」を表示中に読めない・
+			// 存在しない対象の URL で来ても出す）。URL はこのあと正規化されるので、出るのは 1 回。
+			const wasFound = parsed !== null && sameTreeTarget(parsed, lastFoundTarget);
+			if (loaded && resolved.missingTarget && !wasFound) {
+				toastStore.push('info', MISSING_TREE_TARGET_MESSAGE);
 			}
+			if (!sameTreeTarget(treeFilter, resolved.target)) treeFilter = resolved.target;
 			const canonical = monitorViewSearch(resolved.target, parseMonitorFocus(params));
 			if (loaded && search !== canonical) {
 				void navigateToTarget(resolved.target, { replace: true });

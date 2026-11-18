@@ -3302,13 +3302,13 @@
 		const resolved = resolveTagsView(parsed, currentConnections, currentGroups, { loaded });
 		untrack(() => {
 			if (loaded && !resolved.missingTarget) lastFoundTarget = resolved.view.target;
-			if (!sameTagsView(currentView(), resolved.view)) {
-				const wasFound = parsed.target !== null && sameTreeTarget(parsed.target, lastFoundTarget);
-				if (loaded && resolved.missingTarget && !wasFound) {
-					toastStore.push('info', MISSING_TREE_TARGET_MESSAGE);
-				}
-				applyView(resolved.view);
+			// 案内は、表示が変わるかとは別に判定する（すでに「すべて」を表示中に読めない・
+			// 存在しない対象の URL で来ても出す）。URL はこのあと正規化されるので、出るのは 1 回。
+			const wasFound = parsed.target !== null && sameTreeTarget(parsed.target, lastFoundTarget);
+			if (loaded && resolved.missingTarget && !wasFound) {
+				toastStore.push('info', MISSING_TREE_TARGET_MESSAGE);
 			}
+			if (!sameTagsView(currentView(), resolved.view)) applyView(resolved.view);
 			if (loaded && search !== tagsViewSearch(resolved.view)) {
 				void navigateToView(resolved.view, { replace: true });
 			}
