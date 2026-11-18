@@ -15,21 +15,21 @@
  * 同じ挙動）を導入し、`設定` だけ `/settings` を明示している
  * （banto-hub の navigation.ts と同じパターン）。
  *
- * #383 段階2a / R1-B: `/tags`（タグ設定）を追加。位置は
- * recorder-requirements.md §6 の画面順（監視・ヒストリカル・タグ設定・…）に
+ * #383 段階2a / R1-B: `/tags`（記録）を追加。位置は
+ * recorder-requirements.md §6 の画面順（監視・ヒストリカル・記録・…）に
  * 合わせ、ヒストリカルの直後・イベントの手前に置く。`adminOnly` は付けない -
  * viewer も閲覧できる（R0 §3.6: 読み取りは viewer 以上、書き込みは editor
  * 以上）。
  *
- * #393（#524 の段階 1）: `/groups`（グループ設定 = 表示グループの定義）を
- * タグ設定の直後に追加（§6 の画面順: 監視・ヒストリカル・タグ設定・グループ
- * 設定・イベント）。タグ設定と同じく viewer も閲覧でき、閲覧公開のセッションには
+ * #393（#524 の段階 1）: `/groups`（表示グループの定義）を
+ * 記録の直後に追加（§6 の画面順: 監視・ヒストリカル・記録・表示グループ・
+ * イベント）。記録と同じく viewer も閲覧でき、閲覧公開のセッションには
  * 出さない（設定画面のため）。コマンドパレットにはこの表から自動で載る。
  *
  * I2b（2026-10-04 オーナー決定: ChronoGazer でも閲覧公開を使う）: banto v3.0.0
  * の admin-template `navigation.ts` の `NavItem.publicViewer` と
  * `publicNavItems()` を写した。閲覧公開のセッションに見せるのは、計測値を
- * 見るだけの画面（監視・ヒストリカル・イベント）。タグ設定（PLC の接続先・
+ * 見るだけの画面（監視・ヒストリカル・イベント）。記録（PLC の接続先・
  * アドレスを含む設定画面）・ユーザー管理・監査ログ・設定は出さない
  * （admin-template が「ツリー」と設定を出さないのと同じ考え方）。
  *
@@ -49,7 +49,7 @@
  * `isNavItemActive()` を足した。メニューバー（`ShellMenubar.svelte`）・ドック
  * （`ShellLauncher.svelte`）・サイドバーが同じ関数で並べる。並びは改善案
  * （docs/chronogazer-ui-improvement-proposal.md）に合わせ「監視 / ヒストリカル /
- * イベント / タグ設定 / グループ設定 / 管理 ▾（ユーザー管理・監査ログ、admin だけ）/ 設定」。
+ * イベント / 記録 / 表示グループ / 管理 ▾（ユーザー管理・監査ログ、admin だけ）/ 設定」。
  * `adminOnly` の項目は 1 つの「管理」グループとして**最初の管理項目の位置**に集める
  * （`group` の指定は要らない）。表の順はサイドバー・コマンドパレットの並びでもある。
  */
@@ -123,8 +123,8 @@ export const navItems: NavItem[] = [
 	{ path: '/monitor', label: '監視', icon: '📈', publicViewer: true },
 	{ path: '/historical', label: 'ヒストリカル', icon: '🕰️', publicViewer: true },
 	{ path: '/events', label: 'イベント', icon: '🔔', publicViewer: true },
-	{ path: '/tags', label: 'タグ設定', icon: '🏷️' },
-	{ path: '/groups', label: 'グループ設定', icon: '🗂️' },
+	{ path: '/tags', label: '記録', icon: '📝' },
+	{ path: '/groups', label: '表示グループ', icon: '🗂️' },
 	{ path: '/users', label: 'ユーザー管理', icon: '👤', adminOnly: true },
 	{ path: '/audit-log', label: '監査ログ', icon: '🧾', adminOnly: true },
 	{ path: '/api-keys', label: 'API キー', icon: '🔑', adminOnly: true },

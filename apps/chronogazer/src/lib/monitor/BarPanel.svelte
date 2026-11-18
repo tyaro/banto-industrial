@@ -35,7 +35,7 @@
 		pens: readonly MeterView[];
 		/** 時刻の表示（端末のロケール）。 */
 		timeLabel: (epochMs: number) => string;
-		/** 設定不正・レンジ未設定のペンに添えるタグ設定へのリンク（`null` = 出さない）。 */
+		/** 設定不正・レンジ未設定のペンに添える記録へのリンク（`null` = 出さない）。 */
 		tagsHref: string | null;
 	}
 
@@ -99,7 +99,7 @@
 					{pen.rangeMessage}
 					{#if pen.range.kind === 'unset' && tagsHref}
 						<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -- tagsHref は呼び出し側が resolveAppPath() で作る -->
-						<a class="fix-link" href={tagsHref}>タグ設定を開く</a>
+						<a class="fix-link" href={tagsHref}>記録を開く</a>
 					{/if}
 				</div>
 			{/if}
@@ -114,7 +114,7 @@
 			{/if}
 			{#if pen.linkToTags && tagsHref}
 				<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -- tagsHref は呼び出し側が resolveAppPath() で作る -->
-				<a class="fix-link" href={tagsHref}>タグ設定で直す</a>
+				<a class="fix-link" href={tagsHref}>記録で直す</a>
 			{/if}
 		</li>
 	{/each}

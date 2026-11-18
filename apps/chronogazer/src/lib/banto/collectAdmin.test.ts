@@ -458,7 +458,7 @@ describe('除外の一覧（#414 段階2）', () => {
 		expect(collectExclusionsHeadline(collectExclusions(state).length)).toBe('除外あり（1 件）');
 		const note = collectExclusionsNote(state);
 		expect(note).not.toBeNull();
-		const text = `${note?.summary}タグ設定${note?.fix}`;
+		const text = `${note?.summary}記録${note?.fix}`;
 		expect(text).not.toContain('収集しています');
 		expect(text).toContain('現在は収集していません');
 		// 走っていないので「再起動」ではなく「開始」を案内する。
@@ -493,7 +493,7 @@ describe('除外の一覧（#414 段階2）', () => {
 			exclusions
 		});
 
-		it('hubNotConfigured: 設定 > Hub接続 へ案内し、タグ設定で直せとは言わない（連鎖の除外があっても）', () => {
+		it('hubNotConfigured: 設定 > Hub接続 へ案内し、記録で直せとは言わない（連鎖の除外があっても）', () => {
 			const note = collectExclusionsNote(
 				running([
 					hub('hubNotConfigured'),
@@ -516,7 +516,7 @@ describe('除外の一覧（#414 段階2）', () => {
 			expect(note?.guides[0].link).toBeNull();
 		});
 
-		it('hubTagNotFound / hubTagTypeChanged: タグ設定でそのタグを編集して直す案内（削除・再登録は勧めない。理由の並びは固定）', () => {
+		it('hubTagNotFound / hubTagTypeChanged: 記録でそのタグを編集して直す案内（削除・再登録は勧めない。理由の並びは固定）', () => {
 			const note = collectExclusionsNote(
 				running([hub('hubTagTypeChanged', 'tag:5'), hub('hubTagNotFound', 'tag:4')])
 			);
@@ -528,11 +528,11 @@ describe('除外の一覧（#414 段階2）', () => {
 				expect(guide.text).not.toContain('登録し直');
 				expect(guide.link?.path).toBe('/tags');
 			}
-			// タグ設定での作業が要る理由なので、従来のリンク文も出す。
+			// 記録での作業が要る理由なので、従来のリンク文も出す。
 			expect(note?.fix).not.toBeNull();
 		});
 
-		it('設定の不正と Hub の環境理由が混ざれば、タグ設定の案内も Hub の案内も出る', () => {
+		it('設定の不正と Hub の環境理由が混ざれば、記録の案内も Hub の案内も出る', () => {
 			const note = collectExclusionsNote(running([legacy, hub('hubNotConfigured')]));
 			expect(note?.fix).toContain('「収集を再起動」');
 			expect(note?.summary).toContain('不正');

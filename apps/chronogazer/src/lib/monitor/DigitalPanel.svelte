@@ -14,7 +14,7 @@
 	 *   ありません」）を小さく添える（2026-10-08 オーナー決定 Q2、#531 レビュー）。
 	 * - しきい値は**色と文字の両方**で出す（色だけで伝えない）。
 	 * - `invalid`（設定不正）は直す場所へのリンクを添える（`tagsHref` が `null` なら
-	 *   出さない - 閲覧公開のセッションはタグ設定を開けない）。
+	 *   出さない - 閲覧公開のセッションは記録を開けない）。
 	 */
 	import type { DisplayGroup } from '#lib/banto/displayGroupsAdmin.js';
 	import { lastReceivedText, type PenView } from './monitorLogic';
@@ -24,7 +24,7 @@
 		pens: readonly PenView[];
 		/** 時刻の表示（端末のロケール）。 */
 		timeLabel: (epochMs: number) => string;
-		/** 設定不正のペンに添えるタグ設定へのリンク（`null` = 出さない）。 */
+		/** 設定不正のペンに添える記録へのリンク（`null` = 出さない）。 */
 		tagsHref: string | null;
 	}
 
@@ -54,7 +54,7 @@
 			{/if}
 			{#if pen.linkToTags && tagsHref}
 				<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -- tagsHref は呼び出し側が resolveAppPath() で作る -->
-				<a class="fix-link" href={tagsHref}>タグ設定で直す</a>
+				<a class="fix-link" href={tagsHref}>記録で直す</a>
 			{/if}
 		</li>
 	{/each}

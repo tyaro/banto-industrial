@@ -483,7 +483,7 @@ test.describe.serial('chronogazer 開発用 PLC 相手の収集の一巡（R1-C 
 
 	test('1. 開発用 PLC への接続・収集グループ・タグを画面から作る', async () => {
 		await page.goto('/tags');
-		await expect(page.getByRole('heading', { level: 2, name: 'タグ設定' })).toBeVisible();
+		await expect(page.getByRole('heading', { level: 2, name: '記録' })).toBeVisible();
 
 		const connSection = page.locator('section.registry-section').nth(0);
 		const connForm = connSection.locator('div.create');
@@ -633,10 +633,7 @@ test.describe.serial('chronogazer 開発用 PLC 相手の収集の一巡（R1-C 
 		const row = exclusions.getByRole('row').filter({ hasText: LEGACY_TAG_NAME });
 		await expect(row).toContainText('タグ');
 		await expect(row).toContainText('このドライバのアドレスとして解釈できません');
-		await expect(exclusions.getByRole('link', { name: 'タグ設定' })).toHaveAttribute(
-			'href',
-			'/tags'
-		);
+		await expect(exclusions.getByRole('link', { name: '記録' })).toHaveAttribute('href', '/tags');
 
 		// 正常なタグは収集され、データファイルに書き込みが入る。
 		await expect

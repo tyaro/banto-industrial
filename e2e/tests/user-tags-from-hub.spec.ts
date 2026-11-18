@@ -132,7 +132,7 @@ async function routeCatalog(page: Page, legacySelection: string[]): Promise<void
 	});
 }
 
-test.describe.serial('chronogazer タグ設定の「Hub から追加」（#383 段階3 P4）', () => {
+test.describe.serial('chronogazer 記録の「Hub から追加」（#383 段階3 P4）', () => {
 	let page: Page;
 	let headers: ApiHeaders;
 	let confirmAnswer: 'accept' | 'dismiss' = 'accept';

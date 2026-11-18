@@ -359,7 +359,7 @@ describe('penView（値・品質・しきい値の総当たり）', () => {
 			}
 		],
 		[
-			'invalid: 設定不正、タグ設定へ案内',
+			'invalid: 設定不正、記録へ案内',
 			{ value: null, ptimeMs: null, quality: 'invalid', lastGoodMs: null },
 			tag(),
 			{

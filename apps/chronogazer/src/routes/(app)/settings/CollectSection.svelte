@@ -334,7 +334,7 @@
 					<p class="note">
 						{exclusionsNote.summary}
 						{#if exclusionsNote.fix !== null}
-							<a href={resolveAppPath('/tags')}>タグ設定</a>{exclusionsNote.fix}
+							<a href={resolveAppPath('/tags')}>記録</a>{exclusionsNote.fix}
 						{/if}
 					</p>
 					{#each exclusionsNote.guides as guide (guide.reason)}
@@ -431,7 +431,7 @@
 		{/if}
 
 		<p class="note">
-			収集の開始・停止・接続の切断などの記録は「イベント」画面で見られます。タグ設定の変更（接続のシミュレーションの切替を含む）は自動では反映されません（「収集を再起動」で反映します）。
+			収集の開始・停止・接続の切断などの記録は「イベント」画面で見られます。記録の変更（接続のシミュレーションの切替を含む）は自動では反映されません（「収集を再起動」で反映します）。
 		</p>
 	{:else}
 		<p class="note">

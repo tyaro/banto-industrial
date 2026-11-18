@@ -1,5 +1,5 @@
 /**
- * グループ設定画面（`/groups`、#393 = #524 の段階 1）の E2E 固定。
+ * 「表示グループ」ページ（`/groups`、#393 = #524 の段階 1）の E2E 固定。
  *
  * 固定したい受入条件:
  * 1. 表示グループを作成できる（名前・表示種別・トレンドの既定時間窓・ペン 2 本・
@@ -96,7 +96,7 @@ async function cleanupFixtures(request: APIRequestContext, headers: ApiHeaders):
 	if (failures.length > 0) throw new Error(`掃除に失敗しました:\n${failures.join('\n')}`);
 }
 
-test.describe.serial('chronogazer グループ設定画面（#393）', () => {
+test.describe.serial('chronogazer 「表示グループ」ページ（#393）', () => {
 	let page: Page;
 	let headers: ApiHeaders;
 	let tagAId: number;
@@ -175,10 +175,10 @@ test.describe.serial('chronogazer グループ設定画面（#393）', () => {
 	test('1. 表示グループを作成できる（ペン 2 本・種別・時間窓・色、しきい値は読み取り専用）', async () => {
 		await page
 			.locator('aside nav')
-			.getByRole('link', { name: /グループ設定/ })
+			.getByRole('link', { name: /表示グループ/ })
 			.click();
 		await expect(page).toHaveURL(/\/groups$/);
-		await expect(page.getByRole('heading', { level: 2, name: 'グループ設定' })).toBeVisible();
+		await expect(page.getByRole('heading', { level: 2, name: '表示グループ' })).toBeVisible();
 
 		await list().getByRole('button', { name: '新規グループ' }).click();
 		await editor().getByLabel('名前').fill(GROUP_NAME);
@@ -255,7 +255,7 @@ test.describe.serial('chronogazer グループ設定画面（#393）', () => {
 		expect(dialogs).toEqual([`${GROUP_NAME} を削除しますか？`]);
 
 		await page.reload();
-		await expect(page.getByRole('heading', { level: 2, name: 'グループ設定' })).toBeVisible();
+		await expect(page.getByRole('heading', { level: 2, name: '表示グループ' })).toBeVisible();
 		await expect(list().getByRole('button', { name: '新規グループ' })).toBeEnabled();
 		await expect(groupButton()).toHaveCount(0);
 

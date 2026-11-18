@@ -527,7 +527,7 @@ const REASON_NOT_STARTED: &str = "購読の状態をまだ確認していませ�
 const REASON_NOT_CONFIGURED: &str = "Hubへの接続が設定されていません。";
 const REASON_NOT_CONNECTED: &str = "Hubに接続できていないため購読していません。";
 const REASON_NO_TAGS: &str =
-    "Hub 経由のタグが登録されていないため購読していません（「タグ設定」の「Hub から追加」で登録します）。";
+    "Hub 経由のタグが登録されていないため購読していません（「記録」の「Hub から追加」で登録します）。";
 const REASON_ALL_UNSUPPORTED: &str =
     "登録したタグの名前が購読プロトコルの制約に合わないため、購読できるタグがありません。";
 const REASON_NO_KEY: &str =

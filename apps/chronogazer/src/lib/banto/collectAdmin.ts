@@ -609,12 +609,12 @@ export function collectStateDetail(state: CollectorStateView): string {
 			// #414 段階2: 全部が設定の不正で外れた場合は、登録・有効化ではなく
 			// 「直す」が次の一手（一覧は `collectExclusionsHeadline` の下に出る）。
 			if (state.exclusions.length > 0 && !exclusionsNeedSettingFix(state.exclusions)) {
-				// Hub に未接続・Hub を持たない実行形態など、タグ設定では直らない理由だけ。
+				// Hub に未接続・Hub を持たない実行形態など、記録では直らない理由だけ。
 				return '有効なタグがすべて収集できない設定で外れたため、収集するものがありません（失敗ではありません）。下の「除外あり」の案内に従ってから「収集を開始」を押してください。';
 			}
 			return state.exclusions.length > 0
-				? '有効なタグがすべて設定の不正で外れたため、収集するものがありません（失敗ではありません）。下の「除外あり」の一覧の設定を「タグ設定」で直してから「収集を開始」を押してください。'
-				: '有効なタグが1件もないため、収集するものがありません（失敗ではありません）。「タグ設定」でタグを登録・有効化してから「収集を再起動」を押してください。';
+				? '有効なタグがすべて設定の不正で外れたため、収集するものがありません（失敗ではありません）。下の「除外あり」の一覧の設定を「記録」で直してから「収集を開始」を押してください。'
+				: '有効なタグが1件もないため、収集するものがありません（失敗ではありません）。「記録」でタグを登録・有効化してから「収集を再起動」を押してください。';
 		case 'startFailed':
 			return '前回の開始が失敗したままです。失敗した理由はこの状態表示には含まれません - 「収集を開始」を押すと、その結果として理由が表示されます。';
 	}
@@ -654,15 +654,15 @@ export function collectExclusionsHeadline(count: number): string | null {
  * 「収集を再起動」、`noTargets` は走っていないので「収集を開始」）。
  *
  * - `summary`: 何が起きているか。
- * - `fix`: 画面が「タグ設定」リンクの**直後**に続ける文。
+ * - `fix`: 画面が「記録」リンクの**直後**に続ける文。
  *
  * 除外欄を出さない状態（一覧が空・`running` / `noTargets` 以外）では `null`。
  */
 export interface CollectExclusionsNote {
 	summary: string;
 	/**
-	 * 「タグ設定」リンクの直後に続ける文。**設定の不正を直す必要がある**ときだけ
-	 * （Hub に未接続・Hub を持たない実行形態のように、タグ設定では直らない理由
+	 * 「記録」リンクの直後に続ける文。**設定の不正を直す必要がある**ときだけ
+	 * （Hub に未接続・Hub を持たない実行形態のように、記録では直らない理由
 	 * だけが原因のときは `null` で、画面はリンクも出さない）。
 	 */
 	fix: string | null;
@@ -694,17 +694,17 @@ const HUB_EXCLUSION_GUIDES: readonly ExclusionGuide[] = [
 	},
 	{
 		reason: 'hubTagNotFound',
-		text: 'Hub にタグが見つからないため外れたタグがあります（Hub で削除・改名されたか、使っているキーでは見えません）。まず Hub 側でタグの名前と、使っているキーで見えるかを確認してください。Hub で改名されたなら、タグ設定で該当のタグを編集してアドレス（外部名）を新しい名前に直し、「収集を再起動」してください（削除せず編集すれば、ID・しきい値・表示・履歴が保たれます）。キーで見えないだけなら Hub 側のキー設定を確認してください:',
-		link: { label: 'タグ設定', path: '/tags' }
+		text: 'Hub にタグが見つからないため外れたタグがあります（Hub で削除・改名されたか、使っているキーでは見えません）。まず Hub 側でタグの名前と、使っているキーで見えるかを確認してください。Hub で改名されたなら、記録で該当のタグを編集してアドレス（外部名）を新しい名前に直し、「収集を再起動」してください（削除せず編集すれば、ID・しきい値・表示・履歴が保たれます）。キーで見えないだけなら Hub 側のキー設定を確認してください:',
+		link: { label: '記録', path: '/tags' }
 	},
 	{
 		reason: 'hubTagTypeChanged',
-		text: 'Hub 側でデータ型が変わったため外れたタグがあります。タグ設定で該当のタグを編集してデータ型を Hub に合わせ、「収集を再起動」してください（削除せず編集すれば、ID・しきい値・表示・履歴が保たれます）:',
-		link: { label: 'タグ設定', path: '/tags' }
+		text: 'Hub 側でデータ型が変わったため外れたタグがあります。記録で該当のタグを編集してデータ型を Hub に合わせ、「収集を再起動」してください（削除せず編集すれば、ID・しきい値・表示・履歴が保たれます）:',
+		link: { label: '記録', path: '/tags' }
 	}
 ];
 
-/** タグ設定では直らない（環境の）理由。これと連鎖（配下の除外）だけなら「タグ設定で直して」は案内しない。 */
+/** 記録では直らない（環境の）理由。これと連鎖（配下の除外）だけなら「記録で直して」は案内しない。 */
 const NON_TAG_FIX_REASONS: ReadonlySet<string> = new Set([
 	'hubNotConfigured',
 	'hubSourceUnavailable',
@@ -713,7 +713,7 @@ const NON_TAG_FIX_REASONS: ReadonlySet<string> = new Set([
 	'groupExcluded'
 ]);
 
-/** 除外のうち、タグ設定で直すべきもの（設定の不正・Hub のタグの食い違い）が 1 件でもあるか。 */
+/** 除外のうち、記録で直すべきもの（設定の不正・Hub のタグの食い違い）が 1 件でもあるか。 */
 export function exclusionsNeedSettingFix(exclusions: readonly ExclusionView[]): boolean {
 	return exclusions.some((exclusion) => !NON_TAG_FIX_REASONS.has(exclusion.reason));
 }

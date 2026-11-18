@@ -12,13 +12,13 @@ import {
 const paths = (items: NavItem[]) => items.map((item) => item.path);
 
 describe('navItems の並び（改善案の順、#1159）', () => {
-	it('監視 / ヒストリカル / イベント / タグ設定 / グループ設定 / 管理 / 設定', () => {
+	it('監視 / ヒストリカル / イベント / 記録 / 表示グループ / 管理 / 設定', () => {
 		expect(navItems.map((item) => item.label)).toEqual([
 			'監視',
 			'ヒストリカル',
 			'イベント',
-			'タグ設定',
-			'グループ設定',
+			'記録',
+			'表示グループ',
 			'ユーザー管理',
 			'監査ログ',
 			'API キー',
@@ -54,7 +54,7 @@ describe('visibleNavItems', () => {
 });
 
 describe('navBarEntries', () => {
-	it('admin: 監視 / ヒストリカル / イベント / タグ設定 / グループ設定 / 管理(グループ) / 設定 の並び', () => {
+	it('admin: 監視 / ヒストリカル / イベント / 記録 / 表示グループ / 管理(グループ) / 設定 の並び', () => {
 		const entries = navBarEntries(visibleNavItems({ role: 'admin' }));
 		expect(
 			entries.map((entry) => (entry.kind === 'item' ? entry.item.label : `[${entry.key}]`))
@@ -62,8 +62,8 @@ describe('navBarEntries', () => {
 			'監視',
 			'ヒストリカル',
 			'イベント',
-			'タグ設定',
-			'グループ設定',
+			'記録',
+			'表示グループ',
 			`[${ADMIN_GROUP_KEY}]`,
 			'設定'
 		]);

@@ -1,5 +1,5 @@
 /**
- * `groups/+page.svelte`（グループ設定、#393）の判断を純関数に出したもの。
+ * `groups/+page.svelte`（表示グループ、#393）の判断を純関数に出したもの。
  * `tags/tagsPageLogic.ts` と同じ理由（Svelte 5 rune を使うページは、この
  * リポジトリの最小 vitest 構成では直接ロードできない）で、状態を持たない
  * 判断だけをここに置き、依存ゼロでテストする。
@@ -172,7 +172,7 @@ export interface TagThresholds {
 
 /**
  * しきい値の読み取り専用の表示（LL / L / H / HH の順）。1 つも無ければ
- * 「しきい値なし」。編集はタグ設定画面の「しきい値（記録計の設定）」で行う
+ * 「しきい値なし」。編集は「記録」ページの「しきい値（記録計の設定）」で行う
  * （保存は記録計の側の設定の経路。§3.7.6）。
  */
 export function thresholdSummary(tag: TagThresholds | undefined): string {
