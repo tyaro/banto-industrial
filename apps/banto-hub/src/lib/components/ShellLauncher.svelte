@@ -12,11 +12,12 @@
 	import {
 		isNavItemActive,
 		navBarEntries,
-		resolveAppPath,
+		navItemHref,
 		visibleNavItems,
 		type NavItem
 	} from '#lib/navigation.js';
 	import { sessionStore } from '#lib/session.svelte.js';
+	import { sharedTreeTarget } from '#lib/treeSelection.svelte.js';
 	import { settings } from '#lib/settings.svelte.js';
 	import { LauncherBar, type LauncherGroup, type LauncherItem } from '@banto/ui';
 	import { navIcon } from './navIcons';
@@ -32,7 +33,7 @@
 		const count = item.path === '/status' ? pendingCount : 0;
 		return {
 			id: item.path,
-			href: resolveAppPath(item.path),
+			href: navItemHref(item.path, sharedTreeTarget.current),
 			label: item.label,
 			icon: navIcon(item.icon),
 			active: isNavItemActive(item, page.url.pathname),

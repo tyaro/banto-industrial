@@ -151,8 +151,8 @@ test.describe.serial('banto-hub モニタ Tree/検索 + 確認導線ディープ
 		await expect(page.getByText(EXTERNAL_B)).toHaveCount(0);
 	});
 
-	test('3. /monitor?group=<id> のディープリンクでそのグループに絞られる', async () => {
-		await page.goto(`/monitor?group=${groupAId}`);
+	test('3. /monitor?target=group:<id> のディープリンクでそのグループに絞られる', async () => {
+		await page.goto(`/monitor?target=group:${groupAId}`);
 		await expect(page.getByText(EXTERNAL_A)).toBeVisible();
 		await expect(page.getByText(EXTERNAL_B)).toHaveCount(0);
 	});

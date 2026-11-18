@@ -6,16 +6,12 @@
 	// ドロワー、nav-menubar-plan.md §4.9）。ドロワーは折り畳みを持たない。
 	import { tick, untrack } from 'svelte';
 	import { page } from '$app/state';
-	import {
-		isNavItemActive,
-		resolveAppPath,
-		visibleNavItems,
-		type NavItem
-	} from '#lib/navigation.js';
+	import { isNavItemActive, navItemHref, visibleNavItems, type NavItem } from '#lib/navigation.js';
 	import { settings } from '#lib/settings.svelte.js';
 	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
 	import { NAV_TOGGLE_ATTR, SIDEBAR_ID, findVisibleNavToggle } from '#lib/mobileNav.js';
 	import { sessionStore } from '#lib/session.svelte.js';
+	import { sharedTreeTarget } from '#lib/treeSelection.svelte.js';
 	import { APP_NAME } from '#lib/appName.js';
 
 	let { pendingCount = 0 }: { pendingCount?: number } = $props();
@@ -127,7 +123,7 @@
 	<nav>
 		{#each visibleItems as item (item.path)}
 			<a
-				href={resolveAppPath(item.path)}
+				href={navItemHref(item.path, sharedTreeTarget.current)}
 				class:active={isActive(item)}
 				title={collapsed ? item.label : undefined}
 				onclick={handleNavClick}

@@ -31,6 +31,8 @@
  */
 import type { CollectionGroup, PlcConnection, TagKind } from './tagRegistryAdmin';
 import { resolveAppPath } from '../navigation';
+import { monitorViewSearch } from './monitorView';
+import type { TreeFilterSelection } from './treeFilterPrune';
 
 /** `PlcConnection.protocol === "virtual"`（`calc`/`mem`）かどうか。型だけの
  * 依存に留めるため、`tagRegistryAdmin.isVirtualConnection` は呼ばず同じ判定
@@ -64,16 +66,18 @@ const MEM_CONNECTION_NAME = 'mem';
  * として値・品質・時刻へ1クリックで移動できるようにする」）: タグ登録
  * ページの各成功ハンドラから `/monitor` へ渡す遷移先を組み立てる。
  *
- * - `groupId` が指定されていれば `?group={id}`。`groupId` が無く
- *   `connectionId` があれば `?connection={id}`（**group と connection は
+ * - `groupId` が指定されていれば `?target=group:{id}`。`groupId` が無く
+ *   `connectionId` があれば `?target=connection:{id}`（**group と connection は
  *   同時指定しない・group を優先** - モニタのツリー絞り込みは「すべて／
- *   接続／グループ」のいずれか1つの粒度しか選べないため）。
+ *   接続／グループ」のいずれか1つの粒度しか選べないため）。#1179 PR3b で
+ *   タグ登録と同じ `target` の形にした（組み立ては `./monitorView` の
+ *   `monitorViewSearch`）。
  * - `focus`（対象タグの external_name 配列）が空でなければ `focus=` を
  *   付ける。複数要素はカンマ区切りで連結し、各要素は `encodeURIComponent`
  *   する（`URLSearchParams` は使わない - 呼び出し側で組み立てた「区切りの
  *   カンマは生のまま、要素の中身だけ encode 済み」の文字列をそのまま
  *   `URLSearchParams` へ渡すと、`,` まで含めて二重に percent-encode
- *   されてしまう）。group/connection パラメータがあれば `&` で連結する。
+ *   されてしまう）。target パラメータがあれば `&` で連結する。
  * - `focus` が空配列・未指定なら `focus` パラメータ自体を付けない。
  * - 何も指定が無ければ `/monitor` をそのまま返す。
  */
@@ -82,17 +86,13 @@ export function monitorHref(opts: {
 	connectionId?: number | null;
 	focus?: string[];
 }): string {
-	const params: string[] = [];
-	if (opts.groupId !== null && opts.groupId !== undefined) {
-		params.push(`group=${opts.groupId}`);
-	} else if (opts.connectionId !== null && opts.connectionId !== undefined) {
-		params.push(`connection=${opts.connectionId}`);
-	}
-	if (opts.focus && opts.focus.length > 0) {
-		params.push(`focus=${opts.focus.map((name) => encodeURIComponent(name)).join(',')}`);
-	}
-	const monitor = resolveAppPath('/monitor');
-	return params.length === 0 ? monitor : `${monitor}?${params.join('&')}`;
+	const target: TreeFilterSelection =
+		opts.groupId !== null && opts.groupId !== undefined
+			? { type: 'group', id: opts.groupId }
+			: opts.connectionId !== null && opts.connectionId !== undefined
+				? { type: 'connection', id: opts.connectionId }
+				: { type: 'all' };
+	return `${resolveAppPath('/monitor')}${monitorViewSearch(target, opts.focus ?? [])}`;
 }
 
 // --- 親設定プリセット（ツリー選択・URLクエリ → フォームへの引継ぎ） --------

@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
 	parseTagsView,
+	parseTreeTarget,
 	resolveTagsView,
+	resolveTreeTarget,
 	sameTagsView,
 	tagsViewSearch,
+	treeTargetSearch,
 	type TagsView
 } from './tagsView.js';
 
@@ -111,5 +114,42 @@ describe('sameTagsView', () => {
 		expect(sameTagsView(a, { target: { type: 'group', id: 11 }, tab: 'list' })).toBe(false);
 		expect(sameTagsView(a, { target: { type: 'connection', id: 10 }, tab: 'list' })).toBe(false);
 		expect(sameTagsView(a, { target: { type: 'group', id: 10 }, tab: 'settings' })).toBe(false);
+	});
+});
+
+describe('parseTreeTarget / resolveTreeTarget / treeTargetSearch（#1179 PR3b）', () => {
+	const target = (search: string) => parseTreeTarget(new URLSearchParams(search));
+
+	it('target だけを読む（tab は見ない）', () => {
+		expect(target('')).toEqual({ type: 'all' });
+		expect(target('target=group:10&tab=settings')).toEqual({ type: 'group', id: 10 });
+		expect(target('target=connection:2')).toEqual({ type: 'connection', id: 2 });
+		expect(target('target=foo')).toBeNull();
+		expect(target('target=group:0')).toBeNull();
+	});
+
+	it('一覧に無い id・読めない値は「すべて」と missingTarget、読み込み前は存在を判定しない', () => {
+		expect(resolveTreeTarget(target('target=group:99'), connections, groups, loaded)).toEqual({
+			target: { type: 'all' },
+			missingTarget: true
+		});
+		expect(resolveTreeTarget(null, connections, groups, loaded)).toEqual({
+			target: { type: 'all' },
+			missingTarget: true
+		});
+		expect(resolveTreeTarget(target('target=group:99'), [], [], { loaded: false })).toEqual({
+			target: { type: 'group', id: 99 },
+			missingTarget: false
+		});
+		expect(resolveTreeTarget(target('target=connection:1'), connections, groups, loaded)).toEqual({
+			target: { type: 'connection', id: 1 },
+			missingTarget: false
+		});
+	});
+
+	it('対象だけのクエリを作る（「すべて」は空）', () => {
+		expect(treeTargetSearch({ type: 'all' })).toBe('');
+		expect(treeTargetSearch({ type: 'group', id: 10 })).toBe('?target=group:10');
+		expect(treeTargetSearch({ type: 'connection', id: 2 })).toBe('?target=connection:2');
 	});
 });

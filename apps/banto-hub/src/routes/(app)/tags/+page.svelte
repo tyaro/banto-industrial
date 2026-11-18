@@ -29,7 +29,9 @@
 	import { deferredDelete, UNDO_WINDOW_MS } from '#lib/banto/deferredDelete.svelte.js';
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
+	import { sharedTreeTarget } from '#lib/treeSelection.svelte.js';
 	import {
+		MISSING_TREE_TARGET_MESSAGE,
 		parseTagsView,
 		resolveTagsView,
 		sameTagsView,
@@ -3264,7 +3266,9 @@
 	async function navigateToView(view: TagsView, options: { replace: boolean }): Promise<void> {
 		const url = new URL(page.url.href);
 		url.search = tagsViewSearch(view);
-		if (url.href === page.url.href) return;
+		// 先の `goto` がまだ終わっていない間は `page.url` が古いので、同じに見えても
+		// 省かない（上下キーを続けて押し、元の行へ戻ったときに URL だけが先の行に残る）。
+		if (url.href === page.url.href && viewNavsInFlight === 0) return;
 		const href = url.href;
 		viewNavHrefs.add(href);
 		viewNavsInFlight += 1;
@@ -3300,16 +3304,13 @@
 		const resolved = resolveTagsView(parsed, currentConnections, currentGroups, { loaded });
 		untrack(() => {
 			if (loaded && !resolved.missingTarget) lastFoundTarget = resolved.view.target;
-			if (!sameTagsView(currentView(), resolved.view)) {
-				const wasFound = parsed.target !== null && sameTreeTarget(parsed.target, lastFoundTarget);
-				if (loaded && resolved.missingTarget && !wasFound) {
-					toastStore.push(
-						'info',
-						'指定された接続先・収集グループが見つからないため、すべてのタグを表示します'
-					);
-				}
-				applyView(resolved.view);
+			// 案内は、表示が変わるかとは別に判定する（すでに「すべて」を表示中に読めない・
+			// 存在しない対象の URL で来ても出す）。URL はこのあと正規化されるので、出るのは 1 回。
+			const wasFound = parsed.target !== null && sameTreeTarget(parsed.target, lastFoundTarget);
+			if (loaded && resolved.missingTarget && !wasFound) {
+				toastStore.push('info', MISSING_TREE_TARGET_MESSAGE);
 			}
+			if (!sameTagsView(currentView(), resolved.view)) applyView(resolved.view);
 			if (loaded && search !== tagsViewSearch(resolved.view)) {
 				void navigateToView(resolved.view, { replace: true });
 			}
@@ -3319,6 +3320,12 @@
 	afterNavigate((nav) => {
 		// 戻る・進むで来た項目は、どの操作で積んだものか分からない。
 		if (nav.type === 'popstate') viewEntryFromKeyNavigation = false;
+	});
+
+	// #1179 PR3b: 選んでいる対象をタグモニタと共有する（ナビのリンクが `?target=` に
+	// 付ける、`#lib/treeSelection.svelte.ts`）。タブは共有しない。
+	$effect(() => {
+		sharedTreeTarget.set(treeFilter);
 	});
 
 	/** 中央のタブ。「すべて」には「設定」が無い（タブ列ごと出さない - `.view-tabs.single`）。 */
