@@ -18,9 +18,13 @@
 	 *   BantoTree は行の `aria-label` に `node.label` を出す）。以前の「ボタンの
 	 *   中身の文字」と同じ文字列（アイコンを除く名前＋バッジ・件数・周期）を
 	 *   `label` に入れて、E2E・支援技術から見える名前を変えない。
-	 * - 子グループが 0 件の接続の「収集グループ未登録」の案内は、BantoTree に
-	 *   空状態のスロットが無いため、選べない（`disabled`）子ノードとして出す。
-	 *   選択・右クリックはこのコンポーネントで捨てる。
+	 * - 子グループが 0 件の接続の「収集グループ未登録」の案内は、BantoTree の
+	 *   `emptyChildren`（banto v7.4.0、banto#653）で出す。以前は選べない
+	 *   （`disabled`）子ノードに見せていたが、`emptyChildren` の行はノードでは
+	 *   なく、矢印キーが飛ばし、選択・右クリックの対象にもならない。
+	 * - 狭幅（左ツリーが退避パネル）では `selectionFollowsFocus=false`
+	 *   （2026-11-18 オーナー決定）。上下キーはフォーカスだけを動かし、
+	 *   Enter・Space・クリックで選ぶ。広幅は従来どおり選択がフォーカスに付く。
 	 *
 	 * T18-6c（2026-08-27 オーナー決定、TAG-UX-9 見た目刷新）: ノード種別
 	 * アイコン・グループの設定周期表示・空グループ案内行。banto-hub 固有の
@@ -47,10 +51,16 @@
 		tags: Tag[];
 		selectedId?: string | null;
 		/**
+		 * 上下キーなどのフォーカス移動に選択を付いてこさせるか（BantoTree の
+		 * `selectionFollowsFocus`）。狭幅の退避パネルでは `false` を渡す。
+		 */
+		selectionFollowsFocus?: boolean;
+		/**
 		 * ノードの選択の通知。`navigation: true` は、上下・Home・End・左右の
-		 * キーでフォーカスが動いたことに選択が付いてきた場合（BantoTree は単一
-		 * 選択でフォーカスに選択が付く）。クリック・Space・Enter（子の無い行の
-		 * 確定）は `false`。狭幅で退避パネルを閉じるのは `false` のときだけ。
+		 * キーでフォーカスが動いたことに選択が付いてきた場合（広幅のみ起きる。
+		 * ページが履歴を積まず置き換えるために使う）。クリック・Space・Enter
+		 * （子の無い行の確定）は `false`。狭幅で退避パネルを閉じるかはページが
+		 * 狭幅かどうかだけで決める。
 		 */
 		onselect?: (data: ConnectionTreeNodeData, info: { navigation: boolean }) => void;
 		/**
@@ -62,10 +72,17 @@
 		oncontextmenu?: (data: ConnectionTreeNodeData, position: { x: number; y: number }) => void;
 	}
 
-	let { connections, groups, tags, selectedId = null, onselect, oncontextmenu }: Props = $props();
+	let {
+		connections,
+		groups,
+		tags,
+		selectedId = null,
+		selectionFollowsFocus = true,
+		onselect,
+		oncontextmenu
+	}: Props = $props();
 
-	/** ツリーの中だけで使う、「収集グループ未登録」の案内行の data。 */
-	type NodeData = ConnectionTreeNodeData | { kind: 'empty' };
+	type NodeData = ConnectionTreeNodeData;
 
 	// T18-5a（docs/banto-hub-t18-design.md「T18-5a 大量タグ性能」第1段）:
 	// tags/groups をそれぞれ1回だけ Map に集計する（O(T)/O(G)）。connections/
@@ -99,21 +116,12 @@
 		const allNode: TreeNode<NodeData> = { id: 'all', label: 'すべて', data: { kind: 'all' } };
 		const connectionNodes = connections.map((connection): TreeNode<NodeData> => {
 			const childGroups = groupsByConnection.get(connection.id) ?? [];
-			const children: TreeNode<NodeData>[] =
-				childGroups.length > 0
-					? childGroups.map((group): TreeNode<NodeData> => ({
-							id: `group:${group.id}`,
-							label: groupAccessibleName(group),
-							data: { kind: 'group', group, connection }
-						}))
-					: [
-							{
-								id: `empty:${connection.id}`,
-								label: '収集グループ未登録',
-								disabled: true,
-								data: { kind: 'empty' }
-							}
-						];
+			// 子グループが 0 件でも `[]` を渡す（`emptyChildren` の案内行が出る）。
+			const children = childGroups.map((group): TreeNode<NodeData> => ({
+				id: `group:${group.id}`,
+				label: groupAccessibleName(group),
+				data: { kind: 'group', group, connection }
+			}));
 			return {
 				id: `conn:${connection.id}`,
 				label: connectionAccessibleName(connection),
@@ -136,12 +144,6 @@
 		walk(nodes);
 		return map;
 	});
-
-	/** 案内行（と data の無いノード）を外して、ページへ渡す data にする。 */
-	function toPageData(data: NodeData | undefined): ConnectionTreeNodeData | null {
-		if (!data || data.kind === 'empty') return null;
-		return data;
-	}
 
 	/**
 	 * T18-6c: ノード種別アイコン（行頭）。実 PLC 接続は 🔌、`calc`/`mem`
@@ -189,11 +191,11 @@
 
 	// 選択の通知は id の配列で来る（単一選択なので先頭だけ）。既に選択中の
 	// ノードをもう一度選んでも通知する（以前の `TreeView` と同じ。狭幅で
-	// 退避パネルを閉じる契機になる）。案内行（disabled）は選べない。
+	// 退避パネルを閉じる契機になる）。
 	function handleSelectionChange(ids: string[]): void {
 		const id = ids[0];
 		if (id === undefined) return;
-		const data = toPageData(dataById.get(id));
+		const data = dataById.get(id);
 		if (!data) return;
 		// 直前の入力がナビゲーションのキーなら、フォーカスに付いてきた選択。
 		const navigation = lastInputWasNavigation;
@@ -202,7 +204,8 @@
 	}
 
 	/**
-	 * 直前の入力が、フォーカスを動かすキーだったか。ツリーを包む要素で
+	 * 直前の入力が、フォーカスを動かすキーだったか（広幅で上下キーを速く
+	 * 押したときに、ページが履歴を積まず置き換えるための印。）ツリーを包む要素で
 	 * `keydown`・`pointerdown` を capture で受けて記録する（BantoTree の
 	 * ハンドラより先に走るので、その中で呼ばれる `onSelectionChange` から読める）。
 	 * BantoTree の DOM やクラスには依存しない。
@@ -222,12 +225,12 @@
 	 * 行でも「確定した」として通知する（狭幅で退避パネルを閉じる契機）。
 	 */
 	function handleActivate(node: TreeNode<NodeData>): void {
-		const data = toPageData(node.data);
+		const data = node.data;
 		if (data) onselect?.(data, { navigation: false });
 	}
 
 	function handleContextMenu(node: TreeNode<NodeData>, position: { x: number; y: number }): void {
-		const data = toPageData(node.data);
+		const data = node.data;
 		if (data) oncontextmenu?.(data, position);
 	}
 </script>
@@ -269,10 +272,12 @@
 			-->
 			<span class="badge db" title="SQL（query_sql）を持つグループ（DB Source、S2）">SQL</span>
 		{/if}
-	{:else if node.data?.kind === 'empty'}
-		<!-- T18-6c: 子グループが1つも無い接続の下の淡色の案内行。 -->
-		<span class="empty-label">{node.label}</span>
 	{/if}
+{/snippet}
+
+<!-- T18-6c: 子グループが1つも無い接続の下の淡色の案内行（`emptyChildren`）。 -->
+{#snippet emptyGroups()}
+	<span class="empty-label">収集グループ未登録</span>
 {/snippet}
 
 <!--
@@ -288,6 +293,8 @@
 		{nodes}
 		label={nodeLabel}
 		autoExpandNewRoots
+		{selectionFollowsFocus}
+		emptyChildren={emptyGroups}
 		selection={selectedId ? [selectedId] : []}
 		onSelectionChange={handleSelectionChange}
 		onActivate={handleActivate}
@@ -346,8 +353,7 @@
 	}
 
 	/*
-	 * 「収集グループ未登録」の案内行。BantoTree は disabled の行を半透明に
-	 * するので、色は既存の --banto-text-muted に落とすだけにする。
+	 * 「収集グループ未登録」の案内行（`emptyChildren`）。淡色・斜体。
 	 */
 	.empty-label {
 		color: var(--banto-text-muted);

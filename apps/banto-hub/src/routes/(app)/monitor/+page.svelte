@@ -410,9 +410,9 @@
 					: { type: 'group', id: data.group.id };
 		requestTarget(next, { keyNavigation: navigation });
 		// #378: 狭幅では「選んだ」時点（クリック・Space・Enter）で退避パネルを
-		// 閉じる（タグ登録ページと同じ）。上下キーなどフォーカス移動に付いてきた
-		// 選択（`navigation`）では閉じない。
-		if (layoutNarrow && !navigation) treeOpen = false;
+		// 閉じる（タグ登録ページと同じ）。狭幅は `selectionFollowsFocus=false`
+		// なので、上下キーは選択を起こさず、ここへ来るのは選んだときだけ。
+		if (layoutNarrow) treeOpen = false;
 	}
 
 	// --- T18-4c: 確認導線のディープリンク受け口 -----------------------------
@@ -612,6 +612,7 @@
 						{groups}
 						tags={adminTags}
 						selectedId={treeSelectedId}
+						selectionFollowsFocus={!layoutNarrow}
 						onselect={handleTreeSelect}
 					/>
 				{/snippet}
