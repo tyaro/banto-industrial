@@ -79,7 +79,7 @@ pub mod driver;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
-use banto_collect::{CurrentReading, CurrentSample, CurrentValuesHandle, Quality};
+use banto_collect::{CurrentReading, CurrentSample, CurrentValuesHandle, GoodHistory, Quality};
 use banto_core::BantoError;
 use banto_expr::{CompiledExpr, Value};
 use banto_tags::{COMPUTED_TAG_KIND, STRING_DATA_TYPE};
@@ -95,6 +95,14 @@ pub struct ServerTagStore {
     /// Effective quality can be interrupted by catalog disablement without
     /// any sample write. Shared with PLC views; never changes source data.
     reenabled_ms: RwLock<HashMap<String, i64>>,
+    /// 「未確認」用の PLC タグの受信履歴（`banto_collect::GoodHistory`）。
+    /// このストアは Hub のプロセスの間ずっと 1 つなので、ここに置いて
+    /// `crate::hub::CollectorManager` が収集の開始のたびに同じものを渡す。
+    /// 値のキャッシュ（`CurrentValuesHandle`）は無効化・構成の適用で retain
+    /// され、収集の停止→開始で作り直されるが、この記録は消えない
+    /// （2026-11-18 オーナー決定）。computed/internal/DB タグの受信記録は
+    /// `map` の `last_good_ms` で、`map` のエントリは消さないので別に持たない。
+    plc_good_history: GoodHistory,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -117,7 +125,19 @@ impl ServerTagStore {
         Self {
             map: RwLock::new(HashMap::new()),
             reenabled_ms: RwLock::new(HashMap::new()),
+            plc_good_history: GoodHistory::new(),
         }
+    }
+
+    /// PLC タグの受信履歴（`plc_good_history` の doc 参照）。clone は同じ
+    /// 集合を共有する。
+    pub fn plc_good_history(&self) -> GoodHistory {
+        self.plc_good_history.clone()
+    }
+
+    /// PLC タグ `tag_key` が Hub のこのプロセスで一度でも良好値を受けたか。
+    pub(crate) fn plc_received_good(&self, tag_key: &str) -> bool {
+        self.plc_good_history.contains(tag_key)
     }
 
     /// Called at every successful catalog publication, under the manager's

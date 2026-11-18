@@ -105,7 +105,7 @@ pub use config::{
     HubSource, PushSource, RegistrySnapshot, TagExclusionCause, Thresholds,
 };
 pub use current::{
-    CurrentReading, CurrentSample, CurrentValuesHandle, Quality, STALE_PERIOD_FACTOR,
+    CurrentReading, CurrentSample, CurrentValuesHandle, GoodHistory, Quality, STALE_PERIOD_FACTOR,
 };
 pub use error::CollectError;
 pub use event::{

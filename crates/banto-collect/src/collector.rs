@@ -198,7 +198,7 @@ use tokio::task::JoinHandle;
 
 use crate::client::ClientFactory;
 use crate::config::{CollectorConfig, ConnectionPlan, ProtocolConfig};
-use crate::current::CurrentValuesHandle;
+use crate::current::{CurrentValuesHandle, GoodHistory};
 use crate::error::CollectError;
 use crate::event::{CollectEvent, EventKind, EventSink};
 use crate::external::ExternalSource;
@@ -387,6 +387,36 @@ impl Collector {
         factory: ClientFactory,
         external: Option<Arc<dyn ExternalSource>>,
     ) -> Result<Self, CollectError> {
+        Self::start_in_with_history(
+            config,
+            place,
+            clock,
+            events,
+            options,
+            factory,
+            external,
+            GoodHistory::new(),
+        )
+        .await
+    }
+
+    /// [`Self::start_in`] whose cache records usable samples into the
+    /// caller's `good_history` (`crate::current` module doc "Received-good
+    /// history"). Pass the same history to every start to keep "has this tag
+    /// ever delivered a usable value" across collector restarts and
+    /// [`Self::apply_config`]'s cache `retain` (banto-hub's 「未確認」).
+    /// [`Self::start_in`] passes a fresh one, private to this collector.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_in_with_history(
+        config: CollectorConfig,
+        place: DataPlace,
+        clock: Arc<dyn Clock>,
+        events: EventSink,
+        options: CollectorOptions,
+        factory: ClientFactory,
+        external: Option<Arc<dyn ExternalSource>>,
+        good_history: GoodHistory,
+    ) -> Result<Self, CollectError> {
         if config.connections.is_empty() {
             return Err(CollectError::Config(
                 "収集対象がありません（有効な接続・グループ・タグを設定してください）".to_string(),
@@ -407,7 +437,7 @@ impl Collector {
         );
         let (writer_tx, _writer_rx) = watch::channel(writer);
 
-        let current = CurrentValuesHandle::new(clock.clone());
+        let current = CurrentValuesHandle::with_good_history(clock.clone(), good_history);
         let status: StatusMap = Arc::new(RwLock::new(HashMap::new()));
 
         events
