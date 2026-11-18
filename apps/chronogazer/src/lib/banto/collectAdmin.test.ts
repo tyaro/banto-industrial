@@ -493,7 +493,7 @@ describe('除外の一覧（#414 段階2）', () => {
 			exclusions
 		});
 
-		it('hubNotConfigured: 設定 > Hub接続 へ案内し、記録で直せとは言わない（連鎖の除外があっても）', () => {
+		it('hubNotConfigured: 設定 > Hub接続 へ案内し、「記録」ページで直せとは言わない（連鎖の除外があっても）', () => {
 			const note = collectExclusionsNote(
 				running([
 					hub('hubNotConfigured'),
@@ -516,7 +516,7 @@ describe('除外の一覧（#414 段階2）', () => {
 			expect(note?.guides[0].link).toBeNull();
 		});
 
-		it('hubTagNotFound / hubTagTypeChanged: 記録でそのタグを編集して直す案内（削除・再登録は勧めない。理由の並びは固定）', () => {
+		it('hubTagNotFound / hubTagTypeChanged: 「記録」ページでそのタグを編集して直す案内（削除・再登録は勧めない。理由の並びは固定）', () => {
 			const note = collectExclusionsNote(
 				running([hub('hubTagTypeChanged', 'tag:5'), hub('hubTagNotFound', 'tag:4')])
 			);
@@ -528,7 +528,7 @@ describe('除外の一覧（#414 段階2）', () => {
 				expect(guide.text).not.toContain('登録し直');
 				expect(guide.link?.path).toBe('/tags');
 			}
-			// 記録での作業が要る理由なので、従来のリンク文も出す。
+			// 「記録」ページでの作業が要る理由なので、従来のリンク文も出す。
 			expect(note?.fix).not.toBeNull();
 		});
 

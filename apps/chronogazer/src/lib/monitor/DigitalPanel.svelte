@@ -54,7 +54,7 @@
 			{/if}
 			{#if pen.linkToTags && tagsHref}
 				<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -- tagsHref は呼び出し側が resolveAppPath() で作る -->
-				<a class="fix-link" href={tagsHref}>記録で直す</a>
+				<a class="fix-link" href={tagsHref}>「記録」ページで直す</a>
 			{/if}
 		</li>
 	{/each}

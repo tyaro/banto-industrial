@@ -394,10 +394,9 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 
 		await expect(cell(TAG_INVALID).locator('.value')).toHaveText('—');
 		await expect(cell(TAG_INVALID)).toContainText('設定不正（収集対象外）');
-		await expect(cell(TAG_INVALID).getByRole('link', { name: '記録で直す' })).toHaveAttribute(
-			'href',
-			'/tags'
-		);
+		await expect(
+			cell(TAG_INVALID).getByRole('link', { name: '「記録」ページで直す' })
+		).toHaveAttribute('href', '/tags');
 
 		await expect(cell(TAG_HIGH)).toContainText('H 上限以上');
 		await expect(cell(TAG_HIGH).locator('.value')).toHaveText(/^\d+$/);
@@ -512,13 +511,15 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		await expect(invalidCell.locator('.track')).toHaveCount(1);
 		await expect(invalidCell.locator('.fill')).toHaveCount(0);
 		await expect(invalidCell).toContainText('設定不正（収集対象外）');
-		await expect(invalidCell.getByRole('link', { name: '記録で直す' })).toBeVisible();
+		await expect(invalidCell.getByRole('link', { name: '「記録」ページで直す' })).toBeVisible();
 
 		// レンジが無いタグ: 棒の代わりに理由と記録へのリンク。値と判定の文字は出す。
 		const highCell = cell(TAG_HIGH);
 		await expect(highCell).toHaveAttribute('data-range', 'unset');
-		await expect(highCell).toContainText('レンジ未設定（記録で工学値レンジを入れてください）');
-		await expect(highCell.getByRole('link', { name: '記録を開く' })).toHaveAttribute(
+		await expect(highCell).toContainText(
+			'レンジ未設定（「記録」ページで工学値レンジを入れてください）'
+		);
+		await expect(highCell.getByRole('link', { name: '「記録」ページを開く' })).toHaveAttribute(
 			'href',
 			'/tags'
 		);

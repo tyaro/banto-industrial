@@ -493,7 +493,7 @@ pub fn tag_referenced_error(referrers: &[DisplayGroupRef]) -> BantoError {
     BantoError::Validation {
         field_errors: vec![field_error(
             TAG_REFERENCED_FIELD,
-            format!("このタグは表示グループ{names}のペンに割り当てられているため削除できません。先に表示グループでペンから外してください"),
+            format!("このタグは表示グループ{names}のペンに割り当てられているため削除できません。先に「表示グループ」ページでペンから外してください"),
         )],
     }
 }

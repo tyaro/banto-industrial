@@ -609,12 +609,12 @@ export function collectStateDetail(state: CollectorStateView): string {
 			// #414 段階2: 全部が設定の不正で外れた場合は、登録・有効化ではなく
 			// 「直す」が次の一手（一覧は `collectExclusionsHeadline` の下に出る）。
 			if (state.exclusions.length > 0 && !exclusionsNeedSettingFix(state.exclusions)) {
-				// Hub に未接続・Hub を持たない実行形態など、記録では直らない理由だけ。
+				// Hub に未接続・Hub を持たない実行形態など、「記録」ページでは直らない理由だけ。
 				return '有効なタグがすべて収集できない設定で外れたため、収集するものがありません（失敗ではありません）。下の「除外あり」の案内に従ってから「収集を開始」を押してください。';
 			}
 			return state.exclusions.length > 0
-				? '有効なタグがすべて設定の不正で外れたため、収集するものがありません（失敗ではありません）。下の「除外あり」の一覧の設定を「記録」で直してから「収集を開始」を押してください。'
-				: '有効なタグが1件もないため、収集するものがありません（失敗ではありません）。「記録」でタグを登録・有効化してから「収集を再起動」を押してください。';
+				? '有効なタグがすべて設定の不正で外れたため、収集するものがありません（失敗ではありません）。下の「除外あり」の一覧の設定を「記録」ページで直してから「収集を開始」を押してください。'
+				: '有効なタグが1件もないため、収集するものがありません（失敗ではありません）。「記録」ページでタグを登録・有効化してから「収集を再起動」を押してください。';
 		case 'startFailed':
 			return '前回の開始が失敗したままです。失敗した理由はこの状態表示には含まれません - 「収集を開始」を押すと、その結果として理由が表示されます。';
 	}
@@ -662,7 +662,7 @@ export interface CollectExclusionsNote {
 	summary: string;
 	/**
 	 * 「記録」リンクの直後に続ける文。**設定の不正を直す必要がある**ときだけ
-	 * （Hub に未接続・Hub を持たない実行形態のように、記録では直らない理由
+	 * （Hub に未接続・Hub を持たない実行形態のように、「記録」ページでは直らない理由
 	 * だけが原因のときは `null` で、画面はリンクも出さない）。
 	 */
 	fix: string | null;
@@ -699,12 +699,12 @@ const HUB_EXCLUSION_GUIDES: readonly ExclusionGuide[] = [
 	},
 	{
 		reason: 'hubTagTypeChanged',
-		text: 'Hub 側でデータ型が変わったため外れたタグがあります。記録で該当のタグを編集してデータ型を Hub に合わせ、「収集を再起動」してください（削除せず編集すれば、ID・しきい値・表示・履歴が保たれます）:',
+		text: 'Hub 側でデータ型が変わったため外れたタグがあります。「記録」ページで該当のタグを編集してデータ型を Hub に合わせ、「収集を再起動」してください（削除せず編集すれば、ID・しきい値・表示・履歴が保たれます）:',
 		link: { label: '記録', path: '/tags' }
 	}
 ];
 
-/** 記録では直らない（環境の）理由。これと連鎖（配下の除外）だけなら「記録で直して」は案内しない。 */
+/** 「記録」ページでは直らない（環境の）理由。これと連鎖（配下の除外）だけなら「「記録」ページで直して」は案内しない。 */
 const NON_TAG_FIX_REASONS: ReadonlySet<string> = new Set([
 	'hubNotConfigured',
 	'hubSourceUnavailable',
@@ -713,7 +713,7 @@ const NON_TAG_FIX_REASONS: ReadonlySet<string> = new Set([
 	'groupExcluded'
 ]);
 
-/** 除外のうち、記録で直すべきもの（設定の不正・Hub のタグの食い違い）が 1 件でもあるか。 */
+/** 除外のうち、「記録」ページで直すべきもの（設定の不正・Hub のタグの食い違い）が 1 件でもあるか。 */
 export function exclusionsNeedSettingFix(exclusions: readonly ExclusionView[]): boolean {
 	return exclusions.some((exclusion) => !NON_TAG_FIX_REASONS.has(exclusion.reason));
 }

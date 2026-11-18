@@ -253,7 +253,7 @@ test.describe.serial('ChronoGazer viewer-public mode', () => {
 		});
 		const tagBase = { collectionGroupId: cg.id, dataType: 'u16', decimals: 0, enabled: true };
 		// 工学値レンジのあるタグ（バー・計器が描ける）と、レンジの無いタグ（「レンジ未設定」。
-		// 編集者には記録へのリンクが出るが、閲覧者には出さない）。
+		// 編集者には「記録」ページへのリンクが出るが、閲覧者には出さない）。
 		const scaled = await postJson<NamedRow>(page.request, headers, '/api/tags', {
 			...tagBase,
 			name: PV_TAG_SCALED,
@@ -321,7 +321,7 @@ test.describe.serial('ChronoGazer viewer-public mode', () => {
 				}
 				// 読み取り専用: 本文（タブの中）に設定画面（記録・表示グループ・収集の
 				// 設定）へのリンクを 1 つも出さない。編集者ならレンジ未設定のタグに
-				// 「記録を開く」が出る（user-simulator-monitor.spec.ts のテスト 5・6）。
+				// 「記録」ページを開くリンクが出る（user-simulator-monitor.spec.ts のテスト 5・6）。
 				await expect(panel.getByRole('link')).toHaveCount(0);
 			}
 			await expect(viewer.getByRole('button', { name: 'ログアウト' })).toHaveCount(0);

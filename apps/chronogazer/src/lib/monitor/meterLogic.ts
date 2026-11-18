@@ -65,7 +65,7 @@ export type MeterRange =
 	/** タグの情報を読めていない（設定が無いのか分からない）。 */
 	| { kind: 'noTag' };
 
-export const RANGE_UNSET_MESSAGE = 'レンジ未設定（記録で工学値レンジを入れてください）';
+export const RANGE_UNSET_MESSAGE = 'レンジ未設定（「記録」ページで工学値レンジを入れてください）';
 export const RANGE_NO_TAG_MESSAGE = 'タグの情報を読み込めないため、レンジを決められません';
 
 function finite(n: number | null | undefined): n is number {
