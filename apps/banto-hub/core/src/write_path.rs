@@ -176,8 +176,11 @@
 //! | `ItemError::VerificationFailed` | `uncertain` | 送ったあとの RMW の確認読みの不一致(#902)。機器には効いているかもしれない。WASM ゲストの `verification-failed` もこれに写る(今のゲストは返さない) |
 //! | 将来の `ItemError` の値 | `uncertain` | 意味が分からない値は「効いていない」と言い切らない |
 //!
-//! HTTP/gRPC の応答([`WriteRejection`])は変えていない: どちらも
-//! `WriteFailed`(REST: 502 `write_failed`)のまま。区別は監査行にだけ残す。
+//! HTTP/gRPC の応答([`WriteRejection`])も同じ分類で分ける(#1201、
+//! docs/hub/tag-server-design.md §6.6 の 4): `failed` は `WriteFailed`
+//! (REST: 502 `write_failed`, gRPC: UNAVAILABLE)、`uncertain` は
+//! `WriteUncertain`(REST: 502 `write_uncertain`, gRPC: UNKNOWN)。
+//! 監査の結果と拒否がずれないよう、組は [`PlcWriteFailure::new`] で作る。
 //! `uncertain` でも自動では再送しない。
 
 use std::collections::HashMap;
@@ -434,6 +437,11 @@ pub enum WriteRejection {
     /// gate 8: broker への書き込み要求自体、または物理書き込みが失敗
     /// (REST: 502, gRPC: UNAVAILABLE)。
     WriteFailed(String),
+    /// #1201: gate 8 で、送ったあとで結果が分からない(監査の `result` が
+    /// `uncertain`。REST: 502 `write_uncertain`, gRPC: UNKNOWN)。PLC には
+    /// 効いているかもしれないので、呼び出し側は自動で再送しない。確定した
+    /// 失敗は [`WriteRejection::WriteFailed`]。
+    WriteUncertain(String),
     /// log-before-write の DB 書き込みに失敗(REST: 500, gRPC: INTERNAL) -
     /// 防御的分岐。
     AuditWriteFailed,
@@ -1953,22 +1961,27 @@ fn build_plc_write_item(
     ))
 }
 
-/// A per-item refusal from the driver, as the write's rejection (the audit
-/// detail and the response carry its text: the device's code for
-/// `ItemError::Device`, the RMW confirmation mismatch for `Rejected`,
-/// docs/hub/driver/banto-hub-driver-io-design.md §9).
-fn item_rejection(err: &ItemError) -> WriteRejection {
-    WriteRejection::WriteFailed(err.to_string())
-}
-
 /// gate 8 の PLC 分岐の失敗(#898): 呼び出し元へ返す拒否と、監査行に残す
-/// 結果の組。拒否(= REST/gRPC の応答)は従来と同じで、`audit` だけが
+/// 結果の組。拒否(= REST/gRPC の応答)も `audit` に沿って
 /// `failed`/`uncertain` を分ける(このモジュールの doc comment「監査の
 /// `result` の分類」)。
 #[derive(Debug, Clone, PartialEq)]
 struct PlcWriteFailure {
     rejection: WriteRejection,
     audit: WriteAuditResult,
+}
+
+impl PlcWriteFailure {
+    /// 監査の結果と文から、拒否と組を作る(#1201)。`Uncertain` なら
+    /// `WriteUncertain`、`Failed` なら `WriteFailed`。拒否と監査の結果が
+    /// ずれないよう、gate 8 の失敗はここで作る。
+    fn new(audit: WriteAuditResult, message: String) -> Self {
+        let rejection = match audit {
+            WriteAuditResult::Uncertain => WriteRejection::WriteUncertain(message),
+            _ => WriteRejection::WriteFailed(message),
+        };
+        Self { rejection, audit }
+    }
 }
 
 impl From<WriteRejection> for PlcWriteFailure {
@@ -2059,10 +2072,7 @@ fn broker_failure(err: &banto_broker::BrokerError, register_bit: bool) -> PlcWri
     {
         message.push_str(FC22_TIMEOUT_HINT);
     }
-    PlcWriteFailure {
-        rejection: WriteRejection::WriteFailed(message),
-        audit: broker_error_audit_result(err),
-    }
+    PlcWriteFailure::new(broker_error_audit_result(err), message)
 }
 
 /// `BrokerHandle::write` が `Ok(results)` を返したときの 1 件ぶんの結果を、
@@ -2071,14 +2081,14 @@ fn broker_failure(err: &banto_broker::BrokerError, register_bit: bool) -> PlcWri
 fn item_outcome(result: Option<&Result<(), ItemError>>) -> Result<(), PlcWriteFailure> {
     match result {
         Some(Ok(())) => Ok(()),
-        Some(Err(item_err)) => Err(PlcWriteFailure {
-            rejection: item_rejection(item_err),
-            audit: item_error_audit_result(item_err),
-        }),
-        None => Err(PlcWriteFailure {
-            rejection: WriteRejection::WriteFailed("broker から応答がありませんでした".to_string()),
-            audit: WriteAuditResult::Uncertain,
-        }),
+        Some(Err(item_err)) => Err(PlcWriteFailure::new(
+            item_error_audit_result(item_err),
+            item_err.to_string(),
+        )),
+        None => Err(PlcWriteFailure::new(
+            WriteAuditResult::Uncertain,
+            "broker から応答がありませんでした".to_string(),
+        )),
     }
 }
 
@@ -2224,6 +2234,7 @@ impl WriteRejection {
             WriteRejection::ValueOutOfRange(_) => "value_out_of_range",
             WriteRejection::InvalidAddress(_) => "invalid_address",
             WriteRejection::WriteFailed(_) => "write_failed",
+            WriteRejection::WriteUncertain(_) => "write_uncertain",
             WriteRejection::AuditWriteFailed => "audit_write_failed",
             WriteRejection::Internal(_) => "internal",
             WriteRejection::BatchAborted => "batch_aborted",
@@ -2244,6 +2255,7 @@ impl WriteRejection {
             WriteRejection::ValueOutOfRange(detail)
             | WriteRejection::InvalidAddress(detail)
             | WriteRejection::WriteFailed(detail)
+            | WriteRejection::WriteUncertain(detail)
             | WriteRejection::Internal(detail) => Some(detail.clone()),
             WriteRejection::BatchAborted => Some(
                 "同じバッチ内の他のエントリがゲートで拒否されたため、書き込みを行いませんでした"
@@ -2452,10 +2464,7 @@ mod tests {
         ] {
             assert_eq!(
                 broker_failure(&err, false),
-                PlcWriteFailure {
-                    rejection: WriteRejection::WriteFailed(err.to_string()),
-                    audit,
-                },
+                PlcWriteFailure::new(audit, err.to_string()),
                 "{err:?}"
             );
         }
@@ -2499,7 +2508,7 @@ mod tests {
         let with_hint = broker_failure(&timeout, true);
         assert_eq!(
             with_hint.rejection,
-            WriteRejection::WriteFailed(format!("{timeout}{FC22_TIMEOUT_HINT}"))
+            WriteRejection::WriteUncertain(format!("{timeout}{FC22_TIMEOUT_HINT}"))
         );
         assert_eq!(with_hint.audit, WriteAuditResult::Uncertain);
         assert!(with_hint.rejection.detail().unwrap().contains("FC22"));
@@ -2507,7 +2516,7 @@ mod tests {
         let plain = broker_failure(&timeout, false);
         assert_eq!(
             plain.rejection,
-            WriteRejection::WriteFailed(timeout.to_string())
+            WriteRejection::WriteUncertain(timeout.to_string())
         );
         assert_eq!(plain.audit, WriteAuditResult::Uncertain);
         // 応答なし以外の ConnectionFailed(応答の不一致など)にも付けない。
@@ -2518,7 +2527,7 @@ mod tests {
         let got = broker_failure(&mismatch, true);
         assert_eq!(
             got.rejection,
-            WriteRejection::WriteFailed(mismatch.to_string())
+            WriteRejection::WriteUncertain(mismatch.to_string())
         );
         assert_eq!(got.audit, WriteAuditResult::Uncertain);
     }
@@ -2548,7 +2557,7 @@ mod tests {
         assert_eq!(
             item_outcome(None),
             Err(PlcWriteFailure {
-                rejection: WriteRejection::WriteFailed(
+                rejection: WriteRejection::WriteUncertain(
                     "broker から応答がありませんでした".to_string()
                 ),
                 audit: WriteAuditResult::Uncertain,
@@ -2568,7 +2577,7 @@ mod tests {
         assert_eq!(
             item_outcome(Some(&Err(mismatch.clone()))),
             Err(PlcWriteFailure {
-                rejection: WriteRejection::WriteFailed(mismatch.to_string()),
+                rejection: WriteRejection::WriteUncertain(mismatch.to_string()),
                 audit: WriteAuditResult::Uncertain,
             })
         );
@@ -2576,6 +2585,18 @@ mod tests {
             item_error_audit_result(&ItemError::Rejected("同じビットに true と false".into())),
             WriteAuditResult::Failed
         );
+    }
+
+    /// #1201: 応答のコード(REST・MCP の `error`)は監査の結果に沿って分かれる。
+    /// `failed` は `write_failed`、`uncertain` は `write_uncertain`。
+    #[test]
+    fn the_response_code_follows_the_audit_result() {
+        let failed = PlcWriteFailure::new(WriteAuditResult::Failed, "f".into());
+        assert_eq!(failed.rejection.rest_error_code(), "write_failed");
+        let uncertain = PlcWriteFailure::new(WriteAuditResult::Uncertain, "u".into());
+        assert_eq!(uncertain.rejection.rest_error_code(), "write_uncertain");
+        assert_eq!(uncertain.rejection.to_json()["error"], "write_uncertain");
+        assert_eq!(uncertain.rejection.detail().as_deref(), Some("u"));
     }
 
     /// #898: broker に渡す前の拒否(`build_*` の Err・セッション無し)は

@@ -158,7 +158,9 @@ fn write_rejection_response(
         | WriteRejection::InvalidOnBehalfOf
         | WriteRejection::ValueOutOfRange(_)
         | WriteRejection::InvalidAddress(_) => StatusCode::UNPROCESSABLE_ENTITY,
-        WriteRejection::WriteFailed(_) => StatusCode::BAD_GATEWAY,
+        WriteRejection::WriteFailed(_) | WriteRejection::WriteUncertain(_) => {
+            StatusCode::BAD_GATEWAY
+        }
         WriteRejection::AuditWriteFailed | WriteRejection::Internal(_) => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
@@ -256,7 +258,7 @@ pub(super) struct WriteState {
         (status = 422, description = "unsupported_value_type / value_out_of_range / invalid_correlation_id / invalid_on_behalf_of(後ろ 2 つは監査に残さず、PLC へも送らない)"),
         (status = 429, description = "rate_limited"),
         (status = 501, description = "write_unsupported_protocol"),
-        (status = 502, description = "write_failed(監査の行を作った後の失敗なので、本文に `audit_id` が付く)"),
+        (status = 502, description = "write_failed(送って失敗が確定した)または write_uncertain(送ったあとで結果が分からない。効いているかもしれないので自動で再送しない)。監査の行を作った後の失敗なので、本文に `audit_id` が付く"),
         (status = 503, description = "writes_disabled / collection_not_running"),
     ),
     tag = "tag-space",

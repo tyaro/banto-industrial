@@ -181,7 +181,7 @@ string タグは文字列。
   で、監査の行に残り結果に返る。`on_behalf_of`（1〜128 文字、制御文字不可）は名乗る操作者で、
   **自己申告**として監査の `operator_claim` に残る（認証された主体は API キー）。形が合わなければ
   `invalid_correlation_id` / `invalid_on_behalf_of` のエラーで、監査に残さず書かない。
-  PLC へ送った後の失敗（`write_failed`）のエラー本文には `audit_id` が付く。
+  PLC へ送った後の失敗（`write_failed`、結果不明は `write_uncertain`）のエラー本文には `audit_id` が付く。
 
 - **ワードデバイスのビット**（T20 ④）: bit タグのアドレスは `D100.0`〜`D100.F`
   （**16進**、SLMP の慣習）。書き込みは read-modify-write で、同じワード内の他ビットを保持する。
