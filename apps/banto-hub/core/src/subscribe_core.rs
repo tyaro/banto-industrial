@@ -413,4 +413,38 @@ mod unverified_tests {
         assert_eq!(q, Quality::Bad);
         assert!(unverified);
     }
+
+    #[test]
+    fn bad_good_bad_within_one_tick_resends_to_clear_unverified() {
+        let entry = internal_entry();
+        let mut map = TagMap::default();
+        map.insert_for_test(entry);
+        let store = ServerTagStore::new();
+        let patterns = vec![TagPattern::parse("x.y.z").unwrap()];
+
+        // 初回: サンプル無し(Bad・未確認)。
+        let (initial, last) = initial_values(&patterns, &map, None, &store, 1_000, None);
+        assert_eq!(initial.len(), 1);
+        assert!(initial[0].unverified);
+        let mut sub = Subscription {
+            patterns,
+            mode: Mode::OnChange,
+            last,
+            next_due_ms: 0,
+        };
+
+        // 評価の 1 周期の間に Bad → Good → Bad。v・q は初回と同じに戻るが、
+        // 良好値を受けたので未確認は解除される。
+        store.set("tag:1", Some(1.0), Quality::Good, 900);
+        store.set("tag:1", None, Quality::Bad, 950);
+
+        let sent = evaluate(&mut sub, &map, None, &store, 1_250, None)
+            .expect("unverified の変化で送り直される");
+        assert_eq!(sent.len(), 1);
+        assert_eq!((sent[0].v, sent[0].q), (None, Quality::Bad));
+        assert!(!sent[0].unverified);
+
+        // 対照: 変化なしなら何も返らない。
+        assert!(evaluate(&mut sub, &map, None, &store, 1_500, None).is_none());
+    }
 }
