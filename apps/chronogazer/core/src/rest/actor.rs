@@ -65,7 +65,9 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use banto_core::ErrorBody;
-use banto_server::routes::{bearer_token, require_role_at_least, RoleGuard};
+use banto_server::routes::{
+    bearer_token, record_denied_as, record_write_as, require_role_at_least, AuditActor, RoleGuard,
+};
 use banto_server::{require_auth, require_banto_client_header, AuthState, AuthenticatedSession};
 use serde_json::json;
 
@@ -142,9 +144,9 @@ impl Actor {
         }
     }
 
-    /// 監査を 1 本残す。成功した書き込みは `result: "ok"`（banto の
-    /// `record_write` と同じ値）。`origin` は呼び出し元が渡す（REST は
-    /// `"rest"`、MCP は `"mcp"` - [`crate::ops::Via::origin`]。#1161 PR5a）。
+    /// 監査を 1 本残す。成功した書き込みは `result: "ok"`。banto の
+    /// `record_write_as` に寄せた（banto#647）。`origin` は呼び出し元が渡す
+    /// （REST は `"rest"`、MCP は `"mcp"` - [`crate::ops::Via::origin`]。#1161 PR5a）。
     pub(crate) async fn record(
         &self,
         audit: &AuditLogService,
@@ -155,21 +157,20 @@ impl Actor {
         detail: Option<serde_json::Value>,
     ) {
         let (username, role) = self.audit_actor();
-        audit
-            .record(AuditEntry {
-                actor_username: Some(username),
-                actor_role: Some(role),
-                action,
-                resource,
-                entity_id,
-                detail,
-                origin,
-                result: "ok",
-            })
-            .await;
+        record_write_as(
+            audit,
+            Some(AuditActor { username, role }),
+            origin,
+            action,
+            resource,
+            entity_id,
+            detail,
+        )
+        .await;
     }
 
-    /// 権限不足の `denied` を残す。`origin` と `detail` は [`Via`] から作る:
+    /// 権限不足の `denied` を残す。banto の `record_denied_as` に寄せた
+    /// （banto#647）。`origin` と `detail` は [`Via`] から作る:
     /// REST は banto の `require_role_at_least` と同じ形（`origin: "rest"`、
     /// `detail` は `{method, path}`）、MCP は `origin: "mcp"`、`detail` は
     /// `{tool}`（[`Via::denied_detail`]、#1161 PR5a）。
@@ -180,18 +181,14 @@ impl Actor {
         resource: &str,
     ) {
         let (username, role) = self.audit_actor();
-        audit
-            .record(AuditEntry {
-                actor_username: Some(username),
-                actor_role: Some(role),
-                action: "denied",
-                resource,
-                entity_id: None,
-                detail: Some(via.denied_detail()),
-                origin: via.origin(),
-                result: "denied",
-            })
-            .await;
+        record_denied_as(
+            audit,
+            AuditActor { username, role },
+            via.origin(),
+            resource,
+            via.denied_detail(),
+        )
+        .await;
     }
 }
 

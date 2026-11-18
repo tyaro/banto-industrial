@@ -121,6 +121,7 @@ use crate::write_audit::WriteAuditService;
 use crate::write_control::{WriteControl, WriteControlChange};
 use crate::write_path::{execute_write, execute_write_batch, WriteDeps};
 use crate::write_rate::WriteRateLimiter;
+use banto_server::routes::{record_write_as, AuditActor};
 use banto_server::ServerEvent;
 
 // --- 状態 --------------------------------------------------------------
@@ -1758,8 +1759,8 @@ fn require_admin_scope(ctx: &ApiKeyContext) -> Result<(), Value> {
 const QUEUED_MESSAGE: &str = "ロックダウン済みで収集中のため、変更を未適用キューに保存しました。";
 
 /// 構成操作の監査（設計 §3.3「全構成操作を audit_log に記録する」）- REST の
-/// `record_write`（`crate::rest`）と同じ `AuditEntry` の組み立て方だが、
-/// actor は bearer セッションの identity ではなく **API キーの
+/// `record_write`（`crate::rest`）と同じ組み立て方（banto の `record_write_as` に
+/// 寄せた、banto#647）だが、actor は bearer セッションの identity ではなく **API キーの
 /// 表記 `"{name}（{prefix}）"`**（[`ApiKeyContext::actor_label`]）。#713 で失効
 /// キーを削除すると同じ名前で再発行できるため、名前だけでは旧いキーと新しい
 /// キーの操作を区別できない。プレフィックスを付けて見分ける。`actor_role` は固定文字列 `"api_key"`、`origin` は
@@ -1782,19 +1783,20 @@ async fn audit_config_action(
     entity_id: Option<&str>,
     detail: Option<Value>,
 ) {
-    state
-        .audit
-        .record(AuditEntry {
-            actor_username: Some(ctx.actor_label().as_str()),
-            actor_role: Some("api_key"),
-            action,
-            resource,
-            entity_id,
-            detail,
-            origin: "mcp",
-            result: "ok",
-        })
-        .await;
+    let label = ctx.actor_label();
+    record_write_as(
+        &state.audit,
+        Some(AuditActor {
+            username: label.as_str(),
+            role: "api_key",
+        }),
+        "mcp",
+        action,
+        resource,
+        entity_id,
+        detail,
+    )
+    .await;
 }
 
 // --- 7. list_connections -----------------------------------------------------
