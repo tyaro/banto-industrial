@@ -55,7 +55,7 @@ use banto_collect::{CurrentValuesHandle, Quality};
 
 use crate::api_keys::{ApiKeyContext, HubScopeChecks};
 use crate::computed::ServerTagStore;
-use crate::hub::{read_current_view, TagEntry, TagMap};
+use crate::hub::{read_current_view_with_history, TagEntry, TagMap};
 
 /// 評価タイマの固定周期(設計 §5.2/§5.4「250ms 評価」)。`crate::stream`/
 /// `crate::grpc` の両方がこの値で `tokio::time::interval` を作る。
@@ -154,23 +154,28 @@ pub struct ResolvedValue {
     pub q: Quality,
     pub t: i64,
     /// 未確認: 品質が Good でなく、かつ Hub の今回の起動後にこのタグで一度も
-    /// 良好値を受けていない(`CurrentView::source_time_ms` が `None`)。
+    /// 良好値を受けていない(生の reading の `last_good_ms` が無い)。表示用の
+    /// 無効化(`!entry.enabled` で `source_time_ms` が `None` になる)とは独立に、
+    /// 生の受信履歴で判定する。
     /// 収集開始後の不良(通信異常)と区別するための表示用で、DB には残さない
     /// (2026-11-18 オーナー決定)。
     pub unverified: bool,
 }
 
 /// `read_current_view` を購読の 1 行(値・品質・時刻・未確認)へ射影する。
-/// 未確認の定義は [`ResolvedValue::unverified`]。無効タグ・サンプル無しの
-/// タグ・値未設定の内部タグは良好値を持たないので未確認になる。
+/// 未確認の定義は [`ResolvedValue::unverified`]。サンプル無しのタグ・値未設定の
+/// 内部タグ・一度も良好値を受けずに無効にしたタグは未確認になるが、良好値を
+/// 受けた後に無効にしたタグは未確認にならない。不正な bit 値が Good として
+/// 記録された場合も生の `last_good_ms` があれば受信はあったとみなす。
 fn read_resolved(
     entry: &TagEntry,
     current: Option<&CurrentValuesHandle>,
     server_store: &ServerTagStore,
     now_ms: i64,
 ) -> (Option<f64>, Quality, i64, bool) {
-    let view = read_current_view(entry, current, server_store, now_ms);
-    let unverified = view.quality != Quality::Good && view.source_time_ms.is_none();
+    let (view, received_good) =
+        read_current_view_with_history(entry, current, server_store, now_ms);
+    let unverified = view.quality != Quality::Good && !received_good;
     (view.value, view.quality, view.timestamp_ms, unverified)
 }
 
@@ -386,5 +391,26 @@ mod unverified_tests {
         let (v, q, _, unverified) = read_resolved(&entry, None, &store, 1_000);
         assert_eq!((v, q), (Some(1.0), Quality::Good));
         assert!(!unverified);
+    }
+
+    #[test]
+    fn disabled_after_a_good_sample_is_bad_but_not_unverified() {
+        let mut entry = internal_entry();
+        let store = ServerTagStore::new();
+        store.set("tag:1", Some(1.0), Quality::Good, 900);
+        entry.enabled = false;
+        let (v, q, _, unverified) = read_resolved(&entry, None, &store, 1_000);
+        assert_eq!((v, q), (None, Quality::Bad));
+        assert!(!unverified);
+    }
+
+    #[test]
+    fn disabled_without_any_good_sample_is_unverified() {
+        let mut entry = internal_entry();
+        let store = ServerTagStore::new();
+        entry.enabled = false;
+        let (_, q, _, unverified) = read_resolved(&entry, None, &store, 1_000);
+        assert_eq!(q, Quality::Bad);
+        assert!(unverified);
     }
 }

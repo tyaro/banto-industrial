@@ -413,6 +413,32 @@ pub fn read_current_view_with_stored(
     server_store: &ServerTagStore,
     now_ms: i64,
 ) -> (CurrentView, Option<Quality>) {
+    let (view, stored, _) = read_current_view_raw(entry, collect, server_store, now_ms);
+    (view, stored)
+}
+
+/// [`read_current_view`]'s view together with whether the **raw** reading
+/// (before the `!entry.enabled` / invalid-value blanking of
+/// [`effective_current_view`]) has a `last_good_ms`, i.e. whether this Hub run
+/// has ever received a good sample for the tag. 「未確認」の判定用: 表示用の
+/// 無効化とは独立に、生の受信履歴で決める。`read_current_view` と同じ読み方で、
+/// 既存の関数の戻り値・意味は変えない。
+pub(crate) fn read_current_view_with_history(
+    entry: &TagEntry,
+    collect: Option<&CurrentValuesHandle>,
+    server_store: &ServerTagStore,
+    now_ms: i64,
+) -> (CurrentView, bool) {
+    let (view, _, received_good) = read_current_view_raw(entry, collect, server_store, now_ms);
+    (view, received_good)
+}
+
+fn read_current_view_raw(
+    entry: &TagEntry,
+    collect: Option<&CurrentValuesHandle>,
+    server_store: &ServerTagStore,
+    now_ms: i64,
+) -> (CurrentView, Option<Quality>, bool) {
     let (reading, stored) = if entry.tag_kind == banto_tags::PLC_TAG_KIND {
         match collect.and_then(|c| c.get_with_stored(&entry.tag_key)) {
             Some((reading, stored)) => (Some(reading), Some(stored)),
@@ -421,10 +447,11 @@ pub fn read_current_view_with_stored(
     } else {
         (server_store.get_reading(&entry.tag_key), None)
     };
+    let received_good = reading.is_some_and(|r| r.last_good_ms.is_some());
     let mut view = effective_current_view(entry, reading, now_ms);
     view.quality_since_ms =
         server_store.effective_quality_since(&entry.tag_key, view.quality, view.quality_since_ms);
-    (view, stored)
+    (view, stored, received_good)
 }
 
 /// The wire string for a [`Quality`] - `"good"`/`"bad"`/`"stale"`, identical
