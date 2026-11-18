@@ -2861,3 +2861,68 @@ async fn a_rejection_before_sending_has_no_audit_id_and_keeps_the_first_claim_in
     );
     sim.stop();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_404_for_an_unknown_tag_keeps_its_shape_and_carries_the_correlation_id() {
+    let app = test_app("correlation-404").await;
+    app.write_control.enable();
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &["write:nope.nope.nope"],
+    )
+    .await;
+
+    let (status, body) = v1_post(
+        &app.router,
+        "/api/v1/values/nope.nope.nope",
+        &key,
+        json!({ "v": 1, "correlation_id": "c-404" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body:?}");
+    assert_eq!(body["kind"], "not_found", "{body:?}");
+    assert_eq!(body["resource"], "tags");
+    assert_eq!(body["id"], "nope.nope.nope");
+    assert_eq!(body["correlation_id"], "c-404");
+
+    // 申告が無いときは今まで通り(欄は出ない)。
+    let (status, body) = v1_post(
+        &app.router,
+        "/api/v1/values/nope.nope.nope",
+        &key,
+        json!({ "v": 1 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.get("correlation_id").is_none(), "{body:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_write_scope_403_carries_the_correlation_id() {
+    let app = test_app("correlation-403").await;
+    app.write_control.enable();
+    let (key, _id) = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
+
+    let (status, body) = v1_post(
+        &app.router,
+        "/api/v1/values/line1.fast.temp01",
+        &key,
+        json!({ "v": 1, "correlation_id": "c-403" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body:?}");
+    assert_eq!(body["error"], "missing_write_scope");
+    assert_eq!(body["correlation_id"], "c-403");
+
+    let (status, body) = v1_post(
+        &app.router,
+        "/api/v1/values/line1.fast.temp01",
+        &key,
+        json!({ "v": 1 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body.get("correlation_id").is_none(), "{body:?}");
+}

@@ -7137,3 +7137,52 @@ async fn mcp_connection_passwords_leave_no_plaintext_after_the_upkeep() {
         }
     }
 }
+
+/// #1201: write スコープの無い鍵の拒否にも、検証済みの `correlation_id` が付く。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_tag_value_missing_scope_rejection_carries_the_correlation_id() {
+    let app = test_app("write-scope-correlation").await;
+    let sim = Simulator::start().await;
+    let (_tag_id, external_name) = make_tag(
+        &app,
+        "line1",
+        sim.addr.port(),
+        "temp01",
+        "D100",
+        "u16",
+        true,
+        true,
+    )
+    .await;
+    app.write_control.enable();
+    let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call(
+            "write_tag_value",
+            json!({ "tag": external_name, "value": 1, "correlation_id": "mcp-403" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("missing_write_scope"), "{text}");
+    assert!(text.contains("correlation_id: mcp-403"), "{text}");
+
+    let (_status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call(
+            "write_tag_value",
+            json!({ "tag": external_name, "value": 1 }),
+        ),
+    )
+    .await;
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(!text.contains("correlation_id"), "{text}");
+
+    sim.stop();
+}

@@ -126,11 +126,23 @@ fn write_rejection_response(
     use crate::write_path::WriteRejection;
 
     if matches!(rejection, WriteRejection::NotFound) {
-        return ApiError(BantoError::NotFound {
+        let error = BantoError::NotFound {
             resource: "tags".to_string(),
             id: tag,
-        })
-        .into_response();
+        };
+        let Some(correlation_id) = correlation_id else {
+            return ApiError(error).into_response();
+        };
+        // #1201: ApiError と同じ 404 + `ErrorBody` の形のまま `correlation_id` だけ足す。
+        let mut body = serde_json::to_value(banto_core::ErrorBody::from(&error))
+            .unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(map) = body.as_object_mut() {
+            map.insert(
+                "correlation_id".to_string(),
+                serde_json::json!(correlation_id),
+            );
+        }
+        return (StatusCode::NOT_FOUND, Json(body)).into_response();
     }
 
     let status = match &rejection {
@@ -276,7 +288,18 @@ pub(super) async fn v1_write_value(
             &tag,
             &meta,
         );
-        return missing_write_scope_response();
+        // #1201: 検証済みの `correlation_id` は拒否にも返す(形は変えず欄だけ足す)。
+        return match meta.correlation_id() {
+            Some(id) => (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "missing_write_scope",
+                    "correlation_id": id,
+                })),
+            )
+                .into_response(),
+            None => missing_write_scope_response(),
+        };
     }
 
     let requested = parse_requested_value(&body.v);

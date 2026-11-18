@@ -1568,9 +1568,14 @@ async fn tool_write_tag_value(
             &tag,
             &meta,
         );
-        return Ok(tool_error(format!(
+        let mut message = format!(
             "missing_write_scope: タグ '{tag}' への write:{{tag}} スコープを持つ API キーが必要です。"
-        )));
+        );
+        // #1201: 検証済みの `correlation_id` は拒否にも返す(本文は文章のまま、末尾に足す)。
+        if let Some(id) = meta.correlation_id() {
+            message.push_str(&format!(" correlation_id: {id}"));
+        }
+        return Ok(tool_error(message));
     }
 
     let requested = parse_requested_value(&value);

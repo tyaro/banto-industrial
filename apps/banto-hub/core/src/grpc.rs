@@ -956,7 +956,12 @@ impl TagServiceTrait for GrpcService {
                 &req.tag,
                 &meta,
             );
-            return Err(Status::permission_denied("missing_write_scope"));
+            // #1201: 検証済みの `correlation_id` は拒否にも metadata で返す。
+            let mut status = Status::permission_denied("missing_write_scope");
+            if let Some(Ok(value)) = meta.correlation_id().map(str::parse) {
+                status.metadata_mut().insert("correlation-id", value);
+            }
+            return Err(status);
         }
 
         // `oneof num|bool` を型情報を保ったまま `RequestedValue` へ - REST の
