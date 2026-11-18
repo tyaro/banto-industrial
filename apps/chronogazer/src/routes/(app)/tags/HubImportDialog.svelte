@@ -24,7 +24,7 @@
 	 */
 	import { Modal } from '@banto/ui';
 	import { guardUnsavedChanges, UNSAVED_NOTICE } from '#lib/unsavedChanges.js';
-	import { UnsavedChangesNotice } from '@banto/forms';
+	import { isSamePath, UnsavedChangesNotice } from '@banto/forms';
 	import { isProviderError } from '@banto/admin-core';
 	import { toastStore } from '#lib/toast.svelte.js';
 	import {
@@ -106,7 +106,13 @@
 		label: ms >= 1000 ? `${ms / 1000}s` : `${ms}ms`
 	}));
 
-	guardUnsavedChanges({ isDirty: () => dirty, isSaving: () => registering });
+	guardUnsavedChanges({
+		isDirty: () => dirty,
+		isSaving: () => registering,
+		// 開いたまま URL のクエリだけが変わる移動（戻る・進む）ではダイアログは閉じず下書きが残る
+		// （`hubDialogOpen` は URL に連動しない）ので、同じページの移動として確認の対象外にする。
+		isSamePage: isSamePath
+	});
 
 	function errorMessage(err: unknown): string {
 		if (isProviderError(err)) {
