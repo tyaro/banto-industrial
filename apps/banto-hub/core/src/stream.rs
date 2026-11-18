@@ -903,6 +903,9 @@ struct ValueWire {
     v: Option<f64>,
     q: &'static str,
     t: i64,
+    /// 未確認(起動後に一度も良好値を受けていない)のときだけ載る。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    unverified: bool,
 }
 
 /// `crate::subscribe_core::ResolvedValue`(transport 非依存)から WS の
@@ -915,6 +918,7 @@ impl From<ResolvedValue> for ValueWire {
             v: value.v,
             q: quality_str(value.q),
             t: value.t,
+            unverified: value.unverified,
         }
     }
 }
@@ -1110,6 +1114,23 @@ pub(crate) mod tests {
     use banto_collect::CollectorOptions;
     use banto_tstore::SystemClock;
     use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    /// `unverified` はワイヤに未確認のときだけ載る(互換のため常には載せない)。
+    #[test]
+    fn value_wire_carries_unverified_only_when_true() {
+        let wire = |unverified| {
+            serde_json::to_value(ValueWire::from(ResolvedValue {
+                tag: "a.b.c".to_string(),
+                v: None,
+                q: banto_collect::Quality::Bad,
+                t: 1,
+                unverified,
+            }))
+            .unwrap()
+        };
+        assert_eq!(wire(true)["unverified"], serde_json::json!(true));
+        assert!(wire(false).get("unverified").is_none());
+    }
 
     /// 偽の照合が返すもの。
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -101,6 +101,7 @@
 		v: number | null;
 		q: string;
 		t: number;
+		unverified?: boolean;
 	}
 
 	const FLASH_MS = 700;
@@ -170,7 +171,8 @@
 			...entry,
 			v: cached?.v ?? previous?.v ?? null,
 			q: cached?.q ?? previous?.q ?? 'stale',
-			t: cached?.t ?? previous?.t ?? 0
+			t: cached?.t ?? previous?.t ?? 0,
+			unverified: cached ? !!cached.unverified : !!previous?.unverified
 		};
 	}
 
@@ -654,7 +656,10 @@
 										<th>接続</th>
 										<th>グループ</th>
 										<th>{columnLabels.value}</th>
-										<th>{columnLabels.quality}</th>
+										<th
+											title="未確認 = Hub の起動後に、まだ一度も実機から値を読めていない状態（収集開始後の不良とは別）"
+											>{columnLabels.quality}</th
+										>
 										<th>時刻</th>
 									</tr>
 								</thead>
@@ -866,6 +871,12 @@
 
 	.quality-stale {
 		color: var(--banto-text-muted);
+	}
+
+	/* 未確認: 通信異常（赤）ではなく、まだ読めていないだけ。stale より斜体で見分ける。 */
+	.quality-unverified {
+		color: var(--banto-text-muted);
+		font-style: italic;
 	}
 
 	/* T9 連携: シミュレーション接続配下のタグに付けるバッジ。plc-connections

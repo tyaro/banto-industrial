@@ -95,13 +95,15 @@ export interface MonitorCellRow {
 	v: number | null;
 	q: string;
 	unit?: string | null;
+	/** 起動後に一度も良好値を受けていない（`q` は良好でない）。 */
+	unverified?: boolean;
 }
 
 export interface MonitorCellDisplay {
 	/** 値の列に出す文字列。 */
 	value: string;
-	/** 色分けの区分（`good` / `bad` / `stale`）。 */
-	qualityClass: 'good' | 'bad' | 'stale';
+	/** 色分けの区分（`good` / `bad` / `stale` / `unverified`）。 */
+	qualityClass: 'good' | 'bad' | 'stale' | 'unverified';
 	/** 品質の列に出す文字列。 */
 	qualityLabel: string;
 }
@@ -111,6 +113,9 @@ const QUALITY_LABELS: Readonly<Record<string, string>> = {
 	bad: '不良',
 	stale: '陳腐化'
 };
+
+/** 未確認 = 起動後にまだ一度も実機から良好値を読めていない（収集開始後の不良と区別する）。 */
+export const UNVERIFIED_LABEL = '未確認';
 
 export function qualityLabel(q: string): string {
 	return Object.hasOwn(QUALITY_LABELS, q) ? QUALITY_LABELS[q] : q;
@@ -132,6 +137,9 @@ export function formatValue(row: MonitorCellRow): string {
 export function monitorCellDisplay(row: MonitorCellRow, mode: CellDisplayMode): MonitorCellDisplay {
 	switch (mode) {
 		case 'live':
+			if (row.unverified && row.q !== 'good') {
+				return { value: '--', qualityClass: 'unverified', qualityLabel: UNVERIFIED_LABEL };
+			}
 			return {
 				value: formatValue(row),
 				qualityClass: qualityClass(row.q),
@@ -143,7 +151,9 @@ export function monitorCellDisplay(row: MonitorCellRow, mode: CellDisplayMode): 
 			return {
 				value: formatValue(row),
 				qualityClass: 'stale',
-				qualityLabel: `${qualityLabel('stale')}（受信時: ${qualityLabel(row.q)}）`
+				qualityLabel: `${qualityLabel('stale')}（受信時: ${
+					row.unverified && row.q !== 'good' ? UNVERIFIED_LABEL : qualityLabel(row.q)
+				}）`
 			};
 	}
 }

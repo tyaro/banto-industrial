@@ -148,7 +148,7 @@ test.describe.serial('banto-hub 演算タグの式チェック API (#342 段階A
 	test('1. 構文エラーのある式を入力すると下線とメッセージが出る', async () => {
 		await page.goto('/tags');
 		await groupNodeByName(page, CALC_GROUP_NAME).click();
-		await page.getByRole('button', { name: '新規登録' }).click();
+		await page.getByRole('button', { name: 'タグを追加' }).click();
 		// #342 段階C: 新規作成フォームも広幅では非モーダルの右ペイン
 		// （`<aside aria-label>` = role `complementary`）へ移った（#375 の編集
 		// ペインと同じ型）ため `role="dialog"` では取れない。アクセシブル名

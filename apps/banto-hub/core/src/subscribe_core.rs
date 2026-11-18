@@ -55,7 +55,7 @@ use banto_collect::{CurrentValuesHandle, Quality};
 
 use crate::api_keys::{ApiKeyContext, HubScopeChecks};
 use crate::computed::ServerTagStore;
-use crate::hub::{read_current, TagEntry, TagMap};
+use crate::hub::{read_current_view, TagEntry, TagMap};
 
 /// 評価タイマの固定周期(設計 §5.2/§5.4「250ms 評価」)。`crate::stream`/
 /// `crate::grpc` の両方がこの値で `tokio::time::interval` を作る。
@@ -139,9 +139,11 @@ pub fn interval_floor_ms(patterns: &[TagPattern], map: &TagMap) -> i64 {
         .max(EVAL_TICK_MS)
 }
 
-/// on_change の diff 基準(外部名 → 直近の値/品質)。単なる型複雑度回避の
-/// エイリアス(clippy::type_complexity)。
-pub type DiffBaseline = HashMap<String, (Option<f64>, Quality)>;
+/// on_change の diff 基準(外部名 → 直近の値/品質/未確認)。単なる型複雑度
+/// 回避のエイリアス(clippy::type_complexity)。未確認も入れるのは、評価の
+/// 1 周期の間に未確認の Bad → Good → Bad と動いて値・品質が元に戻ったとき、
+/// 「未確認」のまま送り直されずに残らないようにするため。
+pub type DiffBaseline = HashMap<String, (Option<f64>, Quality, bool)>;
 
 /// 1タグの評価済みの値 - transport 非依存の表現。`crate::stream::ValueWire`
 /// (JSON)/gRPC の `TagValue`(proto)へはここから変換する。
@@ -151,6 +153,25 @@ pub struct ResolvedValue {
     pub v: Option<f64>,
     pub q: Quality,
     pub t: i64,
+    /// 未確認: 品質が Good でなく、かつ Hub の今回の起動後にこのタグで一度も
+    /// 良好値を受けていない(`CurrentView::source_time_ms` が `None`)。
+    /// 収集開始後の不良(通信異常)と区別するための表示用で、DB には残さない
+    /// (2026-11-18 オーナー決定)。
+    pub unverified: bool,
+}
+
+/// `read_current_view` を購読の 1 行(値・品質・時刻・未確認)へ射影する。
+/// 未確認の定義は [`ResolvedValue::unverified`]。無効タグ・サンプル無しの
+/// タグ・値未設定の内部タグは良好値を持たないので未確認になる。
+fn read_resolved(
+    entry: &TagEntry,
+    current: Option<&CurrentValuesHandle>,
+    server_store: &ServerTagStore,
+    now_ms: i64,
+) -> (Option<f64>, Quality, i64, bool) {
+    let view = read_current_view(entry, current, server_store, now_ms);
+    let unverified = view.quality != Quality::Good && view.source_time_ms.is_none();
+    (view.value, view.quality, view.timestamp_ms, unverified)
 }
 
 /// 1購読分の状態(diff 基準・次回発火時刻)。`crate::stream`/`crate::grpc`
@@ -206,13 +227,14 @@ pub fn initial_values(
     let values = matched
         .into_iter()
         .map(|entry| {
-            let (v, q, t) = read_current(entry, current, server_store, now_ms);
-            last.insert(entry.external_name.clone(), (v, q));
+            let (v, q, t, unverified) = read_resolved(entry, current, server_store, now_ms);
+            last.insert(entry.external_name.clone(), (v, q, unverified));
             ResolvedValue {
                 tag: entry.external_name.clone(),
                 v,
                 q,
                 t,
+                unverified,
             }
         })
         .collect();
@@ -245,22 +267,26 @@ pub fn evaluate(
             let mut changed_values = Vec::new();
             let mut still_present: HashSet<String> = HashSet::with_capacity(matched.len());
             for entry in &matched {
-                let (v, q, t) = read_current(entry, current, server_store, now_ms);
+                let (v, q, t, unverified) = read_resolved(entry, current, server_store, now_ms);
                 still_present.insert(entry.external_name.clone());
 
                 let changed = match sub.last.get(entry.external_name.as_str()) {
-                    Some((prev_v, prev_q)) => *prev_v != v || *prev_q != q,
+                    Some((prev_v, prev_q, prev_unverified)) => {
+                        *prev_v != v || *prev_q != q || *prev_unverified != unverified
+                    }
                     // 新規にマッチしたタグ(ワイルドカード購読が構成変更後に
                     // 拾った新タグ等)は初回として必ず1回送る。
                     None => true,
                 };
                 if changed {
-                    sub.last.insert(entry.external_name.clone(), (v, q));
+                    sub.last
+                        .insert(entry.external_name.clone(), (v, q, unverified));
                     changed_values.push(ResolvedValue {
                         tag: entry.external_name.clone(),
                         v,
                         q,
                         t,
+                        unverified,
                     });
                 }
             }
@@ -280,12 +306,14 @@ pub fn evaluate(
                 let values = matched
                     .iter()
                     .map(|entry| {
-                        let (v, q, t) = read_current(entry, current, server_store, now_ms);
+                        let (v, q, t, unverified) =
+                            read_resolved(entry, current, server_store, now_ms);
                         ResolvedValue {
                             tag: entry.external_name.clone(),
                             v,
                             q,
                             t,
+                            unverified,
                         }
                     })
                     .collect();
@@ -295,5 +323,68 @@ pub fn evaluate(
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod unverified_tests {
+    //! 「未確認」(起動後に一度も良好値を受けていない)の判定。
+    use super::*;
+    use banto_tags::INTERNAL_TAG_KIND;
+
+    fn internal_entry() -> TagEntry {
+        TagEntry {
+            external_name: "x.y.z".to_string(),
+            tag_key: "tag:1".to_string(),
+            ids: (1, 1, 1),
+            connection: "x".to_string(),
+            group: "y".to_string(),
+            name: "z".to_string(),
+            address: String::new(),
+            data_type: "f64".to_string(),
+            unit: None,
+            decimals: 0,
+            period_ms: 1_000,
+            enabled: true,
+            writable: true,
+            tag_kind: INTERNAL_TAG_KIND.to_string(),
+            expression: None,
+            retain: false,
+            simulation: false,
+            push: false,
+        }
+    }
+
+    #[test]
+    fn bad_without_any_good_sample_is_unverified() {
+        let entry = internal_entry();
+        let store = ServerTagStore::new();
+        // サンプル無し(値未設定)も、良好値を持たない Bad も未確認。
+        assert!(read_resolved(&entry, None, &store, 1_000).3);
+        store.set("tag:1", None, Quality::Bad, 900);
+        let (_, q, _, unverified) = read_resolved(&entry, None, &store, 1_000);
+        assert_eq!(q, Quality::Bad);
+        assert!(unverified);
+    }
+
+    #[test]
+    fn bad_after_a_good_sample_is_not_unverified() {
+        let entry = internal_entry();
+        let store = ServerTagStore::new();
+        store.set("tag:1", Some(1.0), Quality::Good, 800);
+        store.set("tag:1", None, Quality::Bad, 900);
+        let (_, q, _, unverified) = read_resolved(&entry, None, &store, 1_000);
+        assert_eq!(q, Quality::Bad);
+        assert!(!unverified);
+    }
+
+    #[test]
+    fn good_is_not_unverified() {
+        let entry = internal_entry();
+        let store = ServerTagStore::new();
+        store.set("tag:1", Some(1.0), Quality::Good, 900);
+        let (v, q, _, unverified) = read_resolved(&entry, None, &store, 1_000);
+        assert_eq!((v, q), (Some(1.0), Quality::Good));
+        assert!(!unverified);
     }
 }

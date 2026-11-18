@@ -235,7 +235,7 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 		// に確定する（`tagOnboarding.ts::resolveRegistrationTarget`）ので、
 		// 式欄とトグルが最初から出る。
 		await groupNodeByName(page, CALC_GROUP_NAME).click();
-		await page.getByRole('button', { name: '新規登録' }).click();
+		await page.getByRole('button', { name: 'タグを追加' }).click();
 
 		// #342 段階C: 新規作成も広幅では非モーダルの右ペイン
 		// （`role="complementary"`）。
@@ -436,7 +436,7 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 
 		// `calc` グループが選択されたままなので、新規登録も `tagKind === 'computed'`
 		// ＝トグルの表示条件は満たしたまま。それでもモード遷移で OFF に戻る。
-		await page.getByRole('button', { name: '新規登録' }).click();
+		await page.getByRole('button', { name: 'タグを追加' }).click();
 
 		const createPane = page.getByRole('complementary', { name: '新規作成' });
 		await expect(createPane).toBeVisible();
@@ -465,7 +465,7 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 			// 出ているので変更不要。
 			await narrowPage.locator('button[aria-label="接続とグループ"]').click();
 			await groupNodeByName(narrowPage, CALC_GROUP_NAME).click();
-			await narrowPage.getByRole('button', { name: '新規登録' }).click();
+			await narrowPage.getByRole('button', { name: 'タグを追加' }).click();
 
 			// 狭幅の新規作成は従来どおり中央モーダル（`role="dialog"`）。
 			const modal = narrowPage.getByRole('dialog', { name: '新規作成' });

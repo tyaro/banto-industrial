@@ -100,7 +100,10 @@ describe('resolveTagTreeContextMenuAction', () => {
 			'新規登録',
 			'新規作成',
 			'登録して次へ',
-			'登録して閉じる'
+			'登録して閉じる',
+			'タグを追加',
+			'保存して次を追加',
+			'保存して閉じる'
 		];
 		const conn = connection({ id: 1, name: 'plc1' });
 		const g = group({ id: 1, plcConnectionId: 1 });
@@ -193,7 +196,10 @@ describe('resolveTreeContextMenuItems', () => {
 			'新規登録',
 			'新規作成',
 			'登録して次へ',
-			'登録して閉じる'
+			'登録して閉じる',
+			'タグを追加',
+			'保存して次を追加',
+			'保存して閉じる'
 		];
 		const conn = connection({ id: 1, name: 'plc1' });
 		const g = group({ id: 1, plcConnectionId: 1 });

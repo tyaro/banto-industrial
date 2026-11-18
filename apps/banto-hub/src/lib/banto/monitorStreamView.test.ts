@@ -83,6 +83,38 @@ describe('monitorCellDisplay', () => {
 		expect(monitorCellDisplay(row, mode)).toEqual(expected);
 	});
 
+	describe('未確認（起動後に一度も良好値を受けていない）', () => {
+		const unverified = { v: null, q: 'bad', unit: null, unverified: true };
+
+		it('通常は「未確認」・値は --・赤ではない区分', () => {
+			expect(monitorCellDisplay(unverified, 'live')).toEqual({
+				value: '--',
+				qualityClass: 'unverified',
+				qualityLabel: '未確認'
+			});
+		});
+
+		it('停止中は「陳腐化（受信時: 未確認）」', () => {
+			expect(monitorCellDisplay(unverified, 'halted')).toEqual({
+				value: '--',
+				qualityClass: 'stale',
+				qualityLabel: '陳腐化（受信時: 未確認）'
+			});
+		});
+
+		it('スナップショット待ちは既存のまま', () => {
+			expect(monitorCellDisplay(unverified, 'awaitingSnapshot')).toEqual({
+				value: '--',
+				qualityClass: 'stale',
+				qualityLabel: '陳腐化'
+			});
+		});
+
+		it('unverified が無い不良は従来どおり「不良」', () => {
+			expect(monitorCellDisplay({ v: null, q: 'bad' }, 'live').qualityClass).toBe('bad');
+		});
+	});
+
 	it('停止中は品質「良好」をそのまま出さない', () => {
 		const cell = monitorCellDisplay(good, 'halted');
 		expect(cell.qualityLabel).not.toBe('良好');
