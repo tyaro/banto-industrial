@@ -35,6 +35,10 @@ export interface WriteAuditEntry {
 		| 'rejected'
 		| string;
 	detail: string | null;
+	/** #1201: 呼出側が付けた突き合わせ用の ID（古い行・バッチは null）。 */
+	correlationId: string | null;
+	/** #1201: 要求の `on_behalf_of`。呼出側の自己申告で、Hub は確かめていない。 */
+	operatorClaim: string | null;
 }
 
 const NETWORK_ERROR_MESSAGE = 'サーバーに接続できません';

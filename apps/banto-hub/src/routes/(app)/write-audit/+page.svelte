@@ -177,7 +177,9 @@
 							<td>{formatSqliteUtc(row.ts)}</td>
 							<td
 								>{row.apiKeyNameSnapshot}{#if row.apiKeyPrefixSnapshot}
-									<small class="key-prefix">{row.apiKeyPrefixSnapshot}</small>{/if}</td
+									<small class="key-prefix">{row.apiKeyPrefixSnapshot}</small
+									>{/if}{#if row.operatorClaim}
+									<small class="claim">申告: {row.operatorClaim}</small>{/if}</td
 							>
 							<td class="tag-name">{row.externalNameSnapshot}</td>
 							<td class="value">{row.valueRequested ?? row.valueRequestedText ?? '-'}</td>
@@ -209,6 +211,15 @@
 					{selected.apiKeyNameSnapshot}{#if selected.apiKeyPrefixSnapshot}
 						<small class="key-prefix">{selected.apiKeyPrefixSnapshot}</small>{/if}（ID: {selected.apiKeyId}）
 				</dd>
+				<dt>操作者（申告）</dt>
+				<dd class="wrap">
+					{selected.operatorClaim ?? '—'}
+					<small class="claim-note"
+						>呼出側の申告で、Hub は確かめていません。認証の根拠は API キーです。</small
+					>
+				</dd>
+				<dt>相関 ID</dt>
+				<dd class="wrap">{selected.correlationId ?? '—'}</dd>
 				<dt>タグ</dt>
 				<dd>
 					{selected.externalNameSnapshot}{selected.tagId > 0
@@ -239,6 +250,23 @@
 		color: var(--banto-text-muted, #6b7280);
 		font-family: monospace;
 		margin-left: 0.25rem;
+	}
+
+	.claim {
+		display: block;
+		color: var(--banto-text-muted, #6b7280);
+		font-size: 0.75rem;
+		overflow-wrap: anywhere;
+		max-width: 16rem;
+	}
+
+	.claim-note {
+		display: block;
+		color: var(--banto-text-muted, #6b7280);
+	}
+
+	.wrap {
+		overflow-wrap: anywhere;
 	}
 
 	.page {

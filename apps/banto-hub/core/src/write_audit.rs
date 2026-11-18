@@ -316,6 +316,11 @@ pub struct WriteAuditEntry {
     pub action: String,
     pub result: String,
     pub detail: Option<String>,
+    /// #1201: 呼び出し側が付けた突き合わせ用の ID(0111 より前の行・バッチは `NULL`)。
+    pub correlation_id: Option<String>,
+    /// #1201: 要求の `on_behalf_of`。**呼び出し側の自己申告で、Hub は確かめていない**
+    /// (認証された主体は `api_key_*`)。
+    pub operator_claim: Option<String>,
 }
 
 fn column_map() -> ColumnMap {
@@ -1409,7 +1414,7 @@ impl WriteAuditService {
 
         let mut rows_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
             "SELECT id, ts, api_key_id, api_key_name_snapshot, api_key_prefix_snapshot, tag_id, external_name_snapshot, \
-             value_requested, value_requested_text, action, result, detail FROM hub_write_audit",
+             value_requested, value_requested_text, action, result, detail, correlation_id, operator_claim FROM hub_write_audit",
         );
         banto_storage::list_query::sqlite::apply_list_params(&mut rows_builder, &columns, &params)?;
         let rows: Vec<WriteAuditEntry> = rows_builder
@@ -1476,6 +1481,32 @@ mod tests {
         assert_eq!(row.value_requested, Some(42.5));
         assert_eq!(row.action, "write");
         assert_eq!(row.result, "ok");
+    }
+
+    #[tokio::test]
+    async fn list_returns_claim_and_correlation_id_or_null() {
+        let svc = service().await;
+        let mut with_claim = sample_row();
+        with_claim.correlation_id = Some("corr-1".to_string());
+        with_claim.operator_claim = Some("alice".to_string());
+        svc.insert_row(&with_claim).await.unwrap();
+        svc.insert_row(&sample_row()).await.unwrap();
+
+        let result = svc.list(ListParams::default()).await.unwrap();
+        assert_eq!(result.total_count, 2);
+        let claimed = result
+            .rows
+            .iter()
+            .find(|r| r.correlation_id.is_some())
+            .expect("row with claim");
+        assert_eq!(claimed.correlation_id.as_deref(), Some("corr-1"));
+        assert_eq!(claimed.operator_claim.as_deref(), Some("alice"));
+        let plain = result
+            .rows
+            .iter()
+            .find(|r| r.correlation_id.is_none())
+            .expect("row without claim");
+        assert_eq!(plain.operator_claim, None);
     }
 
     #[tokio::test]
