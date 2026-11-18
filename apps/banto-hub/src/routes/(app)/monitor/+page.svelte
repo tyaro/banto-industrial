@@ -314,7 +314,9 @@
 		const url = new URL(page.url.href);
 		// T18-4c の確認対象（`focus`）は選択を変えても残す（`#lib/banto/monitorView.ts`）。
 		url.search = monitorViewSearch(target, parseMonitorFocus(url.searchParams));
-		if (url.href === page.url.href) return;
+		// 先の `goto` がまだ終わっていない間は `page.url` が古いので、同じに見えても
+		// 省かない（上下キーを続けて押し、元の行へ戻ったときに URL だけが先の行に残る）。
+		if (url.href === page.url.href && targetNavsInFlight === 0) return;
 		targetNavsInFlight += 1;
 		try {
 			// `reset: false`: フォーカスとスクロールを動かさない（同じページの中の切り替え）。

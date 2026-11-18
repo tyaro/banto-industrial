@@ -131,13 +131,16 @@ test.describe.serial('banto-hub タグ登録・タグモニタ: ツリーの選�
 		await connNode().click();
 		await expect(page).toHaveURL(monitorConnUrl());
 
-		// 接続先の下は配下のグループ（展開済み）。2 回目の下で別の行へ移っても、
-		// 移らなくても、キーで積んだ項目は 1 つだけ。
+		// 接続先の下は配下のグループ（展開済み）。接続先と配下のグループの間だけを
+		// 行き来する（グループの下に行があるかはほかの spec の作ったデータ次第なので
+		// 使わない）。上・下を続けて押し、先の `goto` が終わる前に元の行へ戻っても、
+		// URL が途中の行に残らないことも見る。キーで積んだ項目は 1 つだけ。
 		await page.keyboard.press('ArrowDown');
 		await expect(page).toHaveURL(monitorGroupUrl());
-		await page.keyboard.press('ArrowDown');
 		await page.keyboard.press('ArrowUp');
+		await page.keyboard.press('ArrowDown');
 		await expect(page).toHaveURL(monitorGroupUrl());
+		await expect(monitorSelection()).toHaveText(GROUP);
 
 		await page.goBack();
 		await expect(page).toHaveURL(monitorConnUrl());

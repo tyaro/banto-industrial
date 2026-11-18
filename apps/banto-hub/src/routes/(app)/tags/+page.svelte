@@ -3266,7 +3266,9 @@
 	async function navigateToView(view: TagsView, options: { replace: boolean }): Promise<void> {
 		const url = new URL(page.url.href);
 		url.search = tagsViewSearch(view);
-		if (url.href === page.url.href) return;
+		// 先の `goto` がまだ終わっていない間は `page.url` が古いので、同じに見えても
+		// 省かない（上下キーを続けて押し、元の行へ戻ったときに URL だけが先の行に残る）。
+		if (url.href === page.url.href && viewNavsInFlight === 0) return;
 		const href = url.href;
 		viewNavHrefs.add(href);
 		viewNavsInFlight += 1;
