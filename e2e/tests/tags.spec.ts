@@ -746,4 +746,74 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 			await page.setViewportSize({ width: 1280, height: 720 });
 		}
 	});
+
+	test('16. 版の衝突の後に同じ行を選び直すと、最新の版がフォームに出て保存できる（#1179 PR4b レビュー）', async () => {
+		await page.goto('/tags');
+		await recordList(page).getByRole('gridcell', { name: TAG_NAME, exact: true }).click();
+		const detail = detailPane(page);
+		await expect(detail.getByRole('heading', { level: 3, name: TAG_NAME })).toBeVisible();
+
+		// 別経路（API）が先に同じ記録項目の単位を更新する。
+		const login = await page.request.post('/api/auth/login', {
+			headers: { 'X-Banto-Client': 'banto' },
+			data: { username: ADMIN_USERNAME, password: ADMIN_PASSWORD }
+		});
+		const { token } = (await login.json()) as { token: string };
+		const headers = { 'X-Banto-Client': 'banto', Authorization: `Bearer ${token}` };
+		const list = await page.request.get('/api/tags', { headers });
+		const rows = (await list.json()) as Array<Record<string, unknown>>;
+		const row = rows.find((r) => r.name === TAG_NAME);
+		expect(row).toBeTruthy();
+		const { id, revision, ...rest } = row as Record<string, unknown>;
+		const put = await page.request.put(`/api/tags/${String(id)}`, {
+			headers,
+			data: { ...rest, unit: 'api', expectedRevision: revision }
+		});
+		expect(put.ok()).toBe(true);
+
+		// 古い版のまま画面で保存 -> 衝突の案内。入力は残る。
+		const unit = detail.getByLabel('単位', { exact: true });
+		await unit.fill('ui');
+		await detail.getByRole('button', { name: '保存', exact: true }).click();
+		await expect(page.getByText('先に更新しました')).toBeVisible();
+		await expect(unit).toHaveValue('ui');
+
+		// 同じ行をもう一度選ぶと、最新の値（API が書いた単位）で作り直される。
+		await recordList(page).getByRole('gridcell', { name: TAG_NAME, exact: true }).click();
+		await expect(unit).toHaveValue('api');
+
+		// 最新の版で保存できる。
+		await unit.fill('ui2');
+		await detail.getByRole('button', { name: '保存', exact: true }).click();
+		await expect(page.getByText('更新しました', { exact: true })).toBeVisible();
+		await expect(unit).toHaveValue('ui2');
+	});
+
+	test('17. 削除の成功は、無関係な右ペインの作成フォームと入力を捨てない（#1179 PR4b レビュー）', async () => {
+		const DELETE_GROUP = 'E2E削除用グループ';
+		const DRAFT_NAME = 'E2E下書き接続先';
+		await page.goto('/tags');
+		await selectTreeNode(page, CONNECTION_NAME);
+		const groupForm = await openCreateGroup(page);
+		await groupForm.getByLabel('名前').fill(DELETE_GROUP);
+		await groupForm.getByRole('button', { name: '作成' }).click();
+		await expect(treeNode(page, DELETE_GROUP)).toHaveAttribute('aria-selected', 'true');
+		await expect(detailPane(page)).toHaveCount(0);
+
+		// 配下の無いグループの「設定」を開き、右に無関係な作成フォームを入力途中にする。
+		await openSettingsTab(page);
+		const draft = await openCreateConnection(page);
+		await draft.getByLabel('名前').fill(DRAFT_NAME);
+
+		// 中央で削除を承認する。
+		page.once('dialog', (dialog) => void dialog.accept());
+		await settingsPane(page).getByRole('button', { name: '削除' }).click();
+		await expect(treeNode(page, DELETE_GROUP)).toHaveCount(0);
+
+		// 削除は成功し、右の追加フォームと入力は残っている。
+		await expect(
+			detailPane(page).getByRole('heading', { level: 3, name: '接続先を追加' })
+		).toBeVisible();
+		await expect(detailPane(page).getByLabel('名前')).toHaveValue(DRAFT_NAME);
+	});
 });

@@ -682,7 +682,10 @@
 					toastStore.push('success', '削除しました');
 					selectedConnection = null;
 					// #1179 PR4b: 消した接続先の「設定」から「すべて」へ移る。
-					forceView({ target: { type: 'all' }, tab: 'list' });
+					forceView(
+						{ target: { type: 'all' }, tab: 'list' },
+						{ kind: 'connection', id: pending.id }
+					);
 					await reloadConnections();
 					break;
 				case 'stale-success':
@@ -904,10 +907,13 @@
 					// #1179 PR4b: 消したグループの「設定」から、親の接続先へ移る。
 					const parent = selectedGroup?.plcConnectionId;
 					selectedGroup = null;
-					forceView({
-						target: parent === undefined ? { type: 'all' } : { type: 'connection', id: parent },
-						tab: 'list'
-					});
+					forceView(
+						{
+							target: parent === undefined ? { type: 'all' } : { type: 'connection', id: parent },
+							tab: 'list'
+						},
+						{ kind: 'group', id: pending.id }
+					);
 					await reloadGroups();
 					break;
 				}
@@ -1097,6 +1103,19 @@
 		return connectionRows.find((c) => c.id === group.plcConnectionId)?.protocol === 'hub';
 	}
 
+	/**
+	 * 同じ行を選んだとき、最新の版で作り直すか。タグの版が違う（版の衝突の後に一覧を
+	 * 読み直した）か、しきい値の保存が版の衝突で断られたあとのときだけ。
+	 */
+	function shouldReselectTag(
+		current: Tag | null,
+		clicked: Tag,
+		thresholdsConflicted: boolean
+	): boolean {
+		if (current === null || current.id !== clicked.id) return false;
+		return thresholdsConflicted || current.revision !== clicked.revision;
+	}
+
 	/** 編集中のタグが Hub 経由か（スケーリングの欄を出さない）。選んだ時点で決める。 */
 	let selectedTagIsHub = $state(false);
 
@@ -1107,7 +1126,11 @@
 	 */
 	function selectTag(tag: Tag): void {
 		if (!canWrite || rightPaneBusy()) return;
-		if (rightPane === 'tag' && selectedTag?.id === tag.id) return;
+		if (rightPane === 'tag' && selectedTag?.id === tag.id) {
+			// 同じ行: 版が同じなら何もしない。違えば（版の衝突の後に一覧を読み直した）
+			// 選び直しとして最新の版で作り直す。
+			if (!shouldReselectTag(selectedTag, tag, thresholdsConflict)) return;
+		}
 		if (!confirmDiscardRightPane()) return;
 		selectedTag = tag;
 		openRightPane('tag');
@@ -1161,6 +1184,7 @@
 	let selectedThresholds: TagThresholds | null = $state(null);
 	let thresholdsError: string | null = $state(null);
 	let thresholdsGeneration = 0;
+	let thresholdsConflict = false;
 	let editThresholdsStore = $state(untrack(() => createFormStore(thresholdSchema(TAG_THR))));
 	let savingThresholds = $state(false);
 
@@ -1169,6 +1193,7 @@
 		const generation = thresholdsGeneration;
 		selectedThresholds = null;
 		thresholdsError = null;
+		thresholdsConflict = false;
 		try {
 			const loaded = await getTagThresholds(tagId);
 			if (generation !== thresholdsGeneration || selectedTag?.id !== tagId) return;
@@ -1183,6 +1208,9 @@
 		}
 	}
 
+	// しきい値の版（`selectedThresholds.revision`）はタグの版とは別。しきい値だけが
+	// 版の衝突で断られたら `thresholdsConflict` を立て、同じ行の選び直しでも
+	// `selectTag` が読み直す（`loadThresholds` が下ろす）。
 	async function saveThresholds(): Promise<void> {
 		if (!selectedTag || !selectedThresholds || savingThresholds || savingTag || deletingTag) {
 			return;
@@ -1210,6 +1238,7 @@
 					break;
 				case 'error':
 					applyServerErrors(TAG_THR, THRESHOLD_WIRE_FIELDS, outcome.err, editThresholdsStore);
+					if (isRevisionConflict(outcome.err)) thresholdsConflict = true;
 					break;
 				case 'stale-success':
 				case 'stale-error':
@@ -1325,7 +1354,9 @@
 	//   作り直す（`discardForView`）ので、続く離脱の確認（`guardUnsavedChanges`）は
 	//   もう出ない。
 	// - 対象・タブを変えると右ペインは閉じる（右ペインの中身は、前の対象の一覧の
-	//   行か、前の対象への追加だったため）。
+	//   行か、前の対象への追加だったため）。**例外: 削除に伴う移動（`forceView`）は
+	//   右ペインを閉じない**（無関係な作成フォームの下書きを守る。作成フォームの
+	//   親の選択欄が消したものを指していたら、その欄だけ未選択に戻す）。
 
 	/** 右ペインの中身（どれか 1 つ）。`null` = 閉じている。 */
 	type RightPaneKind = 'tag' | 'createTag' | 'createConnection' | 'createGroup';
@@ -1566,10 +1597,36 @@
 		requestView({ target: created, tab: 'list' });
 	}
 
-	/** 確かめずに移る（削除の成功の後。捨てるフォームは消した対象のもの）。 */
-	function forceView(next: RecordsView): void {
+	/** 削除した接続先・グループ（作成フォームの親の選択欄が指していたら未選択に戻す）。 */
+	type DeletedParent = { kind: 'connection' | 'group'; id: number };
+
+	function clearDeletedParent(deleted: DeletedParent): void {
+		const points = (store: { values: Record<string, unknown> }, name: string): boolean =>
+			store.values[name] !== '' && Number(store.values[name]) === deleted.id;
+		if (deleted.kind === 'connection') {
+			const name = `${GROUP_CREATE}PlcConnectionId`;
+			if (points(createGroupStore, name)) createGroupStore.setValue(name, '');
+		} else {
+			const name = `${TAG_CREATE}CollectionGroupId`;
+			if (points(createTagStore, name)) createTagStore.setValue(name, '');
+		}
+	}
+
+	/**
+	 * 確かめずに移る（削除の成功の後）。「設定」タブ側の `selectedConnection`/
+	 * `selectedGroup` は捨てるが、右ペインは残す（上記のとおり）。
+	 */
+	function forceView(next: RecordsView, deleted: DeletedParent): void {
 		viewEntryFromKeyNavigation = false;
-		discardForView();
+		// 削除に伴う移動は、ふつうの切り替え（`requestView`）と違い**右ペインを閉じない**。
+		// 右ペインには消した対象と無関係な作成フォームが開いていることがあり（削除の
+		// 応答待ちの間に開いたものも）、その入力を確認なしに捨てないため。
+		selectedConnection = null;
+		selectedGroup = null;
+		clearDeletedParent(deleted);
+		if (rightPane === 'tag' && selectedTag && tags && !tags.some((t) => t.id === selectedTag?.id)) {
+			closeRightPane();
+		}
 		applyView(next);
 		void navigateToView(next, { replace: false });
 	}
