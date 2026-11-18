@@ -281,13 +281,15 @@ async fn read_hub_record(settings: &SettingsService) -> Result<Option<HubRecord>
 
 fn print_catalog_table(tags: &[HubTagView]) {
     println!(
-        "  {:<32} {:<32} {:<10} {:<10} {:<8}",
-        "external_name", "name", "data_type", "unit", "tag_kind"
+        "  {:<32} {:<14} {:<14} {:<24} {:<10} {:<10} {:<8}",
+        "external_name", "connection", "group", "name", "data_type", "unit", "tag_kind"
     );
     for tag in tags.iter().take(20) {
         println!(
-            "  {:<32} {:<32} {:<10} {:<10} {:<8}",
+            "  {:<32} {:<14} {:<14} {:<24} {:<10} {:<10} {:<8}",
             tag.external_name,
+            tag.connection,
+            tag.group,
             tag.name,
             tag.data_type,
             tag.unit.clone().unwrap_or_else(|| "-".to_owned()),

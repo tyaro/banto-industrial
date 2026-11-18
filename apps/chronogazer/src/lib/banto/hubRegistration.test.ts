@@ -28,6 +28,8 @@ import {
 function tag(externalName: string, dataType = 'f32', overrides: Partial<HubTag> = {}): HubTag {
 	return {
 		externalName,
+		connection: 'HUB',
+		group: 'G',
 		name: externalName.split('.').pop() ?? externalName,
 		dataType,
 		unit: '℃',

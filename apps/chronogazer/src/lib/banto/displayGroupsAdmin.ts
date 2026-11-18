@@ -14,6 +14,7 @@
  * と 1:1（camelCase）。**しきい値は持たない** - タグ定義の属性で、画面は
  * タグの値を読み取り専用で見せるだけ（recorder-requirements.md §3.7.1）。
  */
+import type { HubTagRow, Tag } from './tagRegistryAdmin';
 import {
 	demoModeError,
 	httpRequest,
@@ -37,6 +38,17 @@ export interface Pen {
 	colorSlot: number | null;
 }
 
+/**
+ * 保存で送るペン（Mirrors `PenPayload`、#1179 PR5）。`tagId`（登録済みの記録項目）か
+ * `hubTag`（Hub のカタログの行。保存で記録項目に登録される）の**どちらか一つ**。
+ */
+export type PenInput =
+	{ tagId: number; colorSlot: number | null } | { hubTag: HubTagRow; colorSlot: number | null };
+
+/** `hubTag` のペンの登録先（Mirrors `HubTagGroupPayload`）。どちらか一つ。 */
+export type HubTagGroupInput =
+	{ collectionGroupId: number } | { newGroup: { name: string; periodMs: number } };
+
 /** Mirrors `chronogazer_core::display_groups::DisplayGroup`. */
 export interface DisplayGroup {
 	id: number;
@@ -48,6 +60,12 @@ export interface DisplayGroup {
 	revision: number;
 }
 
+/**
+ * 作成・更新の応答（Mirrors `DisplayGroupSaveResponse`）。`registeredTags` は今回 Hub の
+ * タグから記録項目に登録したときだけ付く。`pens` は全部 `tagId`。
+ */
+export type DisplayGroupSaveResponse = DisplayGroup & { registeredTags?: Tag[] };
+
 /** Mirrors `chronogazer_core::display_groups::DisplayGroupPayload`. */
 export interface DisplayGroupInput {
 	name: string;
@@ -55,7 +73,9 @@ export interface DisplayGroupInput {
 	sortOrder?: number;
 	kind: DisplayKind;
 	attributes: DisplayAttributes;
-	pens: Pen[];
+	pens: PenInput[];
+	/** `hubTag` のペンがあるときだけ付ける登録先。 */
+	hubTagGroup?: HubTagGroupInput;
 	/** 楽観ロック（更新のみ）。編集を始めたときの `revision`。 */
 	expectedRevision?: number;
 }
@@ -66,23 +86,31 @@ export async function listDisplayGroups(): Promise<DisplayGroup[]> {
 	return httpRequest<DisplayGroup[]>('/api/display-groups', { method: 'GET' });
 }
 
-export async function createDisplayGroup(input: DisplayGroupInput): Promise<DisplayGroup> {
+export async function createDisplayGroup(
+	input: DisplayGroupInput
+): Promise<DisplayGroupSaveResponse> {
 	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
-		return invokeCommand<DisplayGroup>('display_groups_create', { input });
+		return invokeCommand<DisplayGroupSaveResponse>('display_groups_create', { input });
 	}
-	return httpRequest<DisplayGroup>('/api/display-groups', { method: 'POST', body: input });
+	return httpRequest<DisplayGroupSaveResponse>('/api/display-groups', {
+		method: 'POST',
+		body: input
+	});
 }
 
 export async function updateDisplayGroup(
 	id: number,
 	input: DisplayGroupInput
-): Promise<DisplayGroup> {
+): Promise<DisplayGroupSaveResponse> {
 	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
-		return invokeCommand<DisplayGroup>('display_groups_update', { id, input });
+		return invokeCommand<DisplayGroupSaveResponse>('display_groups_update', { id, input });
 	}
-	return httpRequest<DisplayGroup>(`/api/display-groups/${id}`, { method: 'PUT', body: input });
+	return httpRequest<DisplayGroupSaveResponse>(`/api/display-groups/${id}`, {
+		method: 'PUT',
+		body: input
+	});
 }
 
 export async function deleteDisplayGroup(id: number): Promise<void> {

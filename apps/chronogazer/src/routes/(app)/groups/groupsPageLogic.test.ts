@@ -3,6 +3,12 @@ import type { DisplayGroup } from '#lib/banto/displayGroupsAdmin.js';
 import {
 	MAX_PENS,
 	addPen,
+	appendPens,
+	defaultHubTarget,
+	hasHubPens,
+	penKey,
+	remainingPens,
+	replacePenTag,
 	canAddPen,
 	colorSlotVar,
 	defaultColorSlot,
@@ -39,7 +45,11 @@ const group: DisplayGroup = {
 };
 
 function withPens(...tagIds: (number | null)[]): GroupDraft {
-	return { ...emptyDraft(), name: 'g', pens: tagIds.map((tagId) => ({ tagId, colorSlot: null })) };
+	return {
+		...emptyDraft(),
+		name: 'g',
+		pens: tagIds.map((tagId) => ({ tagId, hubTag: null, colorSlot: null }))
+	};
 }
 
 describe('下書きと保存の形（#393）', () => {
@@ -120,8 +130,8 @@ describe('ペンの操作', () => {
 
 	it('同じグループの他のペンが使っているタグは選べない', () => {
 		const draft = withPens(1, null, 3);
-		expect([...tagsUsedByOtherPens(draft, 0)]).toEqual([3]);
-		expect([...tagsUsedByOtherPens(draft, 1)].sort()).toEqual([1, 3]);
+		expect([...tagsUsedByOtherPens(draft, 0)]).toEqual(['tag:3']);
+		expect([...tagsUsedByOtherPens(draft, 1)].sort()).toEqual(['tag:1', 'tag:3']);
 	});
 
 	it('色の既定はペンの位置 + 1 の枠（8 で頭打ち）、指定があればそれ', () => {
@@ -194,6 +204,7 @@ describe('サーバーの検証エラーの振り分け', () => {
 			kind: ['種別'],
 			timeWindowSec: ['時間窓'],
 			pens: ['8 本まで'],
+			hubTagGroup: [],
 			penRows: { 0: ['重複'], 2: ['タグが見つかりません', '色'] },
 			revision: ['先に更新されました'],
 			other: ['使えない項目', '16 個まで']
@@ -315,5 +326,127 @@ describe('「最新の内容を読み込む」（オーナーレビュー P2-2�
 				describeError
 			})
 		).toEqual({ kind: 'deleted', groups: [other] });
+	});
+});
+
+const hubRow = {
+	externalName: 'HUB/G/T1',
+	name: 'T1',
+	dataType: 'f32',
+	unit: 'degC',
+	decimals: 1
+};
+
+function hubPen(colorSlot: number | null = null) {
+	return { tagId: null, hubTag: hubRow, colorSlot };
+}
+
+describe('Hub のタグのペン（#1179 PR6b）', () => {
+	const target = { kind: 'existing', collectionGroupId: 9 } as const;
+
+	it('hubTag のペンは hubTag で送り、登録先 hubTagGroup を付ける（tagId のペンだけなら付けない）', () => {
+		const draft = { ...withPens(1), hubTarget: target };
+		expect(draftToInput(draft).hubTagGroup).toBeUndefined();
+		const withHub = { ...draft, pens: [...draft.pens, hubPen(3)] };
+		const input = draftToInput(withHub);
+		expect(input.pens).toEqual([
+			{ tagId: 1, colorSlot: null },
+			{ hubTag: hubRow, colorSlot: 3 }
+		]);
+		expect(input.hubTagGroup).toEqual({ collectionGroupId: 9 });
+	});
+
+	it('新しいグループへ登録するときは名前を trim して newGroup で送る', () => {
+		const draft = {
+			...emptyDraft(),
+			pens: [hubPen()],
+			hubTarget: { kind: 'new', name: ' Hub のタグ ', periodMs: 500 } as const
+		};
+		expect(draftToInput(draft).hubTagGroup).toEqual({
+			newGroup: { name: 'Hub のタグ', periodMs: 500 }
+		});
+	});
+
+	it('未保存の判定: hubTag のペンの追加・登録先の変更は未保存、hubTag が無ければ登録先は無関係', () => {
+		const baseline = draftFromGroup(group);
+		const added = { ...baseline, pens: [...baseline.pens, hubPen()], hubTarget: target };
+		expect(isDraftDirty(added, baseline)).toBe(true);
+		expect(
+			isDraftDirty({ ...added, hubTarget: { kind: 'existing', collectionGroupId: 10 } }, added)
+		).toBe(true);
+		expect(isDraftDirty({ ...baseline, hubTarget: target }, baseline)).toBe(false);
+	});
+
+	it('重複判定のキーは tag:<id> と hub:<外部名>', () => {
+		expect(penKey({ tagId: 4, hubTag: null })).toBe('tag:4');
+		expect(penKey({ tagId: null, hubTag: hubRow })).toBe('hub:HUB/G/T1');
+		expect(penKey({ tagId: null, hubTag: null })).toBeNull();
+		const draft = { ...withPens(1), pens: [...withPens(1).pens, hubPen()] };
+		expect([...tagsUsedByOtherPens(draft, 0)]).toEqual(['hub:HUB/G/T1']);
+		expect([...tagsUsedByOtherPens(draft)].sort()).toEqual(['hub:HUB/G/T1', 'tag:1']);
+	});
+
+	it('draftProblems: タグ未選択と、hubTag のペンの登録先の不備を止める', () => {
+		expect(draftProblems({ ...withPens(null), hubTarget: null })).toEqual([
+			'ペン 1 のタグを選んでください'
+		]);
+		const noGroup = { ...emptyDraft(), pens: [hubPen()], hubTarget: null };
+		expect(draftProblems(noGroup)).toHaveLength(1);
+		const emptyName = {
+			...noGroup,
+			hubTarget: { kind: 'new', name: ' ', periodMs: 1000 } as const
+		};
+		expect(draftProblems(emptyName)[0]).toContain('名前');
+		expect(draftProblems({ ...noGroup, hubTarget: target })).toEqual([]);
+	});
+
+	it('既定の登録先: Hub のグループがあれば最初のもの、無ければ「Hub のタグ」の新しいグループ', () => {
+		expect(defaultHubTarget([{ id: 5 }, { id: 6 }])).toEqual({
+			kind: 'existing',
+			collectionGroupId: 5
+		});
+		expect(defaultHubTarget([])).toEqual({ kind: 'new', name: 'Hub のタグ', periodMs: 1000 });
+	});
+
+	it('appendPens: 残りを超えるなら黙って一部だけ足さず、何も足さない。hubTag を足すと登録先が決まる', () => {
+		const draft = withPens(1, 2, 3, 4, 5, 6);
+		expect(remainingPens(draft)).toBe(2);
+		const three = [hubPen(), hubPen(), hubPen()];
+		expect(appendPens(draft, three, target)).toBe(draft);
+		const added = appendPens(draft, [hubPen()], target);
+		expect(added.pens).toHaveLength(7);
+		expect(added.hubTarget).toEqual(target);
+		expect(hasHubPens(added)).toBe(true);
+		// 登録先が決まっているときは保つ。
+		const kept = appendPens(
+			{ ...added, hubTarget: { kind: 'existing', collectionGroupId: 1 } },
+			[hubPen()],
+			target
+		);
+		expect(kept.hubTarget).toEqual({ kind: 'existing', collectionGroupId: 1 });
+	});
+
+	it('replacePenTag: タグを置き換えても色は保つ', () => {
+		const draft = { ...withPens(1, 2), pens: [{ tagId: 1, hubTag: null, colorSlot: 6 }] };
+		const replaced = replacePenTag(draft, 0, hubPen(), target);
+		expect(replaced.pens[0]).toMatchObject({ tagId: null, hubTag: hubRow, colorSlot: 6 });
+		expect(replaced.hubTarget).toEqual(target);
+		expect(replacePenTag(draft, 5, hubPen(), target)).toBe(draft);
+	});
+
+	it('hubTag・hubTagGroup の誤りの位置を振り分ける', () => {
+		const sorted = sortFieldErrors([
+			{ field: 'pens[1].hubTag.dataType', message: '型' },
+			{ field: 'pens[1].hubTag', message: '登録済み' },
+			{ field: 'hubTagGroup.newGroup.name', message: '名前' },
+			{ field: 'hubTagGroup', message: '登録先' }
+		]);
+		expect(sorted.penRows).toEqual({ 1: ['型', '登録済み'] });
+		expect(sorted.hubTagGroup).toEqual(['名前', '登録先']);
+		expect(sorted.other).toEqual([]);
+		expect(fieldErrorTabs(sorted)).toEqual({ settings: false, pens: true });
+		expect(
+			fieldErrorTabs(sortFieldErrors([{ field: 'hubTagGroup.collectionGroupId', message: 'x' }]))
+		).toEqual({ settings: false, pens: true });
 	});
 });

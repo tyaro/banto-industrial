@@ -15,8 +15,15 @@
 import type {
 	DisplayGroup,
 	DisplayGroupInput,
-	DisplayKind
+	DisplayKind,
+	PenInput
 } from '#lib/banto/displayGroupsAdmin.js';
+import type { HubTagRow } from '#lib/banto/tagRegistryAdmin.js';
+import {
+	DEFAULT_HUB_GROUP_PERIOD_MS,
+	registrationBlocker,
+	type RegistrationTarget
+} from '#lib/banto/hubRegistration.js';
 import { REVISION_CONFLICT_FIELD } from '#lib/banto/revisionConflict.js';
 
 /** グループ数の上限（§3.2）。画面は作成ボタンを止めるだけで、拒否はサーバー。 */
@@ -48,9 +55,21 @@ export function kindLabel(kind: DisplayKind): string {
 	return KIND_OPTIONS.find((option) => option.value === kind)?.label ?? kind;
 }
 
+/** Hub のタグの登録先を新しいグループにしたときの、名前の既定の提案（空にしない）。 */
+export const DEFAULT_HUB_GROUP_NAME = 'Hub のタグ';
+
+/**
+ * ペン 1 行の下書き。**`tagId` と `hubTag` はどちらか一つ**（両方 `null` = まだタグを
+ * 選んでいない行）。`hubTag` は Hub のカタログの行で、保存で記録項目に登録されて
+ * ペンに割り当たる（#1179 PR5・PR6b）。
+ */
 export interface PenDraft {
-	/** `null` = まだタグを選んでいない行。 */
+	/** 登録済みの記録項目。 */
 	tagId: number | null;
+	/** まだ記録項目になっていない Hub のタグ（保存で登録）。 */
+	hubTag: HubTagRow | null;
+	/** `hubTag` の出どころ（Hub の接続先名・収集グループ名）。表示だけで、保存には使わない。 */
+	hubSource?: { connection: string; group: string } | null;
 	colorSlot: number | null;
 }
 
@@ -60,10 +79,39 @@ export interface GroupDraft {
 	/** トレンドのときだけ保存に使う（他の種別では送らない）。 */
 	timeWindowSec: number;
 	pens: PenDraft[];
+	/**
+	 * `hubTag` のペンの登録先。`hubTag` のペンを足すときに決まる（`null` = まだ無い）。
+	 * 未保存の判定・保存の形に入るのは、`hubTag` のペンがあるときだけ。
+	 */
+	hubTarget: RegistrationTarget | null;
 }
 
 export function emptyDraft(): GroupDraft {
-	return { name: '', kind: 'trend', timeWindowSec: DEFAULT_TIME_WINDOW_SEC, pens: [] };
+	return {
+		name: '',
+		kind: 'trend',
+		timeWindowSec: DEFAULT_TIME_WINDOW_SEC,
+		pens: [],
+		hubTarget: null
+	};
+}
+
+/** 登録先の既定: Hub のグループがあれば最初のもの、無ければ新しいグループ（名前は「Hub のタグ」）。 */
+export function defaultHubTarget(hubGroups: readonly { id: number }[]): RegistrationTarget {
+	return hubGroups.length > 0
+		? { kind: 'existing', collectionGroupId: hubGroups[0].id }
+		: { kind: 'new', name: DEFAULT_HUB_GROUP_NAME, periodMs: DEFAULT_HUB_GROUP_PERIOD_MS };
+}
+
+export function hasHubPens(draft: Pick<GroupDraft, 'pens'>): boolean {
+	return draft.pens.some((pen) => pen.hubTag !== null);
+}
+
+/** ペンの重複判定のキー（`tag:<id>` / `hub:<外部名>`）。タグ未選択は `null`。 */
+export function penKey(pen: Pick<PenDraft, 'tagId' | 'hubTag'>): string | null {
+	if (pen.tagId !== null) return `tag:${pen.tagId}`;
+	if (pen.hubTag !== null) return `hub:${pen.hubTag.externalName}`;
+	return null;
 }
 
 export function draftFromGroup(group: DisplayGroup): GroupDraft {
@@ -71,7 +119,8 @@ export function draftFromGroup(group: DisplayGroup): GroupDraft {
 		name: group.name,
 		kind: group.kind,
 		timeWindowSec: group.attributes.timeWindowSec ?? DEFAULT_TIME_WINDOW_SEC,
-		pens: group.pens.map((pen) => ({ tagId: pen.tagId, colorSlot: pen.colorSlot }))
+		pens: group.pens.map((pen) => ({ tagId: pen.tagId, hubTag: null, colorSlot: pen.colorSlot })),
+		hubTarget: null
 	};
 }
 
@@ -84,8 +133,19 @@ export function draftToInput(draft: GroupDraft, expectedRevision?: number): Disp
 		name: draft.name,
 		kind: draft.kind,
 		attributes: draft.kind === 'trend' ? { timeWindowSec: draft.timeWindowSec } : {},
-		pens: draft.pens.map((pen) => ({ tagId: pen.tagId as number, colorSlot: pen.colorSlot }))
+		pens: draft.pens.map((pen): PenInput =>
+			pen.hubTag !== null
+				? { hubTag: pen.hubTag, colorSlot: pen.colorSlot }
+				: { tagId: pen.tagId as number, colorSlot: pen.colorSlot }
+		)
 	};
+	if (hasHubPens(draft) && draft.hubTarget !== null) {
+		const target = draft.hubTarget;
+		input.hubTagGroup =
+			target.kind === 'existing'
+				? { collectionGroupId: target.collectionGroupId as number }
+				: { newGroup: { name: target.name.trim(), periodMs: target.periodMs } };
+	}
 	if (expectedRevision !== undefined) input.expectedRevision = expectedRevision;
 	return input;
 }
@@ -96,7 +156,9 @@ function draftKey(draft: GroupDraft): string {
 		name: draft.name,
 		kind: draft.kind,
 		timeWindowSec: draft.kind === 'trend' ? draft.timeWindowSec : null,
-		pens: draft.pens.map((pen) => [pen.tagId, pen.colorSlot])
+		pens: draft.pens.map((pen) => [penKey(pen), pen.colorSlot]),
+		// 登録先は `hubTag` のペンがあるときだけ未保存の判定に入る。
+		hubTarget: hasHubPens(draft) ? draft.hubTarget : null
 	});
 }
 
@@ -109,8 +171,17 @@ export function isDraftDirty(draft: GroupDraft, baseline: GroupDraft): boolean {
 export function draftProblems(draft: GroupDraft): string[] {
 	const problems: string[] = [];
 	draft.pens.forEach((pen, index) => {
-		if (pen.tagId === null) problems.push(`ペン ${index + 1} のタグを選んでください`);
+		if (pen.tagId === null && pen.hubTag === null) {
+			problems.push(`ペン ${index + 1} のタグを選んでください`);
+		}
 	});
+	if (hasHubPens(draft)) {
+		const blocker = registrationBlocker(
+			1,
+			draft.hubTarget ?? { kind: 'existing', collectionGroupId: null }
+		);
+		if (blocker !== null) problems.push(`Hub のタグの登録先: ${blocker}`);
+	}
 	return problems;
 }
 
@@ -120,7 +191,49 @@ export function canAddPen(draft: GroupDraft): boolean {
 
 export function addPen(draft: GroupDraft): GroupDraft {
 	if (!canAddPen(draft)) return draft;
-	return { ...draft, pens: [...draft.pens, { tagId: null, colorSlot: null }] };
+	return { ...draft, pens: [...draft.pens, { tagId: null, hubTag: null, colorSlot: null }] };
+}
+
+/** あと何本ペンを足せるか。 */
+export function remainingPens(draft: Pick<GroupDraft, 'pens'>): number {
+	return Math.max(MAX_PENS - draft.pens.length, 0);
+}
+
+/**
+ * タグ選択で選んだペンを末尾に足す。残りを超えるときは**何も足さない**（黙って一部だけ
+ * 足さない。止める理由は画面が出す）。`hubTag` のペンを初めて足すとき、登録先が未決なら
+ * `defaultTarget` にする。
+ */
+export function appendPens(
+	draft: GroupDraft,
+	picks: readonly PenDraft[],
+	defaultTarget: RegistrationTarget
+): GroupDraft {
+	if (picks.length === 0 || picks.length > remainingPens(draft)) return draft;
+	const needsTarget = picks.some((pen) => pen.hubTag !== null);
+	return {
+		...draft,
+		pens: [...draft.pens, ...picks],
+		hubTarget: needsTarget && draft.hubTarget === null ? defaultTarget : draft.hubTarget
+	};
+}
+
+/** 1 本のペンのタグを置き換える（色は保つ）。 */
+export function replacePenTag(
+	draft: GroupDraft,
+	index: number,
+	pick: PenDraft,
+	defaultTarget: RegistrationTarget
+): GroupDraft {
+	if (index < 0 || index >= draft.pens.length) return draft;
+	const pens = draft.pens.map((pen, i) =>
+		i === index ? { ...pick, colorSlot: pen.colorSlot } : pen
+	);
+	return {
+		...draft,
+		pens,
+		hubTarget: pick.hubTag !== null && draft.hubTarget === null ? defaultTarget : draft.hubTarget
+	};
 }
 
 export function removePen(draft: GroupDraft, index: number): GroupDraft {
@@ -150,11 +263,15 @@ export function colorSlotVar(slot: number): string {
 	return `var(--banto-chart-${slot})`;
 }
 
-/** このペンの行で選べないタグ（同じグループの他のペンが使っている）。 */
-export function tagsUsedByOtherPens(draft: GroupDraft, index: number): Set<number> {
-	const used = new Set<number>();
+/**
+ * このペンの行で選べないタグ（同じグループの他のペンが使っている）。キーは
+ * {@link penKey}（`tag:<id>` / `hub:<外部名>`）。`index` を省略すると全ペン。
+ */
+export function tagsUsedByOtherPens(draft: GroupDraft, index: number | null = null): Set<string> {
+	const used = new Set<string>();
 	draft.pens.forEach((pen, i) => {
-		if (i !== index && pen.tagId !== null) used.add(pen.tagId);
+		const key = penKey(pen);
+		if (i !== index && key !== null) used.add(key);
 	});
 	return used;
 }
@@ -241,6 +358,8 @@ export interface SortedFieldErrors {
 	timeWindowSec: string[];
 	/** ペンの数など、ペンの一覧全体への誤り。 */
 	pens: string[];
+	/** `hubTag` のペンの登録先（`hubTagGroup.*`）への誤り。登録先の欄に出す。 */
+	hubTagGroup: string[];
 	/** ペンの行ごと（キーは行の番号、0 始まり）。 */
 	penRows: Record<number, string[]>;
 	/** 版の食い違い（`expectedRevision`）。 */
@@ -249,7 +368,8 @@ export interface SortedFieldErrors {
 	other: string[];
 }
 
-const PEN_FIELD = /^pens\[(\d+)\]\.(tagId|colorSlot)$/;
+const PEN_FIELD = /^pens\[(\d+)\]\.(tagId|colorSlot|hubTag(\..+)?)$/;
+const HUB_TAG_GROUP_FIELD = /^hubTagGroup(\..+)?$/;
 
 export function sortFieldErrors(fieldErrors: readonly FieldErrorLike[]): SortedFieldErrors {
 	const sorted: SortedFieldErrors = {
@@ -257,6 +377,7 @@ export function sortFieldErrors(fieldErrors: readonly FieldErrorLike[]): SortedF
 		kind: [],
 		timeWindowSec: [],
 		pens: [],
+		hubTagGroup: [],
 		penRows: {},
 		revision: [],
 		other: []
@@ -270,6 +391,7 @@ export function sortFieldErrors(fieldErrors: readonly FieldErrorLike[]): SortedF
 		else if (fe.field === 'kind') sorted.kind.push(fe.message);
 		else if (fe.field === 'attributes.timeWindowSec') sorted.timeWindowSec.push(fe.message);
 		else if (fe.field === 'pens') sorted.pens.push(fe.message);
+		else if (HUB_TAG_GROUP_FIELD.test(fe.field)) sorted.hubTagGroup.push(fe.message);
 		else if (fe.field === REVISION_CONFLICT_FIELD) sorted.revision.push(fe.message);
 		else sorted.other.push(fe.message);
 	}
@@ -287,7 +409,10 @@ export function emptyFieldErrors(): SortedFieldErrors {
 export function fieldErrorTabs(errors: SortedFieldErrors): { settings: boolean; pens: boolean } {
 	return {
 		settings: errors.name.length > 0 || errors.kind.length > 0 || errors.timeWindowSec.length > 0,
-		pens: errors.pens.length > 0 || Object.values(errors.penRows).some((rows) => rows.length > 0)
+		pens:
+			errors.pens.length > 0 ||
+			errors.hubTagGroup.length > 0 ||
+			Object.values(errors.penRows).some((rows) => rows.length > 0)
 	};
 }
 
