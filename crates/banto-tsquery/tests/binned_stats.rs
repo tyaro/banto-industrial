@@ -3,7 +3,7 @@
 
 mod common;
 
-use banto_tsquery::{TsQuery, TsQueryError, MAX_STAT_BINS};
+use banto_tsquery::{TsQuery, TsQueryError, MAX_STAT_BINS, MAX_STAT_CELLS};
 use common::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -194,4 +194,25 @@ async fn rejects_invalid_arguments() {
         .await
         .unwrap_err();
     assert!(matches!(err, TsQueryError::InvalidInput(_)), "{err:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejects_too_many_cells_even_without_history() {
+    let dir = TempDir::new("stats-cells");
+    let q = TsQuery::new(dir.path());
+    let max = MAX_STAT_BINS as i64;
+    let names: Vec<String> = (0..11).map(|i| format!("t{i}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let err = q
+        .read_binned_stats("g1", &tag_keys(&refs), 0, max - 1, 1)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TsQueryError::InvalidInput(_)), "{err:?}");
+    // exactly MAX_STAT_CELLS (10 tags x 100,000 bins) is accepted.
+    assert_eq!(MAX_STAT_CELLS, 10 * MAX_STAT_BINS);
+    let r = q
+        .read_binned_stats("g1", &tag_keys(&refs[..10]), 0, max - 1, 1)
+        .await
+        .unwrap();
+    assert_eq!(r.bins.len(), MAX_STAT_BINS);
 }

@@ -21,6 +21,11 @@
 //!   There is no other non-finite handling: SQLite stores NaN as NULL (so it
 //!   is excluded like any NULL); `+-inf` is kept as written, so `max`/`avg`
 //!   can be `inf` (and an `inf + -inf` sum yields a NaN `avg`).
+//!
+//! Size limits (checked before any file is opened or allocated): the bin
+//! count is capped by [`MAX_STAT_BINS`] and `bins x tags` by
+//! [`MAX_STAT_CELLS`], since the dense accumulator is allocated up front even
+//! when there is no history.
 
 use banto_tstore::DataPlace;
 
@@ -37,6 +42,12 @@ use crate::types::{BinnedStats, StatBin, TagStat};
 /// choose a coarser interval up front instead of discovering the limit via
 /// [`TsQueryError::InvalidInput`].
 pub const MAX_STAT_BINS: usize = 100_000;
+
+/// Upper bound on `bins x tags` (accumulator cells). Each cell is about 40
+/// bytes, so the worst case is about 40 MB. The ChronoGazer CSV export uses
+/// at most 8 tags x 100,000 bins = 800,000 cells. Checked before any
+/// allocation, even when there is no history.
+pub const MAX_STAT_CELLS: usize = 1_000_000;
 
 pub(crate) async fn read_binned_stats(
     place: &DataPlace,
@@ -60,6 +71,13 @@ pub(crate) async fn read_binned_stats(
     if count > MAX_STAT_BINS as i128 {
         return Err(TsQueryError::InvalidInput(format!(
             "ビン数が上限を超えています: {count}（上限 {MAX_STAT_BINS}）。間隔を広げるか期間を狭めてください"
+        )));
+    }
+    let cells = count * tag_keys.len() as i128;
+    if cells > MAX_STAT_CELLS as i128 {
+        return Err(TsQueryError::InvalidInput(format!(
+            "ビン数 × タグ数が上限を超えています: {count} × {}（上限 {MAX_STAT_CELLS}）。期間を狭める・間隔を広げる・タグ数を絞るのいずれかをしてください",
+            tag_keys.len()
         )));
     }
 

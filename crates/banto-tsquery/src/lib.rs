@@ -55,7 +55,7 @@ pub mod error;
 pub use decimate::MAX_TARGET_BINS;
 pub use error::TsQueryError;
 pub use raw::DEFAULT_MAX_RAW_ROWS;
-pub use stats::MAX_STAT_BINS;
+pub use stats::{MAX_STAT_BINS, MAX_STAT_CELLS};
 pub use types::{
     Bin, BinValue, BinnedStats, Catalog, DecimatedRange, GroupCatalogEntry, RawRange, RawRow,
     StatBin, TagAggregate, TagCatalogEntry, TagStat,
