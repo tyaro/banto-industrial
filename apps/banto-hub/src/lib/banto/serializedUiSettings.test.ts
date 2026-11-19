@@ -87,9 +87,73 @@ describe('createSerializedUiSettings', () => {
 		await p2;
 	});
 
-	it('get は内側へそのまま渡す', async () => {
+	it('書き込みが無ければ get は素通し', async () => {
 		const { inner } = fakeInner();
 		const s = createSerializedUiSettings(inner, () => 't');
 		expect(await s.get('x')).toBe('got:x');
+	});
+
+	it('書き込みの送信中に呼んだ get は、送信が終わるまで内側の get を呼ばない', async () => {
+		const { inner, sent } = fakeInner();
+		const calls: string[] = [];
+		const s = createSerializedUiSettings(
+			{
+				get: (k) => {
+					calls.push(k);
+					return inner.get(k);
+				},
+				set: inner.set
+			},
+			() => 't'
+		);
+		void s.set('k', '1');
+		const g = s.get('k');
+		await tick();
+		expect(calls).toEqual([]);
+		sent[0].resolve();
+		expect(await g).toBe('got:k');
+		expect(calls).toEqual(['k']);
+	});
+
+	it('控えている値も送られてから読む', async () => {
+		const { inner, sent } = fakeInner();
+		const calls: string[] = [];
+		const s = createSerializedUiSettings(
+			{
+				get: (k) => {
+					calls.push(k);
+					return inner.get(k);
+				},
+				set: inner.set
+			},
+			() => 't'
+		);
+		void s.set('k', '1');
+		void s.set('k', '2');
+		const g = s.get('k');
+		sent[0].resolve();
+		await tick();
+		expect(sent.map((x) => x.value)).toEqual(['1', '2']);
+		expect(calls).toEqual([]);
+		sent[1].resolve();
+		await g;
+		expect(calls).toEqual(['k']);
+	});
+
+	it('書き込みが失敗しても get は読む（reject しない）', async () => {
+		const { inner, sent } = fakeInner();
+		const s = createSerializedUiSettings(inner, () => 't');
+		const p = s.set('k', '1');
+		const g = s.get('k');
+		sent[0].reject(new Error('500'));
+		await expect(p).rejects.toThrow('500');
+		expect(await g).toBe('got:k');
+	});
+
+	it('別のキーの書き込みは待たない', async () => {
+		const { inner } = fakeInner();
+		const s = createSerializedUiSettings(inner, () => 't');
+		void s.set('a', '1');
+		expect(await s.get('b')).toBe('got:b');
 	});
 });
