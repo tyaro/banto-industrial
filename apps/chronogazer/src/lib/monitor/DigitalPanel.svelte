@@ -16,6 +16,7 @@
 	 * - `invalid`（設定不正）は直す場所へのリンクを添える（`tagsHref` が `null` なら
 	 *   出さない - 閲覧公開のセッションは記録を開けない）。
 	 */
+	import { penColorVar } from '@banto-industrial/trend';
 	import type { DisplayGroup } from '#lib/banto/displayGroupsAdmin.js';
 	import { lastReceivedText, type PenView } from './monitorLogic';
 
@@ -38,7 +39,7 @@
 			class="digital-cell"
 			data-state={pen.state}
 			data-level={pen.level}
-			style:--pen-color={`var(--banto-chart-${pen.colorSlot})`}
+			style:--pen-color={penColorVar(pen.colorSlot)}
 		>
 			<div class="pen-name">{pen.name}</div>
 			<div class="pen-value">

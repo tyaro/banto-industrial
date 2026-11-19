@@ -267,7 +267,7 @@
 
 	// --- 描くペン ---------------------------------------------------------------
 
-	/** ペンは先頭から 8 本まで（履歴の口のタグの上限。グループの上限と同じ 8）。 */
+	/** ペンは先頭から 16 本まで（履歴の口のタグの上限。グループの上限と同じ 16）。 */
 	const penGroup = $derived(
 		selectedGroup && selectedGroup.pens.length > 0
 			? { pens: selectedGroup.pens.slice(0, HISTORY_MAX_PENS) }

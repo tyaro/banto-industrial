@@ -2,7 +2,7 @@
  * ヒストリカル画面のロジック（`historyLogic.ts`）のテスト。
  *
  * - 期間の検証（前後・31 日）・「前へ / 次へ」（現在を超えない）・URL の読み書き（おかしければ既定）。
- * - `bins` は描画幅・2000・ペン数 × bins ≤ 8000 に収まる。
+ * - `bins` は描画幅・2000・ペン数 × bins ≤ 32000 に収まる。
  * - 期間の 2 つの形（両端を含む ⇔ 半開区間）の変換、部品の `TrendFetch` の形
  *   （ペンごとの系列・API の `binMs`・`unknownTagIds` の付帯情報・`ready` でないときの失敗）。
  */
@@ -197,9 +197,9 @@ describe('historyBins / historyRequestFor', () => {
 		}
 	});
 
-	it('2000 以下・ペン数 × bins ≤ 8000 に収まる', () => {
+	it('2000 以下・ペン数 × bins ≤ 32000 に収まる', () => {
 		for (const width of [0, 1, 100, 1000, 5000, 20000]) {
-			for (let tags = 1; tags <= 8; tags++) {
+			for (let tags = 1; tags <= 16; tags++) {
 				const bins = historyBins(width, tags);
 				expect(bins).toBeGreaterThanOrEqual(1);
 				expect(bins).toBeLessThanOrEqual(HISTORY_MAX_BINS);
@@ -213,9 +213,10 @@ describe('historyBins / historyRequestFor', () => {
 		expect(historyBins(49, 1)).toBe(49);
 	});
 
-	it('要求はタグの重複を除き、8 本までに切る', () => {
-		const req = historyRequestFor({ fromMs: 0, toMs: HOUR }, [1, 1, 2, 3, 4, 5, 6, 7, 8, 9], 1000);
-		expect(req?.tagIds).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+	it('要求はタグの重複を除き、16 本までに切る', () => {
+		const ids = Array.from({ length: 17 }, (_, i) => i + 1);
+		const req = historyRequestFor({ fromMs: 0, toMs: HOUR }, [1, ...ids], 1000);
+		expect(req?.tagIds).toEqual(ids.slice(0, 16));
 		expect(req?.fromMs).toBe(0);
 		expect(req?.toMs).toBe(HOUR);
 	});

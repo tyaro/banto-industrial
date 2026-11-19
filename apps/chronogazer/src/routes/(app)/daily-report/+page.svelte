@@ -38,6 +38,12 @@
 		selectGroup,
 		tagMetaNotices
 	} from '#lib/monitor/monitorLogic.js';
+	import PenSelectList from '#lib/penSelection/PenSelectList.svelte';
+	import {
+		effectivePenSelection,
+		needsPenSelection,
+		togglePenSelection
+	} from '#lib/penSelection/penSelectionLogic.js';
 	import {
 		DAILY_REPORT_CLIENT_TIMEOUT_MS,
 		DAILY_REPORT_EMPTY_MESSAGE,
@@ -160,9 +166,22 @@
 
 	// --- 日報の読み出し -----------------------------------------------------------
 
-	/** ペンは先頭から 8 本まで（読み出しの口のタグの上限）。 */
+	/**
+	 * 日報に載せるペンは 8 本まで（読み出しの口のタグの上限）。グループが 9 本以上のペンを持つ
+	 * ときは、ペンのチェックの一覧で選ばせる（既定は先頭から 8 本。選んだ状態はこの画面の中だけで、
+	 * グループを替えると既定に戻る。trend-design.md §6）。
+	 */
+	let chosen = $state<{ groupId: number; tagIds: number[] } | null>(null);
+	const groupTagIds = $derived(selectedGroup ? selectedGroup.pens.map((pen) => pen.tagId) : []);
+	const needsSelection = $derived(needsPenSelection(groupTagIds.length, DAILY_REPORT_MAX_TAGS));
 	const penTagIds = $derived(
-		selectedGroup ? selectedGroup.pens.slice(0, DAILY_REPORT_MAX_TAGS).map((pen) => pen.tagId) : []
+		effectivePenSelection(
+			groupTagIds,
+			chosen !== null && selectedGroup !== null && chosen.groupId === selectedGroup.id
+				? chosen.tagIds
+				: null,
+			DAILY_REPORT_MAX_TAGS
+		)
 	);
 
 	type Outcome =
@@ -371,10 +390,25 @@
 					{#each tagMetaNoticeLines as notice (notice)}
 						<p class="note warn no-print" role="status">{notice}</p>
 					{/each}
-					{#if selectedGroup.pens.length > DAILY_REPORT_MAX_TAGS}
-						<p class="note warn no-print" role="status">
-							ペンは先頭の {DAILY_REPORT_MAX_TAGS} 本だけを載せています。
-						</p>
+					{#if needsSelection}
+						<div class="no-print">
+							<PenSelectList
+								tagIds={groupTagIds}
+								selected={penTagIds}
+								limit={DAILY_REPORT_MAX_TAGS}
+								label={(id) => tagInfoOf(id).name}
+								ontoggle={(id) =>
+									(chosen = {
+										groupId: selectedGroup.id,
+										tagIds: togglePenSelection(groupTagIds, penTagIds, id, DAILY_REPORT_MAX_TAGS)
+									})}
+							/>
+						</div>
+						{#if penTagIds.length === 0}
+							<p class="note warn no-print" role="status">
+								日報に載せるペンを 1 本以上選んでください。
+							</p>
+						{/if}
 					{/if}
 					{#if unknownNote !== null}
 						<p class="note warn no-print" role="status">{unknownNote}</p>

@@ -444,7 +444,10 @@ mod tests {
         .unwrap();
         // 2〜13 は admin-template のコピー（9・11 は除く）、101 からはこの app 固有（#393 の表示グループ、
         // #532 の記録計の側のタグごとの設定、#1161 PR4 の API キー）。
-        assert_eq!(versions, vec![2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103]);
+        assert_eq!(
+            versions,
+            vec![2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103, 104]
+        );
         let has_auth_epoch: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'auth_epoch'",
         )
@@ -523,7 +526,10 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(versions, vec![2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103]);
+        assert_eq!(
+            versions,
+            vec![2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103, 104]
+        );
         let after: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pragma_table_info('audit_log') WHERE name = 'pending_id'",
         )

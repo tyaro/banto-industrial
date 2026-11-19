@@ -20,6 +20,7 @@
 	 *   （`meterDescription`、バーと同じ文）で伝える（#535）。
 	 */
 	import { Gauge } from '@banto/charts';
+	import { penColorVar } from '@banto-industrial/trend';
 	import type { DisplayGroup } from '#lib/banto/displayGroupsAdmin.js';
 	import { lastReceivedText } from './monitorLogic';
 	import { meterDescription, scaleText, type MeterView } from './meterLogic';
@@ -55,7 +56,7 @@
 			data-tone={pen.tone}
 			data-range={pen.range.kind}
 			data-out={pen.bar?.out ?? 'none'}
-			style:--pen-color={`var(--banto-chart-${pen.colorSlot})`}
+			style:--pen-color={penColorVar(pen.colorSlot)}
 		>
 			<div class="pen-name">
 				{pen.name}{#if pen.unit}<span class="unit">（{pen.unit}）</span>{/if}

@@ -698,7 +698,7 @@ pub use history::{
 mod export;
 pub use export::{
     validate_export_request, CollectExport, ExportMode, ExportRequest, ExportRow, ExportStat,
-    ExportTag, EXPORT_MAX_ROWS, EXPORT_MIN_INTERVAL_MS,
+    ExportTag, EXPORT_MAX_ROWS, EXPORT_MAX_TAGS, EXPORT_MIN_INTERVAL_MS,
 };
 
 // #1207 R3: 日報（1 時間ごと・1 日全体の最小・最大・平均・件数）のための読み出し
@@ -706,8 +706,8 @@ pub use export::{
 mod daily_report;
 pub use daily_report::{
     validate_daily_report_request, CollectDailyReport, DailyReportHour, DailyReportRequest,
-    DailyReportStat, DailyReportTag, DAILY_REPORT_BIN_MS, DAILY_REPORT_MAX_WINDOW_MS,
-    DAILY_REPORT_MIN_WINDOW_MS,
+    DailyReportStat, DailyReportTag, DAILY_REPORT_BIN_MS, DAILY_REPORT_MAX_TAGS,
+    DAILY_REPORT_MAX_WINDOW_MS, DAILY_REPORT_MIN_WINDOW_MS,
 };
 
 /// 収集サービスの状態。**必要最小限の 5 つ**だけ（語彙を増やさない）。

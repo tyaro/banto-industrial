@@ -25,6 +25,8 @@ import {
 	HISTORY_MAX_BINS,
 	HISTORY_MAX_POINTS,
 	HISTORY_MAX_TAGS,
+	EXPORT_MAX_TAGS,
+	DAILY_REPORT_MAX_TAGS,
 	collectConnectionsNote,
 	collectExclusions,
 	collectExclusionsHeadline,
@@ -677,9 +679,15 @@ describe('collectDailyReportQuery（#1207 R3 日報）', () => {
 });
 
 describe('履歴の上限（Rust の定数の写し）', () => {
-	it('HISTORY_MAX_BINS・HISTORY_MAX_POINTS が Rust と同じ値（8 ペンなら 1 本 1000 区間）', () => {
+	it('HISTORY_MAX_BINS・HISTORY_MAX_POINTS が Rust と同じ値（16 ペンなら 1 本 2000 区間）', () => {
 		expect(HISTORY_MAX_BINS).toBe(2000);
-		expect(HISTORY_MAX_POINTS).toBe(8000);
-		expect(Math.floor(HISTORY_MAX_POINTS / HISTORY_MAX_TAGS)).toBe(1000);
+		expect(HISTORY_MAX_POINTS).toBe(32000);
+		expect(HISTORY_MAX_TAGS).toBe(16);
+		expect(Math.floor(HISTORY_MAX_POINTS / HISTORY_MAX_TAGS)).toBe(2000);
+	});
+
+	it('CSV・日報の上限は 8 本のまま（トレンドの 16 本と分けてある）', () => {
+		expect(EXPORT_MAX_TAGS).toBe(8);
+		expect(DAILY_REPORT_MAX_TAGS).toBe(8);
 	});
 });

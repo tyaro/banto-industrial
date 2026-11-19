@@ -236,7 +236,7 @@ test.describe.serial('chronogazer 「表示グループ」の Hub タグ追加�
 		await expect(temp).toContainText('追加済み');
 		await expect(temp.getByRole('button', { name: '「temp」を追加' })).toBeDisabled();
 		await expect(tagPicker(page).getByTestId('pen-tag-picker-remaining')).toContainText(
-			'あと 7 本'
+			'あと 15 本'
 		);
 	});
 });

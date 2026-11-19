@@ -304,8 +304,12 @@ export interface CollectHistory {
 	unknownTagIds: number[];
 }
 
-/** 履歴 1 回で読めるタグの本数の上限（`HISTORY_MAX_TAGS`）。 */
-export const HISTORY_MAX_TAGS = 8;
+/** 履歴 1 回で読めるタグの本数の上限（`HISTORY_MAX_TAGS`。旧 8 → 16、PR 5a）。 */
+export const HISTORY_MAX_TAGS = 16;
+/** 期間 CSV に出せるタグの本数の上限（`EXPORT_MAX_TAGS`。8 のまま）。 */
+export const EXPORT_MAX_TAGS = 8;
+/** 日報に載せるタグの本数の上限（`DAILY_REPORT_MAX_TAGS`。8 のまま）。 */
+export const DAILY_REPORT_MAX_TAGS = 8;
 /** 履歴 1 回で読める期間の幅の上限（ミリ秒、31 日、`HISTORY_MAX_WINDOW_MS`）。 */
 export const HISTORY_MAX_WINDOW_MS = 31 * 24 * 3_600_000;
 /**
@@ -316,10 +320,10 @@ export const HISTORY_MAX_WINDOW_MS = 31 * 24 * 3_600_000;
 export const HISTORY_MAX_BINS = 2000;
 /**
  * 1 回の応答全体の予算: **タグの本数（重複を除く）× `bins`** の上限
- * （`HISTORY_MAX_POINTS`）。8 ペンなら 1 本 1000 区間まで。超えると
+ * （`HISTORY_MAX_POINTS`）。16 ペンなら 1 本 2000 区間まで。超えると
  * `validation`（`bins` の誤り）。
  */
-export const HISTORY_MAX_POINTS = 8000;
+export const HISTORY_MAX_POINTS = 32000;
 
 /** [`getCollectHistory`] の引数。期間は両端を含み、`fromMs < toMs`。 */
 export interface CollectHistoryParams {
@@ -599,7 +603,7 @@ export async function listCollectEvents(
  * - **`notRunning` は返らない**（収集が止まっていても過去の記録は読める）。
  *   `unavailable` はデータファイルか設定 DB を読めなかったとき（理由は
  *   返らない）。
- * - 上限（タグ 8 本・期間 31 日・`bins` ≤ [`HISTORY_MAX_BINS`]・
+ * - 上限（タグ 16 本・期間 31 日・`bins` ≤ [`HISTORY_MAX_BINS`]・
  *   本数 × `bins` ≤ [`HISTORY_MAX_POINTS`]）を外れると `validation` のエラー。
  *   系列の点の数は `bins` 以下（素通しの経路でもサーバーが畳む）。
  * - 収集の操作キューを通らない。直近 1 秒ほどはまだデータファイルに無い
@@ -626,7 +630,7 @@ export async function getCollectHistory(
 
 /**
  * 期間の CSV の材料（`viewer` 以上）。生の値か、決まった間隔の統計を、横持ちで返す。
- * 上限（タグ 8 本・期間 31 日・10 万行）を外れると `validation`（行数は `toMs`）。
+ * 上限（タグ 8 本・期間 31 日・10 万行。`EXPORT_MAX_TAGS`）を外れると `validation`（行数は `toMs`）。
  * 収集の操作キューを通らない。
  */
 export async function getCollectExport(

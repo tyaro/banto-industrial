@@ -6,12 +6,22 @@
 	 * 中央モーダル（`@banto/ui` の `Modal`）なので Esc・オーバーレイ・× は同じ閉じる処理を
 	 * 通る。閉じたら（画面を離れて壊れたときも）結果を無視し、保存には進まない
 	 * （Tauri ではサーバー側の読み出しは止まらない）。保存先の選択を取り消したら黙って閉じる。
+	 *
+	 * CSV は 8 本まで（`EXPORT_MAX_TAGS`）。グループが 9 本以上のペンを持つときは、黙って先頭の
+	 * 8 本に絞らず、ペンのチェックの一覧（`PenSelectList`）から選ばせる（trend-design.md §6）。
+	 * 選んだ状態はダイアログの中だけで持ち、開き直すと既定（先頭から 8 本）に戻る。
 	 */
 	import { onDestroy, untrack } from 'svelte';
 	import { Modal } from '@banto/ui';
 	import { isProviderError } from '@banto/admin-core';
 	import { toastStore } from '#lib/toast.svelte.js';
-	import { getCollectExport, saveCsvFile } from '#lib/banto/collectAdmin.js';
+	import { EXPORT_MAX_TAGS, getCollectExport, saveCsvFile } from '#lib/banto/collectAdmin.js';
+	import PenSelectList from '#lib/penSelection/PenSelectList.svelte';
+	import {
+		effectivePenSelection,
+		needsPenSelection,
+		togglePenSelection
+	} from '#lib/penSelection/penSelectionLogic.js';
 	import {
 		DEFAULT_EXPORT_CHOICE,
 		EXPORT_INTERVALS,
@@ -49,6 +59,10 @@
 	let stat = $state<ExportStat>(
 		DEFAULT_EXPORT_CHOICE.mode === 'interval' ? DEFAULT_EXPORT_CHOICE.stat : 'avg'
 	);
+	// 9 本以上のグループで選んだタグ（`null` = 既定の選択）。
+	let chosen = $state<number[] | null>(null);
+	const needsSelection = $derived(needsPenSelection(tagIds.length, EXPORT_MAX_TAGS));
+	const selectedTagIds = $derived(effectivePenSelection(tagIds, chosen, EXPORT_MAX_TAGS));
 	let busy = $state(false);
 	let errorText = $state<string | null>(null);
 	let controller: AbortController | null = null;
@@ -72,6 +86,7 @@
 		} else if (openKey === null) {
 			openKey = key;
 			errorText = null;
+			chosen = null;
 		} else if (openKey !== key) {
 			openKey = null;
 			controller?.abort();
@@ -99,7 +114,7 @@
 	}
 
 	async function run(): Promise<void> {
-		if (busy) return;
+		if (busy || selectedTagIds.length === 0) return;
 		busy = true;
 		errorText = null;
 		const mine = new AbortController();
@@ -107,7 +122,7 @@
 		// 始めた時点の値で組む（途中で画面側が変わっても、応答に合う名前・見出しにする）。
 		const snapGroup = groupName;
 		const snapRange = range;
-		const snapTagIds = [...tagIds];
+		const snapTagIds = [...selectedTagIds];
 		const snapChoice = choice;
 		const snapInfo = snapshotTagInfo(snapTagIds, tagInfo);
 		try {
@@ -163,6 +178,18 @@
 			<dd>{exportTimeLabel(range.fromMs, false)} 〜 {exportTimeLabel(range.toMs, false)}</dd>
 		</dl>
 
+		{#if needsSelection}
+			<PenSelectList
+				{tagIds}
+				selected={selectedTagIds}
+				limit={EXPORT_MAX_TAGS}
+				label={(id) => tagInfo(id).name}
+				disabled={busy}
+				ontoggle={(id) =>
+					(chosen = togglePenSelection(tagIds, selectedTagIds, id, EXPORT_MAX_TAGS))}
+			/>
+		{/if}
+
 		<fieldset class="choice" disabled={busy}>
 			<legend>出力する値</legend>
 			<label class="radio">
@@ -204,7 +231,7 @@
 
 		<div class="actions">
 			<button type="button" onclick={onclose}>キャンセル</button>
-			<button type="submit" class="primary" disabled={busy}>
+			<button type="submit" class="primary" disabled={busy || selectedTagIds.length === 0}>
 				{busy ? '出力しています…' : '出力'}
 			</button>
 		</div>

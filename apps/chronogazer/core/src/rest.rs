@@ -6627,7 +6627,7 @@ mod tests {
                 "toMs",
             ),
             (
-                "/api/collect/history?tagIds=1,2,3,4,5,6,7,8,9&fromMs=0&toMs=1&bins=10",
+                "/api/collect/history?tagIds=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17&fromMs=0&toMs=1&bins=10",
                 "tagIds",
             ),
             (

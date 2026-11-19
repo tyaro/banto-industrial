@@ -20,6 +20,7 @@
 	 *   （`meterDescription`）で支援技術に伝える。同じ値のしきい値の名前は 1 つに
 	 *   まとめる（`LL/L/H`。等号は正しい設定なので、重ねると読めない。#535）。
 	 */
+	import { penColorVar } from '@banto-industrial/trend';
 	import type { DisplayGroup } from '#lib/banto/displayGroupsAdmin.js';
 	import { lastReceivedText } from './monitorLogic';
 	import {
@@ -54,7 +55,7 @@
 			data-tone={pen.tone}
 			data-range={pen.range.kind}
 			data-out={pen.bar?.out ?? 'none'}
-			style:--pen-color={`var(--banto-chart-${pen.colorSlot})`}
+			style:--pen-color={penColorVar(pen.colorSlot)}
 			style:--tone-color={toneColorVar(pen.tone)}
 		>
 			<div class="pen-name">{pen.name}</div>

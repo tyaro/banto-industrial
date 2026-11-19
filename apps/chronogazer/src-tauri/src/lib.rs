@@ -3750,7 +3750,7 @@ async fn collect_history_body(
 ///
 /// **収集が止まっていても読める**（`notRunning` を返さない）。読めなかった
 /// ときは `unavailable` で、理由（ファイルのパスを含みうる）は返さない。
-/// 収集の操作キューは通らない。上限（タグ 8 本・期間 1 時間・`bins`）と
+/// 収集の操作キューは通らない。上限（タグ 16 本・期間 31 日・`bins`）と
 /// 割り切り（タグを別グループへ移す前の区間は欠測、など）は
 /// `chronogazer_core::collect` の `history` モジュールの doc。
 #[tauri::command]

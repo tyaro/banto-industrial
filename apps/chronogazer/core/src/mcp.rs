@@ -399,7 +399,7 @@ fn display_group_schema(update: bool) -> Value {
                         },
                         "colorSlot": {
                             "type": ["integer", "null"],
-                            "description": "系列色の枠（1〜8）。省略は既定。",
+                            "description": "系列色の枠（1〜16）。省略は既定。",
                         },
                     },
                     "additionalProperties": false,

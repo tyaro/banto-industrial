@@ -463,7 +463,7 @@ async fn mini_soak_collect_with_monitor_polling() {
     let sim = ramp::start(RampProtocol::ModbusTcp).await;
     let groups = register(&pool, sim.addr().port()).await;
     let all_tag_ids: Vec<i64> = groups.iter().flat_map(|g| g.tag_ids.clone()).collect();
-    // トレンドの 1 グループの上限（8 ペン）に合わせて、先頭の 8 タグの履歴を読む。
+    // 先頭の 8 タグの履歴を読む（トレンドの履歴の口は 16 本まで読めるが、ここは 8 本で足りる）。
     let history_tag_ids: Vec<i64> = all_tag_ids.iter().copied().take(8).collect();
 
     let svc = CollectorService::new(

@@ -16,15 +16,18 @@
  */
 import { isProviderError } from '@banto/admin-core';
 import {
-	HISTORY_MAX_TAGS,
+	DAILY_REPORT_MAX_TAGS as SERVER_DAILY_REPORT_MAX_TAGS,
 	type CollectDailyReport,
 	type CollectDailyReportParams,
 	type DailyReportStat
 } from '../banto/collectAdmin';
 import { formatValue } from '../monitor/monitorLogic';
 
-/** 日報に載せるタグの上限（サーバーの上限と同じ 8 本。表示グループの上限でもある）。 */
-export const DAILY_REPORT_MAX_TAGS = HISTORY_MAX_TAGS;
+/**
+ * 日報に載せるタグの上限（サーバーの上限と同じ 8 本）。表示グループは 16 ペンまで持てるので、
+ * 9 本以上のグループは画面でペンを選ばせる（`penSelection`）。
+ */
+export const DAILY_REPORT_MAX_TAGS = SERVER_DAILY_REPORT_MAX_TAGS;
 
 /** 小数桁を読めない（タグ情報が未取得の）ときの桁数。 */
 export const DAILY_REPORT_DEFAULT_DECIMALS = 2;
