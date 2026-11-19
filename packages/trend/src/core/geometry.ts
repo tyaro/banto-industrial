@@ -4,6 +4,7 @@
  * 描き方（決め）:
  * - 区間の x は区間の実際の範囲 `[max(tMs, startMs), min(tMs + binMs, endMs))` の中央
  *   （範囲を渡さなければ `tMs + binMs / 2`）。表示範囲の端で欠ける区間の x が範囲の外に出てクリップされないようにする。
+ * - 範囲を渡したとき、範囲と重ならない区間は描かずに飛ばす（線は切らず `prevT` も進めない。範囲外は前後に並ぶだけ）。
  * - 各区間は min と max の縦線になり、隣の区間へは**前の点に近い方の端**から入る。
  *   1 px に 1 区間なら縦線が並んで帯に見え、拡大して区間が広いときは折れ線に見える。
  * - 値が 1 つ（min == max、または片方だけ有限）の区間は点 1 つ。
@@ -64,9 +65,15 @@ export function envelopePath(
 		if (!binOk) return tMs;
 		const s = fin(startMs) ? Math.max(tMs, startMs) : tMs;
 		const e = fin(endMs) ? Math.min(tMs + binMs, endMs) : tMs + binMs;
-		return e > s ? (s + e) / 2 : s;
+		return (s + e) / 2;
+	};
+	// 表示範囲と重ならない区間か（範囲を渡したときだけ使う）。
+	const outside = (tMs: number): boolean => {
+		if (fin(startMs) && (binOk ? tMs + binMs <= startMs : tMs < startMs)) return true;
+		return fin(endMs) && tMs >= endMs;
 	};
 	for (const b of bins) {
+		if (options && fin(b.tMs) && outside(b.tMs)) continue;
 		const lo = fin(b.min) ? b.min : fin(b.max) ? b.max : null;
 		const hi = fin(b.max) ? b.max : lo;
 		const px = fin(b.tMs) ? x(options ? centerOf(b.tMs) : b.tMs + half) : NaN;

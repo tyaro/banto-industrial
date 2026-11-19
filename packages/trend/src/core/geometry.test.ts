@@ -70,4 +70,23 @@ describe('envelopePath', () => {
 		const head: Bin[] = [{ tMs: -2000, min: 10, max: 10 }];
 		expect(envelopePath(head, 3000, x, y, { startMs: 0 })).toBe('M500,90L500,90');
 	});
+
+	it('表示範囲と重ならない区間は描かない', () => {
+		const stale: Bin[] = [
+			{ tMs: 0, min: 1, max: 2 },
+			{ tMs: 10, min: 1, max: 2 }
+		];
+		expect(envelopePath(stale, 10, (t) => t - 100, y, { startMs: 100, endMs: 200 })).toBe('');
+		const bins: Bin[] = [
+			{ tMs: 80, min: 10, max: 10 },
+			{ tMs: 90, min: 10, max: 10 },
+			{ tMs: 100, min: 20, max: 20 },
+			{ tMs: 190, min: 30, max: 30 },
+			{ tMs: 200, min: 40, max: 40 },
+			{ tMs: 210, min: 50, max: 50 }
+		];
+		expect(envelopePath(bins, 10, x, y, { startMs: 100, endMs: 200 })).toBe(
+			'M105,80L105,80M195,70L195,70'
+		);
+	});
 });
