@@ -12,22 +12,21 @@
 <script lang="ts">
 	import { linearScale, niceTicks } from '@banto/charts';
 	import { cursorReadout } from './core/cursor';
-	import { envelopePath, hasFiniteValue, visibleBins } from './core/geometry';
+	import { drawableSeries, type TrendData } from './core/data';
+	import { envelopePath, hasFiniteValue } from './core/geometry';
 	import { axisOwners, formatValue, penColorVar, resolveYDomain } from './core/pens';
-	import type { Bin, TrendPen, YDomain } from './core/pens';
+	import type { TrendPen, YDomain } from './core/pens';
 	import { isValidRange, panRange, zoomRange, type TimeRange } from './core/range';
 	import { timeTicks } from './core/timeTicks';
 
 	interface Props {
 		range: TimeRange;
 		pens: readonly TrendPen[];
-		binsByPen: Readonly<Record<string, readonly Bin[] | undefined>>;
 		/**
-		 * `binsByPen` を読んだときの区間の幅（ミリ秒）。包絡の x（区間の中央）とカーソルの区間の
-		 * 判定に使う。今の範囲と幅から計算し直さず、データと組で持った値を渡す（読み直しの間・
-		 * 失敗した後も、手元のデータを正しい幅で描くため）。
+		 * `data.range` は取得した範囲。読み直しの間・失敗後も、手元のデータはこの範囲と各系列の幅で
+		 * だけ描く（取得していない時刻に線やカーソルの値を出さない）。
 		 */
-		binMs: number;
+		data: TrendData | null;
 		height?: number;
 		/** 図の名前（aria-label）。 */
 		label: string;
@@ -43,8 +42,7 @@
 	let {
 		range,
 		pens,
-		binsByPen,
-		binMs,
+		data,
 		height = 360,
 		label,
 		width = $bindable(0),
@@ -82,24 +80,23 @@
 	});
 
 	const xScale = $derived(linearScale([range.startMs, range.endMs], [0, plotWidth]));
-	// 表示範囲と重なる区間だけを、縦軸・空の判定・線・カーソルで共用する。
-	const visibleByPen = $derived.by(() => {
-		const out: Record<string, Bin[]> = {};
-		for (const p of pens) out[p.id] = visibleBins(binsByPen[p.id] ?? [], binMs, range);
-		return out;
-	});
-	const domains: YDomain[] = $derived(pens.map((p) => resolveYDomain(p, visibleByPen[p.id])));
+	// 取得範囲 ∩ 表示範囲と重なる区間だけを、縦軸・空の判定・線・カーソルで共用する。
+	const drawable = $derived(drawableSeries(data, range));
+	const emptyBins: never[] = [];
+	const domains: YDomain[] = $derived(
+		pens.map((p) => resolveYDomain(p, drawable.series[p.id]?.bins ?? emptyBins))
+	);
 	const paths = $derived(
 		valid
-			? pens.map((p, i) =>
-					envelopePath(
-						visibleByPen[p.id],
-						binMs,
-						xScale,
-						linearScale(domains[i], [plotHeight, 0]),
-						{ startMs: range.startMs, endMs: range.endMs }
-					)
-				)
+			? pens.map((p, i) => {
+					const s = drawable.series[p.id];
+					const eff = drawable.effective;
+					if (!s || !eff) return '';
+					return envelopePath(s.bins, s.binMs, xScale, linearScale(domains[i], [plotHeight, 0]), {
+						startMs: eff.startMs,
+						endMs: eff.endMs
+					});
+				})
 			: []
 	);
 	const xTicks = $derived(valid ? timeTicks(range, plotWidth) : []);
@@ -118,9 +115,11 @@
 	const rightTicks = $derived(axisTicks(owners.right));
 	const gridTicks = $derived(owners.left !== null ? leftTicks : rightTicks);
 
-	const hasData = $derived(pens.some((p) => hasFiniteValue(visibleByPen[p.id])));
+	const hasData = $derived(
+		pens.some((p) => hasFiniteValue(drawable.series[p.id]?.bins ?? emptyBins))
+	);
 	const readout = $derived(
-		cursorMs !== null ? cursorReadout(pens, visibleByPen, binMs, cursorMs) : null
+		cursorMs !== null ? cursorReadout(pens, drawable.series, cursorMs, drawable.effective) : null
 	);
 	const cursorX = $derived(cursorMs !== null && valid ? xScale(cursorMs) : null);
 

@@ -1,13 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createRangeLoader, isAbortError, type TrendFetchRequest } from './loader';
-import type { Bin } from './pens';
+import type { TrendSeries } from './data';
 
 const req = (startMs: number) => ({
 	range: { startMs, endMs: startMs + 1000 },
 	penIds: ['a'],
 	bins: 10
 });
-const result = (v: number): Record<string, Bin[]> => ({ a: [{ tMs: 0, min: v, max: v }] });
+const result = (v: number): Record<string, TrendSeries> => ({
+	a: { bins: [{ tMs: 0, min: v, max: v }], binMs: 100 }
+});
 
 function deferred<T>() {
 	let resolve!: (v: T) => void;
@@ -38,7 +40,7 @@ describe('createRangeLoader', () => {
 		expect(fetch).toHaveBeenCalledTimes(1);
 		expect(fetch.mock.calls[0][0].range.startMs).toBe(2);
 		expect(fetch.mock.calls[0][0].signal).toBeInstanceOf(AbortSignal);
-		expect(onResult).toHaveBeenCalledWith(result(2), req(2));
+		expect(onResult).toHaveBeenCalledWith({ range: req(2).range, series: result(2) }, req(2));
 	});
 
 	it('既定の debounce は 200ms', async () => {
@@ -52,10 +54,10 @@ describe('createRangeLoader', () => {
 	});
 
 	it('新しい要求で読み出し中のものを abort し、abort に従わない古い結果は捨てる', async () => {
-		const pending: ReturnType<typeof deferred<Record<string, Bin[]>>>[] = [];
+		const pending: ReturnType<typeof deferred<Record<string, TrendSeries>>>[] = [];
 		const signals: AbortSignal[] = [];
 		const fetch = vi.fn((r: TrendFetchRequest) => {
-			const d = deferred<Record<string, Bin[]>>();
+			const d = deferred<Record<string, TrendSeries>>();
 			pending.push(d);
 			signals.push(r.signal);
 			return d.promise;
@@ -73,14 +75,14 @@ describe('createRangeLoader', () => {
 		pending[0].resolve(result(1));
 		await vi.advanceTimersByTimeAsync(0);
 		expect(onResult).toHaveBeenCalledTimes(1);
-		expect(onResult).toHaveBeenCalledWith(result(2), req(2));
+		expect(onResult).toHaveBeenCalledWith({ range: req(2).range, series: result(2) }, req(2));
 		expect(onError).not.toHaveBeenCalled();
 	});
 
 	it('AbortError と古い要求の失敗は onError に渡さない。今の要求の失敗は渡す', async () => {
-		const pending: ReturnType<typeof deferred<Record<string, Bin[]>>>[] = [];
+		const pending: ReturnType<typeof deferred<Record<string, TrendSeries>>>[] = [];
 		const fetch = vi.fn(() => {
-			const d = deferred<Record<string, Bin[]>>();
+			const d = deferred<Record<string, TrendSeries>>();
 			pending.push(d);
 			return d.promise;
 		});
@@ -121,7 +123,7 @@ describe('createRangeLoader', () => {
 
 	it('dispose で待ちと読み出し中を止め、以後の要求を無視する', async () => {
 		const signals: AbortSignal[] = [];
-		const d = deferred<Record<string, Bin[]>>();
+		const d = deferred<Record<string, TrendSeries>>();
 		const fetch = vi.fn((r: TrendFetchRequest) => {
 			signals.push(r.signal);
 			return d.promise;

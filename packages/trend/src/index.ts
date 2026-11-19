@@ -20,7 +20,10 @@
  *   Tauri の呼び出し、SCADA の History API の型をここに入れない。設計書 §4.1・§4.3）。
  * - 表示範囲の状態。`TrendChart` は制御された部品で、操作の結果を `onRangeChange` で
  *   返すだけ。範囲は利用側が持つ。
- * - 平均・件数。共通の契約は `Bin { tMs, min, max }` だけ（設計書 §4.3）。
+ * - 平均・件数。共通の区間の契約は `Bin { tMs, min, max }` だけ（設計書 §4.3）。
+ *
+ * データの受け渡しの契約は「取得範囲 + ペンごとの `{ bins, binMs }`」（`core/data.ts` の
+ * `TrendData`）。幅は API の実際の値をデータと組で持ち、描画は取得範囲と表示範囲の重なりだけで行う。
  *
  * banto の `LineChart` を使わない理由は設計書 §2 の 1（横軸が点の番号で、縦軸が全系列で
  * 共通。記録計の時刻の軸・ペンごとの縦軸・ハイブリッドに合わない）。banto の純粋な関数
@@ -58,6 +61,13 @@ export {
 	type YDomain
 } from './core/pens';
 export { envelopePath, visibleBins, hasFiniteValue } from './core/geometry';
+export {
+	intersectRange,
+	drawableSeries,
+	type TrendSeries,
+	type TrendData,
+	type DrawableSeries
+} from './core/data';
 export { binAt, cursorReadout, type CursorValue } from './core/cursor';
 export {
 	createRangeLoader,

@@ -13,7 +13,7 @@
  * - キャッシュは持たない（後で足す）。
  */
 
-import type { Bin } from './pens';
+import type { TrendData, TrendSeries } from './data';
 import type { TimeRange } from './range';
 
 export interface TrendFetchRequest {
@@ -23,8 +23,11 @@ export interface TrendFetchRequest {
 	signal: AbortSignal;
 }
 
-/** ペンの id → 区間の列（`tMs` の昇順）。 */
-export type TrendFetch = (req: TrendFetchRequest) => Promise<Record<string, Bin[]>>;
+/**
+ * ペンの id → `{ bins, binMs }`（区間は `tMs` の昇順。`binMs` は API が返した実際の幅で、
+ * 要求の区間の数から推定しない）。
+ */
+export type TrendFetch = (req: TrendFetchRequest) => Promise<Record<string, TrendSeries>>;
 
 /** `request` に渡す要求（signal はローダーが付ける）。 */
 export type TrendLoadRequest = Omit<TrendFetchRequest, 'signal'>;
@@ -32,7 +35,8 @@ export type TrendLoadRequest = Omit<TrendFetchRequest, 'signal'>;
 export interface RangeLoaderOptions {
 	fetch: TrendFetch;
 	debounceMs?: number;
-	onResult: (result: Record<string, Bin[]>, req: TrendLoadRequest) => void;
+	/** `data.range` は要求した範囲（取得した範囲）。 */
+	onResult: (data: TrendData, req: TrendLoadRequest) => void;
 	onError?: (error: unknown, req: TrendLoadRequest) => void;
 }
 
@@ -76,7 +80,7 @@ export function createRangeLoader(options: RangeLoaderOptions): RangeLoader {
 		const controller = new AbortController();
 		inflight = controller;
 		const current = () => my === seq && !disposed && !controller.signal.aborted;
-		let p: Promise<Record<string, Bin[]>>;
+		let p: Promise<Record<string, TrendSeries>>;
 		try {
 			p = fetch({ ...req, signal: controller.signal });
 		} catch (e) {
@@ -84,7 +88,7 @@ export function createRangeLoader(options: RangeLoaderOptions): RangeLoader {
 		}
 		p.then(
 			(result) => {
-				if (current()) onResult(result, req);
+				if (current()) onResult({ range: req.range, series: result }, req);
 			},
 			(e) => {
 				if (current() && !isAbortError(e)) onError?.(e, req);

@@ -2,7 +2,9 @@
  * カーソルの位置の値（凡例に出す）。
  */
 
+import type { TrendSeries } from './data';
 import { formatValue, MISSING_TEXT, type Bin, type TrendPen } from './pens';
+import type { TimeRange } from './range';
 
 const fin = (v: number | null | undefined): v is number =>
 	typeof v === 'number' && Number.isFinite(v);
@@ -40,15 +42,21 @@ export interface CursorValue {
 	text: string;
 }
 
-/** ペンごとのカーソル位置の値。値が 1 つなら `値 単位`、幅があれば `最小〜最大 単位`。 */
+/**
+ * ペンごとのカーソル位置の値。値が 1 つなら `値 単位`、幅があれば `最小〜最大 単位`。
+ * 区間の幅はペンごと（`series[id].binMs`）。`tMs` が有効範囲（取得範囲 ∩ 表示範囲）の外、
+ * または有効範囲が null なら全ペン「—」。
+ */
 export function cursorReadout(
 	pens: readonly TrendPen[],
-	binsByPen: Readonly<Record<string, readonly Bin[] | undefined>>,
-	binMs: number,
-	tMs: number
+	series: Readonly<Record<string, TrendSeries | undefined>>,
+	tMs: number,
+	effective: TimeRange | null
 ): CursorValue[] {
+	const inside = effective !== null && tMs >= effective.startMs && tMs < effective.endMs;
 	return pens.map((pen) => {
-		const b = binAt(binsByPen[pen.id] ?? [], binMs, tMs);
+		const s = series[pen.id];
+		const b = inside && s ? binAt(s.bins, s.binMs, tMs) : null;
 		const min = b ? (fin(b.min) ? b.min : fin(b.max) ? b.max : null) : null;
 		const max = b ? (fin(b.max) ? b.max : min) : null;
 		if (min === null || max === null)
