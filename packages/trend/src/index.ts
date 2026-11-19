@@ -10,6 +10,8 @@
  * - ペンと縦軸（`core/pens.ts`）。ペンごとの縦軸の範囲（指定 → 工学値レンジ → データ）、
  *   左右の 2 軸、16 色の枠。
  * - 区間（bins）の数と、MIN/MAX の包絡の形（`core/bins.ts`・`core/geometry.ts`）。
+ * - しきい値などの横の帯の位置（`core/bands.ts`）。指定したペンの縦軸で、線の下に描く
+ *   （汎用の `{ from, to, colorVar, label }`。管理線に置き換えるときに見直す）。
  * - カーソル 1 本の値（`core/cursor.ts`）と、範囲が変わったときの読み直しの段取り
  *   （`core/loader.ts`。debounce・abort・古い結果を捨てる）。
  * - SVG の描画（`TrendChart.svelte`）。計算は core に置き、描画の層は後で Canvas に
@@ -68,6 +70,13 @@ export {
 	type TrendData,
 	type DrawableSeries
 } from './core/data';
+export {
+	bandRects,
+	bandLayout,
+	type TrendBand,
+	type TrendBands,
+	type BandRect
+} from './core/bands';
 export { binAt, cursorReadout, type CursorValue } from './core/cursor';
 export {
 	createRangeLoader,

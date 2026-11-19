@@ -1,28 +1,38 @@
 /**
- * ヒストリカル画面の純粋なロジック（#1207 PR2）: 期間の計算・検証・URL の読み書き・
- * `bins` の決め方・履歴の応答を描画の格子にする処理。画面（`routes/(app)/historical`）
- * は、これを呼んで描くだけにする。
+ * ヒストリカル画面の純粋なロジック（#1207 PR2・#1231 PR 2b）: 期間の計算・検証・URL の
+ * 読み書き・`bins` の決め方・履歴の応答を共通のトレンドの部品（`@banto-industrial/trend`）の
+ * 形にする処理。画面（`routes/(app)/historical`）は、これを呼んで描くだけにする。
  *
  * - **期間は 31 日まで**（2026-11-19 オーナー決定。`HISTORY_MAX_WINDOW_MS`、
  *   サーバーの検証は `to - from <= 31 日`）。描くタグは表示グループを選んで決め、その場で
  *   足し引きしない。
- * - **`LineChart` の x は並びの添字**（時刻の目盛ではない）。系列ごとに点の時刻が揃わない
- *   ので、期間を等間隔の「区間」に割った格子を作り、点を区間に写す（`buildHistoryGrid`）。
- * - **包絡で描く**: 履歴の点は区間の最小・最大。1 区間を 2 行（最小 → 最大）にして 1 本の
- *   線でつなぐと、山も谷も落とさずに、ペンごとに 1 本の色で描ける。行数は描画幅以下に
- *   する（`LineChart` は行数が幅を超えると素朴に間引いて山を落とすため）。
- * - 欠測（`null`）は 0 にしない。線を切る（`gaps: 'break'`）。
+ * - 描画は `TrendChart`（時刻の軸・ペンごとの縦軸・区間の MIN/MAX の包絡）。区間の幅は
+ *   API が返した実際の `binMs`（サーバーが収集周期まで広げる）を系列と組で渡す。欠測
+ *   （`null`）は線を切る。
+ * - 期間は 2 つの形を持つ: 画面の URL と履歴の口は両端を含む `HistoryRange { fromMs, toMs }`、
+ *   部品は半開区間 `TimeRange [startMs, endMs)`。変換は `toTimeRange`・`toHistoryRange` だけで行う。
  */
 import { isProviderError } from '@banto/admin-core';
+import {
+	binCount,
+	dataExtent,
+	drawableSeries,
+	type TimeRange,
+	type TrendData,
+	type TrendFetch,
+	type TrendPen,
+	type TrendSeries
+} from '@banto-industrial/trend';
 import {
 	HISTORY_MAX_BINS,
 	HISTORY_MAX_POINTS,
 	HISTORY_MAX_TAGS,
 	HISTORY_MAX_WINDOW_MS,
 	type CollectHistory,
-	type CollectHistoryParams
+	type CollectHistoryParams,
+	type Readout
 } from '../banto/collectAdmin';
-import { maxTrendRows, valueExtent, type TrendRow } from '../monitor/trendLogic';
+import { penLegendLabel, type TrendPenInfo } from '../monitor/trendLogic';
 
 export interface HistoryRange {
 	fromMs: number;
@@ -49,6 +59,9 @@ export const HISTORY_MAX_PENS = HISTORY_MAX_TAGS;
 
 /** 再読み込みを束ねる時間（連続した操作・リサイズ、ms）。 */
 export const HISTORY_DEBOUNCE_MS = 300;
+
+/** 拡大・縮小・パンが止まってから URL を合わせるまでの時間（ms。履歴は積まない）。 */
+export const HISTORY_URL_SYNC_MS = 300;
 
 // --- 期間 --------------------------------------------------------------------
 
@@ -167,127 +180,145 @@ export function historyQuery(groupId: number, range: HistoryRange): string {
 	return `?group=${groupId}&from=${range.fromMs}&to=${range.toMs}`;
 }
 
+// --- 期間の 2 つの形 ------------------------------------------------------------
+
+/**
+ * `HistoryRange`（両端を含む `[fromMs, toMs]`。URL・履歴の口・CSV 出力）→ 部品の
+ * `TimeRange`（半開区間 `[startMs, endMs)`）。ミリ秒の整数なので、両端を含む `toMs` は
+ * 半開区間の `toMs + 1` と同じ時刻の集まり。幅は 1 ms 増える（31 日ちょうどの期間は
+ * `MAX_RANGE_MS` を 1 ms 超えるが、部品は範囲を受けるだけで、拡大・縮小のときに 31 日へ丸める）。
+ */
+export function toTimeRange(range: HistoryRange): TimeRange {
+	return { startMs: range.fromMs, endMs: range.toMs + 1 };
+}
+
+/** `toTimeRange` の逆。部品の範囲（拡大・縮小・パンの結果）を URL・履歴の口の形にする。 */
+export function toHistoryRange(range: TimeRange): HistoryRange {
+	return { fromMs: range.startMs, toMs: range.endMs - 1 };
+}
+
+/** 2 つの期間が同じか。 */
+export function sameHistoryRange(a: HistoryRange, b: HistoryRange): boolean {
+	return a.fromMs === b.fromMs && a.toMs === b.toMs;
+}
+
 // --- bins --------------------------------------------------------------------
 
 /**
- * 履歴の `bins`（純関数）。1 区間は 2 行（最小・最大）になるので、行数の上限
- * （描画域の幅・2000・ペン数 × bins ≤ 8000。`maxTrendRows`）の半分。リサイズのたびに
- * 読み直さないよう、50 以上は 25 刻みに切り下げる。
+ * 履歴の `bins`（純関数）。区間の数は描画域の幅から（`binCount`: 1 px に 1 区間、2000 まで）。
+ * ただし履歴の口の予算（系列 1 本 `HISTORY_MAX_BINS`・本数 × bins ≤ `HISTORY_MAX_POINTS`）を
+ * 越えない。リサイズのたびに読み直さないよう、50 以上は 25 刻みに切り下げる。
  */
-export function historyBins(widthPx: number, tagCount: number): number {
-	const rows = maxTrendRows(widthPx, tagCount);
-	let bins = Math.max(1, Math.floor(rows / 2));
+export function historyBins(plotWidthPx: number, tagCount: number): number {
+	let bins = binCount(plotWidthPx);
 	if (bins >= 50) bins = Math.floor(bins / 25) * 25;
-	return Math.min(bins, HISTORY_MAX_BINS, Math.floor(HISTORY_MAX_POINTS / Math.max(1, tagCount)));
+	return Math.max(
+		1,
+		Math.min(bins, HISTORY_MAX_BINS, Math.floor(HISTORY_MAX_POINTS / Math.max(1, tagCount)))
+	);
 }
 
 /** 履歴の要求（純関数）。タグが無い・描画幅がまだ無い・期間が外れているなら `null`。 */
 export function historyRequestFor(
 	range: HistoryRange,
 	penTagIds: readonly number[],
-	widthPx: number
+	plotWidthPx: number
 ): CollectHistoryParams | null {
 	const tagIds = [...new Set(penTagIds)].slice(0, HISTORY_MAX_PENS);
-	if (tagIds.length === 0 || !(widthPx > 0) || !checkRange(range).ok) return null;
+	if (tagIds.length === 0 || !(plotWidthPx > 0) || !checkRange(range).ok) return null;
 	return {
 		tagIds,
 		fromMs: range.fromMs,
 		toMs: range.toMs,
-		bins: historyBins(widthPx, tagIds.length)
+		bins: historyBins(plotWidthPx, tagIds.length)
 	};
 }
 
-// --- 格子 --------------------------------------------------------------------
+// --- ペンと読み出し ------------------------------------------------------------------
 
-export interface HistoryGrid {
-	/** 1 区間の幅（ms）。 */
-	stepMs: number;
-	/** 区間の数。行数はこの 2 倍。 */
-	bins: number;
-	/** 行 `2k` = 区間 k の最小、`2k + 1` = 最大。`t` は区間の始まり・中ほど。 */
-	rows: TrendRow[];
+/**
+ * 部品のペンの ID。並びの位置とタグ ID から作る（同じタグを 2 回置いても衝突しない）。
+ * 読み出しの口（`createHistoryFetch`）はここからタグ ID を読み戻す。
+ */
+export function historyPenId(index: number, tagId: number): string {
+	return `pen-${index}-tag-${tagId}`;
+}
+
+/** `historyPenId` からタグ ID を読む。形が違えば `null`。 */
+export function tagIdOfPenId(penId: string): number | null {
+	const m = /^pen-\d+-tag-(\d+)$/.exec(penId);
+	if (!m) return null;
+	const n = Number(m[1]);
+	return Number.isSafeInteger(n) ? n : null;
+}
+
+/** 部品のペン（純関数）。色の枠は監視画面と同じ（`--banto-chart-<枠>`）。 */
+export function historyTrendPens(pens: readonly TrendPenInfo[]): TrendPen[] {
+	return pens.map((pen, index) => ({
+		id: historyPenId(index, pen.tagId),
+		label: penLegendLabel(pen),
+		colorSlot: pen.colorSlot,
+		decimals: pen.isBit ? 0 : pen.decimals,
+		// bit のタグは縦軸を 0〜1 に固定する（監視画面の `trendIncludeY` と同じ考え）。
+		...(pen.isBit ? { yMin: 0, yMax: 1 } : {})
+	}));
+}
+
+/** 収集が使えず読めなかった（`Readout` が `ready` でない）。画面は「読み出せませんでした」を出す。 */
+export class HistoryUnavailableError extends Error {
+	constructor() {
+		super(HISTORY_UNAVAILABLE_MESSAGE);
+		this.name = 'HistoryUnavailableError';
+	}
+}
+
+/** 読み出しの付帯情報（部品の契約に入らないもの）。 */
+export interface HistoryExtras {
+	/** レジストリに居ないタグ（削除された）。 */
+	unknownTagIds: number[];
 }
 
 /**
- * 履歴の応答を格子にする（純関数）。期間（両端を含む）を `bins` 個の区間に割り、
- * 点 `[tMs, tMs + 有効幅)` が重なる区間に最小・最大を畳み込む（区間内の最小の最小、
- * 最大の最大）。系列の無いペン（不明なタグ）・欠測の区間は `null` のまま。
+ * 部品の `TrendFetch` を作る。`read` は `getCollectHistory`（試験では差し替える）。
  *
- * **有効幅 = `max(binMs, 収集周期, 1)`**（記録計の「1 サンプルは次のサンプルまで有効」。
- * 監視画面の PR #543 の `mergeHistory` と同じ）。収集周期が格子の 1 区間より長いタグ
- * （周期 60 秒・1 時間窓で 1 区間 6 秒など）は、点と点の間の区間が空になり、線が点の並びに
- * 細切れになるため。周期は `periodMsOf(tagId)`（収集グループの `periodMs`、無ければ `null`）。
- * 周期による延長は次の点（サーバーが返した欠測の点を含む）の手前で止める。欠測の点
- * （min/max が `null`）自体は書かないので、本当の欠測では線が切れる。
- * 次の点がある限り幅は次の点で止め、`binMs` を下限にしない: 収集周期を途中で変えると
- * `binMs` は読んだ周期の最大になり、素通しの点（`binMs` より狭い間隔）が良い値を後続の
- * 欠測の点の先まで延ばして、記録の途切れを隠してしまうため。
+ * - ペンの ID からタグ ID を読み、重複を除いて 1 回で読む。系列はペンごとに
+ *   `{ bins: 点（tMs の昇順）, binMs: API の実際の幅 }` にする（同じタグのペンは同じ系列を共有）。
+ * - `Readout` が `ready` でなければ `HistoryUnavailableError` を投げる（空に潰さない）。
+ * - `unknownTagIds` は返すオブジェクトを鍵にして `extras` に置く（ローダーの `onResult` は
+ *   このオブジェクトそのものを `data.series` で渡すので、画面はそこから引ける）。
  */
-export function buildHistoryGrid(
-	range: HistoryRange,
-	bins: number,
-	penTagIds: readonly number[],
-	history: Pick<CollectHistory, 'series'>,
-	periodMsOf: (tagId: number) => number | null = () => null
-): HistoryGrid {
-	const span = range.toMs - range.fromMs + 1;
-	const count = Math.max(1, Math.floor(bins));
-	const stepMs = Math.max(1, Math.ceil(span / count));
-	const n = Math.max(1, Math.ceil(span / stepMs));
-	const lo: (number | null)[][] = penTagIds.map(() => Array.from({ length: n }, () => null));
-	const hi: (number | null)[][] = penTagIds.map(() => Array.from({ length: n }, () => null));
-	penTagIds.forEach((tagId, pen) => {
-		const series = history.series.find((s) => s.tagId === tagId);
-		if (!series) return;
-		const binWidth = Math.max(1, series.binMs);
-		const hold = Math.max(binWidth, periodMsOf(tagId) ?? 0);
-		const points = [...series.points].sort((a, b) => a.tMs - b.tMs);
-		for (let i = 0; i < points.length; i++) {
-			const point = points[i];
-			const next = points[i + 1];
-			// 次の点（欠測の点も）までは延ばすが、その先へは延ばさない。
-			const width =
-				next !== undefined && next.tMs > point.tMs
-					? Math.max(1, Math.min(hold, next.tMs - point.tMs))
-					: hold;
-			if (
-				point.min === null ||
-				point.max === null ||
-				!Number.isFinite(point.min) ||
-				!Number.isFinite(point.max)
-			) {
-				continue;
-			}
-			const first = Math.max(0, Math.floor((point.tMs - range.fromMs) / stepMs));
-			const last = Math.min(n - 1, Math.floor((point.tMs + width - 1 - range.fromMs) / stepMs));
-			for (let k = first; k <= last; k++) {
-				const curLo = lo[pen][k];
-				const curHi = hi[pen][k];
-				lo[pen][k] = curLo === null ? point.min : Math.min(curLo, point.min);
-				hi[pen][k] = curHi === null ? point.max : Math.max(curHi, point.max);
-			}
+export function createHistoryFetch(
+	read: (params: CollectHistoryParams, signal: AbortSignal) => Promise<Readout<CollectHistory>>,
+	extras: WeakMap<object, HistoryExtras>
+): TrendFetch {
+	return async ({ range, penIds, bins, signal }) => {
+		const tagOf = new Map<string, number>();
+		for (const id of penIds) {
+			const tagId = tagIdOfPenId(id);
+			if (tagId !== null) tagOf.set(id, tagId);
 		}
-	});
-	const rows: TrendRow[] = [];
-	for (let k = 0; k < n; k++) {
-		const t = range.fromMs + k * stepMs;
-		rows.push({ t, values: lo.map((col) => col[k]) });
-		rows.push({ t: t + Math.floor(stepMs / 2), values: hi.map((col) => col[k]) });
-	}
-	return { stepMs, bins: n, rows };
+		const hr = toHistoryRange(range);
+		const tagIds = [...new Set(tagOf.values())];
+		const readout = await read({ tagIds, fromMs: hr.fromMs, toMs: hr.toMs, bins }, signal);
+		if (readout.state !== 'ready') throw new HistoryUnavailableError();
+		const byTag = new Map<number, TrendSeries>();
+		for (const s of readout.data.series) {
+			byTag.set(s.tagId, {
+				bins: [...s.points].sort((a, b) => a.tMs - b.tMs),
+				binMs: s.binMs
+			});
+		}
+		const out: Record<string, TrendSeries> = {};
+		for (const [id, tagId] of tagOf) {
+			const s = byTag.get(tagId);
+			if (s) out[id] = s;
+		}
+		extras.set(out, { unknownTagIds: [...readout.data.unknownTagIds] });
+		return out;
+	};
 }
 
 // --- 表示 --------------------------------------------------------------------
-
-/** 目盛・ツールチップの日時の書式。期間が 1 日を超えるなら日付も、1 時間以内なら秒まで。 */
-export function historyTimeLabel(epochMs: number, spanMs: number): string {
-	const at = new Date(epochMs);
-	if (Number.isNaN(at.getTime())) return String(epochMs);
-	const hm = `${pad(at.getHours())}:${pad(at.getMinutes())}`;
-	if (spanMs > DAY_MS) return `${pad(at.getMonth() + 1)}/${pad(at.getDate())} ${hm}`;
-	if (spanMs <= HOUR_MS) return `${hm}:${pad(at.getSeconds())}`;
-	return hm;
-}
 
 /** 期間の表示（「2026/11/19 09:00 〜 2026/11/19 10:00」）。 */
 export function rangeLabel(range: HistoryRange): string {
@@ -298,21 +329,36 @@ export function rangeLabel(range: HistoryRange): string {
 	return `${text(range.fromMs)} 〜 ${text(range.toMs)}`;
 }
 
-/** 画面外の説明文（図は `role="img"` で中が読まれないため）。 */
+/** 表示中（取得範囲 ∩ 表示範囲）の値の範囲（全ペン）。値が無ければ `null`。 */
+export function historyExtent(
+	data: TrendData | null,
+	view: TimeRange
+): { min: number; max: number } | null {
+	let min = Infinity;
+	let max = -Infinity;
+	for (const s of Object.values(drawableSeries(data, view).series)) {
+		const e = dataExtent(s.bins);
+		if (e === null) continue;
+		min = Math.min(min, e[0]);
+		max = Math.max(max, e[1]);
+	}
+	return min <= max ? { min, max } : null;
+}
+
+/** 画面外の説明文（各ペンの縦軸の範囲は部品の説明文が読む）。 */
 export function historyDescription(input: {
 	range: HistoryRange;
 	penLabels: readonly string[];
-	rows: readonly TrendRow[];
+	extent: { min: number; max: number } | null;
 	bandPenName: string | null;
 }): string {
 	const parts = [
 		`${rangeLabel(input.range)} のトレンド（各区間の最小と最大）。ペン: ${input.penLabels.join('、')}。`
 	];
-	const extent = valueExtent(input.rows);
 	parts.push(
-		extent === null
+		input.extent === null
 			? 'この期間に表示できる値はありません。'
-			: `縦軸は全ペン共通の自動スケールで、表示中の値の範囲は ${extent.min}〜${extent.max}。`
+			: `縦軸はペンごとの範囲で、表示中の値の範囲は ${input.extent.min}〜${input.extent.max}。`
 	);
 	parts.push(
 		input.bandPenName === null ? 'しきい値の帯: なし。' : `しきい値の帯: ${input.bandPenName}。`
@@ -344,9 +390,4 @@ export function unknownTagsNote(
 ): string | null {
 	if (unknownTagIds.length === 0) return null;
 	return `削除されたタグがあります（${unknownTagIds.map(nameOf).join('、')}）。そのタグの履歴は表示されません。`;
-}
-
-/** 値が 1 つも無い（全部欠測）か。 */
-export function isEmptyGrid(grid: Pick<HistoryGrid, 'rows'>): boolean {
-	return valueExtent(grid.rows) === null;
 }
