@@ -437,7 +437,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             versions,
-            vec![2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111]
+            vec![
+                2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111
+            ]
         );
     }
 
@@ -565,7 +567,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             versions,
-            vec![2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111]
+            vec![
+                2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111
+            ]
         );
         let pending_id: Option<String> =
             sqlx::query_scalar("SELECT pending_id FROM audit_log WHERE action = 'probe'")
