@@ -37,6 +37,7 @@ GET /api/tags
 GET /api/tags/expression/functions
 GET /api/tags/group-counts
 GET /api/tags/{id}
+GET /api/ui-settings/{key}
 GET /api/users
 GET /api/v1/events
 GET /api/v1/ingest/{id}/stream
@@ -108,4 +109,5 @@ PUT /api/sink/groups/{id}
 PUT /api/sink/status
 PUT /api/store-settings
 PUT /api/tags/{id}
+PUT /api/ui-settings/{key}
 PUT /api/users/{id}

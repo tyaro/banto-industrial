@@ -1,11 +1,16 @@
 /**
- * relay-wright の同名ファイルから複製。永続化の二層構成（localStorage の
- * FOUC キャッシュ + UiSettingsProvider）はそのまま — banto-hub では
- * `getUiSettings()` が `createLocalUiSettings()`（#lib/banto/setup.ts 参照:
- * バックエンドに /api/ui-settings が無いため）に固定されるので、
- * `persistRemote`/`syncFromProvider` は実質 localStorage への二重書き込み
- * になるが、将来サーバー側 UiSettingsProvider を追加したときに無改変で
- * 効くようこのまま残す。
+ * App settings store (Svelte 5 runes)。ChronoGazer の同名ファイルと同じ形。
+ *
+ * 永続化は設定ごとに二層（#1147）:
+ * - localStorage: 変更のたびに同期で書く。FOUC 防止の写しで（app.html の inline script が
+ *   `banto.theme`/`banto.preset` を最初の描画の前に戻す）、ログイン前の表示もこれで決まる。
+ * - `getUiSettings()`（setup.ts）= Hub のサーバー（`/api/ui-settings/{key}`、ログインした
+ *   利用者ごと）: 変更のたびに best-effort で書く（未ログインの失敗は握りつぶす。写しには
+ *   もう入っている）。デスクトップ版は起動ごとに origin が変わり localStorage が消えるため、
+ *   本体はサーバー側。ログイン後に `syncFromProvider()`（`(app)/+layout.ts` のガードが、
+ *   セッションを確かめた直後に呼ぶ）で読み直し、サーバーの値が写しを上書きする。
+ *   再起動直後のログイン画面は既定のテーマで出てよい（2026-11-19 オーナー決定、
+ *   docs/hub/hub-desktop-tls-design.md §7）。
  *
  * #1159（banto v7.2.0 のメニューバー、nav-menubar-plan.md §3）: admin-template の
  * `navLayout`（サイドバー / ドック / メニューバー）と `launcherPosition`（ドックの
@@ -25,6 +30,7 @@ import {
 	type ThemePreset
 } from '@banto/theme';
 import { getUiSettings } from './banto/setup';
+import { syncRecentFromProvider } from './recentCommands';
 import {
 	isLauncherPosition,
 	isNavLayout,
@@ -71,7 +77,7 @@ function loadLauncherPosition(): LauncherPosition {
 	return parseLauncherPosition(localStorage.getItem(LAUNCHER_POSITION_KEY));
 }
 
-/** Best-effort provider write: 未認証/オフラインの失敗は想定内で無視する。 */
+/** Best-effort provider write: 未認証/オフラインの失敗は想定内で無視する（写しには入っている）。 */
 function persistRemote(key: string, value: string): void {
 	void getUiSettings()
 		.set(key, value)
@@ -87,6 +93,16 @@ class Settings {
 	launcherPosition: LauncherPosition = $state(loadLauncherPosition());
 
 	#unwatchSystem: (() => void) | undefined;
+	/** キーごとの編集の世代（setter のたびに増える）。読み込み中の編集を巻き戻さないため。 */
+	#edits = new Map<string, number>();
+
+	#editGen(key: string): number {
+		return this.#edits.get(key) ?? 0;
+	}
+
+	#touch(key: string) {
+		this.#edits.set(key, this.#editGen(key) + 1);
+	}
 
 	#applyThemeMode(mode: ThemeMode) {
 		this.themeMode = mode;
@@ -118,21 +134,25 @@ class Settings {
 	}
 
 	setThemeMode(mode: ThemeMode) {
+		this.#touch(MODE_SETTING);
 		this.#applyThemeMode(mode);
 		persistRemote(MODE_SETTING, mode);
 	}
 
 	setThemePreset(preset: ThemePreset) {
+		this.#touch(PRESET_SETTING);
 		this.#applyThemePreset(preset);
 		persistRemote(PRESET_SETTING, preset);
 	}
 
 	setNavLayout(layout: NavLayout) {
+		this.#touch(NAV_LAYOUT_SETTING);
 		this.#applyNavLayout(layout);
 		persistRemote(NAV_LAYOUT_SETTING, layout);
 	}
 
 	setLauncherPosition(position: LauncherPosition) {
+		this.#touch(LAUNCHER_POSITION_SETTING);
 		this.#applyLauncherPosition(position);
 		persistRemote(LAUNCHER_POSITION_SETTING, position);
 	}
@@ -145,9 +165,30 @@ class Settings {
 		this.#applyLauncherPosition(this.launcherPosition);
 	}
 
-	/** ログイン直後に一度呼ぶ: UiSettingsProvider から読み直す。 */
-	async syncFromProvider(): Promise<void> {
+	/**
+	 * ログイン直後に一度呼ぶ: UiSettingsProvider（サーバー）から読み直して適用する（写しも更新）。
+	 * 未保存のキーや失敗は、いまの値（localStorage 由来）のままにする。
+	 *
+	 * 遅れて返った応答で壊さないための 2 つの守り:
+	 * - `isCurrent`: 「いまも読み込みを始めたセッションか」。応答の後に確かめ、古いセッションの
+	 *   応答は何にも当てない（最近のコマンドも同じ境界）。
+	 * - `session`: セッションの鍵（`snapshot.generation`）。最近のコマンドの取り込みが同じ
+	 *   セッションで重なっても、未送信の記録を捨てない。
+	 * - 編集の世代: 読み込みの開始後に利用者が変えたキーは、遅れて返った古い値で巻き戻さない。
+	 */
+	async syncFromProvider(isCurrent: () => boolean = () => true, session?: unknown): Promise<void> {
 		const ui = getUiSettings();
+		// 最近使ったコマンド（#1147）も同じ境界で並行して取り込む。
+		const recent =
+			session === undefined
+				? syncRecentFromProvider(isCurrent)
+				: syncRecentFromProvider(isCurrent, session);
+		const started = {
+			mode: this.#editGen(MODE_SETTING),
+			preset: this.#editGen(PRESET_SETTING),
+			navLayout: this.#editGen(NAV_LAYOUT_SETTING),
+			launcherPosition: this.#editGen(LAUNCHER_POSITION_SETTING)
+		};
 		try {
 			const [mode, preset, navLayout, launcherPosition] = await Promise.all([
 				ui.get(MODE_SETTING),
@@ -155,13 +196,23 @@ class Settings {
 				ui.get(NAV_LAYOUT_SETTING),
 				ui.get(LAUNCHER_POSITION_SETTING)
 			]);
-			if (isThemeMode(mode)) this.#applyThemeMode(mode);
-			if (isThemePreset(preset)) this.#applyThemePreset(preset);
-			if (isNavLayout(navLayout)) this.#applyNavLayout(navLayout);
-			if (isLauncherPosition(launcherPosition)) this.#applyLauncherPosition(launcherPosition);
+			if (isCurrent()) {
+				if (isThemeMode(mode) && this.#editGen(MODE_SETTING) === started.mode)
+					this.#applyThemeMode(mode);
+				if (isThemePreset(preset) && this.#editGen(PRESET_SETTING) === started.preset)
+					this.#applyThemePreset(preset);
+				if (isNavLayout(navLayout) && this.#editGen(NAV_LAYOUT_SETTING) === started.navLayout)
+					this.#applyNavLayout(navLayout);
+				if (
+					isLauncherPosition(launcherPosition) &&
+					this.#editGen(LAUNCHER_POSITION_SETTING) === started.launcherPosition
+				)
+					this.#applyLauncherPosition(launcherPosition);
+			}
 		} catch {
 			// Best-effort: オフライン/未認証時は現在値のまま。
 		}
+		await recent;
 	}
 
 	toggleSidebar() {

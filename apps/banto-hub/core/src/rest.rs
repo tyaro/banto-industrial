@@ -37,6 +37,13 @@
 //! サービス（users/audit/settings）も banto の `banto-admin-services` のもの
 //! （`crate::users`・`crate::audit`・`crate::settings` の doc comment）。
 //!
+//! `GET|PUT /api/ui-settings/{key}`（#1147）: 利用者ごとの UI 設定（テーマ・
+//! プリセット・ナビの配置・ランチャーの位置・最近使ったコマンド）。ChronoGazer と
+//! 同じ banto の `ui_settings_router` で、`require_auth` だけ（ロールの下限なし）、
+//! 呼び出した利用者自身の名前空間（`ui.{username}.{key}`）だけを読み書きする。
+//! デスクトップ版は起動ごとに origin が変わり localStorage が消えるため、サーバー側に
+//! 持つ（docs/hub/hub-desktop-tls-design.md §7）。CSRF ヘッダの確認の内側に置く。
+//!
 //! 自前のまま残しているもの（banto-hub 固有）: 管理系の認証ゲート
 //! [`require_session`]（#431 の `StopWrites`・[`SessionCheck`] の区別・5 秒の
 //! 上限・[`UnverifiedStopException`]）とその後ろの RBAC の床
@@ -100,7 +107,7 @@ use banto_collect::{
 use banto_core::{BantoError, ErrorBody, FieldError, ListParams, ListResult};
 use banto_server::routes::{
     actor_identity, audit_log_router, audit_logout_middleware, extra_auth_router, record_write,
-    users_router, LogoutAuditState,
+    ui_settings_router, users_router, LogoutAuditState,
 };
 use banto_server::{
     auth_routes, require_banto_client_header, sse_route, ApiError, AuthState, AuthenticatedSession,
@@ -841,6 +848,12 @@ fn api_router_with_controller_mode(
             auth.clone(),
         ))
         .merge(users_router(users, audit.clone(), auth.clone()))
+        // #1147: 利用者ごとの UI 設定（テーマ・ナビの配置等）。ChronoGazer と同じ banto の
+        // ルーターで、`require_auth` だけ（ロールの下限なし）、自分の名前空間だけ読み書きする。
+        .merge(ui_settings_router(
+            SettingsService::new(Db::Sqlite(manager.pool())),
+            auth.clone(),
+        ))
         .merge(audit_log_router(
             audit.clone(),
             SettingsService::new(Db::Sqlite(manager.pool())),

@@ -15,17 +15,17 @@
  *   コピー元のクライアントコードが `getBantoMode() === 'tauri'` 分岐を
  *   含んだまま無改変で動くようにするため（実装指示: 「コピーしたクライ
  *   アントが無改変で動くように」）。
- * - `createHttpUiSettings` は使わない: banto-hub バックエンドに
- *   `/api/ui-settings/*` ルートが存在しない（apps/banto-hub/core/src/rest.rs
- *   のルーター一覧参照）ため、`createLocalUiSettings()`（localStorage）に
- *   固定する。これは relay-wright の「プレーンブラウザデモモード」の
- *   フォールバックと同じ実装だが、banto-hub では唯一の選択肢である点が
- *   異なる。
+ * - UI 設定（#1147）: `createHttpUiSettings`（`/api/ui-settings/{key}`、利用者ごと）を
+ *   `bantoReady` の中で差し替える。Hub は Tauri のコマンド経路を持たず（デスクトップ版の
+ *   画面も HTTP で読み込む）、`createTauriUiSettings` は使わない。差し替え前（モジュールの
+ *   読み込み直後）は localStorage 版で、`settings.svelte.ts` の同期書き込みと FOUC 写しが
+ *   そのまま動く。
  */
 import {
 	connectEvents,
 	createHttpAuthProvider,
 	createHttpDataProvider,
+	createHttpUiSettings,
 	createLocalUiSettings,
 	createSseEventProvider,
 	initBanto
@@ -33,6 +33,7 @@ import {
 import type { Notifier, UiSettingsProvider } from '@banto/admin-core';
 import { toastStore } from '#lib/toast.svelte.js';
 import { purgeLoopbackRememberedToken } from './loopbackTokenPurge';
+import { createSerializedUiSettings } from './serializedUiSettings';
 
 /** usersAdmin.ts 等の CSRF ヘッダー（管理系 REST 全体で共通）。 */
 export const CSRF_HEADER = { 'X-Banto-Client': 'banto' } as const;
@@ -48,8 +49,13 @@ export function getBantoMode(): BantoMode {
 	return 'server';
 }
 
-/** UI 設定の永続化 - banto-hub には /api/ui-settings が無いため常に localStorage。 */
-const uiSettings: UiSettingsProvider = createLocalUiSettings();
+/**
+ * UI 設定の永続化（#1147）。`bantoReady` が解決するまでは localStorage 版（写しだけ）で、
+ * 解決後は Hub のサーバー（`/api/ui-settings/{key}`、利用者ごと）へ差し替わる。未ログインの
+ * 書き込みはサーバーで 401 になるが、呼び出し側（`settings.svelte.ts`）が握りつぶす
+ * （localStorage の写しは常に書く）。
+ */
+let uiSettings: UiSettingsProvider = createLocalUiSettings();
 export function getUiSettings(): UiSettingsProvider {
 	return uiSettings;
 }
@@ -69,6 +75,11 @@ export const bantoReady: Promise<void> = (async () => {
 	await purgeLoopbackRememberedToken();
 	const authProvider = createHttpAuthProvider();
 	const dataProvider = createHttpDataProvider({ getToken: authProvider.getToken });
+	// 書き込みはキーごとに直列化し、トークンが替わったら捨てる（serializedUiSettings.ts）。
+	uiSettings = createSerializedUiSettings(
+		createHttpUiSettings({ getToken: authProvider.getToken }),
+		authProvider.getToken
+	);
 	initBanto({ dataProvider, authProvider, notifier, resources: [] });
 	connectEvents(createSseEventProvider({ getToken: authProvider.getToken }));
 })();
