@@ -1,52 +1,51 @@
 /**
- * リアルタイムトレンドの純関数（`trendLogic.ts`）の表。
+ * 監視画面のトレンドの純関数（`trendLogic.ts`）の表。
  *
- * 格子（刻みの選び方・揃え方）・進めると古い行を捨てる・値の無い刻みは `null`・
- * 履歴と現在値の合わせ方・しきい値の帯（無い・同じ値・端の無い側）・端末ごとの
- * 時間窓（壊れた localStorage を含む）・説明文と注記。
+ * 追従の状態遷移（追従・左へパンで止める・右端を今へ戻すと再開）・履歴を読み直す条件
+ * （追従中に毎秒は読まない・範囲を出たら・幅が変わったら・途切れの後）・しきい値の帯
+ * （無い・同じ値・端の無い側）・端末ごとの時間窓（壊れた localStorage を含む）・説明文と注記・
+ * 表示の時計。
  */
 import { describe, expect, it } from 'vitest';
-import { envelopePath } from '@banto-industrial/trend';
-import { HISTORY_MAX_BINS } from '../banto/collectAdmin';
+import {
+	hybridData,
+	liveAppend,
+	liveRetainMs,
+	type LivePen,
+	type TrendSeries,
+	type TrendData
+} from '@banto-industrial/trend';
 import { TIME_WINDOW_OPTIONS } from '../../routes/(app)/groups/groupsPageLogic';
 import {
 	DEFAULT_TREND_WINDOW_SEC,
+	FOLLOW_TOLERANCE_MS,
 	HISTORY_UNAVAILABLE_NOTE,
 	SIMULATION_NOTE,
 	TREND_DANGER_COLOR,
 	TREND_WARNING_COLOR,
 	TREND_WINDOWS_SEC,
 	TREND_WINDOW_STORAGE_KEY,
-	advanceTrend,
-	alignToStep,
-	appendLive,
-	chooseStepMs,
-	emptyTrendBuffer,
 	groupDefaultWindowSec,
-	historyPointValue,
-	historyRequest,
 	loadTrendWindowOverride,
-	maxTrendRows,
-	mergeHistory,
+	needsHistoryReload,
 	penLegendLabel,
+	rangeChangeFollow,
 	resolveBandPen,
 	resolveTrendWindowSec,
 	saveTrendWindowOverride,
+	startFollow,
 	observeServerClock,
 	serverClockNow,
+	tickFollow,
 	type ServerClock,
 	thresholdBands,
-	trendBufferData,
 	trendDescription,
 	trendNotices,
 	trendPenInfos,
 	isAllBitTrend,
 	trendWindowLabel,
-	valueExtent,
-	type TrendBuffer,
 	type TrendPenInfo
 } from './trendLogic';
-import { trendPenId } from './trendPens';
 import type { ThresholdFields } from '../banto/tagThresholdsAdmin';
 import { INITIAL_VALUES_STATE, applyValuesOutcome, type ValuesState } from './valuesPoller.svelte';
 
@@ -57,8 +56,38 @@ const NONE: ThresholdFields = {
 	thresholdLl: null
 };
 
-const values = (buffer: TrendBuffer) => buffer.rows.map((row) => row.values);
-const times = (buffer: TrendBuffer) => buffer.rows.map((row) => row.t);
+const MIN = 60_000;
+
+/** 説明文の試験の描画データ: ペンごとの値の列を 1 秒刻みの区間（min = max）にする。 */
+function dataOf(penIds: readonly string[], columns: readonly (number | null)[][]): TrendData {
+	const series: Record<string, TrendSeries> = {};
+	penIds.forEach((id, i) => {
+		series[id] = {
+			binMs: 1000,
+			bins: columns.map((row, k) => ({ tMs: k * 1000, min: row[i], max: row[i] }))
+		};
+	});
+	return { range: { startMs: 0, endMs: columns.length * 1000 }, series };
+}
+
+/** 追従中の説明文（表示範囲は窓の幅、値はペンの並びどおりの列）。 */
+function describeOf(
+	windowSec: number,
+	pens: readonly TrendPenInfo[],
+	columns: readonly (number | null)[][],
+	bandTagId: number | null
+): string {
+	const penIds = pens.map((_, i) => `p${i}`);
+	return trendDescription({
+		windowSec,
+		view: { startMs: 0, endMs: windowSec * 1000 },
+		following: true,
+		pens,
+		penIds,
+		data: columns.length > 0 ? dataOf(penIds, columns) : null,
+		bandTagId
+	});
+}
 
 describe('時間窓の選択肢', () => {
 	it('「表示グループ」ページ（= Rust の TREND_TIME_WINDOWS_SEC）と同じ', () => {
@@ -75,244 +104,145 @@ describe('時間窓の選択肢', () => {
 	});
 });
 
-describe('chooseStepMs / maxTrendRows', () => {
-	it.each([
-		// [窓(秒), 幅, 周期, 本数, 刻み]
-		['10 分・1280px・500ms・1 本 → 1 秒（600 行）', 600, 1280, 500, 1, 1000],
-		['1 分・1280px・500ms → 1 秒（周期の 2 倍が下限）', 60, 1280, 500, 1, 1000],
-		['1 分・1280px・1 秒 → 2 秒', 60, 1280, 1000, 1, 2000],
-		['10 分・描画域 244px・500ms → 5 秒（244 行以下に収める）', 600, 244, 500, 1, 5000],
-		['1 時間・描画域 1280px・1 秒 → 5 秒（720 行）', 3600, 1280, 1000, 1, 5000],
-		['1 時間・2600px・500ms・8 本 → 5 秒（8000/8 = 1000 行以下）', 3600, 2600, 500, 8, 5000],
-		['1 時間・100px → 最大の 60 秒', 3600, 100, 500, 1, 60_000],
-		['5 分・1280px・5 秒周期 → 10 秒', 300, 1280, 5000, 1, 10_000]
-	])('%s', (_name, windowSec, plotWidthPx, pollPeriodMs, tagCount, expected) => {
-		const step = chooseStepMs({
-			windowMs: windowSec * 1000,
-			plotWidthPx,
-			pollPeriodMs,
-			tagCount
+describe('追従の状態（startFollow / tickFollow / rangeChangeFollow）', () => {
+	const NOW = 10 * 3_600_000;
+
+	it('追従中は右端を今にして幅を保って進む。変わらなければ同じオブジェクト', () => {
+		const s = startFollow(10 * MIN, NOW);
+		expect(s).toEqual({
+			following: true,
+			widthMs: 10 * MIN,
+			view: { startMs: NOW - 10 * MIN, endMs: NOW }
 		});
-		expect(step).toBe(expected);
-		// 選んだ刻みの行数は（最大の候補で諦めたとき以外）上限以下。
-		if (step !== 60_000) {
-			expect((windowSec * 1000) / step).toBeLessThanOrEqual(maxTrendRows(plotWidthPx, tagCount));
-		}
-	});
-
-	it('行数の上限は描画域の幅・HISTORY_MAX_BINS・本数あたりの予算の最小', () => {
-		expect(maxTrendRows(1000, 1)).toBe(1000);
-		expect(maxTrendRows(5000, 1)).toBe(HISTORY_MAX_BINS);
-		expect(maxTrendRows(5000, 8)).toBe(1000);
-		expect(maxTrendRows(0, 1)).toBe(1);
-	});
-
-	it('オーナーの例: 10 分窓・1 秒周期・描画域 224px は間引きの起きない刻みを選ぶ（#550）', () => {
-		const windowMs = 600_000;
-		const step = chooseStepMs({ windowMs, plotWidthPx: 224, pollPeriodMs: 1000, tagCount: 1 });
-		expect(windowMs / step).toBeLessThanOrEqual(224);
-		expect(step).toBe(5000);
-	});
-
-	it('幅を振っても、行数は描画域の幅を超えない（60 秒で諦める 1 時間窓を除く）', () => {
-		for (let plotWidthPx = 100; plotWidthPx <= 3000; plotWidthPx += 7) {
-			for (const sec of TREND_WINDOWS_SEC) {
-				const windowMs = sec * 1000;
-				const step = chooseStepMs({ windowMs, plotWidthPx, pollPeriodMs: 500, tagCount: 1 });
-				if (step === 60_000) continue;
-				expect(windowMs / step).toBeLessThanOrEqual(plotWidthPx);
-			}
-		}
-	});
-
-	it('どの窓でも、行数が整数になる', () => {
-		for (const sec of TREND_WINDOWS_SEC) {
-			for (const width of [300, 800, 1280, 2000]) {
-				for (const period of [500, 1000, 2000, 5000]) {
-					const step = chooseStepMs({
-						windowMs: sec * 1000,
-						plotWidthPx: width,
-						pollPeriodMs: period,
-						tagCount: 3
-					});
-					expect(Number.isInteger((sec * 1000) / step)).toBe(true);
-				}
-			}
-		}
-	});
-});
-
-describe('格子（emptyTrendBuffer / advanceTrend）', () => {
-	it('空の格子は窓の行数ぶんの null で、最後の行が今の刻み', () => {
-		const b = emptyTrendBuffer(1000, 5000, 2, 10_500);
-		expect(times(b)).toEqual([6000, 7000, 8000, 9000, 10_000]);
-		expect(values(b).every((v) => v.length === 2 && v.every((x) => x === null))).toBe(true);
-		expect(alignToStep(10_999, 1000)).toBe(10_000);
-	});
-
-	it.each([
-		['同じ刻みなら変わらない', 10_900, [6000, 7000, 8000, 9000, 10_000]],
-		['時計が戻っても変わらない', 3000, [6000, 7000, 8000, 9000, 10_000]],
-		[
-			'2 刻み進めると古い 2 行を捨て、null を 2 行足す',
-			12_100,
-			[8000, 9000, 10_000, 11_000, 12_000]
-		],
-		['窓より長く空いたら作り直す', 60_000, [56_000, 57_000, 58_000, 59_000, 60_000]]
-	])('%s', (_name, now, expected) => {
-		const b = emptyTrendBuffer(1000, 5000, 1, 10_500);
-		const next = advanceTrend(b, now);
-		expect(times(next)).toEqual(expected);
-		expect(next.rows).toHaveLength(5);
-	});
-
-	it('進めても古い行の値は残り、足した刻みは null（値の無い刻み = 線が切れる）', () => {
-		let b = emptyTrendBuffer(1000, 5000, 1, 10_000);
-		b = appendLive(b, 10_000, [1]);
-		b = appendLive(b, 13_200, [4]);
-		expect(values(b)).toEqual([[null], [1], [null], [null], [4]]);
-	});
-});
-
-describe('appendLive', () => {
-	it('同じ刻みに 2 回来たら後の値。undefined はそのまま、非有限は null', () => {
-		let b = emptyTrendBuffer(1000, 3000, 3, 10_000);
-		b = appendLive(b, 10_100, [1, 2, 3]);
-		b = appendLive(b, 10_600, [5, undefined as unknown as null, Number.NaN]);
-		expect(values(b).at(-1)).toEqual([5, 2, null]);
-		expect(b.liveFromT).toBe(10_000);
-	});
-
-	it('0 は 0 のまま（null と区別する）', () => {
-		const b = appendLive(emptyTrendBuffer(1000, 3000, 2, 0), 0, [0, null]);
-		expect(values(b).at(-1)).toEqual([0, null]);
-	});
-
-	it('liveFromT は最初に書いた刻みのまま', () => {
-		let b = emptyTrendBuffer(1000, 5000, 1, 10_000);
-		b = appendLive(b, 10_000, [1]);
-		b = appendLive(b, 12_000, [2]);
-		expect(b.liveFromT).toBe(10_000);
-	});
-});
-
-describe('historyPointValue（最小と最大の中点）', () => {
-	it.each([
-		[{ min: 2, max: 4 }, 3],
-		[{ min: 5, max: 5 }, 5],
-		[{ min: null, max: null }, null],
-		[{ min: null, max: 7 }, 7],
-		[{ min: 1, max: Number.POSITIVE_INFINITY }, 1],
-		[{ min: 0, max: 0 }, 0]
-	])('%o → %s', (point, expected) => {
-		expect(historyPointValue(point)).toBe(expected);
-	});
-});
-
-describe('mergeHistory（初期窓 + 現在値）', () => {
-	const series = (tagId: number, binMs: number, points: [number, number | null][]) => ({
-		tagId,
-		simulation: false,
-		binMs,
-		points: points.map(([tMs, v]) => ({ tMs, min: v, max: v }))
-	});
-
-	it('点を刻みに書く。欠測は null、現在値の行（liveFromT 以後）は上書きしない', () => {
-		let b = emptyTrendBuffer(1000, 6000, 1, 15_000); // 10_000..15_000
-		b = appendLive(b, 15_000, [99]);
-		const merged = mergeHistory(b, [7], {
-			series: [
-				series(7, 1000, [
-					[10_000, 1],
-					[11_000, 2],
-					[12_000, null],
-					[13_000, 4],
-					[14_000, 5],
-					[15_000, 6]
-				])
-			]
+		expect(tickFollow(s, NOW)).toBe(s);
+		expect(tickFollow(s, NOW + 1000).view).toEqual({
+			startMs: NOW + 1000 - 10 * MIN,
+			endMs: NOW + 1000
 		});
-		expect(values(merged)).toEqual([[1], [2], [null], [4], [5], [99]]);
 	});
 
-	it('収集周期が刻みより長いタグは、次の点まで値を保つ（線が細切れにならない）', () => {
-		const b = emptyTrendBuffer(1000, 6000, 1, 15_000);
-		const merged = mergeHistory(
-			b,
-			[7],
-			{
-				series: [
-					series(7, 1, [
-						[10_000, 1],
-						[13_000, 2]
-					])
-				]
-			},
-			() => 3000
+	it('左へパン（右端が今から外れる）で追従をやめ、止めている間は時計が進んでも動かない', () => {
+		const s = startFollow(10 * MIN, NOW);
+		const panned = { startMs: NOW - 15 * MIN, endMs: NOW - 5 * MIN };
+		const stopped = rangeChangeFollow(s, panned, NOW);
+		expect(stopped).toEqual({ following: false, widthMs: 10 * MIN, view: panned });
+		expect(tickFollow(stopped, NOW + 60_000)).toBe(stopped);
+	});
+
+	it('今から離れた位置での拡大は追従をやめ、右端を今に付けた拡大・縮小はその幅で追従を続ける', () => {
+		const s = startFollow(10 * MIN, NOW);
+		const zoomedPast = { startMs: NOW - 8 * MIN, endMs: NOW - 2 * MIN };
+		expect(rangeChangeFollow(s, zoomedPast, NOW).following).toBe(false);
+		const zoomedAtNow = { startMs: NOW - 30 * MIN, endMs: NOW };
+		expect(rangeChangeFollow(s, zoomedAtNow, NOW)).toEqual({
+			following: true,
+			widthMs: 30 * MIN,
+			view: zoomedAtNow
+		});
+	});
+
+	it('右端を今へ戻すと（許容 FOLLOW_TOLERANCE_MS 以内）追従を再開する。不正な範囲は無視', () => {
+		const stopped = rangeChangeFollow(
+			startFollow(10 * MIN, NOW),
+			{ startMs: NOW - 20 * MIN, endMs: NOW - 10 * MIN },
+			NOW
 		);
-		expect(values(merged)).toEqual([[1], [1], [1], [2], [2], [2]]);
+		const back = rangeChangeFollow(
+			stopped,
+			{ startMs: NOW - 10 * MIN - 500, endMs: NOW - 500 },
+			NOW
+		);
+		expect(FOLLOW_TOLERANCE_MS).toBeGreaterThan(500);
+		expect(back.following).toBe(true);
+		expect(back.view).toEqual({ startMs: NOW - 10 * MIN, endMs: NOW });
+		expect(rangeChangeFollow(stopped, { startMs: 5, endMs: 5 }, NOW)).toBe(stopped);
 	});
 
-	it('窓より前の点は捨て、ペンの並びどおりに入れる。系列の無いペンは null のまま', () => {
-		const b = emptyTrendBuffer(1000, 3000, 3, 12_000); // 10_000..12_000
-		const merged = mergeHistory(b, [2, 1, 9], {
-			series: [
-				series(1, 1000, [
-					[5000, 100],
-					[10_000, 10],
-					[11_000, 11]
-				]),
-				series(2, 1000, [[12_000, 20]])
-			]
-		});
-		expect(values(merged)).toEqual([
-			[null, 10, null],
-			[null, 11, null],
-			[20, null, null]
-		]);
-	});
-
-	it('区間の幅が刻みより狭いときは同じ刻みの後の点', () => {
-		const b = emptyTrendBuffer(1000, 2000, 1, 11_000);
-		const merged = mergeHistory(b, [1], {
-			series: [
-				series(1, 500, [
-					[10_000, 1],
-					[10_500, 2],
-					[11_000, 3]
-				])
-			]
-		});
-		expect(values(merged)).toEqual([[2], [3]]);
-	});
-
-	it('同じタグのペンが 2 本あれば両方に入る', () => {
-		const b = emptyTrendBuffer(1000, 1000, 2, 10_000);
-		const merged = mergeHistory(b, [1, 1], { series: [series(1, 1000, [[10_000, 4]])] });
-		expect(values(merged)).toEqual([[4, 4]]);
+	it('幅は部品の範囲（1 分〜31 日）に丸める', () => {
+		expect(startFollow(10, NOW).widthMs).toBe(MIN);
+		expect(startFollow(400 * 24 * 3_600_000, NOW).widthMs).toBe(31 * 24 * 3_600_000);
 	});
 });
 
-describe('historyRequest / valueExtent', () => {
-	it('期間は格子の全体（両端を含む）、区間の数は行数、タグは重複を除く', () => {
-		const b = emptyTrendBuffer(1000, 600_000, 2, 1_000_000);
-		expect(historyRequest(b, [3, 3, 4])).toEqual({
-			tagIds: [3, 4],
-			fromMs: 401_000,
-			toMs: 1_000_999,
-			bins: 600
-		});
-		expect(historyRequest(b, [])).toBeNull();
+describe('履歴を読み直すか（needsHistoryReload）', () => {
+	const NOW = 10 * 3_600_000;
+	const view = { startMs: NOW - 10 * MIN, endMs: NOW };
+	const requested = { range: view, binMs: 1000 };
+	const base = { requested, view, binMs: 1000, following: true, liveFroms: [NOW - 9 * MIN] };
+
+	it('まだ要求していなければ読む。ペンが無い・範囲が不正なら読まない', () => {
+		expect(needsHistoryReload({ ...base, requested: null })).toBe(true);
+		expect(needsHistoryReload({ ...base, requested: null, liveFroms: [] })).toBe(false);
+		expect(needsHistoryReload({ ...base, requested: null, view: { startMs: 1, endMs: 1 } })).toBe(
+			false
+		);
 	});
 
-	it('値の範囲は null を飛ばす。値が無ければ null', () => {
+	it('追従中は、左端が要求した範囲の中にあり幅が同じなら、毎秒は読まない', () => {
+		for (let s = 0; s < 120; s++) {
+			const v = { startMs: view.startMs + s * 1000, endMs: view.endMs + s * 1000 };
+			expect(needsHistoryReload({ ...base, view: v })).toBe(false);
+		}
+		// リングバッファが無いペン（値が bad のまま）があっても、追従中は右端の伸びで読まない。
 		expect(
-			valueExtent([
-				{ t: 0, values: [null, 3] },
-				{ t: 1, values: [-1, null] }
-			])
-		).toEqual({ min: -1, max: 3 });
-		expect(valueExtent([{ t: 0, values: [null] }])).toBeNull();
+			needsHistoryReload({
+				...base,
+				view: { startMs: view.startMs + 5000, endMs: view.endMs + 5000 },
+				liveFroms: [null]
+			})
+		).toBe(false);
+	});
+
+	it('左端が要求した範囲を出たら読む（左へパン・縮小、追従で窓 1 つぶん進んだ）', () => {
+		const left = { startMs: view.startMs - 1, endMs: view.endMs - 1 };
+		expect(needsHistoryReload({ ...base, view: left, following: false })).toBe(true);
+		const ahead = { startMs: view.endMs, endMs: view.endMs + 10 * MIN };
+		expect(needsHistoryReload({ ...base, view: ahead, liveFroms: [null] })).toBe(true);
+	});
+
+	it('表示範囲が丸ごと liveFrom より前で、その範囲を読み済みなら読まない', () => {
+		const past = { startMs: NOW - 60 * MIN, endMs: NOW - 50 * MIN };
+		expect(
+			needsHistoryReload({
+				...base,
+				requested: { range: past, binMs: 1000 },
+				view: past,
+				following: false,
+				liveFroms: [NOW - 9 * MIN]
+			})
+		).toBe(false);
+	});
+
+	it('区間の幅が変わったら読む（拡大・縮小・描画域の幅）', () => {
+		expect(needsHistoryReload({ ...base, binMs: 2000 })).toBe(true);
+	});
+
+	it('表示範囲を全部リングバッファで描けるなら、範囲を出ても読まない', () => {
+		const ahead = { startMs: view.endMs, endMs: view.endMs + 10 * MIN };
+		expect(needsHistoryReload({ ...base, view: ahead, liveFroms: [view.endMs - MIN] })).toBe(false);
+	});
+
+	it('途切れの後に書き直し始めた（liveFrom が要求した範囲の終わりより後）なら読む', () => {
+		const later = { startMs: view.startMs + 30_000, endMs: view.endMs + 30_000 };
+		expect(needsHistoryReload({ ...base, view: later, liveFroms: [NOW + 20_000] })).toBe(true);
+		// 一度読めば（要求した範囲の終わり ≥ liveFrom）繰り返さない。
+		expect(
+			needsHistoryReload({
+				...base,
+				requested: { range: later, binMs: 1000 },
+				view: { startMs: later.startMs + 1000, endMs: later.endMs + 1000 },
+				liveFroms: [NOW + 20_000]
+			})
+		).toBe(false);
+	});
+
+	it('追従を止めている間は、履歴で描く部分が要求した範囲を出たら読む', () => {
+		const zoomOut = { startMs: view.startMs, endMs: view.endMs + 5 * MIN };
+		expect(
+			needsHistoryReload({ ...base, view: zoomOut, following: false, liveFroms: [null] })
+		).toBe(true);
+		// ライブで描ける部分（liveFrom 以後）は履歴が無くてよい。
+		expect(needsHistoryReload({ ...base, view: zoomOut, following: false })).toBe(false);
 	});
 });
 
@@ -513,18 +443,16 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 			tags
 		);
 		const rows = [
-			{ t: 0, values: [10, null] },
-			{ t: 1, values: [85.25, 3] }
+			[10, null],
+			[85.25, 3]
 		];
-		expect(trendDescription({ windowSec: 600, pens, rows, bandTagId: 1 })).toBe(
+		expect(describeOf(600, pens, rows, 1)).toBe(
 			'直近 10 分のトレンド。ペン: 温度（℃）、圧力。縦軸はペンごとの自動スケール。表示中の値の範囲: 温度 10.0〜85.3、圧力 3。しきい値の帯: 温度（HH 90.0 以上 危険、H 80.0〜90.0 注意）。'
 		);
-		expect(trendDescription({ windowSec: 60, pens, rows: [], bandTagId: 2 })).toBe(
+		expect(describeOf(60, pens, [], 2)).toBe(
 			'直近 1 分のトレンド。ペン: 温度（℃）、圧力。表示できる値はまだありません。しきい値の帯: 圧力（しきい値の設定なし）。'
 		);
-		expect(trendDescription({ windowSec: 60, pens, rows: [], bandTagId: null })).toContain(
-			'しきい値の帯: なし。'
-		);
+		expect(describeOf(60, pens, [], null)).toContain('しきい値の帯: なし。');
 	});
 
 	it('説明文: ペンごとの範囲を言い、合算の範囲は言わない。値が無いペンは値なし', () => {
@@ -540,15 +468,15 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 		const pens = [mk(1, 'A'), mk(2, 'B'), mk(3, 'C')] as unknown as Parameters<
 			typeof trendDescription
 		>[0]['pens'];
-		const text = trendDescription({
-			windowSec: 60,
+		const text = describeOf(
+			60,
 			pens,
-			rows: [
-				{ t: 0, values: [0, 100, null] },
-				{ t: 1, values: [10, 200, null] }
+			[
+				[0, 100, null],
+				[10, 200, null]
 			],
-			bandTagId: null
-		});
+			null
+		);
 		expect(text).toContain('表示中の値の範囲: A 0〜10、B 100〜200、C 値なし。');
 		expect(text).not.toContain('A 0〜200');
 		expect(text).not.toContain('全ペン共通');
@@ -566,36 +494,53 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 		expect(isAllBitTrend(bits)).toBe(true);
 
 		const rows = [
-			{ t: 0, values: [0, 1] },
-			{ t: 1, values: [1, 1] }
+			[0, 1],
+			[1, 1]
 		];
-		expect(trendDescription({ windowSec: 60, pens: bits, rows, bandTagId: null })).toBe(
+		expect(describeOf(60, bits, rows, null)).toBe(
 			'直近 1 分のトレンド。ペン: 運転中、異常。縦軸は 0 と 1 で、表示中の値は 0〜1。しきい値の帯: なし。'
 		);
 		// 値が 1 種類だけのとき。
-		expect(
-			trendDescription({
-				windowSec: 60,
-				pens: bits,
-				rows: [{ t: 0, values: [1, 1] }],
-				bandTagId: null
-			})
-		).toContain('表示中の値は 1。');
+		expect(describeOf(60, bits, [[1, 1]], null)).toContain('表示中の値は 1。');
 
 		// 混在: 数値の範囲で言う。
 		const mixed = trendPenInfos(g(2, 3), withBit);
 		expect(isAllBitTrend(mixed)).toBe(false);
-		const text = trendDescription({
-			windowSec: 60,
-			pens: mixed,
-			rows: [{ t: 0, values: [5, 1] }],
-			bandTagId: null
-		});
+		const text = describeOf(60, mixed, [[5, 1]], null);
 		expect(text).toContain('縦軸はペンごとの自動スケール。表示中の値の範囲: 圧力 5、運転中 1。');
 		expect(text).toContain('bit のペン（運転中）は 0 が False、1 が True。');
 
 		// ペンが無いときは全 bit ではない。
 		expect(isAllBitTrend([])).toBe(false);
+	});
+
+	it('説明文: 表示範囲の外の値は数えない。追従を止めていれば期間を言う。min・max の包絡も読む', () => {
+		const pens = trendPenInfos({ pens: [{ tagId: 2, colorSlot: null }] }, tags);
+		const data: TrendData = {
+			range: { startMs: 0, endMs: 4000 },
+			series: {
+				p0: {
+					binMs: 1000,
+					bins: [
+						{ tMs: 0, min: 1, max: 1 },
+						{ tMs: 1000, min: 2, max: 7 },
+						{ tMs: 2000, min: 3, max: 3 },
+						{ tMs: 3000, min: 100, max: 100 }
+					]
+				}
+			}
+		};
+		const text = trendDescription({
+			windowSec: 60,
+			view: { startMs: 1000, endMs: 3000 },
+			following: false,
+			pens,
+			penIds: ['p0'],
+			data,
+			bandTagId: null
+		});
+		expect(text).toMatch(/^.+〜.+ のトレンド（追従を止めています）。ペン: 圧力。/);
+		expect(text).toContain('表示中の値の範囲: 圧力 2〜7。');
 	});
 
 	it('注記: 履歴を読めない・不明なタグ・シミュレーションを別々に', () => {
@@ -616,111 +561,6 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 			'次のタグは登録が見つからないため履歴がありません: タグ ID 9',
 			`${SIMULATION_NOTE}（温度、圧力）。`
 		]);
-	});
-});
-
-describe('trendBufferData（格子 → 部品の契約）', () => {
-	const buffer = (rows: { t: number; values: (number | null)[] }[]) => ({
-		rows,
-		stepMs: 1000,
-		windowMs: 3000
-	});
-
-	it('範囲は [最初の刻みの始まり, 最後の刻みの終わり)、系列は刻みごとの min = max で幅は stepMs', () => {
-		const { range, data } = trendBufferData(
-			buffer([
-				{ t: 10_000, values: [1, 5] },
-				{ t: 11_000, values: [2, 6] },
-				{ t: 12_000, values: [3, 7] }
-			]),
-			['a', 'b'],
-			13_000
-		);
-		expect(range).toEqual({ startMs: 10_000, endMs: 13_000 });
-		expect(data?.range).toEqual({ startMs: 10_000, endMs: 13_000 });
-		expect(data?.series.a).toEqual({
-			binMs: 1000,
-			bins: [
-				{ tMs: 10_000, min: 1, max: 1 },
-				{ tMs: 11_000, min: 2, max: 2 },
-				{ tMs: 12_000, min: 3, max: 3 }
-			]
-		});
-		expect(data?.series.b?.bins.map((b) => b.min)).toEqual([5, 6, 7]);
-	});
-
-	it('null はそのまま欠測（0 にしない）', () => {
-		const { data } = trendBufferData(
-			buffer([
-				{ t: 0, values: [null] },
-				{ t: 1000, values: [4] }
-			]),
-			['a'],
-			2000
-		);
-		expect(data?.series.a?.bins).toEqual([
-			{ tMs: 0, min: null, max: null },
-			{ tMs: 1000, min: 4, max: 4 }
-		]);
-	});
-
-	it('同じタグを 2 回置いたペンは、並びの位置ごとの別の系列', () => {
-		const { data } = trendBufferData(
-			buffer([{ t: 0, values: [1, 1, 9] }]),
-			[trendPenId(0, 7), trendPenId(1, 7), trendPenId(2, 8)],
-			1000
-		);
-		expect(Object.keys(data?.series ?? {})).toEqual(['pen-0-tag-7', 'pen-1-tag-7', 'pen-2-tag-8']);
-		expect(data?.series['pen-2-tag-8']?.bins[0].min).toBe(9);
-	});
-
-	it('行が無ければ data は null、実バッファの格子からも作れる', () => {
-		expect(trendBufferData(buffer([]), ['a'], 0).data).toBeNull();
-		const b = emptyTrendBuffer(1000, 3000, 1, 5500);
-		const { range, data } = trendBufferData(b, ['a'], 5500);
-		expect(data?.range).toEqual({ startMs: 3000, endMs: 6000 });
-		expect(range).toEqual({ startMs: 2500, endMs: 5500 });
-	});
-
-	describe('表示範囲の右端は今（最新値を未来に描かない、オーナーレビュー）', () => {
-		const rows = [
-			{ t: 0, values: [1] },
-			{ t: 60_000, values: [2] },
-			{ t: 120_000, values: [3] }
-		];
-		const buf = { rows, stepMs: 60_000, windowMs: 180_000 };
-
-		it('最後の格子が始まった直後は右端が now、左端が now - windowMs。最後の点は now を超えない', () => {
-			const now = 121_000;
-			const { range, data } = trendBufferData(buf, ['a'], now);
-			expect(range).toEqual({ startMs: now - 180_000, endMs: now });
-			expect(data?.range).toEqual({ startMs: 0, endMs: 180_000 });
-			const s = data!.series.a!;
-			const xs: number[] = [];
-			envelopePath(
-				s.bins,
-				s.binMs,
-				(v) => {
-					xs.push(v);
-					return v;
-				},
-				(v) => v,
-				{ startMs: range.startMs, endMs: range.endMs }
-			);
-			expect(xs.length).toBeGreaterThan(0);
-			expect(Math.max(...xs)).toBeLessThanOrEqual(now);
-		});
-
-		it('now が最後の格子の始まり以下・非有限なら last.t + 1', () => {
-			for (const now of [120_000, 100_000, Number.NaN, Infinity, null]) {
-				expect(trendBufferData(buf, ['a'], now).range.endMs).toBe(120_001);
-			}
-		});
-
-		it('now が格子の終わりを超えるなら last.t + stepMs', () => {
-			const { range } = trendBufferData(buf, ['a'], 500_000);
-			expect(range).toEqual({ startMs: 0, endMs: 180_000 });
-		});
 	});
 });
 
@@ -748,10 +588,10 @@ describe('表示の時計（observeServerClock / serverClockNow、PR #543 のレ
 	});
 
 	/**
-	 * 収集周期 60 秒・ポーリング 5 秒・刻み 10 秒で、開いた時点のサンプルの古さ（0 / 30 / 55 秒）
-	 * によらず、good のサンプルが続く間は線が切れない（応答 → `applyValuesOutcome` → 時計 →
-	 * `appendLive` を通す）。古さ 55 秒は「開いて 5 秒後に次のサンプル」で、`ptimeMs` を時計に
-	 * すると時計が跳んで間の刻みが `null` になった（再レビュー P2）。
+	 * 収集周期 60 秒・ポーリング 5 秒で、開いた時点のサンプルの古さ（0 / 30 / 55 秒）によらず、
+	 * good のサンプルが続く間は線が切れない（応答 → `applyValuesOutcome` → 時計 → `liveAppend` →
+	 * `hybridData` を通す）。古さ 55 秒は「開いて 5 秒後に次のサンプル」で、`ptimeMs` を時計に
+	 * すると時計が跳んで間が欠測になった（再レビュー P2）。
 	 */
 	it.each([
 		[0, 60_000],
@@ -763,10 +603,9 @@ describe('表示の時計（observeServerClock / serverClockNow、PR #543 のレ
 	])('サンプルの古さ %i ms・窓 %i ms', (ageMs, windowMs) => {
 		const T0 = 3_600_000_000;
 		const localOffset = 987_654; // 端末の単調な時刻はサーバーの時刻と無関係
-		const step = 10_000;
 		let state: ValuesState = INITIAL_VALUES_STATE;
 		let clock: ServerClock = null;
-		let buffer: TrendBuffer | null = null;
+		let pen: LivePen | undefined;
 		let lastNow = -Infinity;
 		for (let k = 0; k <= 36; k++) {
 			// 5 秒ごと + 少し揺らぐ（応答を待ってから次を予約する）。
@@ -790,21 +629,18 @@ describe('表示の時計（observeServerClock / serverClockNow、PR #543 のレ
 			if (now === null) throw new Error('時計が無い');
 			expect(now).toBeGreaterThanOrEqual(lastNow);
 			lastNow = now;
-			buffer ??= emptyTrendBuffer(step, windowMs, 1, now);
-			buffer = appendLive(buffer, now, [42]);
+			pen = liveAppend(pen, { tMs: now, value: 42 }, { retainMs: liveRetainMs(windowMs) });
 		}
-		const live = buffer!.rows.filter((row) => row.t >= (buffer!.liveFromT ?? Infinity));
-		expect(live.length).toBeGreaterThan(5);
-		expect(live.every((row) => row.values[0] === 42)).toBe(true);
-	});
-
-	it('ポーリングの失敗の間は書き足さないので、刻みは null（線が切れる）のまま', () => {
-		let clock: ServerClock = observeServerClock(null, 1_000_000, 0);
-		let buffer = emptyTrendBuffer(10_000, 60_000, 1, serverClockNow(clock, 0)!);
-		buffer = appendLive(buffer, serverClockNow(clock, 0)!, [1]);
-		// 30 秒失敗して、次の成功。
-		clock = observeServerClock(clock, 1_030_000, 30_000);
-		buffer = appendLive(buffer, serverClockNow(clock, 30_000)!, [2]);
-		expect(values(buffer).flat()).toEqual([null, null, 1, null, null, 2]);
+		const data = hybridData({
+			history: null,
+			live: { p: pen },
+			penIds: ['p'],
+			binMs: Math.ceil(windowMs / 600),
+			// サンプル間隔 = 収集周期とポーリングの周期の長い方。
+			sampleIntervalMs: { p: 60_000 }
+		});
+		const bins = data?.series.p?.bins ?? [];
+		expect(bins.length).toBeGreaterThan(1);
+		expect(bins.every((b) => b.min === 42 && b.max === 42)).toBe(true);
 	});
 });

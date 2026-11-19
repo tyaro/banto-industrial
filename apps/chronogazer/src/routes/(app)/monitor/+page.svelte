@@ -13,12 +13,14 @@
 	 *   （`commands.ts` の `displayGroupCommands`。一覧は `displayGroupCatalog` で共有）。
 	 * - **デジタル表示**を描く。**バー・計器**は D-2 で足した（`BarPanel.svelte`・
 	 *   `GaugePanel.svelte`。レンジ・色の判断は `meterLogic.ts`）。**トレンド**は
-	 *   D-3b で足した（`TrendPanel.svelte`。共通の部品 `TrendChart` で描く。格子・帯の
-	 *   判断は `trendLogic.ts`、バッファの持ち主は `trendFeed.svelte.ts`）。現在値は同じポーラーの結果を
-	 *   書き足し、初期窓だけ履歴（D-3a）を読む。履歴はグループ・時間窓・刻みが
-	 *   変わったときに読み直し、前の構成の応答は捨てる（グループをまたいで線を
-	 *   持ち越さない）。時間窓は端末ごと（Q4、localStorage）で、グループの定義には
-	 *   書かない。
+	 *   D-3b で足した（`TrendPanel.svelte`。共通の部品 `TrendChart` で描く。帯・追従の
+	 *   判断は `trendLogic.ts`、データの持ち主は `trendFeed.svelte.ts`）。設計書 trend-design.md
+	 *   §10 の 4b で**ハイブリッド**にした: 現在値は同じポーラーの結果をリングバッファに書き足し、
+	 *   過去は表示範囲に要る履歴（D-3a）を読む。拡大・縮小・左へのパンで過去へつながり、
+	 *   「最新へ」（右端を今へ戻す）で追従に戻る。グループ・ペンの並びが変わったら全部捨て、
+	 *   前の構成の応答は捨てる（グループをまたいで線を持ち越さない）。ポーリングの失敗・収集の
+	 *   停止・タブが隠れた間は、リングバッファに途切れを知らせる。時間窓は端末ごと（Q4、
+	 *   localStorage）で、グループの定義には書かない。
 	 * - **現在値のポーリング**（`valuesPoller.svelte.ts`）。周期はグループのペンの
 	 *   収集周期の最短を 500ms〜5s に丸めたもの（2026-10-08 オーナー決定 Q1）。
 	 *   描かない種別・ペンが無いグループ・タブが隠れている間は止める。
@@ -75,7 +77,6 @@
 	import { TrendFeed } from '#lib/monitor/trendFeed.svelte.js';
 	import {
 		TREND_WINDOWS_SEC,
-		chooseStepMs,
 		collectPeriodMsOf,
 		groupDefaultWindowSec,
 		loadTrendWindowOverride,
@@ -213,8 +214,8 @@
 
 	const trendFeed = new TrendFeed();
 	/**
-	 * トレンドの描画域の幅（px、`TrendChart` が返す余白を除いた幅）。刻みを決めるのに使う。
-	 * 余白は縦軸の有無だけで決まり、刻み・格子を替えても幅は変わらない。
+	 * トレンドの描画域の幅（px、`TrendChart` が返す余白を除いた幅）。履歴の区間の数を決めるのに使う。
+	 * 余白は縦軸の有無だけで決まり、データを替えても幅は変わらない。
 	 */
 	let trendWidth = $state(0);
 	/**
@@ -244,9 +245,8 @@
 	);
 	/** フィードが今のグループのものか（違えば前のグループの線を出さない）。 */
 	const trendFeedCurrent = $derived(
-		trendTarget !== null && trendFeed.groupId === trendTarget.id && trendFeed.buffer !== null
+		trendTarget !== null && trendFeed.groupId === trendTarget.id && trendFeed.view !== null
 	);
-	const trendBuffer = $derived(trendFeedCurrent ? trendFeed.buffer : null);
 	const trendNoticeLines = $derived.by(() => {
 		if (!trendFeedCurrent) return [];
 		const nameOf = (id: number) =>
@@ -265,12 +265,14 @@
 	/**
 	 * 表示の時計（`trendLogic.ts` の `observeServerClock`）。現在値の応答の `serverNowMs`
 	 * （応答を作った時点のサーバーの時刻）を基準に、端末の単調な経過時間で進める。サーバーの
-	 * 時刻を受け取るまでは `null` で、格子を作らない（端末の時計で作らない）。時計はサーバー
+	 * 時刻を受け取るまでは `null` で、トレンドを作らない（端末の時計で書かない）。時計はサーバー
 	 * 全体のものなので、グループを替えても残す。
 	 */
 	let serverClock: ServerClock = null;
 	/** 時計に反映済みの現在値のスナップショット（成功のたびに新しいオブジェクト）。 */
 	let observedValues: object | null = null;
+	/** 前回見た連続失敗の回数（増えたらリングバッファに途切れを知らせる）。 */
+	let seenFailures = 0;
 
 	$effect(() => {
 		const target = trendTarget;
@@ -279,6 +281,7 @@
 		const windowSec = trendWindowSec;
 		const period = periodMs;
 		const views = penViews;
+		const visible = pageVisible;
 		untrack(() => {
 			if (target === null) {
 				trendFeed.reset();
@@ -286,6 +289,13 @@
 			}
 			// グループが替わったら、新しいグループの値が来る前でも前の線を捨てる。
 			if (trendFeed.groupId !== null && trendFeed.groupId !== target.id) trendFeed.reset();
+			// 途切れ: 読み取りの失敗（連続失敗が増えた）・収集の停止・タブが隠れた（ポーリングを
+			// 止めた）。その間の値はリングバッファに無いので、履歴で描く。
+			const failures = current?.failures ?? 0;
+			if (!visible || current === null || current.phase !== 'ready' || failures > seenFailures) {
+				trendFeed.breakLive();
+			}
+			seenFailures = failures;
 			if (current === null || current.phase !== 'ready' || current.values === null) return;
 			if (current.values !== observedValues) {
 				observedValues = current.values;
@@ -297,15 +307,13 @@
 			trendFeed.sync(
 				{
 					groupId: target.id,
-					windowMs: windowSec * 1000,
-					stepMs: chooseStepMs({
-						windowMs: windowSec * 1000,
-						plotWidthPx: width,
-						pollPeriodMs: period ?? 1000,
-						tagCount: new Set(penTagIds).size
-					}),
 					penTagIds,
-					periodMsOf: collectPeriodOf
+					windowMs: windowSec * 1000,
+					plotWidthPx: width,
+					// サンプル間隔: タグの収集周期とポーリングの周期の長い方（どちらより短くは届かない）。
+					sampleIntervalMs: penTagIds.map(
+						(tagId) => Math.max(collectPeriodOf(tagId) ?? 0, period ?? 0) || null
+					)
 				},
 				now,
 				current.values,
@@ -461,10 +469,14 @@
 						<TrendPanel
 							group={selectedGroup}
 							pens={trendPens}
-							buffer={trendBuffer}
+							data={trendFeedCurrent ? trendFeed.data : null}
+							view={trendFeedCurrent ? trendFeed.view : null}
+							following={!trendFeedCurrent || trendFeed.following}
 							windowSec={trendWindowSec}
 							windowOptions={TREND_WINDOWS_SEC}
 							onWindowChange={onTrendWindowChange}
+							onRangeChange={(range) => trendFeed.rangeChange(range)}
+							onFollowLatest={() => trendFeed.followLatest()}
 							{bandTagId}
 							{onSelectBandPen}
 							notices={trendNoticeLines}

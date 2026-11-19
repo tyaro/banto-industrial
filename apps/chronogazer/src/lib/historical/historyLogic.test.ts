@@ -286,7 +286,7 @@ describe('createHistoryFetch', () => {
 		});
 		expect(out[ids[1]]).toEqual(out[ids[0]]);
 		expect(out[ids[2]]).toBeUndefined();
-		expect(extras.get(out)).toEqual({ unknownTagIds: [9] });
+		expect(extras.get(out)).toEqual({ unknownTagIds: [9], simulationTagIds: [] });
 	});
 
 	it('ready でなければ HistoryUnavailableError を投げる（空に潰さない）', async () => {
