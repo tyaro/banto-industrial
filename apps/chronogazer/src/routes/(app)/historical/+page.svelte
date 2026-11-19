@@ -359,7 +359,12 @@
 		<div class="empty-state" role="alert">
 			<p class="empty-message">表示グループを読み込めませんでした</p>
 			<p class="empty-hint">{displayGroupCatalog.error}</p>
-			<button type="button" onclick={() => void reload()} disabled={displayGroupCatalog.loading}>
+			<button
+				type="button"
+				class="secondary"
+				onclick={() => void reload()}
+				disabled={displayGroupCatalog.loading}
+			>
 				再読み込み
 			</button>
 		</div>
@@ -451,7 +456,7 @@
 							終了
 							<input type="datetime-local" bind:value={toDraft} required />
 						</label>
-						<button type="submit">表示</button>
+						<button type="submit" class="primary">表示</button>
 					</form>
 					<div class="shift" role="group" aria-label="期間をずらす">
 						<button type="button" onclick={() => shift('prev')}>前へ</button>
@@ -488,12 +493,16 @@
 					{#if outcome?.state === 'unavailable'}
 						<p class="note warn" role="alert">
 							{HISTORY_UNAVAILABLE_MESSAGE}
-							<button type="button" onclick={() => (retryToken += 1)}>再試行</button>
+							<button type="button" class="secondary" onclick={() => (retryToken += 1)}
+								>再試行</button
+							>
 						</p>
 					{:else if outcome?.state === 'error'}
 						<p class="note warn" role="alert">
 							{outcome.message}
-							<button type="button" onclick={() => (retryToken += 1)}>再試行</button>
+							<button type="button" class="secondary" onclick={() => (retryToken += 1)}
+								>再試行</button
+							>
 						</p>
 					{/if}
 					{#if loading}
@@ -595,11 +604,66 @@
 
 	.custom input {
 		font: inherit;
+		height: var(--banto-control-height);
+		box-sizing: border-box;
+		padding: 0 0.5rem;
+		background: var(--banto-surface);
+		color: var(--banto-text);
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius-md);
 	}
 
-	.preset[aria-pressed='true'] {
-		border-color: var(--banto-text);
+	.range-bar button,
+	.note button,
+	.empty-state button {
+		height: var(--banto-control-height);
+		box-sizing: border-box;
+		padding: 0 0.75rem;
+		background: transparent;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius-md);
+		color: inherit;
+		font: inherit;
+		cursor: pointer;
+	}
+
+	.range-bar button:disabled,
+	.note button:disabled,
+	.empty-state button:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
+	.range-bar button:hover:not(:disabled),
+	.note button:hover:not(:disabled),
+	.empty-state button:hover:not(:disabled) {
+		background: color-mix(in srgb, var(--banto-primary) 8%, transparent);
+	}
+
+	.range-bar button.primary {
+		background: var(--banto-primary-solid);
+		border-color: var(--banto-primary-solid);
+		color: var(--banto-on-solid);
 		font-weight: 600;
+	}
+
+	.range-bar button.primary:hover:not(:disabled) {
+		background: var(--banto-primary-solid);
+	}
+
+	.range-bar .preset[aria-pressed='true'] {
+		background: var(--banto-primary-solid);
+		border-color: var(--banto-primary-solid);
+		color: var(--banto-on-solid);
+		font-weight: 600;
+	}
+
+	.range-bar .preset[aria-pressed='true']:hover:not(:disabled) {
+		background: var(--banto-primary-solid);
+	}
+
+	.note button {
+		margin-left: 0.5rem;
 	}
 
 	.note {

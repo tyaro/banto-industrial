@@ -219,6 +219,9 @@ export interface HistoryGrid {
  * 細切れになるため。周期は `periodMsOf(tagId)`（収集グループの `periodMs`、無ければ `null`）。
  * 周期による延長は次の点（サーバーが返した欠測の点を含む）の手前で止める。欠測の点
  * （min/max が `null`）自体は書かないので、本当の欠測では線が切れる。
+ * 次の点がある限り幅は次の点で止め、`binMs` を下限にしない: 収集周期を途中で変えると
+ * `binMs` は読んだ周期の最大になり、素通しの点（`binMs` より狭い間隔）が良い値を後続の
+ * 欠測の点の先まで延ばして、記録の途切れを隠してしまうため。
  */
 export function buildHistoryGrid(
 	range: HistoryRange,
@@ -245,7 +248,7 @@ export function buildHistoryGrid(
 			// 次の点（欠測の点も）までは延ばすが、その先へは延ばさない。
 			const width =
 				next !== undefined && next.tMs > point.tMs
-					? Math.max(binWidth, Math.min(hold, next.tMs - point.tMs))
+					? Math.max(1, Math.min(hold, next.tMs - point.tMs))
 					: hold;
 			if (
 				point.min === null ||

@@ -408,4 +408,33 @@ describe('buildHistoryGrid: 収集周期が区間より長いタグ', () => {
 		expect(grid.rows[38].values).toEqual([null]); // 区間 19
 		expect(grid.rows[40].values).toEqual([5]); // 区間 20
 	});
+
+	it('点の間隔が binMs より狭くても、欠測の点の区間は null（周期を途中で変えた素通し）', () => {
+		// binMs = 60 秒。良い点 1 秒、欠測の点 11 秒・21 秒。1 区間 6 秒。
+		const grid = buildHistoryGrid(
+			range,
+			600,
+			[1],
+			{
+				series: [
+					{
+						tagId: 1,
+						simulation: false,
+						binMs: 60_000,
+						points: [
+							{ tMs: 1000, min: 1, max: 2 },
+							{ tMs: 11_000, min: null, max: null },
+							{ tMs: 21_000, min: null, max: null }
+						]
+					}
+				]
+			},
+			() => 60_000
+		);
+		expect(grid.rows[0].values).toEqual([1]); // 区間 0
+		expect(grid.rows[2].values).toEqual([1]); // 区間 1（〜11 秒）
+		expect(grid.rows[4].values).toEqual([null]); // 区間 2（12 秒〜）
+		expect(grid.rows[8].values).toEqual([null]); // 区間 4
+		expect(grid.rows[20].values).toEqual([null]); // 区間 10（60 秒）
+	});
 });
