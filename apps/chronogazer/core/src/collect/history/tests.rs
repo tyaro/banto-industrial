@@ -49,8 +49,7 @@ fn the_window_limit_is_31_days() {
     // 長い期間でも点の予算は外れたまま通らない。
     assert_eq!(
         field_names(
-            validate_history_request(&[1, 2, 3, 4, 5], 0, HISTORY_MAX_WINDOW_MS, 2000)
-                .unwrap_err()
+            validate_history_request(&[1, 2, 3, 4, 5], 0, HISTORY_MAX_WINDOW_MS, 2000).unwrap_err()
         ),
         vec!["bins"]
     );
@@ -122,7 +121,11 @@ async fn long_reads_are_limited_to_two_and_a_timed_out_read_keeps_its_permit() {
     // 3 本目は札が無いので走り出せず、30 秒で打ち切られる。
     let third = run_long_read(&gate, HISTORY_LONG_READ_TIMEOUT, job(3)).await;
     assert_eq!(third, Err(LongReadStop::TimedOut));
-    assert_eq!(started.load(Ordering::SeqCst), 2, "3 本目は走り出していない");
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        2,
+        "3 本目は走り出していない"
+    );
     assert_eq!(running.load(Ordering::SeqCst), 2);
 
     // 走っている 1 本を、待つ側が打ち切った後でも札は戻らない。
@@ -139,7 +142,11 @@ async fn long_reads_are_limited_to_two_and_a_timed_out_read_keeps_its_permit() {
         run_long_read(&gate, Duration::from_secs(30), job(4)).await
     };
     assert_eq!(timed_out, Err(LongReadStop::TimedOut));
-    assert_eq!(running.load(Ordering::SeqCst), 1, "打ち切っても裏で走っている");
+    assert_eq!(
+        running.load(Ordering::SeqCst),
+        1,
+        "打ち切っても裏で走っている"
+    );
     assert_eq!(gate.available_permits(), 1, "走っている間は札を持ち続ける");
 
     release.notify_waiters();
@@ -906,8 +913,7 @@ async fn history_31d_perf() {
     eprintln!("生成 {days} 日: {:?}", t0.elapsed());
 
     let svc = CollectorService::new(pool.clone(), data_dir, crate::test_support::drivers());
-    let request =
-        validate_history_request(&ids, day0, day0 + days * 86_400_000 - 1, 1000).unwrap();
+    let request = validate_history_request(&ids, day0, day0 + days * 86_400_000 - 1, 1000).unwrap();
     for round in 0..3 {
         let t = std::time::Instant::now();
         let Readout::Ready { data } = svc.history(&request).await else {
