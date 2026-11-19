@@ -36,6 +36,8 @@
 		type PickerRow
 	} from './penTagPicker.js';
 	import { hubStatusLabel } from '#lib/banto/hubAdmin.js';
+	import type { ValuesMap } from '#lib/monitor/valuesPoller.svelte.js';
+	import { valueCell, type ValueTarget } from '#lib/monitor/valueColumn.js';
 
 	interface Props {
 		mode: 'add' | 'replace';
@@ -58,6 +60,10 @@
 		onpick: (rows: PickerRow[]) => void;
 		onback: () => void;
 		onrefresh: () => void;
+		/** 現在値の表（`tag:<id>` → 値。読めていなければ `null` で各行は「—」）。 */
+		values?: ValuesMap | null;
+		/** 値が出せない理由（列見出しの上に一度だけ出す）。 */
+		valuesNote?: string | null;
 	}
 
 	let {
@@ -76,8 +82,19 @@
 		disabled = false,
 		onpick,
 		onback,
-		onrefresh
+		onrefresh,
+		values = null,
+		valuesNote = null
 	}: Props = $props();
+
+	const tagsById = $derived(new Map(tags.map((tag) => [tag.id, tag])));
+
+	/** 行の値の引き当て先。登録済み = `tag`、未登録の Hub のタグ = `hub`（値は取りに行かない）。 */
+	function targetOf(row: PickerRow): ValueTarget {
+		if (row.pick?.kind === 'tag') return { kind: 'tag', tagId: row.pick.tagId };
+		if (row.pick?.kind === 'hub') return { kind: 'hub' };
+		return { kind: 'none' };
+	}
 
 	type NodeData = PickerNodeData;
 
@@ -251,6 +268,9 @@
 				{searching ? '一致するタグがありません。' : 'この収集グループにタグがありません。'}
 			</p>
 		{:else}
+			{#if valuesNote !== null}
+				<p class="note" data-testid="pen-tag-picker-values-note" role="status">{valuesNote}</p>
+			{/if}
 			<div class="table-scroll">
 				<table>
 					<thead>
@@ -259,6 +279,8 @@
 							<th>名前</th>
 							{#if searching}<th>接続先</th><th>収集グループ</th>{/if}
 							<th>単位</th>
+							<th>現在値</th>
+							<th>品質</th>
 							<th>状態</th>
 							<th class="act-col"><span class="sr-only">操作</span></th>
 						</tr>
@@ -267,6 +289,7 @@
 						{#each limited.shown as row (row.key + '|' + row.nodeId)}
 							{@const state = rowState(row, used)}
 							{@const mark = rowMark(row, state)}
+							{@const cell = valueCell(targetOf(row), tagsById, values)}
 							<tr
 								class:added={state.kind === 'added'}
 								class:blocked={state.kind === 'blocked'}
@@ -290,6 +313,8 @@
 								<td class="name-col" title={row.address}>{row.name}</td>
 								{#if searching}<td>{row.connection}</td><td>{row.group}</td>{/if}
 								<td>{row.unit ?? ''}</td>
+								<td class="value-col" data-testid="pen-tag-picker-value">{cell.text}</td>
+								<td class="quality-col" data-state={cell.state}>{cell.quality ?? ''}</td>
 								<td
 									class="mark"
 									class:unregistered={row.kind === 'unregistered' && state.kind === 'addable'}
@@ -426,6 +451,25 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+	}
+
+	.value-col {
+		text-align: right;
+		font-variant-numeric: tabular-nums;
+		white-space: nowrap;
+	}
+
+	.quality-col {
+		white-space: nowrap;
+		font-size: 0.8rem;
+		color: var(--banto-text-muted);
+	}
+
+	.quality-col[data-state='bad'],
+	.quality-col[data-state='stale'],
+	.quality-col[data-state='invalid'],
+	.quality-col[data-state='unregistered'] {
+		color: var(--banto-warning);
 	}
 
 	.mark.unregistered {
