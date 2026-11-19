@@ -11,12 +11,14 @@
 //! ## スキーマの出所（DB スキーマの整理、2026-10-02 オーナー決定）
 //!
 //! この app 自身のテーブルは banto の admin-template と**同じ形**にする。
-//! `migrations-sqlite/` の `0002`〜`0008`・`0010`・`0012` の 8 本は、当面
+//! `migrations-sqlite/` の `0002`〜`0008`・`0010`・`0012`・`0013` の 9 本は、当面
 //! `banto apps/admin-template/core/migrations-sqlite/<同じファイル名>`
 //! を **byte 等価**でコピーしたもの（`0002`〜`0007` は v2.1.1、`0008` は
 //! v6.5.0 = 監査の保留の `audit_log.pending_id`、banto ADR-0019。ChronoGazer は
 //! まだ保留を有効にしていないが、banto-hub と同じ集合に揃えておく - #437。
-//! `0012` は v7.4.0 = users の楽観ロック `users.version`（banto#651）。上流の
+//! `0012` は v7.4.0 = users の楽観ロック `users.version`（banto#651）。
+//! `0013` は v7.7.0 = ユーザーごとの権限の表 `user_permissions`（banto#697。上流の
+//! `UsersService` の一覧・更新がこの表を読むので写す）。上流の
 //! `0009`・`0011`（items の索引・version）はこの app が items を使わないので写さない。
 //! `0010` = 監査の記録単位の生成列（上流の監査一覧が recordResource/recordId で絞れる列。
 //! 無いとその指定で SQL エラーになるので写す）。
@@ -416,7 +418,7 @@ mod tests {
     }
 
     /// スキーマ整理（2026-10-02）: 記録テーブルは migrator ごとに分かれ、共有の `_sqlx_migrations`
-    /// は作られない。この app の分は上流 admin-template の 8 本 + この app 固有。
+    /// は作られない。この app の分は上流 admin-template の 9 本 + この app 固有。
     #[tokio::test]
     async fn migrations_are_recorded_in_per_migrator_tables() {
         let pool = init_db_memory().await.unwrap();
@@ -440,9 +442,9 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        // 2〜12 は admin-template のコピー（9・11 は除く）、101 からはこの app 固有（#393 の表示グループ、
+        // 2〜13 は admin-template のコピー（9・11 は除く）、101 からはこの app 固有（#393 の表示グループ、
         // #532 の記録計の側のタグごとの設定、#1161 PR4 の API キー）。
-        assert_eq!(versions, vec![2, 3, 4, 5, 7, 8, 10, 12, 101, 102, 103]);
+        assert_eq!(versions, vec![2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103]);
         let has_auth_epoch: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'auth_epoch'",
         )
@@ -521,7 +523,7 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(versions, vec![2, 3, 4, 5, 7, 8, 10, 12, 101, 102, 103]);
+        assert_eq!(versions, vec![2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103]);
         let after: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pragma_table_info('audit_log') WHERE name = 'pending_id'",
         )

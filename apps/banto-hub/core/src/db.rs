@@ -13,18 +13,20 @@
 //!
 //! `migrations-sqlite/` は 2 種類:
 //!
-//! - `0002`〜`0008`・`0010`・`0012`（settings/users/user_roles/audit_log/user_auth_epoch/
-//!   audit_log_pending_id/audit_record_scope/users_version の 8 本）は、当面
+//! - `0002`〜`0008`・`0010`・`0012`・`0013`（settings/users/user_roles/audit_log/user_auth_epoch/
+//!   audit_log_pending_id/audit_record_scope/users_version/user_permissions の 9 本）は、当面
 //!   `banto apps/admin-template/core/migrations-sqlite/<同じファイル名>`
 //!   を **byte 等価**でコピーしたもの（`0002`〜`0007` は v2.1.1、`0008` は
 //!   v6.5.0 = 監査の保留の `audit_log.pending_id`、banto ADR-0019・#437、
 //!   `0012` は v7.4.0 = users の楽観ロック `users.version`、banto#651。
+//!   `0013` は v7.7.0 = ユーザーごとの権限の表 `user_permissions`（banto#697。上流の
+//!   `UsersService` の一覧・更新がこの表を読むので写す）。
 //!   上流の `0009`・`0011`（items の索引・version）はこの app が items を使わない
 //!   ので写さない。`0010` = 監査の記録単位の生成列（上流の監査一覧が recordResource/recordId で
 //!   絞れる列。無いとその指定で SQL エラーになるので写す）。
 //!   banto 側には手を入れない。番号の飛び - `0001_items`・`0006_attachments` が無い - は上流の番号をそのまま残しているため）。中身を書き換えないこと:
 //!   上流と食い違うと「banto に寄せる」土台にならず、`sqlx` の checksum も
-//!   変わる。上流を上げるときは同じ名前でコピーし直す。ChronoGazer と同じ 8 本。
+//!   変わる。上流を上げるときは同じ名前でコピーし直す。ChronoGazer と同じ 9 本。
 //!   `0008` は `0101`〜`0106` を適用済みの既存 DB には「若い番号が後から来る」
 //!   形になるが、`sqlx` 0.9 の `Migrator::run` は適用済みに無い版を流すだけで
 //!   順序の逆転を拒まない（テスト
@@ -409,7 +411,7 @@ mod tests {
     }
 
     /// スキーマ整理（2026-10-02）: 記録テーブルは migrator ごとに分かれ、共有の `_sqlx_migrations`
-    /// は作られない。この app の分は上流 admin-template の 8 本 + Hub 固有。
+    /// は作られない。この app の分は上流 admin-template の 9 本 + Hub 固有。
     #[tokio::test]
     async fn migrations_are_recorded_in_per_migrator_tables() {
         let pool = init_db_memory().await.unwrap();
@@ -435,7 +437,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             versions,
-            vec![2, 3, 4, 5, 7, 8, 10, 12, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111]
+            vec![
+                2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111
+            ]
         );
     }
 
@@ -563,7 +567,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             versions,
-            vec![2, 3, 4, 5, 7, 8, 10, 12, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111]
+            vec![
+                2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111
+            ]
         );
         let pending_id: Option<String> =
             sqlx::query_scalar("SELECT pending_id FROM audit_log WHERE action = 'probe'")
