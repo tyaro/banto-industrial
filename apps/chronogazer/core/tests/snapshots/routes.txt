@@ -18,6 +18,7 @@ GET /api/backups/{fileName}
 GET /api/collect
 GET /api/collect/connections
 GET /api/collect/events
+GET /api/collect/export
 GET /api/collect/history
 GET /api/collect/values
 GET /api/collection-groups

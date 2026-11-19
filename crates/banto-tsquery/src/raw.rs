@@ -3,13 +3,18 @@
 //! this is the small-range/CSV-export path; large ranges belong on
 //! `read_decimated` instead, which is why this enforces `max_rows`).
 //!
-//! Delegates the actual per-file row fetch to
-//! [`banto_tstore::reader::TsReader::read_range`] (see `plan.rs`'s module
-//! doc for why the other three query methods cannot do the same) and only
-//! adds: multi-file concatenation in file order (files never overlap in
+//! Delegates the per-file row fetch to
+//! [`banto_tstore::reader::TsReader::read_range_columns`] (see `plan.rs`'s
+//! module doc for why the other three query methods cannot do the same) and
+//! only adds: multi-file concatenation in file order (files never overlap in
 //! time - see `writer.rs`'s rotation design - so no merge-sort is needed,
 //! only concatenation), `tag_keys` projection/reordering, and the row-count
-//! limit.
+//! limit. Memory is bounded in the query itself: each file is read with
+//! `LIMIT remaining_budget + 1` and only the requested tags' columns, so a
+//! live writer appending mid-read cannot grow the fetch, and one extra row
+//! is enough to know the budget was exceeded. Consequently
+//! `TsQueryError::TooManyRows::count` means "at least this many" (rows
+//! counted up to the first overshoot), not the true total.
 //!
 //! A candidate file whose `TsReader::open` fails with
 //! `banto_tstore::TstoreError::Uninitialized` (writer created the file but
@@ -102,23 +107,48 @@ async fn read_file(
             .map(|tag_key| group.columns.iter().position(|c| &c.tag_key == tag_key))
             .collect();
 
-        let samples = reader.read_range(group_key, from_ms, to_ms).await?;
-        if rows.len() + samples.len() > max_rows {
+        // Only the columns this file actually has are selected (an empty
+        // selection still reads `ptime`, so a group present without any
+        // requested tag keeps emitting all-None rows). `slots[i]` maps
+        // tag_keys[i] to its position in the selected list.
+        let mut selected: Vec<usize> = Vec::new();
+        let slots: Vec<Option<usize>> = column_indices
+            .iter()
+            .map(|idx| {
+                idx.map(|i| {
+                    selected.iter().position(|&s| s == i).unwrap_or_else(|| {
+                        selected.push(i);
+                        selected.len() - 1
+                    })
+                })
+            })
+            .collect();
+
+        // Bounded fetch: at most one row past the remaining budget, so an
+        // oversized range is detected without materializing it.
+        let remaining = max_rows.saturating_sub(rows.len());
+        let samples = reader
+            .read_range_columns(
+                group_key,
+                &selected,
+                from_ms,
+                to_ms,
+                remaining.saturating_add(1),
+            )
+            .await?;
+        if samples.len() > remaining {
             return Err(TsQueryError::TooManyRows {
                 count: rows.len() + samples.len(),
                 max: max_rows,
             });
         }
 
-        for sample in samples {
-            let values = column_indices
+        for (ptime_ms, fetched) in samples {
+            let values = slots
                 .iter()
-                .map(|idx| idx.and_then(|i| sample.values[i]))
+                .map(|slot| slot.and_then(|s| fetched[s]))
                 .collect();
-            rows.push(RawRow {
-                ptime_ms: sample.ptime_ms,
-                values,
-            });
+            rows.push(RawRow { ptime_ms, values });
         }
     }
     Ok(())

@@ -1025,6 +1025,83 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_range_columns_limits_projects_and_rejects_bad_input() {
+        let dir = TempDir::new("read-range-columns");
+        let clock = clock_at(DAY1_START_MS);
+        let writer = TsWriter::open(dir.path(), two_group_config(), clock)
+            .await
+            .unwrap();
+        for i in 0..5i64 {
+            let c2 = if i % 2 == 0 {
+                Some(i as f64 * 10.0)
+            } else {
+                None
+            };
+            writer
+                .append("g1", DAY1_START_MS + i * 1_000, &[Some(i as f64), c2])
+                .await
+                .unwrap();
+        }
+        writer.close().await.unwrap();
+
+        let files = list_data_files(dir.path()).unwrap();
+        let reader = TsReader::open(&files[0].path).await.unwrap();
+        let end = DAY1_START_MS + 4_000;
+        // limit は行数を打ち切る（先頭から昇順）。
+        let two = reader
+            .read_range_columns("g1", &[0], DAY1_START_MS, end, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            two,
+            vec![
+                (DAY1_START_MS, vec![Some(0.0)]),
+                (DAY1_START_MS + 1_000, vec![Some(1.0)])
+            ]
+        );
+        // 射影: 2 列目だけ（NULL を含む）、要求順。
+        let c2 = reader
+            .read_range_columns("g1", &[1], DAY1_START_MS, end, 10)
+            .await
+            .unwrap();
+        let vals: Vec<_> = c2.iter().map(|(_, v)| v[0]).collect();
+        assert_eq!(vals, vec![Some(0.0), None, Some(20.0), None, Some(40.0)]);
+        let both = reader
+            .read_range_columns("g1", &[1, 0], DAY1_START_MS, end, 10)
+            .await
+            .unwrap();
+        assert_eq!(both[2].1, vec![Some(20.0), Some(2.0)]);
+        // 範囲は両端を含み、範囲外は除く。
+        let inner = reader
+            .read_range_columns("g1", &[0], DAY1_START_MS + 1_000, DAY1_START_MS + 3_000, 10)
+            .await
+            .unwrap();
+        assert_eq!(inner.len(), 3);
+        // 列なしなら ptime だけ。limit 0 は空。
+        let ptime_only = reader
+            .read_range_columns("g1", &[], DAY1_START_MS, end, 10)
+            .await
+            .unwrap();
+        assert_eq!(ptime_only.len(), 5);
+        assert!(ptime_only.iter().all(|(_, v)| v.is_empty()));
+        let zero = reader
+            .read_range_columns("g1", &[0], DAY1_START_MS, end, 0)
+            .await
+            .unwrap();
+        assert!(zero.is_empty());
+        let err = reader
+            .read_range_columns("nope", &[0], 0, 1, 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TstoreError::UnknownGroup(_)), "{err:?}");
+        let err = reader
+            .read_range_columns("g1", &[9], 0, 1, 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TstoreError::Config(_)), "{err:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn read_range_bounds_are_inclusive_and_exclude_outside_values() {
         let dir = TempDir::new("range-bounds");
         let clock = clock_at(DAY1_START_MS);

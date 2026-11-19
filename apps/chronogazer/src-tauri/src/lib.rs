@@ -100,9 +100,10 @@ use chronogazer_core::server_admin::{
 // 自動開始を足し、C-3a で読み出し 3 本（現在値・接続状態・イベント一覧）を
 // 足した（監査の `resource` も床も REST と共有の定数）。
 use chronogazer_core::collect::{
-    registry_exclusions, validate_history_request, CollectEventList, CollectHistory,
-    CollectOutcome, CollectorStateView, ConnectionView, EventPage, ExclusionView, Readout,
-    ValuesResponse, COLLECT_AUDIT_RESOURCE, COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
+    registry_exclusions, validate_export_request, validate_history_request, CollectEventList,
+    CollectExport, CollectHistory, CollectOutcome, CollectorStateView, ConnectionView, EventPage,
+    ExclusionView, Readout, ValuesResponse, COLLECT_AUDIT_RESOURCE, COLLECT_OPERATION_ROLE,
+    COLLECT_READ_ROLE,
 };
 // #393: 表示グループ。検証・保存は REST と同じ `DisplayGroupService`。
 use chronogazer_core::display_groups::{
@@ -3763,6 +3764,218 @@ async fn collect_history(
     collect_history_body(&state, tag_ids, from_ms, to_ms, bins).await
 }
 
+/// Body of [`collect_export`]（spec M14 split-function pattern）。床を先に見る
+/// （[`collect_history_body`] と同じ順）。
+async fn collect_export_body(
+    state: &AppState,
+    tag_ids: Vec<i64>,
+    from_ms: i64,
+    to_ms: i64,
+    mode: String,
+    interval_ms: Option<i64>,
+    stat: Option<String>,
+) -> Result<Readout<CollectExport>, BantoError> {
+    require_collect_reader(state).await?;
+    let request = validate_export_request(
+        &tag_ids,
+        from_ms,
+        to_ms,
+        &mode,
+        interval_ms,
+        stat.as_deref(),
+    )?;
+    state.services.collect.export(&request).await
+}
+
+/// 期間指定 CSV 出力の値（#1207 R3。横持ちの表）。**`viewer` 以上**、監査しない。
+/// `chronogazer_core::rest` の `GET /api/collect/export` と**同じ検証・同じ
+/// メソッド**を通る双子。`mode` は `raw`（生の値）か `interval`（`intervalMs` 以上
+/// 1000 で揃える）。行数が 10 万を超えると `Validation`（`toMs`）。形・上限・割り切りは
+/// `chronogazer_core::collect` の `export` モジュールの doc。
+#[tauri::command]
+async fn collect_export(
+    state: State<'_, AppState>,
+    tag_ids: Vec<i64>,
+    from_ms: i64,
+    to_ms: i64,
+    mode: String,
+    interval_ms: Option<i64>,
+    stat: Option<String>,
+) -> Result<Readout<CollectExport>, BantoError> {
+    collect_export_body(&state, tag_ids, from_ms, to_ms, mode, interval_ms, stat).await
+}
+
+/// [`save_csv_file`] の結果。**ファイル名だけ**を返す（フルパスは画面に渡さない）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveCsvResult {
+    /// 保存した（取り消しなら `false`）。
+    saved: bool,
+    /// 利用者が選んだファイルの名前（ディレクトリは含まない）。
+    file_name: Option<String>,
+}
+
+/// 保存ダイアログの既定のファイル名を整える: ディレクトリの区切りより後ろだけを
+/// 使い、制御文字と Windows で使えない文字を除き、末尾の空白・ドットを落とし、
+/// 拡張子は `.csv` に揃える。空になったら `export.csv`。
+fn sanitize_csv_file_name(raw: &str) -> String {
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or("");
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control() && !"<>:\"|?*".contains(*c))
+        .collect();
+    let cleaned = cleaned.trim().trim_end_matches('.').trim();
+    let stem = match cleaned.len().checked_sub(4) {
+        Some(at) if cleaned.is_char_boundary(at) && cleaned[at..].eq_ignore_ascii_case(".csv") => {
+            &cleaned[..at]
+        }
+        _ => cleaned,
+    };
+    let stem: String = stem.trim_end_matches('.').chars().take(100).collect();
+    let stem = stem.trim();
+    if stem.is_empty() {
+        "export.csv".to_string()
+    } else {
+        format!("{stem}.csv")
+    }
+}
+
+/// [`save_csv_file`] が受け取る内容の上限（バイト）。正当な CSV の最大は
+/// 10 万行（`EXPORT_MAX_ROWS`）× （時刻列 約 23 文字 + 8 タグ × f64 の文字列 最大
+/// 約 25 文字 + 区切り）+ ヘッダ + BOM で約 23 MB。64 MiB はその全部を余裕を持って通し、
+/// 画面から差し込まれた巨大な文字列は通さない。
+const SAVE_CSV_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// 内容が上限を超えていたらエラー（ダイアログを開く前に判定する）。
+fn check_csv_size(len: usize) -> Result<(), BantoError> {
+    if len > SAVE_CSV_MAX_BYTES {
+        return Err(BantoError::Other(format!(
+            "CSV が大きすぎて保存できません（上限 {} MB）。期間を狭めてください",
+            SAVE_CSV_MAX_BYTES / (1024 * 1024)
+        )));
+    }
+    Ok(())
+}
+
+/// `path` を壊さずに置き換える: 同じディレクトリの一時ファイルへ書いて
+/// `sync_all` し、`rename` で差し替える。途中で失敗したら**この呼び出しが作った**
+/// 一時ファイルだけを消し、元のファイルは触らない。`write` は一時ファイルへ書く手順
+/// （失敗の試験用に差し替え可）。
+fn write_replacing_with(
+    path: &std::path::Path,
+    bytes: &[u8],
+    write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
+    write_replacing_via(path, &tmp, bytes, write)
+}
+
+/// [`write_replacing_with`] の本体。一時ファイルの名前 `tmp` を外から決める（試験で
+/// 衝突を再現するため）。`create_new` が失敗した（名前の衝突など）ときは、自分が作って
+/// いない既存のファイルを消さないよう、一時ファイルには触れない。
+fn write_replacing_via(
+    path: &std::path::Path,
+    tmp: &std::path::Path,
+    bytes: &[u8],
+    write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)?;
+    // ここから先は、この呼び出しが `tmp` を作った。
+    let result = (|| {
+        write(&mut file, bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    result
+}
+
+fn write_replacing(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_replacing_with(path, bytes, |file, bytes| {
+        use std::io::Write as _;
+        file.write_all(bytes)
+    })
+}
+
+/// CSV を**ネイティブの保存ダイアログ**で選んだ場所へ書く（#1207 R3 PR2）。
+///
+/// **パスを画面（webview）から受け取らない**のが要点: 受け取るのは既定の
+/// ファイル名と内容だけで、保存先は Rust 側で開いたダイアログで利用者が選ぶ。
+/// 画面（または画面に差し込まれたスクリプト）が任意のパスへ書く口にならない。
+/// 返すのも**ファイル名だけ**（フルパスは返さない）。取り消しは `saved: false`。
+/// 内容の大きさは出力の行数の上限（10 万行）で決まる。**`viewer` 以上**
+/// （[`collect_export`] と同じ床）。ダイアログは同期 API なので、非同期ランタイムを
+/// 止めないよう `spawn_blocking` の中で開く。
+#[tauri::command]
+async fn save_csv_file(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    default_name: String,
+    content: String,
+) -> Result<SaveCsvResult, BantoError> {
+    require_collect_reader(&state).await?;
+    check_csv_size(content.len())?;
+    let name = sanitize_csv_file_name(&default_name);
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        let Some(picked) = app
+            .dialog()
+            .file()
+            .add_filter("CSV", &["csv"])
+            .set_file_name(name)
+            .blocking_save_file()
+        else {
+            return Ok(SaveCsvResult {
+                saved: false,
+                file_name: None,
+            });
+        };
+        let path = picked
+            .into_path()
+            .map_err(|err| format!("保存先を解釈できません: {err}"))?;
+        write_replacing(&path, content.as_bytes())
+            .map_err(|err| format!("書き込めません: {err}"))?;
+        Ok::<_, String>(SaveCsvResult {
+            saved: true,
+            file_name: path.file_name().map(|n| n.to_string_lossy().into_owned()),
+        })
+    })
+    .await;
+    match outcome {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(detail)) => {
+            // パスを含みうる理由はログだけ。
+            eprintln!("banto: CSV の保存に失敗しました: {detail}");
+            Err(BantoError::Other(
+                "ファイルを保存できませんでした".to_string(),
+            ))
+        }
+        Err(join) => {
+            eprintln!("banto: CSV の保存のタスクが途中で終わりました: {join}");
+            Err(BantoError::Other(
+                "ファイルを保存できませんでした".to_string(),
+            ))
+        }
+    }
+}
+
 /// The running engine (#392 B1-2), managed so the exit cleanup can stop it.
 /// Never dropped before the process ends (Tauri's managed state), which is
 /// also what keeps the A1 instance lock (held by the engine) until then.
@@ -4877,6 +5090,8 @@ pub fn run() {
             collect_connections,
             collect_events_list,
             collect_history,
+            collect_export,
+            save_csv_file,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -6410,6 +6625,122 @@ mod tests {
             matches!(err, BantoError::Validation { .. }),
             "検証の誤りになっていない: {err:?}"
         );
+    }
+
+    /// `collect_export_body` も履歴と同じ床（未認証は拒否・viewer は読める）と
+    /// 同じ検証を通る（`chronogazer_core` の検証表の双子）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collect_export_is_viewer_readable_and_validated() {
+        let state = app_state().await;
+        collect_export_body(&state, vec![1], 0, 1000, "raw".into(), None, None)
+            .await
+            .expect_err("未認証で出力が読めている");
+
+        let viewer = state
+            .services
+            .users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create_user");
+        state.set_session_for_test(Some(DesktopSession::Account(viewer)));
+
+        let export = collect_export_body(&state, vec![42], 0, 60_000, "raw".into(), None, None)
+            .await
+            .expect("viewer は出力を読めること");
+        let data = export.data().expect("走っていなくても ready");
+        assert!(data.tags.is_empty() && data.rows.is_empty());
+        assert_eq!(data.unknown_tag_ids, vec![42]);
+
+        let err = collect_export_body(&state, vec![1], 0, 1000, "interval".into(), None, None)
+            .await
+            .expect_err("interval に intervalMs が無い");
+        assert!(matches!(err, BantoError::Validation { .. }), "{err:?}");
+        let err = collect_export_body(
+            &state,
+            vec![1],
+            0,
+            1000,
+            "interval".into(),
+            Some(1000),
+            None,
+        )
+        .await
+        .expect_err("interval に stat が無い");
+        assert!(matches!(err, BantoError::Validation { .. }), "{err:?}");
+        collect_export_body(
+            &state,
+            vec![42],
+            0,
+            2000,
+            "interval".into(),
+            Some(1000),
+            Some("min".into()),
+        )
+        .await
+        .expect("interval + stat は通る");
+    }
+
+    /// 保存ダイアログの既定名: 区切りより後ろだけ・禁則文字を除く・`.csv` に揃える。
+    #[test]
+    fn csv_default_file_names_are_sanitized() {
+        for (raw, expected) in [
+            ("report", "report.csv"),
+            ("report.csv", "report.csv"),
+            ("Report.CSV", "Report.csv"),
+            ("..\\..\\evil/path/data.csv", "data.csv"),
+            ("C:\\Users\\x\\a:b*c?.txt", "abc.txt.csv"),
+            ("", "export.csv"),
+            ("   ...  ", "export.csv"),
+            ("dir/", "export.csv"),
+            (".csv", "export.csv"),
+            ("日報 2026-11.csv", "日報 2026-11.csv"),
+        ] {
+            assert_eq!(sanitize_csv_file_name(raw), expected, "入力: {raw:?}");
+        }
+        assert!(sanitize_csv_file_name(&"a".repeat(500)).len() <= 104);
+    }
+
+    #[test]
+    fn save_csv_size_cap_is_checked_before_anything_else() {
+        assert!(check_csv_size(SAVE_CSV_MAX_BYTES).is_ok());
+        assert!(check_csv_size(SAVE_CSV_MAX_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn save_csv_write_replaces_existing_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.csv");
+        std::fs::write(&path, b"old").unwrap();
+        write_replacing(&path, b"new content").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new content");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn save_csv_failed_write_keeps_original_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.csv");
+        std::fs::write(&path, b"original").unwrap();
+        let err = write_replacing_with(&path, b"new", |_, _| {
+            Err(std::io::Error::other("disk full"))
+        });
+        assert!(err.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn save_csv_temp_name_collision_keeps_the_existing_file_and_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.csv");
+        std::fs::write(&path, b"original").unwrap();
+        let tmp = dir.path().join(".a.csv.fixed.tmp");
+        std::fs::write(&tmp, b"someone else's").unwrap();
+        let err = write_replacing_via(&path, &tmp, b"new", |_, _| Ok(())).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        // 自分が作っていない一時ファイルは消さない。出力先も触らない。
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"someone else's");
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
     }
 
     // --- #413: 接続単位シミュレーション -------------------------------------
