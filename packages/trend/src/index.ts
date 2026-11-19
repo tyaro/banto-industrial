@@ -14,6 +14,8 @@
  *   （汎用の `{ from, to, colorVar, label }`。管理線に置き換えるときに見直す）。
  * - カーソル 1 本の値（`core/cursor.ts`）と、範囲が変わったときの読み直しの段取り
  *   （`core/loader.ts`。debounce・abort・古い結果を捨てる）。
+ * - ハイブリッドの純粋な核（設計書 §8）。ペンごとのリングバッファと `liveFrom`（`core/live.ts`）、
+ *   履歴の区間とのつなぎ合わせ・境界をまたぐ区間の読み直しの計画と段取り（`core/hybrid.ts`）。
  * - SVG の描画（`TrendChart.svelte`）。計算は core に置き、描画の層は後で Canvas に
  *   替えられるよう組み立てだけを持つ。
  *
@@ -87,4 +89,35 @@ export {
 	type RangeLoader,
 	type RangeLoaderOptions
 } from './core/loader';
+export {
+	EMPTY_LIVE_PEN,
+	LIVE_EVICT_SLACK,
+	LIVE_MIN_RETAIN_MS,
+	liveRetainMs,
+	liveAppend,
+	liveAppendAll,
+	liveBreak,
+	liveBreakAll,
+	type LiveSample,
+	type LivePen,
+	type LiveBuffers,
+	type LiveOptions
+} from './core/live';
+export {
+	boundaryKey,
+	boundaryPlan,
+	boundaryValuesFrom,
+	pruneBoundary,
+	estimateIntervalMs,
+	liveBinMs,
+	liveBins,
+	hybridData,
+	createBoundaryLoader,
+	type HybridSources,
+	type HybridInput,
+	type BoundaryValues,
+	type BoundaryRequest,
+	type BoundaryLoader,
+	type BoundaryLoaderOptions
+} from './core/hybrid';
 export { default as TrendChart } from './TrendChart.svelte';
