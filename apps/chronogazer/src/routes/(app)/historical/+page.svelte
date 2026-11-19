@@ -256,10 +256,12 @@
 
 	$effect(() => {
 		const key = requestKey;
+		// 表示グループの ID は requestKey に入らない。並びの同じタグを持つ別グループへ
+		// 切り替えたときも読み直せるよう、dataKey も追跡する（`current` が前の結果を捨てるため）。
+		const dKey = dataKey;
 		void retryToken;
 		if (key === null || !available) return;
 		const req = untrack(() => request);
-		const dKey = untrack(() => dataKey);
 		const rangeNow = untrack(() => range);
 		const ids = untrack(() => penTagIds);
 		if (req === null || dKey === null) return;
