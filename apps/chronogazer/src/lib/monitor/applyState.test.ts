@@ -10,6 +10,7 @@ import {
 	isPenUnsaved,
 	notRunningLabel,
 	penApplyState,
+	reflectGate,
 	STARTING_RECHECK_MAX,
 	nextStatusRecheckMs,
 	STATUS_RECHECK_MS,
@@ -288,5 +289,21 @@ describe('nextStatusRecheckMs', () => {
 	];
 	it.each(cases)('%s', (_n, collect, attempts, visible, expected) => {
 		expect(nextStatusRecheckMs(collect, attempts, visible)).toBe(expected);
+	});
+});
+
+describe('reflectGate', () => {
+	const start = { action: 'start' as const };
+	const restart = { action: 'restart' as const };
+	it.each([
+		['採用された・同じ前提', true, false, start, start, false, 'proceed'],
+		['採用されなかった（追い越された）', false, false, start, start, false, 'unconfirmed'],
+		['disposed', true, true, start, start, false, 'abort'],
+		['disposed かつ未採用', false, true, start, start, false, 'abort'],
+		['採用されたがボタンが無い', true, false, start, null, false, 'changed'],
+		['採用されたが dirty', true, false, start, start, true, 'changed'],
+		['採用されたが action が変わった', true, false, start, restart, false, 'changed']
+	] as const)('%s', (_name, adopted, disposed, shown, now, dirty, expected) => {
+		expect(reflectGate(adopted, disposed, shown, now, dirty)).toBe(expected);
 	});
 });

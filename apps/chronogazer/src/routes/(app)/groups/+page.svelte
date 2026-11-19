@@ -91,6 +91,7 @@
 		isPenUnsaved,
 		penApplyState,
 		nextStatusRecheckMs,
+		reflectGate,
 		STATUS_RECHECK_MS
 	} from '#lib/monitor/applyState.js';
 	import { MONITOR_POLL_DEFAULT_MS } from '#lib/monitor/monitorLogic.js';
@@ -637,8 +638,9 @@
 		statusTimer = null;
 	}
 
-	async function refreshCollectState(): Promise<void> {
-		if (disposed || !available || !isCollectAvailable()) return;
+	/** 今回の取得が最新として採用され `collectState` に書かれたときだけ `true`。 */
+	async function refreshCollectState(): Promise<boolean> {
+		if (disposed || !available || !isCollectAvailable()) return false;
 		const gen = ++collectGen;
 		let next: CollectorStateView | null = null;
 		try {
@@ -666,7 +668,7 @@
 				sim = null;
 			}
 		}
-		if (disposed || gen !== collectGen) return;
+		if (disposed || gen !== collectGen) return false;
 		collectState = next;
 		runningSimulation = sim;
 		// `starting` のまま止まらないよう上限まで 1 秒おき、それ以外は 5 秒おきに取り直す。
@@ -678,6 +680,7 @@
 		}
 		clearStatusTimer();
 		if (wait !== null) statusTimer = setTimeout(() => void refreshCollectState(), wait);
+		return true;
 	}
 
 	const baselineTagIds = $derived(
@@ -728,10 +731,16 @@
 		reflectError = null;
 		try {
 			// 確認の前に前提（収集の状態）を取り直す（`reflecting` の間は `reflect.disabled` が立つので見ない）。別クライアントで変わっていたら確認を出さない。
-			await refreshCollectState();
-			if (disposed) return;
+			const adopted = await refreshCollectState();
 			const reflect = band.reflect;
-			if (reflect === null || dirty || reflect.action !== shown.action) {
+			const gate = reflectGate(adopted, disposed, shown, reflect, dirty);
+			if (gate === 'abort') return;
+			if (gate === 'unconfirmed') {
+				reflectNotice =
+					'収集の状態を確かめられませんでした。表示を確認してからもう一度押してください。';
+				return;
+			}
+			if (gate === 'changed' || reflect === null) {
 				reflectNotice = '収集の状態が変わりました。表示を確認してからもう一度押してください。';
 				return;
 			}

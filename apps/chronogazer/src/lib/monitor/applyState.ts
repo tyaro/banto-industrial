@@ -191,6 +191,25 @@ function idleLabel(states: readonly ApplyState[]): string {
 	return '記録するタグがありません';
 }
 
+export type ReflectGate = 'proceed' | 'changed' | 'unconfirmed' | 'abort';
+
+/**
+ * 確認の前の取り直しのあと、「記録へ反映」を続けてよいか（純関数）。
+ * `adopted` = 取り直しが最新として採用されたか。採用されていなければ状態を確かめられていない。
+ */
+export function reflectGate(
+	adopted: boolean,
+	disposed: boolean,
+	shown: Pick<ReflectButton, 'action'>,
+	now: Pick<ReflectButton, 'action'> | null,
+	dirty: boolean
+): ReflectGate {
+	if (disposed) return 'abort';
+	if (!adopted) return 'unconfirmed';
+	if (now === null || dirty || now.action !== shown.action) return 'changed';
+	return 'proceed';
+}
+
 /** 収集の開始が終わるのを待つ取り直しの連続の上限（1 秒おき = 約 30 秒）。 */
 export const STARTING_RECHECK_MAX = 30;
 export const STARTING_RECHECK_MS = 1000;
