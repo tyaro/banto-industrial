@@ -76,6 +76,7 @@
 	import {
 		TREND_WINDOWS_SEC,
 		chooseStepMs,
+		collectPeriodMsOf,
 		groupDefaultWindowSec,
 		loadTrendWindowOverride,
 		resolveBandPen,
@@ -255,9 +256,7 @@
 	});
 
 	function collectPeriodOf(tagId: number): number | null {
-		const tag = tags.find((t) => t.id === tagId);
-		const cg = tag ? collectionGroups.find((g) => g.id === tag.collectionGroupId) : undefined;
-		return cg && Number.isFinite(cg.periodMs) && cg.periodMs > 0 ? cg.periodMs : null;
+		return collectPeriodMsOf(tags, collectionGroups, tagId);
 	}
 
 	/**

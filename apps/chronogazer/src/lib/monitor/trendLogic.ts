@@ -355,6 +355,20 @@ export function historyPointValue(point: Pick<HistoryPoint, 'min' | 'max'>): num
 }
 
 /**
+ * タグの収集周期（ms。タグ → 収集グループの `periodMs`）。引けない・正でないときは `null`。
+ * 監視画面・ヒストリカル画面が `periodMsOf` に渡す。
+ */
+export function collectPeriodMsOf(
+	tags: readonly { id: number; collectionGroupId: number }[],
+	collectionGroups: readonly { id: number; periodMs: number }[],
+	tagId: number
+): number | null {
+	const tag = tags.find((t) => t.id === tagId);
+	const cg = tag ? collectionGroups.find((g) => g.id === tag.collectionGroupId) : undefined;
+	return cg && Number.isFinite(cg.periodMs) && cg.periodMs > 0 ? cg.periodMs : null;
+}
+
+/**
  * 履歴を格子に合わせる（純関数）。ペンごとにタグの系列を引き、点の
  * `[tMs, tMs + holdMs)` に重なる刻みに値を書く（`holdMs` は `binMs` と
  * `periodMsOf(tagId)` の大きい方）。点は時刻順に書くので、同じ刻みに 2 点が重なれば
