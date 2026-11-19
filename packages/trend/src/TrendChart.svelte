@@ -119,9 +119,11 @@
 	const cursorX = $derived(cursorMs !== null && valid ? xScale(cursorMs) : null);
 
 	const pad2 = (n: number) => String(n).padStart(2, '0');
-	function formatDateTime(tMs: number): string {
+	// withSeconds: カーソルは横軸の秒の目盛りと照合できるよう秒まで出す（範囲の要約は分まで）。
+	function formatDateTime(tMs: number, withSeconds = false): string {
 		const d = new Date(tMs);
-		return `${d.getFullYear()}/${pad2(d.getMonth() + 1)}/${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+		const base = `${d.getFullYear()}/${pad2(d.getMonth() + 1)}/${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+		return withSeconds ? `${base}:${pad2(d.getSeconds())}` : base;
 	}
 	function rangeText(pen: TrendPen, d: YDomain): string {
 		const unit = pen.unit ? ` ${pen.unit}` : '';
@@ -340,7 +342,7 @@
 		</ul>
 	{/if}
 	{#if cursorMs !== null}
-		<p class="bi-trend__cursor-time">{formatDateTime(cursorMs)}</p>
+		<p class="bi-trend__cursor-time">{formatDateTime(cursorMs, true)}</p>
 	{/if}
 </div>
 
