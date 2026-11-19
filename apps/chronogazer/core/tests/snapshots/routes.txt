@@ -31,6 +31,7 @@ GET /api/hub
 GET /api/hub/catalog
 GET /api/hub/subscription
 GET /api/openapi.json
+GET /api/permissions
 GET /api/plc-connections
 GET /api/plc-connections/{id}
 GET /api/settings/auth
