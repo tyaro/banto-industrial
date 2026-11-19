@@ -125,7 +125,7 @@ export interface ApplyBandInput {
 	busy: boolean;
 }
 
-export type ApplyBandKind = 'editing' | 'pending' | 'recording' | 'notRunning' | 'unknown';
+export type ApplyBandKind = 'editing' | 'pending' | 'recording' | 'idle' | 'notRunning' | 'unknown';
 
 export interface ReflectButton {
 	action: Extract<CollectAction, 'start' | 'restart'>;
@@ -153,6 +153,32 @@ export const REFLECT_RESTART_CONFIRM =
 	'収集を再起動して、保存したタグを記録に反映します。再起動の間（数秒）はすべてのタグの記録が途切れます。よろしいですか？';
 export const REFLECT_START_CONFIRM =
 	'収集を開始して、保存したタグを記録に反映します。よろしいですか？';
+
+/** 収集は走っているが記録されるペンが無いときの文言（除外 > 不明 > 無効 の順で代表を出す）。 */
+function idleLabel(states: readonly ApplyState[]): string {
+	if (states.some((s) => s.kind === 'excluded')) return APPLY_LABELS.excluded;
+	if (states.some((s) => s.kind === 'unknown')) return APPLY_LABELS.unknown;
+	if (states.some((s) => s.kind === 'disabled')) return APPLY_LABELS.disabled;
+	return '記録するタグがありません';
+}
+
+/** 収集の開始が終わるのを待つ取り直しの連続の上限（1 秒おき = 約 30 秒）。 */
+export const STARTING_RECHECK_MAX = 30;
+export const STARTING_RECHECK_MS = 1000;
+
+/** 取得した状態が `starting` なら、上限までは次の取り直しを予約する（純関数）。 */
+export function shouldRecheckStarting(
+	collect: CollectorStateView | null,
+	attempts: number,
+	pageVisible: boolean
+): boolean {
+	return (
+		pageVisible &&
+		collect !== null &&
+		collect.state === 'starting' &&
+		attempts < STARTING_RECHECK_MAX
+	);
+}
 
 /**
  * 帯の文言とボタン（純関数）。一行: 「編集中（未保存）」→「保存済み・未反映 n 件」→「記録中」。
@@ -200,9 +226,12 @@ export function applyBand(input: ApplyBandInput): ApplyBand {
 		};
 	}
 	if (running) {
-		return count > 0
-			? withButton('pending', `${APPLY_LABELS.pending} ${count} 件`, 'restart')
-			: noButton('recording', APPLY_LABELS.recording);
+		if (count > 0) return withButton('pending', `${APPLY_LABELS.pending} ${count} 件`, 'restart');
+		// 未反映が 0 件でも、記録されているペンが 1 本も無ければ「記録中」とは言わない。
+		if (states.some((s) => s.kind === 'recording')) {
+			return noButton('recording', APPLY_LABELS.recording);
+		}
+		return noButton('idle', idleLabel(states));
 	}
 	const text = notRunningLabel(collect);
 	if (!startable) return noButton('notRunning', text);

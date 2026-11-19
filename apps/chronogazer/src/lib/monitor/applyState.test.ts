@@ -10,6 +10,8 @@ import {
 	isPenUnsaved,
 	notRunningLabel,
 	penApplyState,
+	STARTING_RECHECK_MAX,
+	shouldRecheckStarting,
 	type ApplyState
 } from './applyState';
 
@@ -178,5 +180,36 @@ describe('applyBand', () => {
 	it('状態が不明でも編集中は編集中', () => {
 		const b = applyBand({ ...base, dirty: true, collect: null, states: [] });
 		expect(b.kind).toBe('editing');
+	});
+});
+
+describe('applyBand: 走行中で未反映が 0 件', () => {
+	const cases: [string, ApplyState['kind'][], string, string][] = [
+		['全部除外', ['excluded', 'excluded'], 'idle', APPLY_LABELS.excluded],
+		['全部無効', ['disabled', 'disabled'], 'idle', APPLY_LABELS.disabled],
+		['全部不明', ['unknown'], 'idle', APPLY_LABELS.unknown],
+		['除外と無効の混在は除外', ['disabled', 'excluded'], 'idle', APPLY_LABELS.excluded],
+		['不明と無効の混在は不明', ['disabled', 'unknown'], 'idle', APPLY_LABELS.unknown],
+		['1 本でも記録中なら記録中', ['excluded', 'recording', 'disabled'], 'recording', '記録中'],
+		['ペン無し', [], 'idle', '記録するタグがありません'],
+		['タグ未選択のみ', ['none'], 'idle', '記録するタグがありません']
+	];
+	it.each(cases)('%s', (_n, kinds, kind, text) => {
+		const b = applyBand({ ...base, collect: running([]), states: kinds.map(st) });
+		expect(b.kind).toBe(kind);
+		expect(b.text).toBe(text);
+		expect(b.reflect).toBeNull();
+	});
+});
+
+describe('shouldRecheckStarting', () => {
+	it('starting かつ見えていて上限未満のときだけ予約する', () => {
+		const starting: CollectorStateView = { state: 'starting' };
+		expect(shouldRecheckStarting(starting, 0, true)).toBe(true);
+		expect(shouldRecheckStarting(starting, STARTING_RECHECK_MAX - 1, true)).toBe(true);
+		expect(shouldRecheckStarting(starting, STARTING_RECHECK_MAX, true)).toBe(false);
+		expect(shouldRecheckStarting(starting, 0, false)).toBe(false);
+		expect(shouldRecheckStarting(running([]), 0, true)).toBe(false);
+		expect(shouldRecheckStarting(null, 0, true)).toBe(false);
 	});
 });

@@ -85,7 +85,13 @@
 		toCollectStateView,
 		type CollectorStateView
 	} from '#lib/banto/collectAdmin.js';
-	import { applyBand, isPenUnsaved, penApplyState } from '#lib/monitor/applyState.js';
+	import {
+		applyBand,
+		isPenUnsaved,
+		penApplyState,
+		shouldRecheckStarting,
+		STARTING_RECHECK_MS
+	} from '#lib/monitor/applyState.js';
 	import { MONITOR_POLL_DEFAULT_MS } from '#lib/monitor/monitorLogic.js';
 	import { ValuesPoller } from '#lib/monitor/valuesPoller.svelte.js';
 	import { valueCell, valuesNote } from '#lib/monitor/valueColumn.js';
@@ -607,6 +613,7 @@
 	let reflectNotice = $state<string | null>(null);
 	let reflectError = $state<string | null>(null);
 	let followUpTimer: ReturnType<typeof setTimeout> | null = null;
+	let startingRechecks = 0;
 
 	async function refreshCollectState(): Promise<void> {
 		if (!available || !isCollectAvailable()) return;
@@ -621,7 +628,18 @@
 		} catch {
 			next = null;
 		}
-		if (gen === collectGen) collectState = next;
+		if (gen !== collectGen) return;
+		collectState = next;
+		// `starting` のまま止まらないよう、1 秒おきに（上限まで）取り直す。
+		if (next?.state === 'starting') {
+			if (shouldRecheckStarting(next, startingRechecks, pageVisible)) {
+				startingRechecks++;
+				if (followUpTimer !== null) clearTimeout(followUpTimer);
+				followUpTimer = setTimeout(() => void refreshCollectState(), STARTING_RECHECK_MS);
+			}
+		} else {
+			startingRechecks = 0;
+		}
 	}
 
 	const baselineTagIds = $derived(
