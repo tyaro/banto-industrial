@@ -1318,7 +1318,7 @@ async fn main() {
                 let state = svc.state();
                 let ok = attached
                     && !outcome.pending
-                    && matches!(&state, CollectorState::Running { groups: 2, tags, exclusions }
+                    && matches!(&state, CollectorState::Running { groups: 2, tags, exclusions, .. }
                         if *tags == names.len() * 2 && exclusions.is_empty());
                 println!("  状態: {state:?}");
                 results.push(StepResult::new(

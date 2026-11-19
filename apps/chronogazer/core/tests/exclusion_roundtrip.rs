@@ -224,6 +224,7 @@ async fn broken_items_are_left_out_their_values_are_invalid_and_their_history_is
             groups: 1,
             tags: 1,
             exclusions,
+            ..
         } => exclusions,
         other => panic!("Running {{ groups: 1, tags: 1, .. }} を期待したが {other:?}"),
     };

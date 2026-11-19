@@ -265,9 +265,10 @@ async fn roundtrip(protocol: RampProtocol, protocol_name: &str, address: &str) {
         CollectorState::Running {
             groups: 1,
             tags: 1,
+            tag_keys: vec![tag_key.clone()],
             exclusions: vec![],
         },
-        "開始後の状態"
+        "開始後の状態（読んでいるタグのキーも入る）"
     );
 
     // 接続ごとの状態が「接続中」になる（(d) の plc_connected と対になる観測）。

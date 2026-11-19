@@ -87,7 +87,13 @@ export {
 export type CollectorStateView =
 	| { state: 'stopped' }
 	| { state: 'starting' }
-	| { state: 'running'; groups: number; tags: number; exclusions: ExclusionView[] }
+	| {
+			state: 'running';
+			groups: number;
+			tags: number;
+			tagKeys: string[];
+			exclusions: ExclusionView[];
+	  }
 	| { state: 'noTargets'; exclusions: ExclusionView[] }
 	| { state: 'startFailed' };
 
@@ -134,7 +140,13 @@ export interface ExclusionView {
 export type CollectorState =
 	| { state: 'stopped' }
 	| { state: 'starting' }
-	| { state: 'running'; groups: number; tags: number; exclusions: ExclusionView[] }
+	| {
+			state: 'running';
+			groups: number;
+			tags: number;
+			tagKeys: string[];
+			exclusions: ExclusionView[];
+	  }
 	| { state: 'noTargets'; exclusions: ExclusionView[] }
 	| { state: 'startFailed'; reason: string };
 

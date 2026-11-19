@@ -268,6 +268,26 @@ impl CollectorConfig {
         self.connections.iter().map(|c| c.groups.len()).sum()
     }
 
+    /// #1198: the `tag_key`s (`"tag:<id>"`, the identity the current-value
+    /// cache and `GET /api/collect/values` use) of every tag this config
+    /// actually samples, sorted and without duplicates. Its length equals
+    /// [`Self::tag_count`] (a tag belongs to exactly one group). For a config
+    /// from the lenient build this is the post-exclusion set, so a UI can tell
+    /// "the running collector reads this tag" apart from "saved but not yet
+    /// picked up" even before the first value reaches the cache.
+    pub fn tag_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .connections
+            .iter()
+            .flat_map(|c| c.groups.iter())
+            .flat_map(|g| g.tags.iter())
+            .map(|t| t.key.clone())
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
     /// Total number of collected tags across every group.
     pub fn tag_count(&self) -> usize {
         self.connections
