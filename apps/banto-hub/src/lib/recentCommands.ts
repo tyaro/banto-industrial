@@ -1,10 +1,12 @@
 /**
- * 最近使ったコマンド（コマンドパレット、#1147）。永続化は設定と同じ二層
- * （`settings.svelte.ts` の冒頭コメント参照）:
- * - localStorage `banto.commandPaletteRecent`: 変更のたびに同期で書く写し。
- * - `getUiSettings()`（Hub のサーバー、利用者ごと）の `commands.recent`: best-effort で
- *   書く（未ログインの失敗は握りつぶす）。ログイン後に `syncRecentFromProvider()` で
- *   読み直し、サーバーの値が写しを上書きする（`settings.syncFromProvider()` から呼ぶ）。
+ * 最近使ったコマンド（コマンドパレット、#1147）。localStorage は使わない（origin 共通で、
+ * 認証トークンがタブごとの sessionStorage にあるので、同じ origin の別タブに別の利用者が
+ * いることがある）。履歴はこのモジュールのメモリと、`getUiSettings()`（Hub のサーバー、
+ * 利用者ごと）の `commands.recent` だけに持つ:
+ * - サーバーへは記録のたびに best-effort で書く（未ログインの失敗は握りつぶす）。
+ * - ログイン後に `syncRecentFromProvider()` で読み直し、サーバーの値をメモリに当てる
+ *   （`settings.syncFromProvider()` から呼ぶ）。
+ * - 以前のビルドが残した localStorage `banto.commandPaletteRecent` は取り込みの開始時に消す。
  *
  * `commands.ts`（goto・各種ストアを引く）から分けてあるのは、`settings.svelte.ts` が
  * 取り込みのためにこのモジュールを読んでも循環しないようにするため。値は ID の
@@ -30,32 +32,30 @@ export function parseRecentIds(raw: string | null | undefined): string[] {
 	}
 }
 
+/** 履歴（新しい順）。取り込みで得た値と、その後の記録。 */
+let recentIds: string[] = [];
+
 export function loadRecentCommandIds(): string[] {
-	if (typeof localStorage === 'undefined') return [];
-	try {
-		return parseRecentIds(localStorage.getItem(RECENT_KEY));
-	} catch {
-		return [];
-	}
+	return [...recentIds];
 }
 
-function writeLocal(ids: string[]): void {
-	if (typeof localStorage === 'undefined') return;
+/** 以前のビルドが localStorage に残した写しを消す（読まない・書かない）。 */
+function removeLegacyCopy(): void {
 	try {
-		localStorage.setItem(RECENT_KEY, JSON.stringify(ids));
+		if (typeof localStorage !== 'undefined') localStorage.removeItem(RECENT_KEY);
 	} catch {
-		// ベストエフォートの利便機能 - コマンド実行自体をブロックしない。
+		// ストレージが使えなくても影響しない。
 	}
 }
+removeLegacyCopy();
 
 /**
- * 取り込み（{@link syncRecentFromProvider}）の状態。写しはセッションをまたぐ値として
- * 信用しない（localStorage は利用者で共有される）ので、サーバーへ書いてよいのは
- * 取り込みが成功した後（`ready`）だけ。
- * - `idle`: まだ取り込みを始めていない（ログイン前）。記録は写しにだけ書く。
- * - `syncing`: 取り込み中。写しにだけ書き、ID を `pendingIds` に控える。
- * - `ready`: 成功済み。写しとサーバーの両方へ書く。
- * - `failed`: 失敗。写しにだけ書く（サーバーを短い並びで上書きしない）。
+ * 取り込み（{@link syncRecentFromProvider}）の状態。メモリの履歴は取り込みが成功する
+ * までサーバーの値ではないので、サーバーへ書いてよいのは取り込みが成功した後（`ready`）だけ。
+ * - `idle`: まだ取り込みを始めていない（ログイン前）。記録はメモリにだけ書く。
+ * - `syncing`: 取り込み中。メモリにだけ書き、ID を `pendingIds` に控える。
+ * - `ready`: 成功済み。メモリとサーバーの両方へ書く。
+ * - `failed`: 失敗。メモリにだけ書く（サーバーを短い並びで上書きしない）。
  */
 let syncState: 'idle' | 'syncing' | 'ready' | 'failed' = 'idle';
 /** 取り込み中に記録した ID（新しい順）。 */
@@ -68,40 +68,39 @@ function pushFront(id: string, ids: string[]): string[] {
 }
 
 function writeRemote(ids: string[]): void {
-	// best-effort: 未認証/オフラインの失敗は想定内（写しには入っている）。
+	// best-effort: 未認証/オフラインの失敗は想定内（メモリには入っている）。
 	void getUiSettings()
 		.set(RECENT_SETTING, JSON.stringify(ids))
 		.catch(() => {});
 }
 
 export function recordRecentCommand(id: string): void {
-	if (typeof localStorage === 'undefined') return;
-	const next = pushFront(id, loadRecentCommandIds());
-	writeLocal(next);
+	recentIds = pushFront(id, recentIds);
 	if (syncState === 'syncing') pendingIds = pushFront(id, pendingIds);
-	else if (syncState === 'ready') writeRemote(next);
+	else if (syncState === 'ready') writeRemote(recentIds);
 }
 
 /**
- * ログイン後（セッション確定後）に呼ぶ。始めた時点で写しを空にし（前の利用者の履歴を
- * 出さない）、成功したらサーバーの値をそのまま写しに当てる（null・壊れた値・空は空）。
+ * ログイン後（セッション確定後）に呼ぶ。始めた時点でメモリを空にし（前の利用者の履歴を
+ * 出さない）、成功したらサーバーの値をそのままメモリに当てる（null・壊れた値・空は空）。
  * 取り込み中の記録は、サーバー値の前に足して（重複を除き最大 {@link MAX_RECENT} 件）、
- * あったときだけサーバーへ書き戻す。失敗したら写しの記録だけを持ち、サーバーへは書かない。
+ * あったときだけサーバーへ書き戻す。失敗したらメモリの記録だけを持ち、サーバーへは書かない。
  *
  * `isCurrent` は「いまも取り込みを始めたセッションか」。始める前と応答の後に確かめ、
- * 古いセッションなら写しにもサーバーにも何もしない。
+ * 古いセッションならメモリにもサーバーにも何もしない。
  */
 export async function syncRecentFromProvider(isCurrent: () => boolean = () => true): Promise<void> {
 	if (!isCurrent()) return;
 	const seq = ++syncSeq;
 	syncState = 'syncing';
 	pendingIds = [];
-	writeLocal([]);
+	recentIds = [];
+	removeLegacyCopy();
 	let serverIds: string[];
 	try {
 		serverIds = parseRecentIds(await getUiSettings().get(RECENT_SETTING));
 	} catch {
-		// Best-effort: 失敗したら写しの記録だけを持つ。次のセッションの取り込みでやり直す。
+		// Best-effort: 失敗したらメモリの記録だけを持つ。次のセッションの取り込みでやり直す。
 		if (seq === syncSeq && isCurrent()) syncState = 'failed';
 		return;
 	}
@@ -112,7 +111,7 @@ export async function syncRecentFromProvider(isCurrent: () => boolean = () => tr
 		0,
 		MAX_RECENT
 	);
-	writeLocal(merged);
+	recentIds = merged;
 	syncState = 'ready';
 	if (recorded.length > 0) writeRemote(merged);
 }
@@ -121,5 +120,6 @@ export async function syncRecentFromProvider(isCurrent: () => boolean = () => tr
 export function resetRecentSyncForTest(): void {
 	syncState = 'idle';
 	pendingIds = [];
+	recentIds = [];
 	syncSeq++;
 }

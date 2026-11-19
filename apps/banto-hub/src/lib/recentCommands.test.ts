@@ -65,7 +65,7 @@ describe('recordRecentCommand（取り込みが済んだ後）', () => {
 		await syncRecentFromProvider();
 	});
 
-	it('写しとサーバーの両方に、新しい順で書く（重複は先頭へ）', async () => {
+	it('メモリとサーバーの両方に、新しい順で書く（重複は先頭へ）', async () => {
 		recordRecentCommand('a');
 		recordRecentCommand('b');
 		recordRecentCommand('a');
@@ -81,7 +81,7 @@ describe('recordRecentCommand（取り込みが済んだ後）', () => {
 		expect(ids[0]).toBe(`c${MAX_RECENT + 2}`);
 	});
 
-	it('サーバーへの書き込みが失敗しても写しには入り、例外にならない', async () => {
+	it('サーバーへの書き込みが失敗してもメモリには入り、例外にならない', async () => {
 		failing.set = true;
 		recordRecentCommand('a');
 		await Promise.resolve();
@@ -102,16 +102,42 @@ function deferGet() {
 	return { resolve, reject };
 }
 
+describe('localStorage との関係', () => {
+	it('localStorage を読まない（別タブの利用者が書いた値が混ざらない）', async () => {
+		storage.setItem(RECENT_KEY, JSON.stringify(['other-tab-user']));
+		expect(loadRecentCommandIds()).toEqual([]);
+		await syncRecentFromProvider();
+		storage.setItem(RECENT_KEY, JSON.stringify(['other-tab-user']));
+		recordRecentCommand('mine');
+		await Promise.resolve();
+		expect(loadRecentCommandIds()).toEqual(['mine']);
+		expect(JSON.parse(store.get(RECENT_SETTING) ?? 'null')).toEqual(['mine']);
+	});
+
+	it('記録しても localStorage へ書かない', async () => {
+		await syncRecentFromProvider();
+		recordRecentCommand('a');
+		expect(storage.getItem(RECENT_KEY)).toBeNull();
+	});
+
+	it('取り込みの開始時に、以前のビルドが残した旧キーを消す', async () => {
+		storage.setItem(RECENT_KEY, JSON.stringify(['legacy']));
+		await syncRecentFromProvider();
+		expect(storage.getItem(RECENT_KEY)).toBeNull();
+	});
+});
+
 describe('syncRecentFromProvider', () => {
-	it('サーバーの値が写しを上書きする', async () => {
-		storage.setItem(RECENT_KEY, JSON.stringify(['local']));
+	it('サーバーの値がメモリを上書きする', async () => {
 		store.set(RECENT_SETTING, JSON.stringify(['server1', 'server2']));
 		await syncRecentFromProvider();
 		expect(loadRecentCommandIds()).toEqual(['server1', 'server2']);
 	});
 
-	it('始めた時点で写しを空にする（前の利用者の履歴を出さない）', async () => {
-		storage.setItem(RECENT_KEY, JSON.stringify(['previous-user']));
+	it('始めた時点でメモリを空にする（前の利用者の履歴を出さない）', async () => {
+		store.set(RECENT_SETTING, JSON.stringify(['u1']));
+		await syncRecentFromProvider();
+		expect(loadRecentCommandIds()).toEqual(['u1']);
 		const d = deferGet();
 		const p = syncRecentFromProvider();
 		expect(loadRecentCommandIds()).toEqual([]);
@@ -119,9 +145,9 @@ describe('syncRecentFromProvider', () => {
 		await p;
 	});
 
-	it('サーバーが null・壊れた値・空配列なら写しは空（前の利用者の履歴が残らない）', async () => {
+	it('サーバーが null・壊れた値・空配列なら履歴は空（前の利用者の履歴が残らない）', async () => {
 		for (const raw of [null, 'broken', '[]']) {
-			storage.setItem(RECENT_KEY, JSON.stringify(['previous-user']));
+			recordRecentCommand('previous-user');
 			if (raw === null) store.delete(RECENT_SETTING);
 			else store.set(RECENT_SETTING, raw);
 			await syncRecentFromProvider();
@@ -133,7 +159,7 @@ describe('syncRecentFromProvider', () => {
 		expect(JSON.parse(store.get(RECENT_SETTING) ?? 'null')).toEqual(['mine']);
 	});
 
-	it('取り込み中の記録は写しにだけ書き、返ったらサーバー値とまとめて書き戻す', async () => {
+	it('取り込み中の記録はメモリにだけ書き、返ったらサーバー値とまとめて書き戻す', async () => {
 		store.set(RECENT_SETTING, JSON.stringify(['s1', 'a', 's2']));
 		const d = deferGet();
 		const p = syncRecentFromProvider();
@@ -155,14 +181,14 @@ describe('syncRecentFromProvider', () => {
 		expect(setLog).toEqual([]);
 	});
 
-	it('取り込みが済む前（ログイン前）の記録は写しにだけ書く', async () => {
+	it('取り込みが済む前（ログイン前）の記録はメモリにだけ書く', async () => {
 		recordRecentCommand('pre');
 		await Promise.resolve();
 		expect(store.has(RECENT_SETTING)).toBe(false);
 	});
 
-	it('読み取りが失敗したら写しの記録だけを持ち、サーバーへは書かない', async () => {
-		storage.setItem(RECENT_KEY, JSON.stringify(['previous-user']));
+	it('読み取りが失敗したらメモリの記録だけを持ち、サーバーへは書かない', async () => {
+		recordRecentCommand('previous-user');
 		store.set(RECENT_SETTING, JSON.stringify(['server']));
 		failing.get = true;
 		await expect(syncRecentFromProvider()).resolves.toBeUndefined();
@@ -177,9 +203,8 @@ describe('syncRecentFromProvider', () => {
 		expect(loadRecentCommandIds()).toEqual(['server']);
 	});
 
-	it('古いセッションの応答は写しにもサーバーにも何もしない', async () => {
+	it('古いセッションの応答はメモリにもサーバーにも何もしない', async () => {
 		store.set(RECENT_SETTING, JSON.stringify(['server']));
-		storage.setItem(RECENT_KEY, JSON.stringify(['kept']));
 		let current = true;
 		const d = deferGet();
 		const p = syncRecentFromProvider(() => current);
@@ -189,7 +214,7 @@ describe('syncRecentFromProvider', () => {
 		await p;
 		expect(loadRecentCommandIds()).toEqual(['during']); // 応答は当たっていない
 		expect(JSON.parse(store.get(RECENT_SETTING) ?? 'null')).toEqual(['server']);
-		// 始める前から古いなら、写しも空にしない。
+		// 始める前から古いなら、メモリも空にしない。
 		await syncRecentFromProvider(() => false);
 		expect(loadRecentCommandIds()).toEqual(['during']);
 	});
