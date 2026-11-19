@@ -153,13 +153,21 @@ export class ValuesPoller {
 	/**
 	 * `key` の対象でポーリングを始める。同じ対象で動いていれば周期だけ差し替える
 	 * （次の予約から効く。二重に起動しない）。対象が変わったら値を捨てて始め直す。
+	 *
+	 * `options.fresh` が真なら、**止まっている状態から始めるとき**は同じ対象でも
+	 * 状態を初期（「読み込み中」・値なし）に戻す。既に動いていて周期だけ差し替える
+	 * 場合は何もしない。既定は偽（値を残す）。タブやページに戻るたびに再開する画面で、
+	 * 離れる前の値が「正常」として一瞬出る（再取得に失敗しても、連続失敗の
+	 * しきい値までは古いと分からない）のを避けるために使う（#1198 PR2 のレビュー）。
 	 */
-	start(key: number, periodMs: number): void {
+	start(key: number, periodMs: number, options?: { fresh?: boolean }): void {
 		this.#periodMs = periodMs;
 		if (this.#running && this.key === key) return;
 		this.stop();
 		if (this.key !== key) {
 			this.key = key;
+			this.state = INITIAL_VALUES_STATE;
+		} else if (options?.fresh) {
 			this.state = INITIAL_VALUES_STATE;
 		}
 		this.#running = true;

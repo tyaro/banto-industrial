@@ -185,6 +185,51 @@ describe('ValuesPoller', () => {
 		poller.stop();
 	});
 
+	it('fresh で再開すると、取得が未完了の間は前の値を出さない（初期の状態）', async () => {
+		const { fetch, calls } = deferredFetch();
+		const poller = new ValuesPoller({ fetch, timeoutMs: 4000 });
+		poller.start(1, 1000);
+		calls[0].resolve(READY_A);
+		await flush();
+		expect(poller.state.values).not.toBeNull();
+		poller.stop();
+		poller.start(1, 1000, { fresh: true });
+		expect(poller.state).toEqual(INITIAL_VALUES_STATE);
+		expect(poller.state.values).toBeNull();
+		poller.stop();
+	});
+
+	it('fresh で再開して取得が失敗しても、前の値は出ない', async () => {
+		const { fetch, calls } = deferredFetch();
+		const poller = new ValuesPoller({ fetch, timeoutMs: 4000 });
+		poller.start(1, 1000);
+		calls[0].resolve(READY_A);
+		await flush();
+		poller.stop();
+		poller.start(1, 1000, { fresh: true });
+		calls[1].reject(new Error('down'));
+		await flush();
+		expect(poller.state.values).toBeNull();
+		expect(poller.state.phase).toBe('loading');
+		expect(poller.state.failures).toBe(1);
+		poller.stop();
+	});
+
+	it('fresh なしの再開は今までどおり値を残し、動いている間の fresh は何も消さない', async () => {
+		const { fetch, calls } = deferredFetch();
+		const poller = new ValuesPoller({ fetch, timeoutMs: 4000 });
+		poller.start(1, 1000);
+		calls[0].resolve(READY_A);
+		await flush();
+		poller.start(1, 500, { fresh: true }); // 動いている: 周期の差し替えだけ
+		expect(poller.state.phase).toBe('ready');
+		poller.stop();
+		poller.start(1, 1000);
+		expect(poller.state.phase).toBe('ready');
+		expect(poller.state.values).not.toBeNull();
+		poller.stop();
+	});
+
 	it('対象を切り替えると値を捨て、前の対象への飛行中の応答を採らない', async () => {
 		const { fetch, calls } = deferredFetch();
 		const poller = new ValuesPoller({ fetch, timeoutMs: 4000 });

@@ -562,7 +562,7 @@
 	$effect(() => {
 		const wanted = valuesWanted;
 		untrack(() => {
-			if (wanted) valuesPoller.start(POLL_KEY, MONITOR_POLL_DEFAULT_MS);
+			if (wanted) valuesPoller.start(POLL_KEY, MONITOR_POLL_DEFAULT_MS, { fresh: true });
 			else valuesPoller.stop();
 		});
 	});
