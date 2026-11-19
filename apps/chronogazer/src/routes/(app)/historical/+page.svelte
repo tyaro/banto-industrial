@@ -80,12 +80,10 @@
 		historyExtent,
 		historyQuery,
 		historyRequestFor,
-		historyTrendPens,
 		presetRange,
 		resolveRange,
 		sameHistoryRange,
 		shiftRange,
-		tagIdOfPenId,
 		toHistoryRange,
 		toLocalInputValue,
 		toTimeRange,
@@ -93,6 +91,7 @@
 		type HistoryExtras,
 		type HistoryRange
 	} from '#lib/historical/historyLogic.js';
+	import { tagIdOfTrendPenId, toTrendPens } from '#lib/monitor/trendPens.js';
 
 	const available = isTagRegistryAvailable() && isCollectAvailable();
 	const canEdit = $derived(canWriteResources(sessionStore.role) && !sessionStore.publicViewer);
@@ -276,7 +275,7 @@
 	);
 	const pens = $derived(penGroup ? trendPenInfos(penGroup, tags) : []);
 	const penTagIds = $derived(pens.map((pen) => pen.tagId));
-	const trendPens: TrendPen[] = $derived(historyTrendPens(pens));
+	const trendPens: TrendPen[] = $derived(toTrendPens(pens));
 	const penIds = $derived(trendPens.map((pen) => pen.id));
 
 	let bandChoice = $state<{ groupId: number; tagId: number } | null>(null);
@@ -305,11 +304,11 @@
 			: null
 	);
 	function onPenSelect(penId: string): void {
-		const tagId = tagIdOfPenId(penId);
+		const tagId = tagIdOfTrendPenId(penId);
 		if (selectedGroup && tagId !== null) bandChoice = { groupId: selectedGroup.id, tagId };
 	}
 	function penHasThresholds(penId: string): boolean {
-		const tagId = tagIdOfPenId(penId);
+		const tagId = tagIdOfTrendPenId(penId);
 		return hasThresholds(pens.find((p) => p.tagId === tagId)?.thresholds);
 	}
 

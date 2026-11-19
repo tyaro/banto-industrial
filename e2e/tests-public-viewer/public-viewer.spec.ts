@@ -298,11 +298,9 @@ test.describe.serial('ChronoGazer viewer-public mode', () => {
 				if (kind === 'trend') {
 					const trend = panel.getByRole('region', { name: `${name} のトレンド表示` });
 					await expect(trend).toBeVisible({ timeout: 20_000 });
-					await expect(trend.locator('.chart-host svg path[fill="none"]').first()).toHaveAttribute(
-						'd',
-						/L/,
-						{ timeout: 20_000 }
-					);
+					await expect(trend.locator('.bi-trend__line').first()).toHaveAttribute('d', /L/, {
+						timeout: 20_000
+					});
 				} else if (kind === 'gauge') {
 					await expect(cell(PV_TAG_SCALED).locator('[role="img"]')).toHaveAttribute(
 						'aria-label',

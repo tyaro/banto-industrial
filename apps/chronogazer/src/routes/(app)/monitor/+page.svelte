@@ -13,8 +13,8 @@
 	 *   （`commands.ts` の `displayGroupCommands`。一覧は `displayGroupCatalog` で共有）。
 	 * - **デジタル表示**を描く。**バー・計器**は D-2 で足した（`BarPanel.svelte`・
 	 *   `GaugePanel.svelte`。レンジ・色の判断は `meterLogic.ts`）。**トレンド**は
-	 *   D-3b で足した（`TrendPanel.svelte`。格子・帯の判断は `trendLogic.ts`、
-	 *   バッファの持ち主は `trendFeed.svelte.ts`）。現在値は同じポーラーの結果を
+	 *   D-3b で足した（`TrendPanel.svelte`。共通の部品 `TrendChart` で描く。格子・帯の
+	 *   判断は `trendLogic.ts`、バッファの持ち主は `trendFeed.svelte.ts`）。現在値は同じポーラーの結果を
 	 *   書き足し、初期窓だけ履歴（D-3a）を読む。履歴はグループ・時間窓・刻みが
 	 *   変わったときに読み直し、前の構成の応答は捨てる（グループをまたいで線を
 	 *   持ち越さない）。時間窓は端末ごと（Q4、localStorage）で、グループの定義には
@@ -212,7 +212,10 @@
 	// --- トレンド（D-3b） ---------------------------------------------------------
 
 	const trendFeed = new TrendFeed();
-	/** トレンドの描画域の幅（px、`TrendPanel` が測る）。刻みを決めるのに使う。 */
+	/**
+	 * トレンドの描画域の幅（px、`TrendChart` が返す余白を除いた幅）。刻みを決めるのに使う。
+	 * 余白は縦軸の有無だけで決まり、刻み・格子を替えても幅は変わらない。
+	 */
 	let trendWidth = $state(0);
 	/**
 	 * この画面で選んだ時間窓（グループ ID → 秒。`null` = グループの既定）。無いグループは
@@ -243,7 +246,7 @@
 	const trendFeedCurrent = $derived(
 		trendTarget !== null && trendFeed.groupId === trendTarget.id && trendFeed.buffer !== null
 	);
-	const trendRows = $derived(trendFeedCurrent ? (trendFeed.buffer?.rows ?? []) : []);
+	const trendBuffer = $derived(trendFeedCurrent ? trendFeed.buffer : null);
 	const trendNoticeLines = $derived.by(() => {
 		if (!trendFeedCurrent) return [];
 		const nameOf = (id: number) =>
@@ -297,7 +300,7 @@
 					windowMs: windowSec * 1000,
 					stepMs: chooseStepMs({
 						windowMs: windowSec * 1000,
-						widthPx: width,
+						plotWidthPx: width,
 						pollPeriodMs: period ?? 1000,
 						tagCount: new Set(penTagIds).size
 					}),
@@ -458,7 +461,7 @@
 						<TrendPanel
 							group={selectedGroup}
 							pens={trendPens}
-							rows={trendRows}
+							buffer={trendBuffer}
 							windowSec={trendWindowSec}
 							windowOptions={TREND_WINDOWS_SEC}
 							onWindowChange={onTrendWindowChange}
