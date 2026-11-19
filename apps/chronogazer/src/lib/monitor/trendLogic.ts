@@ -437,7 +437,12 @@ export function valueExtent(rows: readonly TrendRow[]): { min: number; max: numb
 /**
  * 格子を共通のトレンドの部品（`TrendChart`）の契約にする（純関数）。
  *
- * - 表示範囲 = 取得範囲 = `[rows[0].t, rows[last].t + stepMs)`（格子そのもの）。
+ * - 取得範囲（`data.range`）= `[rows[0].t, rows[last].t + stepMs)`（格子そのもの）。
+ * - 表示範囲（返す `range`）は追従の右端を「今」（`nowMs`）で切る: `[endMs - windowMs, endMs)`。
+ *   部品は区間の点を「区間と表示範囲の重なりの真ん中」に描くので、右端を最後の格子の終わりに
+ *   すると最新値が未来の時刻に描かれる。`endMs` は `nowMs` を基本に、`nowMs` が最後の格子の
+ *   始まり以下・非有限なら `last.t + 1`（最後の格子を必ず少し見せる）、格子の終わりを超えるなら
+ *   `last.t + stepMs`（格子より先を空けない）に丸める。
  * - ペン i の系列は `{ bins: 行ごとに { tMs: 刻みの始まり, min: 値, max: 値 }, binMs: stepMs }`。
  *   値の無い刻み（`null`）は欠測のまま渡し、部品が線を切る。同じタグを 2 回置いたペンも
  *   並びの位置ごとの別の系列（ID は `penIds` と並びが対応する）。
@@ -445,11 +450,18 @@ export function valueExtent(rows: readonly TrendRow[]): { min: number; max: numb
  */
 export function trendBufferData(
 	buffer: Pick<TrendBuffer, 'rows' | 'stepMs' | 'windowMs'>,
-	penIds: readonly string[]
+	penIds: readonly string[],
+	nowMs: number | null
 ): { range: TimeRange; data: TrendData | null } {
 	const { rows, stepMs } = buffer;
 	if (rows.length === 0) return { range: { startMs: 0, endMs: buffer.windowMs }, data: null };
-	const range: TimeRange = { startMs: rows[0].t, endMs: rows[rows.length - 1].t + stepMs };
+	const lastT = rows[rows.length - 1].t;
+	const fetched: TimeRange = { startMs: rows[0].t, endMs: lastT + stepMs };
+	const endMs =
+		nowMs === null || !Number.isFinite(nowMs) || nowMs <= lastT
+			? lastT + 1
+			: Math.min(nowMs, lastT + stepMs);
+	const range: TimeRange = { startMs: endMs - buffer.windowMs, endMs };
 	const series: Record<string, TrendSeries> = {};
 	penIds.forEach((id, i) => {
 		series[id] = {
@@ -460,7 +472,7 @@ export function trendBufferData(
 			binMs: stepMs
 		};
 	});
-	return { range, data: { range, series } };
+	return { range, data: { range: fetched, series } };
 }
 
 // --- しきい値の帯 ------------------------------------------------------------

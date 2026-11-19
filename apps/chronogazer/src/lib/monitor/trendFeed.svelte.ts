@@ -76,6 +76,8 @@ export class TrendFeed {
 	groupId = $state<number | null>(null);
 	buffer = $state.raw<TrendBuffer | null>(null);
 	historyState = $state<TrendHistoryState>('idle');
+	/** 最後に `configure` / `append` で受けた表示の時計（追従の右端。`null` = まだ無い）。 */
+	nowMs = $state<number | null>(null);
 	/** 履歴に居なかったタグ（登録が見つからない）。 */
 	unknownTagIds = $state.raw<number[]>([]);
 	/** 履歴の系列が `simulation` のタグ。 */
@@ -107,6 +109,7 @@ export class TrendFeed {
 	 * で作り直し、履歴を [`HISTORY_FLUSH_GRACE_MS`] 後に 1 回読む。作り直したら `true`。
 	 */
 	configure(config: TrendConfig, nowMs: number): boolean {
+		this.nowMs = nowMs;
 		const key = trendConfigKey(config);
 		if (key === this.key) {
 			this.#config = config;
@@ -149,6 +152,7 @@ export class TrendFeed {
 	/** 現在値を 1 回分書き足す（`values` はペンの並びどおり、`nowMs` はサーバーの時計）。 */
 	append(nowMs: number, values: readonly (number | null)[]): void {
 		if (this.buffer === null) return;
+		this.nowMs = nowMs;
 		this.buffer = appendLive(this.buffer, nowMs, values);
 	}
 
@@ -160,6 +164,7 @@ export class TrendFeed {
 		this.key = null;
 		this.groupId = null;
 		this.buffer = null;
+		this.nowMs = null;
 		this.historyState = 'idle';
 		this.unknownTagIds = [];
 		this.simulationTagIds = [];

@@ -6,6 +6,7 @@
  * 時間窓（壊れた localStorage を含む）・説明文と注記。
  */
 import { describe, expect, it } from 'vitest';
+import { envelopePath } from '@banto-industrial/trend';
 import { HISTORY_MAX_BINS } from '../banto/collectAdmin';
 import { TIME_WINDOW_OPTIONS } from '../../routes/(app)/groups/groupsPageLogic';
 import {
@@ -632,10 +633,11 @@ describe('trendBufferData（格子 → 部品の契約）', () => {
 				{ t: 11_000, values: [2, 6] },
 				{ t: 12_000, values: [3, 7] }
 			]),
-			['a', 'b']
+			['a', 'b'],
+			13_000
 		);
 		expect(range).toEqual({ startMs: 10_000, endMs: 13_000 });
-		expect(data?.range).toEqual(range);
+		expect(data?.range).toEqual({ startMs: 10_000, endMs: 13_000 });
 		expect(data?.series.a).toEqual({
 			binMs: 1000,
 			bins: [
@@ -653,7 +655,8 @@ describe('trendBufferData（格子 → 部品の契約）', () => {
 				{ t: 0, values: [null] },
 				{ t: 1000, values: [4] }
 			]),
-			['a']
+			['a'],
+			2000
 		);
 		expect(data?.series.a?.bins).toEqual([
 			{ tMs: 0, min: null, max: null },
@@ -662,20 +665,62 @@ describe('trendBufferData（格子 → 部品の契約）', () => {
 	});
 
 	it('同じタグを 2 回置いたペンは、並びの位置ごとの別の系列', () => {
-		const { data } = trendBufferData(buffer([{ t: 0, values: [1, 1, 9] }]), [
-			trendPenId(0, 7),
-			trendPenId(1, 7),
-			trendPenId(2, 8)
-		]);
+		const { data } = trendBufferData(
+			buffer([{ t: 0, values: [1, 1, 9] }]),
+			[trendPenId(0, 7), trendPenId(1, 7), trendPenId(2, 8)],
+			1000
+		);
 		expect(Object.keys(data?.series ?? {})).toEqual(['pen-0-tag-7', 'pen-1-tag-7', 'pen-2-tag-8']);
 		expect(data?.series['pen-2-tag-8']?.bins[0].min).toBe(9);
 	});
 
 	it('行が無ければ data は null、実バッファの格子からも作れる', () => {
-		expect(trendBufferData(buffer([]), ['a']).data).toBeNull();
+		expect(trendBufferData(buffer([]), ['a'], 0).data).toBeNull();
 		const b = emptyTrendBuffer(1000, 3000, 1, 5500);
-		const { range } = trendBufferData(b, ['a']);
-		expect(range).toEqual({ startMs: 3000, endMs: 6000 });
+		const { range, data } = trendBufferData(b, ['a'], 5500);
+		expect(data?.range).toEqual({ startMs: 3000, endMs: 6000 });
+		expect(range).toEqual({ startMs: 2500, endMs: 5500 });
+	});
+
+	describe('表示範囲の右端は今（最新値を未来に描かない、オーナーレビュー）', () => {
+		const rows = [
+			{ t: 0, values: [1] },
+			{ t: 60_000, values: [2] },
+			{ t: 120_000, values: [3] }
+		];
+		const buf = { rows, stepMs: 60_000, windowMs: 180_000 };
+
+		it('最後の格子が始まった直後は右端が now、左端が now - windowMs。最後の点は now を超えない', () => {
+			const now = 121_000;
+			const { range, data } = trendBufferData(buf, ['a'], now);
+			expect(range).toEqual({ startMs: now - 180_000, endMs: now });
+			expect(data?.range).toEqual({ startMs: 0, endMs: 180_000 });
+			const s = data!.series.a!;
+			const xs: number[] = [];
+			envelopePath(
+				s.bins,
+				s.binMs,
+				(v) => {
+					xs.push(v);
+					return v;
+				},
+				(v) => v,
+				{ startMs: range.startMs, endMs: range.endMs }
+			);
+			expect(xs.length).toBeGreaterThan(0);
+			expect(Math.max(...xs)).toBeLessThanOrEqual(now);
+		});
+
+		it('now が最後の格子の始まり以下・非有限なら last.t + 1', () => {
+			for (const now of [120_000, 100_000, Number.NaN, Infinity, null]) {
+				expect(trendBufferData(buf, ['a'], now).range.endMs).toBe(120_001);
+			}
+		});
+
+		it('now が格子の終わりを超えるなら last.t + stepMs', () => {
+			const { range } = trendBufferData(buf, ['a'], 500_000);
+			expect(range).toEqual({ startMs: 0, endMs: 180_000 });
+		});
 	});
 });
 

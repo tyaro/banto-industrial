@@ -8,7 +8,7 @@
 	 * 自分ではデータを取りに行かない（§3.7.4 の関所のプレビューが使い回す）。格子・帯・説明文の
 	 * 判断は `trendLogic.ts`、バッファの持ち主は画面の `trendFeed.svelte.ts`。
 	 *
-	 * - **格子を部品の契約にする**: `trendBufferData`（表示範囲 = 取得範囲 = 格子の範囲）。
+	 * - **格子を部品の契約にする**: `trendBufferData`（取得範囲 = 格子の範囲、表示範囲の右端は今で、最後の格子の途中で切る）。
 	 *   **追従だけ**で拡大・縮小・パンは持たない（`onRangeChange` を渡さない。過去へのパンは
 	 *   ハイブリッドの PR）。
 	 * - **値が無い刻みは線を切る**（`null` は欠測。0 の位置に描かない、#414 段階2）。
@@ -52,6 +52,8 @@
 		notices: readonly string[];
 		/** 直近の履歴を読み込み中。 */
 		historyLoading: boolean;
+		/** 表示の時計（サーバーの時刻、ms。`null` = まだ無い）。追従の右端に使う。 */
+		nowMs: number | null;
 		/** 描画域の幅（px、画面が刻みを決めるのに使う）。 */
 		width?: number;
 	}
@@ -67,6 +69,7 @@
 		onSelectBandPen,
 		notices,
 		historyLoading,
+		nowMs,
 		width = $bindable(0)
 	}: Props = $props();
 
@@ -75,7 +78,8 @@
 	const view = $derived(
 		trendBufferData(
 			buffer ?? { rows: [], stepMs: 1000, windowMs: windowSec * 1000 },
-			trendPens.map((pen) => pen.id)
+			trendPens.map((pen) => pen.id),
+			nowMs
 		)
 	);
 

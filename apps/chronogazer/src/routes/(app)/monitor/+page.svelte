@@ -469,6 +469,7 @@
 							{onSelectBandPen}
 							notices={trendNoticeLines}
 							historyLoading={trendFeedCurrent && trendFeed.historyState === 'loading'}
+							nowMs={trendFeed.nowMs}
 							bind:width={trendWidth}
 						/>
 					{:else if selectedGroup.kind === 'bar'}

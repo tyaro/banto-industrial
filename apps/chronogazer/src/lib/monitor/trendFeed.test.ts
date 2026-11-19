@@ -184,6 +184,17 @@ describe('TrendFeed', () => {
 		expect(feed.unknownTagIds).toEqual([9]);
 	});
 
+	it('nowMs は configure / append で受けた時計を持ち、reset で null に戻る', () => {
+		const feed = new TrendFeed({ fetchHistory: controllableFetch().fetch, graceMs: GRACE });
+		expect(feed.nowMs).toBeNull();
+		feed.configure(config(), 14_000);
+		expect(feed.nowMs).toBe(14_000);
+		feed.append(14_500, [1]);
+		expect(feed.nowMs).toBe(14_500);
+		feed.reset();
+		expect(feed.nowMs).toBeNull();
+	});
+
 	it('reset で止めて捨てる。飛行中の応答も書かない', async () => {
 		const { fetch, calls } = controllableFetch();
 		const feed = new TrendFeed({ fetchHistory: fetch, graceMs: GRACE, timeoutMs: TIMEOUT });
