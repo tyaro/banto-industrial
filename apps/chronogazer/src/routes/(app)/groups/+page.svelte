@@ -621,6 +621,8 @@
 	 */
 	let runningSimulation = $state<ReadonlyMap<string, boolean> | null>(null);
 	let collectGen = 0;
+	// 離れた後に、待っていた操作の続きが取り直しとタイマを張り直さないための印（#1219 のレビュー）。
+	let disposed = false;
 	let reflecting = $state(false);
 	let reflectNotice = $state<string | null>(null);
 	let reflectError = $state<string | null>(null);
@@ -636,7 +638,7 @@
 	}
 
 	async function refreshCollectState(): Promise<void> {
-		if (!available || !isCollectAvailable()) return;
+		if (disposed || !available || !isCollectAvailable()) return;
 		const gen = ++collectGen;
 		let next: CollectorStateView | null = null;
 		try {
@@ -664,7 +666,7 @@
 				sim = null;
 			}
 		}
-		if (gen !== collectGen) return;
+		if (disposed || gen !== collectGen) return;
 		collectState = next;
 		runningSimulation = sim;
 		// `starting` のまま止まらないよう上限まで 1 秒おき、それ以外は 5 秒おきに取り直す。
@@ -727,6 +729,7 @@
 		try {
 			// 確認の前に前提（収集の状態）を取り直す（`reflecting` の間は `reflect.disabled` が立つので見ない）。別クライアントで変わっていたら確認を出さない。
 			await refreshCollectState();
+			if (disposed) return;
 			const reflect = band.reflect;
 			if (reflect === null || dirty || reflect.action !== shown.action) {
 				reflectNotice = '収集の状態が変わりました。表示を確認してからもう一度押してください。';
@@ -746,6 +749,7 @@
 				(signal) => runCollectAction(action, signal),
 				COLLECT_UI_TIMEOUT_MS
 			);
+			if (disposed) return; // 離れた後は状態も通知も書かず、取り直しも予約しない。
 			const display = collectOperationDisplay(
 				action,
 				outcome,
@@ -758,10 +762,13 @@
 				collectState = toCollectStateView(outcome.value.status);
 			}
 			await refreshCollectState();
+			if (disposed) return;
 			// 受け付けただけ・打ち切りのときは、終わった頃にもう一度だけ取り直す。
 			if (outcome.kind === 'timedOut' || (outcome.kind === 'ok' && outcome.value.pending)) {
 				if (followUpTimer !== null) clearTimeout(followUpTimer);
-				followUpTimer = setTimeout(() => void refreshCollectState(), 3000);
+				followUpTimer = setTimeout(() => {
+					if (!disposed) void refreshCollectState();
+				}, 3000);
 			}
 		}
 	}
@@ -773,6 +780,7 @@
 	});
 
 	onDestroy(() => {
+		disposed = true;
 		valuesPoller.stop();
 		collectGen++;
 		if (followUpTimer !== null) clearTimeout(followUpTimer);
