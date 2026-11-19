@@ -197,7 +197,9 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 			await expect(form.getByTestId('driver-field-port').locator('input')).toBeDisabled();
 		} finally {
 			releasePost();
-			await page.unroute('**/api/plc-connections', { behavior: 'wait' });
+			// unroute の第 2 引数はハンドラで { behavior } を渡しても外れない。この試験の route は 1 つだけなので
+			// unrouteAll で外し、処理中の呼び出しも待つ。
+			await page.unrouteAll({ behavior: 'wait' });
 		}
 		// 作成に成功したら右ペインは閉じ、作った接続先をツリーで選ぶ。
 		await expect(detailPane(page)).toHaveCount(0);
@@ -252,7 +254,9 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 			await expect(detail.getByTestId('driver-field-port').locator('input')).toBeDisabled();
 		} finally {
 			releasePut();
-			await page.unroute('**/api/plc-connections/*', { behavior: 'wait' });
+			// unroute の第 2 引数はハンドラで { behavior } を渡しても外れない。この試験の route は 1 つだけなので
+			// unrouteAll で外し、処理中の呼び出しも待つ。
+			await page.unrouteAll({ behavior: 'wait' });
 		}
 		// 保存の PUT の完了を待ってから次へ進む（待たずに 3b の reload へ進むと PUT が
 		// ERR_ABORTED になり、保存前の値が返る）。
@@ -285,7 +289,9 @@ test.describe.serial('chronogazer 「記録」ページ（#383 段階2a / R1-B�
 			await expect(detail.getByLabel('ユニットID')).toHaveValue('7');
 		} finally {
 			releaseCatalog();
-			await page.unroute('**/api/drivers', { behavior: 'wait' });
+			// unroute の第 2 引数はハンドラで { behavior } を渡しても外れない。この試験の route は 1 つだけなので
+			// unrouteAll で外し、処理中の呼び出しも待つ。
+			await page.unrouteAll({ behavior: 'wait' });
 		}
 	});
 
