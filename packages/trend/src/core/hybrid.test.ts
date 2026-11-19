@@ -10,6 +10,7 @@ import {
 	createBoundaryLoader,
 	estimateIntervalMs,
 	hybridData,
+	withTrueEnds,
 	liveBinMs,
 	liveBins,
 	pruneBoundary,
@@ -297,6 +298,193 @@ describe('hybridData — 幅を広げたときの履歴の終わり', () => {
 	});
 });
 
+const S = 1000;
+/** 描画とカーソルの両方で、`t` に値が無い（線が `t` を通らず、カーソルが欠測）。 */
+function missingAt(s: TrendSeries, t: number) {
+	expect(binAt(s.bins, s.binMs, t)).toBeNull();
+}
+const at = (s: TrendSeries, t: number) => binAt(s.bins, s.binMs, t);
+
+describe('hybridData — 本当の範囲の外は欠測（規則 1 つ）', () => {
+	it('withTrueEnds: 本当の終わりが次より前なら欠測を挟み、値の無い区間・終わりが次以後なら挟まない', () => {
+		const v = (tMs: number): Bin => ({ tMs, min: 1, max: 1 });
+		const gap = (tMs: number): Bin => ({ tMs, min: null, max: null });
+		expect(
+			withTrueEnds(
+				[
+					{ bin: v(0), endMs: 10 },
+					{ bin: v(10), endMs: 15 },
+					{ bin: gap(20), endMs: 25 },
+					{ bin: v(30), endMs: 40 }
+				],
+				50
+			)
+		).toEqual([v(0), v(10), gap(15), gap(20), v(30), gap(40)]);
+		expect(withTrueEnds([{ bin: v(0), endMs: 60 }], 50)).toEqual([v(0)]);
+	});
+
+	it('ライブの先頭の途中区間: [liveFrom, 格子の終わり) の外は欠測で、次の値まで線をつながない', () => {
+		const live = { a: pen([19 * S, 40 * S].map((tMs) => ({ tMs, value: 1 }))) };
+		const out = hybridData({
+			history: null,
+			live,
+			penIds: ['a'],
+			binMs: 20 * S,
+			sampleIntervalMs: { a: 10 * S }
+		})!;
+		const s = out.series.a!;
+		expect(s.binMs).toBe(20 * S);
+		expect(at(s, 19.5 * S)).toEqual({ tMs: 19 * S, min: 1, max: 1 });
+		missingAt(s, 30 * S);
+		expect(at(s, 40 * S)).not.toBeNull();
+		// 19 秒の区間と 40 秒の区間の間で線が切れる。
+		expect(segments(s)).toBe(2);
+	});
+
+	it('まだライブが無いペン: 他のペンのライブで範囲が延びても、履歴の取得範囲の外は欠測', () => {
+		const history: TrendData = {
+			range: { startMs: 0, endMs: 15 * S },
+			series: {
+				a: {
+					bins: [
+						{ tMs: 0, min: 1, max: 1 },
+						{ tMs: 10 * S, min: 2, max: 2 }
+					],
+					binMs: 10 * S
+				}
+			}
+		};
+		const live = {
+			a: EMPTY_LIVE_PEN,
+			b: pen([20 * S, 30 * S, 40 * S].map((tMs) => ({ tMs, value: 5 })))
+		};
+		const out = hybridData({
+			history,
+			live,
+			penIds: ['a', 'b'],
+			binMs: 10 * S,
+			nowMs: 41 * S
+		})!;
+		expect(out.range.endMs).toBe(41 * S);
+		const a = out.series.a!;
+		expect(a.binMs).toBe(10 * S);
+		expect(at(a, 12 * S)).toEqual({ tMs: 10 * S, min: 2, max: 2 });
+		missingAt(a, 17 * S);
+		missingAt(a, 30 * S);
+		expect(segments(a)).toBe(1);
+	});
+
+	it('ライブの無いペンの履歴の途中の穴と、取得範囲の終わり以後に始まる区間は使わない', () => {
+		const history: TrendData = {
+			range: { startMs: 0, endMs: 30 * S },
+			series: {
+				a: {
+					bins: [
+						{ tMs: 0, min: 1, max: 1 },
+						{ tMs: 20 * S, min: 2, max: 2 },
+						{ tMs: 30 * S, min: 9, max: 9 }
+					],
+					binMs: 10 * S
+				}
+			}
+		};
+		const live = { b: pen([0, 30 * S, 50 * S].map((tMs) => ({ tMs, value: 5 }))) };
+		const out = hybridData({ history, live, penIds: ['a', 'b'], binMs: 10 * S })!;
+		const a = out.series.a!;
+		missingAt(a, 15 * S);
+		missingAt(a, 35 * S);
+		expect(a.bins.some((b) => b.max === 9)).toBe(false);
+		expect(segments(a)).toBe(2);
+	});
+
+	it('ライブの途中の空の格子は欠測で、線が切れる', () => {
+		const live = { a: pen([0, 10 * S, 60 * S, 70 * S].map((tMs) => ({ tMs, value: 3 }))) };
+		const s = hybridData({
+			history: null,
+			live,
+			penIds: ['a'],
+			binMs: 20 * S,
+			sampleIntervalMs: { a: 10 * S }
+		})!.series.a!;
+		expect(at(s, 15 * S)).not.toBeNull();
+		missingAt(s, 30 * S);
+		missingAt(s, 50 * S);
+		expect(at(s, 65 * S)).not.toBeNull();
+		expect(segments(s)).toBe(2);
+	});
+
+	it('ライブの最後の区間は格子の終わりまで。nowMs がその先でも描画は変わらず、その先のカーソルは欠測', () => {
+		const live = { a: pen([0, 10 * S, 20 * S].map((tMs) => ({ tMs, value: 3 }))) };
+		const base = {
+			history: null,
+			live,
+			penIds: ['a'],
+			binMs: 20 * S,
+			sampleIntervalMs: { a: 10 * S }
+		};
+		const near = hybridData({ ...base, nowMs: 30 * S })!;
+		const far = hybridData({ ...base, nowMs: 55 * S })!;
+		expect(at(near.series.a!, 29 * S)).not.toBeNull();
+		expect(at(far.series.a!, 39 * S)).not.toBeNull();
+		missingAt(far.series.a!, 45 * S);
+		const path = (s: TrendSeries) => envelopePath(s.bins, s.binMs, id, id);
+		expect(path(far.series.a!)).toBe(path(near.series.a!));
+	});
+
+	it('境界の区間: 読み直した値は liveFrom まで、読み直しがまだなら区間ごと欠測', () => {
+		// 履歴は 20 秒の区間。liveFrom = 25 秒、ライブの幅も 20 秒。
+		const history: TrendData = {
+			range: { startMs: 0, endMs: 60 * S },
+			series: {
+				a: {
+					bins: [
+						{ tMs: 0, min: 1, max: 1 },
+						{ tMs: 20 * S, min: 1, max: 9 },
+						{ tMs: 40 * S, min: 9, max: 9 }
+					],
+					binMs: 20 * S
+				}
+			}
+		};
+		const live = { a: pen([25 * S, 35 * S, 45 * S].map((tMs) => ({ tMs, value: 4 }))) };
+		const src = { history, live, penIds: ['a'] };
+		const opts = { ...src, binMs: 20 * S, sampleIntervalMs: { a: 10 * S } };
+		const before = hybridData(opts)!.series.a!;
+		missingAt(before, 22 * S);
+		expect(at(before, 30 * S)).not.toBeNull();
+		const [req] = boundaryPlan(src);
+		const boundary = boundaryValuesFrom(req, {
+			a: { bins: [{ tMs: 20 * S, min: 2, max: 2 }], binMs: 5 * S }
+		});
+		const s = hybridData({ ...opts, boundary })!.series.a!;
+		expect(at(s, 22 * S)).toEqual({ tMs: 20 * S, min: 2, max: 2 });
+		expect(at(s, 26 * S)).toEqual({ tMs: 25 * S, min: 4, max: 4 });
+		// 読み直した区間の終わり = liveFrom = 最初のライブの区間の始まりなので、つながったまま。
+		expect(segments(s)).toBe(1);
+		expect(s.bins.some((b) => b.max === 9)).toBe(false);
+	});
+
+	it('範囲が他のペンで前に広がっても、ライブだけのペンは liveFrom より前が欠測', () => {
+		const history: TrendData = {
+			range: { startMs: 0, endMs: 20 * S },
+			series: {
+				a: {
+					bins: [
+						{ tMs: 0, min: 1, max: 1 },
+						{ tMs: 10 * S, min: 1, max: 1 }
+					],
+					binMs: 10 * S
+				}
+			}
+		};
+		const live = { b: pen([30 * S, 40 * S].map((tMs) => ({ tMs, value: 5 }))) };
+		const out = hybridData({ history, live, penIds: ['a', 'b'], binMs: 10 * S, nowMs: 45 * S })!;
+		expect(out.range).toEqual({ startMs: 0, endMs: 45 * S });
+		missingAt(out.series.b!, 5 * S);
+		missingAt(out.series.a!, 25 * S);
+	});
+});
+
 describe('hybridData — そのほか', () => {
 	it('履歴が null なら liveFrom からだけ描き、範囲の右端は nowMs', () => {
 		const live = { a: pen(every(T0 + 30_000, T0 + 3 * M, 10_000, () => 1)) };
@@ -329,7 +517,7 @@ describe('hybridData — そのほか', () => {
 			binMs: M,
 			nowMs: T0 + 9 * M
 		})!;
-		expect(out.series.a).toBe(series);
+		expect(out.series.a).toEqual(series);
 		expect(out.range).toEqual(history.range);
 	});
 

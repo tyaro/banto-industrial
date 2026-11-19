@@ -14,22 +14,37 @@
  *   届くので、一瞬の切れ目のほうが害が小さい。
  * - リングバッファの値は、エポックに揃えた幅 `liveBinMs` の格子で最小・最大にまとめる。最初の区間だけ
  *   `tMs = liveFrom` で始める（格子の途中から）。`null` のサンプルは値に数えず、値が 1 つも無い区間は
- *   欠測（null）。サンプルが 1 つも無い格子は出さない（`envelopePath` の「区間の列の穴」で線が切れる）。
+ *   欠測（null）。サンプルが 1 つも無い格子は出さない（下の規則で欠測の区間が入って線が切れる）。
  * - 幅 `liveBinMs` は、履歴の系列の `binMs`（無ければ利用側が渡す `binMs`）を、サンプル間隔の 1.5 倍
  *   以上になるまで整数倍に広げたもの。サンプル間隔ちょうどの幅だと、間隔のゆらぎで値の無い格子が
  *   できて線が細切れになるため（間隔が幅未満なら、幅 ≥ 1.5 × 間隔のどの区間にも値が入る）。
  *   サンプル間隔は利用側が渡す（収集周期・ポーリングの間隔）。渡さなければバッファの直近の間隔の
  *   中央値で見積もる。
- * - 出力の系列の `binMs` は、リングバッファがあるペンでは `liveBinMs`（履歴の幅以上）。履歴の区間は
- *   次の区間の始まりで打ち切られる（`binEndMs`）ので、狭い間隔の履歴の区間もそのまま並べてよい。
- *   つなぎ目（読み直した区間 → `liveFrom` の区間）の間隔は幅より狭いので、両側に値があれば線はつながる。
- *   ただし幅が履歴より広いと履歴の区間の終わりが後ろへ伸びるので、本来の終わり（`binEndMs`・取得範囲の
- *   終わりの小さい方）と次の区間の始まりの間には欠測の区間を入れ、読んでいない時刻を値で埋めない。
+ * - 出力の系列の `binMs` は、リングバッファがあるペンでは `liveBinMs`（履歴の幅以上）、無いペンでは
+ *   履歴の `binMs`。描画とカーソルは区間の終わりを `binEndMs`（`min(tMs + binMs, 次の tMs)`）で決める。
  * - 出力の `range` は 1 本: 始まりは履歴の取得範囲の始まりと各ペンの `liveFrom` の早い方、終わりは
  *   履歴の取得範囲の終わり・`nowMs`・最新のサンプルの直後の遅い方（`nowMs` はリングバッファを持つ
  *   ペンがあるときだけ使う。履歴だけなら取得範囲のまま）。履歴が無い（読み出し中・失敗）ときは
- *   `liveFrom` からだけ描く。履歴の取得範囲と `liveFrom` の間に隙間があれば、そこには区間が無く
- *   （`envelopePath` の「区間の列の穴」で）線が切れる。
+ *   `liveFrom` からだけ描く。履歴の取得範囲と `liveFrom` の間に隙間があれば、下の規則で欠測の
+ *   区間が入って線が切れる。
+ *
+ * 規則（本当の終わり。全部のペンの出力に通す）: 出力の区間ごとに、値を本当に持つ範囲の終わりを持つ。
+ * 本当の終わりが次の区間の始まり（最後の区間なら出力の `range.endMs`）より前なら、本当の終わりに欠測の
+ * 区間 `{ tMs: 本当の終わり, min: null, max: null }` を入れる（`withTrueEnds`）。こうすると `binEndMs` は
+ * どの区間でも本当の終わりを超えず、幅が広い・次の区間が遠い・範囲が他のペンで延びたときも、値の無い
+ * 時刻に線やカーソルの値を出さない。本当の終わりは:
+ * - 履歴の区間: `min(binEndMs(tMs, 履歴の binMs, 元の次の tMs), 履歴の取得範囲の終わり)`。途中の穴・
+ *   取得範囲の終わり・ライブとの隙間・ライブの無いペンで範囲が延びた場合が、どれもこれで切れる。
+ *   取得範囲の終わり以後に始まる区間は使わない。
+ * - 境界の区間（読み直し、またはまだで欠測）: `liveFrom`。
+ * - ライブの区間: その格子の終わり（`floor(tMs / w) * w + w`）。先頭の途中区間（`tMs = liveFrom`）も
+ *   その格子の終わりで、次の値のある格子までは欠測。
+ * - ライブの最後の区間も格子の終わり。新しい格子にまだサンプルが届いていない間は、その格子（`nowMs`
+ *   まで）が欠測になる。線の点は区間の中央なので描画は変わらず、カーソルの値だけが「—」になる
+ *   （値の無い時刻なので正しい。次のサンプルで埋まる）。
+ * 欠測の区間（元から値の無い区間）の後には入れない（もう切れている）。つなぎ目は、読み直した区間の
+ * 本当の終わり = `liveFrom` = 最初のライブの区間の始まりなので欠測は入らず、両側に値があれば線は
+ * つながる。
  */
 
 import { binEndMs } from './geometry';
@@ -122,28 +137,60 @@ export function liveBins(samples: readonly LiveSample[], liveFrom: number, binMs
 	return out;
 }
 
-/** 履歴の系列を `liveFrom` で分ける。`before` は終わりが `liveFrom` 以下の区間（`ends` は各区間の本来の終わり）、`straddle` はまたぐ区間の始まり。 */
-function splitHistory(
-	series: TrendSeries,
-	rangeEndMs: number,
-	liveFrom: number
-): { before: Bin[]; ends: number[]; straddle: number | null } {
-	const before: Bin[] = [];
-	const ends: number[] = [];
+/** 区間と、その区間が本当に値を持つ範囲の終わり（排他）。 */
+export interface BinSpan {
+	bin: Bin;
+	endMs: number;
+}
+
+const hasValue = (b: Bin) => fin(b.min) || fin(b.max);
+
+/**
+ * 区間の列（`tMs` の昇順）に、本当の終わりで欠測の区間を挟む。本当の終わりが次の区間の始まり
+ * （最後の区間なら `rangeEndMs`）より前で、区間の始まりより後のときだけ入れる。値の無い区間の後には
+ * 入れない。
+ */
+export function withTrueEnds(spans: readonly BinSpan[], rangeEndMs: number): Bin[] {
+	const out: Bin[] = [];
+	for (let i = 0; i < spans.length; i++) {
+		const { bin, endMs } = spans[i];
+		out.push(bin);
+		const next = i + 1 < spans.length ? spans[i + 1].bin.tMs : rangeEndMs;
+		if (hasValue(bin) && fin(endMs) && endMs > bin.tMs && endMs < next)
+			out.push({ tMs: endMs, min: null, max: null });
+	}
+	return out;
+}
+
+/** 履歴の区間とその本当の終わり（`min(binEndMs, 取得範囲の終わり)`）。取得範囲の終わり以後は使わない。 */
+function historySpans(series: TrendSeries, rangeEndMs: number): BinSpan[] {
+	const out: BinSpan[] = [];
 	const { bins, binMs } = series;
 	for (let i = 0; i < bins.length; i++) {
 		const b = bins[i];
 		if (!fin(b.tMs)) continue;
-		if (b.tMs >= liveFrom) break;
-		const end = Math.min(binEndMs(b.tMs, binMs, bins[i + 1]?.tMs), rangeEndMs);
-		if (end <= liveFrom) {
-			before.push(b);
-			ends.push(end);
-			continue;
-		}
-		return { before, ends, straddle: b.tMs };
+		if (b.tMs >= rangeEndMs) break;
+		out.push({ bin: b, endMs: Math.min(binEndMs(b.tMs, binMs, bins[i + 1]?.tMs), rangeEndMs) });
 	}
-	return { before, ends, straddle: null };
+	return out;
+}
+
+/**
+ * 履歴の系列を `liveFrom` で分ける。`before` は本当の終わりが `liveFrom` 以下の区間（`historySpans`）、
+ * `straddle` は `liveFrom` をまたぐ区間の始まり。
+ */
+function splitHistory(
+	series: TrendSeries,
+	rangeEndMs: number,
+	liveFrom: number
+): { before: BinSpan[]; straddle: number | null } {
+	const before: BinSpan[] = [];
+	for (const sp of historySpans(series, rangeEndMs)) {
+		if (sp.bin.tMs >= liveFrom) break;
+		if (sp.endMs > liveFrom) return { before, straddle: sp.bin.tMs };
+		before.push(sp);
+	}
+	return { before, straddle: null };
 }
 
 function activeLive(live: LiveBuffers, penId: string): (LivePen & { liveFrom: number }) | null {
@@ -226,7 +273,7 @@ export function boundaryValuesFrom(
 /** 履歴とリングバッファを 1 本の `TrendData` にする。描けるものが無ければ null。 */
 export function hybridData(input: HybridInput): TrendData | null {
 	const { history, live, penIds, boundary } = input;
-	const series: Record<string, TrendSeries> = {};
+	const spans: Record<string, { spans: BinSpan[]; binMs: number }> = {};
 	let startMs = history ? history.range.startMs : Infinity;
 	let endMs = history ? history.range.endMs : -Infinity;
 	let anyLive = false;
@@ -235,7 +282,8 @@ export function hybridData(input: HybridInput): TrendData | null {
 		const hs = history?.series[penId];
 		const lp = activeLive(live, penId);
 		if (!lp) {
-			if (hs) series[penId] = hs;
+			if (hs && history)
+				spans[penId] = { spans: historySpans(hs, history.range.endMs), binMs: hs.binMs };
 			continue;
 		}
 		anyLive = true;
@@ -244,31 +292,27 @@ export function hybridData(input: HybridInput): TrendData | null {
 		const base = hs && fin(hs.binMs) && hs.binMs > 0 ? hs.binMs : input.binMs;
 		const interval = input.sampleIntervalMs?.[penId] ?? estimateIntervalMs(lp.samples);
 		const w = liveBinMs(base, interval);
-		const bins: Bin[] = [];
-		const liveAll = liveBins(lp.samples, lp.liveFrom, w);
-		const liveFirst = liveAll[0];
+		const out: BinSpan[] = [];
 		if (hs && history) {
-			const { before, ends, straddle } = splitHistory(hs, history.range.endMs, lp.liveFrom);
-			// 出力の幅 w は履歴の幅より広いことがあり、区間の終わりが本来より後ろへ伸びる。
-			// 本来の終わりと次の区間の始まりの間（読んでいない時刻）には欠測の区間を入れる。
-			const nextAfter = straddle ?? liveFirst?.tMs ?? null;
-			for (let i = 0; i < before.length; i++) {
-				bins.push(before[i]);
-				const next = i + 1 < before.length ? before[i + 1].tMs : nextAfter;
-				if (next !== null && next > ends[i]) bins.push({ tMs: ends[i], min: null, max: null });
-			}
+			const { before, straddle } = splitHistory(hs, history.range.endMs, lp.liveFrom);
+			out.push(...before);
 			if (straddle !== null) {
 				const got = boundary?.[boundaryKey(penId, straddle, lp.liveFrom)];
-				bins.push(got ? { ...got, tMs: straddle } : { tMs: straddle, min: null, max: null });
+				const bin = got ? { ...got, tMs: straddle } : { tMs: straddle, min: null, max: null };
+				out.push({ bin, endMs: lp.liveFrom });
 			}
 		}
-		bins.push(...liveAll);
-		series[penId] = { bins, binMs: w };
+		for (const b of liveBins(lp.samples, lp.liveFrom, w))
+			out.push({ bin: b, endMs: Math.floor(b.tMs / w) * w + w });
+		spans[penId] = { spans: out, binMs: w };
 	}
 
 	if (!history && !anyLive) return null;
 	if (anyLive && fin(input.nowMs)) endMs = Math.max(endMs, input.nowMs);
 	if (!(startMs < endMs)) return null;
+	const series: Record<string, TrendSeries> = {};
+	for (const [penId, s] of Object.entries(spans))
+		series[penId] = { bins: withTrueEnds(s.spans, endMs), binMs: s.binMs };
 	return { range: { startMs, endMs }, series };
 }
 
