@@ -23,6 +23,11 @@
 //! delete-and-recreate under the same name resolves again on the next rebind.
 //! [`StableTagId`] remains only as the Hub's wire shape in [`CatalogTag::ids`].
 //!
+//! [`RestClient::fetch_status`] (#1223) reads `GET /api/v1/status` as a
+//! [`HubStatus`]; check [`HubStatus::supports_write_contract`] before writing,
+//! because the Hub version string cannot tell whether the #1201 write contract
+//! is available (an older Hub omits `capabilities`, which means unsupported).
+//!
 //! [`RestClient::write_tag`] is deliberately independent of `worker.rs`'s
 //! reconnect/backoff supervisor: it is a single request that never retries
 //! automatically (2026-09-01 owner decision), because resending a write the
@@ -104,8 +109,8 @@ pub use pinned_tls::PinnedHubTls;
 pub use rest::RestClient;
 pub use secret::{SecretApiKey, SecretError};
 pub use types::{
-    BindingView, CatalogSnapshot, CatalogTag, CollectionMode, GenerationSnapshot, StableTagId,
-    TagClientConnectionState, TagClientState, ValueEntry, ValueQuality, ValueSource,
-    ValuesSnapshot,
+    BindingView, CatalogSnapshot, CatalogTag, CollectionMode, GenerationSnapshot, HubStatus,
+    StableTagId, TagClientConnectionState, TagClientState, ValueEntry, ValueQuality, ValueSource,
+    ValuesSnapshot, WRITE_CONTRACT_V1,
 };
 pub use write::{RequestedValue, WriteOptions, WriteReceipt};

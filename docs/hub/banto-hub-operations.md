@@ -801,6 +801,15 @@ REST（上の #431 の例外）から行ってください。MCP（API キー）
   「保存状態の注意」と `GET /api/v1/status` の `write_persistence_warning`
   にも同じ説明を出します。状態を確かめてから有効化してください（有効化が
   両方に保存できると注意は消えます）。
+- **機能の対応の判定**（2026-11-19、#1223）: `GET /api/v1/status` の
+  `capabilities`（文字列の配列、読み取りキーで読めます）に、この Hub が
+  提供する機能の名前を載せます。版の文字列では #1201 の書き込みの契約
+  （`correlation_id`・`on_behalf_of`・`audit_id`、502 `write_uncertain`）の
+  有無が分からないため、`write_contract_v1` の有無で判定します。一度出した
+  名前は消さず、契約を変えるときは新しい名前を足します。古い Hub はこの
+  欄を返さないので、欄が無い場合は未対応として扱ってください
+  （`banto-tagclient` の `RestClient::fetch_status` と
+  `HubStatus::supports_write_contract`）。
 - **無効化**は、ライブの受付をすぐに止めてから、状態ファイル → DB の順に保存
   します。**どちらか一方に保存できれば成功（200）**で、再起動しても無効の
   ままです。保存できなかった側があるときは、応答の `persistence_warning` と

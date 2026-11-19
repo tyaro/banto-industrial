@@ -920,6 +920,19 @@ impl From<SinkStatusSnapshot> for SinkStatusEntry {
     }
 }
 
+/// この Hub が提供する機能の名前（`GET /api/v1/status` の `capabilities`、
+/// #1223）。版の文字列では機能の有無を判別できない（#1201 の前後で版が
+/// 同じだった）ため、消費側（temp-scada 等）が名前で判定する。
+///
+/// - `write_contract_v1`: #1201 の書き込みの契約。`correlation_id`・
+///   `on_behalf_of` を受け、`audit_id` を応答に返し、結果が不明なときは
+///   502 `write_uncertain`、確実に失敗したときは `write_failed` と区別する。
+///
+/// 一度出荷した名前は消さず、別の意味にも使い回さない。契約を変えるときは
+/// 新しい名前（例: `write_contract_v2`）を足す。古い Hub はこの欄自体を
+/// 返さないので、欄が無い＝未対応として扱う。
+pub(crate) const HUB_CAPABILITIES: &[&str] = &["write_contract_v1"];
+
 /// `GET /api/v1/status` の応答。T19 S5: `crate::mcp`の`get_server_status`
 /// ツールが[`compute_status`]をそのまま呼んで`serde_json::to_value`で
 /// 包み直すため`pub(crate)`（フィールド自体へは触れない - トレイト経由の
@@ -927,6 +940,9 @@ impl From<SinkStatusSnapshot> for SinkStatusEntry {
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct StatusResponse {
     pub(super) version: String,
+    /// #1223: この Hub が提供する機能の名前（[`HUB_CAPABILITIES`]）。
+    /// 古い Hub はこの欄を返さない（欄が無い＝未対応）。
+    pub(super) capabilities: Vec<String>,
     pub(super) revision: u64,
     pub(super) configured_revision: u64,
     pub(super) running_revision: u64,
@@ -1112,6 +1128,7 @@ pub(crate) async fn compute_status(state: &TagSpaceState) -> Result<StatusRespon
 
     Ok(StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
+        capabilities: HUB_CAPABILITIES.iter().map(|c| (*c).to_string()).collect(),
         revision,
         configured_revision: runtime.configured_revision,
         running_revision: runtime.running_revision,

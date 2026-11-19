@@ -292,6 +292,7 @@ impl From<IngestStatusEntry> for AdminIngestStatusEntry {
 #[serde(rename_all = "camelCase")]
 struct AdminStatusResponse {
     version: String,
+    capabilities: Vec<String>,
     revision: u64,
     configured_revision: u64,
     running_revision: u64,
@@ -417,6 +418,7 @@ impl AdminStatusResponse {
     fn new(status: StatusResponse, secret_storage: AdminSecretStorageEntry) -> Self {
         Self {
             version: status.version,
+            capabilities: status.capabilities,
             revision: status.revision,
             configured_revision: status.configured_revision,
             running_revision: status.running_revision,
