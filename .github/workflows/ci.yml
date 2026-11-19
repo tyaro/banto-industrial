@@ -35,6 +35,8 @@
 # - root の Cargo.toml / Cargo.lock・toolchain・proto・.cargo・.config は Rust workspace
 #   全体 + 両アプリの E2E。root の package.json / pnpm-lock.yaml / lint・format・TS
 #   設定は全 frontend + 両 E2E。
+# - `packages/**`（共通のフロントの部品。いまは packages/trend）は frontend-chronogazer
+#   （その中で部品の check・test も回す）。
 #
 # テストは cargo-nextest（`--profile ci`、設定は `.config/nextest.toml`）で走らせる
 # （#ci-speed、2026-10-19。それまでは rust ジョブ 1 本で fmt / clippy / nextest /
@@ -273,6 +275,14 @@ jobs:
 
       - name: Test
         run: pnpm --filter chronogazer test
+
+      # 共通のトレンドの部品（packages/trend）。ChronoGazer が使い、将来は SCADA も使う。
+      # ci-changes.mjs は packages/** の変更でこのジョブを走らせる。
+      - name: Type check (packages/trend)
+        run: pnpm --filter @banto-industrial/trend check
+
+      - name: Test (packages/trend)
+        run: pnpm --filter @banto-industrial/trend test
 
       - name: Build
         run: pnpm --filter chronogazer build

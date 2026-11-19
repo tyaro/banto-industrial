@@ -1,0 +1,35 @@
+{
+  "name": "@banto-industrial/trend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "記録計のトレンド（時刻の軸・ペンごとの縦軸・MIN/MAX の包絡）の共通部品。ChronoGazer と temp-scada が使う",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": {
+      "svelte": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "check": "svelte-check --tsconfig ./tsconfig.json"
+  },
+  "dependencies": {
+    "@banto/charts": "github:tyaro/banto#v7.8.0&path:packages/charts"
+  },
+  "peerDependencies": {
+    "svelte": "^5.57.3"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.3.1",
+    "svelte": "^5.57.3",
+    "svelte-check": "^4.7.8",
+    "typescript": "^6.0.3",
+    "vite": "^8.3.8",
+    "vitest": "^5.1.0"
+  }
+}
