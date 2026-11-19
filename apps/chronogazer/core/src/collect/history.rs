@@ -29,8 +29,10 @@
 //! # 上限（viewer にも開いているため）
 //!
 //! * タグは **1〜[`HISTORY_MAX_TAGS`] 本**（重複は 1 本に数える）、
-//! * 期間は `fromMs < toMs` かつ **幅 [`HISTORY_MAX_WINDOW_MS`]（1 時間）以内**
-//!   （両端を含む。`banto-tsquery` の約束どおり）、
+//! * 期間は `fromMs < toMs` かつ **幅 [`HISTORY_MAX_WINDOW_MS`]（31 日）以内**
+//!   （両端を含む。`banto-tsquery` の約束どおり。2026-11-19 オーナー決定:
+//!   ヒストリカル画面の 1 回の表示は 31 日まで。「とりあえず 31 日、後でどうするかは
+//!   別途考える」）、
 //! * `bins` は **1〜[`HISTORY_MAX_BINS`]**（2000。グラフの幅に合わせた API の
 //!   上限で、`banto_tsquery::MAX_TARGET_BINS`（20 万、内部のメモリの安全弁）
 //!   とは別に決める）、
@@ -46,7 +48,29 @@
 //! 作れる最大の応答」を基準に決めている（PR #536 のオーナーレビュー P1）。
 //!
 //! 外れたら `BantoError::Validation`（REST は 422）で、**ファイルには触らない**。
-//! 1 時間を超える期間は R2（ヒストリカル）で別に決める。
+//!
+//! # 長い読み出しの絞り
+//!
+//! bins・点の予算は期間に依らないので応答の大きさは変わらないが、**読む量**
+//! （31 日 × 8 タグ分の日次ファイル）は期間に比例して増える。そこで幅が
+//! [`HISTORY_LONG_READ_THRESHOLD_MS`]（1 時間 = 旧上限。ちょうどは短い側）を
+//! **超える**要求を「長い読み出し」と呼び、
+//!
+//! * 同時に走るのは **[`HISTORY_LONG_READ_PERMITS`] 本（2 本）まで**
+//!   （`tokio::sync::Semaphore`）。1 時間以下の要求（監視画面のリアルタイム
+//!   トレンドの初期窓）は絞りの対象にしない - 長い読み出しで監視画面を待たせない、
+//! * 待ち時間の上限は絞りの待ちを含めて **[`HISTORY_LONG_READ_TIMEOUT`]（30 秒）**。
+//!   1 時間以下は従来どおり [`HISTORY_READ_TIMEOUT`]（10 秒）。
+//!
+//! **打ち切っても実際の読み出しは裏で走り続けうる**: `sqlx` の SQLite は別
+//! スレッドで文を実行するので、future を捨てても文が最後まで走ることがある。
+//! 待つ側（呼び出し側）だけ打ち切って札を返すと、「実際に走っている重い
+//! 読み出し」が 2 本を超えて積み上がり、絞りの意味がなくなる。そのため長い
+//! 読み出しは `tokio::spawn` したタスクの中で**札（permit）を持ったまま**行い、
+//! timeout は `JoinHandle` を待つ側にだけ掛ける。打ち切ったら呼び出し側は
+//! [`Readout::Unavailable`] を返すが、タスクは abort せず、**終わるまで札を
+//! 持ち続ける**（[`run_long_read`]）。札の待ちの最中に打ち切られた場合は
+//! まだ何も spawn していないので、残るものは無い。
 //!
 //! # 返すもの（タグごとの系列）
 //!
@@ -103,12 +127,15 @@
 //! 以後は現在値のポーリングで足していく（D-3b）。
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use banto_core::{BantoError, FieldError};
 use banto_tsquery::{BinValue, DecimatedRange, TsQuery};
 use serde::Serialize;
 use sqlx::SqlitePool;
+use tokio::sync::Semaphore;
 
 use super::{CollectorService, Readout};
 
@@ -116,9 +143,20 @@ use super::{CollectorService, Readout};
 /// 本数の想定（表示グループ 1 つ分）に合わせた。
 pub const HISTORY_MAX_TAGS: usize = 8;
 
-/// 1 回の要求で読める期間の幅の上限（ミリ秒、1 時間）。リアルタイムトレンドの
-/// 初期窓（既定 10 分・選択可）を賄う幅。
-pub const HISTORY_MAX_WINDOW_MS: i64 = 3_600_000;
+/// 1 回の要求で読める期間の幅の上限（ミリ秒、31 日）。ヒストリカル画面の 1 回の
+/// 表示の上限（2026-11-19 オーナー決定。後で見直す）。リアルタイムトレンドの
+/// 初期窓（既定 10 分・選択可）はこの下の短い読み出しで賄う。
+/// 応答の大きさは [`HISTORY_MAX_BINS`]・[`HISTORY_MAX_POINTS`] が決めるので、
+/// 期間を広げても上限は付いたまま。
+pub const HISTORY_MAX_WINDOW_MS: i64 = 31 * 24 * 3_600_000;
+
+/// 「長い読み出し」の境界（ミリ秒、1 時間 = 旧上限）。**幅がこれを超える**
+/// 要求だけが絞り（[`HISTORY_LONG_READ_PERMITS`]）と長い待ち時間
+/// （[`HISTORY_LONG_READ_TIMEOUT`]）の対象で、ちょうど 1 時間は短い側。
+pub const HISTORY_LONG_READ_THRESHOLD_MS: i64 = 3_600_000;
+
+/// 長い読み出しの同時数の上限。理由はモジュール doc「長い読み出しの絞り」。
+pub const HISTORY_LONG_READ_PERMITS: usize = 2;
 
 /// 系列 1 本あたりの `bins` の上限（= 返す点の数の上限）。
 ///
@@ -149,6 +187,11 @@ pub const HISTORY_MAX_POINTS: usize = 8000;
 /// 残る」- この処理には副作用が無い）。
 pub const HISTORY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// 長い読み出し（[`HISTORY_LONG_READ_THRESHOLD_MS`] 超）の待ち時間の上限。
+/// 絞りの待ちも含めた全体。過ぎたら [`Readout::Unavailable`] だが、読み出し自体は
+/// 終わるまで札を持って走り続ける（[`run_long_read`]）。
+pub const HISTORY_LONG_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// 検証を通った履歴の要求。**[`validate_history_request`] でしか作れない**
 /// （フィールドは非公開）ので、[`CollectorService::history`] に上限を外れた
 /// 要求が届くことはない。
@@ -164,6 +207,12 @@ pub struct HistoryRequest {
 impl HistoryRequest {
     pub fn tag_ids(&self) -> &[i64] {
         &self.tag_ids
+    }
+
+    /// 長い読み出し（幅が [`HISTORY_LONG_READ_THRESHOLD_MS`] を超える。ちょうどは
+    /// 短い側）か。絞りと待ち時間の対象かどうかを決める。
+    fn is_long(&self) -> bool {
+        self.to_ms.saturating_sub(self.from_ms) > HISTORY_LONG_READ_THRESHOLD_MS
     }
 }
 
@@ -513,6 +562,49 @@ async fn read_history(
     })
 }
 
+/// 長い読み出しの打ち切りの結末（[`run_long_read`]）。
+#[derive(Debug, PartialEq, Eq)]
+enum LongReadStop {
+    /// `timeout` を過ぎた（札の待ち、または読み出し中）。
+    TimedOut,
+    /// 読み出しのタスクが panic した・取り消された。
+    Aborted,
+}
+
+/// 長い読み出しを札つきで走らせる。
+///
+/// 札は**呼び出し側で先に取り**（待ちは `timeout` に含む）、読み出しは
+/// `tokio::spawn` したタスクが札を持ったまま行う。`timeout` は `JoinHandle` を
+/// 待つ側にだけ掛かり、過ぎてもタスクは abort しない（終わるまで札を持つ）。
+/// 理由: `sqlx` の SQLite は別スレッドで文を実行するので future を捨てても文は
+/// 走り続けうる。札を先に返すと実際に走る重い読み出しが 2 本を超えうる。
+async fn run_long_read<T, F>(
+    gate: &Arc<Semaphore>,
+    timeout: Duration,
+    work: F,
+) -> Result<T, LongReadStop>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let gate = Arc::clone(gate);
+    let waited = tokio::time::timeout(timeout, async move {
+        // 札の待ち。ここで打ち切られても、まだ何も spawn していない。
+        let permit = gate
+            .acquire_owned()
+            .await
+            .map_err(|_closed| LongReadStop::Aborted)?;
+        let task = tokio::spawn(async move {
+            let out = work.await;
+            drop(permit); // 読み出しが本当に終わってから返す
+            out
+        });
+        task.await.map_err(|_join| LongReadStop::Aborted)
+    })
+    .await;
+    waited.unwrap_or(Err(LongReadStop::TimedOut))
+}
+
 impl CollectorService {
     /// **直近の履歴**（`GET /api/collect/history` / `collect_history`）。
     /// 形・上限・割り切りはこのモジュールの doc。
@@ -530,22 +622,41 @@ impl CollectorService {
         // 本体・`-wal`・`-shm` を握ってから読み取り専用で開く（リンクにされた名前は断る）。
         // デスクトップ・`data.dir` が外のときはパス（[`super::CollectorContext::data_place`]）。
         let query = TsQuery::with_place(ctx.data_place());
-        match tokio::time::timeout(
-            HISTORY_READ_TIMEOUT,
-            read_history(&ctx.pool, &query, request),
-        )
-        .await
-        {
+        let (limit, outcome) = if request.is_long() {
+            // 長い読み出し: 同時 2 本に絞り、spawn したタスクが札を持つ。
+            let pool = ctx.pool.clone();
+            let request = request.clone();
+            let outcome = run_long_read(
+                &self.inner.history_long_reads,
+                HISTORY_LONG_READ_TIMEOUT,
+                async move { read_history(&pool, &query, &request).await },
+            )
+            .await;
+            (HISTORY_LONG_READ_TIMEOUT, outcome)
+        } else {
+            let outcome = tokio::time::timeout(
+                HISTORY_READ_TIMEOUT,
+                read_history(&ctx.pool, &query, request),
+            )
+            .await
+            .map_err(|_elapsed| LongReadStop::TimedOut);
+            (HISTORY_READ_TIMEOUT, outcome)
+        };
+        match outcome {
             Ok(Ok(history)) => Readout::Ready { data: history },
             Ok(Err(err)) => {
                 eprintln!("banto: 履歴の読み出しに失敗しました: {err}");
                 Readout::Unavailable
             }
-            Err(_elapsed) => {
+            Err(LongReadStop::TimedOut) => {
                 eprintln!(
                     "banto: 履歴の読み出しが{}秒以内に終わりませんでした",
-                    HISTORY_READ_TIMEOUT.as_secs()
+                    limit.as_secs()
                 );
+                Readout::Unavailable
+            }
+            Err(LongReadStop::Aborted) => {
+                eprintln!("banto: 履歴の読み出しのタスクが途中で終わりました");
                 Readout::Unavailable
             }
         }

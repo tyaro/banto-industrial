@@ -6440,7 +6440,7 @@ mod tests {
 
         for (bad, field) in [
             (
-                "/api/collect/history?tagIds=1&fromMs=0&toMs=3600001&bins=10",
+                "/api/collect/history?tagIds=1&fromMs=0&toMs=2678400001&bins=10",
                 "toMs",
             ),
             (

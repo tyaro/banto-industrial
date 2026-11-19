@@ -1984,6 +1984,9 @@ struct CollectorInner {
     /// 外**で呼ばれるので、そこで `tokio::spawn` すると panic する）。
     /// `OnceLock` なので二重には立たない。
     channels: OnceLock<Channels>,
+    /// 長い履歴の読み出し（[`history::HISTORY_LONG_READ_THRESHOLD_MS`] 超）の同時数を
+    /// 絞る札（[`history::HISTORY_LONG_READ_PERMITS`] 枚）。短い読み出しは通らない。
+    history_long_reads: Arc<tokio::sync::Semaphore>,
 }
 
 /// ライフサイクルタスクへの**2 本**の送信口。操作と読み取りでキューを分けて
@@ -2127,6 +2130,9 @@ impl CollectorService {
                 #[cfg(test)]
                 enqueue_gate: OnceLock::new(),
                 channels: OnceLock::new(),
+                history_long_reads: Arc::new(tokio::sync::Semaphore::new(
+                    history::HISTORY_LONG_READ_PERMITS,
+                )),
             }),
         }
     }

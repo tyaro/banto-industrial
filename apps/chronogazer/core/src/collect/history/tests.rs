@@ -32,15 +32,132 @@ fn field_names(err: BantoError) -> Vec<String> {
 
 // --- 要求の検証（上限） -------------------------------------------------------
 
+/// 31 日（2026-11-19 オーナー決定）ちょうどは通り、31 日 + 1ms は拒否する。
+/// 点の予算（bins・本数）は期間に依らず付いたまま。
+#[test]
+fn the_window_limit_is_31_days() {
+    assert_eq!(HISTORY_MAX_WINDOW_MS, 31 * 24 * 3_600_000);
+    validate_history_request(&[1], 0, HISTORY_MAX_WINDOW_MS, HISTORY_MAX_BINS as u64)
+        .expect("31 日ちょうどは通る");
+    assert_eq!(
+        field_names(
+            validate_history_request(&[1], 0, HISTORY_MAX_WINDOW_MS + 1, HISTORY_MAX_BINS as u64)
+                .unwrap_err()
+        ),
+        vec!["toMs"]
+    );
+    // 長い期間でも点の予算は外れたまま通らない。
+    assert_eq!(
+        field_names(
+            validate_history_request(&[1, 2, 3, 4, 5], 0, HISTORY_MAX_WINDOW_MS, 2000)
+                .unwrap_err()
+        ),
+        vec!["bins"]
+    );
+}
+
+/// 長い読み出しの境界: 幅が 1 時間ちょうどは短い側、1ms 超えで長い側。
+///
+/// 反証: `is_long` の比較を `>=` にすると、ちょうど 1 時間が長い側になって落ちる。
+#[test]
+fn the_long_read_boundary_is_strictly_beyond_one_hour() {
+    let short = validate_history_request(&[1], 0, HISTORY_LONG_READ_THRESHOLD_MS, 10).unwrap();
+    assert!(!short.is_long(), "ちょうど 1 時間は短い側");
+    let long = validate_history_request(&[1], 0, HISTORY_LONG_READ_THRESHOLD_MS + 1, 10).unwrap();
+    assert!(long.is_long());
+    let tiny = validate_history_request(&[1], 10, 11, 10).unwrap();
+    assert!(!tiny.is_long());
+    assert_eq!(HISTORY_LONG_READ_THRESHOLD_MS, 3_600_000);
+    assert_eq!(HISTORY_LONG_READ_PERMITS, 2);
+    assert_eq!(HISTORY_LONG_READ_TIMEOUT, Duration::from_secs(30));
+}
+
+/// 絞り: 札 2 枚が埋まっている間、3 本目は待たされ、30 秒で打ち切られる
+/// （仮想時計。実時間は待たない）。打ち切っても**走っている読み出しは札を持ち
+/// 続け**、終わって初めて札が戻る（= 実際に走る数が 2 本を超えない）。
+///
+/// 反証: 札を呼び出し側の timeout の内側で持つ（spawn しない・打ち切りで札を
+/// 返す）形にすると、`available_permits() == 0` の確認か、3 本目の時点で
+/// 走っているタスク数の確認が落ちる。
+#[tokio::test(start_paused = true)]
+async fn long_reads_are_limited_to_two_and_a_timed_out_read_keeps_its_permit() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+
+    let gate = Arc::new(Semaphore::new(HISTORY_LONG_READ_PERMITS));
+    let release = Arc::new(Notify::new());
+    let running = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(AtomicUsize::new(0));
+
+    let job = |tag: usize| {
+        let release = release.clone();
+        let running = running.clone();
+        let started = started.clone();
+        async move {
+            started.fetch_add(1, Ordering::SeqCst);
+            running.fetch_add(1, Ordering::SeqCst);
+            release.notified().await;
+            running.fetch_sub(1, Ordering::SeqCst);
+            tag
+        }
+    };
+
+    // 1・2 本目は長い待ち時間で走り出す。
+    let first = tokio::spawn({
+        let gate = gate.clone();
+        let fut = job(1);
+        async move { run_long_read(&gate, Duration::from_secs(3600), fut).await }
+    });
+    let second = tokio::spawn({
+        let gate = gate.clone();
+        let fut = job(2);
+        async move { run_long_read(&gate, Duration::from_secs(3600), fut).await }
+    });
+    // 2 本が実際に走り出すまで譲る。
+    while started.load(Ordering::SeqCst) < 2 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(gate.available_permits(), 0);
+
+    // 3 本目は札が無いので走り出せず、30 秒で打ち切られる。
+    let third = run_long_read(&gate, HISTORY_LONG_READ_TIMEOUT, job(3)).await;
+    assert_eq!(third, Err(LongReadStop::TimedOut));
+    assert_eq!(started.load(Ordering::SeqCst), 2, "3 本目は走り出していない");
+    assert_eq!(running.load(Ordering::SeqCst), 2);
+
+    // 走っている 1 本を、待つ側が打ち切った後でも札は戻らない。
+    let timed_out = {
+        let gate = gate.clone();
+        let release2 = release.clone();
+        // 先に 1・2 本目を終わらせて札を空け、4 本目を長く走らせて打ち切る。
+        release2.notify_waiters();
+        assert_eq!(first.await.unwrap(), Ok(1));
+        assert_eq!(second.await.unwrap(), Ok(2));
+        while gate.available_permits() < 2 {
+            tokio::task::yield_now().await;
+        }
+        run_long_read(&gate, Duration::from_secs(30), job(4)).await
+    };
+    assert_eq!(timed_out, Err(LongReadStop::TimedOut));
+    assert_eq!(running.load(Ordering::SeqCst), 1, "打ち切っても裏で走っている");
+    assert_eq!(gate.available_permits(), 1, "走っている間は札を持ち続ける");
+
+    release.notify_waiters();
+    while gate.available_permits() < 2 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(running.load(Ordering::SeqCst), 0);
+}
+
 /// 上限ちょうどは通り、1 つでも超えたら該当フィールドの誤りになる。
 ///
-/// 反証: `HISTORY_MAX_WINDOW_MS` の比較を `>=` にすると「ちょうど 1 時間」が
+/// 反証: `HISTORY_MAX_WINDOW_MS` の比較を `>=` にすると「ちょうど 31 日」が
 /// 落ちる。重複除去を外すと「同じ ID を 9 回」が `tagIds` の誤りになって落ちる。
 #[test]
 fn request_limits_accept_the_boundary_and_reject_one_beyond() {
     let eight: Vec<i64> = (1..=8).collect();
     let ok = validate_history_request(&eight, 0, HISTORY_MAX_WINDOW_MS, 600)
-        .expect("8 本・ちょうど 1 時間は通る");
+        .expect("8 本・ちょうど 31 日は通る");
     assert_eq!(ok.tag_ids(), eight.as_slice());
 
     // 重複は 1 本に数え、最初に現れた順を保つ。
@@ -63,7 +180,7 @@ fn request_limits_accept_the_boundary_and_reject_one_beyond() {
     assert_eq!(
         field_names(validate_history_request(&[1], 0, HISTORY_MAX_WINDOW_MS + 1, 1).unwrap_err()),
         vec!["toMs"],
-        "1 時間を 1ms でも超えたら拒否する"
+        "31 日を 1ms でも超えたら拒否する"
     );
     assert_eq!(
         field_names(validate_history_request(&[1], 5, 5, 1).unwrap_err()),
@@ -736,6 +853,72 @@ async fn the_gap_only_path_never_exceeds_bins_at_the_budget() {
             .points
             .iter()
             .all(|p| p.min.is_none() && p.max.is_none()));
+    }
+    pool.close().await;
+}
+
+/// 性能の計測（手元用）: 1 秒周期・8 タグ・31 日分の日次ファイルに対する、
+/// 31 日窓・bins 1000（8 本 × 1000 = 予算ちょうど）の読み出し時間。
+/// `cargo test -p chronogazer-core --release history_31d_perf -- --ignored --nocapture`。
+/// 日数は環境変数 `HISTORY_PERF_DAYS`（既定 31）で減らせる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "手元の性能計測（データ生成が重い）"]
+async fn history_31d_perf() {
+    let days: i64 = std::env::var("HISTORY_PERF_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(31);
+    let dir = TempDir::new();
+    let data_dir = dir.path().join("data");
+    let pool = init_db_memory().await.expect("init_db_memory");
+    let conn = connection(&pool, "real", false).await;
+    let grp = group(&pool, "A", conn, 1000).await;
+    let mut ids = Vec::new();
+    for i in 0..8 {
+        ids.push(tag(&pool, &format!("t{i}"), grp).await);
+    }
+    let clock = Arc::new(ManualClock::new(BASE_MS, OFFSET_MS));
+    let writer = TsWriter::open(
+        &data_dir,
+        StoreConfig {
+            groups: vec![group_config(grp, 1000, &ids)],
+        },
+        clock.clone(),
+    )
+    .await
+    .expect("writer を開ける");
+    // ローカル日付（+09:00）の 0 時から 1 日分ずつ。
+    let day0 = (BASE_MS / 86_400_000) * 86_400_000 - OFFSET_MS;
+    let t0 = std::time::Instant::now();
+    for d in 0..days {
+        let start = day0 + d * 86_400_000;
+        clock.set_now_ms(start + 12 * 3_600_000);
+        for k in 0..86_400_i64 {
+            let v = (k % 1000) as f64;
+            let row: Vec<Option<f64>> = (0..8).map(|i| Some(v + i as f64)).collect();
+            writer
+                .append(&format!("grp:{grp}"), start + k * 1000, &row)
+                .await
+                .expect("書ける");
+        }
+    }
+    writer.close().await.expect("writer を閉じる");
+    eprintln!("生成 {days} 日: {:?}", t0.elapsed());
+
+    let svc = CollectorService::new(pool.clone(), data_dir, crate::test_support::drivers());
+    let request =
+        validate_history_request(&ids, day0, day0 + days * 86_400_000 - 1, 1000).unwrap();
+    for round in 0..3 {
+        let t = std::time::Instant::now();
+        let Readout::Ready { data } = svc.history(&request).await else {
+            panic!("読めるはず");
+        };
+        eprintln!(
+            "読み出し {round}: {:?}（{} 系列 / {} 点）",
+            t.elapsed(),
+            data.series.len(),
+            data.series.iter().map(|s| s.points.len()).sum::<usize>()
+        );
     }
     pool.close().await;
 }
