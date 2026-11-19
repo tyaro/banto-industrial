@@ -242,4 +242,12 @@ describe('注記・エラー', () => {
 			)
 		).toContain('（T1）');
 	});
+
+	it('simulationNote: 現在のフラグが true でも過去の記録値は出る（注記は出ないと言わない）', () => {
+		// 現在のフラグ（simulation: true）と過去の統計（非 null）が併存するケース。
+		const note = simulationNote({ tags: [{ tagId: 1, simulation: true }] }, (id) => `T${id}`);
+		expect(note).not.toBeNull();
+		expect(note).not.toContain('日報には出ません');
+		expect(note).toContain('切り替える前に記録した値は表示されます');
+	});
 });

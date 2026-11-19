@@ -283,12 +283,16 @@ export function unknownTagsNote(
 	return `削除されたタグがあります（${unknownTagIds.map(nameOf).join('、')}）。日報には載せていません。`;
 }
 
-/** シミュレーション接続のタグの注記。無ければ `null`（値は記録されないので、日報は欠測になる）。 */
+/**
+ * シミュレーション接続のタグの注記。無ければ `null`。
+ * `simulation` は**現在の設定**であって履歴ではない。シミュレーション中の値は記録されないので
+ * その時間帯は欠測（「—」）になるが、切り替える前に記録した値は日報に出る。
+ */
 export function simulationNote(
 	report: Pick<CollectDailyReport, 'tags'>,
 	nameOf: (tagId: number) => string
 ): string | null {
 	const names = report.tags.filter((tag) => tag.simulation).map((tag) => nameOf(tag.tagId));
 	if (names.length === 0) return null;
-	return `シミュレーション接続のタグ（${names.join('、')}）の値は記録されないため、日報には出ません。`;
+	return `現在シミュレーション接続のタグがあります（${names.join('、')}）。シミュレーション中の値は記録されないため、その間は「—」になります。切り替える前に記録した値は表示されます。`;
 }
