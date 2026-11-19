@@ -4,6 +4,7 @@ import {
 	effectivePenSelection,
 	isPenCheckDisabled,
 	needsPenSelection,
+	shouldDiscardPenSelection,
 	penSelectionCountLabel,
 	togglePenSelection
 } from './penSelectionLogic';
@@ -95,5 +96,25 @@ describe('タグ ID の重複は 1 本に数える', () => {
 		expect(togglePenSelection(tagIds, ids(8), 9, 8)).toEqual(ids(8));
 		expect(togglePenSelection(tagIds, ids(8), 8, 8)).toEqual(ids(7));
 		expect(togglePenSelection(tagIds, ids(7), 9, 8)).toEqual([...ids(7), 9]);
+	});
+});
+
+describe('shouldDiscardPenSelection', () => {
+	it('グループが替わると捨てる', () => {
+		expect(shouldDiscardPenSelection(1, 2)).toBe(true);
+	});
+	it('同じグループのまま（日付の変更など）なら保つ', () => {
+		expect(shouldDiscardPenSelection(1, 1)).toBe(false);
+	});
+	it('A → B → A: B に替わった時点で捨てるので、A に戻ると既定に戻る', () => {
+		let chosen: number | null = 1;
+		for (const current of [2, 1]) {
+			if (shouldDiscardPenSelection(chosen, current)) chosen = null;
+		}
+		expect(chosen).toBeNull();
+	});
+	it('未選択・今のグループが未定のときは捨てない', () => {
+		expect(shouldDiscardPenSelection(null, 2)).toBe(false);
+		expect(shouldDiscardPenSelection(1, null)).toBe(false);
 	});
 });

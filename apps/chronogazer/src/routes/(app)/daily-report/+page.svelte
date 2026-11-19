@@ -42,6 +42,7 @@
 	import {
 		effectivePenSelection,
 		needsPenSelection,
+		shouldDiscardPenSelection,
 		togglePenSelection
 	} from '#lib/penSelection/penSelectionLogic.js';
 	import {
@@ -172,6 +173,12 @@
 	 * グループを替えると既定に戻る。trend-design.md §6）。
 	 */
 	let chosen = $state<{ groupId: number; tagIds: number[] } | null>(null);
+	// 有効なグループが替わったら選択を捨てる（A で選び → B → A に戻っても既定から。URL の戻る・進むも同じ）。
+	// 捨てるのは chosen が別のグループのものだったときだけなので、書いたあとは条件が偽になり繰り返さない。
+	$effect(() => {
+		if (shouldDiscardPenSelection(chosen?.groupId ?? null, selectedGroup?.id ?? null))
+			chosen = null;
+	});
 	const groupTagIds = $derived(selectedGroup ? selectedGroup.pens.map((pen) => pen.tagId) : []);
 	const needsSelection = $derived(needsPenSelection(groupTagIds, DAILY_REPORT_MAX_TAGS));
 	const penTagIds = $derived(

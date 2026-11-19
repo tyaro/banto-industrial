@@ -76,3 +76,16 @@ export function isPenCheckDisabled(
 export function penSelectionCountLabel(selected: number, limit: number): string {
 	return `選択中 ${selected} / ${limit} 本`;
 }
+
+/**
+ * 選んだ状態を捨てるか。選んだときのグループ（`chosenGroupId`）と今表示しているグループが
+ * 違えば捨てる（A で選び、B を開き、A に戻ったときに前の選択を引きずらない）。同じグループの
+ * ままの日付の変更では保つ。まだ選んでいない（`null`）、または今のグループが未定（読み込み中、
+ * `null`）のときは捨てない。
+ */
+export function shouldDiscardPenSelection(
+	chosenGroupId: number | null,
+	currentGroupId: number | null
+): boolean {
+	return chosenGroupId !== null && currentGroupId !== null && chosenGroupId !== currentGroupId;
+}
