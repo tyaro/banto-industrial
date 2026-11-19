@@ -11,7 +11,10 @@
  *   swallowed - the local cache already has the value). Read back once per
  *   login via `syncFromProvider()` (called from the `(app)` route guard
  *   once the SessionController confirmed the session), so a value saved from another
- *   client/session wins over this tab's stale localStorage.
+ *   client/session wins over this tab's stale localStorage. The late response is
+ *   guarded twice (#1215): `isCurrent` drops a response that belongs to a session that
+ *   is no longer live, and a per-key edit generation keeps a value the user changed
+ *   after the read began from being rolled back.
  *
  * #1159（banto v7.2.0 のメニューバー、nav-menubar-plan.md §3）: admin-template の
  * `navLayout`（サイドバー / ドック / メニューバー）と `launcherPosition`（ドックの
@@ -93,6 +96,16 @@ class Settings {
 	launcherPosition: LauncherPosition = $state(loadLauncherPosition());
 
 	#unwatchSystem: (() => void) | undefined;
+	/** Per-key edit generation (bumped by every setter): a read that started before an edit must not roll it back. */
+	#edits = new Map<string, number>();
+
+	#editGen(key: string): number {
+		return this.#edits.get(key) ?? 0;
+	}
+
+	#touch(key: string) {
+		this.#edits.set(key, this.#editGen(key) + 1);
+	}
 
 	/** Apply + cache locally, WITHOUT the provider write (init/syncFromProvider must not echo values back). */
 	#applyThemeMode(mode: ThemeMode) {
@@ -125,21 +138,25 @@ class Settings {
 	}
 
 	setThemeMode(mode: ThemeMode) {
+		this.#touch(MODE_SETTING);
 		this.#applyThemeMode(mode);
 		persistRemote(MODE_SETTING, mode);
 	}
 
 	setThemePreset(preset: ThemePreset) {
+		this.#touch(PRESET_SETTING);
 		this.#applyThemePreset(preset);
 		persistRemote(PRESET_SETTING, preset);
 	}
 
 	setNavLayout(layout: NavLayout) {
+		this.#touch(NAV_LAYOUT_SETTING);
 		this.#applyNavLayout(layout);
 		persistRemote(NAV_LAYOUT_SETTING, layout);
 	}
 
 	setLauncherPosition(position: LauncherPosition) {
+		this.#touch(LAUNCHER_POSITION_SETTING);
 		this.#applyLauncherPosition(position);
 		persistRemote(LAUNCHER_POSITION_SETTING, position);
 	}
@@ -159,9 +176,21 @@ class Settings {
 	 * guaranteed authenticated (the controller just confirmed the session). A
 	 * missing key (never saved) or any provider failure leaves the current
 	 * (localStorage-seeded) values in place.
+	 *
+	 * Two guards against a late response (#1215):
+	 * - `isCurrent`: is the session that started the read still the live one?
+	 *   Checked after the response; a stale session's response is applied to nothing.
+	 * - edit generation: a key the user changed after the read began is not
+	 *   rolled back by the (older) value that came back.
 	 */
-	async syncFromProvider(): Promise<void> {
+	async syncFromProvider(isCurrent: () => boolean = () => true): Promise<void> {
 		const ui = getUiSettings();
+		const started = {
+			mode: this.#editGen(MODE_SETTING),
+			preset: this.#editGen(PRESET_SETTING),
+			navLayout: this.#editGen(NAV_LAYOUT_SETTING),
+			launcherPosition: this.#editGen(LAUNCHER_POSITION_SETTING)
+		};
 		try {
 			const [mode, preset, navLayout, launcherPosition] = await Promise.all([
 				ui.get(MODE_SETTING),
@@ -169,10 +198,18 @@ class Settings {
 				ui.get(NAV_LAYOUT_SETTING),
 				ui.get(LAUNCHER_POSITION_SETTING)
 			]);
-			if (isThemeMode(mode)) this.#applyThemeMode(mode);
-			if (isThemePreset(preset)) this.#applyThemePreset(preset);
-			if (isNavLayout(navLayout)) this.#applyNavLayout(navLayout);
-			if (isLauncherPosition(launcherPosition)) this.#applyLauncherPosition(launcherPosition);
+			if (!isCurrent()) return;
+			if (isThemeMode(mode) && this.#editGen(MODE_SETTING) === started.mode)
+				this.#applyThemeMode(mode);
+			if (isThemePreset(preset) && this.#editGen(PRESET_SETTING) === started.preset)
+				this.#applyThemePreset(preset);
+			if (isNavLayout(navLayout) && this.#editGen(NAV_LAYOUT_SETTING) === started.navLayout)
+				this.#applyNavLayout(navLayout);
+			if (
+				isLauncherPosition(launcherPosition) &&
+				this.#editGen(LAUNCHER_POSITION_SETTING) === started.launcherPosition
+			)
+				this.#applyLauncherPosition(launcherPosition);
 		} catch {
 			// Best-effort: offline/unauthenticated reads keep the local values.
 		}

@@ -100,8 +100,12 @@ export async function load({ url }) {
 	// M12: now that the session is confirmed, pull theme settings from the
 	// UiSettingsProvider (settings DB) - a value saved from another
 	// client/session beats this tab's localStorage cache. Fire-and-forget:
-	// navigation must not wait on (or fail with) a settings read.
-	void settings.syncFromProvider();
+	// navigation must not wait on (or fail with) a settings read. The read can
+	// outlive this session (a login in another tab, a logout), so it is told
+	// whether the generation THIS load confirmed is still live (#1215) and
+	// drops its response otherwise. The same controller backs the Tauri path.
+	const confirmedGeneration = snapshot.generation;
+	void settings.syncFromProvider(() => controller.snapshot.generation === confirmedGeneration);
 
 	// The generation THIS load confirmed (I-16) - never a `snapshot.generation`
 	// read now: after the awaits above another session may already have been
