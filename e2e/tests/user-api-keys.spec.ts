@@ -75,7 +75,9 @@ test.describe.serial('chronogazer API キー画面 (#1161 PR4b)', () => {
 		await page.reload();
 		await expect(warning).toBeVisible();
 		await expect(warning).toContainText('127.0.0.1');
-		await page.unroute('**/api/settings/server');
+		// ハンドラは route.fetch() を待つので、処理中に外して reload すると要求が打ち切られて
+		// fulfill が「already handled」で落ちる（CI で再試行も含めて落ちた）。処理中のハンドラを待ってから外す。
+		await page.unroute('**/api/settings/server', { behavior: 'wait' });
 		await page.reload();
 		await expect(warning).toHaveCount(0);
 	});
