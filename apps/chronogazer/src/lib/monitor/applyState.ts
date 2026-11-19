@@ -31,6 +31,8 @@ export type ApplyKind =
 	| 'disabled'
 	/** 走っている収集が読んでいるが、シミュレーション接続なので値は記録されない。 */
 	| 'simulated'
+	/** 走っている収集が読んでいるが、接続の記録状態（シミュレーションか）が分からない。 */
+	| 'targetUnknown'
 	/** 走っている収集が読んでいる。 */
 	| 'recording'
 	/** 収集が走っていない（保存済み・有効）。 */
@@ -53,6 +55,7 @@ export const APPLY_LABELS = {
 	// 既存の文言（collectAdmin.ts `SIMULATION_RUNNING_NOTE`）をそのまま使う。
 	simulated: SIMULATION_RUNNING_NOTE,
 	recording: '記録中',
+	targetUnknown: '収集対象（記録状態不明）',
 	unknown: '不明'
 } as const;
 
@@ -102,8 +105,12 @@ export function penApplyState(
 		| {
 				enabled: boolean;
 				collectionGroupId?: number;
-				/** タグの接続が、走っている収集でシミュレーションか（呼び出し側が決める）。 */
-				simulated?: boolean;
+				/**
+				 * タグの接続が、走っている収集でシミュレーションか（呼び出し側が決める）。
+				 * `null` = 走っている収集の接続の状態が分からない（`tagKeys` にあっても「記録中」と
+				 * 言わず `targetUnknown`）。省略は `false` と同じ。
+				 */
+				simulated?: boolean | null;
 		  }
 		| undefined,
 	collect: CollectorStateView | null
@@ -125,6 +132,9 @@ export function penApplyState(
 	if (collect.state !== 'running') return { kind: 'notRunning', label: notRunningLabel(collect) };
 	if (collect.tagKeys.includes(key) && tag.simulated === true) {
 		return { kind: 'simulated', label: APPLY_LABELS.simulated };
+	}
+	if (collect.tagKeys.includes(key) && tag.simulated === null) {
+		return { kind: 'targetUnknown', label: APPLY_LABELS.targetUnknown };
 	}
 	if (collect.tagKeys.includes(key)) return { kind: 'recording', label: APPLY_LABELS.recording };
 	return { kind: 'pending', label: APPLY_LABELS.pending };
@@ -171,10 +181,11 @@ export const REFLECT_RESTART_CONFIRM =
 export const REFLECT_START_CONFIRM =
 	'収集を開始して、保存したタグを記録に反映します。よろしいですか？';
 
-/** 収集は走っているが記録されるペンが無いときの文言（除外 > シミュレーション > 不明 > 無効 の順で代表を出す）。 */
+/** 収集は走っているが記録されるペンが無いときの文言（除外 > シミュレーション > 収集対象（記録状態不明）> 不明 > 無効 の順で代表を出す）。 */
 function idleLabel(states: readonly ApplyState[]): string {
 	if (states.some((s) => s.kind === 'excluded')) return APPLY_LABELS.excluded;
 	if (states.some((s) => s.kind === 'simulated')) return APPLY_LABELS.simulated;
+	if (states.some((s) => s.kind === 'targetUnknown')) return APPLY_LABELS.targetUnknown;
 	if (states.some((s) => s.kind === 'unknown')) return APPLY_LABELS.unknown;
 	if (states.some((s) => s.kind === 'disabled')) return APPLY_LABELS.disabled;
 	return '記録するタグがありません';
@@ -184,18 +195,23 @@ function idleLabel(states: readonly ApplyState[]): string {
 export const STARTING_RECHECK_MAX = 30;
 export const STARTING_RECHECK_MS = 1000;
 
-/** 取得した状態が `starting` なら、上限までは次の取り直しを予約する（純関数）。 */
-export function shouldRecheckStarting(
+/** 収集の状態を定期的に取り直す間隔（`starting` 以外。別クライアントの停止・開始に追従する）。 */
+export const STATUS_RECHECK_MS = 5000;
+
+/**
+ * 次の取り直しまでの待ち（ms）。`null` = 予約しない（見えていないとき）。
+ * `starting` は上限まで 1 秒おき、上限に達したら通常の周期に戻る（純関数）。
+ */
+export function nextStatusRecheckMs(
 	collect: CollectorStateView | null,
-	attempts: number,
+	startingAttempts: number,
 	pageVisible: boolean
-): boolean {
-	return (
-		pageVisible &&
-		collect !== null &&
-		collect.state === 'starting' &&
-		attempts < STARTING_RECHECK_MAX
-	);
+): number | null {
+	if (!pageVisible) return null;
+	if (collect !== null && collect.state === 'starting' && startingAttempts < STARTING_RECHECK_MAX) {
+		return STARTING_RECHECK_MS;
+	}
+	return STATUS_RECHECK_MS;
 }
 
 /**

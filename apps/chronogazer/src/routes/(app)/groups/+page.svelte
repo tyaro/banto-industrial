@@ -90,8 +90,8 @@
 		applyBand,
 		isPenUnsaved,
 		penApplyState,
-		shouldRecheckStarting,
-		STARTING_RECHECK_MS
+		nextStatusRecheckMs,
+		STATUS_RECHECK_MS
 	} from '#lib/monitor/applyState.js';
 	import { MONITOR_POLL_DEFAULT_MS } from '#lib/monitor/monitorLogic.js';
 	import { ValuesPoller } from '#lib/monitor/valuesPoller.svelte.js';
@@ -600,29 +600,40 @@
 	function onVisibilityChange(): void {
 		pageVisible = document.visibilityState === 'visible';
 		if (pageVisible) void refreshCollectState();
+		else clearStatusTimer();
 	}
 
 	// --- 操作の状態（#1198 PR3。編集中 → 保存済み・未反映 → 記録中）---
 	//
 	// 収集の状態（`GET /api/collect`）は、開いたとき・保存が成功した後・「記録へ反映」の後・
-	// タブが見えるようになったときに取り直す（ポーリングはしない）。遅れて返った応答が
-	// 新しい状態を巻き戻さないよう世代番号で捨てる。取れなかったら `null`（= 不明）にして、
+	// タブが見えるようになったときに加え、見えている間は定期的に（`starting` は 1 秒、それ以外は
+	// 5 秒。`nextStatusRecheckMs`）取り直す。別クライアントの停止・開始に追従するため。タイマは
+	// `statusTimer` の 1 本だけで、`refreshCollectState` の最後に次の 1 回を予約する（見えなく
+	// なったら・離れたら止める）。遅れて返った応答が新しい状態を巻き戻さないよう世代番号で捨てる。取れなかったら `null`（= 不明）にして、
 	// 「未反映」と誤って言わない。
 	let collectState = $state<CollectorStateView | null>(null);
 	/**
 	 * 走っている収集の接続ごとのシミュレーション（`conn:<id>` → `simulation`）。走っている
 	 * 収集が起動時に使った値で、シミュレーションの接続のタグは値が記録されない。取れていない
-	 * （走っていない・取得失敗）ときは `null` で、レジストリの接続の `simulation` で代える
-	 * （切替は再起動まで反映されないので食い違いうるが、取れないときに「記録中」と言い切る
-	 * よりは、登録の今の値を目安にする）。
+	 * （走っていない・取得失敗）ときは `null`。レジストリの接続の `simulation` では代えない:
+	 * 保存値と実行状態は再起動まで食い違う（運転中にオフにして保存しても、走っている収集は
+	 * シミュレーションのまま）ので、取れないときは「記録中」と断定せず `targetUnknown` にする。
 	 */
 	let runningSimulation = $state<ReadonlyMap<string, boolean> | null>(null);
 	let collectGen = 0;
 	let reflecting = $state(false);
 	let reflectNotice = $state<string | null>(null);
 	let reflectError = $state<string | null>(null);
+	/** 反映後などの 1 回きりの取り直し。 */
 	let followUpTimer: ReturnType<typeof setTimeout> | null = null;
+	/** 定期の取り直し（常に 1 本だけ）。 */
+	let statusTimer: ReturnType<typeof setTimeout> | null = null;
 	let startingRechecks = 0;
+
+	function clearStatusTimer(): void {
+		if (statusTimer !== null) clearTimeout(statusTimer);
+		statusTimer = null;
+	}
 
 	async function refreshCollectState(): Promise<void> {
 		if (!available || !isCollectAvailable()) return;
@@ -656,16 +667,15 @@
 		if (gen !== collectGen) return;
 		collectState = next;
 		runningSimulation = sim;
-		// `starting` のまま止まらないよう、1 秒おきに（上限まで）取り直す。
+		// `starting` のまま止まらないよう上限まで 1 秒おき、それ以外は 5 秒おきに取り直す。
+		const wait = nextStatusRecheckMs(next, startingRechecks, pageVisible);
 		if (next?.state === 'starting') {
-			if (shouldRecheckStarting(next, startingRechecks, pageVisible)) {
-				startingRechecks++;
-				if (followUpTimer !== null) clearTimeout(followUpTimer);
-				followUpTimer = setTimeout(() => void refreshCollectState(), STARTING_RECHECK_MS);
-			}
+			if (wait !== null && wait < STATUS_RECHECK_MS) startingRechecks++;
 		} else {
 			startingRechecks = 0;
 		}
+		clearStatusTimer();
+		if (wait !== null) statusTimer = setTimeout(() => void refreshCollectState(), wait);
 	}
 
 	const baselineTagIds = $derived(
@@ -681,17 +691,15 @@
 	 */
 	function applyTagOf(
 		tagId: number
-	): { enabled: boolean; collectionGroupId: number; simulated: boolean } | undefined {
+	): { enabled: boolean; collectionGroupId: number; simulated: boolean | null } | undefined {
 		const tag = tagsById.get(tagId);
 		if (tag === undefined) return undefined;
 		const group = groupsById.get(tag.collectionGroupId);
 		const connection = group && connectionsById.get(group.plcConnectionId);
 		const enabled = tag.enabled && (group?.enabled ?? true) && (connection?.enabled ?? true);
 		const connKey = group === undefined ? null : `conn:${group.plcConnectionId}`;
-		const simulated =
-			(connKey === null ? undefined : runningSimulation?.get(connKey)) ??
-			connection?.simulation ??
-			false;
+		// 走っている収集の接続の状態が分からないときは `null`（レジストリの値で代えない）。
+		const simulated = (connKey === null ? undefined : runningSimulation?.get(connKey)) ?? null;
 		return { enabled, collectionGroupId: tag.collectionGroupId, simulated };
 	}
 
@@ -711,20 +719,35 @@
 	);
 
 	async function reflectToRecording(): Promise<void> {
-		const reflect = band.reflect;
-		if (reflect === null || reflect.disabled || reflecting) return;
-		if (!window.confirm(reflect.confirm)) return;
-		reflecting = true;
+		const shown = band.reflect;
+		if (shown === null || shown.disabled || reflecting) return;
+		reflecting = true; // 取り直しの間も二重押しを防ぐ。
 		reflectNotice = null;
 		reflectError = null;
-		collectGen++; // 操作中に飛んでいた取得の応答は、もう古い。
 		try {
+			// 確認の前に前提（収集の状態）を取り直す（`reflecting` の間は `reflect.disabled` が立つので見ない）。別クライアントで変わっていたら確認を出さない。
+			await refreshCollectState();
+			const reflect = band.reflect;
+			if (reflect === null || dirty || reflect.action !== shown.action) {
+				reflectNotice = '収集の状態が変わりました。表示を確認してからもう一度押してください。';
+				return;
+			}
+			if (!window.confirm(reflect.confirm)) return;
+			await runReflect(reflect.action);
+		} finally {
+			reflecting = false;
+		}
+	}
+
+	async function runReflect(action: 'start' | 'restart'): Promise<void> {
+		collectGen++; // 操作中に飛んでいた取得の応答は、もう古い。
+		{
 			const outcome = await runWithLimit(
-				(signal) => runCollectAction(reflect.action, signal),
+				(signal) => runCollectAction(action, signal),
 				COLLECT_UI_TIMEOUT_MS
 			);
 			const display = collectOperationDisplay(
-				reflect.action,
+				action,
 				outcome,
 				outcome.kind === 'failed' ? errorMessage(outcome.error) : null
 			);
@@ -740,8 +763,6 @@
 				if (followUpTimer !== null) clearTimeout(followUpTimer);
 				followUpTimer = setTimeout(() => void refreshCollectState(), 3000);
 			}
-		} finally {
-			reflecting = false;
 		}
 	}
 
@@ -755,6 +776,7 @@
 		valuesPoller.stop();
 		collectGen++;
 		if (followUpTimer !== null) clearTimeout(followUpTimer);
+		clearStatusTimer();
 		if (typeof document !== 'undefined') {
 			document.removeEventListener('visibilitychange', onVisibilityChange);
 		}

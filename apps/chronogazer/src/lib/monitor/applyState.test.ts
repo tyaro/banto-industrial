@@ -11,7 +11,9 @@ import {
 	notRunningLabel,
 	penApplyState,
 	STARTING_RECHECK_MAX,
-	shouldRecheckStarting,
+	nextStatusRecheckMs,
+	STATUS_RECHECK_MS,
+	STARTING_RECHECK_MS,
 	type ApplyState
 } from './applyState';
 
@@ -78,6 +80,24 @@ describe('penApplyState', () => {
 			[pen, false, on, running(['tag:1'], [excl('tag', 'tag:9')])],
 			'recording',
 			'記録中'
+		],
+		[
+			'simulated が null は収集対象（記録状態不明）',
+			[pen, false, { ...on, simulated: null }, running(['tag:1'])],
+			'targetUnknown',
+			'収集対象（記録状態不明）'
+		],
+		[
+			'simulated が false は記録中',
+			[pen, false, { ...on, simulated: false }, running(['tag:1'])],
+			'recording',
+			'記録中'
+		],
+		[
+			'simulated が null でも tagKeys に無ければ未反映',
+			[pen, false, { ...on, simulated: null }, running([])],
+			'pending',
+			'保存済み・未反映'
 		],
 		[
 			'exclusions が tagKeys より優先',
@@ -227,6 +247,20 @@ describe('applyBand: 走行中で未反映が 0 件', () => {
 		['全部無効', ['disabled', 'disabled'], 'idle', APPLY_LABELS.disabled],
 		['全部不明', ['unknown'], 'idle', APPLY_LABELS.unknown],
 		['除外と無効の混在は除外', ['disabled', 'excluded'], 'idle', APPLY_LABELS.excluded],
+		['収集対象（記録状態不明）のみ', ['targetUnknown'], 'idle', APPLY_LABELS.targetUnknown],
+		[
+			'シミュレーションと記録状態不明はシミュレーション',
+			['targetUnknown', 'simulated'],
+			'idle',
+			APPLY_LABELS.simulated
+		],
+		[
+			'記録状態不明と不明は記録状態不明',
+			['unknown', 'targetUnknown'],
+			'idle',
+			APPLY_LABELS.targetUnknown
+		],
+		['記録中と記録状態不明の混在は記録中', ['targetUnknown', 'recording'], 'recording', '記録中'],
 		['不明と無効の混在は不明', ['disabled', 'unknown'], 'idle', APPLY_LABELS.unknown],
 		['1 本でも記録中なら記録中', ['excluded', 'recording', 'disabled'], 'recording', '記録中'],
 		['ペン無し', [], 'idle', '記録するタグがありません'],
@@ -240,14 +274,19 @@ describe('applyBand: 走行中で未反映が 0 件', () => {
 	});
 });
 
-describe('shouldRecheckStarting', () => {
-	it('starting かつ見えていて上限未満のときだけ予約する', () => {
-		const starting: CollectorStateView = { state: 'starting' };
-		expect(shouldRecheckStarting(starting, 0, true)).toBe(true);
-		expect(shouldRecheckStarting(starting, STARTING_RECHECK_MAX - 1, true)).toBe(true);
-		expect(shouldRecheckStarting(starting, STARTING_RECHECK_MAX, true)).toBe(false);
-		expect(shouldRecheckStarting(starting, 0, false)).toBe(false);
-		expect(shouldRecheckStarting(running([]), 0, true)).toBe(false);
-		expect(shouldRecheckStarting(null, 0, true)).toBe(false);
+describe('nextStatusRecheckMs', () => {
+	const starting: CollectorStateView = { state: 'starting' };
+	const cases: [string, CollectorStateView | null, number, boolean, number | null][] = [
+		['starting は 1 秒', starting, 0, true, STARTING_RECHECK_MS],
+		['starting の上限直前', starting, STARTING_RECHECK_MAX - 1, true, STARTING_RECHECK_MS],
+		['starting の上限で通常の周期に戻る', starting, STARTING_RECHECK_MAX, true, STATUS_RECHECK_MS],
+		['running は 5 秒', running([]), 0, true, STATUS_RECHECK_MS],
+		['stopped は 5 秒', { state: 'stopped' }, 0, true, STATUS_RECHECK_MS],
+		['取れていない（null）も 5 秒', null, 0, true, STATUS_RECHECK_MS],
+		['見えていなければ予約しない', running([]), 0, false, null],
+		['starting でも見えていなければ予約しない', starting, 0, false, null]
+	];
+	it.each(cases)('%s', (_n, collect, attempts, visible, expected) => {
+		expect(nextStatusRecheckMs(collect, attempts, visible)).toBe(expected);
 	});
 });
