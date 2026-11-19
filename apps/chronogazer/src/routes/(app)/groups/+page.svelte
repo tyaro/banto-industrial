@@ -73,10 +73,27 @@
 	} from '#lib/banto/tagRegistryAdmin.js';
 	import { getHubCatalog } from '#lib/banto/hubAdmin.js';
 	import {
+		collectOperationDisplay,
 		collectTimeLabel,
+		COLLECT_READ_TIMEOUT_MS,
+		COLLECT_UI_TIMEOUT_MS,
+		getCollectConnections,
+		getCollectStatus,
 		getCollectValues,
-		isCollectAvailable
+		isCollectAvailable,
+		runCollectAction,
+		runWithLimit,
+		toCollectStateView,
+		type CollectorStateView
 	} from '#lib/banto/collectAdmin.js';
+	import {
+		applyBand,
+		isPenUnsaved,
+		penApplyState,
+		nextStatusRecheckMs,
+		reflectGate,
+		STATUS_RECHECK_MS
+	} from '#lib/monitor/applyState.js';
 	import { MONITOR_POLL_DEFAULT_MS } from '#lib/monitor/monitorLogic.js';
 	import { ValuesPoller } from '#lib/monitor/valuesPoller.svelte.js';
 	import { valueCell, valuesNote } from '#lib/monitor/valueColumn.js';
@@ -450,11 +467,13 @@
 					? await createDisplayGroup(draftToInput(draft))
 					: await updateDisplayGroup(target, draftToInput(draft, editingRevision));
 			const registered = saved.registeredTags ?? [];
+			// 登録があれば収集の状態を取り直す（保存済み・未反映の判定のため）。
+			if (registered.length > 0) void refreshCollectState();
 			toastStore.push(
 				'success',
 				(target === 'new' ? `${saved.name} を作成しました` : `${saved.name} を更新しました`) +
 					(registered.length > 0
-						? `。${registered.length} 件を記録項目に登録しました。収集中なら「収集を再起動」で記録が始まります。`
+						? `。${registered.length} 件を記録項目に登録しました。上の「記録へ反映」で記録が始まります。`
 						: '')
 			);
 			await reloadGroups();
@@ -581,15 +600,200 @@
 
 	function onVisibilityChange(): void {
 		pageVisible = document.visibilityState === 'visible';
+		if (pageVisible) void refreshCollectState();
+		else clearStatusTimer();
+	}
+
+	// --- 操作の状態（#1198 PR3。編集中 → 保存済み・未反映 → 記録中）---
+	//
+	// 収集の状態（`GET /api/collect`）は、開いたとき・保存が成功した後・「記録へ反映」の後・
+	// タブが見えるようになったときに加え、見えている間は定期的に（`starting` は 1 秒、それ以外は
+	// 5 秒。`nextStatusRecheckMs`）取り直す。別クライアントの停止・開始に追従するため。タイマは
+	// `statusTimer` の 1 本だけで、`refreshCollectState` の最後に次の 1 回を予約する（見えなく
+	// なったら・離れたら止める）。遅れて返った応答が新しい状態を巻き戻さないよう世代番号で捨てる。取れなかったら `null`（= 不明）にして、
+	// 「未反映」と誤って言わない。
+	let collectState = $state<CollectorStateView | null>(null);
+	/**
+	 * 走っている収集の接続ごとのシミュレーション（`conn:<id>` → `simulation`）。走っている
+	 * 収集が起動時に使った値で、シミュレーションの接続のタグは値が記録されない。取れていない
+	 * （走っていない・取得失敗）ときは `null`。レジストリの接続の `simulation` では代えない:
+	 * 保存値と実行状態は再起動まで食い違う（運転中にオフにして保存しても、走っている収集は
+	 * シミュレーションのまま）ので、取れないときは「記録中」と断定せず `targetUnknown` にする。
+	 */
+	let runningSimulation = $state<ReadonlyMap<string, boolean> | null>(null);
+	let collectGen = 0;
+	// 離れた後に、待っていた操作の続きが取り直しとタイマを張り直さないための印（#1219 のレビュー）。
+	let disposed = false;
+	let reflecting = $state(false);
+	let reflectNotice = $state<string | null>(null);
+	let reflectError = $state<string | null>(null);
+	/** 反映後などの 1 回きりの取り直し。 */
+	let followUpTimer: ReturnType<typeof setTimeout> | null = null;
+	/** 定期の取り直し（常に 1 本だけ）。 */
+	let statusTimer: ReturnType<typeof setTimeout> | null = null;
+	let startingRechecks = 0;
+
+	function clearStatusTimer(): void {
+		if (statusTimer !== null) clearTimeout(statusTimer);
+		statusTimer = null;
+	}
+
+	/** 今回の取得が最新として採用され `collectState` に書かれたときだけ `true`。 */
+	async function refreshCollectState(): Promise<boolean> {
+		if (disposed || !available || !isCollectAvailable()) return false;
+		const gen = ++collectGen;
+		let next: CollectorStateView | null = null;
+		try {
+			const outcome = await runWithLimit(
+				(signal) => getCollectStatus(signal),
+				COLLECT_READ_TIMEOUT_MS
+			);
+			if (outcome.kind === 'ok') next = outcome.value;
+		} catch {
+			next = null;
+		}
+		let sim: Map<string, boolean> | null = null;
+		if (next?.state === 'running') {
+			try {
+				const outcome = await runWithLimit(
+					(signal) => getCollectConnections(signal),
+					COLLECT_READ_TIMEOUT_MS
+				);
+				if (outcome.kind === 'ok' && outcome.value.state === 'ready') {
+					sim = new Map(
+						Object.entries(outcome.value.data).map(([key, view]) => [key, view.simulation])
+					);
+				}
+			} catch {
+				sim = null;
+			}
+		}
+		if (disposed || gen !== collectGen) return false;
+		collectState = next;
+		runningSimulation = sim;
+		// `starting` のまま止まらないよう上限まで 1 秒おき、それ以外は 5 秒おきに取り直す。
+		const wait = nextStatusRecheckMs(next, startingRechecks, pageVisible);
+		if (next?.state === 'starting') {
+			if (wait !== null && wait < STATUS_RECHECK_MS) startingRechecks++;
+		} else {
+			startingRechecks = 0;
+		}
+		clearStatusTimer();
+		if (wait !== null) statusTimer = setTimeout(() => void refreshCollectState(), wait);
+		return true;
+	}
+
+	const baselineTagIds = $derived(
+		new Set(baseline.pens.flatMap((pen) => (pen.tagId === null ? [] : [pen.tagId])))
+	);
+	const groupsById = $derived(new Map(collectionGroups.map((g) => [g.id, g])));
+	const connectionsById = $derived(new Map(connections.map((c) => [c.id, c])));
+
+	/**
+	 * 反映状態の判定に渡すタグ。収集グループや接続が無効なら、タグが有効でも収集の対象に
+	 * 入らず、再起動しても入らないので「無効」として扱う（「未反映」と言って「記録へ反映」を
+	 * 出さない）。
+	 */
+	function applyTagOf(
+		tagId: number
+	): { enabled: boolean; collectionGroupId: number; simulated: boolean | null } | undefined {
+		const tag = tagsById.get(tagId);
+		if (tag === undefined) return undefined;
+		const group = groupsById.get(tag.collectionGroupId);
+		const connection = group && connectionsById.get(group.plcConnectionId);
+		const enabled = tag.enabled && (group?.enabled ?? true) && (connection?.enabled ?? true);
+		const connKey = group === undefined ? null : `conn:${group.plcConnectionId}`;
+		// 走っている収集の接続の状態が分からないときは `null`（レジストリの値で代えない）。
+		const simulated = (connKey === null ? undefined : runningSimulation?.get(connKey)) ?? null;
+		return { enabled, collectionGroupId: tag.collectionGroupId, simulated };
+	}
+
+	/** `draft.pens` と同じ並びのペンごとの反映状態。 */
+	const penApplyStates = $derived(
+		draft.pens.map((pen) =>
+			penApplyState(
+				pen,
+				isPenUnsaved(pen, baselineTagIds),
+				pen.tagId === null ? undefined : applyTagOf(pen.tagId),
+				collectState
+			)
+		)
+	);
+	const band = $derived(
+		applyBand({ dirty, collect: collectState, states: penApplyStates, canWrite, busy: reflecting })
+	);
+
+	async function reflectToRecording(): Promise<void> {
+		const shown = band.reflect;
+		if (shown === null || shown.disabled || reflecting) return;
+		reflecting = true; // 取り直しの間も二重押しを防ぐ。
+		reflectNotice = null;
+		reflectError = null;
+		try {
+			// 確認の前に前提（収集の状態）を取り直す（`reflecting` の間は `reflect.disabled` が立つので見ない）。別クライアントで変わっていたら確認を出さない。
+			const adopted = await refreshCollectState();
+			const reflect = band.reflect;
+			const gate = reflectGate(adopted, disposed, shown, reflect, dirty);
+			if (gate === 'abort') return;
+			if (gate === 'unconfirmed') {
+				reflectNotice =
+					'収集の状態を確かめられませんでした。表示を確認してからもう一度押してください。';
+				return;
+			}
+			if (gate === 'changed' || reflect === null) {
+				reflectNotice = '収集の状態が変わりました。表示を確認してからもう一度押してください。';
+				return;
+			}
+			if (!window.confirm(reflect.confirm)) return;
+			await runReflect(reflect.action);
+		} finally {
+			reflecting = false;
+		}
+	}
+
+	async function runReflect(action: 'start' | 'restart'): Promise<void> {
+		collectGen++; // 操作中に飛んでいた取得の応答は、もう古い。
+		{
+			const outcome = await runWithLimit(
+				(signal) => runCollectAction(action, signal),
+				COLLECT_UI_TIMEOUT_MS
+			);
+			if (disposed) return; // 離れた後は状態も通知も書かず、取り直しも予約しない。
+			const display = collectOperationDisplay(
+				action,
+				outcome,
+				outcome.kind === 'failed' ? errorMessage(outcome.error) : null
+			);
+			reflectNotice = display.notice;
+			reflectError = display.error;
+			if (outcome.kind === 'ok') {
+				collectGen++;
+				collectState = toCollectStateView(outcome.value.status);
+			}
+			await refreshCollectState();
+			if (disposed) return;
+			// 受け付けただけ・打ち切りのときは、終わった頃にもう一度だけ取り直す。
+			if (outcome.kind === 'timedOut' || (outcome.kind === 'ok' && outcome.value.pending)) {
+				if (followUpTimer !== null) clearTimeout(followUpTimer);
+				followUpTimer = setTimeout(() => {
+					if (!disposed) void refreshCollectState();
+				}, 3000);
+			}
+		}
 	}
 
 	onMount(() => {
 		pageVisible = document.visibilityState === 'visible';
 		document.addEventListener('visibilitychange', onVisibilityChange);
+		void refreshCollectState();
 	});
 
 	onDestroy(() => {
+		disposed = true;
 		valuesPoller.stop();
+		collectGen++;
+		if (followUpTimer !== null) clearTimeout(followUpTimer);
+		clearStatusTimer();
 		if (typeof document !== 'undefined') {
 			document.removeEventListener('visibilitychange', onVisibilityChange);
 		}
@@ -1116,6 +1320,27 @@
 								</p>
 							{/if}
 
+							<div class="apply-band" data-testid="apply-band" data-kind={band.kind}>
+								<span class="apply-text" role="status">{band.text}</span>
+								{#if band.reflect !== null}
+									<button
+										type="button"
+										data-testid="apply-reflect"
+										onclick={() => void reflectToRecording()}
+										disabled={band.reflect.disabled}
+										title={band.reflect.title ?? undefined}
+									>
+										{band.reflect.label}
+									</button>
+								{/if}
+							</div>
+							{#if reflectNotice}
+								<p class="note" role="status">{reflectNotice}</p>
+							{/if}
+							{#if reflectError}
+								<p class="load-error" role="alert">{reflectError}</p>
+							{/if}
+
 							<div class="actions">
 								{#if canWrite}
 									<button type="button" class="primary" onclick={() => void save()} disabled={busy}>
@@ -1193,6 +1418,15 @@
 																		: tagLabel(pen.tagId)}
 																{#if pen.hubTag !== null}
 																	<span class="unreg-badge">未登録（保存で記録に追加）</span>
+																{/if}
+																{#if penApplyStates[index]?.label}
+																	<span
+																		class="apply-badge"
+																		data-testid="pen-apply-state"
+																		data-kind={penApplyStates[index].kind}
+																	>
+																		{penApplyStates[index].label}
+																	</span>
 																{/if}
 															</span>
 															{@const cell = valueCell(
@@ -1780,6 +2014,32 @@
 	}
 
 	.pen-value-text {
+		font-weight: 600;
+	}
+
+	.apply-band {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		flex-wrap: wrap;
+		font-size: 0.85rem;
+	}
+
+	.apply-band[data-kind='editing'] .apply-text,
+	.apply-band[data-kind='pending'] .apply-text {
+		color: var(--banto-warning);
+		font-weight: 600;
+	}
+
+	.apply-badge {
+		font-size: 0.75rem;
+		color: var(--banto-text-muted);
+	}
+
+	.apply-badge[data-kind='unsaved'],
+	.apply-badge[data-kind='pending'],
+	.apply-badge[data-kind='excluded'] {
+		color: var(--banto-warning);
 		font-weight: 600;
 	}
 
