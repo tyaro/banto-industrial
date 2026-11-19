@@ -3,6 +3,7 @@
  */
 
 import type { TrendSeries } from './data';
+import { binEndMs } from './geometry';
 import { formatValue, MISSING_TEXT, type Bin, type TrendPen } from './pens';
 import type { TimeRange } from './range';
 
@@ -10,7 +11,7 @@ const fin = (v: number | null | undefined): v is number =>
 	typeof v === 'number' && Number.isFinite(v);
 
 /**
- * `tMs` を含む区間（`[b.tMs, b.tMs + binMs)`）。`bins` は `tMs` の昇順（契約）。
+ * `tMs` を含む区間（`[b.tMs, min(b.tMs + binMs, 次の区間の tMs))`）。`bins` は `tMs` の昇順（契約）。
  * 範囲外・欠測（有限の値が無い）は null。
  */
 export function binAt(bins: readonly Bin[], binMs: number, tMs: number): Bin | null {
@@ -29,7 +30,7 @@ export function binAt(bins: readonly Bin[], binMs: number, tMs: number): Bin | n
 	}
 	if (found < 0) return null;
 	const b = bins[found];
-	if (tMs >= b.tMs + binMs) return null;
+	if (tMs >= binEndMs(b.tMs, binMs, bins[found + 1]?.tMs)) return null;
 	if (!fin(b.min) && !fin(b.max)) return null;
 	return b;
 }

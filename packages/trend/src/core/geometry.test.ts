@@ -125,11 +125,58 @@ describe('visibleBins / hasFiniteValue', () => {
 
 	it('範囲の端をまたぐ区間は残る', () => {
 		const bins: Bin[] = [
+			{ tMs: 70, min: 1, max: 2 },
 			{ tMs: 90, min: 1, max: 2 },
-			{ tMs: 100, min: 1, max: 2 },
 			{ tMs: 190, min: 1, max: 2 },
 			{ tMs: 200, min: 1, max: 2 }
 		];
-		expect(visibleBins(bins, 20, range).map((b) => b.tMs)).toEqual([90, 100, 190]);
+		// 70 は [70, 90) で範囲の外。90 は [90, 110) で端をまたぐ。190 は [190, 200)。
+		expect(visibleBins(bins, 20, range).map((b) => b.tMs)).toEqual([90, 190]);
+	});
+});
+
+describe('区間の終わりは次の区間の始まりで打ち切る', () => {
+	// 収集周期が途中で変わり、binMs（最大の周期）より狭い間隔の点が並ぶ。
+	const bins: Bin[] = [
+		{ tMs: 1000, min: 5, max: 6 },
+		{ tMs: 11000, min: null, max: null },
+		{ tMs: 21000, min: null, max: null }
+	];
+	const range = { startMs: 30000, endMs: 60000 };
+
+	it('欠測の期間の中に前の値が残らない（visibleBins・envelopePath・縦軸）', () => {
+		const v = visibleBins(bins, 60000, range);
+		expect(v.map((b) => b.tMs)).not.toContain(1000);
+		expect(hasFiniteValue(v)).toBe(false);
+		expect(envelopePath(bins, 60000, x, y, range)).toBe('');
+	});
+
+	it('最後の区間は tMs + binMs のまま（次が無ければ打ち切らない）', () => {
+		const one: Bin[] = [{ tMs: 1000, min: 5, max: 6 }];
+		expect(visibleBins(one, 60000, range).length).toBe(1);
+		expect(visibleBins(one, 60000, { startMs: 30000, endMs: 70000 }).length).toBe(1);
+		expect(visibleBins(one, 60000, { startMs: 61000, endMs: 70000 }).length).toBe(0);
+	});
+
+	it('間隔が binMs と同じ普通の列では結果が変わらず、絞った列を渡しても同じ', () => {
+		const normal: Bin[] = [
+			{ tMs: 0, min: 10, max: 20 },
+			{ tMs: 10, min: 15, max: 30 },
+			{ tMs: 20, min: 0, max: 18 }
+		];
+		const r = { startMs: 5, endMs: 25 };
+		const full = envelopePath(normal, 10, x, y, r);
+		expect(full).toBe(envelopePath(visibleBins(normal, 10, r), 10, x, y, r));
+		expect(envelopePath(normal, 10, x, y)).toBe('M5,90L5,80L15,85L15,70L25,82L25,100');
+	});
+
+	it('中央の x は次の点で打ち切った範囲の中央', () => {
+		const b: Bin[] = [
+			{ tMs: 0, min: 10, max: 10 },
+			{ tMs: 4, min: 20, max: 20 }
+		];
+		// 1 点目は [0, 4) の中央 2、2 点目は [4, 14) の中央 9。
+		expect(envelopePath(b, 10, x, y)).toBe('M2,90L9,80');
+		expect(envelopePath(b, 10, x, y, { startMs: 0, endMs: 100 })).toBe('M2,90L9,80');
 	});
 });

@@ -11,6 +11,17 @@ const bins: Bin[] = [
 ];
 
 describe('binAt', () => {
+	it('次の点より後の時刻では前の区間を返さない（周期が途中で変わる列）', () => {
+		const b: Bin[] = [
+			{ tMs: 0, min: 1, max: 2 },
+			{ tMs: 4, min: null, max: null },
+			{ tMs: 8, min: 3, max: 4 }
+		];
+		expect(binAt(b, 10, 3)).toBe(b[0]);
+		expect(binAt(b, 10, 4)).toBeNull();
+		expect(binAt(b, 10, 7)).toBeNull();
+		expect(binAt(b, 10, 9)).toBe(b[2]);
+	});
 	it('tMs を含む区間を返す', () => {
 		expect(binAt(bins, 10, 0)).toBe(bins[0]);
 		expect(binAt(bins, 10, 9.9)).toBe(bins[0]);

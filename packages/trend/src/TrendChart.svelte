@@ -8,9 +8,14 @@
     ドラッグで横のパン。素のホイールはページのスクロールに任せる。キーボードは ← → で
     幅の 10% のパン、+ / - で中央基準の拡大・縮小、Esc でカーソルを消す。
   - 色はペンの `penColorVar`、文字・線・背景は `--banto-*` のトークンだけ。
+  - 帯（`bands`）は指定したペンの縦軸で、描画域の背景（線の下）に描く（`core/bands.ts`）。
+  - 凡例は `onPenSelect` を渡すとペンを選ぶボタンになる（押した印は `selectedPenId`、
+    利用側の印は `legendBadge`）。どのペンを選ぶと何が変わるかは利用側が決める。
 -->
 <script lang="ts">
+	import type { Snippet } from 'svelte';
 	import { linearScale, niceTicks } from '@banto/charts';
+	import { bandLayout, type TrendBands } from './core/bands';
 	import { cursorReadout } from './core/cursor';
 	import { drawableSeries, type TrendData } from './core/data';
 	import { envelopePath, hasFiniteValue } from './core/geometry';
@@ -37,6 +42,16 @@
 		/** パンの丸めに使う今（既定は Date.now()）。 */
 		nowMs?: number;
 		onRangeChange?: (range: TimeRange) => void;
+		/** 横の帯（しきい値など）。`penId` のペンの縦軸で、線の下に描く。 */
+		bands?: TrendBands | null;
+		/** 凡例のペンを押したとき。渡すと凡例の各項目がボタンになる。 */
+		onPenSelect?: (penId: string) => void;
+		/** 凡例で押した印を付けるペン（`onPenSelect` を渡したときだけ使う）。 */
+		selectedPenId?: string | null;
+		/** 凡例の一覧の名前（aria-label）。 */
+		legendLabel?: string;
+		/** 凡例の項目の末尾に足す、利用側の印。 */
+		legendBadge?: Snippet<[TrendPen]>;
 	}
 
 	let {
@@ -49,7 +64,12 @@
 		loading = false,
 		emptyMessage = 'この期間のデータはありません',
 		nowMs,
-		onRangeChange
+		onRangeChange,
+		bands = null,
+		onPenSelect,
+		selectedPenId = null,
+		legendLabel = '凡例',
+		legendBadge
 	}: Props = $props();
 
 	const uid = $props.id();
@@ -99,6 +119,7 @@
 				})
 			: []
 	);
+	const bandRectList = $derived(valid ? bandLayout(bands, pens, domains, plotHeight) : []);
 	const xTicks = $derived(valid ? timeTicks(range, plotWidth) : []);
 	const yTickCount = $derived(Math.max(2, Math.floor(plotHeight / 40)));
 
@@ -305,6 +326,16 @@
 				{/if}
 
 				<g clip-path="url(#{uid}-clip)">
+					{#each bandRectList as b, i (i)}
+						<rect
+							class="bi-trend__band"
+							x="0"
+							y={b.y}
+							width={plotWidth}
+							height={b.height}
+							fill={b.colorVar}><title>{b.label}</title></rect
+						>
+					{/each}
 					{#each pens as pen, i (pen.id)}
 						{#if paths[i]}
 							<path class="bi-trend__line" d={paths[i]} stroke={penColorVar(pen.colorSlot)} />
@@ -332,15 +363,20 @@
 	<p class="bi-trend__sr" aria-live="polite">{loading ? '読み込み中' : ''}</p>
 
 	{#if pens.length > 0}
-		<ul class="bi-trend__legend">
+		<ul class="bi-trend__legend" aria-label={legendLabel}>
 			{#each pens as pen, i (pen.id)}
 				<li class="bi-trend__legend-item">
-					<span class="bi-trend__swatch" style:background={penColorVar(pen.colorSlot)}></span>
-					<span class="bi-trend__legend-label">{pen.label}</span>
-					{#if pen.axis === 'right'}<span class="bi-trend__muted">（右軸）</span>{/if}
-					<span class="bi-trend__muted">{rangeText(pen, domains[i])}</span>
-					{#if readout}
-						<span class="bi-trend__value">{readout[i].text}</span>
+					{#if onPenSelect}
+						<button
+							type="button"
+							class="bi-trend__legend-button"
+							aria-pressed={selectedPenId === pen.id}
+							onclick={() => onPenSelect(pen.id)}
+						>
+							{@render legendBody(pen, i)}
+						</button>
+					{:else}
+						{@render legendBody(pen, i)}
 					{/if}
 				</li>
 			{/each}
@@ -350,6 +386,17 @@
 		<p class="bi-trend__cursor-time">{formatDateTime(cursorMs, true)}</p>
 	{/if}
 </div>
+
+{#snippet legendBody(pen: TrendPen, i: number)}
+	<span class="bi-trend__swatch" style:background={penColorVar(pen.colorSlot)}></span>
+	<span class="bi-trend__legend-label">{pen.label}</span>
+	{#if pen.axis === 'right'}<span class="bi-trend__muted">（右軸）</span>{/if}
+	<span class="bi-trend__muted">{rangeText(pen, domains[i])}</span>
+	{#if readout}
+		<span class="bi-trend__value">{readout[i].text}</span>
+	{/if}
+	{#if legendBadge}{@render legendBadge(pen)}{/if}
+{/snippet}
 
 <style>
 	.bi-trend {
@@ -397,6 +444,9 @@
 		stroke-linecap: round;
 		vector-effect: non-scaling-stroke;
 	}
+	.bi-trend__band {
+		opacity: 0.12;
+	}
 	.bi-trend__cursor {
 		stroke: var(--banto-text-muted);
 		stroke-width: 1;
@@ -419,6 +469,26 @@
 		display: inline-flex;
 		align-items: center;
 		gap: var(--banto-space-1);
+	}
+	.bi-trend__legend-button {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--banto-space-1);
+		padding: 0.1rem 0.4rem;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
+		background: transparent;
+		color: var(--banto-text-muted);
+		font: inherit;
+		cursor: pointer;
+	}
+	.bi-trend__legend-button[aria-pressed='true'] {
+		border-color: var(--banto-text);
+		color: var(--banto-text);
+	}
+	.bi-trend__legend-button:focus-visible {
+		outline: none;
+		box-shadow: var(--banto-focus-ring);
 	}
 	.bi-trend__swatch {
 		display: inline-block;

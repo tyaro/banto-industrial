@@ -13,6 +13,7 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@banto-industrial/trend": "workspace:*",
     "@banto/admin-core": "github:tyaro/banto#v7.8.0&path:packages/admin-core",
     "@banto/charts": "github:tyaro/banto#v7.8.0&path:packages/charts",
     "@banto/forms": "github:tyaro/banto#v7.8.0&path:packages/forms",

@@ -227,6 +227,34 @@ test.describe.serial('chronogazer 「表示グループ」ページ（#393）', 
 		await expect(pane2.getByLabel('ペン 2 の色')).toHaveValue('5');
 	});
 
+	// #1231 PR 2b: ヒストリカル画面は共通の部品 `TrendChart` で描く。作ったグループのペンが
+	// 図（role="application"）と凡例（押すとしきい値の帯のペンを選ぶボタン）に出ることだけを見る
+	// （記録は無いので線は出ない）。終わったら表示グループのページへ戻し、次の試験の前提を保つ。
+	test('2-2. ヒストリカル画面で、作ったグループが共通のトレンドの図で開く', async () => {
+		await page
+			.locator('aside nav')
+			.getByRole('link', { name: /ヒストリカル/ })
+			.click();
+		await expect(page).toHaveURL(/\/historical/);
+		await page.getByRole('tab', { name: GROUP_NAME }).click();
+		await expect(page).toHaveURL(/\/historical\?group=\d+&from=\d+&to=\d+$/);
+		await expect(
+			page.getByRole('application', { name: `${GROUP_NAME} のヒストリカル` })
+		).toBeVisible();
+		const legend = page.getByRole('list', {
+			name: 'ペン（押すと、しきい値の帯をそのペンで表示します）'
+		});
+		await expect(legend.getByRole('button')).toHaveCount(2);
+		await expect(legend.getByRole('button', { name: new RegExp(TAG_A) })).toBeVisible();
+
+		await page
+			.locator('aside nav')
+			.getByRole('link', { name: /表示グループ/ })
+			.click();
+		await expect(page).toHaveURL(/\/groups/);
+		await openGroupSettings(page, GROUP_NAME);
+	});
+
 	test('3. 編集（種別を計器へ・ペン 2 を外す）を保存し、再読み込み後も残る', async () => {
 		await openSettingsTab(page);
 		await center().getByLabel('表示種別').selectOption({ label: '計器' });

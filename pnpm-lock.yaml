@@ -99,6 +99,9 @@ importers:
 
   apps/chronogazer:
     dependencies:
+      '@banto-industrial/trend':
+        specifier: workspace:*
+        version: link:../../packages/trend
       '@banto/admin-core':
         specifier: github:tyaro/banto#v7.8.0&path:packages/admin-core
         version: https://codeload.github.com/tyaro/banto/tar.gz/8e76b3222255b075db4e06af89805f8990d09856#path:packages/admin-core

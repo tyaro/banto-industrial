@@ -2,37 +2,52 @@
  * ヒストリカル画面のロジック（`historyLogic.ts`）のテスト。
  *
  * - 期間の検証（前後・31 日）・「前へ / 次へ」（現在を超えない）・URL の読み書き（おかしければ既定）。
- * - `bins` は描画幅・2000・ペン数 × bins ≤ 8000 に収まり、行数（bins の 2 倍）が描画幅を超えない。
- * - 格子は包絡（区間の最小・最大）で、欠測は `null`、系列ごとの時刻・`binMs` の違いを吸収する。
+ * - `bins` は描画幅・2000・ペン数 × bins ≤ 8000 に収まる。
+ * - 期間の 2 つの形（両端を含む ⇔ 半開区間）の変換、ペンの ID、部品の `TrendFetch` の形
+ *   （ペンごとの系列・API の `binMs`・`unknownTagIds` の付帯情報・`ready` でないときの失敗）。
  */
 import { describe, expect, it } from 'vitest';
 import { ProviderError } from '@banto/admin-core';
-import { HISTORY_MAX_BINS, HISTORY_MAX_POINTS, HISTORY_MAX_WINDOW_MS } from '../banto/collectAdmin';
-import { trendPlotWidthPx } from '../monitor/trendLogic';
+import {
+	HISTORY_MAX_BINS,
+	HISTORY_MAX_POINTS,
+	HISTORY_MAX_WINDOW_MS,
+	type CollectHistory,
+	type CollectHistoryParams,
+	type Readout
+} from '../banto/collectAdmin';
 import {
 	HISTORY_LIMIT_MESSAGE,
 	HISTORY_PRESETS,
 	RANGE_INVALID_MESSAGE,
 	RANGE_ORDER_MESSAGE,
 	RANGE_TOO_WIDE_MESSAGE,
+	HistoryUnavailableError,
 	activePresetWidth,
-	buildHistoryGrid,
 	canShiftNext,
 	checkRange,
+	createHistoryFetch,
 	defaultRange,
 	fromLocalInputValue,
 	historyBins,
+	historyDescription,
 	historyErrorMessage,
+	historyExtent,
+	historyPenId,
 	historyQuery,
 	historyRequestFor,
-	historyTimeLabel,
-	isEmptyGrid,
+	historyTrendPens,
 	parseMsParam,
 	presetRange,
 	resolveRange,
+	sameHistoryRange,
 	shiftRange,
+	tagIdOfPenId,
+	toHistoryRange,
 	toLocalInputValue,
-	unknownTagsNote
+	toTimeRange,
+	unknownTagsNote,
+	type HistoryExtras
 } from './historyLogic';
 
 const NOW = 1_800_000_000_000;
@@ -176,17 +191,16 @@ describe('URL の読み書き', () => {
 });
 
 describe('historyBins / historyRequestFor', () => {
-	it('行数（bins の 2 倍）が描画域の幅を超えない', () => {
+	it('区間の数が描画域の幅を超えない', () => {
 		for (const width of [200, 400, 800, 1200, 1900, 4000]) {
 			for (const tags of [1, 3, 8]) {
-				const bins = historyBins(width, tags);
-				expect(bins * 2).toBeLessThanOrEqual(Math.max(2, trendPlotWidthPx(width)));
+				expect(historyBins(width, tags)).toBeLessThanOrEqual(width);
 			}
 		}
 	});
 
 	it('2000 以下・ペン数 × bins ≤ 8000 に収まる', () => {
-		for (const width of [100, 1000, 5000, 20000]) {
+		for (const width of [0, 1, 100, 1000, 5000, 20000]) {
 			for (let tags = 1; tags <= 8; tags++) {
 				const bins = historyBins(width, tags);
 				expect(bins).toBeGreaterThanOrEqual(1);
@@ -197,7 +211,8 @@ describe('historyBins / historyRequestFor', () => {
 	});
 
 	it('50 以上は 25 刻み（リサイズのたびに読み直さない）', () => {
-		expect(historyBins(1000, 2) % 25).toBe(0);
+		expect(historyBins(1013, 2)).toBe(1000);
+		expect(historyBins(49, 1)).toBe(49);
 	});
 
 	it('要求はタグの重複を除き、8 本までに切る', () => {
@@ -215,122 +230,144 @@ describe('historyBins / historyRequestFor', () => {
 	});
 });
 
-describe('buildHistoryGrid', () => {
-	const range = { fromMs: 1000, toMs: 1999 }; // 幅 1000 ms（両端を含む）
+describe('期間の 2 つの形（両端を含む ⇔ 半開区間）', () => {
+	it('toTimeRange は終わりを 1 ms 先にし、toHistoryRange で戻る', () => {
+		const r = { fromMs: 1000, toMs: 1999 };
+		expect(toTimeRange(r)).toEqual({ startMs: 1000, endMs: 2000 });
+		expect(toHistoryRange(toTimeRange(r))).toEqual(r);
+		expect(sameHistoryRange(r, { fromMs: 1000, toMs: 1999 })).toBe(true);
+		expect(sameHistoryRange(r, { fromMs: 1000, toMs: 2000 })).toBe(false);
+	});
 
-	it('区間 k は 2 行（最小・最大）で、行数は bins の 2 倍', () => {
-		const grid = buildHistoryGrid(range, 10, [1], {
-			series: [
-				{
-					tagId: 1,
-					simulation: false,
-					binMs: 100,
-					points: [
-						{ tMs: 1000, min: 1, max: 5 },
-						{ tMs: 1100, min: 2, max: 3 }
+	it('31 日ちょうどの期間は、戻しても 31 日以内のまま', () => {
+		const r = { fromMs: NOW - HISTORY_MAX_WINDOW_MS, toMs: NOW };
+		expect(checkRange(toHistoryRange(toTimeRange(r))).ok).toBe(true);
+	});
+});
+
+describe('ペンの ID と部品のペン', () => {
+	it('並びとタグ ID から作り、同じタグが 2 回でも衝突しない', () => {
+		expect(historyPenId(0, 7)).not.toBe(historyPenId(1, 7));
+		expect(tagIdOfPenId(historyPenId(3, 42))).toBe(42);
+		expect(tagIdOfPenId('pen-x')).toBeNull();
+	});
+
+	it('色の枠・名前・小数桁を写し、bit は縦軸 0〜1', () => {
+		const pens = historyTrendPens([
+			{
+				tagId: 1,
+				name: '炉温',
+				unit: '℃',
+				decimals: 1,
+				isBit: false,
+				colorSlot: 3,
+				thresholds: null
+			},
+			{
+				tagId: 2,
+				name: '運転',
+				unit: null,
+				decimals: null,
+				isBit: true,
+				colorSlot: 1,
+				thresholds: null
+			}
+		]);
+		expect(pens[0]).toEqual({
+			id: historyPenId(0, 1),
+			label: '炉温（℃）',
+			colorSlot: 3,
+			decimals: 1
+		});
+		expect(pens[1]).toMatchObject({ id: historyPenId(1, 2), yMin: 0, yMax: 1, decimals: 0 });
+	});
+});
+
+describe('createHistoryFetch', () => {
+	const signal = new AbortController().signal;
+	const ready = (data: CollectHistory): Readout<CollectHistory> => ({ state: 'ready', data });
+
+	it('タグの重複を除いて 1 回で読み、ペンごとの系列（昇順・API の binMs）にする', async () => {
+		const calls: CollectHistoryParams[] = [];
+		const extras = new WeakMap<object, HistoryExtras>();
+		const fetch = createHistoryFetch(async (params) => {
+			calls.push(params);
+			return ready({
+				fromMs: 1000,
+				toMs: 1999,
+				series: [
+					{
+						tagId: 5,
+						simulation: false,
+						binMs: 60_000,
+						points: [
+							{ tMs: 1500, min: 2, max: 3 },
+							{ tMs: 1000, min: 1, max: 1 }
+						]
+					}
+				],
+				unknownTagIds: [9]
+			});
+		}, extras);
+		const ids = [historyPenId(0, 5), historyPenId(1, 5), historyPenId(2, 9)];
+		const out = await fetch({
+			range: { startMs: 1000, endMs: 2000 },
+			penIds: ids,
+			bins: 10,
+			signal
+		});
+		expect(calls).toEqual([{ tagIds: [5, 9], fromMs: 1000, toMs: 1999, bins: 10 }]);
+		expect(out[ids[0]]).toEqual({
+			binMs: 60_000,
+			bins: [
+				{ tMs: 1000, min: 1, max: 1 },
+				{ tMs: 1500, min: 2, max: 3 }
+			]
+		});
+		expect(out[ids[1]]).toEqual(out[ids[0]]);
+		expect(out[ids[2]]).toBeUndefined();
+		expect(extras.get(out)).toEqual({ unknownTagIds: [9] });
+	});
+
+	it('ready でなければ HistoryUnavailableError を投げる（空に潰さない）', async () => {
+		const fetch = createHistoryFetch(async () => ({ state: 'unavailable' }), new WeakMap());
+		await expect(
+			fetch({ range: { startMs: 0, endMs: 10 }, penIds: [historyPenId(0, 1)], bins: 1, signal })
+		).rejects.toBeInstanceOf(HistoryUnavailableError);
+	});
+});
+
+describe('説明文', () => {
+	it('表示中の値の範囲は取得範囲 ∩ 表示範囲だけを見る', () => {
+		const data = {
+			range: { startMs: 0, endMs: 2000 },
+			series: {
+				a: {
+					binMs: 1000,
+					bins: [
+						{ tMs: 0, min: 1, max: 2 },
+						{ tMs: 1000, min: 5, max: 9 }
 					]
 				}
-			]
-		});
-		expect(grid.stepMs).toBe(100);
-		expect(grid.bins).toBe(10);
-		expect(grid.rows).toHaveLength(20);
-		expect(grid.rows[0]).toEqual({ t: 1000, values: [1] });
-		expect(grid.rows[1]).toEqual({ t: 1050, values: [5] });
-		expect(grid.rows[2].values).toEqual([2]);
-		expect(grid.rows[3].values).toEqual([3]);
-		// 点の無い区間は欠測（0 にしない）。
-		expect(grid.rows[4].values).toEqual([null]);
-		expect(grid.rows[5].values).toEqual([null]);
+			}
+		};
+		expect(historyExtent(data, { startMs: 0, endMs: 2000 })).toEqual({ min: 1, max: 9 });
+		expect(historyExtent(data, { startMs: 1000, endMs: 2000 })).toEqual({ min: 5, max: 9 });
+		expect(historyExtent(null, { startMs: 0, endMs: 2000 })).toBeNull();
 	});
 
-	it('欠測の点（null）・非有限は線を切る', () => {
-		const grid = buildHistoryGrid(range, 10, [1], {
-			series: [
-				{
-					tagId: 1,
-					simulation: false,
-					binMs: 100,
-					points: [
-						{ tMs: 1000, min: null, max: null },
-						{ tMs: 1100, min: Number.NaN, max: 4 }
-					]
-				}
-			]
-		});
-		expect(isEmptyGrid(grid)).toBe(true);
-	});
-
-	it('同じ区間に重なる点は最小の最小・最大の最大にする（山を落とさない）', () => {
-		const grid = buildHistoryGrid(range, 2, [1], {
-			series: [
-				{
-					tagId: 1,
-					simulation: false,
-					binMs: 10,
-					points: [
-						{ tMs: 1000, min: 3, max: 4 },
-						{ tMs: 1010, min: 1, max: 9 },
-						{ tMs: 1020, min: 5, max: 6 }
-					]
-				}
-			]
-		});
-		expect(grid.rows[0].values).toEqual([1]);
-		expect(grid.rows[1].values).toEqual([9]);
-	});
-
-	it('系列ごとに binMs・時刻が違っても、ペンの列に正しく入る', () => {
-		const grid = buildHistoryGrid(range, 10, [1, 2], {
-			series: [
-				{ tagId: 1, simulation: false, binMs: 100, points: [{ tMs: 1000, min: 1, max: 2 }] },
-				// 粗い系列: 300 ms 幅の点 1 つが 3 区間にまたがる。
-				{ tagId: 2, simulation: false, binMs: 300, points: [{ tMs: 1200, min: 7, max: 8 }] }
-			]
-		});
-		expect(grid.rows[0].values).toEqual([1, null]);
-		expect(grid.rows[4].values).toEqual([null, 7]);
-		expect(grid.rows[8].values).toEqual([null, 7]);
-		expect(grid.rows[9].values).toEqual([null, 8]);
-		expect(grid.rows[10].values).toEqual([null, null]);
-	});
-
-	it('系列の無いペン（削除されたタグ）は null のまま', () => {
-		const grid = buildHistoryGrid(range, 4, [1, 99], {
-			series: [{ tagId: 1, simulation: false, binMs: 250, points: [{ tMs: 1000, min: 1, max: 1 }] }]
-		});
-		expect(grid.rows.every((row) => row.values[1] === null)).toBe(true);
-	});
-
-	it('期間の外の点は無視し、末尾を超えない', () => {
-		const grid = buildHistoryGrid(range, 10, [1], {
-			series: [
-				{
-					tagId: 1,
-					simulation: false,
-					binMs: 100,
-					points: [
-						{ tMs: 0, min: 1, max: 1 },
-						{ tMs: 1900, min: 4, max: 5 },
-						{ tMs: 5000, min: 9, max: 9 }
-					]
-				}
-			]
-		});
-		expect(grid.rows).toHaveLength(20);
-		expect(grid.rows[18].values).toEqual([4]);
-		expect(grid.rows[19].values).toEqual([5]);
+	it('値が無ければその旨、帯のペンを言う', () => {
+		const range = { fromMs: 0, toMs: HOUR };
+		expect(
+			historyDescription({ range, penLabels: ['A'], extent: null, bandPenName: null })
+		).toContain('この期間に表示できる値はありません。しきい値の帯: なし。');
+		expect(
+			historyDescription({ range, penLabels: ['A'], extent: { min: 1, max: 2 }, bandPenName: 'A' })
+		).toContain('表示中の値の範囲は 1〜2。しきい値の帯: A。');
 	});
 });
 
 describe('表示・エラーの文言', () => {
-	it('時刻の書式は期間で変わる', () => {
-		const at = new Date(2026, 10, 19, 9, 5, 7).getTime();
-		expect(historyTimeLabel(at, HOUR)).toBe('09:05:07');
-		expect(historyTimeLabel(at, 8 * HOUR)).toBe('09:05');
-		expect(historyTimeLabel(at, 7 * 24 * HOUR)).toBe('11/19 09:05');
-	});
-
 	it('422（validation）は日本語の案内にする', () => {
 		const err = new ProviderError({ kind: 'validation', field_errors: [] });
 		expect(historyErrorMessage(err)).toBe(HISTORY_LIMIT_MESSAGE);
@@ -345,96 +382,5 @@ describe('表示・エラーの文言', () => {
 	it('不明なタグの注記は名前を挙げ、無ければ null', () => {
 		expect(unknownTagsNote([], (id) => String(id))).toBeNull();
 		expect(unknownTagsNote([3, 4], (id) => `タグ ID ${id}`)).toContain('タグ ID 3、タグ ID 4');
-	});
-});
-
-describe('buildHistoryGrid: 収集周期が区間より長いタグ', () => {
-	// 1 時間窓・600 区間 = 1 区間 6 秒。周期 60 秒で点は 60 秒ごと。
-	const range = { fromMs: 0, toMs: 3_599_999 };
-	const series = (points: { tMs: number; min: number | null; max: number | null }[]) => ({
-		series: [{ tagId: 1, simulation: false, binMs: 6000, points }]
-	});
-	const at = (k: number) => 60_000 * k;
-	const filled = (grid: ReturnType<typeof buildHistoryGrid>, from: number, to: number) =>
-		grid.rows.slice(from * 2, to * 2).every((row) => row.values[0] !== null);
-
-	it('周期が無いと、点の間の区間は null（従来どおり）', () => {
-		const grid = buildHistoryGrid(
-			range,
-			600,
-			[1],
-			series([
-				{ tMs: at(0), min: 1, max: 2 },
-				{ tMs: at(1), min: 3, max: 4 }
-			])
-		);
-		expect(grid.rows[2].values).toEqual([null]); // 区間 1
-	});
-
-	it('周期 60 秒なら、次の点まで区間が埋まって null にならない', () => {
-		const grid = buildHistoryGrid(
-			range,
-			600,
-			[1],
-			series([
-				{ tMs: at(0), min: 1, max: 2 },
-				{ tMs: at(1), min: 3, max: 4 }
-			]),
-			() => 60_000
-		);
-		expect(filled(grid, 0, 10)).toBe(true); // 区間 0〜9 = 最初の 60 秒
-		expect(grid.rows[0].values).toEqual([1]);
-		expect(grid.rows[19].values).toEqual([2]);
-		expect(grid.rows[20].values).toEqual([3]); // 区間 10 = 2 点目
-		// 最後の点は周期分だけ延びる。その先は null。
-		expect(filled(grid, 10, 20)).toBe(true);
-		expect(grid.rows[40].values).toEqual([null]);
-	});
-
-	it('サーバーの欠測点がある区間は、周期でも埋めず null のまま', () => {
-		const grid = buildHistoryGrid(
-			range,
-			600,
-			[1],
-			series([
-				{ tMs: at(0), min: 1, max: 2 },
-				{ tMs: at(1), min: null, max: null },
-				{ tMs: at(2), min: 5, max: 6 }
-			]),
-			() => 60_000
-		);
-		expect(filled(grid, 0, 10)).toBe(true);
-		expect(grid.rows[20].values).toEqual([null]); // 区間 10（欠測点）
-		expect(grid.rows[38].values).toEqual([null]); // 区間 19
-		expect(grid.rows[40].values).toEqual([5]); // 区間 20
-	});
-
-	it('点の間隔が binMs より狭くても、欠測の点の区間は null（周期を途中で変えた素通し）', () => {
-		// binMs = 60 秒。良い点 1 秒、欠測の点 11 秒・21 秒。1 区間 6 秒。
-		const grid = buildHistoryGrid(
-			range,
-			600,
-			[1],
-			{
-				series: [
-					{
-						tagId: 1,
-						simulation: false,
-						binMs: 60_000,
-						points: [
-							{ tMs: 1000, min: 1, max: 2 },
-							{ tMs: 11_000, min: null, max: null },
-							{ tMs: 21_000, min: null, max: null }
-						]
-					}
-				]
-			},
-			() => 60_000
-		);
-		expect(grid.rows[0].values).toEqual([1]); // 区間 0
-		expect(grid.rows[2].values).toEqual([1]); // 区間 1（〜11 秒）
-		expect(grid.rows[4].values).toEqual([null]); // 区間 2（12 秒〜）
-		expect(grid.rows[8].values).toEqual([null]); // 区間 4
-		expect(grid.rows[20].values).toEqual([null]); // 区間 10（60 秒）
 	});
 });

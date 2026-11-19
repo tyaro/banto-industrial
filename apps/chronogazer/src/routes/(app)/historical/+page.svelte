@@ -1,32 +1,39 @@
 <script lang="ts">
 	/**
-	 * ヒストリカル画面（#1207 の R2、PR2。recorder-requirements.md §3.3）。表示グループを
-	 * 選び、期間を指定して、記録した値を最小・最大の包絡で描く。
+	 * ヒストリカル画面（#1207 の R2・#1231 の PR 2b。recorder-requirements.md §3.3、
+	 * trend-design.md §10）。表示グループを選び、期間を指定して、記録した値を最小・最大の
+	 * 包絡で描く。描画は共通の部品 `TrendChart`（`@banto-industrial/trend`）。
 	 *
 	 * - **描くタグは表示グループで決める**（2026-11-19 オーナー決定）。ペンの割当て・色・
-	 *   しきい値の帯は監視画面と同じ（`trendPenInfos`・`HistoryPanel`）。タグをその場で
-	 *   足し引きしない。
+	 *   しきい値の帯は監視画面と同じ（`trendPenInfos`・`thresholdBands`・`resolveBandPen`）。
+	 *   タグをその場で足し引きしない。帯のペンは凡例を押して選ぶ。
 	 * - **期間は 31 日まで**。候補（1・8・24 時間・7・31 日）・任意の開始/終了・前へ/次へ。
 	 *   外れたら読みに行かず、日本語で案内する（`checkRange`）。サーバーの 422 も日本語。
+	 * - **拡大・縮小・パンで読み直す**: 図の操作（Ctrl+ホイール・Shift+ホイール・ドラッグ・
+	 *   キー）は画面の表示範囲（`view`）をすぐ変え、`createRangeLoader` が 300ms 束ねて読み直す
+	 *   （古い要求は abort し、遅れた結果は捨てる）。
 	 * - **URL が状態の持ち主**（`?group=<id>&from=<ms>&to=<ms>`）。戻る・進む・再読み込みで
 	 *   同じ表示に戻る。値がおかしければ既定（先頭のグループ・直近 1 時間）。履歴の積み方:
 	 *   グループ・候補・期間の適用・前へ/次へは**積む**（どれも「別の表示」で、戻るで前の
-	 *   表示に戻れる）。リサイズによる読み直しは URL に触れない。
-	 * - 読み直しは 300ms 束ね、要求の世代が古い応答は捨てる（`#generation` と同じ作法）。
-	 * - ズーム・パンは作っていない: `@banto/charts` の `LineChart` の `zoomable` は読み込み済みの
-	 *   行の添字の中で拡大するだけで、範囲の変化を通知する口が無く、拡大した範囲を読み直せない。
+	 *   表示に戻れる）。拡大・縮小・パンは止まってから（300ms）`goto` の `replace`
+	 *   （フォーカス・スクロールは `reset: false` で保つ）で URL を合わせ、**積まない**。自分で書いた URL では表示範囲を巻き戻さない（`selfWritten`）。
+	 *   リサイズによる読み直しは URL に触れない。
 	 */
 	import { onMount, untrack } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
+	import {
+		TrendChart,
+		createRangeLoader,
+		type TimeRange,
+		type TrendBands,
+		type TrendData,
+		type TrendPen
+	} from '@banto-industrial/trend';
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { canWriteResources } from '#lib/permissions.js';
 	import { resolveAppPath } from '#lib/navigation.js';
-	import {
-		getCollectHistory,
-		isCollectAvailable,
-		type CollectHistory
-	} from '#lib/banto/collectAdmin.js';
+	import { getCollectHistory, isCollectAvailable } from '#lib/banto/collectAdmin.js';
 	import {
 		DEMO_MODE_MESSAGE,
 		isTagRegistryAvailable,
@@ -47,12 +54,12 @@
 		type LoadResult
 	} from '#lib/monitor/monitorLogic.js';
 	import {
-		collectPeriodMsOf,
+		hasThresholds,
 		penLegendLabel,
 		resolveBandPen,
+		thresholdBands,
 		trendPenInfos
 	} from '#lib/monitor/trendLogic.js';
-	import HistoryPanel from '#lib/historical/HistoryPanel.svelte';
 	import ExportDialog from '#lib/historical/ExportDialog.svelte';
 	import {
 		HISTORY_DEBOUNCE_MS,
@@ -60,29 +67,37 @@
 		HISTORY_MAX_PENS,
 		HISTORY_PRESETS,
 		HISTORY_UNAVAILABLE_MESSAGE,
+		HISTORY_URL_SYNC_MS,
+		HistoryUnavailableError,
 		RANGE_INVALID_MESSAGE,
 		activePresetWidth,
-		buildHistoryGrid,
 		canShiftNext,
 		checkRange,
+		createHistoryFetch,
 		fromLocalInputValue,
 		historyDescription,
 		historyErrorMessage,
+		historyExtent,
 		historyQuery,
 		historyRequestFor,
-		isEmptyGrid,
+		historyTrendPens,
 		presetRange,
 		resolveRange,
+		sameHistoryRange,
 		shiftRange,
+		tagIdOfPenId,
+		toHistoryRange,
 		toLocalInputValue,
+		toTimeRange,
 		unknownTagsNote,
+		type HistoryExtras,
 		type HistoryRange
 	} from '#lib/historical/historyLogic.js';
 
 	const available = isTagRegistryAvailable() && isCollectAvailable();
 	const canEdit = $derived(canWriteResources(sessionStore.role) && !sessionStore.publicViewer);
 
-	// --- URL（グループ・期間） -------------------------------------------------
+	// --- URL（グループ・期間）と表示範囲 ------------------------------------------
 
 	/** URL に期間が無いときの既定の期間の基準（画面を開いた時刻で固定する）。 */
 	const mountedAt = Date.now();
@@ -95,12 +110,68 @@
 	const resolved = $derived(
 		resolveRange(page.url.searchParams.get('from'), page.url.searchParams.get('to'), mountedAt)
 	);
-	const range = $derived(resolved.range);
+	/** URL の期間。 */
+	const urlRange = $derived(resolved.range);
+
+	/**
+	 * 表示範囲（部品の半開区間）。URL の期間から作り、拡大・縮小・パンではこちらを先に
+	 * 変える（URL は止まってから合わせる）。
+	 */
+	let view = $state<TimeRange>(untrack(() => toTimeRange(urlRange)));
+	/** 表示範囲を両端を含む形にしたもの（入力欄・候補・前へ/次へ・CSV 出力・説明文）。 */
+	const range = $derived(toHistoryRange(view));
+
+	const rangeKey = (r: HistoryRange) => `${r.fromMs}:${r.toMs}`;
+	/** 自分が replaceState で書いた期間（URL の変化が届いたら 1 つずつ消す）。 */
+	const selfWritten = new Set<string>();
+	let urlSyncTimer: ReturnType<typeof setTimeout> | null = null;
+
+	function cancelUrlSync(): void {
+		if (urlSyncTimer !== null) {
+			clearTimeout(urlSyncTimer);
+			urlSyncTimer = null;
+		}
+	}
+
+	// URL の期間が変わったら、表示範囲を合わせる（戻る・進む・候補・前へ/次へ・グループ）。
+	// 自分が拡大・縮小・パンで書いた URL のときは合わせない（その間に表示範囲が先へ動いて
+	// いても巻き戻さない）。
+	$effect(() => {
+		const r = urlRange;
+		untrack(() => {
+			const key = rangeKey(r);
+			if (selfWritten.delete(key)) return;
+			// よそからの移動が勝つ: 書きかけの URL の合わせは捨てる。
+			cancelUrlSync();
+			selfWritten.clear();
+			if (!sameHistoryRange(toHistoryRange(view), r)) view = toTimeRange(r);
+		});
+	});
 
 	/** 履歴を積んで移る（グループ・期間のどちらも URL が持つ）。 */
 	function go(groupId: number, next: HistoryRange): void {
+		cancelUrlSync();
+		selfWritten.clear();
 		now = Date.now();
 		void goto(`${resolveAppPath('/historical')}${historyQuery(groupId, next)}`, { reset: false });
+	}
+
+	/** 拡大・縮小・パン: 表示範囲をすぐ変え、止まってから URL を履歴を積まずに合わせる。 */
+	function onRangeChange(next: TimeRange): void {
+		view = next;
+		cancelUrlSync();
+		urlSyncTimer = setTimeout(() => {
+			urlSyncTimer = null;
+			const group = untrack(() => selectedGroup);
+			if (!group) return;
+			const target = toHistoryRange(view);
+			if (sameHistoryRange(target, urlRange) && requested === group.id) return;
+			selfWritten.add(rangeKey(target));
+			void goto(`${resolveAppPath('/historical')}${historyQuery(group.id, target)}`, {
+				replace: true,
+				reset: false
+			});
+		}, HISTORY_URL_SYNC_MS);
 	}
 
 	function showGroup(id: number): void {
@@ -126,7 +197,7 @@
 	let toDraft = $state('');
 	let rangeError = $state<string | null>(null);
 
-	// URL の期間が変わったら、入力欄を合わせる（戻る・進む・候補・前へ/次へ）。
+	// 表示範囲が変わったら、入力欄を合わせる（戻る・進む・候補・前へ/次へ・拡大・縮小・パン）。
 	$effect(() => {
 		fromDraft = toLocalInputValue(range.fromMs);
 		toDraft = toLocalInputValue(range.toMs);
@@ -205,6 +276,8 @@
 	);
 	const pens = $derived(penGroup ? trendPenInfos(penGroup, tags) : []);
 	const penTagIds = $derived(pens.map((pen) => pen.tagId));
+	const trendPens: TrendPen[] = $derived(historyTrendPens(pens));
+	const penIds = $derived(trendPens.map((pen) => pen.id));
 
 	let bandChoice = $state<{ groupId: number; tagId: number } | null>(null);
 	const bandTagId = $derived(
@@ -212,46 +285,106 @@
 			? resolveBandPen(pens, bandChoice?.groupId === selectedGroup.id ? bandChoice.tagId : null)
 			: null
 	);
-	function onSelectBandPen(tagId: number): void {
-		if (selectedGroup) bandChoice = { groupId: selectedGroup.id, tagId };
+	/** 帯のペン（同じタグが 2 回あれば先のペン）。 */
+	const bandIndex = $derived(
+		bandTagId === null ? -1 : pens.findIndex((p) => p.tagId === bandTagId)
+	);
+	const bandPen = $derived(bandIndex >= 0 ? pens[bandIndex] : null);
+	const bandPenId = $derived(bandIndex >= 0 ? (trendPens[bandIndex]?.id ?? null) : null);
+	const bands: TrendBands | null = $derived(
+		bandPen && bandPenId !== null
+			? {
+					penId: bandPenId,
+					items: thresholdBands(bandPen.thresholds).map((b) => ({
+						from: b.from,
+						to: b.to,
+						colorVar: b.colorVar ?? 'var(--banto-warning)',
+						label: b.label ?? ''
+					}))
+				}
+			: null
+	);
+	function onPenSelect(penId: string): void {
+		const tagId = tagIdOfPenId(penId);
+		if (selectedGroup && tagId !== null) bandChoice = { groupId: selectedGroup.id, tagId };
+	}
+	function penHasThresholds(penId: string): boolean {
+		const tagId = tagIdOfPenId(penId);
+		return hasThresholds(pens.find((p) => p.tagId === tagId)?.thresholds);
 	}
 
 	// --- 履歴の読み出し ---------------------------------------------------------
 
+	/** 描画域の幅（px。`TrendChart` から返る）。 */
 	let width = $state(0);
 
-	type Outcome =
-		| {
-				state: 'ready';
-				/** 格子の材料。格子はタグ・収集グループの読み込み後に作り直せるよう、ここでは作らない。 */
-				range: HistoryRange;
-				bins: number;
-				ids: number[];
-				data: CollectHistory;
-				unknownTagIds: number[];
-		  }
-		| { state: 'unavailable' }
-		| { state: 'error'; message: string };
+	type Status = { state: 'ok' } | { state: 'unavailable' } | { state: 'error'; message: string };
 	interface Loaded {
-		/** グループ・期間・ペンが同じか（リサイズで `bins` だけ違うときは同じ）。 */
-		dataKey: string;
-		bins: number;
-		outcome: Outcome;
+		/** グループとペンの並び。別のグループ・ペンの結果は使わない。 */
+		key: string;
+		data: TrendData;
+		unknownTagIds: number[];
 	}
 
 	let loaded = $state.raw<Loaded | null>(null);
+	let status = $state.raw<Status | null>(null);
+	let loading = $state(false);
 	let retryToken = $state(0);
 
+	const extras = new WeakMap<object, HistoryExtras>();
+	/** 要求のときのグループとペンの並び（結果を受けたときに `Loaded.key` にする）。 */
+	let pendingKey: string | null = null;
+	const loader = createRangeLoader({
+		fetch: createHistoryFetch((params, signal) => getCollectHistory(params, signal), extras),
+		debounceMs: HISTORY_DEBOUNCE_MS,
+		onResult: (data) => {
+			loaded = {
+				key: pendingKey ?? '',
+				data,
+				unknownTagIds: extras.get(data.series)?.unknownTagIds ?? []
+			};
+			status = { state: 'ok' };
+			loading = false;
+		},
+		onError: (err) => {
+			status =
+				err instanceof HistoryUnavailableError
+					? { state: 'unavailable' }
+					: { state: 'error', message: historyErrorMessage(err) };
+			loading = false;
+		}
+	});
+
 	const request = $derived(historyRequestFor(range, penTagIds, width));
-	const requestKey = $derived(request ? JSON.stringify(request) : null);
-	const dataKey = $derived(
-		selectedGroup && request
-			? `${selectedGroup.id}:${request.fromMs}:${request.toMs}:${request.tagIds.join(',')}`
-			: null
+	const dataKey = $derived(selectedGroup ? `${selectedGroup.id}:${penIds.join(',')}` : null);
+	const requestKey = $derived(
+		request && dataKey ? `${dataKey}|${view.startMs}:${view.endMs}|${request.bins}` : null
 	);
-	/** 今の要求に対する結果（別の表示のものは使わない）。 */
-	const current = $derived(loaded !== null && loaded.dataKey === dataKey ? loaded : null);
-	const loading = $derived(request !== null && (current === null || current.bins !== request.bins));
+
+	$effect(() => {
+		const key = requestKey;
+		void retryToken;
+		if (key === null || !available) {
+			untrack(() => (loading = false));
+			return;
+		}
+		untrack(() => {
+			const req = request;
+			if (req === null) return;
+			if (loaded !== null && loaded.key !== dataKey) {
+				// グループ・ペンが替わった: 前の表示の結果と失敗は出さない。
+				loaded = null;
+				status = null;
+			}
+			pendingKey = dataKey;
+			loading = true;
+			loader.request({ range: view, penIds, bins: req.bins });
+		});
+	});
+
+	/** 今のグループ・ペンの結果（読み直しの間も、取得範囲の中だけ描かれる）。 */
+	const current = $derived(loaded !== null && loaded.key === dataKey ? loaded : null);
+	const data = $derived(current?.data ?? null);
 
 	// --- CSV 出力（表示中のグループ・期間） ------------------------------------------
 
@@ -264,71 +397,9 @@
 		return pen ? { name: pen.name, unit: pen.unit } : { name: `タグ ID ${tagId}`, unit: null };
 	}
 
-	let generation = 0;
-
-	$effect(() => {
-		const key = requestKey;
-		// 表示グループの ID は requestKey に入らない。並びの同じタグを持つ別グループへ
-		// 切り替えたときも読み直せるよう、dataKey も追跡する（`current` が前の結果を捨てるため）。
-		const dKey = dataKey;
-		void retryToken;
-		if (key === null || !available) return;
-		const req = untrack(() => request);
-		const rangeNow = untrack(() => range);
-		const ids = untrack(() => penTagIds);
-		if (req === null || dKey === null) return;
-		const mine = ++generation;
-		const controller = new AbortController();
-		const first = untrack(() => loaded === null);
-		const timer = setTimeout(
-			async () => {
-				let outcome: Outcome;
-				try {
-					const readout = await getCollectHistory(req, controller.signal);
-					if (mine !== generation) return;
-					if (readout.state !== 'ready') {
-						outcome = { state: 'unavailable' };
-					} else {
-						outcome = {
-							state: 'ready',
-							range: rangeNow,
-							bins: req.bins,
-							ids,
-							data: readout.data,
-							unknownTagIds: readout.data.unknownTagIds
-						};
-					}
-				} catch (err) {
-					if (mine !== generation || controller.signal.aborted) return;
-					outcome = { state: 'error', message: historyErrorMessage(err) };
-				}
-				if (mine !== generation) return;
-				loaded = { dataKey: dKey, bins: req.bins, outcome };
-			},
-			first ? 0 : HISTORY_DEBOUNCE_MS
-		);
-		return () => {
-			// 条件が変わった・画面を離れた: 古い応答は世代で捨て、通信も止める。
-			generation += 1;
-			clearTimeout(timer);
-			controller.abort();
-		};
-	});
-
-	const outcome = $derived(current?.outcome ?? null);
-	// タグ・収集グループが履歴の応答より後に届いても、周期を引いて格子を作り直す。
-	const grid = $derived(
-		outcome?.state === 'ready'
-			? buildHistoryGrid(outcome.range, outcome.bins, outcome.ids, outcome.data, (tagId) =>
-					collectPeriodMsOf(tags, tagMeta.collectionGroups, tagId)
-				)
-			: null
-	);
-	const gridRows = $derived(grid ? grid.rows : []);
-	const gridEmpty = $derived(grid !== null && isEmptyGrid(grid));
 	const unknownNote = $derived(
-		outcome?.state === 'ready'
-			? unknownTagsNote(outcome.unknownTagIds, (id) => {
+		current
+			? unknownTagsNote(current.unknownTagIds, (id) => {
 					const pen = pens.find((p) => p.tagId === id);
 					return pen ? penLegendLabel(pen) : `タグ ID ${id}`;
 				})
@@ -338,23 +409,23 @@
 		historyDescription({
 			range,
 			penLabels: pens.map(penLegendLabel),
-			rows: gridRows,
-			bandPenName: pens.find((p) => p.tagId === bandTagId)?.name ?? null
+			extent: historyExtent(data, view),
+			bandPenName: bandPen?.name ?? null
 		})
 	);
 	const emptyMessage = $derived(
-		loading
-			? '読み込んでいます。'
-			: outcome?.state === 'ready' && gridEmpty
-				? HISTORY_EMPTY_MESSAGE
-				: '表示できる値はありません'
+		status?.state === 'ok' ? HISTORY_EMPTY_MESSAGE : '表示できる値はありません'
 	);
 
 	onMount(() => {
 		if (!available) return;
 		void reload();
 		const timer = setInterval(() => (now = Date.now()), 30_000);
-		return () => clearInterval(timer);
+		return () => {
+			clearInterval(timer);
+			cancelUrlSync();
+			loader.dispose();
+		};
 	});
 </script>
 
@@ -513,16 +584,16 @@
 					{#if unknownNote !== null}
 						<p class="note warn" role="status">{unknownNote}</p>
 					{/if}
-					{#if outcome?.state === 'unavailable'}
+					{#if status?.state === 'unavailable'}
 						<p class="note warn" role="alert">
 							{HISTORY_UNAVAILABLE_MESSAGE}
 							<button type="button" class="secondary" onclick={() => (retryToken += 1)}
 								>再試行</button
 							>
 						</p>
-					{:else if outcome?.state === 'error'}
+					{:else if status?.state === 'error'}
 						<p class="note warn" role="alert">
-							{outcome.message}
+							{status.message}
 							<button type="button" class="secondary" onclick={() => (retryToken += 1)}
 								>再試行</button
 							>
@@ -531,17 +602,30 @@
 					{#if loading}
 						<p class="note" role="status">履歴を読み込んでいます。</p>
 					{/if}
-					<HistoryPanel
-						groupName={selectedGroup.name}
-						{pens}
-						rows={gridRows}
-						spanMs={range.toMs - range.fromMs}
-						{bandTagId}
-						{onSelectBandPen}
-						{description}
-						bind:width
-						{emptyMessage}
-					/>
+					<section class="history-panel" aria-label={`${selectedGroup.name} のヒストリカル表示`}>
+						<p class="sr-only">{description}</p>
+						<TrendChart
+							label={`${selectedGroup.name} のヒストリカル`}
+							range={view}
+							pens={trendPens}
+							{data}
+							{loading}
+							{emptyMessage}
+							{bands}
+							bind:width
+							{onRangeChange}
+							{onPenSelect}
+							selectedPenId={bandPenId}
+							legendLabel="ペン（押すと、しきい値の帯をそのペンで表示します）"
+						>
+							{#snippet legendBadge(pen)}
+								{#if pen.id === bandPenId}
+									<span class="band-mark">{penHasThresholds(pen.id) ? '帯' : '帯（設定なし）'}</span
+									>
+								{/if}
+							{/snippet}
+						</TrendChart>
+					</section>
 				{/if}
 			</div>
 		{/if}
@@ -728,5 +812,36 @@
 
 	.empty-hint a {
 		color: var(--banto-primary);
+	}
+
+	.history-panel {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+		padding: 0.75rem;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
+		background: var(--banto-surface);
+		min-width: 0;
+	}
+
+	.band-mark {
+		padding: 0 0.3rem;
+		border-radius: var(--banto-radius);
+		background: var(--banto-warning-tint);
+		color: var(--banto-warning-tint-text);
+		font-weight: 400;
+	}
+
+	.sr-only {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		padding: 0;
+		margin: -1px;
+		overflow: hidden;
+		clip: rect(0, 0, 0, 0);
+		white-space: nowrap;
+		border: 0;
 	}
 </style>

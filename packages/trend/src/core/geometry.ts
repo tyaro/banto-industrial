@@ -2,8 +2,10 @@
  * 包絡（MIN/MAX）の SVG path。描画の層（SVG・後の Canvas）から切り離した計算だけ。
  *
  * 描き方（決め）:
- * - 区間の x は区間の実際の範囲 `[max(tMs, startMs), min(tMs + binMs, endMs))` の中央
- *   （範囲を渡さなければ `tMs + binMs / 2`）。表示範囲の端で欠ける区間の x が範囲の外に出てクリップされないようにする。
+ * - 区間の終わりは `min(tMs + binMs, 次の区間の tMs)`（`binEndMs`。収集周期が途中で変わって `binMs` より狭い
+ *   間隔の点が並んでも、各点は次の点の時刻で打ち切る。最後の区間・次が不正（同じか小さい・非有限）なら `tMs + binMs`）。
+ * - 区間の x は区間の実際の範囲 `[max(tMs, startMs), min(終わり, endMs))` の中央
+ *   （範囲を渡さなければ `tMs + (終わり - tMs) / 2`）。表示範囲の端で欠ける区間の x が範囲の外に出てクリップされないようにする。
  * - 範囲を渡したとき、範囲と重ならない区間は描かずに飛ばす（線は切らず `prevT` も進めない。範囲外は前後に並ぶだけ）。
  * - 縦軸の自動範囲と「データなし」の判定も同じ区間だけを見る（`visibleBins`。範囲外の値に縦軸が引っ張られない）。
  * - 各区間は min と max の縦線になり、隣の区間へは**前の点に近い方の端**から入る。
@@ -16,6 +18,8 @@
  * - 1 点だけの切れ端は同じ点への `L` を足す（`stroke-linecap: round` で点として見える）。
  * - 座標は小数 2 桁に丸める。
  * - `bins` は `tMs` の昇順であること（契約）。並べ替えはしない。
+ * - `visibleBins` で絞った列を渡しても結果は変わらない（重なる区間は連続した部分列で、最後の区間の次は
+ *   表示範囲の外にあり、終わりを `endMs` で切る結果は同じ）。
  */
 
 import type { Bin } from './pens';
@@ -26,15 +30,27 @@ const fin = (v: number | null | undefined): v is number =>
 	typeof v === 'number' && Number.isFinite(v);
 const r2 = (v: number) => Math.round(v * 100) / 100;
 
+/**
+ * 区間の終わり（排他）。`min(tMs + binMs, 次の区間の tMs)`。`binMs` が正の有限でないときは `tMs`。
+ * 次が無い・非有限・`tMs` 以下（異常）なら `tMs + binMs`。
+ */
+export function binEndMs(tMs: number, binMs: number, nextTMs?: number): number {
+	if (!(fin(binMs) && binMs > 0)) return tMs;
+	const e = tMs + binMs;
+	return fin(nextTMs) && nextTMs > tMs && nextTMs < e ? nextTMs : e;
+}
+
 /** 区間が表示範囲 `[startMs, endMs)` と重ならないか（`envelopePath`・`visibleBins` の共通の判定）。 */
 function isOutsideRange(
 	tMs: number,
 	binMs: number,
+	nextTMs: number | undefined,
 	startMs: number | undefined,
 	endMs: number | undefined
 ): boolean {
 	const binOk = fin(binMs) && binMs > 0;
-	if (fin(startMs) && (binOk ? tMs + binMs <= startMs : tMs < startMs)) return true;
+	if (fin(startMs) && (binOk ? binEndMs(tMs, binMs, nextTMs) <= startMs : tMs < startMs))
+		return true;
 	return fin(endMs) && tMs >= endMs;
 }
 
@@ -45,7 +61,8 @@ export function visibleBins(
 	range: { startMs: number; endMs: number }
 ): Bin[] {
 	return bins.filter(
-		(b) => fin(b.tMs) && !isOutsideRange(b.tMs, binMs, range.startMs, range.endMs)
+		(b, i) =>
+			fin(b.tMs) && !isOutsideRange(b.tMs, binMs, bins[i + 1]?.tMs, range.startMs, range.endMs)
 	);
 }
 
@@ -87,21 +104,22 @@ export function envelopePath(
 	};
 
 	const binOk = fin(binMs) && binMs > 0;
-	const half = binOk ? binMs / 2 : 0;
 	const startMs = options?.startMs;
 	const endMs = options?.endMs;
-	const centerOf = (tMs: number): number => {
+	const centerOf = (tMs: number, nextTMs: number | undefined, clip: boolean): number => {
 		if (!binOk) return tMs;
-		const s = fin(startMs) ? Math.max(tMs, startMs) : tMs;
-		const e = fin(endMs) ? Math.min(tMs + binMs, endMs) : tMs + binMs;
+		const s = clip && fin(startMs) ? Math.max(tMs, startMs) : tMs;
+		const end = binEndMs(tMs, binMs, nextTMs);
+		const e = clip && fin(endMs) ? Math.min(end, endMs) : end;
 		return (s + e) / 2;
 	};
-	const outside = (tMs: number): boolean => isOutsideRange(tMs, binMs, startMs, endMs);
-	for (const b of bins) {
-		if (options && fin(b.tMs) && outside(b.tMs)) continue;
+	for (let i = 0; i < bins.length; i++) {
+		const b = bins[i];
+		const nextT = bins[i + 1]?.tMs;
+		if (options && fin(b.tMs) && isOutsideRange(b.tMs, binMs, nextT, startMs, endMs)) continue;
 		const lo = fin(b.min) ? b.min : fin(b.max) ? b.max : null;
 		const hi = fin(b.max) ? b.max : lo;
-		const px = fin(b.tMs) ? x(options ? centerOf(b.tMs) : b.tMs + half) : NaN;
+		const px = fin(b.tMs) ? x(centerOf(b.tMs, nextT, !!options)) : NaN;
 		if (lo === null || hi === null || !Number.isFinite(px)) {
 			endSegment();
 			continue;
