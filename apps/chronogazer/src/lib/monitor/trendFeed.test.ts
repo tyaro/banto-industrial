@@ -261,6 +261,31 @@ describe('TrendFeed', () => {
 		expect(again[1].params.toMs).toBe(NOW + 33_100 - 1);
 	});
 
+	it('liveFrom より前へパンして読み済みなら、現在値が届いても同じ履歴を読み直さない', async () => {
+		const { fetch, calls } = controllableFetch();
+		const feed = newFeed(fetch);
+		feed.sync(config(), NOW, {}, [10]);
+		feed.sync(config(), NOW + 1000, {}, [11]);
+		await vi.advanceTimersByTimeAsync(GRACE + DEBOUNCE);
+		calls[0].resolve(ready());
+		await vi.advanceTimersByTimeAsync(0);
+
+		const past = { startMs: NOW - 30 * MIN, endMs: NOW - 20 * MIN };
+		feed.rangeChange(past);
+		await vi.advanceTimersByTimeAsync(DEBOUNCE);
+		expect(historyCalls(calls)).toHaveLength(2);
+		calls[1].resolve(ready());
+		await vi.advanceTimersByTimeAsync(0);
+		expect(feed.historyState).toBe('ready');
+
+		for (let i = 2; i < 7; i++) {
+			feed.sync(config(), NOW + i * 1000, {}, [i]);
+			await vi.advanceTimersByTimeAsync(GRACE + DEBOUNCE);
+		}
+		expect(historyCalls(calls)).toHaveLength(2);
+		expect(feed.historyState).toBe('ready');
+	});
+
 	it('左へパンで追従をやめ、範囲を出たら読み直す。「最新へ」で追従に戻る', async () => {
 		const { fetch, calls } = controllableFetch();
 		const feed = newFeed(fetch);
