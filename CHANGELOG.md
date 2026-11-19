@@ -2,8 +2,13 @@
 
 banto-industrial のリリースノート。日付は JST。バージョンは [SemVer](https://semver.org/lang/ja/) 準拠（`publish = false` のワークスペースで、タグはリポジトリ状態の目印）。
 
-## 未リリース
+## v0.3.0-alpha.4 — 2026-11-20（アルファ）
 
+alpha.2 の次の配布物です。タグ `v0.3.0-alpha.3`（2026-11-19、`6a08efbb`）は temp-scada の `banto-tagclient` の参照先としてタグだけを付けたもので、版の表記は alpha.2 のままでした。この版はその内容（`capabilities` を含む）と、その後の ChronoGazer の変更を含みます。DB マイグレーションは Hub の 0111（書込み監査の 2 列）と、両アプリの 0013（banto の権限の表）が自動で当たります（前進のみ）。この版全体の実機確認は済んでいません。
+
+- **Hub の `GET /api/v1/status` に `capabilities` を足しました（#1223）。** 書込みの契約（#1177）に対応した Hub は `"write_contract_v1"` を返します。`banto-tagclient` に `RestClient::fetch_status` と `HubStatus::supports_write_contract` を足し、欄の無い古い Hub は「未対応」と判定します。SCADA は書き込む前にこれで確かめます。
+- 依存の wasmtime を 50.0.2 に上げました（RUSTSEC-2026-0566〜0573）。
+- ChronoGazer に「ヒストリカル」画面（表示グループと期間を選んで過去のトレンドを見る。期間は 31 日まで、拡大・縮小・パンで読み直す）、期間の CSV 出力（生の値と、間隔で揃えた値）、「日報」ページを足しました（#1207）。トレンドの描画は共通の部品 `packages/trend` にし、監視画面のトレンドもこの部品に置き換えました（#1231）。
 - 依存の banto を v7.6.0 から v7.8.0 に上げました（#1215）。migration `0013_user_permissions`（banto v7.7.0 の権限の表）を Hub と ChronoGazer の `migrations-sqlite/` に写しました（起動時に自動適用、前進のみ）。UI 設定の書き込みのキーごとの直列化は banto の `createHttpUiSettings`・`createTauriUiSettings` に寄せ、Hub の `serializedUiSettings.ts` を外しました。ChronoGazer のデスクトップ版は `getSessionRevision` を渡し、利用者が替わったときに控えた書き込みを捨てます。
 
 - **【互換を壊す変更】banto-tagclient の `RestClient::write_tag` を、SCADA 向けの書込み契約に合わせました（#1202、#1177 の契約）。** 署名は `write_tag(external_name, value, options: WriteOptions) -> Result<WriteReceipt>` になりました（戻り値は `()` から変わります）。`WriteOptions` で `correlation_id`・`on_behalf_of` を渡せ（Hub と同じ規則で送信前に検証し、不正なら `ErrorKind::InvalidWriteOptions` で何も送りません）、`WriteReceipt` で `audit_id`・`correlation_id` を受け取れます。`RequestedValue` に `Text(String)` を足したため `Copy` ではなくなりました。エラーは応答の `error` コードでも分類します: 403 `key_tripped` は `KeyTripped`、502 `write_uncertain`・500 `internal`・コードの読めない 502・送信後のタイムアウトや切断は新設の `WriteUncertain`（届いたか不明。自動の再送はしません）、502 `write_failed` は `WriteRejected`、500 `audit_write_failed` は `Transport`。503 は Hub のコード（`writes_disabled`・`collection_not_running`）のときだけ `WriteUnavailable`、コードの無い 503（プロキシ）・504・その他の 5xx は送っていないと保証できないので `WriteUncertain`。
