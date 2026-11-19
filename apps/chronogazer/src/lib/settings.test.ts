@@ -20,12 +20,17 @@ class MemoryStorage {
 const store = new Map<string, string>();
 let gate: Promise<void> | null = null;
 let failGet = false;
+// What each GET actually returned (the value as of the call, not as of the reply).
+const returned = new Map<string, string | null>();
 vi.mock('./banto/setup', () => ({
 	getUiSettings: () => ({
 		get: async (key: string) => {
+			// Snapshot at call time so an edit made while the GET is held cannot change what it returns.
+			const snapshot = store.get(key) ?? null;
 			if (gate) await gate;
 			if (failGet) throw new Error('offline');
-			return store.get(key) ?? null;
+			returned.set(key, snapshot);
+			return snapshot;
 		},
 		set: async (key: string, value: string) => {
 			store.set(key, value);
@@ -52,6 +57,7 @@ function hold() {
 
 beforeEach(() => {
 	store.clear();
+	returned.clear();
 	gate = null;
 	failGet = false;
 	vi.stubGlobal('localStorage', new MemoryStorage());
@@ -91,6 +97,8 @@ describe('syncFromProvider', () => {
 		settings.setThemeMode('light');
 		release();
 		await p;
+		// The late GET really carried the stale value, so only the edit-generation check keeps `light`.
+		expect(returned.get('theme.mode')).toBe('dark');
 		expect(settings.themeMode).toBe('light');
 		expect(localStorage.getItem('banto.theme')).toBe('light');
 		expect(settings.navLayout).toBe('launcher');
