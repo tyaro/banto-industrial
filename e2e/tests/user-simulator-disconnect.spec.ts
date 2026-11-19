@@ -334,7 +334,7 @@ test.describe.serial('chronogazer 監視画面の断線 → Bad → 復旧（R1-
 	const panel = () => page.getByRole('tabpanel');
 	const rampCell = () => panel().getByRole('listitem').filter({ hasText: TAG_RAMP });
 	const trendRegion = () => panel().getByRole('region', { name: `${GROUP_TREND} のトレンド表示` });
-	const trendLine = () => trendRegion().locator('.chart-host svg path[fill="none"]').first();
+	const trendLine = () => trendRegion().locator('.bi-trend__line').first();
 	const trendD = async (): Promise<string> => (await trendLine().getAttribute('d')) ?? '';
 	/** 線の切れ端の数（`d` の `M` の数）。 */
 	const segments = async (): Promise<number> => (await trendD()).split('M').length - 1;

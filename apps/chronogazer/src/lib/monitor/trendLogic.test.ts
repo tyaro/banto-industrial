@@ -6,7 +6,7 @@
  * 時間窓（壊れた localStorage を含む）・説明文と注記。
  */
 import { describe, expect, it } from 'vitest';
-import { niceTicks } from '@banto/charts';
+import { envelopePath } from '@banto-industrial/trend';
 import { HISTORY_MAX_BINS } from '../banto/collectAdmin';
 import { TIME_WINDOW_OPTIONS } from '../../routes/(app)/groups/groupsPageLogic';
 import {
@@ -14,7 +14,6 @@ import {
 	HISTORY_UNAVAILABLE_NOTE,
 	SIMULATION_NOTE,
 	TREND_DANGER_COLOR,
-	TREND_RIGHT_MARGIN_PX,
 	TREND_WARNING_COLOR,
 	TREND_WINDOWS_SEC,
 	TREND_WINDOW_STORAGE_KEY,
@@ -33,26 +32,21 @@ import {
 	resolveBandPen,
 	resolveTrendWindowSec,
 	saveTrendWindowOverride,
-	trendLeftMarginMaxPx,
-	trendPlotWidthPx,
 	observeServerClock,
 	serverClockNow,
 	type ServerClock,
 	thresholdBands,
+	trendBufferData,
 	trendDescription,
 	trendNotices,
 	trendPenInfos,
-	trendYFormatter,
-	trendTooltipFormatter,
-	trendSeriesId,
-	BIT_BOTH_LABEL,
-	trendIncludeY,
 	isAllBitTrend,
 	trendWindowLabel,
 	valueExtent,
 	type TrendBuffer,
 	type TrendPenInfo
 } from './trendLogic';
+import { trendPenId } from './trendPens';
 import type { ThresholdFields } from '../banto/tagThresholdsAdmin';
 import { INITIAL_VALUES_STATE, applyValuesOutcome, type ValuesState } from './valuesPoller.svelte';
 
@@ -87,59 +81,46 @@ describe('chooseStepMs / maxTrendRows', () => {
 		['10 分・1280px・500ms・1 本 → 1 秒（600 行）', 600, 1280, 500, 1, 1000],
 		['1 分・1280px・500ms → 1 秒（周期の 2 倍が下限）', 60, 1280, 500, 1, 1000],
 		['1 分・1280px・1 秒 → 2 秒', 60, 1280, 1000, 1, 2000],
-		[
-			'10 分・400px・500ms → 5 秒（描画域は 400-140-16 = 244 行。120 行に収める）',
-			600,
-			400,
-			500,
-			1,
-			5000
-		],
-		['1 時間・1280px・1 秒 → 5 秒（720 行）', 3600, 1280, 1000, 1, 5000],
+		['10 分・描画域 244px・500ms → 5 秒（244 行以下に収める）', 600, 244, 500, 1, 5000],
+		['1 時間・描画域 1280px・1 秒 → 5 秒（720 行）', 3600, 1280, 1000, 1, 5000],
 		['1 時間・2600px・500ms・8 本 → 5 秒（8000/8 = 1000 行以下）', 3600, 2600, 500, 8, 5000],
 		['1 時間・100px → 最大の 60 秒', 3600, 100, 500, 1, 60_000],
 		['5 分・1280px・5 秒周期 → 10 秒', 300, 1280, 5000, 1, 10_000]
-	])('%s', (_name, windowSec, widthPx, pollPeriodMs, tagCount, expected) => {
-		const step = chooseStepMs({ windowMs: windowSec * 1000, widthPx, pollPeriodMs, tagCount });
+	])('%s', (_name, windowSec, plotWidthPx, pollPeriodMs, tagCount, expected) => {
+		const step = chooseStepMs({
+			windowMs: windowSec * 1000,
+			plotWidthPx,
+			pollPeriodMs,
+			tagCount
+		});
 		expect(step).toBe(expected);
 		// 選んだ刻みの行数は（最大の候補で諦めたとき以外）上限以下。
 		if (step !== 60_000) {
-			expect((windowSec * 1000) / step).toBeLessThanOrEqual(maxTrendRows(widthPx, tagCount));
+			expect((windowSec * 1000) / step).toBeLessThanOrEqual(maxTrendRows(plotWidthPx, tagCount));
 		}
 	});
 
 	it('行数の上限は描画域の幅・HISTORY_MAX_BINS・本数あたりの予算の最小', () => {
-		expect(maxTrendRows(1000, 1)).toBe(1000 - 140 - TREND_RIGHT_MARGIN_PX);
+		expect(maxTrendRows(1000, 1)).toBe(1000);
 		expect(maxTrendRows(5000, 1)).toBe(HISTORY_MAX_BINS);
 		expect(maxTrendRows(5000, 8)).toBe(1000);
 		expect(maxTrendRows(0, 1)).toBe(1);
 	});
 
-	it.each([
-		// [幅, 左の余白の最大, 描画域]
-		['狭い 380px（40% = 152 > 140）', 380, 140, 224],
-		['中くらい 300px（40% = 120）', 300, 120, 164],
-		['広い 1200px', 1200, 140, 1200 - 140 - 16],
-		['とても狭い 100px（下限 48 を割らない）', 100, 48, 36]
-	])('描画域の幅は左の余白が最大のとき: %s', (_n, widthPx, left, plot) => {
-		expect(trendLeftMarginMaxPx(widthPx)).toBe(left);
-		expect(trendPlotWidthPx(widthPx)).toBe(plot);
-	});
-
-	it('オーナーの例: 10 分窓・1 秒周期・380px は間引きの起きない刻みを選ぶ（#550）', () => {
+	it('オーナーの例: 10 分窓・1 秒周期・描画域 224px は間引きの起きない刻みを選ぶ（#550）', () => {
 		const windowMs = 600_000;
-		const step = chooseStepMs({ windowMs, widthPx: 380, pollPeriodMs: 1000, tagCount: 1 });
-		expect(windowMs / step).toBeLessThanOrEqual(trendPlotWidthPx(380));
+		const step = chooseStepMs({ windowMs, plotWidthPx: 224, pollPeriodMs: 1000, tagCount: 1 });
+		expect(windowMs / step).toBeLessThanOrEqual(224);
 		expect(step).toBe(5000);
 	});
 
-	it('幅を振っても、行数は最悪の描画域の幅を超えない（60 秒で諦める 1 時間窓を除く）', () => {
-		for (let widthPx = 100; widthPx <= 3000; widthPx += 7) {
+	it('幅を振っても、行数は描画域の幅を超えない（60 秒で諦める 1 時間窓を除く）', () => {
+		for (let plotWidthPx = 100; plotWidthPx <= 3000; plotWidthPx += 7) {
 			for (const sec of TREND_WINDOWS_SEC) {
 				const windowMs = sec * 1000;
-				const step = chooseStepMs({ windowMs, widthPx, pollPeriodMs: 500, tagCount: 1 });
+				const step = chooseStepMs({ windowMs, plotWidthPx, pollPeriodMs: 500, tagCount: 1 });
 				if (step === 60_000) continue;
-				expect(windowMs / step).toBeLessThanOrEqual(trendPlotWidthPx(widthPx));
+				expect(windowMs / step).toBeLessThanOrEqual(plotWidthPx);
 			}
 		}
 	});
@@ -150,7 +131,7 @@ describe('chooseStepMs / maxTrendRows', () => {
 				for (const period of [500, 1000, 2000, 5000]) {
 					const step = chooseStepMs({
 						windowMs: sec * 1000,
-						widthPx: width,
+						plotWidthPx: width,
 						pollPeriodMs: period,
 						tagCount: 3
 					});
@@ -536,7 +517,7 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 			{ t: 1, values: [85.25, 3] }
 		];
 		expect(trendDescription({ windowSec: 600, pens, rows, bandTagId: 1 })).toBe(
-			'直近 10 分のトレンド。ペン: 温度（℃）、圧力。縦軸は全ペン共通の自動スケールで、表示中の値の範囲は 3.0〜85.3。しきい値の帯: 温度（HH 90.0 以上 危険、H 80.0〜90.0 注意）。'
+			'直近 10 分のトレンド。ペン: 温度（℃）、圧力。縦軸はペンごとの自動スケール。表示中の値の範囲: 温度 10.0〜85.3、圧力 3。しきい値の帯: 温度（HH 90.0 以上 危険、H 80.0〜90.0 注意）。'
 		);
 		expect(trendDescription({ windowSec: 60, pens, rows: [], bandTagId: 2 })).toBe(
 			'直近 1 分のトレンド。ペン: 温度（℃）、圧力。表示できる値はまだありません。しきい値の帯: 圧力（しきい値の設定なし）。'
@@ -546,7 +527,34 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 		);
 	});
 
-	it('bit のタグ: isBit、全ペン bit なら縦軸・説明文は False / True、混在は数値のまま（#551）', () => {
+	it('説明文: ペンごとの範囲を言い、合算の範囲は言わない。値が無いペンは値なし', () => {
+		const mk = (tagId: number, name: string) => ({
+			tagId,
+			name,
+			unit: '',
+			decimals: 0,
+			isBit: false,
+			colorSlot: 0,
+			thresholds: null
+		});
+		const pens = [mk(1, 'A'), mk(2, 'B'), mk(3, 'C')] as unknown as Parameters<
+			typeof trendDescription
+		>[0]['pens'];
+		const text = trendDescription({
+			windowSec: 60,
+			pens,
+			rows: [
+				{ t: 0, values: [0, 100, null] },
+				{ t: 1, values: [10, 200, null] }
+			],
+			bandTagId: null
+		});
+		expect(text).toContain('表示中の値の範囲: A 0〜10、B 100〜200、C 値なし。');
+		expect(text).not.toContain('A 0〜200');
+		expect(text).not.toContain('全ペン共通');
+	});
+
+	it('bit のタグ: isBit、全ペン bit なら説明文の縦軸は 0 と 1、混在は数値の範囲（#551）', () => {
 		const withBit = [
 			...tags,
 			{ id: 3, name: '運転中', unit: '', decimals: 0, dataType: 'bit', ...NONE },
@@ -557,15 +565,12 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 		expect(bits.map((p) => p.isBit)).toEqual([true, true]);
 		expect(isAllBitTrend(bits)).toBe(true);
 
-		const fy = trendYFormatter(bits);
-		expect([0, 1, 0.2, 0.5].map(fy)).toEqual(['False', 'True', '', '']);
-
 		const rows = [
 			{ t: 0, values: [0, 1] },
 			{ t: 1, values: [1, 1] }
 		];
 		expect(trendDescription({ windowSec: 60, pens: bits, rows, bandTagId: null })).toBe(
-			'直近 1 分のトレンド。ペン: 運転中、異常。縦軸は False（0）と True（1）で、表示中の値は False〜True。しきい値の帯: なし。'
+			'直近 1 分のトレンド。ペン: 運転中、異常。縦軸は 0 と 1 で、表示中の値は 0〜1。しきい値の帯: なし。'
 		);
 		// 値が 1 種類だけのとき。
 		expect(
@@ -575,48 +580,22 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 				rows: [{ t: 0, values: [1, 1] }],
 				bandTagId: null
 			})
-		).toContain('表示中の値は True。');
+		).toContain('表示中の値は 1。');
 
-		// 混在: 数値のまま（他のタグの 0 / 1 まで True / False に見せない）。
+		// 混在: 数値の範囲で言う。
 		const mixed = trendPenInfos(g(2, 3), withBit);
 		expect(isAllBitTrend(mixed)).toBe(false);
-		expect([0, 1].map(trendYFormatter(mixed))).toEqual(['0', '1']);
 		const text = trendDescription({
 			windowSec: 60,
 			pens: mixed,
 			rows: [{ t: 0, values: [5, 1] }],
 			bandTagId: null
 		});
-		expect(text).toContain('表示中の値の範囲は 1〜5。');
+		expect(text).toContain('縦軸はペンごとの自動スケール。表示中の値の範囲: 圧力 5、運転中 1。');
 		expect(text).toContain('bit のペン（運転中）は 0 が False、1 が True。');
 
 		// ペンが無いときは全 bit ではない。
 		expect(isAllBitTrend([])).toBe(false);
-		expect(trendYFormatter([])(1)).toBe('1');
-	});
-
-	it('縦軸に含める値: 全 bit は [0, 1]、混在・ペン無しは無し。中点 0.5 だけでも False / True の目盛が出る（#554）', () => {
-		const bit = { isBit: true, decimals: 0 };
-		const num = { isBit: false, decimals: 1 };
-		expect(trendIncludeY([bit, bit])).toEqual([0, 1]);
-		expect(trendIncludeY([bit, num])).toBeUndefined();
-		expect(trendIncludeY([num])).toBeUndefined();
-		expect(trendIncludeY([])).toBeUndefined();
-
-		// 境界: 見えている有限値が履歴の中点 0.5 だけ（現在値は bad / stale で null）。
-		const pens = [bit];
-		const formatY = trendYFormatter(pens);
-		const half = historyPointValue({ min: 0, max: 1 });
-		expect(half).toBe(0.5);
-		// 含めないと、banto の目盛は 0.5 の周りで作られ、0 / 1 が無く文字が全部空になる。
-		const without = niceTicks(0.5, 0.5);
-		expect(without.map(formatY).filter((t) => t !== '')).toEqual([]);
-		// 含めると、範囲は 0.5 と [0, 1] の合併 = 0〜1 で、目盛に 0 と 1 が入る。
-		const include = trendIncludeY(pens) ?? [];
-		const ticks = niceTicks(Math.min(0.5, ...include), Math.max(0.5, ...include));
-		expect(ticks).toContain(0);
-		expect(ticks).toContain(1);
-		expect(ticks.map(formatY).filter((t) => t !== '')).toEqual(['False', 'True']);
 	});
 
 	it('注記: 履歴を読めない・不明なタグ・シミュレーションを別々に', () => {
@@ -640,45 +619,108 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 	});
 });
 
-describe('ツールチップの書式（ペンごと、tyaro/banto#376）', () => {
-	const bit = { isBit: true, decimals: 0 };
-	const num = { isBit: false, decimals: 1 };
-	const info = (id: string) => ({ id, label: id, axis: 'left' as const });
-
-	it('混在: bit のペンは 0 / 1 を False / True、数値のペンは縦軸と同じ', () => {
-		const pens = [bit, num];
-		const tip = trendTooltipFormatter(pens);
-		const fy = trendYFormatter(pens);
-		expect(tip(0, info(trendSeriesId(0)), 0)).toBe('False');
-		expect(tip(1, info(trendSeriesId(0)), 0)).toBe('True');
-		// 数値のペンの 0 / 1 は数値のまま（縦軸と同じ）。
-		expect(tip(1, info(trendSeriesId(1)), 0)).toBe('1');
-		expect(tip(12.34, info(trendSeriesId(1)), 0)).toBe(fy(12.34));
-		expect(tip(12.34, info(trendSeriesId(1)), 0)).toBe('12.3');
+describe('trendBufferData（格子 → 部品の契約）', () => {
+	const buffer = (rows: { t: number; values: (number | null)[] }[]) => ({
+		rows,
+		stepMs: 1000,
+		windowMs: 3000
 	});
 
-	it('全 bit: 履歴の区間の中点（0 でも 1 でもない値）は False / True', () => {
-		const tip = trendTooltipFormatter([bit, bit]);
-		expect(BIT_BOTH_LABEL).toBe('False / True');
-		expect(tip(historyPointValue({ min: 0, max: 1 })!, info(trendSeriesId(1)), 3)).toBe(
-			'False / True'
+	it('範囲は [最初の刻みの始まり, 最後の刻みの終わり)、系列は刻みごとの min = max で幅は stepMs', () => {
+		const { range, data } = trendBufferData(
+			buffer([
+				{ t: 10_000, values: [1, 5] },
+				{ t: 11_000, values: [2, 6] },
+				{ t: 12_000, values: [3, 7] }
+			]),
+			['a', 'b'],
+			13_000
 		);
-		// 縦軸は 0.5 の文字を出さない（変えていない）が、ツールチップは出る。
-		expect(trendYFormatter([bit, bit])(0.5)).toBe('');
-		expect(tip(0, info(trendSeriesId(0)), 0)).toBe('False');
-		expect(tip(1, info(trendSeriesId(0)), 0)).toBe('True');
+		expect(range).toEqual({ startMs: 10_000, endMs: 13_000 });
+		expect(data?.range).toEqual({ startMs: 10_000, endMs: 13_000 });
+		expect(data?.series.a).toEqual({
+			binMs: 1000,
+			bins: [
+				{ tMs: 10_000, min: 1, max: 1 },
+				{ tMs: 11_000, min: 2, max: 2 },
+				{ tMs: 12_000, min: 3, max: 3 }
+			]
+		});
+		expect(data?.series.b?.bins.map((b) => b.min)).toEqual([5, 6, 7]);
 	});
 
-	it('系列 ID が分からないときは縦軸の書式、index は結果に影響しない', () => {
-		const pens = [bit, num];
-		const tip = trendTooltipFormatter(pens);
-		const fy = trendYFormatter(pens);
-		expect(tip(1, info('pen-9'), 0)).toBe(fy(1));
-		expect(tip(0.5, info('other'), 0)).toBe(fy(0.5));
-		expect(tip(0.5, info(trendSeriesId(0)), 0)).toBe(tip(0.5, info(trendSeriesId(0)), 99));
-		expect(tip(5, info(trendSeriesId(1)), 0)).toBe(tip(5, info(trendSeriesId(1)), 99));
-		// ペンが無いときも落ちない。
-		expect(trendTooltipFormatter([])(2, info('pen-0'), 0)).toBe('2');
+	it('null はそのまま欠測（0 にしない）', () => {
+		const { data } = trendBufferData(
+			buffer([
+				{ t: 0, values: [null] },
+				{ t: 1000, values: [4] }
+			]),
+			['a'],
+			2000
+		);
+		expect(data?.series.a?.bins).toEqual([
+			{ tMs: 0, min: null, max: null },
+			{ tMs: 1000, min: 4, max: 4 }
+		]);
+	});
+
+	it('同じタグを 2 回置いたペンは、並びの位置ごとの別の系列', () => {
+		const { data } = trendBufferData(
+			buffer([{ t: 0, values: [1, 1, 9] }]),
+			[trendPenId(0, 7), trendPenId(1, 7), trendPenId(2, 8)],
+			1000
+		);
+		expect(Object.keys(data?.series ?? {})).toEqual(['pen-0-tag-7', 'pen-1-tag-7', 'pen-2-tag-8']);
+		expect(data?.series['pen-2-tag-8']?.bins[0].min).toBe(9);
+	});
+
+	it('行が無ければ data は null、実バッファの格子からも作れる', () => {
+		expect(trendBufferData(buffer([]), ['a'], 0).data).toBeNull();
+		const b = emptyTrendBuffer(1000, 3000, 1, 5500);
+		const { range, data } = trendBufferData(b, ['a'], 5500);
+		expect(data?.range).toEqual({ startMs: 3000, endMs: 6000 });
+		expect(range).toEqual({ startMs: 2500, endMs: 5500 });
+	});
+
+	describe('表示範囲の右端は今（最新値を未来に描かない、オーナーレビュー）', () => {
+		const rows = [
+			{ t: 0, values: [1] },
+			{ t: 60_000, values: [2] },
+			{ t: 120_000, values: [3] }
+		];
+		const buf = { rows, stepMs: 60_000, windowMs: 180_000 };
+
+		it('最後の格子が始まった直後は右端が now、左端が now - windowMs。最後の点は now を超えない', () => {
+			const now = 121_000;
+			const { range, data } = trendBufferData(buf, ['a'], now);
+			expect(range).toEqual({ startMs: now - 180_000, endMs: now });
+			expect(data?.range).toEqual({ startMs: 0, endMs: 180_000 });
+			const s = data!.series.a!;
+			const xs: number[] = [];
+			envelopePath(
+				s.bins,
+				s.binMs,
+				(v) => {
+					xs.push(v);
+					return v;
+				},
+				(v) => v,
+				{ startMs: range.startMs, endMs: range.endMs }
+			);
+			expect(xs.length).toBeGreaterThan(0);
+			expect(Math.max(...xs)).toBeLessThanOrEqual(now);
+		});
+
+		it('now が最後の格子の始まり以下・非有限なら last.t + 1', () => {
+			for (const now of [120_000, 100_000, Number.NaN, Infinity, null]) {
+				expect(trendBufferData(buf, ['a'], now).range.endMs).toBe(120_001);
+			}
+		});
+
+		it('now が格子の終わりを超えるなら last.t + stepMs', () => {
+			const { range } = trendBufferData(buf, ['a'], 500_000);
+			expect(range).toEqual({ startMs: 0, endMs: 180_000 });
+		});
 	});
 });
 

@@ -20,7 +20,6 @@ import {
 	type TimeRange,
 	type TrendData,
 	type TrendFetch,
-	type TrendPen,
 	type TrendSeries
 } from '@banto-industrial/trend';
 import {
@@ -32,7 +31,7 @@ import {
 	type CollectHistoryParams,
 	type Readout
 } from '../banto/collectAdmin';
-import { penLegendLabel, type TrendPenInfo } from '../monitor/trendLogic';
+import { tagIdOfTrendPenId } from '../monitor/trendPens';
 
 export interface HistoryRange {
 	fromMs: number;
@@ -236,34 +235,6 @@ export function historyRequestFor(
 
 // --- ペンと読み出し ------------------------------------------------------------------
 
-/**
- * 部品のペンの ID。並びの位置とタグ ID から作る（同じタグを 2 回置いても衝突しない）。
- * 読み出しの口（`createHistoryFetch`）はここからタグ ID を読み戻す。
- */
-export function historyPenId(index: number, tagId: number): string {
-	return `pen-${index}-tag-${tagId}`;
-}
-
-/** `historyPenId` からタグ ID を読む。形が違えば `null`。 */
-export function tagIdOfPenId(penId: string): number | null {
-	const m = /^pen-\d+-tag-(\d+)$/.exec(penId);
-	if (!m) return null;
-	const n = Number(m[1]);
-	return Number.isSafeInteger(n) ? n : null;
-}
-
-/** 部品のペン（純関数）。色の枠は監視画面と同じ（`--banto-chart-<枠>`）。 */
-export function historyTrendPens(pens: readonly TrendPenInfo[]): TrendPen[] {
-	return pens.map((pen, index) => ({
-		id: historyPenId(index, pen.tagId),
-		label: penLegendLabel(pen),
-		colorSlot: pen.colorSlot,
-		decimals: pen.isBit ? 0 : pen.decimals,
-		// bit のタグは縦軸を 0〜1 に固定する（監視画面の `trendIncludeY` と同じ考え）。
-		...(pen.isBit ? { yMin: 0, yMax: 1 } : {})
-	}));
-}
-
 /** 収集が使えず読めなかった（`Readout` が `ready` でない）。画面は「読み出せませんでした」を出す。 */
 export class HistoryUnavailableError extends Error {
 	constructor() {
@@ -294,7 +265,7 @@ export function createHistoryFetch(
 	return async ({ range, penIds, bins, signal }) => {
 		const tagOf = new Map<string, number>();
 		for (const id of penIds) {
-			const tagId = tagIdOfPenId(id);
+			const tagId = tagIdOfTrendPenId(id);
 			if (tagId !== null) tagOf.set(id, tagId);
 		}
 		const hr = toHistoryRange(range);

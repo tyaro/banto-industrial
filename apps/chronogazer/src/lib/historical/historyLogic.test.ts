@@ -3,7 +3,7 @@
  *
  * - 期間の検証（前後・31 日）・「前へ / 次へ」（現在を超えない）・URL の読み書き（おかしければ既定）。
  * - `bins` は描画幅・2000・ペン数 × bins ≤ 8000 に収まる。
- * - 期間の 2 つの形（両端を含む ⇔ 半開区間）の変換、ペンの ID、部品の `TrendFetch` の形
+ * - 期間の 2 つの形（両端を含む ⇔ 半開区間）の変換、部品の `TrendFetch` の形
  *   （ペンごとの系列・API の `binMs`・`unknownTagIds` の付帯情報・`ready` でないときの失敗）。
  */
 import { describe, expect, it } from 'vitest';
@@ -33,22 +33,20 @@ import {
 	historyDescription,
 	historyErrorMessage,
 	historyExtent,
-	historyPenId,
 	historyQuery,
 	historyRequestFor,
-	historyTrendPens,
 	parseMsParam,
 	presetRange,
 	resolveRange,
 	sameHistoryRange,
 	shiftRange,
-	tagIdOfPenId,
 	toHistoryRange,
 	toLocalInputValue,
 	toTimeRange,
 	unknownTagsNote,
 	type HistoryExtras
 } from './historyLogic';
+import { trendPenId } from '../monitor/trendPens';
 
 const NOW = 1_800_000_000_000;
 const HOUR = 3_600_000;
@@ -245,44 +243,6 @@ describe('期間の 2 つの形（両端を含む ⇔ 半開区間）', () => {
 	});
 });
 
-describe('ペンの ID と部品のペン', () => {
-	it('並びとタグ ID から作り、同じタグが 2 回でも衝突しない', () => {
-		expect(historyPenId(0, 7)).not.toBe(historyPenId(1, 7));
-		expect(tagIdOfPenId(historyPenId(3, 42))).toBe(42);
-		expect(tagIdOfPenId('pen-x')).toBeNull();
-	});
-
-	it('色の枠・名前・小数桁を写し、bit は縦軸 0〜1', () => {
-		const pens = historyTrendPens([
-			{
-				tagId: 1,
-				name: '炉温',
-				unit: '℃',
-				decimals: 1,
-				isBit: false,
-				colorSlot: 3,
-				thresholds: null
-			},
-			{
-				tagId: 2,
-				name: '運転',
-				unit: null,
-				decimals: null,
-				isBit: true,
-				colorSlot: 1,
-				thresholds: null
-			}
-		]);
-		expect(pens[0]).toEqual({
-			id: historyPenId(0, 1),
-			label: '炉温（℃）',
-			colorSlot: 3,
-			decimals: 1
-		});
-		expect(pens[1]).toMatchObject({ id: historyPenId(1, 2), yMin: 0, yMax: 1, decimals: 0 });
-	});
-});
-
 describe('createHistoryFetch', () => {
 	const signal = new AbortController().signal;
 	const ready = (data: CollectHistory): Readout<CollectHistory> => ({ state: 'ready', data });
@@ -309,7 +269,7 @@ describe('createHistoryFetch', () => {
 				unknownTagIds: [9]
 			});
 		}, extras);
-		const ids = [historyPenId(0, 5), historyPenId(1, 5), historyPenId(2, 9)];
+		const ids = [trendPenId(0, 5), trendPenId(1, 5), trendPenId(2, 9)];
 		const out = await fetch({
 			range: { startMs: 1000, endMs: 2000 },
 			penIds: ids,
@@ -332,7 +292,7 @@ describe('createHistoryFetch', () => {
 	it('ready でなければ HistoryUnavailableError を投げる（空に潰さない）', async () => {
 		const fetch = createHistoryFetch(async () => ({ state: 'unavailable' }), new WeakMap());
 		await expect(
-			fetch({ range: { startMs: 0, endMs: 10 }, penIds: [historyPenId(0, 1)], bins: 1, signal })
+			fetch({ range: { startMs: 0, endMs: 10 }, penIds: [trendPenId(0, 1)], bins: 1, signal })
 		).rejects.toBeInstanceOf(HistoryUnavailableError);
 	});
 });

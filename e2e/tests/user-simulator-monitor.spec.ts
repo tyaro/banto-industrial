@@ -27,8 +27,8 @@
  *    収集を止めている間の刻みは `null` で、線が切れる（`d` の `M` が増える）。
  * 10.（#551、2026-10-09 オーナー決定）bit のタグ（Modbus のコイル 00001、開発用 PLC が
  *    トグルする）は、デジタルで `True` / `False`（0 / 1 ではない）。バー・計器は
- *    「レンジ未設定」にならず 0〜1（目盛 `False` / `True`）。トレンドは全ペンが bit なら
- *    縦軸の目盛が `False` / `True`。
+ *    「レンジ未設定」にならず 0〜1（目盛 `False` / `True`）。トレンドは共通の部品で、bit の
+ *    ペンは縦軸 0〜1 の数値（目盛 `0` / `1`。True / False の表示は後のペンの属性で足す）。
  *
  * ## ファイル名（実行順）
  *
@@ -607,8 +607,8 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		await expect(tab(GROUP_TREND)).toHaveAttribute('aria-selected', 'true');
 		const trend = panel().getByRole('region', { name: `${GROUP_TREND} のトレンド表示` });
 		await expect(trend).toBeVisible({ timeout: 20_000 });
-		// 線は系列の並び（ペンの並び）どおり。1 本目がランプ。
-		const rampPath = trend.locator('.chart-host svg path[fill="none"]').first();
+		// 線はペンの並びどおり。1 本目がランプ。
+		const rampPath = trend.locator('.bi-trend__line').first();
 		const segments = async (): Promise<number> =>
 			((await rampPath.getAttribute('d')) ?? '').split('M').length - 1;
 
@@ -616,10 +616,9 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		await expect(rampPath).toHaveAttribute('d', /L/, { timeout: 20_000 });
 		const firstD = await rampPath.getAttribute('d');
 		await expect(rampPath).not.toHaveAttribute('d', firstD ?? '', { timeout: 15_000 });
-		// 時刻の目盛（時:分:秒。書式は端末のロケールに任せる。Playwright の既定の en-US では
-		// 「03:41:50 AM」）。
-		await expect(trend.locator('.chart-host svg text.x-tick').first()).toHaveText(
-			/^\d{1,2}:\d{2}:\d{2}( [AP]M)?$/
+		// 時刻の目盛（共通の部品の書式。24 時間表記の時:分、刻みが 1 分未満なら時:分:秒）。
+		await expect(trend.locator('text.bi-trend__tick[text-anchor="middle"]').first()).toHaveText(
+			/^(\d{1,2}\/\d{1,2} )?\d{2}:\d{2}(:\d{2})?$/
 		);
 
 		// 帯の既定は、しきい値のある最初のペン（上限 = H 0、上が開いた注意の帯）。
@@ -627,19 +626,19 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		const highPen = trend.getByRole('button', { name: new RegExp(`^${TAG_HIGH}`) });
 		await expect(highPen).toHaveAttribute('aria-pressed', 'true');
 		await expect(rampPen).toHaveAttribute('aria-pressed', 'false');
-		await expect(trend.locator('.chart-host svg text.band-label')).toHaveText(['H']);
+		await expect(trend.locator('.bi-trend__band title')).toHaveText(['H']);
 		await expect(trend.locator('.sr-only')).toContainText(
 			`しきい値の帯: ${TAG_HIGH}（H 0 以上 注意）。`
 		);
 		// しきい値の無いペンを選ぶと帯は消え、文でもそう言う。
 		await rampPen.click();
 		await expect(rampPen).toHaveAttribute('aria-pressed', 'true');
-		await expect(trend.locator('.chart-host svg text.band-label')).toHaveCount(0);
+		await expect(trend.locator('.bi-trend__band title')).toHaveCount(0);
 		await expect(trend.locator('.sr-only')).toContainText(
 			`しきい値の帯: ${TAG_RAMP}（しきい値の設定なし）。`
 		);
 		await highPen.click();
-		await expect(trend.locator('.chart-host svg text.band-label')).toHaveText(['H']);
+		await expect(trend.locator('.bi-trend__band title')).toHaveText(['H']);
 
 		// 時間窓: 既定（グループの属性。作成時に何も渡さないとサーバーが 10 分を入れる）→
 		// 1 分。端末に覚え、グループの定義には書かない。
@@ -676,7 +675,7 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		await expect.poll(segments, { timeout: 20_000 }).toBeGreaterThan(before);
 	});
 
-	test('8. bit のタグ: デジタルは True / False、トレンドは全ペン bit なら縦軸が False / True（#551）', async () => {
+	test('8. bit のタグ: デジタルは True / False、トレンドは全ペン bit なら縦軸が 0 と 1（#551）', async () => {
 		await page.goto(`/monitor?group=${groupIds[GROUP_BIT]}`);
 		const bitCell = cell(TAG_BIT);
 		const value = bitCell.locator('.value');
@@ -699,24 +698,24 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		await page.goto(`/monitor?group=${groupIds[GROUP_BIT_TREND]}`);
 		const trend = panel().getByRole('region', { name: `${GROUP_BIT_TREND} のトレンド表示` });
 		await expect(trend).toBeVisible({ timeout: 20_000 });
-		// banto v7.0.0 の @banto/charts は文字サイズを測る隠しの <text data-banto-font-probe>（中身は '0'）を
-		// 目盛と同じクラスで足すので、目盛の文字を見るときは外す。
-		const yTicks = trend.locator('.chart-host svg text.y-tick:not([data-banto-font-probe])');
+		// 縦軸の目盛（左の軸の文字）。bit のペンの縦軸は 0〜1 で、値は数値の 0 / 1
+		// （True / False の表示は後の「ペンの属性」で足す）。
+		const yTicks = trend.locator('text.bi-trend__tick[text-anchor="end"]');
 		await expect
 			.poll(async () => (await yTicks.allTextContents()).map((t) => t.trim()), {
 				timeout: 30_000
 			})
-			.toEqual(expect.arrayContaining(['False', 'True']));
-		// 間の目盛（0.2 刻み）の数字は出さない。
+			.toEqual(expect.arrayContaining(['0', '1']));
+		// 目盛は 0〜1 の範囲だけ（True / False の文字は出さない）。
 		for (const text of await yTicks.allTextContents()) {
-			expect(text.trim()).toMatch(/^(False|True)?$/);
+			expect(text.trim()).toMatch(/^(0|1|0\.\d+)$/);
 		}
-		await expect(trend.locator('.sr-only')).toContainText('縦軸は False（0）と True（1）で');
+		await expect(trend.locator('.sr-only').first()).toContainText('縦軸は 0 と 1 で');
 	});
 
-	test('9. 全ペン bit のトレンド: 見える値が履歴の中点 0.5 だけで現在値が bad でも縦軸は False / True（#554 レビュー）', async () => {
+	test('9. 全ペン bit のトレンド: 見える値が履歴の中点 0.5 だけで現在値が bad でも縦軸は 0 と 1（#554 レビュー）', async () => {
 		// 履歴は全区間が「0 も 1 もあった」（中点 0.5）、現在値は bad（値なし）に差し替える。
-		// 縦軸の目盛は `includeY` [0, 1] で必ず 0 と 1 を含み、False / True が出る。
+		// 縦軸は bit のペンの指定（yMin 0・yMax 1）で必ず 0 と 1 を含む。
 		await page.route('**/api/collect/history*', async (route) => {
 			const url = new URL(route.request().url());
 			const fromMs = Number(url.searchParams.get('fromMs'));
@@ -765,23 +764,23 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 			await page.goto(`/monitor?group=${groupIds[GROUP_BIT_TREND]}`);
 			const trend = panel().getByRole('region', { name: `${GROUP_BIT_TREND} のトレンド表示` });
 			await expect(trend).toBeVisible({ timeout: 20_000 });
-			const yTicks = trend.locator('.chart-host svg text.y-tick:not([data-banto-font-probe])');
+			const yTicks = trend.locator('text.bi-trend__tick[text-anchor="end"]');
 			await expect
 				.poll(async () => (await yTicks.allTextContents()).map((t) => t.trim()), {
 					timeout: 30_000
 				})
-				.toEqual(expect.arrayContaining(['False', 'True']));
+				.toEqual(expect.arrayContaining(['0', '1']));
 			// 線は中点 0.5 の水平線として描かれている（偽の 0 / 1 の点を足していない）。
 			// 水平線は外接矩形の高さが 0 で toBeVisible が hidden と判定するので、d 属性で見る。
-			await expect(trend.locator('.chart-host svg path[fill="none"]').first()).toHaveAttribute(
+			await expect(trend.locator('.bi-trend__line').first()).toHaveAttribute(
 				'd',
-				/^M [\d.]+ [\d.]+ L/
+				/^M[\d.]+,[\d.]+L/
 			);
-			// ツールチップ（tyaro/banto#376）: 中点 0.5 の点にカーソルを置くと「False / True」
-			// （縦軸は 0.5 の文字を出さないが、ツールチップは出る）。履歴の点がどの横位置に
-			// 載るかは窓と格子次第なので、プロット面の上を左から右へ動かして値の行を探す。
-			const surface = trend.locator('.chart-host svg rect[fill="transparent"]');
-			const tipValue = trend.locator('.chart-tooltip .tt-value');
+			// カーソルを置くと凡例に値が出る（共通の部品。中点 0.5 の点の上で「0.5」と出る。bit でも丸めない）。
+			// 履歴の点がどの横位置に載るかは窓と格子次第なので、プロット面の上を左から右へ動かして
+			// 値の行を探す。
+			const surface = trend.locator('.bi-trend__plot');
+			const cursorValue = trend.locator('.bi-trend__value');
 			let step = 0;
 			await expect
 				.poll(
@@ -790,11 +789,11 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 						if (box === null) return [];
 						const fraction = ((step++ % 19) + 1) / 20;
 						await page.mouse.move(box.x + box.width * fraction, box.y + box.height / 2);
-						return (await tipValue.allTextContents()).map((t) => t.trim());
+						return (await cursorValue.allTextContents()).map((t) => t.trim());
 					},
 					{ timeout: 30_000 }
 				)
-				.toContain('False / True');
+				.toEqual(expect.arrayContaining([expect.stringMatching(/^0\.5(\s|$)/)]));
 		} finally {
 			await page.unroute('**/api/collect/history*');
 			await page.unroute('**/api/collect/values*');

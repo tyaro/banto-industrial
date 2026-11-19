@@ -1,48 +1,47 @@
 <script lang="ts">
 	/**
 	 * リアルタイムトレンド（R1-D の D-3b、recorder-requirements.md §3.3 の「リアル
-	 * タイム」）。banto の `LineChart`（v6.3.0 の `gaps: 'break'`・開いた帯）で描く。
+	 * タイム」）。共通の部品 `TrendChart`（`@banto-industrial/trend`、設計書
+	 * docs/chronogazer/trend-design.md §10 の 3）で描く。
 	 *
-	 * 他のパネルと同じく、**グループの定義・ペンごとの表示・格子の行を props で
-	 * 受け取るだけ**で、自分ではデータを取りに行かない（§3.7.4 の関所のプレビューが
-	 * 使い回す）。格子・帯・説明文の判断は `trendLogic.ts`、バッファの持ち主は画面の
-	 * `trendFeed.svelte.ts`。
+	 * 他のパネルと同じく、**グループの定義・ペンごとの表示・格子を props で受け取るだけ**で、
+	 * 自分ではデータを取りに行かない（§3.7.4 の関所のプレビューが使い回す）。格子・帯・説明文の
+	 * 判断は `trendLogic.ts`、バッファの持ち主は画面の `trendFeed.svelte.ts`。
 	 *
-	 * - **値が無い刻みは線を切る**（`gaps: 'break'`。0 の位置に描かない、#414 段階2）。
-	 * - **Y 軸は左の共通 1 本・自動スケール**、単位は凡例に（Q7）。
-	 * - **系列の色はペンの色の枠（`colorSlot`）**。`LineChart` は系列の並び順で
-	 *   `--banto-chart-1..8` を使うので、描画域の要素で `--banto-chart-<並び>` を
-	 *   `--cg-slot-<枠>`（外側の要素で元の色を写しておいたもの）に差し替える。外側で
-	 *   写してから内側で差し替えるのは、`--banto-chart-1: var(--banto-chart-3)` の
-	 *   ような同じ要素での参照が入れ替え（1 と 3 の交換）で循環して無効になるため。
-	 * - **凡例はこのパネルのもの**（`LineChart` の凡例は押せないので隠す）。ペンを押すと
-	 *   しきい値の帯を出すペンが替わる（Q5: 帯は選んだ 1 ペンだけ。`aria-pressed`）。
-	 * - 図は `role="img"` で中が読まれないので、ペン・単位・窓・値の範囲・帯を画面外の
-	 *   文（`trendDescription`）で伝える（D-2 の `meterDescription` と同じ作法）。
+	 * - **格子を部品の契約にする**: `trendBufferData`（取得範囲 = 格子の範囲、表示範囲の右端は今で、最後の格子の途中で切る）。
+	 *   **追従だけ**で拡大・縮小・パンは持たない（`onRangeChange` を渡さない。過去へのパンは
+	 *   ハイブリッドの PR）。
+	 * - **値が無い刻みは線を切る**（`null` は欠測。0 の位置に描かない、#414 段階2）。
+	 * - **縦軸はペンごと**（部品の既定。単位は凡例に、Q7）。bit のペンは縦軸 0〜1（小数桁は指定しない）
+	 *   （`toTrendPens`。ヒストリカルと共通）。
+	 * - **系列の色はペンの色の枠（`colorSlot`）**。部品が `--banto-chart-<枠>` で塗る。
+	 * - **凡例は部品のもの**。ペンを押すとしきい値の帯を出すペンが替わる（Q5: 帯は選んだ 1 ペン
+	 *   だけ。`aria-pressed`、印は `legendBadge`）。同じタグを 2 回置いたときは、帯は先のペンで、
+	 *   押した印もそのペンだけに付く（ヒストリカルと同じ）。
+	 * - 部品の図は中が読まれないので、ペン・単位・窓・値の範囲・帯を画面外の文
+	 *   （`trendDescription`）で伝える（D-2 の `meterDescription` と同じ作法）。
 	 * - 時間窓は端末ごと（Q4）。選んだ窓は画面が localStorage に覚え、グループの定義には
 	 *   書かない。
+	 * - `width` は**描画域そのものの幅**（余白を除く。画面が刻みを決めるのに使う）。
 	 */
-	import { LineChart } from '@banto/charts';
+	import { TrendChart, type TrendBands } from '@banto-industrial/trend';
 	import type { DisplayGroup } from '#lib/banto/displayGroupsAdmin.js';
 	import {
-		penLegendLabel,
 		thresholdBands,
+		trendBufferData,
 		trendDescription,
-		trendSeriesId,
-		trendTooltipFormatter,
-		trendTimeLabel,
 		trendWindowLabel,
-		trendIncludeY,
-		trendYFormatter,
 		hasThresholds,
-		type TrendPenInfo,
-		type TrendRow
+		type TrendBuffer,
+		type TrendPenInfo
 	} from './trendLogic';
+	import { tagIdOfTrendPenId, toTrendPens } from './trendPens';
 
 	interface Props {
 		group: Pick<DisplayGroup, 'name'>;
 		pens: readonly TrendPenInfo[];
-		rows: readonly TrendRow[];
+		/** 格子（`null` = まだ無い・別のグループのもの）。 */
+		buffer: TrendBuffer | null;
 		windowSec: number;
 		windowOptions: readonly number[];
 		onWindowChange: (sec: number) => void;
@@ -53,6 +52,8 @@
 		notices: readonly string[];
 		/** 直近の履歴を読み込み中。 */
 		historyLoading: boolean;
+		/** 表示の時計（サーバーの時刻、ms。`null` = まだ無い）。追従の右端に使う。 */
+		nowMs: number | null;
 		/** 描画域の幅（px、画面が刻みを決めるのに使う）。 */
 		width?: number;
 	}
@@ -60,7 +61,7 @@
 	let {
 		group,
 		pens,
-		rows,
+		buffer,
 		windowSec,
 		windowOptions,
 		onWindowChange,
@@ -68,39 +69,52 @@
 		onSelectBandPen,
 		notices,
 		historyLoading,
+		nowMs,
 		width = $bindable(0)
 	}: Props = $props();
 
-	const series = $derived(
-		pens.map((pen, i) => ({
-			id: trendSeriesId(i),
-			label: penLegendLabel(pen),
-			y: (row: TrendRow) => row.values[i]
-		}))
+	const trendPens = $derived(toTrendPens(pens));
+	const rows = $derived(buffer?.rows ?? []);
+	const view = $derived(
+		trendBufferData(
+			buffer ?? { rows: [], stepMs: 1000, windowMs: windowSec * 1000 },
+			trendPens.map((pen) => pen.id),
+			nowMs
+		)
 	);
 
-	/** `--banto-chart-<並び>` をペンの色の枠へ差し替える（doc 参照）。 */
-	const colorStyle = $derived(
-		pens.map((pen, i) => `--banto-chart-${i + 1}: var(--cg-slot-${pen.colorSlot});`).join(' ')
+	/** 帯のペン（同じタグが 2 回あれば先のペン）。 */
+	const bandIndex = $derived(
+		bandTagId === null ? -1 : pens.findIndex((p) => p.tagId === bandTagId)
+	);
+	const bandPen = $derived(bandIndex >= 0 ? pens[bandIndex] : null);
+	const bandPenId = $derived(bandIndex >= 0 ? (trendPens[bandIndex]?.id ?? null) : null);
+	const bands: TrendBands | null = $derived(
+		bandPen && bandPenId !== null
+			? {
+					penId: bandPenId,
+					items: thresholdBands(bandPen.thresholds).map((b) => ({
+						from: b.from,
+						to: b.to,
+						colorVar: b.colorVar ?? 'var(--banto-warning)',
+						label: b.label ?? ''
+					}))
+				}
+			: null
 	);
 
-	const bandPen = $derived(pens.find((pen) => pen.tagId === bandTagId) ?? null);
-	const bands = $derived(bandPen ? thresholdBands(bandPen.thresholds) : []);
-
-	// 縦軸・ツールチップの書式（全ペンが bit なら False / True。判断は trendYFormatter）。
-	const formatY = $derived(trendYFormatter(pens));
-	// ツールチップは縦軸と別の書式（ペンごと。bit は True / False、区間の中点は False / True）。
-	const formatTooltip = $derived(trendTooltipFormatter(pens));
-	// 全ペンが bit なら縦軸に 0 と 1 を必ず含める（中点 0.5 だけでも False / True が出る）。
-	const includeY = $derived(trendIncludeY(pens));
-	function formatX(v: unknown): string {
-		return typeof v === 'number' ? trendTimeLabel(v) : String(v ?? '');
+	function onPenSelect(penId: string): void {
+		const tagId = tagIdOfTrendPenId(penId);
+		if (tagId !== null) onSelectBandPen(tagId);
+	}
+	function penHasThresholds(penId: string): boolean {
+		const tagId = tagIdOfTrendPenId(penId);
+		return hasThresholds(pens.find((p) => p.tagId === tagId)?.thresholds);
 	}
 
 	const description = $derived(
 		trendDescription({ windowSec, pens, rows, bandTagId: bandPen?.tagId ?? null })
 	);
-	const data = $derived([...rows]);
 </script>
 
 <section class="trend-panel" aria-label={`${group.name} のトレンド表示`}>
@@ -125,57 +139,31 @@
 		<p class="note warn" role="status">{notice}</p>
 	{/each}
 
-	<ul class="pens" aria-label="ペン（押すと、しきい値の帯をそのペンで表示します）">
-		{#each pens as pen, i (`${i}:${pen.tagId}`)}
-			<li>
-				<button
-					type="button"
-					class="pen"
-					aria-pressed={pen.tagId === bandPen?.tagId}
-					data-thresholds={hasThresholds(pen.thresholds) ? 'set' : 'none'}
-					onclick={() => onSelectBandPen(pen.tagId)}
-				>
-					<span class="swatch" style:background={`var(--cg-slot-${pen.colorSlot})`}></span>
-					<span class="pen-label">{penLegendLabel(pen)}</span>
-					{#if pen.tagId === bandPen?.tagId}
-						<span class="band-mark">{hasThresholds(pen.thresholds) ? '帯' : '帯（設定なし）'}</span>
-					{/if}
-				</button>
-			</li>
-		{/each}
-	</ul>
-
 	<p class="sr-only">{description}</p>
 
-	<div class="chart-host" style={colorStyle} bind:clientWidth={width}>
-		<LineChart
-			{data}
-			x="t"
-			{series}
-			label={`${group.name} のトレンド`}
-			height={320}
-			gaps="break"
-			{bands}
-			{formatY}
-			{formatTooltip}
-			{includeY}
-			{formatX}
-			messages={{ emptyState: () => '表示できる値はまだありません' }}
-		/>
-	</div>
+	<TrendChart
+		label={`${group.name} のトレンド`}
+		range={view.range}
+		pens={trendPens}
+		data={view.data}
+		height={320}
+		emptyMessage="表示できる値はまだありません"
+		{bands}
+		bind:width
+		{onPenSelect}
+		selectedPenId={bandPenId}
+		legendLabel="ペン（押すと、しきい値の帯をそのペンで表示します）"
+	>
+		{#snippet legendBadge(pen)}
+			{#if pen.id === bandPenId}
+				<span class="band-mark">{penHasThresholds(pen.id) ? '帯' : '帯（設定なし）'}</span>
+			{/if}
+		{/snippet}
+	</TrendChart>
 </section>
 
 <style>
 	.trend-panel {
-		/* 元の系列色を写しておく（`.chart-host` で並び順の枠をこれに差し替える）。 */
-		--cg-slot-1: var(--banto-chart-1);
-		--cg-slot-2: var(--banto-chart-2);
-		--cg-slot-3: var(--banto-chart-3);
-		--cg-slot-4: var(--banto-chart-4);
-		--cg-slot-5: var(--banto-chart-5);
-		--cg-slot-6: var(--banto-chart-6);
-		--cg-slot-7: var(--banto-chart-7);
-		--cg-slot-8: var(--banto-chart-8);
 		display: flex;
 		flex-direction: column;
 		gap: 0.5rem;
@@ -221,57 +209,12 @@
 		border-radius: var(--banto-radius);
 	}
 
-	.pens {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.35rem;
-		margin: 0;
-		padding: 0;
-		list-style: none;
-	}
-
-	.pen {
-		display: inline-flex;
-		align-items: center;
-		gap: 0.35rem;
-		padding: 0.15rem 0.5rem;
-		border: 1px solid var(--banto-border);
-		border-radius: var(--banto-radius);
-		background: transparent;
-		color: var(--banto-text-muted);
-		font: inherit;
-		font-size: 0.8rem;
-		cursor: pointer;
-	}
-
-	.pen[aria-pressed='true'] {
-		border-color: var(--banto-text);
-		color: var(--banto-text);
-		font-weight: 600;
-	}
-
-	.swatch {
-		width: 10px;
-		height: 10px;
-		border-radius: 2px;
-		flex: 0 0 auto;
-	}
-
 	.band-mark {
 		padding: 0 0.3rem;
 		border-radius: var(--banto-radius);
 		background: var(--banto-warning-tint);
 		color: var(--banto-warning-tint-text);
 		font-weight: 400;
-	}
-
-	.chart-host {
-		min-width: 0;
-	}
-
-	/* 凡例はこのパネルの `.pens`（押せる）を使う。`LineChart` の凡例は重複するので隠す。 */
-	.chart-host :global(.chart-legend) {
-		display: none;
 	}
 
 	.sr-only {
