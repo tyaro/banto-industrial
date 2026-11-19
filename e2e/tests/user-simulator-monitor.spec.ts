@@ -618,7 +618,7 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		await expect(rampPath).not.toHaveAttribute('d', firstD ?? '', { timeout: 15_000 });
 		// 時刻の目盛（共通の部品の書式。24 時間表記の時:分、刻みが 1 分未満なら時:分:秒）。
 		await expect(trend.locator('text.bi-trend__tick[text-anchor="middle"]').first()).toHaveText(
-			/^\d{2}:\d{2}(:\d{2})?$/
+			/^(\d{1,2}\/\d{1,2} )?\d{2}:\d{2}(:\d{2})?$/
 		);
 
 		// 帯の既定は、しきい値のある最初のペン（上限 = H 0、上が開いた注意の帯）。
@@ -776,7 +776,7 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 				'd',
 				/^M[\d.]+,[\d.]+L/
 			);
-			// カーソルを置くと凡例に値が出る（共通の部品。中点 0.5 の点の上で「—」以外になる）。
+			// カーソルを置くと凡例に値が出る（共通の部品。中点 0.5 の点の上で「0.5」と出る。bit でも丸めない）。
 			// 履歴の点がどの横位置に載るかは窓と格子次第なので、プロット面の上を左から右へ動かして
 			// 値の行を探す。
 			const surface = trend.locator('.bi-trend__plot');
@@ -793,7 +793,7 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 					},
 					{ timeout: 30_000 }
 				)
-				.not.toEqual(['—']);
+				.toEqual(expect.arrayContaining([expect.stringMatching(/^0\.5(\s|$)/)]));
 		} finally {
 			await page.unroute('**/api/collect/history*');
 			await page.unroute('**/api/collect/values*');

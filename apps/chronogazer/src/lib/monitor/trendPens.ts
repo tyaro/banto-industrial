@@ -24,14 +24,14 @@ export function tagIdOfTrendPenId(penId: string): number | null {
 
 /**
  * 部品のペン（純関数）。色の枠はペンの `colorSlot`（`--banto-chart-<枠>`）。bit のタグは
- * 縦軸を 0〜1・小数 0 桁にする（値は数値の 0 / 1 で出る）。
+ * 縦軸を 0〜1 に固定し、小数桁は指定しない（0・1 はそのまま、区間の中点は 0.5 と出る）。
  */
 export function toTrendPens(pens: readonly TrendPenInfo[]): TrendPen[] {
 	return pens.map((pen, index) => ({
 		id: trendPenId(index, pen.tagId),
 		label: penLegendLabel(pen),
 		colorSlot: pen.colorSlot,
-		decimals: pen.isBit ? 0 : pen.decimals,
+		decimals: pen.isBit ? null : pen.decimals,
 		...(pen.isBit ? { yMin: 0, yMax: 1 } : {})
 	}));
 }

@@ -8,7 +8,7 @@ describe('ペンの ID と部品のペン', () => {
 		expect(tagIdOfTrendPenId('pen-x')).toBeNull();
 	});
 
-	it('色の枠・名前・小数桁を写し、bit は縦軸 0〜1', () => {
+	it('色の枠・名前・小数桁を写し、bit は縦軸 0〜1・小数桁なし', () => {
 		const pens = toTrendPens([
 			{
 				tagId: 1,
@@ -35,6 +35,6 @@ describe('ペンの ID と部品のペン', () => {
 			colorSlot: 3,
 			decimals: 1
 		});
-		expect(pens[1]).toMatchObject({ id: trendPenId(1, 2), yMin: 0, yMax: 1, decimals: 0 });
+		expect(pens[1]).toMatchObject({ id: trendPenId(1, 2), yMin: 0, yMax: 1, decimals: null });
 	});
 });

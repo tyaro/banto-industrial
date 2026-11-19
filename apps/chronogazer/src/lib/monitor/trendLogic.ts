@@ -517,7 +517,7 @@ export interface TrendPenInfo {
 	unit: string | null;
 	/** 小数桁（タグを読めていなければ `null`）。 */
 	decimals: number | null;
-	/** bit のタグ（縦軸は 0〜1・小数 0 桁、値は数値の 0 / 1 のまま）。 */
+	/** bit のタグ（縦軸は 0〜1、小数桁は指定せず、値は数値の 0 / 1 のまま）。 */
 	isBit: boolean;
 	colorSlot: number;
 	thresholds: ThresholdFields | null;
@@ -555,7 +555,7 @@ export function trendPenInfos(
 }
 
 /**
- * グループの全ペンが bit か（説明文の言い方を替える）。bit の縦軸は 0〜1・小数 0 桁で、値は
+ * グループの全ペンが bit か（説明文の言い方を替える）。bit の縦軸は 0〜1（小数桁は指定しない）で、値は
  * 数値の 0 / 1 のまま出る（False / True の表示は後の「ペンの属性」で足す）。
  */
 export function isAllBitTrend(pens: readonly Pick<TrendPenInfo, 'isBit'>[]): boolean {
