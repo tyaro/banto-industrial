@@ -99,6 +99,36 @@ impl TsReader {
         self.groups.iter().find(|g| g.key == group_key)
     }
 
+    /// Number of samples [`Self::read_range`] would return for the same
+    /// arguments (both bounds inclusive), without materializing any row.
+    /// Lets a caller with a row cap reject an oversized range *before*
+    /// `fetch_all` allocates it. The count is a snapshot: a concurrent
+    /// writer may append rows before a following `read_range`.
+    pub async fn count_range(
+        &self,
+        group_key: &str,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<u64, TstoreError> {
+        let group = self
+            .group(group_key)
+            .ok_or_else(|| TstoreError::UnknownGroup(group_key.to_string()))?;
+
+        let sql = format!(
+            "SELECT COUNT(*) FROM {} WHERE ptime >= ? AND ptime <= ?",
+            group.table_name
+        );
+
+        // AssertSqlSafe: `group.table_name` は `samples_<n>` 形式の生成済み
+        // 識別子のみ（`read_range` と同じ理由）。バインド値は from_ms/to_ms のみ。
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .bind(from_ms)
+            .bind(to_ms)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count.max(0) as u64)
+    }
+
     /// Every sample for `group_key` with `from_ms <= ptime_ms <= to_ms`
     /// (both bounds inclusive), ordered ascending by `ptime_ms`.
     pub async fn read_range(

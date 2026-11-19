@@ -3840,6 +3840,66 @@ fn sanitize_csv_file_name(raw: &str) -> String {
     }
 }
 
+/// [`save_csv_file`] が受け取る内容の上限（バイト）。正当な CSV の最大は
+/// 10 万行（`EXPORT_MAX_ROWS`）× （時刻列 約 23 文字 + 8 タグ × f64 の文字列 最大
+/// 約 25 文字 + 区切り）+ ヘッダ + BOM で約 23 MB。64 MiB はその全部を余裕を持って通し、
+/// 画面から差し込まれた巨大な文字列は通さない。
+const SAVE_CSV_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// 内容が上限を超えていたらエラー（ダイアログを開く前に判定する）。
+fn check_csv_size(len: usize) -> Result<(), BantoError> {
+    if len > SAVE_CSV_MAX_BYTES {
+        return Err(BantoError::Other(format!(
+            "CSV が大きすぎて保存できません（上限 {} MB）。期間を狭めてください",
+            SAVE_CSV_MAX_BYTES / (1024 * 1024)
+        )));
+    }
+    Ok(())
+}
+
+/// `path` を壊さずに置き換える: 同じディレクトリの一時ファイルへ書いて
+/// `sync_all` し、`rename` で差し替える。途中で失敗したら一時ファイルを消し、
+/// 元のファイルは触らない。`write` は一時ファイルへ書く手順（失敗の試験用に差し替え可）。
+fn write_replacing_with(
+    path: &std::path::Path,
+    bytes: &[u8],
+    write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        write(&mut file, bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn write_replacing(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_replacing_with(path, bytes, |file, bytes| {
+        use std::io::Write as _;
+        file.write_all(bytes)
+    })
+}
+
 /// CSV を**ネイティブの保存ダイアログ**で選んだ場所へ書く（#1207 R3 PR2）。
 ///
 /// **パスを画面（webview）から受け取らない**のが要点: 受け取るのは既定の
@@ -3857,6 +3917,7 @@ async fn save_csv_file(
     content: String,
 ) -> Result<SaveCsvResult, BantoError> {
     require_collect_reader(&state).await?;
+    check_csv_size(content.len())?;
     let name = sanitize_csv_file_name(&default_name);
     let outcome = tauri::async_runtime::spawn_blocking(move || {
         use tauri_plugin_dialog::DialogExt;
@@ -3875,7 +3936,7 @@ async fn save_csv_file(
         let path = picked
             .into_path()
             .map_err(|err| format!("保存先を解釈できません: {err}"))?;
-        std::fs::write(&path, content.as_bytes())
+        write_replacing(&path, content.as_bytes())
             .map_err(|err| format!("書き込めません: {err}"))?;
         Ok::<_, String>(SaveCsvResult {
             saved: true,
@@ -6623,6 +6684,35 @@ mod tests {
             assert_eq!(sanitize_csv_file_name(raw), expected, "入力: {raw:?}");
         }
         assert!(sanitize_csv_file_name(&"a".repeat(500)).len() <= 104);
+    }
+
+    #[test]
+    fn save_csv_size_cap_is_checked_before_anything_else() {
+        assert!(check_csv_size(SAVE_CSV_MAX_BYTES).is_ok());
+        assert!(check_csv_size(SAVE_CSV_MAX_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn save_csv_write_replaces_existing_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.csv");
+        std::fs::write(&path, b"old").unwrap();
+        write_replacing(&path, b"new content").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new content");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn save_csv_failed_write_keeps_original_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.csv");
+        std::fs::write(&path, b"original").unwrap();
+        let err = write_replacing_with(&path, b"new", |_, _| {
+            Err(std::io::Error::other("disk full"))
+        });
+        assert!(err.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     // --- #413: 接続単位シミュレーション -------------------------------------

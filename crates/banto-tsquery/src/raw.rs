@@ -9,7 +9,9 @@
 //! adds: multi-file concatenation in file order (files never overlap in
 //! time - see `writer.rs`'s rotation design - so no merge-sort is needed,
 //! only concatenation), `tag_keys` projection/reordering, and the row-count
-//! limit.
+//! limit. The limit is enforced *before* rows are materialized (a
+//! `TsReader::count_range` pre-check per file), then re-checked after the
+//! fetch because a live writer can append in between.
 //!
 //! A candidate file whose `TsReader::open` fails with
 //! `banto_tstore::TstoreError::Uninitialized` (writer created the file but
@@ -102,6 +104,20 @@ async fn read_file(
             .map(|tag_key| group.columns.iter().position(|c| &c.tag_key == tag_key))
             .collect();
 
+        // Pre-check with COUNT(*) so an oversized range is rejected before
+        // `read_range`'s `fetch_all` materializes it (memory bound).
+        let count = reader.count_range(group_key, from_ms, to_ms).await?;
+        let projected = (rows.len() as u64).saturating_add(count);
+        if projected > max_rows as u64 {
+            return Err(TsQueryError::TooManyRows {
+                count: usize::try_from(projected).unwrap_or(usize::MAX),
+                max: max_rows,
+            });
+        }
+
+        // A concurrent writer may append between the count and the fetch, so
+        // the post-fetch check stays; the overshoot it can allow is bounded
+        // by what was written in that instant.
         let samples = reader.read_range(group_key, from_ms, to_ms).await?;
         if rows.len() + samples.len() > max_rows {
             return Err(TsQueryError::TooManyRows {

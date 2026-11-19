@@ -1025,6 +1025,42 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn count_range_matches_read_range_and_rejects_unknown_group() {
+        let dir = TempDir::new("count-range");
+        let clock = clock_at(DAY1_START_MS);
+        let writer = TsWriter::open(dir.path(), two_group_config(), clock)
+            .await
+            .unwrap();
+        for i in 0..5i64 {
+            writer
+                .append("g1", DAY1_START_MS + i * 1_000, &[Some(i as f64), None])
+                .await
+                .unwrap();
+        }
+        writer.close().await.unwrap();
+
+        let files = list_data_files(dir.path()).unwrap();
+        let reader = TsReader::open(&files[0].path).await.unwrap();
+        let all = reader
+            .count_range("g1", DAY1_START_MS, DAY1_START_MS + 4_000)
+            .await
+            .unwrap();
+        assert_eq!(all, 5);
+        let inner = reader
+            .count_range("g1", DAY1_START_MS + 1_000, DAY1_START_MS + 3_000)
+            .await
+            .unwrap();
+        assert_eq!(inner, 3);
+        let none = reader
+            .count_range("g1", DAY1_START_MS + 1_001, DAY1_START_MS + 1_999)
+            .await
+            .unwrap();
+        assert_eq!(none, 0);
+        let err = reader.count_range("nope", 0, 1).await.unwrap_err();
+        assert!(matches!(err, TstoreError::UnknownGroup(_)), "{err:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn read_range_bounds_are_inclusive_and_exclude_outside_values() {
         let dir = TempDir::new("range-bounds");
         let clock = clock_at(DAY1_START_MS);

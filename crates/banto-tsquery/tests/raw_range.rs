@@ -174,6 +174,91 @@ async fn exceeding_max_rows_is_an_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exactly_max_rows_succeeds_and_one_more_fails_with_true_count() {
+    let dir = TempDir::new("raw-exact-max");
+    let clock = clock_at(DAY1_START_MS);
+    let config = store_config(vec![group("g1", 1_000, vec![tag("t1", None, 0)])]);
+    let writer = open_writer(dir.path(), config, clock).await;
+    for i in 0..5i64 {
+        writer
+            .append("g1", DAY1_START_MS + i * 1_000, &[Some(i as f64)])
+            .await
+            .unwrap();
+    }
+    writer.close().await.unwrap();
+
+    let query = TsQuery::new(dir.path());
+    let ok = query
+        .read_range(
+            "g1",
+            &tag_keys(&["t1"]),
+            DAY1_START_MS,
+            DAY1_START_MS + 4_000,
+            Some(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.rows.len(), 5);
+
+    let err = query
+        .read_range(
+            "g1",
+            &tag_keys(&["t1"]),
+            DAY1_START_MS,
+            DAY1_START_MS + 4_000,
+            Some(4),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        TsQueryError::TooManyRows { count, max } => {
+            assert_eq!((count, max), (5, 4));
+        }
+        other => panic!("expected TooManyRows, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_budget_rejects_any_row_but_allows_an_empty_range() {
+    let dir = TempDir::new("raw-zero-budget");
+    let clock = clock_at(DAY1_START_MS);
+    let config = store_config(vec![group("g1", 1_000, vec![tag("t1", None, 0)])]);
+    let writer = open_writer(dir.path(), config, clock).await;
+    writer
+        .append("g1", DAY1_START_MS, &[Some(1.0)])
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    let query = TsQuery::new(dir.path());
+    let err = query
+        .read_range(
+            "g1",
+            &tag_keys(&["t1"]),
+            DAY1_START_MS,
+            DAY1_START_MS,
+            Some(0),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        TsQueryError::TooManyRows { count: 1, max: 0 }
+    ));
+    let empty = query
+        .read_range(
+            "g1",
+            &tag_keys(&["t1"]),
+            DAY1_START_MS + 10_000,
+            DAY1_START_MS + 20_000,
+            Some(0),
+        )
+        .await
+        .unwrap();
+    assert!(empty.rows.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn from_greater_than_to_is_invalid_input() {
     let dir = TempDir::new("raw-invalid-range");
     let query = TsQuery::new(dir.path());
