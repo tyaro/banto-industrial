@@ -28,13 +28,17 @@
 	let range = $state<TimeRange>(presetRange(60 * 60 * 1000, Date.now()));
 	let width = $state(0);
 	let binsByPen = $state<Record<string, Bin[]>>({});
+	// 区間の幅は、受け取ったデータと組で持つ（読み直しを待つ間・失敗したときも、
+	// 手元のデータはそれを読んだときの幅で描く。今の範囲と幅から計算し直さない）。
+	let loadedBinMs = $state(0);
 	let loading = $state(false);
 
 	const loader = createRangeLoader({
 		// 利用側の取り方（ChronoGazer は GET /api/collect/history、SCADA は History API）。
 		fetch: ({ range, penIds, bins, signal }) => fetchHistory(range, penIds, bins, signal),
-		onResult: (result) => {
+		onResult: (result, req) => {
 			binsByPen = result;
+			loadedBinMs = binMs(req.range, req.bins);
 			loading = false;
 		},
 		onError: () => (loading = false)
@@ -53,7 +57,7 @@
 	{range}
 	{pens}
 	{binsByPen}
-	binMs={binMs(range, binCount(width))}
+	binMs={loadedBinMs}
 	{loading}
 	bind:width
 	onRangeChange={(r) => (range = r)}

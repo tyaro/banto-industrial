@@ -12,7 +12,7 @@
 <script lang="ts">
 	import { linearScale, niceTicks } from '@banto/charts';
 	import { cursorReadout } from './core/cursor';
-	import { envelopePath } from './core/geometry';
+	import { envelopePath, hasFiniteValue, visibleBins } from './core/geometry';
 	import { axisOwners, formatValue, penColorVar, resolveYDomain } from './core/pens';
 	import type { Bin, TrendPen, YDomain } from './core/pens';
 	import { isValidRange, panRange, zoomRange, type TimeRange } from './core/range';
@@ -22,7 +22,11 @@
 		range: TimeRange;
 		pens: readonly TrendPen[];
 		binsByPen: Readonly<Record<string, readonly Bin[] | undefined>>;
-		/** 区間の幅（ミリ秒）。包絡の x（区間の中央）とカーソルの区間の判定に使う。 */
+		/**
+		 * `binsByPen` を読んだときの区間の幅（ミリ秒）。包絡の x（区間の中央）とカーソルの区間の
+		 * 判定に使う。今の範囲と幅から計算し直さず、データと組で持った値を渡す（読み直しの間・
+		 * 失敗した後も、手元のデータを正しい幅で描くため）。
+		 */
 		binMs: number;
 		height?: number;
 		/** 図の名前（aria-label）。 */
@@ -78,12 +82,18 @@
 	});
 
 	const xScale = $derived(linearScale([range.startMs, range.endMs], [0, plotWidth]));
-	const domains: YDomain[] = $derived(pens.map((p) => resolveYDomain(p, binsByPen[p.id] ?? [])));
+	// 表示範囲と重なる区間だけを、縦軸・空の判定・線・カーソルで共用する。
+	const visibleByPen = $derived.by(() => {
+		const out: Record<string, Bin[]> = {};
+		for (const p of pens) out[p.id] = visibleBins(binsByPen[p.id] ?? [], binMs, range);
+		return out;
+	});
+	const domains: YDomain[] = $derived(pens.map((p) => resolveYDomain(p, visibleByPen[p.id])));
 	const paths = $derived(
 		valid
 			? pens.map((p, i) =>
 					envelopePath(
-						binsByPen[p.id] ?? [],
+						visibleByPen[p.id],
 						binMs,
 						xScale,
 						linearScale(domains[i], [plotHeight, 0]),
@@ -108,13 +118,9 @@
 	const rightTicks = $derived(axisTicks(owners.right));
 	const gridTicks = $derived(owners.left !== null ? leftTicks : rightTicks);
 
-	const hasData = $derived(
-		pens.some((p) =>
-			(binsByPen[p.id] ?? []).some((b) => Number.isFinite(b.min) || Number.isFinite(b.max))
-		)
-	);
+	const hasData = $derived(pens.some((p) => hasFiniteValue(visibleByPen[p.id])));
 	const readout = $derived(
-		cursorMs !== null ? cursorReadout(pens, binsByPen, binMs, cursorMs) : null
+		cursorMs !== null ? cursorReadout(pens, visibleByPen, binMs, cursorMs) : null
 	);
 	const cursorX = $derived(cursorMs !== null && valid ? xScale(cursorMs) : null);
 

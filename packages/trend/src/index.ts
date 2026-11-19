@@ -57,7 +57,7 @@ export {
 	type TrendPen,
 	type YDomain
 } from './core/pens';
-export { envelopePath } from './core/geometry';
+export { envelopePath, visibleBins, hasFiniteValue } from './core/geometry';
 export { binAt, cursorReadout, type CursorValue } from './core/cursor';
 export {
 	createRangeLoader,

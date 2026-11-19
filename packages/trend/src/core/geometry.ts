@@ -5,6 +5,7 @@
  * - 区間の x は区間の実際の範囲 `[max(tMs, startMs), min(tMs + binMs, endMs))` の中央
  *   （範囲を渡さなければ `tMs + binMs / 2`）。表示範囲の端で欠ける区間の x が範囲の外に出てクリップされないようにする。
  * - 範囲を渡したとき、範囲と重ならない区間は描かずに飛ばす（線は切らず `prevT` も進めない。範囲外は前後に並ぶだけ）。
+ * - 縦軸の自動範囲と「データなし」の判定も同じ区間だけを見る（`visibleBins`。範囲外の値に縦軸が引っ張られない）。
  * - 各区間は min と max の縦線になり、隣の区間へは**前の点に近い方の端**から入る。
  *   1 px に 1 区間なら縦線が並んで帯に見え、拡大して区間が広いときは折れ線に見える。
  * - 値が 1 つ（min == max、または片方だけ有限）の区間は点 1 つ。
@@ -24,6 +25,34 @@ type Scale = (v: number) => number;
 const fin = (v: number | null | undefined): v is number =>
 	typeof v === 'number' && Number.isFinite(v);
 const r2 = (v: number) => Math.round(v * 100) / 100;
+
+/** 区間が表示範囲 `[startMs, endMs)` と重ならないか（`envelopePath`・`visibleBins` の共通の判定）。 */
+function isOutsideRange(
+	tMs: number,
+	binMs: number,
+	startMs: number | undefined,
+	endMs: number | undefined
+): boolean {
+	const binOk = fin(binMs) && binMs > 0;
+	if (fin(startMs) && (binOk ? tMs + binMs <= startMs : tMs < startMs)) return true;
+	return fin(endMs) && tMs >= endMs;
+}
+
+/** 表示範囲と重なる区間だけ（`tMs` が非有限の区間は除く）。縦軸・空の判定・カーソルもこれを使う。 */
+export function visibleBins(
+	bins: readonly Bin[],
+	binMs: number,
+	range: { startMs: number; endMs: number }
+): Bin[] {
+	return bins.filter(
+		(b) => fin(b.tMs) && !isOutsideRange(b.tMs, binMs, range.startMs, range.endMs)
+	);
+}
+
+/** 有限の min か max を持つ区間が 1 つでもあるか。 */
+export function hasFiniteValue(bins: readonly Bin[]): boolean {
+	return bins.some((b) => fin(b.min) || fin(b.max));
+}
 
 /** 包絡の path の `d`。点が無ければ空文字。 */
 export function envelopePath(
@@ -67,11 +96,7 @@ export function envelopePath(
 		const e = fin(endMs) ? Math.min(tMs + binMs, endMs) : tMs + binMs;
 		return (s + e) / 2;
 	};
-	// 表示範囲と重ならない区間か（範囲を渡したときだけ使う）。
-	const outside = (tMs: number): boolean => {
-		if (fin(startMs) && (binOk ? tMs + binMs <= startMs : tMs < startMs)) return true;
-		return fin(endMs) && tMs >= endMs;
-	};
+	const outside = (tMs: number): boolean => isOutsideRange(tMs, binMs, startMs, endMs);
 	for (const b of bins) {
 		if (options && fin(b.tMs) && outside(b.tMs)) continue;
 		const lo = fin(b.min) ? b.min : fin(b.max) ? b.max : null;

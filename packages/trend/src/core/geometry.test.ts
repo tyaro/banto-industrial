@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { envelopePath } from './geometry';
+import { envelopePath, hasFiniteValue, visibleBins } from './geometry';
+import { resolveYDomain } from './pens';
+import type { TrendPen } from './pens';
 import type { Bin } from './pens';
 
 // x: 時刻をそのまま px に、y: 値を反転（上が大きい）。
@@ -88,5 +90,46 @@ describe('envelopePath', () => {
 		expect(envelopePath(bins, 10, x, y, { startMs: 100, endMs: 200 })).toBe(
 			'M105,80L105,80M195,70L195,70'
 		);
+	});
+});
+
+describe('visibleBins / hasFiniteValue', () => {
+	const range = { startMs: 100, endMs: 200 };
+	const pen = { id: 'a', label: 'A' } as TrendPen;
+
+	it('表示範囲の外にだけ値がある → 空で、縦軸は既定のまま', () => {
+		const bins: Bin[] = [
+			{ tMs: 0, min: 1000, max: 5000 },
+			{ tMs: 300, min: 9000, max: 9999 }
+		];
+		const v = visibleBins(bins, 10, range);
+		expect(v).toEqual([]);
+		expect(hasFiniteValue(v)).toBe(false);
+		expect(resolveYDomain(pen, v)).toEqual(resolveYDomain(pen, []));
+		expect(resolveYDomain(pen, v)).toEqual([0, 1]);
+	});
+
+	it('一部だけ範囲内 → 重なる区間だけ残り、外の大きな値は縦軸に入らない', () => {
+		const bins: Bin[] = [
+			{ tMs: 50, min: 0, max: 99999 },
+			{ tMs: 95, min: 1, max: 2 },
+			{ tMs: 150, min: 3, max: 4 },
+			{ tMs: 200, min: 0, max: 88888 }
+		];
+		const v = visibleBins(bins, 10, range);
+		expect(v.map((b) => b.tMs)).toEqual([95, 150]);
+		expect(hasFiniteValue(v)).toBe(true);
+		const [, hi] = resolveYDomain(pen, v);
+		expect(hi).toBeLessThan(100);
+	});
+
+	it('範囲の端をまたぐ区間は残る', () => {
+		const bins: Bin[] = [
+			{ tMs: 90, min: 1, max: 2 },
+			{ tMs: 100, min: 1, max: 2 },
+			{ tMs: 190, min: 1, max: 2 },
+			{ tMs: 200, min: 1, max: 2 }
+		];
+		expect(visibleBins(bins, 20, range).map((b) => b.tMs)).toEqual([90, 100, 190]);
 	});
 });
