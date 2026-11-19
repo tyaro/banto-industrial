@@ -99,34 +99,67 @@ impl TsReader {
         self.groups.iter().find(|g| g.key == group_key)
     }
 
-    /// Number of samples [`Self::read_range`] would return for the same
-    /// arguments (both bounds inclusive), without materializing any row.
-    /// Lets a caller with a row cap reject an oversized range *before*
-    /// `fetch_all` allocates it. The count is a snapshot: a concurrent
-    /// writer may append rows before a following `read_range`.
-    pub async fn count_range(
+    /// [`Self::read_range`] の、列を絞り行数を打ち切る版（両端を含む、`ptime` 昇順）。
+    /// `column_indices` は `GroupMeta::columns` への添字で、返す各行の `values` はこの順。
+    /// SQL には `ptime` と要求された列だけを選び、`LIMIT limit` で SQLite 側が打ち切る
+    /// ので、メモリは `limit` 行 × 要求列数で頭打ちになる（取得中に書き手が追記しても超えない）。
+    /// 呼び出し側は「上限 + 1」を渡して、上限を超えたかを返った行数で判定できる。
+    /// `column_indices` が空なら `ptime` だけを読み、各行の `values` は空になる。
+    pub async fn read_range_columns(
         &self,
         group_key: &str,
+        column_indices: &[usize],
         from_ms: i64,
         to_ms: i64,
-    ) -> Result<u64, TstoreError> {
+        limit: usize,
+    ) -> Result<Vec<(i64, Vec<Option<f64>>)>, TstoreError> {
         let group = self
             .group(group_key)
             .ok_or_else(|| TstoreError::UnknownGroup(group_key.to_string()))?;
 
+        let mut column_list = String::from("ptime");
+        let mut names: Vec<&str> = Vec::with_capacity(column_indices.len());
+        for &index in column_indices {
+            let column = group.columns.get(index).ok_or_else(|| {
+                TstoreError::Config(format!(
+                    "列の添字 {index} が範囲外です（group {group_key}、列数 {}）",
+                    group.columns.len()
+                ))
+            })?;
+            column_list.push_str(", ");
+            // GroupMeta 由来の "c1".."cN" のみ（`read_range` と同じ）。
+            column_list.push_str(&column.column_name);
+            names.push(column.column_name.as_str());
+        }
+
         let sql = format!(
-            "SELECT COUNT(*) FROM {} WHERE ptime >= ? AND ptime <= ?",
+            "SELECT {column_list} FROM {} WHERE ptime >= ? AND ptime <= ? \
+             ORDER BY ptime ASC LIMIT ?",
             group.table_name
         );
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
 
-        // AssertSqlSafe: `group.table_name` は `samples_<n>` 形式の生成済み
-        // 識別子のみ（`read_range` と同じ理由）。バインド値は from_ms/to_ms のみ。
-        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        // AssertSqlSafe: `column_list`/`group.table_name` は `read_range` と同じく
+        // `samples_<n>`/`c<i>` 形式の生成済み識別子のみ（GroupMeta から取る）。
+        // バインド値は from_ms/to_ms/limit のみ。
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(from_ms)
             .bind(to_ms)
-            .fetch_one(&self.pool)
+            .bind(limit)
+            .fetch_all(&self.pool)
             .await?;
-        Ok(count.max(0) as u64)
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let ptime_ms: i64 = row.get("ptime");
+                let values = names
+                    .iter()
+                    .map(|name| row.get::<Option<f64>, _>(*name))
+                    .collect();
+                (ptime_ms, values)
+            })
+            .collect())
     }
 
     /// Every sample for `group_key` with `from_ms <= ptime_ms <= to_ms`

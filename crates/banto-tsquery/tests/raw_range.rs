@@ -166,7 +166,8 @@ async fn exceeding_max_rows_is_an_error() {
         .unwrap_err();
     match err {
         TsQueryError::TooManyRows { count, max } => {
-            assert_eq!(count, 5);
+            // `count` は「少なくともこの件数」（上限 + 1 まで読んで打ち切る）。
+            assert!(count > 3, "count={count}");
             assert_eq!(max, 3);
         }
         other => panic!("expected TooManyRows, got {other:?}"),
@@ -174,7 +175,7 @@ async fn exceeding_max_rows_is_an_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exactly_max_rows_succeeds_and_one_more_fails_with_true_count() {
+async fn exactly_max_rows_succeeds_and_one_more_fails() {
     let dir = TempDir::new("raw-exact-max");
     let clock = clock_at(DAY1_START_MS);
     let config = store_config(vec![group("g1", 1_000, vec![tag("t1", None, 0)])]);
@@ -212,7 +213,8 @@ async fn exactly_max_rows_succeeds_and_one_more_fails_with_true_count() {
         .unwrap_err();
     match err {
         TsQueryError::TooManyRows { count, max } => {
-            assert_eq!((count, max), (5, 4));
+            assert!(count > 4, "count={count}");
+            assert_eq!(max, 4);
         }
         other => panic!("expected TooManyRows, got {other:?}"),
     }
@@ -267,4 +269,44 @@ async fn from_greater_than_to_is_invalid_input() {
         .await
         .unwrap_err();
     assert!(matches!(err, TsQueryError::InvalidInput(_)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_tag_of_a_multi_column_group_returns_the_right_values() {
+    let dir = TempDir::new("raw-one-of-many");
+    let clock = clock_at(DAY1_START_MS);
+    let config = store_config(vec![group(
+        "g1",
+        1_000,
+        vec![tag("t1", None, 0), tag("t2", None, 0), tag("t3", None, 0)],
+    )]);
+    let writer = open_writer(dir.path(), config, clock).await;
+    for i in 0..4i64 {
+        let t2 = if i == 1 { None } else { Some((i * 10) as f64) };
+        writer
+            .append(
+                "g1",
+                DAY1_START_MS + i * 1_000,
+                &[Some(i as f64), t2, Some((i * 100) as f64)],
+            )
+            .await
+            .unwrap();
+    }
+    writer.close().await.unwrap();
+
+    let query = TsQuery::new(dir.path());
+    let result = query
+        .read_range(
+            "g1",
+            &tag_keys(&["t2", "missing", "t2"]),
+            DAY1_START_MS,
+            DAY1_START_MS + 3_000,
+            Some(4),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows.len(), 4);
+    assert_eq!(result.rows[0].values, vec![Some(0.0), None, Some(0.0)]);
+    assert_eq!(result.rows[1].values, vec![None, None, None]);
+    assert_eq!(result.rows[3].values, vec![Some(30.0), None, Some(30.0)]);
 }

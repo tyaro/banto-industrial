@@ -3858,14 +3858,14 @@ fn check_csv_size(len: usize) -> Result<(), BantoError> {
 }
 
 /// `path` を壊さずに置き換える: 同じディレクトリの一時ファイルへ書いて
-/// `sync_all` し、`rename` で差し替える。途中で失敗したら一時ファイルを消し、
-/// 元のファイルは触らない。`write` は一時ファイルへ書く手順（失敗の試験用に差し替え可）。
+/// `sync_all` し、`rename` で差し替える。途中で失敗したら**この呼び出しが作った**
+/// 一時ファイルだけを消し、元のファイルは触らない。`write` は一時ファイルへ書く手順
+/// （失敗の試験用に差し替え可）。
 fn write_replacing_with(
     path: &std::path::Path,
     bytes: &[u8],
     write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    use std::io::Write as _;
     let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let name = path
         .file_name()
@@ -3876,19 +3876,33 @@ fn write_replacing_with(
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let tmp = dir.join(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
+    write_replacing_via(path, &tmp, bytes, write)
+}
+
+/// [`write_replacing_with`] の本体。一時ファイルの名前 `tmp` を外から決める（試験で
+/// 衝突を再現するため）。`create_new` が失敗した（名前の衝突など）ときは、自分が作って
+/// いない既存のファイルを消さないよう、一時ファイルには触れない。
+fn write_replacing_via(
+    path: &std::path::Path,
+    tmp: &std::path::Path,
+    bytes: &[u8],
+    write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)?;
+    // ここから先は、この呼び出しが `tmp` を作った。
     let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
         write(&mut file, bytes)?;
         file.flush()?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&tmp, path)
+        std::fs::rename(tmp, path)
     })();
     if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp);
     }
     result
 }
@@ -6713,6 +6727,20 @@ mod tests {
         assert!(err.is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"original");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn save_csv_temp_name_collision_keeps_the_existing_file_and_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.csv");
+        std::fs::write(&path, b"original").unwrap();
+        let tmp = dir.path().join(".a.csv.fixed.tmp");
+        std::fs::write(&tmp, b"someone else's").unwrap();
+        let err = write_replacing_via(&path, &tmp, b"new", |_, _| Ok(())).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        // 自分が作っていない一時ファイルは消さない。出力先も触らない。
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"someone else's");
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
     }
 
     // --- #413: 接続単位シミュレーション -------------------------------------

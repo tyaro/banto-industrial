@@ -31,7 +31,7 @@ pub enum TsQueryError {
     /// worse failure mode than an explicit error telling the caller to use
     /// `read_decimated` or narrow the range.
     #[error(
-        "行数上限を超えました（{count} 件 > 上限 {max} 件）。\
+        "行数上限を超えました（{count} 件以上 > 上限 {max} 件）。\
          read_decimated による間引き取得、または期間を狭めての再実行を検討してください"
     )]
     TooManyRows { count: usize, max: usize },
