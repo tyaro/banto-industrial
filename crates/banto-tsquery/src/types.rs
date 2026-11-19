@@ -1,4 +1,4 @@
-//! Public result shapes for [`crate::TsQuery`]'s four query methods.
+//! Public result shapes for [`crate::TsQuery`]'s query methods.
 
 /// One row from [`crate::TsQuery::read_range`]: a `ptime_ms` plus one
 /// `Option<f64>` per requested tag, in `RawRange::tag_keys` order. `None`
@@ -128,4 +128,38 @@ pub struct GroupCatalogEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Catalog {
     pub groups: Vec<GroupCatalogEntry>,
+}
+
+/// One tag's statistics within one [`StatBin`]. Computed over the non-NULL
+/// samples of the bin (so `count >= 1` always; a bin with none is `None` in
+/// [`StatBin::tags`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TagStat {
+    pub min: f64,
+    pub max: f64,
+    /// `sum / count` over every file's contribution to the bin (weighted by
+    /// sample count, never an average of per-file averages).
+    pub avg: f64,
+    pub count: i64,
+}
+
+/// One fixed-width time bin of [`crate::TsQuery::read_binned_stats`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatBin {
+    /// The bin's start time, `from_ms + index * bin_ms`.
+    pub ptime_ms: i64,
+    /// Aligned to [`BinnedStats::tag_keys`]. `None` = no non-NULL sample of
+    /// that tag landed in this bin (a gap - never interpolated).
+    pub tags: Vec<Option<TagStat>>,
+}
+
+/// [`crate::TsQuery::read_binned_stats`]'s result: min/max/avg/count per
+/// tag for every fixed-width bin of `[from_ms, to_ms]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BinnedStats {
+    pub tag_keys: Vec<String>,
+    /// Exactly the caller's `bin_ms` (never clamped to the collection period).
+    pub bin_ms: i64,
+    /// Ascending, one entry per bin index (empty bins included, all-`None`).
+    pub bins: Vec<StatBin>,
 }

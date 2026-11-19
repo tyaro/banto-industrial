@@ -247,7 +247,7 @@ fn build_gap_bins(
 /// The count is at most `target_bins` (or 3, see [`raw_bin_ms`]): `bin_ms`
 /// is never smaller than `raw_bin_ms`, so `(to_ms - from_ms) / bin_ms + 1 =
 /// ceil(width / bin_ms) <= ceil(width / raw_bin_ms)`.
-fn bin_starts(from_ms: i64, to_ms: i64, bin_ms: i64) -> Result<Vec<i64>, TsQueryError> {
+pub(crate) fn bin_starts(from_ms: i64, to_ms: i64, bin_ms: i64) -> Result<Vec<i64>, TsQueryError> {
     let span = i128::from(to_ms) - i128::from(from_ms);
     let count = span / i128::from(bin_ms) + 1;
     let count = usize::try_from(count).map_err(|_| {
@@ -265,14 +265,16 @@ fn bin_starts(from_ms: i64, to_ms: i64, bin_ms: i64) -> Result<Vec<i64>, TsQuery
         .collect()
 }
 
-/// One tag's accumulated envelope across every file's contribution to one
-/// bin: `(min, max, valid_sample_count)`. Merged additively across files
+/// One tag's accumulated stats across every file's contribution to one bin:
+/// `(min, max, valid_sample_count, sum)`. Merged additively across files
 /// because a bin can straddle a file boundary (local-midnight rotation) -
-/// see this module's doc comment.
-type Accumulator = Option<(f64, f64, i64)>;
+/// see this module's doc comment. `sum` is only meaningful when fetched
+/// (`with_sum`; the envelope path leaves it `0.0`).
+pub(crate) type SumAccumulator = Option<(f64, f64, i64, f64)>;
 
 /// The per-file `GROUP BY` query: one row per non-empty bin, `bin_idx` first,
-/// then `MIN`/`MAX`/`COUNT` for every `present` column.
+/// then `MIN`/`MAX`/`COUNT` (plus `SUM` when `with_sum`) for every `present`
+/// column, in that order (so the per-column stride is 3, or 4 with `SUM`).
 ///
 /// ## Bin index without overflow
 ///
@@ -311,13 +313,16 @@ type Accumulator = Option<(f64, f64, i64)>;
 /// `tests::sql_bin_index_matches_i128_reference` checks this against the
 /// `i128` reference for negative/positive times, `from_ms < 0 <= ptime`,
 /// both ends of the range, `b = 1`, huge `b` and `i64::MIN..=i64::MAX`.
-fn binned_sql(table_name: &str, present: &[(usize, &str)]) -> String {
+fn binned_sql(table_name: &str, present: &[(usize, &str)], with_sum: bool) -> String {
     let mut sql = String::from(
         "SELECT (bin_q - (bin_r < 0)) - ? \
          - ((bin_r + CASE WHEN bin_r < 0 THEN ? ELSE 0 END) < ?) AS bin_idx",
     );
     for (_, column) in present {
         sql.push_str(&format!(", MIN({column}), MAX({column}), COUNT({column})"));
+        if with_sum {
+            sql.push_str(&format!(", SUM({column})"));
+        }
     }
     sql.push_str(&format!(
         " FROM (SELECT ptime / ? AS bin_q, ptime % ? AS bin_r, * FROM {table_name} \
@@ -336,22 +341,25 @@ async fn fetch_bin_rows(
     from_ms: i64,
     to_ms: i64,
     bin_ms: i64,
+    with_sum: bool,
 ) -> Result<Vec<sqlx::sqlite::SqliteRow>, sqlx::Error> {
     let from_q = from_ms.div_euclid(bin_ms);
     let from_r = from_ms.rem_euclid(bin_ms);
     // AssertSqlSafe: `column`/`table_name` は is_safe_table_name/
     // is_safe_column_name で検証済みの samples_<n>/c<i> のみで構成される
     // （plan.rs の「SQL-identifier safety」）。バインド値のみ可変。
-    sqlx::query(sqlx::AssertSqlSafe(binned_sql(table_name, present)))
-        .bind(from_q)
-        .bind(bin_ms)
-        .bind(from_r)
-        .bind(bin_ms)
-        .bind(bin_ms)
-        .bind(from_ms)
-        .bind(to_ms)
-        .fetch_all(pool)
-        .await
+    sqlx::query(sqlx::AssertSqlSafe(binned_sql(
+        table_name, present, with_sum,
+    )))
+    .bind(from_q)
+    .bind(bin_ms)
+    .bind(from_r)
+    .bind(bin_ms)
+    .bind(bin_ms)
+    .bind(from_ms)
+    .bind(to_ms)
+    .fetch_all(pool)
+    .await
 }
 
 async fn fetch_binned(
@@ -361,9 +369,42 @@ async fn fetch_binned(
     to_ms: i64,
     bin_ms: i64,
 ) -> Result<Vec<Bin>, TsQueryError> {
+    let (starts, acc) = fetch_accumulated(plans, tag_count, from_ms, to_ms, bin_ms, false).await?;
+    Ok(starts
+        .into_iter()
+        .zip(acc)
+        .map(|(ptime_ms, slots)| Bin {
+            ptime_ms,
+            tags: slots
+                .iter()
+                .map(|slot| match slot {
+                    Some((min, max, _, _)) => BinValue::Range {
+                        min: *min,
+                        max: *max,
+                    },
+                    None => BinValue::Gap,
+                })
+                .collect(),
+        })
+        .collect())
+}
+
+/// The shared per-file `GROUP BY` + cross-file merge: returns every bin start
+/// plus, per bin and tag, the merged `(min, max, count, sum)` (`None` = no
+/// non-NULL sample). `sum` is only fetched (else `0.0`) when `with_sum`.
+/// Used by [`fetch_binned`] (envelope) and [`crate::stats`] (min/max/avg/count).
+pub(crate) async fn fetch_accumulated(
+    plans: &[FilePlan],
+    tag_count: usize,
+    from_ms: i64,
+    to_ms: i64,
+    bin_ms: i64,
+    with_sum: bool,
+) -> Result<(Vec<i64>, Vec<Vec<SumAccumulator>>), TsQueryError> {
     let starts = bin_starts(from_ms, to_ms, bin_ms)?;
     let num_bins = starts.len();
-    let mut acc: Vec<Vec<Accumulator>> = vec![vec![None; tag_count]; num_bins];
+    let mut acc: Vec<Vec<SumAccumulator>> = vec![vec![None; tag_count]; num_bins];
+    let stride = if with_sum { 4 } else { 3 };
 
     for plan in plans {
         let present: Vec<(usize, &str)> = plan
@@ -383,6 +424,7 @@ async fn fetch_binned(
             from_ms,
             to_ms,
             bin_ms,
+            with_sum,
         )
         .await?;
 
@@ -397,40 +439,33 @@ async fn fetch_binned(
             }
 
             for (result_col, (tag_index, _)) in present.iter().enumerate() {
-                let base = 1 + result_col * 3;
+                let base = 1 + result_col * stride;
                 let min: Option<f64> = row.try_get(base)?;
                 let max: Option<f64> = row.try_get(base + 1)?;
                 let count: i64 = row.try_get(base + 2)?;
                 if count == 0 {
                     continue; // every row in this bin was NULL for this tag - stays Gap.
                 }
+                // SQLite stores NaN as NULL, so a SUM that overflows to
+                // inf + -inf (NaN) comes back NULL: surface it as NaN.
+                let sum: f64 = if with_sum {
+                    row.try_get::<Option<f64>, _>(base + 3)?.unwrap_or(f64::NAN)
+                } else {
+                    0.0
+                };
                 let (min, max) = (min.unwrap(), max.unwrap());
                 let slot = &mut acc[bin_idx][*tag_index];
                 *slot = Some(match slot {
-                    Some((emin, emax, ecount)) => (emin.min(min), emax.max(max), *ecount + count),
-                    None => (min, max, count),
+                    Some((emin, emax, ecount, esum)) => {
+                        (emin.min(min), emax.max(max), *ecount + count, *esum + sum)
+                    }
+                    None => (min, max, count, sum),
                 });
             }
         }
     }
 
-    Ok(starts
-        .into_iter()
-        .zip(acc)
-        .map(|(ptime_ms, slots)| Bin {
-            ptime_ms,
-            tags: slots
-                .iter()
-                .map(|slot| match slot {
-                    Some((min, max, _)) => BinValue::Range {
-                        min: *min,
-                        max: *max,
-                    },
-                    None => BinValue::Gap,
-                })
-                .collect(),
-        })
-        .collect())
+    Ok((starts, acc))
 }
 
 async fn fetch_raw_passthrough(
@@ -669,10 +704,17 @@ mod tests {
                         .unwrap();
                 }
 
-                let rows =
-                    fetch_bin_rows(&pool, "samples_1", &[(0, "c0")], from_ms, i64::MAX, bin_ms)
-                        .await
-                        .unwrap_or_else(|e| panic!("from={from_ms} b={bin_ms}: {e}"));
+                let rows = fetch_bin_rows(
+                    &pool,
+                    "samples_1",
+                    &[(0, "c0")],
+                    from_ms,
+                    i64::MAX,
+                    bin_ms,
+                    false,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("from={from_ms} b={bin_ms}: {e}"));
                 let mut seen = 0i64;
                 for row in rows {
                     let bin_idx: i64 = row

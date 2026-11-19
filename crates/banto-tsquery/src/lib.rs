@@ -6,7 +6,8 @@
 //! directory: raw ranges for small windows/CSV export
 //! ([`TsQuery::read_range`]), server-side min/max-decimated bins for trend
 //! viewports ([`TsQuery::read_decimated`]), per-tag min/max/avg summaries for
-//! daily reports ([`TsQuery::aggregate`]), and what data/groups/tags exist at
+//! daily reports ([`TsQuery::aggregate`]), per-interval min/max/avg/count at a
+//! fixed bin width for interval CSVs ([`TsQuery::read_binned_stats`]), and what data/groups/tags exist at
 //! all for a UI's period picker ([`TsQuery::catalog`]).
 //!
 //! Like `banto-tstore` itself, this crate never reads the tag registry (I1):
@@ -35,6 +36,7 @@
 //!   [`banto_tstore::TsReader::read_range`].
 //! - [`decimate`][]: [`TsQuery::read_decimated`].
 //! - [`aggregate`][]: [`TsQuery::aggregate`].
+//! - [`stats`][]: [`TsQuery::read_binned_stats`].
 //! - [`catalog`][]: [`TsQuery::catalog`].
 //! - [`types`][]: every public result shape.
 //! - [`error`][]: [`TsQueryError`].
@@ -45,6 +47,7 @@ mod decimate;
 mod files;
 mod plan;
 mod raw;
+mod stats;
 mod types;
 
 pub mod error;
@@ -52,9 +55,10 @@ pub mod error;
 pub use decimate::MAX_TARGET_BINS;
 pub use error::TsQueryError;
 pub use raw::DEFAULT_MAX_RAW_ROWS;
+pub use stats::MAX_STAT_BINS;
 pub use types::{
-    Bin, BinValue, Catalog, DecimatedRange, GroupCatalogEntry, RawRange, RawRow, TagAggregate,
-    TagCatalogEntry,
+    Bin, BinValue, BinnedStats, Catalog, DecimatedRange, GroupCatalogEntry, RawRange, RawRow,
+    StatBin, TagAggregate, TagCatalogEntry, TagStat,
 };
 
 use std::path::{Path, PathBuf};
@@ -150,6 +154,22 @@ impl TsQuery {
         to_ms: i64,
     ) -> Result<Vec<TagAggregate>, TsQueryError> {
         aggregate::aggregate(&self.place, group_key, tag_keys, from_ms, to_ms).await
+    }
+
+    /// Fixed-width bins (`from_ms + i * bin_ms`, both range ends inclusive)
+    /// with per-tag `min`/`max`/`avg`/`count` (NULLs excluded; `None` for a
+    /// tag with no sample in a bin). `bin_ms` is used exactly as given. Errors
+    /// with [`TsQueryError::InvalidInput`] for `bin_ms <= 0`, `from_ms >
+    /// to_ms`, or more than [`MAX_STAT_BINS`] bins. See [`mod@stats`].
+    pub async fn read_binned_stats(
+        &self,
+        group_key: &str,
+        tag_keys: &[String],
+        from_ms: i64,
+        to_ms: i64,
+        bin_ms: i64,
+    ) -> Result<BinnedStats, TsQueryError> {
+        stats::read_binned_stats(&self.place, group_key, tag_keys, from_ms, to_ms, bin_ms).await
     }
 
     /// Every group/tag this data directory's files describe, with the
