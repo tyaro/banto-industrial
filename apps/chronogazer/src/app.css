@@ -1,5 +1,6 @@
 @import 'tailwindcss';
 @import '@banto/theme/css';
+@import '@banto/report/print.css';
 
 body {
 	margin: 0;
@@ -8,4 +9,18 @@ body {
 	   shell. `none` under standard, so this is a no-op there. */
 	background-image: var(--banto-bg-image);
 	background-attachment: fixed;
+}
+
+/* 日報（@banto/report の ReportView、#1207 R3）: 帳票のあるページを印刷するときは、シェル
+   （サイドバー・ドック・ヘッダー・案内帯）を隠して帳票の紙面だけにする。ReportView が
+   表示中だけ body に `banto-report-active` を付ける（他のページの印刷には影響しない）。 */
+@media print {
+	body.banto-report-active .shell > :not(.main),
+	body.banto-report-active .shell .main > :not(main) {
+		display: none;
+	}
+
+	body.banto-report-active .shell main {
+		padding: 0;
+	}
 }

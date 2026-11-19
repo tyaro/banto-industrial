@@ -386,6 +386,41 @@ export function collectExportQuery(params: CollectExportParams): string {
 	return query.toString();
 }
 
+/** 日報の 1 区間（1 時間、または 1 日）の統計。サンプルが無い区間は `null`（この型ではなく）。 */
+export interface DailyReportStat {
+	min: number;
+	max: number;
+	avg: number;
+	count: number;
+}
+
+/** 日報の読み出しの結果（`chronogazer_core::collect::daily_report`）。`hours`・`day` の `values` は `tags` と同じ並び。 */
+export interface CollectDailyReport {
+	fromMs: number;
+	toMs: number;
+	intervalMs: number;
+	tags: { tagId: number; simulation: boolean }[];
+	unknownTagIds: number[];
+	hours: { tMs: number; values: (DailyReportStat | null)[] }[];
+	day: (DailyReportStat | null)[];
+}
+
+/** [`getCollectDailyReport`] の引数。 */
+export interface CollectDailyReportParams {
+	tagIds: readonly number[];
+	fromMs: number;
+	toMs: number;
+}
+
+/** `GET /api/collect/daily-report` のクエリ文字列（上限の検証はサーバー）。 */
+export function collectDailyReportQuery(params: CollectDailyReportParams): string {
+	return new URLSearchParams({
+		tagIds: params.tagIds.join(','),
+		fromMs: String(params.fromMs),
+		toMs: String(params.toMs)
+	}).toString();
+}
+
 export const DEMO_MODE_MESSAGE = 'デモモードでは利用できません';
 
 function demoModeError(): ProviderError {
@@ -610,6 +645,28 @@ export async function getCollectExport(
 		});
 	return httpJson<Readout<CollectExport>>(
 		`/api/collect/export?${collectExportQuery(params)}`,
+		'GET',
+		signal
+	);
+}
+
+/**
+ * 日報の材料（`viewer` 以上）。1 時間ごとの統計と 1 日の統計を、タグごとに返す。
+ * 窓は 1〜25 時間・タグ 8 本まで（外れると `validation`）。収集の操作キューを通らない。
+ */
+export async function getCollectDailyReport(
+	params: CollectDailyReportParams,
+	signal?: AbortSignal
+): Promise<Readout<CollectDailyReport>> {
+	if (!isCollectAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri')
+		return invokeCommand<Readout<CollectDailyReport>>('collect_daily_report', {
+			tagIds: [...params.tagIds],
+			fromMs: params.fromMs,
+			toMs: params.toMs
+		});
+	return httpJson<Readout<CollectDailyReport>>(
+		`/api/collect/daily-report?${collectDailyReportQuery(params)}`,
 		'GET',
 		signal
 	);
