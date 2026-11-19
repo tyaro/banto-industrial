@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TrendData, TrendSeries } from './data';
+import { binAt } from './cursor';
 import { envelopePath } from './geometry';
 import type { TrendFetchRequest } from './loader';
 import {
@@ -234,6 +235,65 @@ describe('hybridData — 設計書 §8 の受け入れ', () => {
 		expect(evicted.every((b) => b.min === 1)).toBe(true);
 		expect(s.bins.filter((b) => b.tMs >= p.liveFrom!).every((b) => b.min === 2)).toBe(true);
 		expect(segments(s)).toBe(1);
+	});
+});
+
+describe('hybridData — 幅を広げたときの履歴の終わり', () => {
+	it('履歴の区間が取得範囲の終わりで切れ、ライブとの隙間（読んでいない時刻）は欠測になる', () => {
+		const history: TrendData = {
+			range: { startMs: 0, endMs: 500 },
+			series: { a: { bins: [{ tMs: 0, min: 1, max: 1 }], binMs: 1000 } }
+		};
+		const live = { a: pen([1200, 2200].map((tMs) => ({ tMs, value: 5 }))) };
+		const out = hybridData({
+			history,
+			live,
+			penIds: ['a'],
+			binMs: 1000,
+			sampleIntervalMs: { a: 1000 }
+		})!;
+		const s = out.series.a!;
+		expect(s.binMs).toBe(2000);
+		expect(s.bins[1]).toEqual({ tMs: 500, min: null, max: null });
+		expect(binAt(s.bins, s.binMs, 250)).toEqual({ tMs: 0, min: 1, max: 1 });
+		expect(binAt(s.bins, s.binMs, 750)).toBeNull();
+		expect(binAt(s.bins, s.binMs, 1300)).not.toBeNull();
+		expect(segments(s)).toBe(2);
+	});
+
+	it('履歴の途中の穴（行が返っていない隙間）にも欠測の区間が入る', () => {
+		const history: TrendData = {
+			range: { startMs: 0, endMs: 10_000 },
+			series: {
+				a: {
+					bins: [
+						{ tMs: 0, min: 1, max: 1 },
+						{ tMs: 3000, min: 2, max: 2 }
+					],
+					binMs: 1000
+				}
+			}
+		};
+		const live = { a: pen([20_000, 21_000, 22_000].map((tMs) => ({ tMs, value: 5 }))) };
+		const out = hybridData({
+			history,
+			live,
+			penIds: ['a'],
+			binMs: 1000,
+			sampleIntervalMs: { a: 1000 }
+		})!;
+		const s = out.series.a!;
+		expect(s.binMs).toBeGreaterThan(1000);
+		expect(s.bins.slice(0, 5)).toEqual([
+			{ tMs: 0, min: 1, max: 1 },
+			{ tMs: 1000, min: null, max: null },
+			{ tMs: 3000, min: 2, max: 2 },
+			{ tMs: 4000, min: null, max: null },
+			expect.objectContaining({ tMs: 20_000 })
+		]);
+		expect(binAt(s.bins, s.binMs, 1500)).toBeNull();
+		expect(binAt(s.bins, s.binMs, 5000)).toBeNull();
+		expect(increasing(tms(s))).toBe(true);
 	});
 });
 

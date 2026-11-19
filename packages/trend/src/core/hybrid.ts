@@ -23,6 +23,8 @@
  * - 出力の系列の `binMs` は、リングバッファがあるペンでは `liveBinMs`（履歴の幅以上）。履歴の区間は
  *   次の区間の始まりで打ち切られる（`binEndMs`）ので、狭い間隔の履歴の区間もそのまま並べてよい。
  *   つなぎ目（読み直した区間 → `liveFrom` の区間）の間隔は幅より狭いので、両側に値があれば線はつながる。
+ *   ただし幅が履歴より広いと履歴の区間の終わりが後ろへ伸びるので、本来の終わり（`binEndMs`・取得範囲の
+ *   終わりの小さい方）と次の区間の始まりの間には欠測の区間を入れ、読んでいない時刻を値で埋めない。
  * - 出力の `range` は 1 本: 始まりは履歴の取得範囲の始まりと各ペンの `liveFrom` の早い方、終わりは
  *   履歴の取得範囲の終わり・`nowMs`・最新のサンプルの直後の遅い方（`nowMs` はリングバッファを持つ
  *   ペンがあるときだけ使う。履歴だけなら取得範囲のまま）。履歴が無い（読み出し中・失敗）ときは
@@ -120,13 +122,14 @@ export function liveBins(samples: readonly LiveSample[], liveFrom: number, binMs
 	return out;
 }
 
-/** 履歴の系列を `liveFrom` で分ける。`before` は終わりが `liveFrom` 以下の区間、`straddle` はまたぐ区間の始まり。 */
+/** 履歴の系列を `liveFrom` で分ける。`before` は終わりが `liveFrom` 以下の区間（`ends` は各区間の本来の終わり）、`straddle` はまたぐ区間の始まり。 */
 function splitHistory(
 	series: TrendSeries,
 	rangeEndMs: number,
 	liveFrom: number
-): { before: Bin[]; straddle: number | null } {
+): { before: Bin[]; ends: number[]; straddle: number | null } {
 	const before: Bin[] = [];
+	const ends: number[] = [];
 	const { bins, binMs } = series;
 	for (let i = 0; i < bins.length; i++) {
 		const b = bins[i];
@@ -135,11 +138,12 @@ function splitHistory(
 		const end = Math.min(binEndMs(b.tMs, binMs, bins[i + 1]?.tMs), rangeEndMs);
 		if (end <= liveFrom) {
 			before.push(b);
+			ends.push(end);
 			continue;
 		}
-		return { before, straddle: b.tMs };
+		return { before, ends, straddle: b.tMs };
 	}
-	return { before, straddle: null };
+	return { before, ends, straddle: null };
 }
 
 function activeLive(live: LiveBuffers, penId: string): (LivePen & { liveFrom: number }) | null {
@@ -241,15 +245,24 @@ export function hybridData(input: HybridInput): TrendData | null {
 		const interval = input.sampleIntervalMs?.[penId] ?? estimateIntervalMs(lp.samples);
 		const w = liveBinMs(base, interval);
 		const bins: Bin[] = [];
+		const liveAll = liveBins(lp.samples, lp.liveFrom, w);
+		const liveFirst = liveAll[0];
 		if (hs && history) {
-			const { before, straddle } = splitHistory(hs, history.range.endMs, lp.liveFrom);
-			bins.push(...before);
+			const { before, ends, straddle } = splitHistory(hs, history.range.endMs, lp.liveFrom);
+			// 出力の幅 w は履歴の幅より広いことがあり、区間の終わりが本来より後ろへ伸びる。
+			// 本来の終わりと次の区間の始まりの間（読んでいない時刻）には欠測の区間を入れる。
+			const nextAfter = straddle ?? liveFirst?.tMs ?? null;
+			for (let i = 0; i < before.length; i++) {
+				bins.push(before[i]);
+				const next = i + 1 < before.length ? before[i + 1].tMs : nextAfter;
+				if (next !== null && next > ends[i]) bins.push({ tMs: ends[i], min: null, max: null });
+			}
 			if (straddle !== null) {
 				const got = boundary?.[boundaryKey(penId, straddle, lp.liveFrom)];
 				bins.push(got ? { ...got, tMs: straddle } : { tMs: straddle, min: null, max: null });
 			}
 		}
-		bins.push(...liveBins(lp.samples, lp.liveFrom, w));
+		bins.push(...liveAll);
 		series[penId] = { bins, binMs: w };
 	}
 
