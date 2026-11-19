@@ -48,4 +48,26 @@ describe('envelopePath', () => {
 	it('min > max の区間も縦線にする', () => {
 		expect(envelopePath([{ tMs: 0, min: 20, max: 10 }], 10, x, y)).toBe('M5,90L5,80');
 	});
+
+	it('区間の列に穴（binMs * 1.5 超）があれば線を切る。隣り合う区間はつながる', () => {
+		const hole: Bin[] = [
+			{ tMs: 0, min: 10, max: 10 },
+			{ tMs: 3000, min: 20, max: 20 }
+		];
+		const p = envelopePath(hole, 1000, x, y);
+		expect(p.match(/M/g)).toHaveLength(2);
+		const near: Bin[] = [
+			{ tMs: 0, min: 10, max: 10 },
+			{ tMs: 1400, min: 20, max: 20 }
+		];
+		expect(envelopePath(near, 1000, x, y).match(/M/g)).toHaveLength(1);
+	});
+
+	it('表示範囲の端で欠ける区間の x は範囲の中に置く', () => {
+		const bins: Bin[] = [{ tMs: 9000, min: 10, max: 10 }];
+		expect(envelopePath(bins, 3000, x, y, { endMs: 10000 })).toBe('M9500,90L9500,90');
+		expect(envelopePath(bins, 3000, x, y)).toBe('M10500,90L10500,90');
+		const head: Bin[] = [{ tMs: -2000, min: 10, max: 10 }];
+		expect(envelopePath(head, 3000, x, y, { startMs: 0 })).toBe('M500,90L500,90');
+	});
 });

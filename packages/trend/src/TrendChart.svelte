@@ -86,7 +86,8 @@
 						binsByPen[p.id] ?? [],
 						binMs,
 						xScale,
-						linearScale(domains[i], [plotHeight, 0])
+						linearScale(domains[i], [plotHeight, 0]),
+						{ startMs: range.startMs, endMs: range.endMs }
 					)
 				)
 			: []
