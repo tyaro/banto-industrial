@@ -516,7 +516,7 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 			{ t: 1, values: [85.25, 3] }
 		];
 		expect(trendDescription({ windowSec: 600, pens, rows, bandTagId: 1 })).toBe(
-			'直近 10 分のトレンド。ペン: 温度（℃）、圧力。縦軸は全ペン共通の自動スケールで、表示中の値の範囲は 3.0〜85.3。しきい値の帯: 温度（HH 90.0 以上 危険、H 80.0〜90.0 注意）。'
+			'直近 10 分のトレンド。ペン: 温度（℃）、圧力。縦軸はペンごとの自動スケール。表示中の値の範囲: 温度 10.0〜85.3、圧力 3。しきい値の帯: 温度（HH 90.0 以上 危険、H 80.0〜90.0 注意）。'
 		);
 		expect(trendDescription({ windowSec: 60, pens, rows: [], bandTagId: 2 })).toBe(
 			'直近 1 分のトレンド。ペン: 温度（℃）、圧力。表示できる値はまだありません。しきい値の帯: 圧力（しきい値の設定なし）。'
@@ -524,6 +524,33 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 		expect(trendDescription({ windowSec: 60, pens, rows: [], bandTagId: null })).toContain(
 			'しきい値の帯: なし。'
 		);
+	});
+
+	it('説明文: ペンごとの範囲を言い、合算の範囲は言わない。値が無いペンは値なし', () => {
+		const mk = (tagId: number, name: string) => ({
+			tagId,
+			name,
+			unit: '',
+			decimals: 0,
+			isBit: false,
+			colorSlot: 0,
+			thresholds: null
+		});
+		const pens = [mk(1, 'A'), mk(2, 'B'), mk(3, 'C')] as unknown as Parameters<
+			typeof trendDescription
+		>[0]['pens'];
+		const text = trendDescription({
+			windowSec: 60,
+			pens,
+			rows: [
+				{ t: 0, values: [0, 100, null] },
+				{ t: 1, values: [10, 200, null] }
+			],
+			bandTagId: null
+		});
+		expect(text).toContain('表示中の値の範囲: A 0〜10、B 100〜200、C 値なし。');
+		expect(text).not.toContain('A 0〜200');
+		expect(text).not.toContain('全ペン共通');
 	});
 
 	it('bit のタグ: isBit、全ペン bit なら説明文の縦軸は 0 と 1、混在は数値の範囲（#551）', () => {
@@ -563,7 +590,7 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 			rows: [{ t: 0, values: [5, 1] }],
 			bandTagId: null
 		});
-		expect(text).toContain('表示中の値の範囲は 1〜5。');
+		expect(text).toContain('縦軸はペンごとの自動スケール。表示中の値の範囲: 圧力 5、運転中 1。');
 		expect(text).toContain('bit のペン（運転中）は 0 が False、1 が True。');
 
 		// ペンが無いときは全 bit ではない。

@@ -606,7 +606,6 @@ export function trendDescription(input: {
 		`直近 ${trendWindowLabel(input.windowSec)}のトレンド。ペン: ${input.pens.map(penLegendLabel).join('、')}。`
 	);
 	const extent = valueExtent(input.rows);
-	const decimals = Math.max(0, ...input.pens.map((p) => p.decimals ?? 0));
 	if (extent === null) {
 		parts.push('表示できる値はまだありません。');
 	} else if (isAllBitTrend(input.pens)) {
@@ -615,9 +614,21 @@ export function trendDescription(input: {
 		const hi = String(extent.max);
 		parts.push(`縦軸は 0 と 1 で、表示中の値は ${lo === hi ? lo : `${lo}〜${hi}`}。`);
 	} else {
-		parts.push(
-			`縦軸は全ペン共通の自動スケールで、表示中の値の範囲は ${formatNumber(extent.min, decimals)}〜${formatNumber(extent.max, decimals)}。`
-		);
+		const ranges = input.pens.map((pen, i) => {
+			let min = Infinity;
+			let max = -Infinity;
+			for (const row of input.rows) {
+				const v = row.values[i];
+				if (v === null || v === undefined || !Number.isFinite(v)) continue;
+				if (v < min) min = v;
+				if (v > max) max = v;
+			}
+			if (!Number.isFinite(min)) return `${pen.name} 値なし`;
+			const lo = formatNumber(min, pen.decimals);
+			const hi = formatNumber(max, pen.decimals);
+			return `${pen.name} ${lo === hi ? lo : `${lo}〜${hi}`}`;
+		});
+		parts.push(`縦軸はペンごとの自動スケール。表示中の値の範囲: ${ranges.join('、')}。`);
 		const bits = input.pens.filter((p) => p.isBit);
 		if (bits.length > 0) {
 			parts.push(`bit のペン（${bits.map((p) => p.name).join('、')}）は 0 が False、1 が True。`);
