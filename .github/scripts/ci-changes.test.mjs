@@ -268,6 +268,11 @@ const TABLE = [
 		}
 	],
 	[
+		'packages だけ（共通のフロントの部品）は ChronoGazer のフロントだけ',
+		['packages/trend/src/core/range.ts', 'packages/trend/package.json'],
+		{ ...NONE, run_frontend_chronogazer: true }
+	],
+	[
 		'crates の変更は、そのパッケージと逆依存だけ（banto-tags）',
 		['crates/banto-tags/src/lib.rs'],
 		{

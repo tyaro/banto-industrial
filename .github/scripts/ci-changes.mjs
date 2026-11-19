@@ -61,6 +61,7 @@ export const AREAS = [
 	'rust_all',
 	'crates',
 	'frontend_all',
+	'frontend_packages',
 	'hub',
 	'chronogazer',
 	'hub_sink',
@@ -107,6 +108,14 @@ export const RULES = [
 	{ re: /^apps\/banto-hub-sink\//, areas: ['hub_sink'], why: 'banto-hub-sink' },
 	{ re: /^apps\/banto-hub\//, areas: ['hub'], why: 'banto-hub' },
 	{ re: /^apps\/chronogazer\//, areas: ['chronogazer'], why: 'chronogazer' },
+	// 共通のフロントの部品（いまは packages/trend だけ）。使うのは ChronoGazer の画面で、
+	// 将来は temp-scada の画面も使う（別リポジトリなのでここでは見ない。banto-scada を
+	// このリポジトリに足したら、run_frontend_scada もこの area で走らせる）。
+	{
+		re: /^packages\//,
+		areas: ['frontend_packages'],
+		why: '共通のフロントの部品（ChronoGazer が使う。将来は SCADA も）'
+	},
 	{
 		re: /^installer-common\//,
 		areas: ['hub', 'chronogazer'],
@@ -389,7 +398,8 @@ export function derive(a, crateAffected = []) {
 		// 判定したら必ず走る（repo 全体の ESLint + Prettier。docs の整形もここ）。
 		run_lint_format: true,
 		run_frontend_hub: full || a.frontend_all || a.hub,
-		run_frontend_chronogazer: full || a.frontend_all || a.chronogazer,
+		// packages/*（共通の部品）は、それを使う ChronoGazer のフロントのジョブで check・test する。
+		run_frontend_chronogazer: full || a.frontend_all || a.chronogazer || a.frontend_packages,
 		run_rust: runRust,
 		rust_args: !runRust
 			? ''
