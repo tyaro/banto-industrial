@@ -238,6 +238,12 @@
                 ],
                 "type": "string"
               },
+              "tagKeys": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
               "tags": {
                 "minimum": 0,
                 "type": "integer"
@@ -246,6 +252,7 @@
             "required": [
               "groups",
               "tags",
+              "tagKeys",
               "exclusions",
               "state"
             ],
@@ -340,6 +347,12 @@
                 ],
                 "type": "string"
               },
+              "tagKeys": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
               "tags": {
                 "minimum": 0,
                 "type": "integer"
@@ -348,6 +361,7 @@
             "required": [
               "groups",
               "tags",
+              "tagKeys",
               "exclusions",
               "state"
             ],

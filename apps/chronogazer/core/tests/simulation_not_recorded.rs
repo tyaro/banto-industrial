@@ -218,14 +218,19 @@ async fn simulation_connection_values_are_live_but_never_recorded() {
     );
     let outcome = svc.start().await.expect("収集を開始できる");
     assert!(!outcome.pending, "開始が打ち切られた: {:?}", outcome.status);
-    assert_eq!(
-        svc.state(),
+    match svc.state() {
         CollectorState::Running {
             groups: 2,
             tags: 2,
-            exclusions: vec![],
+            tag_keys,
+            exclusions,
+        } => {
+            assert!(exclusions.is_empty(), "{exclusions:?}");
+            assert_eq!(tag_keys.len(), 2);
+            assert!(tag_keys.contains(&sim_tag_key), "{tag_keys:?}");
         }
-    );
+        other => panic!("Running {{ groups: 2, tags: 2 }} を期待したが {other:?}"),
+    }
 
     // (a) 両方つながり、シミュレーションの印は本題の接続にだけ付く。
     wait_until("両方の接続が connected になること", || async {

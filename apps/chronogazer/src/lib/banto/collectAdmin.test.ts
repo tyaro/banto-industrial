@@ -79,7 +79,7 @@ const EVENT_KINDS = [
 const ALL_STATES: CollectorStateView[] = [
 	{ state: 'stopped' },
 	{ state: 'starting' },
-	{ state: 'running', groups: 2, tags: 10, exclusions: [] },
+	{ state: 'running', groups: 2, tags: 10, tagKeys: [], exclusions: [] },
 	{ state: 'noTargets', exclusions: [] },
 	{ state: 'startFailed' }
 ];
@@ -102,9 +102,9 @@ describe('collectStateLabel / collectStateDetail', () => {
 	});
 
 	it('running は件数を見出しに出す', () => {
-		expect(collectStateLabel({ state: 'running', groups: 1, tags: 3, exclusions: [] })).toBe(
-			'収集中（グループ1件 / タグ3件）'
-		);
+		expect(
+			collectStateLabel({ state: 'running', groups: 1, tags: 3, tagKeys: [], exclusions: [] })
+		).toBe('収集中（グループ1件 / タグ3件）');
 	});
 
 	it('収集対象なしは「失敗」と言わない（別の状態として扱う）', () => {
@@ -256,7 +256,7 @@ describe('toCollectStateView / startFailedReason', () => {
 		const others: CollectorState[] = [
 			{ state: 'stopped' },
 			{ state: 'starting' },
-			{ state: 'running', groups: 1, tags: 1, exclusions: [] },
+			{ state: 'running', groups: 1, tags: 1, tagKeys: [], exclusions: [] },
 			{ state: 'noTargets', exclusions: [] }
 		];
 		for (const state of others) {
@@ -285,8 +285,16 @@ describe('collectOperationDisplay', () => {
 				// 変えてしまうと、`pending` の分岐を消しても「状態名が違うから
 				// 別の文言」になって反証にならない（`pending` を「完了しました」に
 				// 潰す退行をこのテストで捕まえられなくなる）。
-				['pending', accepted({ state: 'running', groups: 1, tags: 2, exclusions: [] }), null],
-				['settled', settled({ state: 'running', groups: 1, tags: 2, exclusions: [] }), null]
+				[
+					'pending',
+					accepted({ state: 'running', groups: 1, tags: 2, tagKeys: [], exclusions: [] }),
+					null
+				],
+				[
+					'settled',
+					settled({ state: 'running', groups: 1, tags: 2, tagKeys: [], exclusions: [] }),
+					null
+				]
 			];
 			const rendered = outcomes.map(([, outcome, text]) =>
 				collectOperationDisplay(action, outcome, text)
@@ -342,7 +350,7 @@ describe('collectOperationDisplay', () => {
 
 		const withoutReason = collectOperationDisplay(
 			'start',
-			settled({ state: 'running', groups: 1, tags: 2, exclusions: [] }),
+			settled({ state: 'running', groups: 1, tags: 2, tagKeys: [], exclusions: [] }),
 			null
 		);
 		expect(withoutReason.notice).toContain('収集中');
@@ -429,7 +437,7 @@ describe('除外の一覧（#414 段階2）', () => {
 
 	it('running / noTargets の一覧だけを返し、それ以外は空（前回の一覧を持ち越さない）', () => {
 		expect(
-			collectExclusions({ state: 'running', groups: 1, tags: 1, exclusions: [legacy] })
+			collectExclusions({ state: 'running', groups: 1, tags: 1, tagKeys: [], exclusions: [legacy] })
 		).toEqual([legacy]);
 		expect(collectExclusions({ state: 'noTargets', exclusions: [legacy] })).toEqual([legacy]);
 		for (const state of [
@@ -471,6 +479,7 @@ describe('除外の一覧（#414 段階2）', () => {
 			state: 'running',
 			groups: 1,
 			tags: 1,
+			tagKeys: [],
 			exclusions: [legacy]
 		});
 		expect(note?.summary).toContain('残りは収集しています');
@@ -490,6 +499,7 @@ describe('除外の一覧（#414 段階2）', () => {
 			state: 'running',
 			groups: 1,
 			tags: 1,
+			tagKeys: [],
 			exclusions
 		});
 
@@ -558,7 +568,7 @@ describe('除外の一覧（#414 段階2）', () => {
 
 	it('除外が無い・走っている構成が無いときは説明文を出さない', () => {
 		expect(
-			collectExclusionsNote({ state: 'running', groups: 1, tags: 1, exclusions: [] })
+			collectExclusionsNote({ state: 'running', groups: 1, tags: 1, tagKeys: [], exclusions: [] })
 		).toBeNull();
 		expect(collectExclusionsNote({ state: 'noTargets', exclusions: [] })).toBeNull();
 		expect(collectExclusionsNote({ state: 'stopped' })).toBeNull();
@@ -575,8 +585,14 @@ describe('除外の一覧（#414 段階2）', () => {
 
 	it('操作の応答から状態表示へ落としても一覧は残る（落とすのは reason だけ）', () => {
 		expect(
-			toCollectStateView({ state: 'running', groups: 1, tags: 1, exclusions: [legacy] })
-		).toEqual({ state: 'running', groups: 1, tags: 1, exclusions: [legacy] });
+			toCollectStateView({
+				state: 'running',
+				groups: 1,
+				tags: 1,
+				tagKeys: [],
+				exclusions: [legacy]
+			})
+		).toEqual({ state: 'running', groups: 1, tags: 1, tagKeys: [], exclusions: [legacy] });
 	});
 });
 

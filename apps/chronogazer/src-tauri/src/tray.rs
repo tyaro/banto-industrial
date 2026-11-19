@@ -301,6 +301,7 @@ pub(crate) fn status_label(state: &CollectorState) -> String {
             groups,
             tags,
             exclusions,
+            ..
         } => {
             if exclusions.is_empty() {
                 format!("収集中（{groups} グループ・{tags} タグ）")
@@ -788,6 +789,7 @@ mod tests {
         CollectorState::Running {
             groups,
             tags,
+            tag_keys: Vec::new(),
             exclusions: (0..exclusions).map(|_| dummy_exclusion()).collect(),
         }
     }

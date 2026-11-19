@@ -449,6 +449,7 @@ async fn hub_sourced_tags_are_recorded_by_the_same_collector() {
             groups,
             tags,
             exclusions,
+            ..
         } => {
             assert_eq!((groups, tags), (1, 5));
             let excluded: Vec<(&str, &str)> = exclusions

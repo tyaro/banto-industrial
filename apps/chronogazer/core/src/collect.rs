@@ -742,6 +742,17 @@ pub enum CollectorState {
     Running {
         groups: usize,
         tags: usize,
+        /// 走っている収集が**実際に読んでいる**タグのキー（`tag:<id>`、
+        /// `GET /api/collect/values` のキーと同じ綴り、昇順）。#1198: 現在値の
+        /// キャッシュは最初の値が書かれたタグしか持たないので、キーが無いことは
+        /// 「保存済み・未反映」とも「反映済みだが未受信」とも取れる。開始で採用した
+        /// 設定（`build_config_lenient_*` の戻り）から取るので、除外で外れた
+        /// タグは入らない（`exclusions` 側にある）。レジストリの今の値ではない。
+        /// 件数は `tags` と同じ（`tag_keys.len() == tags`）。ChronoGazer は
+        /// 実行中に設定を差し替えない（再起動で入れ替える）ので、更新の経路は
+        /// 開始だけ。
+        #[serde(rename = "tagKeys")]
+        tag_keys: Vec<String>,
         exclusions: Vec<ExclusionView>,
     },
     NoTargets {
@@ -790,6 +801,17 @@ pub enum CollectorStateView {
     Running {
         groups: usize,
         tags: usize,
+        /// 走っている収集が**実際に読んでいる**タグのキー（`tag:<id>`、
+        /// `GET /api/collect/values` のキーと同じ綴り、昇順）。#1198: 現在値の
+        /// キャッシュは最初の値が書かれたタグしか持たないので、キーが無いことは
+        /// 「保存済み・未反映」とも「反映済みだが未受信」とも取れる。開始で採用した
+        /// 設定（`build_config_lenient_*` の戻り）から取るので、除外で外れた
+        /// タグは入らない（`exclusions` 側にある）。レジストリの今の値ではない。
+        /// 件数は `tags` と同じ（`tag_keys.len() == tags`）。ChronoGazer は
+        /// 実行中に設定を差し替えない（再起動で入れ替える）ので、更新の経路は
+        /// 開始だけ。
+        #[serde(rename = "tagKeys")]
+        tag_keys: Vec<String>,
         exclusions: Vec<ExclusionView>,
     },
     NoTargets {
@@ -807,10 +829,12 @@ impl From<&CollectorState> for CollectorStateView {
             CollectorState::Running {
                 groups,
                 tags,
+                tag_keys,
                 exclusions,
             } => Self::Running {
                 groups: *groups,
                 tags: *tags,
+                tag_keys: tag_keys.clone(),
                 exclusions: exclusions.clone(),
             },
             CollectorState::NoTargets { exclusions } => Self::NoTargets {
@@ -3017,6 +3041,7 @@ impl Lifecycle {
 
         let groups = config.group_count();
         let tags = config.tag_count();
+        let tag_keys = config.tag_keys();
         // R2b-3a-3（docs/hub/driver/banto-hub-driver-io-design.md §8）: PLC の接続は broker の
         // セッションを通して読む。計画のどの接続にもセッションを用意し（シミュレーション
         // の接続はシミュレータのアドレスへ。banto-hub の `BrokerSimRegistry` と同じ形）、
@@ -3079,6 +3104,7 @@ impl Lifecycle {
         let state = CollectorState::Running {
             groups,
             tags,
+            tag_keys,
             exclusions,
         };
         self.ctx.publish_running(state.clone(), current, writer);
@@ -3878,6 +3904,18 @@ mod tests {
 
     // --- #414 段階2: 開始時に不正な設定だけを外す ----------------------------
 
+    /// 状態が持つ「読んでいるタグのキー」（`Running` 以外は空）。ID を事前に
+    /// 知らない比較で、件数 `tags` との一致だけは別に確かめる。
+    fn keys_of(state: &CollectorState) -> Vec<String> {
+        match state {
+            CollectorState::Running { tag_keys, tags, .. } => {
+                assert_eq!(tag_keys.len(), *tags, "tag_keys の件数は tags と同じ");
+                tag_keys.clone()
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// 期待する除外 1 件（タグのアドレスが読めない）。
     fn invalid_address_exclusion(tag_id: i64, name: &str, address: &str) -> ExclusionView {
         ExclusionView {
@@ -3920,6 +3958,7 @@ mod tests {
                 groups: 1,
                 tags: 1,
                 exclusions: expected.clone(),
+                tag_keys: vec![format!("tag:{good}")],
             }
         );
         assert_eq!(
@@ -3928,6 +3967,7 @@ mod tests {
                 groups: 1,
                 tags: 1,
                 exclusions: expected,
+                tag_keys: vec![format!("tag:{good}")],
             }
         );
 
@@ -4020,6 +4060,7 @@ mod tests {
                 groups: 1,
                 tags: 2,
                 exclusions: vec![],
+                tag_keys: keys_of(&state),
             }
         );
         let values = svc.values();
@@ -4350,6 +4391,7 @@ mod tests {
                 groups,
                 tags,
                 exclusions,
+                ..
             } => {
                 assert_eq!((groups, tags), (1, 1), "PLC 直結の側は動く");
                 assert_eq!(exclusions, expected);
@@ -4423,6 +4465,7 @@ mod tests {
                 groups,
                 tags,
                 exclusions,
+                ..
             } => {
                 assert_eq!((groups, tags), (1, 1), "PLC 直結の側は動く");
                 let listed: Vec<(i64, &str)> =
@@ -4572,6 +4615,7 @@ mod tests {
                 groups,
                 tags,
                 exclusions,
+                ..
             } => {
                 assert_eq!((groups, tags), (2, 2));
                 assert!(exclusions.is_empty(), "{exclusions:?}");
@@ -4687,7 +4731,8 @@ mod tests {
             CollectorState::Running {
                 groups: 1,
                 tags: 1,
-                exclusions: vec![]
+                exclusions: vec![],
+                tag_keys: keys_of(&first),
             }
         );
         assert!(svc.state().is_running());
@@ -4770,7 +4815,8 @@ mod tests {
             CollectorState::Running {
                 groups: 1,
                 tags: 1,
-                exclusions: vec![]
+                exclusions: vec![],
+                tag_keys: keys_of(&state),
             }
         );
 
@@ -4780,7 +4826,8 @@ mod tests {
             CollectorState::Running {
                 groups: 1,
                 tags: 1,
-                exclusions: vec![]
+                exclusions: vec![],
+                tag_keys: keys_of(&again),
             }
         );
 
@@ -4913,7 +4960,8 @@ mod tests {
             CollectorState::Running {
                 groups: 1,
                 tags: 1,
-                exclusions: vec![]
+                exclusions: vec![],
+                tag_keys: keys_of(&state),
             }
         );
 
@@ -5143,7 +5191,8 @@ mod tests {
             CollectorState::Running {
                 groups: 1,
                 tags: 1,
-                exclusions: vec![]
+                exclusions: vec![],
+                tag_keys: keys_of(&started.status),
             }
         );
         assert!(
@@ -5288,6 +5337,7 @@ mod tests {
                 groups: 1,
                 tags: 1,
                 exclusions: vec![],
+                tag_keys: vec![],
             },
             None,
         );
@@ -5297,7 +5347,8 @@ mod tests {
             CollectorStateView::Running {
                 groups: 1,
                 tags: 1,
-                exclusions: vec![]
+                exclusions: vec![],
+                tag_keys: vec![],
             },
             "葉は最後に公開された状態を返し続けるはず（前提）"
         );
@@ -5326,19 +5377,23 @@ mod tests {
         let (pool, svc) = service(&dir).await;
         seed_one_tag(&pool, "40001").await;
 
+        let state = settled(svc.start().await.expect("start"));
         assert_eq!(
-            settled(svc.start().await.expect("start")),
+            state,
             CollectorState::Running {
                 groups: 1,
                 tags: 1,
+                tag_keys: keys_of(&state),
                 exclusions: vec![]
             }
         );
+        let state = settled(svc.restart().await.expect("restart"));
         assert_eq!(
-            settled(svc.restart().await.expect("restart")),
+            state,
             CollectorState::Running {
                 groups: 1,
                 tags: 1,
+                tag_keys: keys_of(&state),
                 exclusions: vec![]
             }
         );
@@ -5369,6 +5424,7 @@ mod tests {
                 groups: 2,
                 tags: 10,
                 exclusions: vec![],
+                tag_keys: vec![],
             },
             CollectorState::NoTargets { exclusions: vec![] },
             CollectorState::StartFailed {
@@ -5398,8 +5454,11 @@ mod tests {
             groups: 2,
             tags: 10,
             exclusions: vec![],
+            tag_keys: vec!["tag:1".to_string(), "tag:2".to_string()],
         }))
         .expect("serialize");
+        // #1198: 読んでいるタグのキーは camelCase の `tagKeys` で公開する。
+        assert_eq!(running["tagKeys"], serde_json::json!(["tag:1", "tag:2"]));
         assert_eq!(running["groups"], 2);
         assert_eq!(running["tags"], 10);
     }
@@ -5424,7 +5483,8 @@ mod tests {
             CollectorState::Running {
                 groups: 1,
                 tags: 1,
-                exclusions: vec![]
+                exclusions: vec![],
+                tag_keys: keys_of(&svc.state()),
             }
         );
         assert!(statuses(&svc).await.is_some());
