@@ -306,8 +306,8 @@ export interface CollectHistory {
 
 /** 履歴 1 回で読めるタグの本数の上限（`HISTORY_MAX_TAGS`）。 */
 export const HISTORY_MAX_TAGS = 8;
-/** 履歴 1 回で読める期間の幅の上限（ミリ秒、`HISTORY_MAX_WINDOW_MS`）。 */
-export const HISTORY_MAX_WINDOW_MS = 3_600_000;
+/** 履歴 1 回で読める期間の幅の上限（ミリ秒、31 日、`HISTORY_MAX_WINDOW_MS`）。 */
+export const HISTORY_MAX_WINDOW_MS = 31 * 24 * 3_600_000;
 /**
  * 系列 1 本あたりの `bins` の上限（`HISTORY_MAX_BINS`。返る点の数も系列ごとに
  * これ以下）。描画の 1 ピクセルに 1 区間あれば山を落とさないので、描画幅に
@@ -522,7 +522,7 @@ export async function listCollectEvents(
  * - **`notRunning` は返らない**（収集が止まっていても過去の記録は読める）。
  *   `unavailable` はデータファイルか設定 DB を読めなかったとき（理由は
  *   返らない）。
- * - 上限（タグ 8 本・期間 1 時間・`bins` ≤ [`HISTORY_MAX_BINS`]・
+ * - 上限（タグ 8 本・期間 31 日・`bins` ≤ [`HISTORY_MAX_BINS`]・
  *   本数 × `bins` ≤ [`HISTORY_MAX_POINTS`]）を外れると `validation` のエラー。
  *   系列の点の数は `bins` 以下（素通しの経路でもサーバーが畳む）。
  * - 収集の操作キューを通らない。直近 1 秒ほどはまだデータファイルに無い

@@ -6403,9 +6403,9 @@ mod tests {
         assert!(data.series.is_empty());
         assert_eq!(data.unknown_tag_ids, vec![42]);
 
-        let err = collect_history_body(&state, vec![1], 0, 3_600_001, 10)
+        let err = collect_history_body(&state, vec![1], 0, 2_678_400_001, 10)
             .await
-            .expect_err("1 時間を超える期間は拒否する");
+            .expect_err("31 日を超える期間は拒否する");
         assert!(
             matches!(err, BantoError::Validation { .. }),
             "検証の誤りになっていない: {err:?}"
