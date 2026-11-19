@@ -12,7 +12,7 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::handle::{validate_start_requests, TagClientHandle};
 use crate::pinned_tls::PinnedHubTls;
 use crate::secret::SecretApiKey;
-use crate::types::{CatalogSnapshot, ValuesSnapshot};
+use crate::types::{CatalogSnapshot, HubStatus, ValuesSnapshot};
 use crate::write::{send_write, validate_write_name, RequestedValue, WriteOptions, WriteReceipt};
 use crate::ws_transport::WebSocketConnection;
 
@@ -148,6 +148,34 @@ impl RestClient {
                 port = ?self.endpoint.port(),
                 body_len = body.len() as u64,
                 "banto-hub catalog response was not valid JSON"
+            );
+            Error::new(ErrorKind::ProtocolError)
+        })
+    }
+
+    /// Fetch and deserialize `GET /api/v1/status` (a read key is enough).
+    ///
+    /// Use [`HubStatus::supports_write_contract`] before writing: a Hub that
+    /// omits `capabilities` is older than the #1201 write contract.
+    pub async fn fetch_status(&self) -> Result<HubStatus> {
+        let response = self
+            .secret
+            .apply_authorization(self.http.get(self.endpoint.status_url()))
+            .send()
+            .await
+            .map_err(|error| self.log_send_failure("fetch_status", &error))?;
+        let status = response.status();
+        classify_catalog_status(&self.endpoint, status)?;
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| self.log_send_failure("fetch_status_body", &error))?;
+        serde_json::from_slice(&body).map_err(|_| {
+            tracing::warn!(
+                host = ?self.endpoint.host(),
+                port = ?self.endpoint.port(),
+                body_len = body.len() as u64,
+                "banto-hub status response was not valid JSON"
             );
             Error::new(ErrorKind::ProtocolError)
         })
@@ -411,6 +439,48 @@ mod tests {
             .join()
             .unwrap()
             .contains("GET /private-prefix/api/v1/values?tags=room+A%2Cline%2F2 HTTP/1.1"));
+    }
+
+    #[tokio::test]
+    async fn status_capabilities_decide_write_contract_support() {
+        let (address, handle) = server(
+            200,
+            r#"{"version":"0.3.0","capabilities":["write_contract_v1","x"],"extra":1}"#,
+        );
+        let status = client(address).fetch_status().await.unwrap();
+        assert!(status.supports_write_contract());
+        assert!(status.has_capability("x"));
+        assert!(handle
+            .join()
+            .unwrap()
+            .contains("GET /private-prefix/api/v1/status HTTP/1.1"));
+
+        // An older Hub omits the field: unsupported.
+        let (address, handle) = server(200, r#"{"version":"0.3.0-alpha.2"}"#);
+        let status = client(address).fetch_status().await.unwrap();
+        assert!(status.capabilities.is_empty());
+        assert!(!status.supports_write_contract());
+        handle.join().unwrap();
+
+        for (code, kind) in [
+            (401, ErrorKind::Unauthorized),
+            (403, ErrorKind::Unauthorized),
+            (500, ErrorKind::CatalogUnavailable),
+        ] {
+            let (address, handle) = server(code, "{}");
+            assert_eq!(
+                client(address).fetch_status().await.unwrap_err().kind(),
+                kind
+            );
+            handle.join().unwrap();
+        }
+
+        let (address, handle) = server(200, "not json");
+        assert_eq!(
+            client(address).fetch_status().await.unwrap_err().kind(),
+            ErrorKind::ProtocolError
+        );
+        handle.join().unwrap();
     }
 
     #[tokio::test]

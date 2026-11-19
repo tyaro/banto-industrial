@@ -58,6 +58,12 @@ impl Endpoint {
         self.rest_urls().tags
     }
 
+    /// `GET /api/v1/status` (#1223). Not part of [`RestUrls`] so that struct
+    /// keeps its two-route shape.
+    pub fn status_url(&self) -> Url {
+        append_path(&self.base, "status")
+    }
+
     pub fn values_url(&self) -> Url {
         self.rest_urls().values
     }

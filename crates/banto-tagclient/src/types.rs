@@ -231,6 +231,38 @@ pub struct CatalogTag {
     pub value_source: ValueSource,
 }
 
+/// Capability name for the #1201 write contract: `correlation_id` /
+/// `on_behalf_of` are accepted, `audit_id` is echoed, and an unconfirmed write
+/// is reported as 502 `write_uncertain` (distinct from `write_failed`).
+pub const WRITE_CONTRACT_V1: &str = "write_contract_v1";
+
+/// The subset of `GET /api/v1/status` a consumer needs to decide which Hub
+/// contracts it may rely on (#1223). The version string cannot tell (it was
+/// the same before and after #1201), so Hubs list capability names instead.
+///
+/// A Hub that predates `capabilities` omits the field; it deserializes as an
+/// empty list, so absence means "unsupported" and callers must not write
+/// through the #1201 contract to it. Unknown fields are ignored.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct HubStatus {
+    pub version: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+impl HubStatus {
+    /// Whether the Hub advertises the named capability.
+    pub fn has_capability(&self, name: &str) -> bool {
+        self.capabilities.iter().any(|c| c == name)
+    }
+
+    /// Whether the Hub supports the #1201 write contract ([`WRITE_CONTRACT_V1`]).
+    /// `false` for older Hubs that omit `capabilities`: do not write to them.
+    pub fn supports_write_contract(&self) -> bool {
+        self.has_capability(WRITE_CONTRACT_V1)
+    }
+}
+
 /// Catalog response metadata and rows.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct CatalogSnapshot {

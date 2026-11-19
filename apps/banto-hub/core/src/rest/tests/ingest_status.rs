@@ -154,6 +154,12 @@ async fn the_status_ingest_section_reports_the_sender_without_secrets_or_values(
     // 機械向け（snake_case）。
     let (status, v1) = v1_get(&env.router, &read_key, "/api/v1/status").await;
     assert_eq!(status, StatusCode::OK, "{v1:?}");
+    // #1223: 書き込みの契約の対応を機能名で知らせる。
+    assert!(v1["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c == "write_contract_v1"));
     let entry = &v1["ingest"][0];
     assert_eq!(entry["connection_id"], id);
     assert_eq!(entry["link"], "live");
