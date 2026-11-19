@@ -53,6 +53,7 @@
 		trendPenInfos
 	} from '#lib/monitor/trendLogic.js';
 	import HistoryPanel from '#lib/historical/HistoryPanel.svelte';
+	import ExportDialog from '#lib/historical/ExportDialog.svelte';
 	import {
 		HISTORY_DEBOUNCE_MS,
 		HISTORY_EMPTY_MESSAGE,
@@ -251,6 +252,17 @@
 	/** 今の要求に対する結果（別の表示のものは使わない）。 */
 	const current = $derived(loaded !== null && loaded.dataKey === dataKey ? loaded : null);
 	const loading = $derived(request !== null && (current === null || current.bins !== request.bins));
+
+	// --- CSV 出力（表示中のグループ・期間） ------------------------------------------
+
+	let exportOpen = $state(false);
+	const canExport = $derived(
+		penTagIds.length > 0 && checkRange(range).ok && request !== null && !loading
+	);
+	function exportTagInfo(tagId: number): { name: string; unit: string | null } {
+		const pen = pens.find((p) => p.tagId === tagId);
+		return pen ? { name: pen.name, unit: pen.unit } : { name: `タグ ID ${tagId}`, unit: null };
+	}
 
 	let generation = 0;
 
@@ -464,10 +476,21 @@
 							次へ
 						</button>
 					</div>
+					<button type="button" onclick={() => (exportOpen = true)} disabled={!canExport}>
+						CSV 出力
+					</button>
 				</div>
 				{#if rangeError !== null}
 					<p class="note warn" role="alert">{rangeError}</p>
 				{/if}
+				<ExportDialog
+					open={exportOpen}
+					groupName={selectedGroup.name}
+					{range}
+					tagIds={penTagIds}
+					tagInfo={exportTagInfo}
+					onclose={() => (exportOpen = false)}
+				/>
 
 				{#if selectedGroup.pens.length === 0}
 					<div class="empty-state">

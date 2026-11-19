@@ -19,6 +19,7 @@ import {
 	COLLECT_POLL_FAILURE_LIMIT,
 	COLLECT_UI_TIMEOUT_MS,
 	collectActionLabel,
+	collectExportQuery,
 	collectHistoryQuery,
 	HISTORY_MAX_BINS,
 	HISTORY_MAX_POINTS,
@@ -631,6 +632,35 @@ describe('collectHistoryQuery（R1-D の D-3a）', () => {
 		expect(parsed.get('fromMs')).toBe('10');
 		expect(parsed.get('toMs')).toBe('5');
 		expect(parsed.get('bins')).toBe('0');
+	});
+});
+
+describe('collectExportQuery（#1207 R3）', () => {
+	it('raw は間隔・統計を載せない', () => {
+		const parsed = new URLSearchParams(
+			collectExportQuery({ tagIds: [2, 1], fromMs: 10, toMs: 20, mode: 'raw', intervalMs: 60_000 })
+		);
+		expect(parsed.get('tagIds')).toBe('2,1');
+		expect(parsed.get('mode')).toBe('raw');
+		expect(parsed.has('intervalMs')).toBe(false);
+		expect(parsed.has('stat')).toBe(false);
+	});
+
+	it('interval は間隔と統計を数値・文字列のまま載せる', () => {
+		const parsed = new URLSearchParams(
+			collectExportQuery({
+				tagIds: [1],
+				fromMs: 0,
+				toMs: 3_600_000,
+				mode: 'interval',
+				intervalMs: 600_000,
+				stat: 'max'
+			})
+		);
+		expect(parsed.get('mode')).toBe('interval');
+		expect(parsed.get('intervalMs')).toBe('600000');
+		expect(parsed.get('stat')).toBe('max');
+		expect(parsed.get('fromMs')).toBe('0');
 	});
 });
 

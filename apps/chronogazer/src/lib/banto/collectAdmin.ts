@@ -344,6 +344,48 @@ export function collectHistoryQuery(params: CollectHistoryParams): string {
 	}).toString();
 }
 
+/** `GET /api/collect/export` の出力の種類（`chronogazer_core::collect::export`）。 */
+export type ExportMode = 'raw' | 'interval';
+/** 間隔で揃えるときの統計。 */
+export type ExportStat = 'avg' | 'min' | 'max';
+
+/** 期間 CSV の読み出しの結果（横持ち: 1 行 = 1 時刻、`values` は `tags` と同じ並び）。 */
+export interface CollectExport {
+	fromMs: number;
+	toMs: number;
+	mode: ExportMode;
+	intervalMs: number | null;
+	stat: ExportStat | null;
+	tags: { tagId: number; simulation: boolean }[];
+	unknownTagIds: number[];
+	rows: { tMs: number; values: (number | null)[] }[];
+}
+
+/** [`getCollectExport`] の引数。`intervalMs`・`stat` は `mode: 'interval'` のときだけ。 */
+export interface CollectExportParams {
+	tagIds: readonly number[];
+	fromMs: number;
+	toMs: number;
+	mode: ExportMode;
+	intervalMs?: number;
+	stat?: ExportStat;
+}
+
+/** `GET /api/collect/export` のクエリ文字列（上限の検証はサーバー）。 */
+export function collectExportQuery(params: CollectExportParams): string {
+	const query = new URLSearchParams({
+		tagIds: params.tagIds.join(','),
+		fromMs: String(params.fromMs),
+		toMs: String(params.toMs),
+		mode: params.mode
+	});
+	if (params.mode === 'interval') {
+		if (params.intervalMs !== undefined) query.set('intervalMs', String(params.intervalMs));
+		if (params.stat !== undefined) query.set('stat', params.stat);
+	}
+	return query.toString();
+}
+
 export const DEMO_MODE_MESSAGE = 'デモモードでは利用できません';
 
 function demoModeError(): ProviderError {
@@ -545,6 +587,60 @@ export async function getCollectHistory(
 		'GET',
 		signal
 	);
+}
+
+/**
+ * 期間の CSV の材料（`viewer` 以上）。生の値か、決まった間隔の統計を、横持ちで返す。
+ * 上限（タグ 8 本・期間 31 日・10 万行）を外れると `validation`（行数は `toMs`）。
+ * 収集の操作キューを通らない。
+ */
+export async function getCollectExport(
+	params: CollectExportParams,
+	signal?: AbortSignal
+): Promise<Readout<CollectExport>> {
+	if (!isCollectAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri')
+		return invokeCommand<Readout<CollectExport>>('collect_export', {
+			tagIds: [...params.tagIds],
+			fromMs: params.fromMs,
+			toMs: params.toMs,
+			mode: params.mode,
+			intervalMs: params.mode === 'interval' ? (params.intervalMs ?? null) : null,
+			stat: params.mode === 'interval' ? (params.stat ?? null) : null
+		});
+	return httpJson<Readout<CollectExport>>(
+		`/api/collect/export?${collectExportQuery(params)}`,
+		'GET',
+		signal
+	);
+}
+
+/** [`saveCsvFile`] の結果。`saved: false` は保存先の選択を取り消したとき。 */
+export interface SaveCsvResult {
+	saved: boolean;
+	/** 保存したファイル名（Tauri のみ。ブラウザは `null`）。 */
+	fileName: string | null;
+}
+
+/**
+ * CSV を保存する。Tauri は Rust 側の保存ダイアログ（`save_csv_file`。パスは画面に渡さない）、
+ * ブラウザは `Blob` のダウンロード。
+ */
+export async function saveCsvFile(defaultName: string, content: string): Promise<SaveCsvResult> {
+	if (getBantoMode() === 'tauri')
+		return invokeCommand<SaveCsvResult>('save_csv_file', { defaultName, content });
+	const url = URL.createObjectURL(new Blob([content], { type: 'text/csv;charset=utf-8' }));
+	try {
+		const a = document.createElement('a');
+		a.href = url;
+		a.download = defaultName;
+		document.body.appendChild(a);
+		a.click();
+		document.body.removeChild(a);
+	} finally {
+		URL.revokeObjectURL(url);
+	}
+	return { saved: true, fileName: null };
 }
 
 // --- 操作（editor 以上） ----------------------------------------------------
