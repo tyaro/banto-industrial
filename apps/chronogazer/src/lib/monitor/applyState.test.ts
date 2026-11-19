@@ -168,6 +168,44 @@ describe('applyBand', () => {
 			expect(b.reflect).toMatchObject({ action: 'start', confirm: REFLECT_START_CONFIRM });
 		}
 	});
+	it('シミュレーションのペンは未反映の件数に数えず、記録中の代表にもしない', () => {
+		const b = applyBand({
+			...base,
+			collect: running(['tag:1']),
+			states: [st('simulated'), st('pending')]
+		});
+		expect(b).toMatchObject({ kind: 'pending', text: '保存済み・未反映 1 件', reflectCount: 1 });
+		const c = applyBand({ ...base, collect: running(['tag:1']), states: [st('simulated')] });
+		expect(c).toMatchObject({
+			kind: 'idle',
+			text: APPLY_LABELS.simulated,
+			reflectCount: 0,
+			reflect: null
+		});
+	});
+	it('noTargets で全部が除外なら、ボタンを出さず除外を代表にする', () => {
+		const b = applyBand({
+			...base,
+			collect: { state: 'noTargets', exclusions: [] },
+			states: [st('excluded'), st('excluded')]
+		});
+		expect(b).toMatchObject({
+			kind: 'notRunning',
+			text: APPLY_LABELS.excluded,
+			reflectCount: 0,
+			reflect: null
+		});
+	});
+	it('noTargets で除外と有効が混在なら、有効なものだけ数えて開始で反映', () => {
+		const b = applyBand({
+			...base,
+			collect: { state: 'noTargets', exclusions: [] },
+			states: [st('excluded'), st('notRunning'), st('notRunning')]
+		});
+		expect(b.reflectCount).toBe(2);
+		expect(b.text).toBe('収集対象なし（有効なタグ 2 件は開始すると記録されます）');
+		expect(b.reflect).toMatchObject({ action: 'start' });
+	});
 	it('開始中はボタン無し', () => {
 		const b = applyBand({ ...base, collect: { state: 'starting' }, states: [st('notRunning')] });
 		expect(b.text).toBe('収集開始中');

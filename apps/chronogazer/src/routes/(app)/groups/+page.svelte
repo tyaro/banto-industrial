@@ -77,6 +77,7 @@
 		collectTimeLabel,
 		COLLECT_READ_TIMEOUT_MS,
 		COLLECT_UI_TIMEOUT_MS,
+		getCollectConnections,
 		getCollectStatus,
 		getCollectValues,
 		isCollectAvailable,
@@ -608,6 +609,14 @@
 	// 新しい状態を巻き戻さないよう世代番号で捨てる。取れなかったら `null`（= 不明）にして、
 	// 「未反映」と誤って言わない。
 	let collectState = $state<CollectorStateView | null>(null);
+	/**
+	 * 走っている収集の接続ごとのシミュレーション（`conn:<id>` → `simulation`）。走っている
+	 * 収集が起動時に使った値で、シミュレーションの接続のタグは値が記録されない。取れていない
+	 * （走っていない・取得失敗）ときは `null` で、レジストリの接続の `simulation` で代える
+	 * （切替は再起動まで反映されないので食い違いうるが、取れないときに「記録中」と言い切る
+	 * よりは、登録の今の値を目安にする）。
+	 */
+	let runningSimulation = $state<ReadonlyMap<string, boolean> | null>(null);
 	let collectGen = 0;
 	let reflecting = $state(false);
 	let reflectNotice = $state<string | null>(null);
@@ -628,8 +637,25 @@
 		} catch {
 			next = null;
 		}
+		let sim: Map<string, boolean> | null = null;
+		if (next?.state === 'running') {
+			try {
+				const outcome = await runWithLimit(
+					(signal) => getCollectConnections(signal),
+					COLLECT_READ_TIMEOUT_MS
+				);
+				if (outcome.kind === 'ok' && outcome.value.state === 'ready') {
+					sim = new Map(
+						Object.entries(outcome.value.data).map(([key, view]) => [key, view.simulation])
+					);
+				}
+			} catch {
+				sim = null;
+			}
+		}
 		if (gen !== collectGen) return;
 		collectState = next;
+		runningSimulation = sim;
 		// `starting` のまま止まらないよう、1 秒おきに（上限まで）取り直す。
 		if (next?.state === 'starting') {
 			if (shouldRecheckStarting(next, startingRechecks, pageVisible)) {
@@ -653,13 +679,20 @@
 	 * 入らず、再起動しても入らないので「無効」として扱う（「未反映」と言って「記録へ反映」を
 	 * 出さない）。
 	 */
-	function applyTagOf(tagId: number): { enabled: boolean; collectionGroupId: number } | undefined {
+	function applyTagOf(
+		tagId: number
+	): { enabled: boolean; collectionGroupId: number; simulated: boolean } | undefined {
 		const tag = tagsById.get(tagId);
 		if (tag === undefined) return undefined;
 		const group = groupsById.get(tag.collectionGroupId);
 		const connection = group && connectionsById.get(group.plcConnectionId);
 		const enabled = tag.enabled && (group?.enabled ?? true) && (connection?.enabled ?? true);
-		return { enabled, collectionGroupId: tag.collectionGroupId };
+		const connKey = group === undefined ? null : `conn:${group.plcConnectionId}`;
+		const simulated =
+			(connKey === null ? undefined : runningSimulation?.get(connKey)) ??
+			connection?.simulation ??
+			false;
+		return { enabled, collectionGroupId: tag.collectionGroupId, simulated };
 	}
 
 	/** `draft.pens` と同じ並びのペンごとの反映状態。 */

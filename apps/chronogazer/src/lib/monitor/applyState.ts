@@ -16,7 +16,7 @@
  * 言わず、状態は「不明」にする。
  */
 import type { CollectAction, CollectorStateView } from '../banto/collectAdmin';
-import { collectExclusions, qualityLabel } from '../banto/collectAdmin';
+import { SIMULATION_RUNNING_NOTE, collectExclusions, qualityLabel } from '../banto/collectAdmin';
 
 export type ApplyKind =
 	/** タグ未選択の行（状態は出さない）。 */
@@ -29,6 +29,8 @@ export type ApplyKind =
 	| 'excluded'
 	/** タグが無効。 */
 	| 'disabled'
+	/** 走っている収集が読んでいるが、シミュレーション接続なので値は記録されない。 */
+	| 'simulated'
 	/** 走っている収集が読んでいる。 */
 	| 'recording'
 	/** 収集が走っていない（保存済み・有効）。 */
@@ -48,6 +50,8 @@ export const APPLY_LABELS = {
 	// 既存の文言（collectAdmin.ts `qualityLabel('invalid')`）をそのまま使う。
 	excluded: qualityLabel('invalid'),
 	disabled: '無効',
+	// 既存の文言（collectAdmin.ts `SIMULATION_RUNNING_NOTE`）をそのまま使う。
+	simulated: SIMULATION_RUNNING_NOTE,
 	recording: '記録中',
 	unknown: '不明'
 } as const;
@@ -82,8 +86,11 @@ export function isPenUnsaved(pen: ApplyPenInput, baselineTagIds: ReadonlySet<num
 /**
  * ペン 1 本の反映状態（純関数）。優先順位:
  * 未保存 > タグ未選択 > 登録情報が無い（不明）> 無効 > 収集の状態が不明 > 収集が走っていない >
- * `exclusions`（設定不正）> `tagKeys`（記録中）> それ以外（保存済み・未反映）。
- * `exclusions` を `tagKeys` より先に見るのは、外されたタグを「記録中」と言わないため
+ * 収集の状態の `exclusions`（設定不正）> 収集が走っていない > `tagKeys` にあってシミュレーション
+ * （値は記録されない）> `tagKeys`（記録中）> それ以外（保存済み・未反映）。
+ * `exclusions` を「走っていない」より先に見るのは、全タグが外れた `noTargets` でも除外は
+ * 付いてくる（開始しても設定を直さないと記録されない）ため。`tagKeys` より先に見るのは、
+ * 外されたタグを「記録中」と言わないため
  * （タグ自身の `tag:<id>` と、属する収集グループの `grp:<id>` を見る。接続ごと外れた
  * タグも `tag:<id>` の除外として載る）。収集グループ・接続が無効なら、呼び出し側が
  * `tag.enabled` を偽にして渡す（再起動しても対象に入らないので「未反映」と言わない）。
@@ -91,7 +98,14 @@ export function isPenUnsaved(pen: ApplyPenInput, baselineTagIds: ReadonlySet<num
 export function penApplyState(
 	pen: ApplyPenInput,
 	unsaved: boolean,
-	tag: { enabled: boolean; collectionGroupId?: number } | undefined,
+	tag:
+		| {
+				enabled: boolean;
+				collectionGroupId?: number;
+				/** タグの接続が、走っている収集でシミュレーションか（呼び出し側が決める）。 */
+				simulated?: boolean;
+		  }
+		| undefined,
 	collect: CollectorStateView | null
 ): ApplyState {
 	if (unsaved) return { kind: 'unsaved', label: APPLY_LABELS.unsaved };
@@ -99,7 +113,6 @@ export function penApplyState(
 	if (tag === undefined) return { kind: 'unknown', label: APPLY_LABELS.unknown };
 	if (!tag.enabled) return { kind: 'disabled', label: APPLY_LABELS.disabled };
 	if (collect === null) return { kind: 'unknown', label: APPLY_LABELS.unknown };
-	if (collect.state !== 'running') return { kind: 'notRunning', label: notRunningLabel(collect) };
 	const key = `tag:${pen.tagId}`;
 	const groupKey = tag.collectionGroupId === undefined ? null : `grp:${tag.collectionGroupId}`;
 	if (
@@ -108,6 +121,10 @@ export function penApplyState(
 		)
 	) {
 		return { kind: 'excluded', label: APPLY_LABELS.excluded };
+	}
+	if (collect.state !== 'running') return { kind: 'notRunning', label: notRunningLabel(collect) };
+	if (collect.tagKeys.includes(key) && tag.simulated === true) {
+		return { kind: 'simulated', label: APPLY_LABELS.simulated };
 	}
 	if (collect.tagKeys.includes(key)) return { kind: 'recording', label: APPLY_LABELS.recording };
 	return { kind: 'pending', label: APPLY_LABELS.pending };
@@ -154,9 +171,10 @@ export const REFLECT_RESTART_CONFIRM =
 export const REFLECT_START_CONFIRM =
 	'収集を開始して、保存したタグを記録に反映します。よろしいですか？';
 
-/** 収集は走っているが記録されるペンが無いときの文言（除外 > 不明 > 無効 の順で代表を出す）。 */
+/** 収集は走っているが記録されるペンが無いときの文言（除外 > シミュレーション > 不明 > 無効 の順で代表を出す）。 */
 function idleLabel(states: readonly ApplyState[]): string {
 	if (states.some((s) => s.kind === 'excluded')) return APPLY_LABELS.excluded;
+	if (states.some((s) => s.kind === 'simulated')) return APPLY_LABELS.simulated;
 	if (states.some((s) => s.kind === 'unknown')) return APPLY_LABELS.unknown;
 	if (states.some((s) => s.kind === 'disabled')) return APPLY_LABELS.disabled;
 	return '記録するタグがありません';
@@ -233,7 +251,11 @@ export function applyBand(input: ApplyBandInput): ApplyBand {
 		}
 		return noButton('idle', idleLabel(states));
 	}
-	const text = notRunningLabel(collect);
+	// 全部が設定不正で外れた（`noTargets`）ときは、開始しても記録されないので除外を代表にする。
+	const text =
+		count === 0 && states.some((s) => s.kind === 'excluded')
+			? APPLY_LABELS.excluded
+			: notRunningLabel(collect);
 	if (!startable) return noButton('notRunning', text);
 	return count > 0
 		? withButton('notRunning', `${text}（有効なタグ ${count} 件は開始すると記録されます）`, 'start')
