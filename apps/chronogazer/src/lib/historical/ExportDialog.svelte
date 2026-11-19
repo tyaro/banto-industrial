@@ -61,7 +61,7 @@
 	);
 	// 9 本以上のグループで選んだタグ（`null` = 既定の選択）。
 	let chosen = $state<number[] | null>(null);
-	const needsSelection = $derived(needsPenSelection(tagIds.length, EXPORT_MAX_TAGS));
+	const needsSelection = $derived(needsPenSelection(tagIds, EXPORT_MAX_TAGS));
 	const selectedTagIds = $derived(effectivePenSelection(tagIds, chosen, EXPORT_MAX_TAGS));
 	let busy = $state(false);
 	let errorText = $state<string | null>(null);

@@ -14,45 +14,53 @@
 /** CSV・日報の案内文（trend-design.md §6 の文言）。 */
 export const PEN_SELECTION_NOTICE = 'CSV・日報は 8 本までです。出すペンを選んでください';
 
-/** 上限を超えるペンを持つ（= 選択の一覧を見せる）か。 */
-export function needsPenSelection(penCount: number, limit: number): boolean {
-	return penCount > limit;
+/** タグ ID の重複を除く（先に出た順）。読み出しの口は同じタグを 1 本に数えるので、数えるのはこの列。 */
+export function uniqueTagIds(tagIds: readonly number[]): number[] {
+	return [...new Set(tagIds)];
 }
 
-/** 既定の選択: グループの先頭から上限まで。 */
+/** 上限を超えるタグを持つ（= 選択の一覧を見せる）か。同じタグの重複は 1 本に数える。 */
+export function needsPenSelection(tagIds: readonly number[], limit: number): boolean {
+	return uniqueTagIds(tagIds).length > limit;
+}
+
+/** 既定の選択: グループの先頭から上限まで（重複を除いた列で数える）。 */
 export function defaultPenSelection(tagIds: readonly number[], limit: number): number[] {
-	return tagIds.slice(0, Math.max(0, limit));
+	return uniqueTagIds(tagIds).slice(0, Math.max(0, limit));
 }
 
 /**
  * 実際に出すタグ（グループの順・上限まで・重複なし）。`chosen` が `null`（まだ選んでいない）
  * なら既定。選んだ中にグループに無いタグがあれば落とす。上限以下のグループは、選択に
- * 関係なく全部（一覧を出さないので今までと同じ）。
+ * 関係なく全部（一覧を出さないので今までと同じ）。タグ ID の重複は 1 本に数える。
  */
 export function effectivePenSelection(
 	tagIds: readonly number[],
 	chosen: readonly number[] | null,
 	limit: number
 ): number[] {
-	if (!needsPenSelection(tagIds.length, limit) || chosen === null) {
+	if (!needsPenSelection(tagIds, limit) || chosen === null) {
 		return defaultPenSelection(tagIds, limit);
 	}
 	const picked = new Set(chosen);
-	return [...new Set(tagIds)].filter((id) => picked.has(id)).slice(0, Math.max(0, limit));
+	return uniqueTagIds(tagIds)
+		.filter((id) => picked.has(id))
+		.slice(0, Math.max(0, limit));
 }
 
-/** チェックを切り替えた後の選択。上限に達しているときの新しいチェックは無視する。 */
+/** チェックを切り替えた後の選択（重複を除いた列で数える）。上限に達しているときの新しいチェックは無視する。 */
 export function togglePenSelection(
 	tagIds: readonly number[],
 	current: readonly number[],
 	tagId: number,
 	limit: number
 ): number[] {
-	const now = effectivePenSelection(tagIds, current, limit);
+	const unique = uniqueTagIds(tagIds);
+	const now = effectivePenSelection(unique, current, limit);
 	if (now.includes(tagId)) return now.filter((id) => id !== tagId);
-	if (!tagIds.includes(tagId) || now.length >= limit) return now;
+	if (!unique.includes(tagId) || now.length >= limit) return now;
 	const next = new Set([...now, tagId]);
-	return tagIds.filter((id) => next.has(id));
+	return unique.filter((id) => next.has(id));
 }
 
 /** このペンのチェックを入れられないか（上限に達していて、まだ選んでいないペン）。 */

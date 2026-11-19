@@ -12,10 +12,10 @@ const ids = (n: number) => Array.from({ length: n }, (_, i) => i + 1);
 
 describe('needsPenSelection', () => {
 	it('8 本ちょうどまでは一覧を出さず、9 本から出す', () => {
-		expect(needsPenSelection(0, 8)).toBe(false);
-		expect(needsPenSelection(8, 8)).toBe(false);
-		expect(needsPenSelection(9, 8)).toBe(true);
-		expect(needsPenSelection(16, 8)).toBe(true);
+		expect(needsPenSelection(ids(0), 8)).toBe(false);
+		expect(needsPenSelection(ids(8), 8)).toBe(false);
+		expect(needsPenSelection(ids(9), 8)).toBe(true);
+		expect(needsPenSelection(ids(16), 8)).toBe(true);
 	});
 });
 
@@ -73,5 +73,27 @@ describe('isPenCheckDisabled / ラベル', () => {
 
 	it('選択数の表示', () => {
 		expect(penSelectionCountLabel(3, 8)).toBe('選択中 3 / 8 本');
+	});
+});
+
+describe('タグ ID の重複は 1 本に数える', () => {
+	it('9 ペンで 8 タグなら選択は要らず、8 タグを返す', () => {
+		const tagIds = [...ids(8), 3];
+		expect(needsPenSelection(tagIds, 8)).toBe(false);
+		expect(defaultPenSelection(tagIds, 8)).toEqual(ids(8));
+		expect(effectivePenSelection(tagIds, null, 8)).toEqual(ids(8));
+		expect(effectivePenSelection(tagIds, [1], 8)).toEqual(ids(8));
+	});
+	it('10 ペンで 9 タグなら選択が要り、既定は重複を除いた先頭 8 タグ', () => {
+		const tagIds = [1, 2, 2, 3, 4, 5, 6, 7, 8, 9];
+		expect(needsPenSelection(tagIds, 8)).toBe(true);
+		expect(defaultPenSelection(tagIds, 8)).toEqual(ids(8));
+		expect(effectivePenSelection(tagIds, null, 8)).toEqual(ids(8));
+	});
+	it('切り替えも重複を除いた列で数える', () => {
+		const tagIds = [1, 2, 2, 3, 4, 5, 6, 7, 8, 9];
+		expect(togglePenSelection(tagIds, ids(8), 9, 8)).toEqual(ids(8));
+		expect(togglePenSelection(tagIds, ids(8), 8, 8)).toEqual(ids(7));
+		expect(togglePenSelection(tagIds, ids(7), 9, 8)).toEqual([...ids(7), 9]);
 	});
 });

@@ -173,7 +173,7 @@
 	 */
 	let chosen = $state<{ groupId: number; tagIds: number[] } | null>(null);
 	const groupTagIds = $derived(selectedGroup ? selectedGroup.pens.map((pen) => pen.tagId) : []);
-	const needsSelection = $derived(needsPenSelection(groupTagIds.length, DAILY_REPORT_MAX_TAGS));
+	const needsSelection = $derived(needsPenSelection(groupTagIds, DAILY_REPORT_MAX_TAGS));
 	const penTagIds = $derived(
 		effectivePenSelection(
 			groupTagIds,

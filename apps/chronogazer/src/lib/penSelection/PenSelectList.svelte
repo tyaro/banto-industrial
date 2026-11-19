@@ -6,7 +6,8 @@
 	import {
 		PEN_SELECTION_NOTICE,
 		isPenCheckDisabled,
-		penSelectionCountLabel
+		penSelectionCountLabel,
+		uniqueTagIds
 	} from '#lib/penSelection/penSelectionLogic.js';
 
 	interface Props {
@@ -27,7 +28,7 @@
 	<legend>出すペン</legend>
 	<p class="notice" role="status">{PEN_SELECTION_NOTICE}</p>
 	<ul>
-		{#each tagIds as tagId (tagId)}
+		{#each uniqueTagIds(tagIds) as tagId (tagId)}
 			<li>
 				<label>
 					<input
