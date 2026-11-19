@@ -37,10 +37,10 @@ use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
 use super::{
-    __path_collect_connections_handler, __path_collect_events_handler,
-    __path_collect_export_handler, __path_collect_history_handler, __path_collect_restart_handler,
-    __path_collect_start_handler, __path_collect_status_handler, __path_collect_stop_handler,
-    __path_collect_values_handler, __path_collection_groups_create,
+    __path_collect_connections_handler, __path_collect_daily_report_handler,
+    __path_collect_events_handler, __path_collect_export_handler, __path_collect_history_handler,
+    __path_collect_restart_handler, __path_collect_start_handler, __path_collect_status_handler,
+    __path_collect_stop_handler, __path_collect_values_handler, __path_collection_groups_create,
     __path_collection_groups_delete, __path_collection_groups_get, __path_collection_groups_list,
     __path_collection_groups_update, __path_config_exclusions_list, __path_drivers_list,
     __path_plc_connections_create, __path_plc_connections_delete, __path_plc_connections_get,
@@ -50,10 +50,11 @@ use super::{
 };
 use super::{display_groups, tag_thresholds};
 use crate::collect::{
-    CollectEventList, CollectEventRow, CollectExport, CollectHistory, CollectOutcome,
-    CollectorState, CollectorStateView, ConnectionStatusView, ConnectionView, CurrentSampleView,
-    ExclusionUnitView, ExclusionView, ExportMode, ExportRow, ExportStat, ExportTag, HistoryPoint,
-    HistorySeries, QualityView, Readout, ValuesResponse,
+    CollectDailyReport, CollectEventList, CollectEventRow, CollectExport, CollectHistory,
+    CollectOutcome, CollectorState, CollectorStateView, ConnectionStatusView, ConnectionView,
+    CurrentSampleView, DailyReportHour, DailyReportStat, DailyReportTag, ExclusionUnitView,
+    ExclusionView, ExportMode, ExportRow, ExportStat, ExportTag, HistoryPoint, HistorySeries,
+    QualityView, Readout, ValuesResponse,
 };
 use crate::display_groups::{
     DisplayAttributes, DisplayGroup, DisplayGroupPayload, DisplayGroupSaveResponse, DisplayKind,
@@ -135,6 +136,7 @@ impl Modify for SecurityAddon {
         collect_events_handler,
         collect_history_handler,
         collect_export_handler,
+        collect_daily_report_handler,
         collect_start_handler,
         collect_stop_handler,
         collect_restart_handler,
@@ -188,6 +190,11 @@ impl Modify for SecurityAddon {
         ExportRow,
         ExportStat,
         ExportTag,
+        CollectDailyReport,
+        DailyReportHour,
+        DailyReportStat,
+        DailyReportTag,
+        Readout<CollectDailyReport>,
         Readout<CollectExport>,
         PlcConnectionPayload,
         PlcConnectionResponse,

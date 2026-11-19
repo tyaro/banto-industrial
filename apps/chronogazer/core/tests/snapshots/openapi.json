@@ -1,6 +1,64 @@
 {
   "components": {
     "schemas": {
+      "CollectDailyReport": {
+        "properties": {
+          "day": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/DailyReportStat"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "array"
+          },
+          "fromMs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "hours": {
+            "items": {
+              "$ref": "#/components/schemas/DailyReportHour"
+            },
+            "type": "array"
+          },
+          "intervalMs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "tags": {
+            "items": {
+              "$ref": "#/components/schemas/DailyReportTag"
+            },
+            "type": "array"
+          },
+          "toMs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "unknownTagIds": {
+            "items": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "fromMs",
+          "toMs",
+          "intervalMs",
+          "tags",
+          "unknownTagIds",
+          "hours",
+          "day"
+        ],
+        "type": "object"
+      },
       "CollectEventList": {
         "properties": {
           "asOfId": {
@@ -566,6 +624,75 @@
         ],
         "type": "object"
       },
+      "DailyReportHour": {
+        "properties": {
+          "tMs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "values": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/DailyReportStat"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "tMs",
+          "values"
+        ],
+        "type": "object"
+      },
+      "DailyReportStat": {
+        "properties": {
+          "avg": {
+            "format": "double",
+            "type": "number"
+          },
+          "count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "max": {
+            "format": "double",
+            "type": "number"
+          },
+          "min": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "min",
+          "max",
+          "avg",
+          "count"
+        ],
+        "type": "object"
+      },
+      "DailyReportTag": {
+        "properties": {
+          "simulation": {
+            "type": "boolean"
+          },
+          "tagId": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "tagId",
+          "simulation"
+        ],
+        "type": "object"
+      },
       "DisplayAttributes": {
         "properties": {
           "timeWindowSec": {
@@ -1083,6 +1210,111 @@
           "invalid"
         ],
         "type": "string"
+      },
+      "Readout_CollectDailyReport": {
+        "oneOf": [
+          {
+            "properties": {
+              "state": {
+                "enum": [
+                  "notRunning"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "state"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "state": {
+                "enum": [
+                  "unavailable"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "state"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "data": {
+                "properties": {
+                  "day": {
+                    "items": {
+                      "oneOf": [
+                        {
+                          "$ref": "#/components/schemas/DailyReportStat"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "type": "array"
+                  },
+                  "fromMs": {
+                    "format": "int64",
+                    "type": "integer"
+                  },
+                  "hours": {
+                    "items": {
+                      "$ref": "#/components/schemas/DailyReportHour"
+                    },
+                    "type": "array"
+                  },
+                  "intervalMs": {
+                    "format": "int64",
+                    "type": "integer"
+                  },
+                  "tags": {
+                    "items": {
+                      "$ref": "#/components/schemas/DailyReportTag"
+                    },
+                    "type": "array"
+                  },
+                  "toMs": {
+                    "format": "int64",
+                    "type": "integer"
+                  },
+                  "unknownTagIds": {
+                    "items": {
+                      "format": "int64",
+                      "type": "integer"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "fromMs",
+                  "toMs",
+                  "intervalMs",
+                  "tags",
+                  "unknownTagIds",
+                  "hours",
+                  "day"
+                ],
+                "type": "object"
+              },
+              "state": {
+                "enum": [
+                  "ready"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "data",
+              "state"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "Readout_CollectEventList": {
         "oneOf": [
@@ -1908,6 +2140,72 @@
           }
         ],
         "summary": "接続ごとの状態",
+        "tags": [
+          "collect"
+        ]
+      }
+    },
+    "/api/collect/daily-report": {
+      "get": {
+        "description": "タグごとの 1 時間ごとの最小・最大・平均・件数と、1 日全体のそれを返す。日は `[fromMs, toMs)`（`toMs` を含まない）で、期間は 1〜25 時間。サンプルが無いタグ・時間は `null`。読み取り（`read` キーで足りる）。",
+        "operationId": "collect_daily_report",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "tagIds",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "日の始まり（ローカルの 0 時。UTC epoch ミリ秒）。",
+            "in": "query",
+            "name": "fromMs",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "日の終わり（翌日のローカルの 0 時。**含まない**）。`fromMs` から 1〜25 時間後。",
+            "in": "query",
+            "name": "toMs",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Readout_CollectDailyReport"
+                }
+              }
+            },
+            "description": "日報の値"
+          },
+          "401": {
+            "description": "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"
+          },
+          "403": {
+            "description": "ロールが足りない"
+          },
+          "422": {
+            "description": "入力の検証エラー（`field_errors` に項目ごとの理由）"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ],
+        "summary": "日報の値",
         "tags": [
           "collect"
         ]
