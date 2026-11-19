@@ -23,6 +23,11 @@
 //! **`toMs - 1`** を渡す。こうしないと、翌日 0 時ちょうどのサンプルが日の合計に入り、
 //! 幅が 1 時間の倍数のときは 25 本目の（ほぼ空の）区間も増える。
 //!
+//! **日の合計は時間ごとの値と同じ 1 回の読み出し**（`read_binned_stats`）から、
+//! 区間の最小の最小・最大の最大・件数の合計・合計値の合計 ÷ 件数（件数で重みを付けた
+//! 平均）として組む（[`merge_day`]）。`aggregate` を別に呼ぶと、収集中に 2 回の読み出しの
+//! 間でサンプルが増え、日の件数・最小・最大が時間の行と食い違うことがあるため。
+//!
 //! # 上限
 //!
 //! * タグは 1〜[`HISTORY_MAX_TAGS`] 本（重複は 1 本。期間 CSV と同じ文言）、
@@ -37,13 +42,15 @@
 //! 居ないタグは [`CollectDailyReport::unknown_tag_ids`]。[`DailyReportHour::values`]・
 //! [`CollectDailyReport::day`] は `tags` と同じ長さ・順で、サンプルが無い（または
 //! 最小・最大・平均が非有限の）タグは `null`（期間 CSV と同じ。非有限は欠測として扱う）。
+//! 日の合計は、サンプルのある区間のどれかに非有限があれば（時間の行と同じく）`null`、
+//! なければ時間の行から組んだ値で、**時間の行と必ず一致する**（件数は時間の件数の和）。
 //! 時間の行は**サンプルが無くても必ず出す**（全タグ `null`）。
 //!
 //! シミュレーション接続の値は記録されない（`null`）。タグを別グループへ移す前の値は
 //! 読めない（履歴と同じ割り切り）。
 
 use banto_core::{BantoError, FieldError};
-use banto_tsquery::{TsQuery, TsQueryError};
+use banto_tsquery::{TagStat, TsQuery, TsQueryError};
 use serde::Serialize;
 use sqlx::SqlitePool;
 
@@ -213,6 +220,30 @@ fn stat_of(min: f64, max: f64, avg: f64, count: i64) -> Option<DailyReportStat> 
     )
 }
 
+/// 日の合計を、時間ごとの区間（同じ 1 回の読み出し）から組む。サンプルのある区間
+/// （`Some`）だけを見て、どれかの最小・最大・合計・平均が非有限なら `None`（時間の行と
+/// 同じく、非有限のサンプルは日も欠測にする）。そうでなければ最小の最小・最大の最大・
+/// 件数の和・合計値の和 ÷ 件数の和。件数の和が 0（サンプルなし）も `None`。
+fn merge_day<'a>(bins: impl IntoIterator<Item = Option<&'a TagStat>>) -> Option<DailyReportStat> {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    let mut sum = 0.0_f64;
+    let mut count = 0_i64;
+    for s in bins.into_iter().flatten() {
+        if !(s.min.is_finite() && s.max.is_finite() && s.sum.is_finite() && s.avg.is_finite()) {
+            return None;
+        }
+        min = min.min(s.min);
+        max = max.max(s.max);
+        sum += s.sum;
+        count = count.saturating_add(s.count);
+    }
+    if count <= 0 {
+        return None;
+    }
+    stat_of(min, max, sum / count as f64, count)
+}
+
 /// 日報の本体（上限・打ち切りの外側は [`CollectorService::daily_report`]）。
 async fn read_daily_report(
     pool: &SqlitePool,
@@ -288,17 +319,15 @@ async fn read_daily_report(
             }
         }
 
-        let totals = query
-            .aggregate(&group_key, &keys, request.from_ms, last_ms)
-            .await
-            .map_err(DailyReportReadError::Store)?;
+        // 日の合計は同じ `stats` から（2 回目の読み出しはしない）。
         for (offset, (column, _)) in members.iter().enumerate() {
-            day[*column] = totals
-                .get(offset)
-                .and_then(|t| match (t.min, t.max, t.avg) {
-                    (Some(min), Some(max), Some(avg)) => stat_of(min, max, avg, t.count),
-                    _ => None,
-                });
+            day[*column] = merge_day(
+                stats
+                    .bins
+                    .iter()
+                    .take(hours.len())
+                    .map(|bin| bin.tags.get(offset).and_then(Option::as_ref)),
+            );
         }
     }
 
@@ -353,6 +382,55 @@ impl CollectorService {
                 eprintln!("banto: 日報の読み出しのタスクが途中で終わりました");
                 Ok(Readout::Unavailable)
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    fn ts(min: f64, max: f64, sum: f64, count: i64) -> TagStat {
+        TagStat {
+            min,
+            max,
+            avg: sum / count as f64,
+            sum,
+            count,
+        }
+    }
+
+    #[test]
+    fn merges_weighted_by_count() {
+        let a = ts(1.0, 5.0, 12.0, 4); // avg 3
+        let b = ts(-2.0, 3.0, 4.0, 1);
+        let got = merge_day([Some(&a), None, Some(&b)]).unwrap();
+        assert_eq!((got.min, got.max, got.count), (-2.0, 5.0, 5));
+        assert!((got.avg - 3.2).abs() < 1e-12, "avg {}", got.avg);
+    }
+
+    #[test]
+    fn empty_or_all_gaps_is_none() {
+        assert_eq!(merge_day([]), None);
+        assert_eq!(merge_day([None, None]), None);
+    }
+
+    #[test]
+    fn any_non_finite_bin_poisons_the_day() {
+        let ok = ts(1.0, 2.0, 3.0, 2);
+        for bad in [
+            ts(1.0, f64::INFINITY, f64::INFINITY, 1),
+            ts(f64::NEG_INFINITY, 1.0, f64::NEG_INFINITY, 1),
+            TagStat {
+                min: 1.0,
+                max: 1.0,
+                avg: f64::NAN,
+                sum: f64::NAN,
+                count: 1,
+            },
+        ] {
+            assert_eq!(merge_day([Some(&ok), Some(&bad)]), None);
+            assert_eq!(merge_day([Some(&bad), Some(&ok)]), None);
         }
     }
 }

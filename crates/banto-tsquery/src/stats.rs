@@ -1,5 +1,5 @@
 //! [`read_binned_stats`]: [`crate::TsQuery::read_binned_stats`]'s
-//! implementation - per-interval min/max/avg/count at a *fixed* bin width,
+//! implementation - per-interval min/max/avg/sum/count at a *fixed* bin width,
 //! for interval CSV export (issue #1207 R3: 1 row per 1 min / 10 min / 1 h).
 //!
 //! Neither neighbour fits: `read_decimated` derives (and clamps) its bin
@@ -105,6 +105,7 @@ pub(crate) async fn read_binned_stats(
                         min,
                         max,
                         avg: sum / count as f64,
+                        sum,
                         count,
                     })
                 })

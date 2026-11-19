@@ -48,6 +48,7 @@ async fn computes_per_bin_stats_with_gaps_and_inclusive_edges() {
     }
     let s0 = r.bins[0].tags[0].unwrap();
     assert_eq!((s0.min, s0.max, s0.avg, s0.count), (10.0, 20.0, 15.0, 2));
+    assert_eq!(s0.sum, 30.0);
     let s1 = r.bins[1].tags[0].unwrap();
     assert_eq!((s1.min, s1.max, s1.avg, s1.count), (5.0, 5.0, 5.0, 1));
     assert!(r.bins[2].tags[0].is_none());
@@ -103,6 +104,7 @@ async fn bin_straddling_two_files_uses_count_weighted_average() {
     let s = r.bins[0].tags[0].unwrap();
     // weighted: 100 / 4 = 25 (average of averages would be 50)
     assert_eq!((s.min, s.max, s.avg, s.count), (0.0, 100.0, 25.0, 4));
+    assert_eq!(s.sum, 100.0, "sum is merged across files");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -140,6 +140,10 @@ pub struct TagStat {
     /// `sum / count` over every file's contribution to the bin (weighted by
     /// sample count, never an average of per-file averages).
     pub avg: f64,
+    /// Sum of the non-NULL samples in the bin across all files
+    /// (`avg == sum / count`). Lets a caller re-merge bins (e.g. a day total
+    /// from hourly bins) without a second read.
+    pub sum: f64,
     pub count: i64,
 }
 

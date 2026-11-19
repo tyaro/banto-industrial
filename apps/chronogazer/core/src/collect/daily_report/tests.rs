@@ -237,6 +237,41 @@ async fn hours_and_day_exclude_the_end_instant() {
     f.pool.close().await;
 }
 
+/// 日の合計は時間の行と同じ 1 回の読み出しから組むので、必ず一致する:
+/// 件数は時間の件数の和、最小・最大は時間の最小の最小・最大の最大、平均は件数の重みつき。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn day_totals_agree_with_hour_rows() {
+    let f = fixture().await;
+    let request = validate_daily_report_request(&[f.a1, f.b1], BASE_MS, BASE_MS + 3 * H).unwrap();
+    let data = ready(&f.svc, &request).await;
+    for (column, day) in data.day.iter().enumerate() {
+        let hours: Vec<DailyReportStat> =
+            data.hours.iter().filter_map(|h| h.values[column]).collect();
+        let day = day.expect("サンプルがある");
+        assert_eq!(day.count, hours.iter().map(|h| h.count).sum::<i64>());
+        assert_eq!(
+            day.min,
+            hours.iter().map(|h| h.min).fold(f64::INFINITY, f64::min)
+        );
+        assert_eq!(
+            day.max,
+            hours
+                .iter()
+                .map(|h| h.max)
+                .fold(f64::NEG_INFINITY, f64::max)
+        );
+        let weighted = hours.iter().map(|h| h.avg * h.count as f64).sum::<f64>() / day.count as f64;
+        assert!(
+            (day.avg - weighted).abs() < 1e-9,
+            "{} vs {weighted}",
+            day.avg
+        );
+    }
+    // a1 は 3 つの時間にまたがる（10,20 / 30 / 40）。
+    assert_eq!(data.day[0], st(10.0, 40.0, 25.0, 4));
+    f.pool.close().await;
+}
+
 /// 非有限は欠測と同じ `null`: +∞ を含む区間と、それを含む日の合計。+∞ が
 /// `toMs` ちょうどなら入らない（4 時間の日は有限、5 時間の日は `null`）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
