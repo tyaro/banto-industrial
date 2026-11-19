@@ -73,11 +73,12 @@ test.describe.serial('ChronoGazer R1-A smoke', () => {
 		await expect(page).toHaveURL(/\/monitor$/);
 	});
 
-	test('3. historical nav renders its R2 placeholder', async () => {
+	test('3. historical nav renders the historical screen (R2, #1207)', async () => {
 		await page.getByRole('link', { name: 'ヒストリカル' }).click();
 		await expect(page).toHaveURL(/\/historical$/);
 		await expect(page.getByRole('heading', { level: 2, name: 'ヒストリカル' })).toBeVisible();
-		await expect(page.getByText('この画面は R2 フェーズで実装予定です')).toBeVisible();
+		// R2 で画面を実装した。グループが 0 件なので空の表示。
+		await expect(page.getByText('表示グループが未設定です')).toBeVisible();
 	});
 
 	// R1-C の C-3b でプレースホルダが実装に置き換わった（このファイルの doc
