@@ -7,7 +7,7 @@
 	 * 通る。閉じたら（画面を離れて壊れたときも）結果を無視し、保存には進まない
 	 * （Tauri ではサーバー側の読み出しは止まらない）。保存先の選択を取り消したら黙って閉じる。
 	 */
-	import { onDestroy } from 'svelte';
+	import { onDestroy, untrack } from 'svelte';
 	import { Modal } from '@banto/ui';
 	import { isProviderError } from '@banto/admin-core';
 	import { toastStore } from '#lib/toast.svelte.js';
@@ -21,7 +21,9 @@
 		buildExportCsv,
 		runExport,
 		exportFileName,
+		exportKey,
 		exportRequestFor,
+		snapshotTagInfo,
 		exportTimeLabel,
 		type ExportChoice,
 		type ExportTagInfo
@@ -55,14 +57,27 @@
 		mode === 'raw' ? { mode: 'raw' } : { mode: 'interval', intervalMs, stat }
 	);
 
+	// 開いた時点の対象の鍵。開いている間にグループ・期間・タグが変わったら（ブラウザの
+	// 戻る・進む）、表示中の期間と食い違うので読み出しを止めて閉じる。
+	let openKey: string | null = null;
+
 	// 開き直したら前回のエラーを消し、閉じたら通信を止める。
 	$effect(() => {
+		const key = exportKey(groupName, range, tagIds);
 		if (!open) {
 			controller?.abort();
 			controller = null;
 			busy = false;
-		} else {
+			openKey = null;
+		} else if (openKey === null) {
+			openKey = key;
 			errorText = null;
+		} else if (openKey !== key) {
+			openKey = null;
+			controller?.abort();
+			controller = null;
+			busy = false;
+			untrack(() => onclose());
 		}
 	});
 
@@ -89,16 +104,23 @@
 		errorText = null;
 		const mine = new AbortController();
 		controller = mine;
+		// 始めた時点の値で組む（途中で画面側が変わっても、応答に合う名前・見出しにする）。
+		const snapGroup = groupName;
+		const snapRange = range;
+		const snapTagIds = [...tagIds];
+		const snapChoice = choice;
+		const snapInfo = snapshotTagInfo(snapTagIds, tagInfo);
 		try {
 			const outcome = await runExport({
 				signal: mine.signal,
-				fetch: () => getCollectExport(exportRequestFor(range, tagIds, choice), mine.signal),
+				fetch: () =>
+					getCollectExport(exportRequestFor(snapRange, snapTagIds, snapChoice), mine.signal),
 				save: async (readout) => {
 					if (readout.state !== 'ready') return { kind: 'unavailable' as const };
-					const csv = buildExportCsv(readout.data, tagInfo);
+					const csv = buildExportCsv(readout.data, snapInfo);
 					return {
 						kind: 'saved' as const,
-						saved: await saveCsvFile(exportFileName(groupName, choice), csv)
+						saved: await saveCsvFile(exportFileName(snapGroup, snapChoice), csv)
 					};
 				}
 			});

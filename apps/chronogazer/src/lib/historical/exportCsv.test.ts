@@ -4,9 +4,11 @@ import {
 	buildExportCsv,
 	exportFileBase,
 	exportFileName,
+	exportKey,
 	exportRequestFor,
 	exportTimeLabel,
-	runExport
+	runExport,
+	snapshotTagInfo
 } from './exportCsv';
 
 const BOM = '﻿';
@@ -224,5 +226,28 @@ describe('exportFileBase / exportFileName', () => {
 		expect(exportFileName('G', { mode: 'raw' }, new Date(2026, 10, 19, 9, 5))).toBe(
 			'G-raw-20261119-0905.csv'
 		);
+	});
+});
+
+describe('exportKey / snapshotTagInfo', () => {
+	const range = { fromMs: 1000, toMs: 2000 };
+	it('グループ・期間・タグが変わると鍵が変わり、同じなら同じ', () => {
+		const base = exportKey('A', range, [1, 2]);
+		expect(exportKey('A', { ...range }, [1, 2])).toBe(base);
+		expect(exportKey('B', range, [1, 2])).not.toBe(base);
+		expect(exportKey('A', { fromMs: 1001, toMs: 2000 }, [1, 2])).not.toBe(base);
+		expect(exportKey('A', { fromMs: 1000, toMs: 2001 }, [1, 2])).not.toBe(base);
+		expect(exportKey('A', range, [1, 3])).not.toBe(base);
+	});
+
+	it('固めたタグ情報は、後で元の解決が変わっても CSV に影響しない', () => {
+		let live: (id: number) => { name: string; unit?: string | null } = (id) => ({
+			name: `温度${id}`,
+			unit: '℃'
+		});
+		const snap = snapshotTagInfo([1], (id) => live(id));
+		live = (id) => ({ name: String(id) });
+		const csv = buildExportCsv(result({ tags: [{ tagId: 1, simulation: false }] }), snap);
+		expect(csv.slice(1)).toBe('時刻,温度1 [℃]');
 	});
 });

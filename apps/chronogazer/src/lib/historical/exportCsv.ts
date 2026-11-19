@@ -57,6 +57,28 @@ export function exportRequestFor(
 	};
 }
 
+/** 出力の対象（グループ・期間・タグ）が変わったかを見分ける鍵。 */
+export function exportKey(
+	groupName: string,
+	range: HistoryRange,
+	tagIds: readonly number[]
+): string {
+	return `${groupName}|${range.fromMs}|${range.toMs}|${tagIds.join(',')}`;
+}
+
+/** 出力を始めた時点のタグ情報を固める（後で画面側の解決が変わっても CSV は変わらない）。 */
+export function snapshotTagInfo(
+	tagIds: readonly number[],
+	tagInfo: (tagId: number) => ExportTagInfo
+): (tagId: number) => ExportTagInfo {
+	const map = new Map<number, ExportTagInfo>();
+	for (const id of tagIds) {
+		const info = tagInfo(id);
+		map.set(id, { name: info.name, unit: info.unit });
+	}
+	return (tagId) => map.get(tagId) ?? { name: String(tagId) };
+}
+
 export type RunExportOutcome<S> = { kind: 'done'; result: S } | { kind: 'cancelled' };
 
 /**
