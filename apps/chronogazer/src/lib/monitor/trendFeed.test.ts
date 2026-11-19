@@ -93,6 +93,23 @@ describe('TrendFeed', () => {
 		vi.useRealTimers();
 	});
 
+	it('小数の nowMs でも、取得の範囲とサンプルの時刻は整数のミリ秒になる', async () => {
+		const { fetch, calls } = controllableFetch();
+		const feed = newFeed(fetch);
+		feed.configure(config(), NOW + 0.7);
+		feed.append(NOW + 0.7, [1]);
+		expect(Number.isInteger(feed.view!.startMs)).toBe(true);
+		expect(Number.isInteger(feed.view!.endMs)).toBe(true);
+		const pen = Object.values(feed.live)[0] as { samples?: { tMs: number }[] } | undefined;
+		expect(pen).toBeDefined();
+		expect(JSON.stringify(pen)).toContain(String(NOW));
+		expect(JSON.stringify(pen)).not.toMatch(/\d\.\d/);
+		await vi.advanceTimersByTimeAsync(GRACE + DEBOUNCE);
+		expect(calls).toHaveLength(1);
+		expect(Number.isInteger(calls[0].params.fromMs)).toBe(true);
+		expect(Number.isInteger(calls[0].params.toMs)).toBe(true);
+	});
+
 	it('flush の待ちの後に表示範囲の履歴を 1 回読み、追従中に毎秒は読み直さない', async () => {
 		const { fetch, calls } = controllableFetch();
 		const feed = newFeed(fetch);

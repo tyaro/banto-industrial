@@ -229,7 +229,9 @@ export class TrendFeed {
 	 * [`HISTORY_FLUSH_GRACE_MS`] 後に読む）、`true` を返す。同じ構成なら、時間窓が変わったときは
 	 * 追従に戻し、追従中は右端を `nowMs` に進める。
 	 */
-	configure(config: TrendConfig, nowMs: number): boolean {
+	configure(config: TrendConfig, rawNowMs: number): boolean {
+		// 時計は小数を含みうる（performance.now）。REST・Tauri の口は i64 なので入口で整数にそろえる。
+		const nowMs = Math.floor(rawNowMs);
 		this.nowMs = nowMs;
 		const key = trendConfigKey(config);
 		const rebuilt = key !== this.key;
@@ -260,10 +262,11 @@ export class TrendFeed {
 	 */
 	sync(
 		config: TrendConfig,
-		nowMs: number,
+		rawNowMs: number,
 		snapshot: object,
 		values: readonly (number | null)[]
 	): void {
+		const nowMs = Math.floor(rawNowMs);
 		this.configure(config, nowMs);
 		if (snapshot === this.#appliedSnapshot) return;
 		this.#appliedSnapshot = snapshot;
@@ -271,8 +274,9 @@ export class TrendFeed {
 	}
 
 	/** 現在値を 1 回分書き足す（`values` はペンの並びどおり、`nowMs` はサーバーの時計）。 */
-	append(nowMs: number, values: readonly (number | null)[]): void {
+	append(rawNowMs: number, values: readonly (number | null)[]): void {
 		if (this.key === null) return;
+		const nowMs = Math.floor(rawNowMs); // 整数のミリ秒にそろえる（configure と同じ）。
 		const samples: Record<string, LiveSample> = {};
 		this.penIds.forEach((id, i) => {
 			const v = values[i];

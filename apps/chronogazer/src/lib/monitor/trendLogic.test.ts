@@ -200,6 +200,19 @@ describe('履歴を読み直すか（needsHistoryReload）', () => {
 		expect(needsHistoryReload({ ...base, view: ahead, liveFroms: [null] })).toBe(true);
 	});
 
+	it('表示範囲が丸ごと liveFrom より前で、その範囲を読み済みなら読まない', () => {
+		const past = { startMs: NOW - 60 * MIN, endMs: NOW - 50 * MIN };
+		expect(
+			needsHistoryReload({
+				...base,
+				requested: { range: past, binMs: 1000 },
+				view: past,
+				following: false,
+				liveFroms: [NOW - 9 * MIN]
+			})
+		).toBe(false);
+	});
+
 	it('区間の幅が変わったら読む（拡大・縮小・描画域の幅）', () => {
 		expect(needsHistoryReload({ ...base, binMs: 2000 })).toBe(true);
 	});

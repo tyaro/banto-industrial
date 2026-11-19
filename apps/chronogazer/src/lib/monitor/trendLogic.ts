@@ -262,7 +262,11 @@ export function needsHistoryReload(input: {
 	);
 	if (!(needEnd > view.startMs)) return false;
 	if (view.startMs < requested.range.startMs || view.startMs >= requested.range.endMs) return true;
-	if (liveFroms.some((f) => f !== null && f > requested.range.endMs && f > view.startMs)) {
+	if (
+		liveFroms.some(
+			(f) => f !== null && f > requested.range.endMs && f > view.startMs && f < view.endMs
+		)
+	) {
 		return true;
 	}
 	return !input.following && needEnd > requested.range.endMs;
