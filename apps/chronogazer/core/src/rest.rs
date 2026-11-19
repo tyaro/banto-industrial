@@ -62,6 +62,7 @@
 //! | GET    | `/api/collect/connections` | -              | `Readout<{[connKey]: ConnectionView}>` (viewer+, C-3a / `simulation` = #413) |
 //! | GET    | `/api/collect/events?offset=&limit=&asOfId=` | -    | `Readout<CollectEventList>` (viewer+, C-3a / `asOfId` = #409) |
 //! | GET    | `/api/collect/history?tagIds=&fromMs=&toMs=&bins=` | - | `Readout<CollectHistory>` (viewer+, R1-D の D-3a) |
+//! | GET    | `/api/collect/daily-report?tagIds=&fromMs=&toMs=` | - | `Readout<CollectDailyReport>` (viewer+, #1207 R3。日報: 1 時間ごと・1 日全体の最小/最大/平均/件数。日は `[fromMs, toMs)`、期間 1〜25 時間) |
 //! | GET    | `/api/collect/export?tagIds=&fromMs=&toMs=&mode=&intervalMs=` | - | `Readout<CollectExport>` (viewer+, #1207 R3。期間指定 CSV 出力の値。行数超過は 422) |
 //! | GET    | `/api/settings/server` | -                  | `ServerStatusView` (admin, #392 B2-1。表は `crate::server_admin` の doc) |
 //! | PUT    | `/api/settings/server` | `{enabled,bind,port,viewerPublic}` | `ServerStatusView` (admin、この PC からの要求だけ、`chronogazer-server` だけ) |
@@ -282,10 +283,11 @@ mod audit_spool_tests;
 mod local_grant_tests;
 use crate::collect::ExclusionView;
 use crate::collect::{
-    parse_tag_ids, validate_export_request, validate_history_request, CollectEventList,
-    CollectExport, CollectHistory, CollectOutcome, CollectorService, CollectorStateView,
-    ConnectionView, EventPage, ExportRequest, HistoryRequest, Readout, ValuesResponse,
-    COLLECT_AUDIT_RESOURCE, COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
+    parse_tag_ids, validate_daily_report_request, validate_export_request,
+    validate_history_request, CollectDailyReport, CollectEventList, CollectExport, CollectHistory,
+    CollectOutcome, CollectorService, CollectorStateView, ConnectionView, DailyReportRequest,
+    EventPage, ExportRequest, HistoryRequest, Readout, ValuesResponse, COLLECT_AUDIT_RESOURCE,
+    COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
 };
 use crate::hub::{HubService, HubSubscriptionView, HubView};
 use crate::ops::{CollectOperation, CollectOps, RegistryOps, Via, ORIGIN_REST};
@@ -853,6 +855,87 @@ async fn collect_export_handler(
     Ok(Json(state.collect.export(&request).await?))
 }
 
+/// `GET /api/collect/daily-report?tagIds=1,2&fromMs=&toMs=` のクエリ（#1207 R3）。
+/// 欠けている値と上限外は [`daily_report_request_from_query`] が
+/// `BantoError::Validation`（422）にする。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+struct CollectDailyReportQuery {
+    #[serde(default)]
+    #[param(required = true)]
+    tag_ids: Option<String>,
+    /// 日の始まり（ローカルの 0 時。UTC epoch ミリ秒）。
+    #[serde(default)]
+    #[param(required = true)]
+    from_ms: Option<i64>,
+    /// 日の終わり（翌日のローカルの 0 時。**含まない**）。`fromMs` から 1〜25 時間後。
+    #[serde(default)]
+    #[param(required = true)]
+    to_ms: Option<i64>,
+}
+
+/// REST のクエリを検証済みの要求にする。上限の判定は Tauri の
+/// `collect_daily_report` と同じ [`validate_daily_report_request`] 1 本。
+fn daily_report_request_from_query(
+    query: &CollectDailyReportQuery,
+) -> Result<DailyReportRequest, BantoError> {
+    let missing: Vec<FieldError> = [
+        ("fromMs", query.from_ms.is_none()),
+        ("toMs", query.to_ms.is_none()),
+    ]
+    .into_iter()
+    .filter(|(_, missing)| *missing)
+    .map(|(field, _)| FieldError {
+        field: field.to_string(),
+        message: "必須です".to_string(),
+    })
+    .collect();
+    if !missing.is_empty() {
+        return Err(BantoError::Validation {
+            field_errors: missing,
+        });
+    }
+    let tag_ids = parse_tag_ids(query.tag_ids.as_deref().unwrap_or(""))?;
+    validate_daily_report_request(
+        &tag_ids,
+        query.from_ms.unwrap_or_default(),
+        query.to_ms.unwrap_or_default(),
+    )
+}
+
+/// `GET /api/collect/daily-report`（**`viewer` 以上**、#1207 R3）: 日報の値。
+/// 1 時間ごと（`fromMs` から 1 時間幅）と 1 日全体の最小・最大・平均・件数をタグごとに返す。
+/// 日は `[fromMs, toMs)`（`toMs` を含まない）。
+///
+/// 期間は 1〜25 時間（夏時間の日を含む）。収集が止まっていても読める。読めなかった
+/// ときは `unavailable`（理由は返さない）。形・上限・割り切りは `crate::collect` の
+/// `daily_report` モジュールの doc。読み取りなので監査しない。
+#[utoipa::path(
+    get,
+    path = "/api/collect/daily-report",
+    tag = "collect",
+    operation_id = "collect_daily_report",
+    summary = "日報の値",
+    description = "タグごとの 1 時間ごとの最小・最大・平均・件数と、1 日全体のそれを返す。日は `[fromMs, toMs)`（`toMs` を含まない）で、期間は 1〜25 時間。サンプルが無いタグ・時間は `null`。読み取り（`read` キーで足りる）。",
+    params(CollectDailyReportQuery),
+    responses(
+        (status = 200, description = "日報の値", body = Readout<CollectDailyReport>),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "ロールが足りない"),
+        (status = 422, description = "入力の検証エラー（`field_errors` に項目ごとの理由）"),
+    ),
+    security(("api_key" = [])),
+)]
+async fn collect_daily_report_handler(
+    State(state): State<CollectState>,
+    Query(query): Query<CollectDailyReportQuery>,
+) -> Result<Json<Readout<CollectDailyReport>>, ApiError> {
+    let request = daily_report_request_from_query(&query)?;
+    Ok(Json(state.collect.daily_report(&request).await?))
+}
+
 /// `POST /api/collect/start`（**`editor` 以上** - [`COLLECT_OPERATION_ROLE`]）。
 #[utoipa::path(
     post,
@@ -1000,6 +1083,11 @@ fn collect_router(collect: CollectorService, audit: AuditLogService, auth: AuthS
         .route("/api/collect/history", get(collect_history_handler))
         // #1207 R3: 期間指定 CSV 出力の値。同じ床・監査しない・キューを通らない。
         .route("/api/collect/export", get(collect_export_handler))
+        // #1207 R3: 日報（1 時間ごと・1 日全体の統計量）。同じ床・監査しない・キューを通らない。
+        .route(
+            "/api/collect/daily-report",
+            get(collect_daily_report_handler),
+        )
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             ActorGuard {

@@ -100,10 +100,10 @@ use chronogazer_core::server_admin::{
 // 自動開始を足し、C-3a で読み出し 3 本（現在値・接続状態・イベント一覧）を
 // 足した（監査の `resource` も床も REST と共有の定数）。
 use chronogazer_core::collect::{
-    registry_exclusions, validate_export_request, validate_history_request, CollectEventList,
-    CollectExport, CollectHistory, CollectOutcome, CollectorStateView, ConnectionView, EventPage,
-    ExclusionView, Readout, ValuesResponse, COLLECT_AUDIT_RESOURCE, COLLECT_OPERATION_ROLE,
-    COLLECT_READ_ROLE,
+    registry_exclusions, validate_daily_report_request, validate_export_request,
+    validate_history_request, CollectDailyReport, CollectEventList, CollectExport, CollectHistory,
+    CollectOutcome, CollectorStateView, ConnectionView, EventPage, ExclusionView, Readout,
+    ValuesResponse, COLLECT_AUDIT_RESOURCE, COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
 };
 // #393: 表示グループ。検証・保存は REST と同じ `DisplayGroupService`。
 use chronogazer_core::display_groups::{
@@ -3805,6 +3805,34 @@ async fn collect_export(
     collect_export_body(&state, tag_ids, from_ms, to_ms, mode, interval_ms, stat).await
 }
 
+/// Body of [`collect_daily_report`]（spec M14 split-function pattern）。床を先に見る
+/// （[`collect_export_body`] と同じ順）。
+async fn collect_daily_report_body(
+    state: &AppState,
+    tag_ids: Vec<i64>,
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<Readout<CollectDailyReport>, BantoError> {
+    require_collect_reader(state).await?;
+    let request = validate_daily_report_request(&tag_ids, from_ms, to_ms)?;
+    state.services.collect.daily_report(&request).await
+}
+
+/// 日報の値（#1207 R3。1 時間ごと・1 日全体の最小・最大・平均・件数）。
+/// **`viewer` 以上**、監査しない。`chronogazer_core::rest` の
+/// `GET /api/collect/daily-report` と**同じ検証・同じメソッド**を通る双子。日は
+/// `[fromMs, toMs)`（`toMs` を含まない）、期間は 1〜25 時間。形・上限・割り切りは
+/// `chronogazer_core::collect` の `daily_report` モジュールの doc。
+#[tauri::command]
+async fn collect_daily_report(
+    state: State<'_, AppState>,
+    tag_ids: Vec<i64>,
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<Readout<CollectDailyReport>, BantoError> {
+    collect_daily_report_body(&state, tag_ids, from_ms, to_ms).await
+}
+
 /// [`save_csv_file`] の結果。**ファイル名だけ**を返す（フルパスは画面に渡さない）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -5091,6 +5119,7 @@ pub fn run() {
             collect_events_list,
             collect_history,
             collect_export,
+            collect_daily_report,
             save_csv_file,
         ])
         .build(tauri::generate_context!())
