@@ -147,7 +147,10 @@ export const bantoReady: Promise<void> = (async () => {
 		bantoMode = 'tauri';
 		const dataProvider = createTauriDataProvider({ invoke });
 		const authProvider = createTauriAuthProvider({ invoke });
-		uiSettings = createTauriUiSettings({ invoke });
+		uiSettings = createTauriUiSettings({
+			invoke,
+			getSessionRevision: () => authProvider.credentialRevision()
+		});
 		initBanto({ dataProvider, authProvider, notifier, resources: [] });
 
 		// Dynamic import: @tauri-apps/api/event's `listen` talks to a real

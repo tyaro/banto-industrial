@@ -33,7 +33,6 @@ import {
 import type { Notifier, UiSettingsProvider } from '@banto/admin-core';
 import { toastStore } from '#lib/toast.svelte.js';
 import { purgeLoopbackRememberedToken } from './loopbackTokenPurge';
-import { createSerializedUiSettings } from './serializedUiSettings';
 
 /** usersAdmin.ts 等の CSRF ヘッダー（管理系 REST 全体で共通）。 */
 export const CSRF_HEADER = { 'X-Banto-Client': 'banto' } as const;
@@ -75,11 +74,9 @@ export const bantoReady: Promise<void> = (async () => {
 	await purgeLoopbackRememberedToken();
 	const authProvider = createHttpAuthProvider();
 	const dataProvider = createHttpDataProvider({ getToken: authProvider.getToken });
-	// 書き込みはキーごとに直列化し、トークンが替わったら捨てる（serializedUiSettings.ts）。
-	uiSettings = createSerializedUiSettings(
-		createHttpUiSettings({ getToken: authProvider.getToken }),
-		authProvider.getToken
-	);
+	// 書き込みのキーごとの直列化・トークンが替わった書き込みの破棄は banto v7.8.0
+	// （`createHttpUiSettings`、banto#707）が持つ。
+	uiSettings = createHttpUiSettings({ getToken: authProvider.getToken });
 	initBanto({ dataProvider, authProvider, notifier, resources: [] });
 	connectEvents(createSseEventProvider({ getToken: authProvider.getToken }));
 })();
