@@ -23,6 +23,7 @@ export default defineConfig({
 			'@banto/charts',
 			'@banto/forms',
 			'@banto/grid-svelte',
+			'@banto/report',
 			'@banto/theme',
 			'@banto/tree-svelte',
 			'@banto/ui'

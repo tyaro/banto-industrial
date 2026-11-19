@@ -111,6 +111,9 @@ importers:
       '@banto/grid-svelte':
         specifier: github:tyaro/banto#v7.8.0&path:packages/grid-svelte
         version: https://codeload.github.com/tyaro/banto/tar.gz/8e76b3222255b075db4e06af89805f8990d09856#path:packages/grid-svelte
+      '@banto/report':
+        specifier: github:tyaro/banto#v7.8.0&path:packages/report
+        version: https://codeload.github.com/tyaro/banto/tar.gz/8e76b3222255b075db4e06af89805f8990d09856#path:packages/report
       '@banto/theme':
         specifier: github:tyaro/banto#v7.8.0&path:packages/theme
         version: https://codeload.github.com/tyaro/banto/tar.gz/8e76b3222255b075db4e06af89805f8990d09856#path:packages/theme
@@ -174,6 +177,10 @@ packages:
 
   '@banto/grid-svelte@https://codeload.github.com/tyaro/banto/tar.gz/8e76b3222255b075db4e06af89805f8990d09856#path:packages/grid-svelte':
     resolution: {path: packages/grid-svelte, tarball: https://codeload.github.com/tyaro/banto/tar.gz/8e76b3222255b075db4e06af89805f8990d09856}
+    version: 7.8.0
+
+  '@banto/report@https://codeload.github.com/tyaro/banto/tar.gz/8e76b3222255b075db4e06af89805f8990d09856#path:packages/report':
+    resolution: {path: packages/report, tarball: https://codeload.github.com/tyaro/banto/tar.gz/8e76b3222255b075db4e06af89805f8990d09856}
     version: 7.8.0
 
   '@banto/theme@https://codeload.github.com/tyaro/banto/tar.gz/8e76b3222255b075db4e06af89805f8990d09856#path:packages/theme':
@@ -1464,6 +1471,8 @@ snapshots:
   '@banto/forms@https://codeload.github.com/tyaro/banto/tar.gz/8e76b3222255b075db4e06af89805f8990d09856#path:packages/forms': {}
 
   '@banto/grid-svelte@https://codeload.github.com/tyaro/banto/tar.gz/8e76b3222255b075db4e06af89805f8990d09856#path:packages/grid-svelte': {}
+
+  '@banto/report@https://codeload.github.com/tyaro/banto/tar.gz/8e76b3222255b075db4e06af89805f8990d09856#path:packages/report': {}
 
   '@banto/theme@https://codeload.github.com/tyaro/banto/tar.gz/8e76b3222255b075db4e06af89805f8990d09856#path:packages/theme': {}
 

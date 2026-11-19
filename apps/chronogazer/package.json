@@ -17,6 +17,7 @@
     "@banto/charts": "github:tyaro/banto#v7.8.0&path:packages/charts",
     "@banto/forms": "github:tyaro/banto#v7.8.0&path:packages/forms",
     "@banto/grid-svelte": "github:tyaro/banto#v7.8.0&path:packages/grid-svelte",
+    "@banto/report": "github:tyaro/banto#v7.8.0&path:packages/report",
     "@banto/theme": "github:tyaro/banto#v7.8.0&path:packages/theme",
     "@banto/tree-svelte": "github:tyaro/banto#v7.8.0&path:packages/tree-svelte",
     "@banto/ui": "github:tyaro/banto#v7.8.0&path:packages/ui",

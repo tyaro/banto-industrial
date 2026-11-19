@@ -12,10 +12,11 @@ import {
 const paths = (items: NavItem[]) => items.map((item) => item.path);
 
 describe('navItems の並び（改善案の順、#1159）', () => {
-	it('監視 / ヒストリカル / イベント / 記録 / 表示グループ / 管理 / 設定', () => {
+	it('監視 / ヒストリカル / 日報 / イベント / 記録 / 表示グループ / 管理 / 設定', () => {
 		expect(navItems.map((item) => item.label)).toEqual([
 			'監視',
 			'ヒストリカル',
+			'日報',
 			'イベント',
 			'記録',
 			'表示グループ',
@@ -38,6 +39,7 @@ describe('visibleNavItems', () => {
 		expect(paths(visible)).toEqual([
 			'/monitor',
 			'/historical',
+			'/daily-report',
 			'/events',
 			'/tags',
 			'/groups',
@@ -49,18 +51,24 @@ describe('visibleNavItems', () => {
 		for (const role of ['admin', 'editor', 'viewer'] as const) {
 			expect(paths(visibleNavItems({ role, publicViewer: true }))).toEqual(paths(publicNavItems()));
 		}
-		expect(paths(publicNavItems())).toEqual(['/monitor', '/historical', '/events']);
+		expect(paths(publicNavItems())).toEqual([
+			'/monitor',
+			'/historical',
+			'/daily-report',
+			'/events'
+		]);
 	});
 });
 
 describe('navBarEntries', () => {
-	it('admin: 監視 / ヒストリカル / イベント / 記録 / 表示グループ / 管理(グループ) / 設定 の並び', () => {
+	it('admin: 監視 / ヒストリカル / 日報 / イベント / 記録 / 表示グループ / 管理(グループ) / 設定 の並び', () => {
 		const entries = navBarEntries(visibleNavItems({ role: 'admin' }));
 		expect(
 			entries.map((entry) => (entry.kind === 'item' ? entry.item.label : `[${entry.key}]`))
 		).toEqual([
 			'監視',
 			'ヒストリカル',
+			'日報',
 			'イベント',
 			'記録',
 			'表示グループ',
@@ -78,15 +86,16 @@ describe('navBarEntries', () => {
 	it('admin 以外にはグループごと出さない', () => {
 		const entries = navBarEntries(visibleNavItems({ role: 'viewer' }));
 		expect(entries.every((entry) => entry.kind === 'item')).toBe(true);
-		expect(entries).toHaveLength(6);
+		expect(entries).toHaveLength(7);
 	});
 
-	it('閲覧公開: 3 項目の単独リンクだけ（グループも設定も無い）', () => {
+	it('閲覧公開: 4 項目の単独リンクだけ（グループも設定も無い）', () => {
 		const entries = navBarEntries(visibleNavItems({ role: 'viewer', publicViewer: true }));
 		expect(entries.every((entry) => entry.kind === 'item')).toBe(true);
 		expect(entries.map((entry) => entry.kind === 'item' && entry.item.label)).toEqual([
 			'監視',
 			'ヒストリカル',
+			'日報',
 			'イベント'
 		]);
 	});

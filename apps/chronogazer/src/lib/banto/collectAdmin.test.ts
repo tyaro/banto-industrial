@@ -19,6 +19,7 @@ import {
 	COLLECT_POLL_FAILURE_LIMIT,
 	COLLECT_UI_TIMEOUT_MS,
 	collectActionLabel,
+	collectDailyReportQuery,
 	collectExportQuery,
 	collectHistoryQuery,
 	HISTORY_MAX_BINS,
@@ -661,6 +662,17 @@ describe('collectExportQuery（#1207 R3）', () => {
 		expect(parsed.get('intervalMs')).toBe('600000');
 		expect(parsed.get('stat')).toBe('max');
 		expect(parsed.get('fromMs')).toBe('0');
+	});
+});
+
+describe('collectDailyReportQuery（#1207 R3 日報）', () => {
+	it('tagIds をカンマ区切り、期間をミリ秒のまま載せる', () => {
+		const parsed = new URLSearchParams(
+			collectDailyReportQuery({ tagIds: [3, 1], fromMs: 1000, toMs: 87_401_000 })
+		);
+		expect(parsed.get('tagIds')).toBe('3,1');
+		expect(parsed.get('fromMs')).toBe('1000');
+		expect(parsed.get('toMs')).toBe('87401000');
 	});
 });
 

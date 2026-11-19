@@ -122,6 +122,7 @@ export const NAV_GROUP_LABELS: Record<NavGroupKey, string> = { [ADMIN_GROUP_KEY]
 export const navItems: NavItem[] = [
 	{ path: '/monitor', label: '監視', icon: '📈', publicViewer: true },
 	{ path: '/historical', label: 'ヒストリカル', icon: '🕰️', publicViewer: true },
+	{ path: '/daily-report', label: '日報', icon: '🗒️', publicViewer: true },
 	{ path: '/events', label: 'イベント', icon: '🔔', publicViewer: true },
 	{ path: '/tags', label: '記録', icon: '📝' },
 	{ path: '/groups', label: '表示グループ', icon: '🗂️' },
