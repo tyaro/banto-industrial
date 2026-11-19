@@ -62,6 +62,8 @@ let syncState: 'idle' | 'syncing' | 'ready' | 'failed' = 'idle';
 let pendingIds: string[] = [];
 /** 取り込みの世代。新しい取り込みが始まったら、古いものの結果は捨てる。 */
 let syncSeq = 0;
+/** 直近に始めた取り込みのセッションの鍵（同じセッションの重なり・やり直しを見分ける）。 */
+let syncSession: { key: unknown } | undefined;
 
 function pushFront(id: string, ids: string[]): string[] {
 	return [id, ...ids.filter((existing) => existing !== id)].slice(0, MAX_RECENT);
@@ -88,13 +90,32 @@ export function recordRecentCommand(id: string): void {
  *
  * `isCurrent` は「いまも取り込みを始めたセッションか」。始める前と応答の後に確かめ、
  * 古いセッションならメモリにもサーバーにも何もしない。
+ *
+ * `session` はセッションの鍵（`snapshot.generation` など）。同じセッションで取り込みが
+ * 重なったとき（前が `syncing`）や、失敗の後にやり直すとき（前が `failed`）は、まだサーバーへ
+ * 送っていない記録を捨てずに引き継ぐ（`syncing` は `pendingIds`、`failed` はその間にメモリへ
+ * 記録した `recentIds`）。鍵が違えば（利用者が替わった）すべて空にする。`ready` なら記録は
+ * サーバーへ書いてあり、`get` は書き込みを待つので、空にして読み直してよい。
+ * 省略すると毎回別の鍵になり、常に空にする。
  */
-export async function syncRecentFromProvider(isCurrent: () => boolean = () => true): Promise<void> {
+export async function syncRecentFromProvider(
+	isCurrent: () => boolean = () => true,
+	session: unknown = Symbol('recent-sync-session')
+): Promise<void> {
 	if (!isCurrent()) return;
 	const seq = ++syncSeq;
+	const carried =
+		syncSession !== undefined && Object.is(syncSession.key, session)
+			? syncState === 'syncing'
+				? pendingIds
+				: syncState === 'failed'
+					? recentIds
+					: []
+			: [];
+	syncSession = { key: session };
 	syncState = 'syncing';
-	pendingIds = [];
-	recentIds = [];
+	pendingIds = [...carried];
+	recentIds = [...carried];
 	removeLegacyCopy();
 	let serverIds: string[];
 	try {
@@ -119,6 +140,7 @@ export async function syncRecentFromProvider(isCurrent: () => boolean = () => tr
 /** テスト用: 取り込みの状態を最初（ログイン前）に戻す。 */
 export function resetRecentSyncForTest(): void {
 	syncState = 'idle';
+	syncSession = undefined;
 	pendingIds = [];
 	recentIds = [];
 	syncSeq++;

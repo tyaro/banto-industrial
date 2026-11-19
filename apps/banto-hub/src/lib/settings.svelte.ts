@@ -172,12 +172,17 @@ class Settings {
 	 * 遅れて返った応答で壊さないための 2 つの守り:
 	 * - `isCurrent`: 「いまも読み込みを始めたセッションか」。応答の後に確かめ、古いセッションの
 	 *   応答は何にも当てない（最近のコマンドも同じ境界）。
+	 * - `session`: セッションの鍵（`snapshot.generation`）。最近のコマンドの取り込みが同じ
+	 *   セッションで重なっても、未送信の記録を捨てない。
 	 * - 編集の世代: 読み込みの開始後に利用者が変えたキーは、遅れて返った古い値で巻き戻さない。
 	 */
-	async syncFromProvider(isCurrent: () => boolean = () => true): Promise<void> {
+	async syncFromProvider(isCurrent: () => boolean = () => true, session?: unknown): Promise<void> {
 		const ui = getUiSettings();
 		// 最近使ったコマンド（#1147）も同じ境界で並行して取り込む。
-		const recent = syncRecentFromProvider(isCurrent);
+		const recent =
+			session === undefined
+				? syncRecentFromProvider(isCurrent)
+				: syncRecentFromProvider(isCurrent, session);
 		const started = {
 			mode: this.#editGen(MODE_SETTING),
 			preset: this.#editGen(PRESET_SETTING),

@@ -218,4 +218,53 @@ describe('syncRecentFromProvider', () => {
 		await syncRecentFromProvider(() => false);
 		expect(loadRecentCommandIds()).toEqual(['during']);
 	});
+
+	it('同じセッションで取り込みが重なっても、間に記録したコマンドを捨てずにまとめて書く', async () => {
+		store.set(RECENT_SETTING, JSON.stringify(['s1']));
+		const d1 = deferGet();
+		const p1 = syncRecentFromProvider(() => true, 7);
+		recordRecentCommand('x');
+		const d2 = deferGet();
+		const p2 = syncRecentFromProvider(() => true, 7);
+		expect(loadRecentCommandIds()).toEqual(['x']);
+		d1.resolve(JSON.stringify(['old']));
+		await p1; // 古い取り込みの結果は捨てる
+		expect(loadRecentCommandIds()).toEqual(['x']);
+		d2.resolve(JSON.stringify(['s1']));
+		await p2;
+		expect(loadRecentCommandIds()).toEqual(['x', 's1']);
+		expect(JSON.parse(store.get(RECENT_SETTING) ?? 'null')).toEqual(['x', 's1']);
+	});
+
+	it('失敗の後に同じセッションで取り込むと、その間の記録が残ってまとめられる', async () => {
+		store.set(RECENT_SETTING, JSON.stringify(['server']));
+		failing.get = true;
+		await syncRecentFromProvider(() => true, 3);
+		recordRecentCommand('after');
+		failing.get = false;
+		await syncRecentFromProvider(() => true, 3);
+		expect(loadRecentCommandIds()).toEqual(['after', 'server']);
+		expect(JSON.parse(store.get(RECENT_SETTING) ?? 'null')).toEqual(['after', 'server']);
+	});
+
+	it('別のセッションの鍵なら、重なり・失敗の後でも記録を捨てる', async () => {
+		store.set(RECENT_SETTING, JSON.stringify(['server']));
+		const d1 = deferGet();
+		const p1 = syncRecentFromProvider(() => true, 1);
+		recordRecentCommand('prev-user');
+		const d2 = deferGet();
+		const p2 = syncRecentFromProvider(() => true, 2);
+		expect(loadRecentCommandIds()).toEqual([]);
+		d1.resolve(null);
+		d2.resolve(JSON.stringify(['server']));
+		await Promise.all([p1, p2]);
+		expect(loadRecentCommandIds()).toEqual(['server']);
+		expect(setLog).toEqual([]);
+		failing.get = true;
+		await syncRecentFromProvider(() => true, 2);
+		recordRecentCommand('mine');
+		failing.get = false;
+		await syncRecentFromProvider(() => true, 9);
+		expect(loadRecentCommandIds()).toEqual(['server']);
+	});
 });

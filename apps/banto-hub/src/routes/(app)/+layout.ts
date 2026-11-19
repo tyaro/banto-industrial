@@ -66,7 +66,10 @@ export async function load() {
 	// 優先する）。fire-and-forget: ナビゲーションを待たせない/失敗させない。
 	// 遅れて返った古いセッションの応答を捨てるため、いまも同じ generation かを渡す。
 	const confirmedGeneration = snapshot.generation;
-	void settings.syncFromProvider(() => controller.snapshot.generation === confirmedGeneration);
+	void settings.syncFromProvider(
+		() => controller.snapshot.generation === confirmedGeneration,
+		confirmedGeneration
+	);
 
 	// この load が確認できた generation（I-16）。いまの `snapshot.generation` を
 	// 読み直さない: 上の await の後に別のセッションが確定していることがあり、
