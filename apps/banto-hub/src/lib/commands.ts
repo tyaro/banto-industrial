@@ -132,34 +132,5 @@ export function buildCommands(): PaletteCommand[] {
 	return [...navigationCommands(), ...themeCommands(), ...configCommands(), ...sessionCommands()];
 }
 
-// --- 最近使ったコマンド（localStorage） -------------------------------------
-
-const RECENT_KEY = 'banto.commandPaletteRecent';
-const MAX_RECENT = 10;
-
-export function loadRecentCommandIds(): string[] {
-	if (typeof localStorage === 'undefined') return [];
-	try {
-		const raw = localStorage.getItem(RECENT_KEY);
-		if (!raw) return [];
-		const parsed: unknown = JSON.parse(raw);
-		return Array.isArray(parsed)
-			? parsed.filter((entry): entry is string => typeof entry === 'string')
-			: [];
-	} catch {
-		return [];
-	}
-}
-
-export function recordRecentCommand(id: string): void {
-	if (typeof localStorage === 'undefined') return;
-	const next = [id, ...loadRecentCommandIds().filter((existing) => existing !== id)].slice(
-		0,
-		MAX_RECENT
-	);
-	try {
-		localStorage.setItem(RECENT_KEY, JSON.stringify(next));
-	} catch {
-		// ベストエフォートの利便機能 - コマンド実行自体をブロックしない。
-	}
-}
+// 最近使ったコマンドは `recentCommands.ts`（localStorage + サーバー、#1147）。
+export { loadRecentCommandIds, recordRecentCommand } from './recentCommands';

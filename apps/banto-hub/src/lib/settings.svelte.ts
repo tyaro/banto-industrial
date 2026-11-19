@@ -1,11 +1,16 @@
 /**
- * relay-wright の同名ファイルから複製。永続化の二層構成（localStorage の
- * FOUC キャッシュ + UiSettingsProvider）はそのまま — banto-hub では
- * `getUiSettings()` が `createLocalUiSettings()`（#lib/banto/setup.ts 参照:
- * バックエンドに /api/ui-settings が無いため）に固定されるので、
- * `persistRemote`/`syncFromProvider` は実質 localStorage への二重書き込み
- * になるが、将来サーバー側 UiSettingsProvider を追加したときに無改変で
- * 効くようこのまま残す。
+ * App settings store (Svelte 5 runes)。ChronoGazer の同名ファイルと同じ形。
+ *
+ * 永続化は設定ごとに二層（#1147）:
+ * - localStorage: 変更のたびに同期で書く。FOUC 防止の写しで（app.html の inline script が
+ *   `banto.theme`/`banto.preset` を最初の描画の前に戻す）、ログイン前の表示もこれで決まる。
+ * - `getUiSettings()`（setup.ts）= Hub のサーバー（`/api/ui-settings/{key}`、ログインした
+ *   利用者ごと）: 変更のたびに best-effort で書く（未ログインの失敗は握りつぶす。写しには
+ *   もう入っている）。デスクトップ版は起動ごとに origin が変わり localStorage が消えるため、
+ *   本体はサーバー側。ログイン後に `syncFromProvider()`（`(app)/+layout.ts` のガードが、
+ *   セッションを確かめた直後に呼ぶ）で読み直し、サーバーの値が写しを上書きする。
+ *   再起動直後のログイン画面は既定のテーマで出てよい（2026-11-19 オーナー決定、
+ *   docs/hub/hub-desktop-tls-design.md §7）。
  *
  * #1159（banto v7.2.0 のメニューバー、nav-menubar-plan.md §3）: admin-template の
  * `navLayout`（サイドバー / ドック / メニューバー）と `launcherPosition`（ドックの
@@ -25,6 +30,7 @@ import {
 	type ThemePreset
 } from '@banto/theme';
 import { getUiSettings } from './banto/setup';
+import { syncRecentFromProvider } from './recentCommands';
 import {
 	isLauncherPosition,
 	isNavLayout,
@@ -71,7 +77,7 @@ function loadLauncherPosition(): LauncherPosition {
 	return parseLauncherPosition(localStorage.getItem(LAUNCHER_POSITION_KEY));
 }
 
-/** Best-effort provider write: 未認証/オフラインの失敗は想定内で無視する。 */
+/** Best-effort provider write: 未認証/オフラインの失敗は想定内で無視する（写しには入っている）。 */
 function persistRemote(key: string, value: string): void {
 	void getUiSettings()
 		.set(key, value)
@@ -145,7 +151,10 @@ class Settings {
 		this.#applyLauncherPosition(this.launcherPosition);
 	}
 
-	/** ログイン直後に一度呼ぶ: UiSettingsProvider から読み直す。 */
+	/**
+	 * ログイン直後に一度呼ぶ: UiSettingsProvider（サーバー）から読み直して適用する（写しも更新）。
+	 * 未保存のキーや失敗は、いまの値（localStorage 由来）のままにする。
+	 */
 	async syncFromProvider(): Promise<void> {
 		const ui = getUiSettings();
 		try {
@@ -162,6 +171,8 @@ class Settings {
 		} catch {
 			// Best-effort: オフライン/未認証時は現在値のまま。
 		}
+		// 最近使ったコマンド（#1147）も同じタイミングで取り込む。
+		await syncRecentFromProvider();
 	}
 
 	toggleSidebar() {

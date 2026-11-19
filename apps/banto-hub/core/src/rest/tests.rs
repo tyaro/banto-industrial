@@ -21,3 +21,4 @@ mod sink;
 mod store_retention;
 mod tag_list_query;
 mod tag_read_scope;
+mod ui_settings;
