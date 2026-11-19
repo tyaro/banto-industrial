@@ -1,11 +1,13 @@
 <script lang="ts">
 	/**
 	 * 「CSV 出力」のダイアログ（#1207 R3 PR3）。表示中の表示グループ・期間を、生の値か
-	 * 間隔で揃えた統計で書き出す。判断は `exportCsv.ts` の純関数で、ここは出すだけ。
+	 * 間隔ごとの統計で書き出す。判断は `exportCsv.ts` の純関数で、ここは出すだけ。
 	 *
 	 * 中央モーダル（`@banto/ui` の `Modal`）なので Esc・オーバーレイ・× は同じ閉じる処理を
-	 * 通る。閉じたら読み出し中の通信も止める。保存先の選択を取り消したら黙って閉じる。
+	 * 通る。閉じたら（画面を離れて壊れたときも）結果を無視し、保存には進まない
+	 * （Tauri ではサーバー側の読み出しは止まらない）。保存先の選択を取り消したら黙って閉じる。
 	 */
+	import { onDestroy } from 'svelte';
 	import { Modal } from '@banto/ui';
 	import { isProviderError } from '@banto/admin-core';
 	import { toastStore } from '#lib/toast.svelte.js';
@@ -17,6 +19,7 @@
 		EXPORT_STATS,
 		EXPORT_UNAVAILABLE_MESSAGE,
 		buildExportCsv,
+		runExport,
 		exportFileName,
 		exportRequestFor,
 		exportTimeLabel,
@@ -63,6 +66,12 @@
 		}
 	});
 
+	// 画面を離れて壊れたとき（open が false にならないまま）も読み出しを無効にする。
+	onDestroy(() => {
+		controller?.abort();
+		controller = null;
+	});
+
 	function messageOf(err: unknown): string {
 		if (isProviderError(err)) {
 			if (err.body.kind === 'validation') {
@@ -81,15 +90,24 @@
 		const mine = new AbortController();
 		controller = mine;
 		try {
-			const readout = await getCollectExport(exportRequestFor(range, tagIds, choice), mine.signal);
-			if (mine.signal.aborted) return;
-			if (readout.state !== 'ready') {
+			const outcome = await runExport({
+				signal: mine.signal,
+				fetch: () => getCollectExport(exportRequestFor(range, tagIds, choice), mine.signal),
+				save: async (readout) => {
+					if (readout.state !== 'ready') return { kind: 'unavailable' as const };
+					const csv = buildExportCsv(readout.data, tagInfo);
+					return {
+						kind: 'saved' as const,
+						saved: await saveCsvFile(exportFileName(groupName, choice), csv)
+					};
+				}
+			});
+			if (outcome.kind === 'cancelled') return;
+			if (outcome.result.kind === 'unavailable') {
 				errorText = EXPORT_UNAVAILABLE_MESSAGE;
 				return;
 			}
-			const csv = buildExportCsv(readout.data, tagInfo);
-			const saved = await saveCsvFile(exportFileName(groupName, choice), csv);
-			if (mine.signal.aborted) return;
+			const saved = outcome.result.saved;
 			if (!saved.saved) {
 				onclose();
 				return;
@@ -100,7 +118,6 @@
 			);
 			onclose();
 		} catch (err) {
-			if (mine.signal.aborted) return;
 			errorText = messageOf(err);
 		} finally {
 			if (controller === mine) controller = null;
@@ -135,7 +152,7 @@
 			{/if}
 			<label class="radio">
 				<input type="radio" name="export-mode" value="interval" bind:group={mode} />
-				間隔で揃える
+				間隔ごとの統計
 			</label>
 			{#if mode === 'interval'}
 				<div class="interval">

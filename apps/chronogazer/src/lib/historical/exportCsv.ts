@@ -1,18 +1,13 @@
 /**
  * ヒストリカル画面の「CSV 出力」の純ロジック（#1207 R3 PR3）。
  *
- * - 出力は表示中の表示グループ・期間（2026-11-19 オーナー決定）。生の値か、間隔で揃えた
+ * - 出力は表示中の表示グループ・期間（2026-11-19 オーナー決定）。生の値か、間隔ごとの
  *   統計（平均・最大・最小）。横持ち（1 行 = 1 時刻、列 = タグ）。
  * - 先頭列は「時刻」（端末のローカル時刻）。タグの列の見出しは `名前` か `名前 [単位]`。
  * - Excel で開く前提: 数式として読まれる見出しは先頭に `'` を付け（`formulaSafe`）、BOM を付ける。
  */
 import { csvFilename, csvForExcel, toCsv, type GridColumn } from '@banto/grid-svelte';
-import {
-	HISTORY_MAX_WINDOW_MS,
-	type CollectExport,
-	type CollectExportParams,
-	type ExportStat
-} from '../banto/collectAdmin';
+import type { CollectExport, CollectExportParams, ExportStat } from '../banto/collectAdmin';
 import type { HistoryRange } from './historyLogic';
 
 export const EXPORT_INTERVALS: readonly { ms: number; label: string }[] = [
@@ -41,11 +36,8 @@ export const DEFAULT_EXPORT_CHOICE: ExportChoice = {
 };
 
 /**
- * 読み出しの引数。間隔で揃えるときは開始を間隔の倍数（エポック基準）に切り下げる
- * （終了はそのまま）。切り下げで期間がサーバーの上限（HISTORY_MAX_WINDOW_MS）を
- * 超えるときは切り上げに替える（上限ちょうどの期間が 422 で断られないように）。
- * 切り上げが終了を超えるなら、元の開始のままにする。1 分・10 分・1 時間の境目は、JST のような「時間単位のずれ」の
- * 時刻帯ならローカルの分・時の境目と一致する。
+ * 読み出しの引数。生・間隔とも、表示している期間をそのまま使う（開始・終了を動かさない）。
+ * 間隔の出力の区間は、サーバーが開始（`fromMs`）から間隔ごとに切る。
  */
 export function exportRequestFor(
 	range: HistoryRange,
@@ -55,19 +47,39 @@ export function exportRequestFor(
 	if (choice.mode === 'raw') {
 		return { tagIds, fromMs: range.fromMs, toMs: range.toMs, mode: 'raw' };
 	}
-	let fromMs = Math.floor(range.fromMs / choice.intervalMs) * choice.intervalMs;
-	if (range.toMs - fromMs > HISTORY_MAX_WINDOW_MS) {
-		const up = Math.ceil(range.fromMs / choice.intervalMs) * choice.intervalMs;
-		fromMs = up <= range.toMs ? up : range.fromMs;
-	}
 	return {
 		tagIds,
-		fromMs,
+		fromMs: range.fromMs,
 		toMs: range.toMs,
 		mode: 'interval',
 		intervalMs: choice.intervalMs,
 		stat: choice.stat
 	};
+}
+
+export type RunExportOutcome<S> = { kind: 'done'; result: S } | { kind: 'cancelled' };
+
+/**
+ * 読み出し → 保存の流れ。`signal` が中止されたら（ダイアログを閉じた・画面を離れた）、
+ * 結果を無視して保存には進まない（Tauri ではサーバー側の読み出しは止まらない）。
+ * 保存の直前と直後にも確かめ、中止後の失敗はエラーにせず `cancelled` にする。
+ */
+export async function runExport<D, S>(args: {
+	signal: AbortSignal;
+	fetch: () => Promise<D>;
+	save: (data: D) => Promise<S>;
+}): Promise<RunExportOutcome<S>> {
+	const { signal } = args;
+	try {
+		const data = await args.fetch();
+		if (signal.aborted) return { kind: 'cancelled' };
+		const result = await args.save(data);
+		if (signal.aborted) return { kind: 'cancelled' };
+		return { kind: 'done', result };
+	} catch (err) {
+		if (signal.aborted) return { kind: 'cancelled' };
+		throw err;
+	}
 }
 
 const pad = (n: number, width = 2) => String(n).padStart(width, '0');

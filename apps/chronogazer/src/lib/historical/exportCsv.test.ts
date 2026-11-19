@@ -5,7 +5,8 @@ import {
 	exportFileBase,
 	exportFileName,
 	exportRequestFor,
-	exportTimeLabel
+	exportTimeLabel,
+	runExport
 } from './exportCsv';
 
 const BOM = '﻿';
@@ -37,56 +38,100 @@ describe('exportRequestFor', () => {
 		});
 	});
 
-	it('interval は開始を間隔の倍数に切り下げ、終了は変えない', () => {
-		const req = exportRequestFor({ fromMs: 3_600_000 + 123_456, toMs: 9_000_001 }, [1], {
+	it('interval も表示の期間をそのまま使う（開始が間隔の倍数でなくても動かさない）', () => {
+		const fromMs = local(2026, 11, 19, 10, 0, 30);
+		const toMs = local(2026, 11, 19, 12, 0, 0);
+		const req = exportRequestFor({ fromMs, toMs }, [1], {
 			mode: 'interval',
 			intervalMs: 600_000,
 			stat: 'max'
 		});
-		expect(req.fromMs).toBe(3_600_000);
-		expect(req.toMs).toBe(9_000_001);
-		expect(req.intervalMs).toBe(600_000);
-		expect(req.stat).toBe('max');
-	});
-
-	it('すでに倍数なら動かさない', () => {
-		const req = exportRequestFor({ fromMs: 7_200_000, toMs: 8_000_000 }, [1], {
+		expect(req).toEqual({
+			tagIds: [1],
+			fromMs,
+			toMs,
 			mode: 'interval',
-			intervalMs: 3_600_000,
-			stat: 'min'
+			intervalMs: 600_000,
+			stat: 'max'
 		});
-		expect(req.fromMs).toBe(7_200_000);
 	});
 
-	it('上限ちょうどの期間で開始が倍数でないなら、切り上げて上限内に収める', () => {
-		const toMs = 100 * 3_600_000;
+	it('上限ちょうどの 31 日でも、開始・終了とも動かさない', () => {
+		const toMs = 100 * 3_600_000 + 1_000;
 		const fromMs = toMs - HISTORY_MAX_WINDOW_MS;
-		const req = exportRequestFor({ fromMs: fromMs + 1_000, toMs: toMs + 1_000 }, [1], {
-			mode: 'interval',
-			intervalMs: 3_600_000,
-			stat: 'avg'
+		for (const intervalMs of [60_000, 600_000, 3_600_000]) {
+			const req = exportRequestFor({ fromMs, toMs }, [1], {
+				mode: 'interval',
+				intervalMs,
+				stat: 'avg'
+			});
+			expect(req.fromMs).toBe(fromMs);
+			expect(req.toMs).toBe(toMs);
+			expect(req.toMs - req.fromMs).toBe(HISTORY_MAX_WINDOW_MS);
+		}
+	});
+});
+
+describe('runExport', () => {
+	it('読み出し → 保存の順に進む', async () => {
+		const calls: string[] = [];
+		const outcome = await runExport({
+			signal: new AbortController().signal,
+			fetch: async () => {
+				calls.push('fetch');
+				return 'data';
+			},
+			save: async (data) => {
+				calls.push(`save:${data}`);
+				return 'saved';
+			}
 		});
-		expect(req.toMs - req.fromMs).toBeLessThanOrEqual(HISTORY_MAX_WINDOW_MS);
-		expect(req.fromMs).toBe(fromMs + 3_600_000);
+		expect(calls).toEqual(['fetch', 'save:data']);
+		expect(outcome).toEqual({ kind: 'done', result: 'saved' });
 	});
 
-	it('上限内の通常の期間は切り下げる', () => {
-		const req = exportRequestFor({ fromMs: 10_000_000, toMs: 20_000_000 }, [1], {
-			mode: 'interval',
-			intervalMs: 3_600_000,
-			stat: 'avg'
+	it('読み出しの途中で中止したら、結果が返っても保存しない', async () => {
+		const controller = new AbortController();
+		let resolveFetch: (v: string) => void = () => {};
+		let saved = false;
+		const pending = runExport({
+			signal: controller.signal,
+			fetch: () => new Promise<string>((r) => (resolveFetch = r)),
+			save: async () => {
+				saved = true;
+				return 'saved';
+			}
 		});
-		expect(req.fromMs).toBe(7_200_000);
+		controller.abort();
+		resolveFetch('late');
+		expect(await pending).toEqual({ kind: 'cancelled' });
+		expect(saved).toBe(false);
 	});
 
-	it('切り上げが終了を超えるなら元の開始のまま', () => {
-		const toMs = HISTORY_MAX_WINDOW_MS + 1_000;
-		const req = exportRequestFor({ fromMs: 500, toMs }, [1], {
-			mode: 'interval',
-			intervalMs: HISTORY_MAX_WINDOW_MS * 2,
-			stat: 'avg'
+	it('読み出しが失敗しても中止済みなら cancelled（エラーにしない）', async () => {
+		const controller = new AbortController();
+		const pending = runExport({
+			signal: controller.signal,
+			fetch: async () => {
+				controller.abort();
+				throw new Error('aborted');
+			},
+			save: async () => 'saved'
 		});
-		expect(req.fromMs).toBe(500);
+		expect(await pending).toEqual({ kind: 'cancelled' });
+	});
+
+	it('保存の途中で中止されたら cancelled', async () => {
+		const controller = new AbortController();
+		const outcome = await runExport({
+			signal: controller.signal,
+			fetch: async () => 'data',
+			save: async () => {
+				controller.abort();
+				return 'saved';
+			}
+		});
+		expect(outcome).toEqual({ kind: 'cancelled' });
 	});
 });
 
