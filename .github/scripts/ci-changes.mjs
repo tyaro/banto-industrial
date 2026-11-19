@@ -381,10 +381,16 @@ export function derive(a, crateAffected = []) {
 	}
 	const hits = (/** @type {keyof typeof JOB_PACKAGES} */ job) =>
 		JOB_PACKAGES[job].some((p) => packages.has(p));
-	const runRust = rustWorkspace || packages.size > 0;
 	// WASM Hub components（ci.yml の rust-wasm ジョブ）は、workspace 全体か、
 	// -p に banto-hub-host が入るときだけ。rust_args と同じ値から決める。
 	const runWasm = rustWorkspace || packages.has('banto-hub-host');
+	// rust-wasm は rust-test-build の nextest archive のテストを走らせる（自前でビルド
+	// しない）。banto-driver-wasm のテスト（--test component・--lib など）も archive に
+	// 入るよう、-p に banto-hub-host が入るときは banto-driver-wasm も足す。
+	// ほかのジョブの判定（hits）には混ぜない。
+	const argPackages = new Set(packages);
+	if (runWasm && !rustWorkspace) argPackages.add('banto-driver-wasm');
+	const runRust = rustWorkspace || packages.size > 0;
 	return {
 		// 判定したら必ず走る（repo 全体の ESLint + Prettier。docs の整形もここ）。
 		run_lint_format: true,
@@ -395,7 +401,7 @@ export function derive(a, crateAffected = []) {
 			? ''
 			: rustWorkspace
 				? '--workspace'
-				: [...packages]
+				: [...argPackages]
 						.sort()
 						.map((p) => `-p ${p}`)
 						.join(' '),
