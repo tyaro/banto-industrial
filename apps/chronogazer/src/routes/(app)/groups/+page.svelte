@@ -49,7 +49,7 @@
 	 * - viewer は閲覧のみ（一覧と各グループの中身は見えるが、入力欄は無効で、
 	 *   右ペインは開かない）。
 	 */
-	import { untrack } from 'svelte';
+	import { onDestroy, onMount, untrack } from 'svelte';
 	import { page } from '$app/state';
 	import { beforeNavigate, goto, type BeforeNavigate } from '$app/navigation';
 	import { isSamePath, UnsavedChangesNotice } from '@banto/forms';
@@ -72,6 +72,14 @@
 		type PlcConnection
 	} from '#lib/banto/tagRegistryAdmin.js';
 	import { getHubCatalog } from '#lib/banto/hubAdmin.js';
+	import {
+		collectTimeLabel,
+		getCollectValues,
+		isCollectAvailable
+	} from '#lib/banto/collectAdmin.js';
+	import { MONITOR_POLL_DEFAULT_MS } from '#lib/monitor/monitorLogic.js';
+	import { ValuesPoller } from '#lib/monitor/valuesPoller.svelte.js';
+	import { valueCell, valuesNote } from '#lib/monitor/valueColumn.js';
 	import { hubGroupsOf } from '#lib/banto/hubRegistration.js';
 	import PenTagPicker from '#lib/components/PenTagPicker.svelte';
 	import {
@@ -533,6 +541,60 @@
 	 */
 	let pickMode = $state<'add' | 'replace' | null>(null);
 
+	// --- 現在値・品質の併記（#1198 PR2。値は ChronoGazer の収集が読んでいる `/api/collect/values`）---
+	//
+	// 監視画面と同じポーラーを、このページを開いている間 1 本だけ回す。止める条件:
+	// 離れたとき（`onDestroy`）・タブが隠れたとき・値を並べる場面が無いとき（「ペン」タブ
+	// 以外、または登録済みのペンもタグ選択も無い）。Hub にしか無いタグは取りに行かない。
+	const valuesPoller = new ValuesPoller({ fetch: (signal) => getCollectValues(signal) });
+	let pageVisible = $state(true);
+	const POLL_KEY = 0;
+
+	const valuesWanted = $derived(
+		available &&
+			isCollectAvailable() &&
+			pageVisible &&
+			draftReady &&
+			activeTab === 'pens' &&
+			(pickMode !== null || draft.pens.some((pen) => pen.tagId !== null))
+	);
+
+	$effect(() => {
+		const wanted = valuesWanted;
+		untrack(() => {
+			if (wanted) valuesPoller.start(POLL_KEY, MONITOR_POLL_DEFAULT_MS);
+			else valuesPoller.stop();
+		});
+	});
+
+	const polledValues = $derived(
+		valuesWanted && valuesPoller.key === POLL_KEY ? valuesPoller.state : null
+	);
+	/** 値の表（読めていなければ `null` = 各行は「—」）。 */
+	const valuesTable = $derived(polledValues?.values ?? null);
+	/** 値が出せない理由（一か所にだけ出す）。 */
+	const valuesNoteText = $derived(
+		polledValues === null
+			? null
+			: valuesNote(true, polledValues, valuesPoller.stale, collectTimeLabel)
+	);
+
+	function onVisibilityChange(): void {
+		pageVisible = document.visibilityState === 'visible';
+	}
+
+	onMount(() => {
+		pageVisible = document.visibilityState === 'visible';
+		document.addEventListener('visibilitychange', onVisibilityChange);
+	});
+
+	onDestroy(() => {
+		valuesPoller.stop();
+		if (typeof document !== 'undefined') {
+			document.removeEventListener('visibilitychange', onVisibilityChange);
+		}
+	});
+
 	/** 右ペインを出すか（編集者以上・「ペン」タブ・下書きの用意ができていて、タグ選択かペンの設定）。 */
 	const penPaneOpen = $derived(
 		canWrite &&
@@ -843,6 +905,8 @@
 							used={tagsUsedByOtherPens(draft, pickMode === 'replace' ? selectedPen : null)}
 							remaining={remainingPens(draft)}
 							max={MAX_PENS}
+							values={valuesTable}
+							valuesNote={valuesNoteText}
 							disabled={busy}
 							onpick={handlePick}
 							onback={backFromPicker}
@@ -1101,6 +1165,11 @@
 											{#each fieldErrors.pens as message, i (i)}
 												<p class="field-error">{message}</p>
 											{/each}
+											{#if valuesNoteText !== null}
+												<p class="note values-note" data-testid="pen-values-note" role="status">
+													{valuesNoteText}
+												</p>
+											{/if}
 											{#if draft.pens.length === 0}
 												<p class="note">
 													ペンがありません。{canWrite ? '「タグを追加」でタグを割り当てます。' : ''}
@@ -1124,6 +1193,24 @@
 																		: tagLabel(pen.tagId)}
 																{#if pen.hubTag !== null}
 																	<span class="unreg-badge">未登録（保存で記録に追加）</span>
+																{/if}
+															</span>
+															{@const cell = valueCell(
+																// 未登録の Hub のタグは隣のバッジが「未登録」を示すので、品質には重ねない。
+																pen.hubTag === null && pen.tagId !== null
+																	? { kind: 'tag', tagId: pen.tagId }
+																	: { kind: 'none' },
+																tagsById,
+																valuesTable
+															)}
+															<span
+																class="pen-value"
+																data-testid="pen-value"
+																data-state={cell.state}
+															>
+																<span class="pen-value-text">{cell.text}</span>
+																{#if cell.quality !== null}
+																	<span class="pen-quality">{cell.quality}</span>
 																{/if}
 															</span>
 															<span
@@ -1682,6 +1769,30 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+	}
+
+	.pen-value {
+		flex: none;
+		display: inline-flex;
+		align-items: baseline;
+		gap: 0.4rem;
+		font-variant-numeric: tabular-nums;
+	}
+
+	.pen-value-text {
+		font-weight: 600;
+	}
+
+	.pen-quality {
+		font-size: 0.75rem;
+		color: var(--banto-text-muted);
+	}
+
+	.pen-value[data-state='bad'] .pen-quality,
+	.pen-value[data-state='stale'] .pen-quality,
+	.pen-value[data-state='invalid'] .pen-quality,
+	.pen-value[data-state='unregistered'] .pen-quality {
+		color: var(--banto-warning);
 	}
 
 	.thresholds {
