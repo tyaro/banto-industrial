@@ -93,6 +93,16 @@ class Settings {
 	launcherPosition: LauncherPosition = $state(loadLauncherPosition());
 
 	#unwatchSystem: (() => void) | undefined;
+	/** キーごとの編集の世代（setter のたびに増える）。読み込み中の編集を巻き戻さないため。 */
+	#edits = new Map<string, number>();
+
+	#editGen(key: string): number {
+		return this.#edits.get(key) ?? 0;
+	}
+
+	#touch(key: string) {
+		this.#edits.set(key, this.#editGen(key) + 1);
+	}
 
 	#applyThemeMode(mode: ThemeMode) {
 		this.themeMode = mode;
@@ -124,21 +134,25 @@ class Settings {
 	}
 
 	setThemeMode(mode: ThemeMode) {
+		this.#touch(MODE_SETTING);
 		this.#applyThemeMode(mode);
 		persistRemote(MODE_SETTING, mode);
 	}
 
 	setThemePreset(preset: ThemePreset) {
+		this.#touch(PRESET_SETTING);
 		this.#applyThemePreset(preset);
 		persistRemote(PRESET_SETTING, preset);
 	}
 
 	setNavLayout(layout: NavLayout) {
+		this.#touch(NAV_LAYOUT_SETTING);
 		this.#applyNavLayout(layout);
 		persistRemote(NAV_LAYOUT_SETTING, layout);
 	}
 
 	setLauncherPosition(position: LauncherPosition) {
+		this.#touch(LAUNCHER_POSITION_SETTING);
 		this.#applyLauncherPosition(position);
 		persistRemote(LAUNCHER_POSITION_SETTING, position);
 	}
@@ -154,9 +168,22 @@ class Settings {
 	/**
 	 * ログイン直後に一度呼ぶ: UiSettingsProvider（サーバー）から読み直して適用する（写しも更新）。
 	 * 未保存のキーや失敗は、いまの値（localStorage 由来）のままにする。
+	 *
+	 * 遅れて返った応答で壊さないための 2 つの守り:
+	 * - `isCurrent`: 「いまも読み込みを始めたセッションか」。応答の後に確かめ、古いセッションの
+	 *   応答は何にも当てない（最近のコマンドも同じ境界）。
+	 * - 編集の世代: 読み込みの開始後に利用者が変えたキーは、遅れて返った古い値で巻き戻さない。
 	 */
-	async syncFromProvider(): Promise<void> {
+	async syncFromProvider(isCurrent: () => boolean = () => true): Promise<void> {
 		const ui = getUiSettings();
+		// 最近使ったコマンド（#1147）も同じ境界で並行して取り込む。
+		const recent = syncRecentFromProvider(isCurrent);
+		const started = {
+			mode: this.#editGen(MODE_SETTING),
+			preset: this.#editGen(PRESET_SETTING),
+			navLayout: this.#editGen(NAV_LAYOUT_SETTING),
+			launcherPosition: this.#editGen(LAUNCHER_POSITION_SETTING)
+		};
 		try {
 			const [mode, preset, navLayout, launcherPosition] = await Promise.all([
 				ui.get(MODE_SETTING),
@@ -164,15 +191,23 @@ class Settings {
 				ui.get(NAV_LAYOUT_SETTING),
 				ui.get(LAUNCHER_POSITION_SETTING)
 			]);
-			if (isThemeMode(mode)) this.#applyThemeMode(mode);
-			if (isThemePreset(preset)) this.#applyThemePreset(preset);
-			if (isNavLayout(navLayout)) this.#applyNavLayout(navLayout);
-			if (isLauncherPosition(launcherPosition)) this.#applyLauncherPosition(launcherPosition);
+			if (isCurrent()) {
+				if (isThemeMode(mode) && this.#editGen(MODE_SETTING) === started.mode)
+					this.#applyThemeMode(mode);
+				if (isThemePreset(preset) && this.#editGen(PRESET_SETTING) === started.preset)
+					this.#applyThemePreset(preset);
+				if (isNavLayout(navLayout) && this.#editGen(NAV_LAYOUT_SETTING) === started.navLayout)
+					this.#applyNavLayout(navLayout);
+				if (
+					isLauncherPosition(launcherPosition) &&
+					this.#editGen(LAUNCHER_POSITION_SETTING) === started.launcherPosition
+				)
+					this.#applyLauncherPosition(launcherPosition);
+			}
 		} catch {
 			// Best-effort: オフライン/未認証時は現在値のまま。
 		}
-		// 最近使ったコマンド（#1147）も同じタイミングで取り込む。
-		await syncRecentFromProvider();
+		await recent;
 	}
 
 	toggleSidebar() {

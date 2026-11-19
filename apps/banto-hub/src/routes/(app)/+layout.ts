@@ -64,7 +64,9 @@ export async function load() {
 	// セッション確定後に UiSettingsProvider から設定を読み直す
 	// （他クライアントで保存された値がこのタブの localStorage キャッシュに
 	// 優先する）。fire-and-forget: ナビゲーションを待たせない/失敗させない。
-	void settings.syncFromProvider();
+	// 遅れて返った古いセッションの応答を捨てるため、いまも同じ generation かを渡す。
+	const confirmedGeneration = snapshot.generation;
+	void settings.syncFromProvider(() => controller.snapshot.generation === confirmedGeneration);
 
 	// この load が確認できた generation（I-16）。いまの `snapshot.generation` を
 	// 読み直さない: 上の await の後に別のセッションが確定していることがあり、
