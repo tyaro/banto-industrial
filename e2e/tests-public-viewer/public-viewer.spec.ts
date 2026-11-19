@@ -8,7 +8,7 @@
  * scenario 4 creates the first admin and later state builds on it.
  *
  * What it proves end to end on the real REST path:
- *   1. without logging in, the allowed screens (監視・ヒストリカル・イベント)
+ *   1. without logging in, the allowed screens (監視・ヒストリカル・日報・イベント)
  *      open as the synthetic viewer, with no redirect loop (the guard in
  *      `apps/chronogazer/src/routes/(app)/+layout.ts`; SvelteKit 3's
  *      `resolve('')` trap, #506);
@@ -39,6 +39,7 @@ const ADMIN_DISPLAY_NAME = 'E2E閲覧公開管理者';
 const ALLOWED = [
 	{ path: '/monitor', label: '監視' },
 	{ path: '/historical', label: 'ヒストリカル' },
+	{ path: '/daily-report', label: '日報' },
 	{ path: '/events', label: 'イベント' }
 ] as const;
 

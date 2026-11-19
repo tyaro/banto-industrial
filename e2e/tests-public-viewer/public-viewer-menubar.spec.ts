@@ -38,7 +38,7 @@ test('viewer-public: メニューバーは許可リストの項目だけで、�
 			.evaluateAll((links) =>
 				links.map((link) => new URL((link as HTMLAnchorElement).href).pathname)
 			);
-		for (const allowed of ['/monitor', '/historical', '/events']) {
+		for (const allowed of ['/monitor', '/historical', '/daily-report', '/events']) {
 			expect(paths).toContain(allowed);
 		}
 		for (const hidden of ['/tags', '/groups', '/users', '/audit-log', '/settings/appearance']) {
