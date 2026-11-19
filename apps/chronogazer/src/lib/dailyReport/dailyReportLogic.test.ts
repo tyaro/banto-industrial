@@ -3,6 +3,8 @@ import { ProviderError } from '@banto/admin-core';
 import { renderReport } from '@banto/report';
 import type { CollectDailyReport } from '../banto/collectAdmin';
 import {
+	DAILY_REPORT_CLIENT_TIMEOUT_MS,
+	dailyReportTimeoutMessage,
 	DAILY_REPORT_EMPTY_CELL,
 	DAILY_REPORT_LIMIT_MESSAGE,
 	buildReportData,
@@ -51,6 +53,18 @@ const info = (tagId: number) => ({
 	name: tagId === 1 ? '温度' : '圧力',
 	unit: tagId === 1 ? '℃' : null,
 	decimals: tagId === 1 ? 1 : null
+});
+
+describe('dailyReportTimeoutMessage', () => {
+	it('既定は期限の秒数を載せる', () => {
+		expect(DAILY_REPORT_CLIENT_TIMEOUT_MS).toBe(60000);
+		expect(dailyReportTimeoutMessage()).toBe(
+			'日報の読み出しが 60 秒以内に終わりませんでした。もう一度試してください。'
+		);
+	});
+	it('期限を渡すとその秒数になる', () => {
+		expect(dailyReportTimeoutMessage(45000)).toContain('45 秒');
+	});
 });
 
 describe('日付', () => {

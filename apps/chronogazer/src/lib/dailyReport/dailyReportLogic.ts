@@ -32,6 +32,22 @@ export const DAILY_REPORT_DEFAULT_DECIMALS = 2;
 /** 欠測のセルの表示。 */
 export const DAILY_REPORT_EMPTY_CELL = '—';
 
+/**
+ * 日報の読み出しを待つ上限（ミリ秒）。サーバーは長い読み出しの絞り
+ * （30 秒、chronogazer core の `HISTORY_LONG_READ_TIMEOUT`）で自分の側を打ち切る。
+ * それを十分に過ぎても何も返らないなら、アプリが応答していないか応答が届いていない
+ * （`collectAdmin.ts` の `COLLECT_UI_TIMEOUT_MS` と同じ考え方）。
+ * 読み込み中の表示のまま止まらないよう、画面側でも期限を切って再試行を出す。
+ */
+export const DAILY_REPORT_CLIENT_TIMEOUT_MS = 60000;
+
+/** 期限切れの文言（秒数は期限から求める）。 */
+export function dailyReportTimeoutMessage(
+	timeoutMs: number = DAILY_REPORT_CLIENT_TIMEOUT_MS
+): string {
+	return `日報の読み出しが ${Math.round(timeoutMs / 1000)} 秒以内に終わりませんでした。もう一度試してください。`;
+}
+
 // --- 日付 --------------------------------------------------------------------
 
 /** `YYYY-MM-DD`（`<input type="date">` と URL の形）。実在する日付だけ受ける。 */

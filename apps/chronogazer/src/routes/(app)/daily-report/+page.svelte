@@ -39,8 +39,10 @@
 		tagMetaNotices
 	} from '#lib/monitor/monitorLogic.js';
 	import {
+		DAILY_REPORT_CLIENT_TIMEOUT_MS,
 		DAILY_REPORT_EMPTY_MESSAGE,
 		DAILY_REPORT_MAX_TAGS,
+		dailyReportTimeoutMessage,
 		DAILY_REPORT_UNAVAILABLE_MESSAGE,
 		buildReportData,
 		canShiftNextDay,
@@ -195,16 +197,26 @@
 		if (req === null) return;
 		const mine = ++generation;
 		const controller = new AbortController();
+		// 通信が止まっても「読み込み中」のまま固まらないよう、期限で打ち切って再試行を出す。
+		// 期限が来たら世代を進めて以降の応答（abort の例外を含む）を捨てる。
+		const timer = setTimeout(() => {
+			if (mine !== generation) return;
+			generation += 1;
+			controller.abort();
+			loaded = { dataKey: key, outcome: { state: 'error', message: dailyReportTimeoutMessage() } };
+		}, DAILY_REPORT_CLIENT_TIMEOUT_MS);
 		void (async () => {
 			let outcome: Outcome;
 			try {
 				const readout = await getCollectDailyReport(req, controller.signal);
+				clearTimeout(timer);
 				if (mine !== generation) return;
 				outcome =
 					readout.state === 'ready'
 						? { state: 'ready', data: readout.data }
 						: { state: 'unavailable' };
 			} catch (err) {
+				clearTimeout(timer);
 				if (mine !== generation || controller.signal.aborted) return;
 				outcome = { state: 'error', message: dailyReportErrorMessage(err) };
 			}
@@ -213,6 +225,7 @@
 		})();
 		return () => {
 			// 条件が変わった・画面を離れた: 古い応答は世代で捨て、通信も止める。
+			clearTimeout(timer);
 			generation += 1;
 			controller.abort();
 		};
