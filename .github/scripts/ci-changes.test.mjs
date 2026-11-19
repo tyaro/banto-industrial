@@ -220,7 +220,7 @@ const NONE = {
 };
 
 const HUB_RUST =
-	'-p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink -p banto-tagclient';
+	'-p banto-driver-wasm -p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink -p banto-tagclient';
 const CHRONO_RUST = '-p chronogazer -p chronogazer-core -p chronogazer-elev';
 
 /** [名前, 変更ファイル, 期待するジョブ] */
@@ -279,6 +279,7 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args: [
+				'-p banto-driver-wasm',
 				'-p banto-hub-core',
 				'-p banto-hub-host',
 				'-p banto-hub-shell',
@@ -302,6 +303,7 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args: [
+				'-p banto-driver-wasm',
 				'-p banto-hub-core',
 				'-p banto-hub-host',
 				'-p banto-hub-shell',
@@ -325,6 +327,7 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args: [
+				'-p banto-driver-wasm',
 				'-p banto-hub-core',
 				'-p banto-hub-host',
 				'-p banto-hub-shell',
@@ -349,6 +352,7 @@ const TABLE = [
 			run_rust: true,
 			rust_args: [
 				'-p banto-db-source',
+				'-p banto-driver-wasm',
 				'-p banto-hub-core',
 				'-p banto-hub-host',
 				'-p banto-hub-shell',
@@ -367,6 +371,7 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args: [
+				'-p banto-driver-wasm',
 				'-p banto-hub-core',
 				'-p banto-hub-host',
 				'-p banto-hub-shell',
@@ -391,6 +396,7 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args: [
+				'-p banto-driver-wasm',
 				'-p banto-hub-core',
 				'-p banto-hub-host',
 				'-p banto-hub-shell',
@@ -416,6 +422,7 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args: [
+				'-p banto-driver-wasm',
 				'-p banto-hub-bootstrap',
 				'-p banto-hub-core',
 				'-p banto-hub-host',
@@ -460,7 +467,7 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args:
-				'-p banto-driver-conformance -p banto-driver-modbus -p banto-driver-slmp -p banto-drivers -p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
+				'-p banto-driver-conformance -p banto-driver-modbus -p banto-driver-slmp -p banto-driver-wasm -p banto-drivers -p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
 			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
@@ -474,7 +481,8 @@ const TABLE = [
 		{
 			...NONE,
 			run_rust: true,
-			rust_args: '-p banto-drivers -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
+			rust_args:
+				'-p banto-driver-wasm -p banto-drivers -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
 			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
@@ -488,7 +496,7 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args:
-				'-p banto-driver-modbus -p banto-drivers -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
+				'-p banto-driver-modbus -p banto-driver-wasm -p banto-drivers -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
 			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
@@ -538,6 +546,7 @@ const TABLE = [
 			run_frontend_hub: true,
 			run_rust: true,
 			rust_args: [
+				'-p banto-driver-wasm',
 				'-p banto-hub-core',
 				'-p banto-hub-host',
 				'-p banto-hub-shell',
@@ -665,6 +674,7 @@ const TABLE = [
 			run_frontend_chronogazer: true,
 			run_rust: true,
 			rust_args: [
+				'-p banto-driver-wasm',
 				'-p banto-hub-core',
 				'-p banto-hub-host',
 				'-p banto-hub-shell',
@@ -1078,9 +1088,16 @@ test('WASM crate の変更は Hub host を選び、固定ゲストの ignored �
 	assert.match(step, /\$wasmToolsVersion = wasm-tools --version/);
 	assert.ok(step.includes("$wasmToolsVersion -notmatch '^wasm-tools 1\\.262\\.0"));
 	assert.match(step, /wasm-tools version mismatch/);
-	assert.match(step, /-- --ignored --exact/);
-	assert.match(step, /1 passed; 0 failed; 0 ignored/);
-	assert.match(step, /3 passed; 0 failed; 0 ignored/);
+	// テストは rust-test-build の nextest archive を走らせる（ここではビルドしない）。
+	assert.doesNotMatch(step, /cargo \+1\.98\.1 test/);
+	assert.ok(step.includes('--run-ignored $RunIgnored'));
+	assert.ok(step.includes("[string]$RunIgnored = 'only'"));
+	assert.match(step, /--no-tests=fail/);
+	assert.match(
+		step,
+		/-Expected 1 -Filter 'binary_id\(banto-hub-host::t12_connection_test\) & test\(=/
+	);
+	assert.match(step, /-Expected 3 -Filter 'binary_id\(banto-driver-wasm::component\)'/);
 });
 
 // 過去の実例（実グラフで引く）。今までの判定は 3 つとも workspace 全体だった。
@@ -1290,6 +1307,13 @@ test('run_wasm: workspace 全体か、-p に banto-hub-host が入るときだ�
 	const hit = only(['banto-plc', 'banto-hub-host']);
 	assert.equal(hit.run_wasm, true);
 	assert.match(hit.rust_args, /(^| )-p banto-hub-host( |$)/);
+	// rust-wasm は archive のテストを走らせるので、banto-driver-wasm のテストも archive に
+	// 入れる。ほかのジョブの判定（driver-api など）には混ぜない。
+	assert.match(hit.rust_args, /(^| )-p banto-driver-wasm( |$)/);
+	assert.equal(hit.run_driver_api, only(['banto-plc', 'banto-hub-host']).run_driver_api);
+	assert.equal(only(['banto-hub-host']).run_driver_api, false);
+	assert.doesNotMatch(only(['banto-plc']).rust_args, /banto-driver-wasm/);
+	assert.equal(derive({ full: true }).rust_args, '--workspace');
 	// workspace 全体
 	assert.equal(derive({ full: true }).run_wasm, true);
 	assert.equal(derive({ rust_all: true }).run_wasm, true);
