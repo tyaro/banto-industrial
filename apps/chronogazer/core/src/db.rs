@@ -16,8 +16,9 @@
 //! を **byte 等価**でコピーしたもの（`0002`〜`0007` は v2.1.1、`0008` は
 //! v6.5.0 = 監査の保留の `audit_log.pending_id`、banto ADR-0019。ChronoGazer は
 //! まだ保留を有効にしていないが、banto-hub と同じ集合に揃えておく - #437。
-//! `0012` は v7.4.0 = users の楽観ロック `users.version`（banto#651）。上流の
-//! `0013` は v7.7.0 = ユーザーごとの権限の表 `user_permissions`（banto#697）。
+//! `0012` は v7.4.0 = users の楽観ロック `users.version`（banto#651）。
+//! `0013` は v7.7.0 = ユーザーごとの権限の表 `user_permissions`（banto#697。上流の
+//! `UsersService` の一覧・更新がこの表を読むので写す）。上流の
 //! `0009`・`0011`（items の索引・version）はこの app が items を使わないので写さない。
 //! `0010` = 監査の記録単位の生成列（上流の監査一覧が recordResource/recordId で絞れる列。
 //! 無いとその指定で SQL エラーになるので写す）。
