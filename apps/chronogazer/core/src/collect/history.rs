@@ -258,7 +258,7 @@ pub struct CollectHistory {
     pub unknown_tag_ids: Vec<i64>,
 }
 
-fn field_error(field: &str, message: impl Into<String>) -> FieldError {
+pub(super) fn field_error(field: &str, message: impl Into<String>) -> FieldError {
     FieldError {
         field: field.to_string(),
         message: message.into(),
@@ -367,14 +367,14 @@ pub fn parse_tag_ids(raw: &str) -> Result<Vec<i64>, BantoError> {
 
 /// レジストリから引いた、タグ 1 本の今の置き場。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TagPlacement {
-    group_id: i64,
-    simulation: bool,
+pub(super) struct TagPlacement {
+    pub(super) group_id: i64,
+    pub(super) simulation: bool,
 }
 
 /// 要求したタグの今の所属グループと、接続がシミュレーションかを引く。
 /// 居ないタグはマップに入らない。
-async fn tag_placements(
+pub(super) async fn tag_placements(
     pool: &SqlitePool,
     tag_ids: &[i64],
 ) -> Result<HashMap<i64, TagPlacement>, sqlx::Error> {
@@ -564,7 +564,7 @@ async fn read_history(
 
 /// 長い読み出しの打ち切りの結末（[`run_long_read`]）。
 #[derive(Debug, PartialEq, Eq)]
-enum LongReadStop {
+pub(super) enum LongReadStop {
     /// `timeout` を過ぎた（札の待ち、または読み出し中）。
     TimedOut,
     /// 読み出しのタスクが panic した・取り消された。
@@ -578,7 +578,7 @@ enum LongReadStop {
 /// 待つ側にだけ掛かり、過ぎてもタスクは abort しない（終わるまで札を持つ）。
 /// 理由: `sqlx` の SQLite は別スレッドで文を実行するので future を捨てても文は
 /// 走り続けうる。札を先に返すと実際に走る重い読み出しが 2 本を超えうる。
-async fn run_long_read<T, F>(
+pub(super) async fn run_long_read<T, F>(
     gate: &Arc<Semaphore>,
     timeout: Duration,
     work: F,
@@ -664,4 +664,4 @@ impl CollectorService {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

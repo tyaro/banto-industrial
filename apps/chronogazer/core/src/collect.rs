@@ -693,6 +693,14 @@ pub use history::{
     HISTORY_READ_TIMEOUT,
 };
 
+// #1207 R3: 期間指定 CSV 出力のための読み出し（`GET /api/collect/export` /
+// `collect_export`）。履歴の双子で、本体は子モジュール。
+mod export;
+pub use export::{
+    validate_export_request, CollectExport, ExportMode, ExportRequest, ExportRow, ExportStat,
+    ExportTag, EXPORT_MAX_ROWS, EXPORT_MIN_INTERVAL_MS,
+};
+
 /// 収集サービスの状態。**必要最小限の 5 つ**だけ（語彙を増やさない）。
 ///
 /// * [`Self::Stopped`] - 止まっている（まだ一度も起動していない、または

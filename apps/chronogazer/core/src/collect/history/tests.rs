@@ -18,8 +18,8 @@ use crate::test_support::TempDir;
 
 /// 2026-07-12T00:00:00Z（`banto-tsquery` のテストと同じ基準日）+ 3 時間。
 /// ローカル日付（+09:00）でも同じ日に収まる。
-const BASE_MS: i64 = 20_646 * 86_400_000 + 3 * 3_600_000;
-const OFFSET_MS: i64 = 9 * 3_600_000;
+pub(in crate::collect) const BASE_MS: i64 = 20_646 * 86_400_000 + 3 * 3_600_000;
+pub(in crate::collect) const OFFSET_MS: i64 = 9 * 3_600_000;
 
 fn field_names(err: BantoError) -> Vec<String> {
     match err {
@@ -411,7 +411,7 @@ fn the_wire_shape_is_camel_case_inside_a_readout() {
 
 // --- データファイルを読む ---------------------------------------------------
 
-async fn connection(pool: &SqlitePool, name: &str, simulation: bool) -> i64 {
+pub(in crate::collect) async fn connection(pool: &SqlitePool, name: &str, simulation: bool) -> i64 {
     PlcConnectionService::new(pool.clone())
         .create(PlcConnectionInput {
             name: name.to_string(),
@@ -433,7 +433,12 @@ async fn connection(pool: &SqlitePool, name: &str, simulation: bool) -> i64 {
         .id
 }
 
-async fn group(pool: &SqlitePool, name: &str, conn_id: i64, period_ms: i64) -> i64 {
+pub(in crate::collect) async fn group(
+    pool: &SqlitePool,
+    name: &str,
+    conn_id: i64,
+    period_ms: i64,
+) -> i64 {
     CollectionGroupService::new(pool.clone())
         .create(CollectionGroupInput {
             name: name.to_string(),
@@ -448,7 +453,7 @@ async fn group(pool: &SqlitePool, name: &str, conn_id: i64, period_ms: i64) -> i
         .id
 }
 
-async fn tag(pool: &SqlitePool, name: &str, group_id: i64) -> i64 {
+pub(in crate::collect) async fn tag(pool: &SqlitePool, name: &str, group_id: i64) -> i64 {
     TagService::new(pool.clone())
         .create(TagInput {
             comment: None,
@@ -476,7 +481,7 @@ async fn tag(pool: &SqlitePool, name: &str, group_id: i64) -> i64 {
         .id
 }
 
-fn column(tag_id: i64) -> TagColumn {
+pub(in crate::collect) fn column(tag_id: i64) -> TagColumn {
     TagColumn {
         key: format!("tag:{tag_id}"),
         name: format!("tag {tag_id}"),
@@ -486,7 +491,11 @@ fn column(tag_id: i64) -> TagColumn {
     }
 }
 
-fn group_config(group_id: i64, period_ms: u32, tag_ids: &[i64]) -> GroupConfig {
+pub(in crate::collect) fn group_config(
+    group_id: i64,
+    period_ms: u32,
+    tag_ids: &[i64],
+) -> GroupConfig {
     GroupConfig {
         key: format!("grp:{group_id}"),
         name: format!("group {group_id}"),

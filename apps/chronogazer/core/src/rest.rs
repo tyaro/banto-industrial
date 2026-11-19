@@ -62,6 +62,7 @@
 //! | GET    | `/api/collect/connections` | -              | `Readout<{[connKey]: ConnectionView}>` (viewer+, C-3a / `simulation` = #413) |
 //! | GET    | `/api/collect/events?offset=&limit=&asOfId=` | -    | `Readout<CollectEventList>` (viewer+, C-3a / `asOfId` = #409) |
 //! | GET    | `/api/collect/history?tagIds=&fromMs=&toMs=&bins=` | - | `Readout<CollectHistory>` (viewer+, R1-D の D-3a) |
+//! | GET    | `/api/collect/export?tagIds=&fromMs=&toMs=&mode=&intervalMs=` | - | `Readout<CollectExport>` (viewer+, #1207 R3。期間指定 CSV 出力の値。行数超過は 422) |
 //! | GET    | `/api/settings/server` | -                  | `ServerStatusView` (admin, #392 B2-1。表は `crate::server_admin` の doc) |
 //! | PUT    | `/api/settings/server` | `{enabled,bind,port,viewerPublic}` | `ServerStatusView` (admin、この PC からの要求だけ、`chronogazer-server` だけ) |
 //! | GET    | `/api/settings/auth`   | -                  | `AuthConfigView` (admin) |
@@ -281,9 +282,10 @@ mod audit_spool_tests;
 mod local_grant_tests;
 use crate::collect::ExclusionView;
 use crate::collect::{
-    parse_tag_ids, validate_history_request, CollectEventList, CollectHistory, CollectOutcome,
-    CollectorService, CollectorStateView, ConnectionView, EventPage, HistoryRequest, Readout,
-    ValuesResponse, COLLECT_AUDIT_RESOURCE, COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
+    parse_tag_ids, validate_export_request, validate_history_request, CollectEventList,
+    CollectExport, CollectHistory, CollectOutcome, CollectorService, CollectorStateView,
+    ConnectionView, EventPage, ExportRequest, HistoryRequest, Readout, ValuesResponse,
+    COLLECT_AUDIT_RESOURCE, COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
 };
 use crate::hub::{HubService, HubSubscriptionView, HubView};
 use crate::ops::{CollectOperation, CollectOps, RegistryOps, Via, ORIGIN_REST};
@@ -760,6 +762,97 @@ async fn collect_history_handler(
     Ok(Json(state.collect.history(&request).await))
 }
 
+/// `GET /api/collect/export?tagIds=1,2&fromMs=&toMs=&mode=raw|interval&intervalMs=`
+/// のクエリ（#1207 R3）。欠けている値と上限外は [`export_request_from_query`] が
+/// `BantoError::Validation`（422）にする。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+struct CollectExportQuery {
+    #[serde(default)]
+    #[param(required = true)]
+    tag_ids: Option<String>,
+    #[serde(default)]
+    #[param(required = true)]
+    from_ms: Option<i64>,
+    #[serde(default)]
+    #[param(required = true)]
+    to_ms: Option<i64>,
+    /// `raw`（生の値）か `interval`（間隔で揃える）。
+    #[serde(default)]
+    #[param(required = true)]
+    mode: Option<String>,
+    /// `interval` のとき必須（1000 以上、ミリ秒）。`raw` では指定できない。
+    #[serde(default)]
+    interval_ms: Option<i64>,
+    /// `interval` のとき必須（`avg`・`min`・`max` のどれか。セルに出す統計量）。
+    /// `raw` では指定できない。
+    #[serde(default)]
+    stat: Option<String>,
+}
+
+/// REST のクエリを検証済みの要求にする。上限の判定は Tauri の
+/// `collect_export` と同じ [`validate_export_request`] 1 本。
+fn export_request_from_query(query: &CollectExportQuery) -> Result<ExportRequest, BantoError> {
+    let missing: Vec<FieldError> = [
+        ("fromMs", query.from_ms.is_none()),
+        ("toMs", query.to_ms.is_none()),
+        ("mode", query.mode.is_none()),
+    ]
+    .into_iter()
+    .filter(|(_, missing)| *missing)
+    .map(|(field, _)| FieldError {
+        field: field.to_string(),
+        message: "必須です".to_string(),
+    })
+    .collect();
+    if !missing.is_empty() {
+        return Err(BantoError::Validation {
+            field_errors: missing,
+        });
+    }
+    let tag_ids = parse_tag_ids(query.tag_ids.as_deref().unwrap_or(""))?;
+    validate_export_request(
+        &tag_ids,
+        query.from_ms.unwrap_or_default(),
+        query.to_ms.unwrap_or_default(),
+        query.mode.as_deref().unwrap_or_default(),
+        query.interval_ms,
+        query.stat.as_deref(),
+    )
+}
+
+/// `GET /api/collect/export`（**`viewer` 以上**、#1207 R3）: 期間指定 CSV 出力の
+/// 値（横持ち: 1 行 = 1 時刻、列 = タグ、セルは数値 1 つ）。生の値か、間隔で揃えた区間の統計量（`stat`）。
+///
+/// 行数は 10 万まで、超えたら 422（`toMs`/`intervalMs`）。収集が止まっていても
+/// 読める。読めなかったときは `unavailable`（理由は返さない）。形・上限・割り切りは
+/// `crate::collect` の `export` モジュールの doc。読み取りなので監査しない。
+#[utoipa::path(
+    get,
+    path = "/api/collect/export",
+    tag = "collect",
+    operation_id = "collect_export",
+    summary = "期間指定の出力",
+    description = "表示グループなどのタグの値を横持ちの表（1 行 = 1 時刻）で返す。`mode=raw` は記録された値、`mode=interval` は `intervalMs` ごとの区間の統計量（`stat` = `avg`・`min`・`max` のどれか 1 つ）。セルは数値 1 つ。行数は 10 万まで。読み取り（`read` キーで足りる）。",
+    params(CollectExportQuery),
+    responses(
+        (status = 200, description = "出力の値", body = Readout<CollectExport>),
+        (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
+        (status = 403, description = "ロールが足りない"),
+        (status = 422, description = "入力の検証エラー・行数の超過（`field_errors` に項目ごとの理由）"),
+    ),
+    security(("api_key" = [])),
+)]
+async fn collect_export_handler(
+    State(state): State<CollectState>,
+    Query(query): Query<CollectExportQuery>,
+) -> Result<Json<Readout<CollectExport>>, ApiError> {
+    let request = export_request_from_query(&query)?;
+    Ok(Json(state.collect.export(&request).await?))
+}
+
 /// `POST /api/collect/start`（**`editor` 以上** - [`COLLECT_OPERATION_ROLE`]）。
 #[utoipa::path(
     post,
@@ -905,6 +998,8 @@ fn collect_router(collect: CollectorService, audit: AuditLogService, auth: AuthS
         .route("/api/collect/events", get(collect_events_handler))
         // R1-D の D-3a: 直近の履歴。同じ床・監査しない・キューを通らない。
         .route("/api/collect/history", get(collect_history_handler))
+        // #1207 R3: 期間指定 CSV 出力の値。同じ床・監査しない・キューを通らない。
+        .route("/api/collect/export", get(collect_export_handler))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             ActorGuard {
@@ -6478,6 +6573,108 @@ mod tests {
         let not_a_number = router
             .oneshot(get_auth(
                 "/api/collect/history?tagIds=1&fromMs=abc&toMs=1&bins=10",
+                &viewer,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(not_a_number.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// #1207 R3: 期間指定出力（`GET /api/collect/export`）も読み取りと同じ床
+    /// （`viewer` 以上・トークン無しは 401）。収集が走っていなくても `ready`、
+    /// 居ないタグは `unknownTagIds`。`mode` の誤り・`raw` の `intervalMs`/`stat`・`interval` の `stat` の欠け・誤り・欠けた値は
+    /// 422、数値でない値は 400。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collect_export_is_viewer_readable_and_validated() {
+        let (router, _audit, _admin, _editor, viewer) = router_with_role_tokens_and_audit().await;
+        let path = "/api/collect/export?tagIds=42%2C42&fromMs=1000&toMs=61000&mode=raw";
+
+        let anonymous = router.clone().oneshot(get(path)).await.unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+        let response = router
+            .clone()
+            .oneshot(get_auth(path, &viewer))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "viewer が出力を読めない");
+        assert_eq!(
+            body_json(response).await,
+            json!({
+                "state": "ready",
+                "data": {
+                    "fromMs": 1000, "toMs": 61000, "mode": "raw", "intervalMs": null, "stat": null,
+                    "tags": [], "unknownTagIds": [42], "rows": []
+                }
+            })
+        );
+
+        let interval = router
+            .clone()
+            .oneshot(get_auth(
+                "/api/collect/export?tagIds=42&fromMs=0&toMs=2000&mode=interval&intervalMs=1000&stat=max",
+                &viewer,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(interval.status(), StatusCode::OK);
+        let interval = body_json(interval).await;
+        assert_eq!(interval["data"]["stat"], json!("max"));
+        assert_eq!(interval["data"]["intervalMs"], json!(1000));
+
+        for (bad, field) in [
+            (
+                "/api/collect/export?tagIds=1&fromMs=0&toMs=1&mode=csv",
+                "mode",
+            ),
+            ("/api/collect/export?tagIds=1&fromMs=0&toMs=1", "mode"),
+            (
+                "/api/collect/export?tagIds=1&fromMs=0&toMs=1&mode=raw&intervalMs=1000",
+                "intervalMs",
+            ),
+            (
+                "/api/collect/export?tagIds=1&fromMs=0&toMs=1&mode=interval&stat=avg",
+                "intervalMs",
+            ),
+            (
+                "/api/collect/export?tagIds=1&fromMs=0&toMs=1&mode=raw&stat=avg",
+                "stat",
+            ),
+            (
+                "/api/collect/export?tagIds=1&fromMs=0&toMs=1&mode=interval&intervalMs=1000",
+                "stat",
+            ),
+            (
+                "/api/collect/export?tagIds=1&fromMs=0&toMs=1&mode=interval&intervalMs=1000&stat=median",
+                "stat",
+            ),
+            (
+                "/api/collect/export?tagIds=1&fromMs=0&toMs=2678400001&mode=raw",
+                "toMs",
+            ),
+            ("/api/collect/export?tagIds=1&toMs=1&mode=raw", "fromMs"),
+            ("/api/collect/export?fromMs=0&toMs=1&mode=raw", "tagIds"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(get_auth(bad, &viewer))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{bad} が拒否されない"
+            );
+            let body = body_json(response).await;
+            assert!(
+                body.to_string().contains(field),
+                "{bad} の誤りが {field} に付いていない: {body}"
+            );
+        }
+
+        let not_a_number = router
+            .oneshot(get_auth(
+                "/api/collect/export?tagIds=1&fromMs=abc&toMs=1&mode=raw",
                 &viewer,
             ))
             .await
