@@ -247,6 +247,8 @@ export class HistoryUnavailableError extends Error {
 export interface HistoryExtras {
 	/** レジストリに居ないタグ（削除された）。 */
 	unknownTagIds: number[];
+	/** 系列が `simulation`（記録されない接続）のタグ。監視のトレンドが注記に使う。 */
+	simulationTagIds: number[];
 }
 
 /**
@@ -284,7 +286,10 @@ export function createHistoryFetch(
 			const s = byTag.get(tagId);
 			if (s) out[id] = s;
 		}
-		extras.set(out, { unknownTagIds: [...readout.data.unknownTagIds] });
+		extras.set(out, {
+			unknownTagIds: [...readout.data.unknownTagIds],
+			simulationTagIds: readout.data.series.filter((s) => s.simulation).map((s) => s.tagId)
+		});
 		return out;
 	};
 }

@@ -1,74 +1,39 @@
 /**
- * リアルタイムトレンド（R1-D の D-3b、recorder-requirements.md §3.3 の「リアル
- * タイム」）の判断をまとめた純関数（`trendLogic.test.ts` が表で固定する）。
- * バッファの持ち主（`trendFeed.svelte.ts`）とパネル（`TrendPanel.svelte`）は
- * ここを呼ぶだけで、判断を書き写さない（docs/implementation-checklist.md §5）。
+ * 監視画面のトレンド（R1-D の D-3b、recorder-requirements.md §3.3 の「リアルタイム」。
+ * 設計書 docs/chronogazer/trend-design.md §8・§10 の 4b でハイブリッドにした）の判断をまとめた
+ * 純関数（`trendLogic.test.ts` が表で固定する）。データの持ち主（`trendFeed.svelte.ts`）と
+ * パネル（`TrendPanel.svelte`）はここを呼ぶだけで、判断を書き写さない
+ * （docs/implementation-checklist.md §5）。
  *
- * ## 時間の格子（なぜ固定の刻みに載せるか）
+ * ## ハイブリッド（直近はリングバッファ、過去は履歴の区間）
  *
- * 描画は共通の部品 `TrendChart`（`@banto-industrial/trend`）で、時刻の軸は実時間。ただし
- * 値を受け取るたびに点を足すと、詰まった区間と空いた区間で 1 点の幅が揺れる。そこで行を
- * **固定の刻み（`stepMs`）の格子**に載せ、窓の行数を一定（`windowMs / stepMs`）に保つ。
- * 値の無い刻みは `null` の行として残し、部品が線を切る（null を 0 と区別する、#414 段階2）。
- * 格子は [`trendBufferData`] で部品の契約（`TrendData`: 刻みごとの `{ tMs, min: v, max: v }`・
- * 幅は `stepMs`）にする。このあいだは追従だけ（拡大・縮小・パンは持たない。過去へのパンは
- * ハイブリッド、設計書 §10 の 4）。
+ * 描画は共通の部品 `TrendChart`（`@banto-industrial/trend`）で、データのつなぎ合わせは部品の
+ * 純粋な核（`liveAppendAll`・`hybridData`・`boundaryPlan` ほか、設計書 §8）が持つ。ここに置くのは
+ * 監視画面だけの判断:
  *
- * 刻みは [`chooseStepMs`]: 候補（60 秒を割り切る値。窓の選択肢はどれも 60 秒の倍数
- * なので行数が整数になる）のうち、次を満たす最小のもの。
+ * - **追従**（[`startFollow`]・[`tickFollow`]・[`rangeChangeFollow`]）: 追従中は右端を今にして
+ *   幅を保って進める。拡大・縮小・パンで右端が今から外れたら追従をやめ、右端を今へ戻したら
+ *   （`isAtNow`、[`FOLLOW_TOLERANCE_MS`] 以内）その幅で追従を再開する。「最新へ」・時間窓の
+ *   選び直しは窓の幅で追従を始め直す。
+ * - **履歴の読み直し**（[`needsHistoryReload`]）: 追従中に毎秒は読まない。区間の幅が変わった・
+ *   表示範囲の左端が最後に要求した範囲の外に出た・途切れの後に履歴とライブの間に隙間ができた
+ *   ときだけ読む（止めている間は、履歴で描く部分が要求した範囲を出たときも）。
  *
- * - **ポーリング周期の 2 倍以上**。1 刻みに 1 回しか読まないと、周期の揺れ（応答を
- *   待ってから次を予約するので、実際の間隔は周期より少し長い）で刻みを飛ばし、
- *   読めているのに線が切れる。2 倍なら 1 刻みに 1 回以上は必ず読む。
- * - **行数が描画域の幅（ピクセル）以下**。1 行 = 1 ピクセル以上の幅を保つため。幅は
- *   `TrendChart` が返す描画域そのもの（余白は縦軸の有無だけで決まるので、刻みを替えても
- *   幅は変わらず、幅 → 刻み → 格子の往復は起きない）。
- * - **履歴の上限**（`HISTORY_MAX_BINS`、本数 × 行数 ≤ `HISTORY_MAX_POINTS`）。初期窓を
- *   1 回の要求で格子と同じ数の区間で読むため。
- *
- * 時刻は**サーバーの時計**（現在値の応答の `serverNowMs`、サンプルの `ptimeMs`、履歴の
- * `tMs`）で揃える。端末の時計を使うと、LAN の別の端末で時計がずれているとき履歴と現在値が
- * 食い違う。表示の時計は [`observeServerClock`] / [`serverClockNow`]: **現在値の応答を作った
- * 時点のサーバーの時刻**（`serverNowMs`）を基準にし、次の応答までは**端末の単調な経過時間**
- * （`performance.now()`）で進める。成功した応答のたびに基準を付け替え、表示の時刻は戻さない
- * （付け替えで見積もりより前になったら、追いつくまで止める）。
+ * 時刻は**サーバーの時計**（現在値の応答の `serverNowMs`、履歴の `tMs`）で揃える。端末の時計を
+ * 使うと、LAN の別の端末で時計がずれているとき履歴と現在値が食い違う。表示の時計は
+ * [`observeServerClock`] / [`serverClockNow`]: **現在値の応答を作った時点のサーバーの時刻**
+ * （`serverNowMs`）を基準にし、次の応答までは**端末の単調な経過時間**（`performance.now()`）で
+ * 進める。成功した応答のたびに基準を付け替え、表示の時刻は戻さない（付け替えで見積もりより前に
+ * なったら、追いつくまで止める）。
  *
  * - サンプルの `ptimeMs`（読みに行った時刻）を時計にすると、表示中のタグがすべて収集周期
- *   60 秒のとき `ptimeMs` が 60 秒間止まり、同じ刻みを書き直し続けて毎分線が切れた
- *   （PR #543 のオーナーレビュー P2）。`ptimeMs` を基準に経過時間で進めても、開いた時点の
- *   サンプルの古さ（最大 1 周期）だけ時計が遅れ、次のサンプルで時計が跳んで間の刻みが `null`
- *   になった（同 再レビュー P2）。応答の時刻はサンプルの古さに関係しないので、good の
- *   サンプルは常に「サーバーの今」の刻みに書かれる（下の「収集周期の長いタグも、ポーリングの
- *   たびに今の値を書く」、履歴の `max(binMs, 周期)` と同じ扱い）。
- * - **サーバーの時刻を受け取るまでは時計が無い**（`null`）。そのあいだ格子を作らず、履歴も
- *   要求しない。端末の時計で格子を作ると、端末の時計が進んでいるとき後から来たサーバーの
- *   時刻が「過去」に見え、`appendLive` が捨ててしまう（PR #543 のレビュー P2）。格子は時計が
- *   できた時点の刻みで終わり、履歴はそこまでを要求し、現在値はその刻みから書く。
- * - 読み取りの失敗（ポーリングが成功しない）・`bad`・`stale` は今までどおり線を切る:
- *   失敗の間は書き足さないので刻みは `null`、`bad` / `stale` の値は `null`。
- *
- * ## 履歴（初期窓）と現在値の合わせ方
- *
- * - **現在値**: ポーリングで受け取るたびに、その時刻の刻みの行へペンごとの値を書く
- *   （同じ刻みに 2 回来たら後の値。品質 good で有限の値だけが数値で、それ以外は
- *   `null`）。収集周期の長いタグも、ポーリングのたびに「今の値」を書くので線は
- *   つながる（記録計の「表示の刻みごとに今の値を打つ」と同じ）。
- * - **履歴**（D-3a の `getCollectHistory`）: 点は間引いた区間の最小・最大。**1 本の
- *   線で描き、値は最小と最大の中点**にする（[`historyPointValue`]）。
- *   - 判断: 包絡を 2 本の線（最小・最大）で描くと 8 ペンで 16 系列になり、banto の
- *     系列色（8 枠）を使い切る・凡例が倍になる。最大だけを描くと上に偏り、現在値
- *     （その時点の 1 サンプル）と並べたときに段差が出る。中点は偏りが無く、区間の
- *     幅は格子の 1 刻み（≒ 1 ピクセル）なので、1 刻みの中の山だけが平らになる。
- *     初期窓の多くの刻みは 1〜数サンプルしか含まず、そのとき最小 = 最大で値は正確。
- *     山を落とさない包絡の表示は R2 のヒストリカルで扱う。
- *   - 点は区間の始まり `tMs` から `holdMs`（区間の幅 `binMs` とそのタグの収集周期の
- *     大きい方）の間の刻みに書く。収集周期が刻みより長いタグを素通しで読んだとき、
- *     点と点の間の刻みが `null` になって線が細切れになるのを防ぐ（1 サンプルは次の
- *     サンプルまで有効、という記録計の扱い）。
- *   - **現在値を書き始めた刻み（`liveFromT`）より前にだけ書く**。現在値の行は
- *     上書きしない。履歴は書き手の flush（約 1 秒）の後に要求する
- *     （`trendFeed.svelte.ts` の `HISTORY_FLUSH_GRACE_MS`）ので、境目に刻みの抜けは
- *     できない。
+ *   60 秒のとき `ptimeMs` が 60 秒間止まり、毎分線が切れた（PR #543 のオーナーレビュー P2）。
+ *   応答の時刻はサンプルの古さに関係しないので、good のサンプルは常に「サーバーの今」に書かれる。
+ * - **サーバーの時刻を受け取るまでは時計が無い**（`null`）。そのあいだリングバッファに書かず、
+ *   履歴も要求しない（端末の時計で書くと、後から来たサーバーの時刻が「過去」に見えて捨てられる。
+ *   PR #543 のレビュー P2）。
+ * - 読み取りの失敗・収集の停止・タブが隠れた間は、リングバッファに途切れを知らせる
+ *   （`liveBreakAll`。その範囲は履歴で描く）。`bad` / `stale` の値は `null`（欠測）のサンプル。
  *
  * ## しきい値の帯（Q5）
  *
@@ -77,14 +42,14 @@
  * 帯を出さない。既定で選ぶのは、しきい値のある最初のペン。
  */
 import type { OpenThresholdBand } from '@banto/charts';
-import type { TimeRange, TrendData, TrendSeries } from '@banto-industrial/trend';
 import {
-	HISTORY_MAX_BINS,
-	HISTORY_MAX_POINTS,
-	type CollectHistory,
-	type CollectHistoryParams,
-	type HistoryPoint
-} from '../banto/collectAdmin';
+	drawableSeries,
+	followRange,
+	isAtNow,
+	isValidRange,
+	type TimeRange,
+	type TrendData
+} from '@banto-industrial/trend';
 import type { DisplayGroup } from '../banto/displayGroupsAdmin';
 import type { TagWithThresholds, ThresholdFields } from '../banto/tagThresholdsAdmin';
 import { formatValue, isBitTag } from './monitorLogic';
@@ -178,156 +143,9 @@ export function resolveTrendWindowSec(
 	return override ?? groupDefaultWindowSec(attributes);
 }
 
-// --- 格子の刻み --------------------------------------------------------------
-
-/** 刻みの候補（ms）。どれも 60 秒を割り切る。 */
-export const TREND_STEP_CANDIDATES_MS: readonly number[] = [
-	250, 500, 1000, 2000, 5000, 10_000, 15_000, 30_000, 60_000
-];
-
-export interface StepInput {
-	windowMs: number;
-	/** 描画域の幅（px。`TrendChart` が返す、余白を除いた幅）。 */
-	plotWidthPx: number;
-	/** 現在値のポーリング周期（ms）。 */
-	pollPeriodMs: number;
-	/** 履歴で読むタグの本数（重複を除く）。 */
-	tagCount: number;
-}
-
-/** 格子の行数の上限（描画域の幅・履歴の上限）。 */
-export function maxTrendRows(plotWidthPx: number, tagCount: number): number {
-	const plot = Math.max(0, Math.floor(plotWidthPx));
-	const budget = Math.floor(HISTORY_MAX_POINTS / Math.max(1, tagCount));
-	return Math.max(1, Math.min(plot, HISTORY_MAX_BINS, budget));
-}
-
-/**
- * 刻みを決める（純関数）。ポーリング周期の 2 倍以上で、行数が上限以下になる最小の
- * 候補。どれも満たさなければ最大の候補（60 秒。1 時間窓で 60 行）。
- */
-export function chooseStepMs(input: StepInput): number {
-	const maxRows = maxTrendRows(input.plotWidthPx, input.tagCount);
-	const minStep = input.pollPeriodMs * 2;
-	for (const step of TREND_STEP_CANDIDATES_MS) {
-		if (step < minStep) continue;
-		if (input.windowMs / step <= maxRows) return step;
-	}
-	return TREND_STEP_CANDIDATES_MS[TREND_STEP_CANDIDATES_MS.length - 1];
-}
-
-/** 時刻をその刻みの始まりに丸める。 */
-export function alignToStep(tMs: number, stepMs: number): number {
-	return Math.floor(tMs / stepMs) * stepMs;
-}
-
-// --- バッファ ----------------------------------------------------------------
-
-/** 格子の 1 行（刻みの始まりの時刻と、ペンの並びどおりの値）。 */
-export interface TrendRow {
-	t: number;
-	/** ペンの並びどおり。`null` = 値が無い（線を切る。0 ではない）。 */
-	values: (number | null)[];
-}
-
-/**
- * トレンドの格子。`rows` は時刻の昇順で、隙間の無い格子（`rows[k+1].t - rows[k].t
- * === stepMs`）、行数は常に `windowMs / stepMs`。
- */
-export interface TrendBuffer {
-	stepMs: number;
-	windowMs: number;
-	penCount: number;
-	rows: TrendRow[];
-	/** 現在値を書き始めた刻み（`null` = まだ書いていない）。履歴はこれより前にだけ書く。 */
-	liveFromT: number | null;
-}
-
-function nullRow(t: number, penCount: number): TrendRow {
-	return { t, values: Array.from({ length: penCount }, () => null) };
-}
-
-/** 窓の行数。 */
-export function trendRowCount(windowMs: number, stepMs: number): number {
-	return Math.max(1, Math.round(windowMs / stepMs));
-}
-
-/** 空の格子（全部 `null`）。最後の行が `nowMs` の刻み。 */
-export function emptyTrendBuffer(
-	stepMs: number,
-	windowMs: number,
-	penCount: number,
-	nowMs: number
-): TrendBuffer {
-	const n = trendRowCount(windowMs, stepMs);
-	const last = alignToStep(nowMs, stepMs);
-	const rows: TrendRow[] = [];
-	for (let k = 0; k < n; k++) rows.push(nullRow(last - (n - 1 - k) * stepMs, penCount));
-	return { stepMs, windowMs, penCount, rows, liveFromT: null };
-}
-
-/**
- * 格子を `nowMs` の刻みまで進める（純関数）。足した刻みは `null`（その間に値を受け
- * 取っていない = 線を切る）で、窓より古い行は捨てる。時計が戻った（`nowMs` が最後の
- * 行より前）ときは何もしない。窓より長く空いたら全部 `null` の格子に作り直す。
- */
-export function advanceTrend(buffer: TrendBuffer, nowMs: number): TrendBuffer {
-	const { stepMs, windowMs, penCount, rows } = buffer;
-	const target = alignToStep(nowMs, stepMs);
-	const last = rows[rows.length - 1]?.t ?? Number.NEGATIVE_INFINITY;
-	if (target <= last) return buffer;
-	if (target - last >= windowMs) {
-		return { ...emptyTrendBuffer(stepMs, windowMs, penCount, nowMs), liveFromT: buffer.liveFromT };
-	}
-	const added: TrendRow[] = [];
-	for (let t = last + stepMs; t <= target; t += stepMs) added.push(nullRow(t, penCount));
-	const n = trendRowCount(windowMs, stepMs);
-	const combined = [...rows, ...added];
-	return { ...buffer, rows: combined.slice(combined.length - n) };
-}
-
-/**
- * 現在値を 1 回分書く（純関数）。`nowMs` の刻みまで進めてから、その行のペンの値を
- * 置き換える（同じ刻みに 2 回来たら後の値）。`values` はペンの並びどおり。
- */
-export function appendLive(
-	buffer: TrendBuffer,
-	nowMs: number,
-	values: readonly (number | null)[]
-): TrendBuffer {
-	const advanced = advanceTrend(buffer, nowMs);
-	const rows = advanced.rows;
-	const lastIndex = rows.length - 1;
-	const lastRow = rows[lastIndex];
-	if (!lastRow || alignToStep(nowMs, advanced.stepMs) !== lastRow.t) return advanced;
-	const nextValues = lastRow.values.map((prev, i) => {
-		const v = values[i];
-		return v === undefined ? prev : v !== null && Number.isFinite(v) ? v : null;
-	});
-	const nextRows = rows.slice();
-	nextRows[lastIndex] = { t: lastRow.t, values: nextValues };
-	return {
-		...advanced,
-		rows: nextRows,
-		liveFromT: advanced.liveFromT ?? lastRow.t
-	};
-}
-
-/**
- * 履歴の点 1 つの値（純関数）: 最小と最大の中点（判断はモジュールの doc）。片方だけ
- * 有限ならその値、どちらも無ければ `null`。
- */
-export function historyPointValue(point: Pick<HistoryPoint, 'min' | 'max'>): number | null {
-	const lo = point.min !== null && Number.isFinite(point.min) ? point.min : null;
-	const hi = point.max !== null && Number.isFinite(point.max) ? point.max : null;
-	if (lo === null) return hi;
-	if (hi === null) return lo;
-	return (lo + hi) / 2;
-}
-
 /**
  * タグの収集周期（ms。タグ → 収集グループの `periodMs`）。引けない・正でないときは `null`。
- * 監視画面・ヒストリカル画面が `periodMsOf` に渡す。
+ * 監視画面がリングバッファのサンプル間隔（ポーリングの周期との長い方）に使う。
  */
 export function collectPeriodMsOf(
 	tags: readonly { id: number; collectionGroupId: number }[],
@@ -337,58 +155,6 @@ export function collectPeriodMsOf(
 	const tag = tags.find((t) => t.id === tagId);
 	const cg = tag ? collectionGroups.find((g) => g.id === tag.collectionGroupId) : undefined;
 	return cg && Number.isFinite(cg.periodMs) && cg.periodMs > 0 ? cg.periodMs : null;
-}
-
-/**
- * 履歴を格子に合わせる（純関数）。ペンごとにタグの系列を引き、点の
- * `[tMs, tMs + holdMs)` に重なる刻みに値を書く（`holdMs` は `binMs` と
- * `periodMsOf(tagId)` の大きい方）。点は時刻順に書くので、同じ刻みに 2 点が重なれば
- * 後の点（現在値の「後の値」と同じ）。`liveFromT` 以後の行は触らない。系列の無い
- * ペン（不明なタグ）は `null` のまま。
- */
-export function mergeHistory(
-	buffer: TrendBuffer,
-	penTagIds: readonly number[],
-	history: Pick<CollectHistory, 'series'>,
-	periodMsOf: (tagId: number) => number | null = () => null
-): TrendBuffer {
-	const { rows, stepMs } = buffer;
-	if (rows.length === 0) return buffer;
-	const first = rows[0].t;
-	const limit = buffer.liveFromT ?? rows[rows.length - 1].t + stepMs;
-	const next = rows.map((row) => ({ t: row.t, values: row.values.slice() }));
-	penTagIds.forEach((tagId, pen) => {
-		const series = history.series.find((s) => s.tagId === tagId);
-		if (!series) return;
-		const period = periodMsOf(tagId) ?? 0;
-		const holdMs = Math.max(series.binMs, period, 1);
-		const points = [...series.points].sort((a, b) => a.tMs - b.tMs);
-		for (const point of points) {
-			const value = historyPointValue(point);
-			const end = point.tMs + holdMs; // 排他
-			// 重なる刻み: row.t < end かつ row.t + stepMs > point.tMs。
-			let k = Math.max(0, Math.floor((point.tMs - first) / stepMs));
-			for (; k < next.length; k++) {
-				const t = next[k].t;
-				if (t >= end || t >= limit) break;
-				if (t + stepMs <= point.tMs) continue;
-				next[k].values[pen] = value;
-			}
-		}
-	});
-	return { ...buffer, rows: next };
-}
-
-/** 初期窓の要求（純関数）。期間は格子の全体（両端を含む）、区間の数は行数。 */
-export function historyRequest(
-	buffer: TrendBuffer,
-	penTagIds: readonly number[]
-): CollectHistoryParams | null {
-	const tagIds = [...new Set(penTagIds)];
-	if (tagIds.length === 0 || buffer.rows.length === 0) return null;
-	const fromMs = buffer.rows[0].t;
-	const toMs = buffer.rows[buffer.rows.length - 1].t + buffer.stepMs - 1;
-	return { tagIds, fromMs, toMs, bins: buffer.rows.length };
 }
 
 /**
@@ -418,61 +184,88 @@ export function observeServerClock(
 	return { serverMs: serverNowMs, localMs: localNowMs, floorMs: shown ?? serverNowMs };
 }
 
-/** 値の範囲（全ペン・全行の最小と最大）。値が 1 つも無ければ `null`。 */
-export function valueExtent(rows: readonly TrendRow[]): { min: number; max: number } | null {
-	let min = Infinity;
-	let max = -Infinity;
-	for (const row of rows) {
-		for (const v of row.values) {
-			if (v === null || !Number.isFinite(v)) continue;
-			if (v < min) min = v;
-			if (v > max) max = v;
-		}
-	}
-	return Number.isFinite(min) ? { min, max } : null;
+// --- 追従と履歴の読み直し（ハイブリッド、設計書 §8・§10 の 4b） ---------------------
+
+/** 右端が今からこれ以内なら「今に付いている」とみなし、追従を再開する。 */
+export const FOLLOW_TOLERANCE_MS = 1000;
+
+/** 追従の状態。`following` の間は右端を今にして、幅 `widthMs` のまま進める。 */
+export interface FollowState {
+	following: boolean;
+	widthMs: number;
+	/** 表示範囲（部品の半開区間）。 */
+	view: TimeRange;
 }
 
-// --- 部品の契約への変換 -------------------------------------------------------
+/** 追従を始める（構成を当てた・時間窓を替えた・「最新へ」）。幅は部品の範囲（1 分〜31 日）に丸める。 */
+export function startFollow(widthMs: number, nowMs: number): FollowState {
+	const view = followRange(widthMs, nowMs);
+	return { following: true, widthMs: view.endMs - view.startMs, view };
+}
+
+/** 時計が進んだ。追従中なら右端を今にする。止めている間・変わらないときは同じオブジェクト。 */
+export function tickFollow(state: FollowState, nowMs: number): FollowState {
+	if (!state.following || !Number.isFinite(nowMs)) return state;
+	const view = followRange(state.widthMs, nowMs);
+	return view.startMs === state.view.startMs && view.endMs === state.view.endMs
+		? state
+		: { ...state, view };
+}
 
 /**
- * 格子を共通のトレンドの部品（`TrendChart`）の契約にする（純関数）。
- *
- * - 取得範囲（`data.range`）= `[rows[0].t, rows[last].t + stepMs)`（格子そのもの）。
- * - 表示範囲（返す `range`）は追従の右端を「今」（`nowMs`）で切る: `[endMs - windowMs, endMs)`。
- *   部品は区間の点を「区間と表示範囲の重なりの真ん中」に描くので、右端を最後の格子の終わりに
- *   すると最新値が未来の時刻に描かれる。`endMs` は `nowMs` を基本に、`nowMs` が最後の格子の
- *   始まり以下・非有限なら `last.t + 1`（最後の格子を必ず少し見せる）、格子の終わりを超えるなら
- *   `last.t + stepMs`（格子より先を空けない）に丸める。
- * - ペン i の系列は `{ bins: 行ごとに { tMs: 刻みの始まり, min: 値, max: 値 }, binMs: stepMs }`。
- *   値の無い刻み（`null`）は欠測のまま渡し、部品が線を切る。同じタグを 2 回置いたペンも
- *   並びの位置ごとの別の系列（ID は `penIds` と並びが対応する）。
- * - 行が 1 つも無ければ `data` は `null`（範囲は窓の幅の 0 起点で、描かれない）。
+ * 拡大・縮小・パンの結果を当てる。右端が今に付いていれば（`isAtNow`）その幅で追従し、
+ * 外れたら（左へパン・今から離れた位置での拡大）追従をやめて範囲をそのまま使う。
+ * 不正な範囲は無視する。幅の上限は部品の `MAX_RANGE_MS`（拡大・縮小が丸める）。
  */
-export function trendBufferData(
-	buffer: Pick<TrendBuffer, 'rows' | 'stepMs' | 'windowMs'>,
-	penIds: readonly string[],
-	nowMs: number | null
-): { range: TimeRange; data: TrendData | null } {
-	const { rows, stepMs } = buffer;
-	if (rows.length === 0) return { range: { startMs: 0, endMs: buffer.windowMs }, data: null };
-	const lastT = rows[rows.length - 1].t;
-	const fetched: TimeRange = { startMs: rows[0].t, endMs: lastT + stepMs };
-	const endMs =
-		nowMs === null || !Number.isFinite(nowMs) || nowMs <= lastT
-			? lastT + 1
-			: Math.min(nowMs, lastT + stepMs);
-	const range: TimeRange = { startMs: endMs - buffer.windowMs, endMs };
-	const series: Record<string, TrendSeries> = {};
-	penIds.forEach((id, i) => {
-		series[id] = {
-			bins: rows.map((row) => {
-				const v = row.values[i] ?? null;
-				return { tMs: row.t, min: v, max: v };
-			}),
-			binMs: stepMs
-		};
-	});
-	return { range, data: { range: fetched, series } };
+export function rangeChangeFollow(state: FollowState, next: TimeRange, nowMs: number): FollowState {
+	if (!isValidRange(next)) return state;
+	if (isAtNow(next, nowMs, FOLLOW_TOLERANCE_MS)) {
+		return startFollow(next.endMs - next.startMs, nowMs);
+	}
+	return { following: false, widthMs: next.endMs - next.startMs, view: next };
+}
+
+/** 最後に出した履歴の要求（範囲と区間の幅）。 */
+export interface HistoryRequested {
+	range: TimeRange;
+	binMs: number;
+}
+
+/**
+ * 履歴を読み直すか（純関数）。追従中に毎秒は読まない（無駄撃ちしない）。
+ *
+ * ペンごとに、表示範囲のうち履歴で描く部分は `[view.startMs, liveFrom)`（リングバッファが無い
+ * ペンは右端まで）。どのペンも履歴で描く部分が無ければ（表示範囲を全部リングバッファで描ける）、
+ * 区間の幅が変わったとき以外は読まない。読むのは:
+ *
+ * 1. まだ要求していない。
+ * 2. 区間の幅が変わった（拡大・縮小・描画域の幅）。リングバッファのまとめ方も履歴の幅で決まるため。
+ * 3. 表示範囲の左端が、最後に要求した範囲の外にある（左へパン・縮小、追従で窓 1 つぶん進んだ）。
+ * 4. あるペンの `liveFrom` が要求した範囲の終わりより後で、表示範囲の中にある（途切れの後に
+ *    書き直し始めた。その間は履歴に記録があるかもしれない）。
+ * 5. 追従を止めている間は、履歴で描く部分の終わりが要求した範囲の終わりより後。
+ */
+export function needsHistoryReload(input: {
+	requested: HistoryRequested | null;
+	view: TimeRange;
+	binMs: number;
+	following: boolean;
+	/** ペンの並びどおりの `liveFrom`（リングバッファが無いペンは `null`）。 */
+	liveFroms: readonly (number | null)[];
+}): boolean {
+	const { requested, view, liveFroms } = input;
+	if (!isValidRange(view) || liveFroms.length === 0) return false;
+	if (requested === null) return true;
+	if (requested.binMs !== input.binMs) return true;
+	const needEnd = Math.max(
+		...liveFroms.map((f) => (f === null ? view.endMs : Math.min(view.endMs, f)))
+	);
+	if (!(needEnd > view.startMs)) return false;
+	if (view.startMs < requested.range.startMs || view.startMs >= requested.range.endMs) return true;
+	if (liveFroms.some((f) => f !== null && f > requested.range.endMs && f > view.startMs)) {
+		return true;
+	}
+	return !input.following && needEnd > requested.range.endMs;
 }
 
 // --- しきい値の帯 ------------------------------------------------------------
@@ -579,11 +372,13 @@ export function penLegendLabel(pen: Pick<TrendPenInfo, 'name' | 'unit'>): string
 	return pen.unit ? `${pen.name}（${pen.unit}）` : pen.name;
 }
 
-/** 時刻の目盛（端末のロケール、時:分:秒）。 */
-export function trendTimeLabel(epochMs: number): string {
+/** 表示範囲の端の時刻（月/日 時:分:秒、端末のロケール）。 */
+function trendTimeLabel(epochMs: number): string {
 	const at = new Date(epochMs);
 	if (Number.isNaN(at.getTime())) return String(epochMs);
-	return at.toLocaleTimeString(undefined, {
+	return at.toLocaleString(undefined, {
+		month: 'numeric',
+		day: 'numeric',
 		hour: '2-digit',
 		minute: '2-digit',
 		second: '2-digit'
@@ -603,45 +398,73 @@ function bandText(band: OpenThresholdBand, decimals: number | null): string {
 	return `${band.label} ${range} ${tone}`;
 }
 
+/** 描画データのうち表示範囲に描かれる値の最小と最大（ペン 1 本）。値が無ければ `null`。 */
+function visibleExtent(
+	data: TrendData | null,
+	view: TimeRange | null,
+	penId: string | undefined
+): { min: number; max: number } | null {
+	if (data === null || view === null || penId === undefined) return null;
+	const series = drawableSeries(data, view).series[penId];
+	let min = Infinity;
+	let max = -Infinity;
+	for (const b of series?.bins ?? []) {
+		for (const v of [b.min, b.max]) {
+			if (v === null || !Number.isFinite(v)) continue;
+			if (v < min) min = v;
+			if (v > max) max = v;
+		}
+	}
+	return Number.isFinite(min) ? { min, max } : null;
+}
+
 /**
  * 画面外の説明文（純関数、D-2 の `meterDescription` と同じ役目）。図は `role="img"`
- * で中が読まれないので、ペン・単位・窓・値の範囲・帯を文で伝える。
+ * で中が読まれないので、ペン・単位・窓（追従を止めていれば表示中の期間）・表示範囲に描かれる
+ * 値の範囲・帯を文で伝える。値は描画データ（`hybridData` の結果）を表示範囲で絞って読む。
  */
 export function trendDescription(input: {
+	/** 時間窓（表示範囲がまだ無いときの言い方に使う）。 */
 	windowSec: number;
+	/** 表示範囲（`null` = まだ無い）。 */
+	view: TimeRange | null;
+	following: boolean;
 	pens: readonly TrendPenInfo[];
-	rows: readonly TrendRow[];
+	/** ペンの並びどおりの部品のペンの ID（`trendPenId`）。 */
+	penIds: readonly string[];
+	data: TrendData | null;
 	bandTagId: number | null;
 }): string {
+	const { view, pens } = input;
 	const parts: string[] = [];
-	parts.push(
-		`直近 ${trendWindowLabel(input.windowSec)}のトレンド。ペン: ${input.pens.map(penLegendLabel).join('、')}。`
-	);
-	const extent = valueExtent(input.rows);
-	if (extent === null) {
+	const penText = pens.map(penLegendLabel).join('、');
+	if (view === null || input.following) {
+		const sec = view === null ? input.windowSec : Math.round((view.endMs - view.startMs) / 1000);
+		parts.push(`直近 ${trendWindowLabel(sec)}のトレンド。ペン: ${penText}。`);
+	} else {
+		parts.push(
+			`${trendTimeLabel(view.startMs)}〜${trendTimeLabel(view.endMs)} のトレンド（追従を止めています）。ペン: ${penText}。`
+		);
+	}
+	const extents = pens.map((_, i) => visibleExtent(input.data, view, input.penIds[i]));
+	const found = extents.filter((e): e is { min: number; max: number } => e !== null);
+	if (found.length === 0) {
 		parts.push('表示できる値はまだありません。');
-	} else if (isAllBitTrend(input.pens)) {
+	} else if (isAllBitTrend(pens)) {
 		// 全ペンが bit: 縦軸は 0 と 1。
-		const lo = String(extent.min);
-		const hi = String(extent.max);
+		const lo = String(Math.min(...found.map((e) => e.min)));
+		const hi = String(Math.max(...found.map((e) => e.max)));
 		parts.push(`縦軸は 0 と 1 で、表示中の値は ${lo === hi ? lo : `${lo}〜${hi}`}。`);
 	} else {
-		const ranges = input.pens.map((pen, i) => {
-			let min = Infinity;
-			let max = -Infinity;
-			for (const row of input.rows) {
-				const v = row.values[i];
-				if (v === null || v === undefined || !Number.isFinite(v)) continue;
-				if (v < min) min = v;
-				if (v > max) max = v;
-			}
-			if (!Number.isFinite(min)) return `${pen.name} 値なし`;
-			const lo = formatNumber(min, pen.decimals);
-			const hi = formatNumber(max, pen.decimals);
+		const ranges = pens.map((pen, i) => {
+			const extent = extents[i];
+			if (extent === null) return `${pen.name} 値なし`;
+			const lo = formatNumber(extent.min, pen.decimals);
+			const hi = formatNumber(extent.max, pen.decimals);
 			return `${pen.name} ${lo === hi ? lo : `${lo}〜${hi}`}`;
 		});
 		parts.push(`縦軸はペンごとの自動スケール。表示中の値の範囲: ${ranges.join('、')}。`);
-		const bits = input.pens.filter((p) => p.isBit);
+		const bits = pens.filter((p) => p.isBit);
 		if (bits.length > 0) {
 			parts.push(`bit のペン（${bits.map((p) => p.name).join('、')}）は 0 が False、1 が True。`);
 		}
@@ -662,7 +485,7 @@ export function trendDescription(input: {
 
 // --- 注記 --------------------------------------------------------------------
 
-/** 履歴（初期窓）の取得の状態。 */
+/** 履歴（表示範囲のうち過去の部分）の取得の状態。 */
 export type TrendHistoryState = 'idle' | 'loading' | 'ready' | 'unavailable';
 
 /** シミュレーション接続のペンに添える一文（D-3b の指示どおり）。 */

@@ -24,7 +24,8 @@
  * 9. トレンド（D-3b）: 線（`path` の `d`）が描かれて伸びる。時刻の目盛。しきい値の
  *    帯は選んだ 1 ペンだけ（既定はしきい値のある最初のペン、凡例のペンで切り替え、
  *    画面外の文にも出る）。時間窓は端末ごとに覚え、グループの定義には書かない。
- *    収集を止めている間の刻みは `null` で、線が切れる（`d` の `M` が増える）。
+ *    収集を止めている間は値が無く、線が切れる（`d` の `M` が増える）。左へパンすると追従を
+ *    やめて「最新へ」が出て、押すと追従に戻る（ハイブリッド、trend-design.md §10 の 4b）。
  * 10.（#551、2026-10-09 オーナー決定）bit のタグ（Modbus のコイル 00001、開発用 PLC が
  *    トグルする）は、デジタルで `True` / `False`（0 / 1 ではない）。バー・計器は
  *    「レンジ未設定」にならず 0〜1（目盛 `False` / `True`）。トレンドは共通の部品で、bit の
@@ -640,6 +641,17 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		await highPen.click();
 		await expect(trend.locator('.bi-trend__band title')).toHaveText(['H']);
 
+		// 左へパン（← キー）で追従をやめ、「最新へ」で追従に戻る。
+		const latest = trend.getByRole('button', { name: '最新へ' });
+		await expect(latest).toHaveCount(0);
+		await trend.locator('.bi-trend__plot').focus();
+		await page.keyboard.press('ArrowLeft');
+		await expect(latest).toBeVisible();
+		await expect(trend.locator('.sr-only')).toContainText('のトレンド（追従を止めています）。');
+		await latest.click();
+		await expect(latest).toHaveCount(0);
+		await expect(trend.locator('.sr-only')).toContainText('直近 10 分のトレンド。');
+
 		// 時間窓: 既定（グループの属性。作成時に何も渡さないとサーバーが 10 分を入れる）→
 		// 1 分。端末に覚え、グループの定義には書かない。
 		const groupAttributes = async (): Promise<unknown> => {
@@ -713,8 +725,8 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		await expect(trend.locator('.sr-only').first()).toContainText('縦軸は 0 と 1 で');
 	});
 
-	test('9. 全ペン bit のトレンド: 見える値が履歴の中点 0.5 だけで現在値が bad でも縦軸は 0 と 1（#554 レビュー）', async () => {
-		// 履歴は全区間が「0 も 1 もあった」（中点 0.5）、現在値は bad（値なし）に差し替える。
+	test('9. 全ペン bit のトレンド: 見える値が履歴の 0〜1 の区間だけで現在値が bad でも縦軸は 0 と 1（#554 レビュー）', async () => {
+		// 履歴は全区間が「0 も 1 もあった」（最小 0・最大 1）、現在値は bad（値なし）に差し替える。
 		// 縦軸は bit のペンの指定（yMin 0・yMax 1）で必ず 0 と 1 を含む。
 		await page.route('**/api/collect/history*', async (route) => {
 			const url = new URL(route.request().url());
@@ -770,13 +782,13 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 					timeout: 30_000
 				})
 				.toEqual(expect.arrayContaining(['0', '1']));
-			// 線は中点 0.5 の水平線として描かれている（偽の 0 / 1 の点を足していない）。
-			// 水平線は外接矩形の高さが 0 で toBeVisible が hidden と判定するので、d 属性で見る。
+			// 線は区間ごとの最小 0〜最大 1 の包絡として描かれている（ハイブリッドの過去の部分は
+			// 履歴の区間そのもの。現在値は bad なのでリングバッファは始まらない）。
 			await expect(trend.locator('.bi-trend__line').first()).toHaveAttribute(
 				'd',
 				/^M[\d.]+,[\d.]+L/
 			);
-			// カーソルを置くと凡例に値が出る（共通の部品。中点 0.5 の点の上で「0.5」と出る。bit でも丸めない）。
+			// カーソルを置くと凡例に値が出る（共通の部品。区間の上で「0〜1」と出る）。
 			// 履歴の点がどの横位置に載るかは窓と格子次第なので、プロット面の上を左から右へ動かして
 			// 値の行を探す。
 			const surface = trend.locator('.bi-trend__plot');
@@ -793,7 +805,7 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 					},
 					{ timeout: 30_000 }
 				)
-				.toEqual(expect.arrayContaining([expect.stringMatching(/^0\.5(\s|$)/)]));
+				.toEqual(expect.arrayContaining([expect.stringMatching(/^0〜1(\s|$)/)]));
 		} finally {
 			await page.unroute('**/api/collect/history*');
 			await page.unroute('**/api/collect/values*');
