@@ -41,7 +41,11 @@
 //!     既定 [`DEFAULT_LINE_WIDTH`]）・`marker`（[`Marker`]）・`markerSize`（2〜8、既定
 //!     [`DEFAULT_MARKER_SIZE`]）・`axis`（[`Axis`]、既定 left）・`yMin`・`yMax`（有限の数、両方
 //!     あれば `yMin < yMax`、既定は工学値レンジ）。種別を問わず保存する（種別は後で変えられる）が、
-//!     画面で効くのはトレンドだけ。管理線・bit の表し方は PR 7 で足す。
+//!     画面で効くのはトレンドだけ。
+//!     管理線（PR 7a）: `limitLines`（true で HH・H・L・LL の線を引く。`null`・false = 引かない）・
+//!     `limitHh`・`limitH`・`limitL`・`limitLl`（有限の数。`null` = タグのしきい値を使う。値は
+//!     表示だけに使い、しきい値のイベントは変えない。設定したものどうしは `LL <= L <= H <= HH`、
+//!     `crate::tag_thresholds` と同じ決まり。`limitLines` が無効でも保存する）。bit の表し方は PR 7c。
 //! - **しきい値は持たない**。しきい値は記録計の側のタグごとの設定
 //!   （`crate::tag_thresholds`、#532。2026-10-08 オーナー決定）で、表示グループ
 //!   からは参照するだけ（画面はその設定を読み取り専用で見せる）。
@@ -378,6 +382,16 @@ pub struct Pen {
     pub y_min: Option<f64>,
     /// 縦軸の最大。`None` = 工学値レンジ。
     pub y_max: Option<f64>,
+    /// 管理線を引くか。`None`・`false` = 引かない。
+    pub limit_lines: Option<bool>,
+    /// 管理線の HH の上書き。`None` = タグのしきい値。
+    pub limit_hh: Option<f64>,
+    /// 管理線の H の上書き。`None` = タグのしきい値。
+    pub limit_h: Option<f64>,
+    /// 管理線の L の上書き。`None` = タグのしきい値。
+    pub limit_l: Option<f64>,
+    /// 管理線の LL の上書き。`None` = タグのしきい値。
+    pub limit_ll: Option<f64>,
 }
 
 impl Pen {
@@ -393,6 +407,11 @@ impl Pen {
             || self.axis.is_some()
             || self.y_min.is_some()
             || self.y_max.is_some()
+            || self.limit_lines.is_some()
+            || self.limit_hh.is_some()
+            || self.limit_h.is_some()
+            || self.limit_l.is_some()
+            || self.limit_ll.is_some()
     }
 }
 
@@ -477,6 +496,17 @@ pub struct PenPayload {
     pub y_min: Option<f64>,
     #[serde(default)]
     pub y_max: Option<f64>,
+    /// 管理線の属性（#1207・#1231 PR 7a）。キー無し = `null` = 既定。
+    #[serde(default)]
+    pub limit_lines: Option<bool>,
+    #[serde(default)]
+    pub limit_hh: Option<f64>,
+    #[serde(default)]
+    pub limit_h: Option<f64>,
+    #[serde(default)]
+    pub limit_l: Option<f64>,
+    #[serde(default)]
+    pub limit_ll: Option<f64>,
 }
 
 impl PenPayload {
@@ -690,6 +720,30 @@ fn validate_pen_style(pen: &PenPayload, index: usize, errors: &mut Vec<FieldErro
             bad("yMax", "縦軸の最大は最小より大きくしてください".to_string());
         }
     }
+    let limit_hh = finite(pen.limit_hh, "limitHh", &mut bad);
+    let limit_h = finite(pen.limit_h, "limitH", &mut bad);
+    let limit_l = finite(pen.limit_l, "limitL", &mut bad);
+    let limit_ll = finite(pen.limit_ll, "limitLl", &mut bad);
+    // LL <= L <= H <= HH（設定したものだけ比べる）。`tag_thresholds::validate_threshold_order`
+    // と同じ決まり（あちらは非公開で欄の名前が thresholdXx なので、ここで limitXx の名前で書く）。
+    // 欄の付け方も同じで、並びの後ろの側（大きいはずの側）の欄に付ける。
+    let chain = [
+        ("limitLl", limit_ll),
+        ("limitL", limit_l),
+        ("limitH", limit_h),
+        ("limitHh", limit_hh),
+    ];
+    let mut prev: Option<(&str, f64)> = None;
+    for (name, value) in chain {
+        let Some(value) = value else { continue };
+        if let Some((prev_name, prev_value)) = prev {
+            if prev_value > value {
+                bad(name, format!("{prev_name} 以上の値にしてください"));
+                break;
+            }
+        }
+        prev = Some((name, value));
+    }
     Pen {
         tag_id: 0,
         color_slot: None,
@@ -703,6 +757,11 @@ fn validate_pen_style(pen: &PenPayload, index: usize, errors: &mut Vec<FieldErro
         axis,
         y_min,
         y_max,
+        limit_lines: pen.limit_lines,
+        limit_hh,
+        limit_h,
+        limit_l,
+        limit_ll,
     }
 }
 
@@ -1032,6 +1091,11 @@ struct PenRow {
     axis: Option<String>,
     y_min: Option<f64>,
     y_max: Option<f64>,
+    limit_lines: Option<i64>,
+    limit_hh: Option<f64>,
+    limit_h: Option<f64>,
+    limit_l: Option<f64>,
+    limit_ll: Option<f64>,
 }
 
 /// DB の列挙の文字列を読む（CHECK で守っているので、未知の値は壊れた DB）。
@@ -1066,6 +1130,11 @@ impl PenRow {
             axis: parse_column(self.axis, "axis", Axis::parse)?,
             y_min: self.y_min,
             y_max: self.y_max,
+            limit_lines: self.limit_lines.map(|v| v != 0),
+            limit_hh: self.limit_hh,
+            limit_h: self.limit_h,
+            limit_l: self.limit_l,
+            limit_ll: self.limit_ll,
         })
     }
 }
@@ -1623,8 +1692,8 @@ async fn insert_pens(
     for (position, pen) in pens.iter().enumerate() {
         sqlx::query(
             "INSERT INTO display_group_pens (group_id, position, tag_id, color_slot, label, unit, \
-             decimals, line_style, line_width, marker, marker_size, axis, y_min, y_max) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             decimals, line_style, line_width, marker, marker_size, axis, y_min, y_max, limit_lines, limit_hh, limit_h, limit_l, limit_ll) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(group_id)
         .bind(position as i64)
@@ -1640,6 +1709,11 @@ async fn insert_pens(
         .bind(pen.axis.map(Axis::as_str))
         .bind(pen.y_min)
         .bind(pen.y_max)
+        .bind(pen.limit_lines.map(i64::from))
+        .bind(pen.limit_hh)
+        .bind(pen.limit_h)
+        .bind(pen.limit_l)
+        .bind(pen.limit_ll)
         .execute(&mut *conn)
         .await
         .map_err(storage)?;
@@ -1706,7 +1780,7 @@ async fn list_on(
         pause.hold().await;
     }
     let pen_rows: Vec<PenRow> = sqlx::query_as("SELECT group_id, tag_id, color_slot, label, unit, decimals, line_style, line_width, marker, 
-         marker_size, axis, y_min, y_max FROM display_group_pens ORDER BY group_id, position")
+         marker_size, axis, y_min, y_max, limit_lines, limit_hh, limit_h, limit_l, limit_ll FROM display_group_pens ORDER BY group_id, position")
     .fetch_all(&mut *conn)
     .await
     .map_err(storage)?;
@@ -1745,7 +1819,7 @@ async fn get_on(
         pause.hold().await;
     }
     let pens: Vec<PenRow> = sqlx::query_as("SELECT group_id, tag_id, color_slot, label, unit, decimals, line_style, line_width, marker, 
-         marker_size, axis, y_min, y_max FROM display_group_pens WHERE group_id = ? ORDER BY position")
+         marker_size, axis, y_min, y_max, limit_lines, limit_hh, limit_h, limit_l, limit_ll FROM display_group_pens WHERE group_id = ? ORDER BY position")
     .bind(id)
     .fetch_all(&mut *conn)
     .await

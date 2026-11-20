@@ -57,6 +57,17 @@ export interface PenStyle {
 	axis: PenAxis | null;
 	yMin: number | null;
 	yMax: number | null;
+	/**
+	 * 管理線（#1207・#1231 PR 7a）。`limitLines` が `true` のとき HH・H・L・LL の線を引く
+	 * （`null`・`false` = 引かない）。`limitHh`・`limitH`・`limitL`・`limitLl` は表示用の上書きで、
+	 * `null` = タグのしきい値を使う。値は表示だけに使い、しきい値のイベントは変えない。
+	 * 設定した値どうしは `LL <= L <= H <= HH`。`limitLines` が無効でも保存する。
+	 */
+	limitLines: boolean | null;
+	limitHh: number | null;
+	limitH: number | null;
+	limitL: number | null;
+	limitLl: number | null;
 }
 
 /** 全部が既定のペンの属性。 */
@@ -70,7 +81,12 @@ export const EMPTY_PEN_STYLE: Readonly<PenStyle> = {
 	markerSize: null,
 	axis: null,
 	yMin: null,
-	yMax: null
+	yMax: null,
+	limitLines: null,
+	limitHh: null,
+	limitH: null,
+	limitL: null,
+	limitLl: null
 };
 
 export interface Pen extends PenStyle {

@@ -669,6 +669,41 @@
                     "null"
                   ]
                 },
+                "limitH": {
+                  "description": "管理線 H の上書き。null・省略はタグのしきい値。",
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "limitHh": {
+                  "description": "管理線 HH の上書き。null・省略はタグのしきい値。表示だけに使い、しきい値のイベントは変えない。設定した管理線どうしは LL <= L <= H <= HH。",
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "limitL": {
+                  "description": "管理線 L の上書き。null・省略はタグのしきい値。",
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "limitLines": {
+                  "description": "true で管理線（HH・H・L・LL）を引く。null・省略・false は引かない。",
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "limitLl": {
+                  "description": "管理線 LL の上書き。null・省略はタグのしきい値。",
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
                 "lineStyle": {
                   "description": "線種。null・省略は solid。none は線なし。",
                   "enum": [
@@ -897,6 +932,41 @@
                   "description": "凡例の名前（前後の空白を除いて 64 文字まで、制御文字は不可）。null・省略はタグの名前。",
                   "type": [
                     "string",
+                    "null"
+                  ]
+                },
+                "limitH": {
+                  "description": "管理線 H の上書き。null・省略はタグのしきい値。",
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "limitHh": {
+                  "description": "管理線 HH の上書き。null・省略はタグのしきい値。表示だけに使い、しきい値のイベントは変えない。設定した管理線どうしは LL <= L <= H <= HH。",
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "limitL": {
+                  "description": "管理線 L の上書き。null・省略はタグのしきい値。",
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "limitLines": {
+                  "description": "true で管理線（HH・H・L・LL）を引く。null・省略・false は引かない。",
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "limitLl": {
+                  "description": "管理線 LL の上書き。null・省略はタグのしきい値。",
+                  "type": [
+                    "number",
                     "null"
                   ]
                 },

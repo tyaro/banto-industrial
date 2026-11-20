@@ -178,7 +178,12 @@ function styleOf(pen: PenStyle & { yMinText?: string; yMaxText?: string }): PenS
 		markerSize: pen.markerSize ?? null,
 		axis: pen.axis ?? null,
 		yMin: axisOf(pen.yMinText, pen.yMin),
-		yMax: axisOf(pen.yMaxText, pen.yMax)
+		yMax: axisOf(pen.yMaxText, pen.yMax),
+		limitLines: pen.limitLines ?? null,
+		limitHh: pen.limitHh ?? null,
+		limitH: pen.limitH ?? null,
+		limitL: pen.limitL ?? null,
+		limitLl: pen.limitLl ?? null
 	};
 }
 
@@ -472,7 +477,7 @@ export interface SortedFieldErrors {
 }
 
 const PEN_FIELD =
-	/^pens\[(\d+)\]\.(tagId|colorSlot|label|unit|decimals|lineStyle|lineWidth|marker|markerSize|axis|yMin|yMax|hubTag(\..+)?)$/;
+	/^pens\[(\d+)\]\.(tagId|colorSlot|label|unit|decimals|lineStyle|lineWidth|marker|markerSize|axis|yMin|yMax|limitLines|limitHh|limitH|limitL|limitLl|hubTag(\..+)?)$/;
 const HUB_TAG_GROUP_FIELD = /^hubTagGroup(\..+)?$/;
 
 export function sortFieldErrors(fieldErrors: readonly FieldErrorLike[]): SortedFieldErrors {
