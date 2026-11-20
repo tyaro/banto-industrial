@@ -284,6 +284,70 @@ describe('resolveLimits', () => {
 	});
 });
 
+describe('端末ごとの時間窓（Q4）', () => {
+	function memoryStorage(initial: Record<string, string> = {}) {
+		const data = new Map(Object.entries(initial));
+		return {
+			getItem: (key: string) => data.get(key) ?? null,
+			setItem: (key: string, value: string) => void data.set(key, value),
+			data
+		};
+	}
+
+	it('覚えが無ければグループの既定、それも無ければ 10 分', () => {
+		expect(resolveTrendWindowSec({ timeWindowSec: 300 }, null)).toBe(300);
+		expect(resolveTrendWindowSec({}, null)).toBe(DEFAULT_TREND_WINDOW_SEC);
+		expect(groupDefaultWindowSec({ timeWindowSec: 42 })).toBe(DEFAULT_TREND_WINDOW_SEC);
+		expect(resolveTrendWindowSec({ timeWindowSec: 300 }, 60)).toBe(60);
+	});
+
+	it('グループごとに覚え、既定と同じ窓を選んだら覚えを消す', () => {
+		const storage = memoryStorage();
+		saveTrendWindowOverride(storage, 1, 60, 600);
+		saveTrendWindowOverride(storage, 2, 3600, 600);
+		expect(loadTrendWindowOverride(storage, 1)).toBe(60);
+		expect(loadTrendWindowOverride(storage, 2)).toBe(3600);
+		expect(loadTrendWindowOverride(storage, 3)).toBeNull();
+		saveTrendWindowOverride(storage, 1, 600, 600);
+		expect(loadTrendWindowOverride(storage, 1)).toBeNull();
+		expect(JSON.parse(storage.data.get(TREND_WINDOW_STORAGE_KEY) ?? '')).toEqual({ '2': 3600 });
+	});
+
+	it.each([
+		['壊れた JSON', '{'],
+		['配列', '[60]'],
+		['選択肢に無い値', '{"1": 42}'],
+		['文字列の値', '{"1": "60"}']
+	])('%s は覚え無しとして読む', (_name, raw) => {
+		expect(loadTrendWindowOverride(memoryStorage({ [TREND_WINDOW_STORAGE_KEY]: raw }), 1)).toBe(
+			null
+		);
+	});
+
+	it('壊れた覚えがあっても保存できる。選択肢に無い窓は保存しない', () => {
+		const storage = memoryStorage({ [TREND_WINDOW_STORAGE_KEY]: '{' });
+		saveTrendWindowOverride(storage, 1, 60, 600);
+		expect(loadTrendWindowOverride(storage, 1)).toBe(60);
+		saveTrendWindowOverride(storage, 1, 42, 600);
+		expect(loadTrendWindowOverride(storage, 1)).toBe(60);
+	});
+
+	it('ストレージが無い・投げるときも画面を止めない', () => {
+		const throwing = {
+			getItem: () => {
+				throw new Error('denied');
+			},
+			setItem: () => {
+				throw new Error('denied');
+			}
+		};
+		expect(loadTrendWindowOverride(undefined, 1)).toBeNull();
+		expect(loadTrendWindowOverride(throwing, 1)).toBeNull();
+		expect(() => saveTrendWindowOverride(throwing, 1, 60, 600)).not.toThrow();
+		expect(() => saveTrendWindowOverride(undefined, 1, 60, 600)).not.toThrow();
+	});
+});
+
 describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 	const tags = [
 		{

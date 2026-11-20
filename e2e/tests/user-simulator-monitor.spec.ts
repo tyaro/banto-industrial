@@ -624,11 +624,11 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 			/^(\d{1,2}\/\d{1,2} )?\d{2}:\d{2}(:\d{2})?$/
 		);
 
-		// 管理線は既定で無効。有効にしたペン（上限 = H 0）だけ線が出て、ランプの値は 0 以上なので
-		// 越えた区間が H の色で重ね描きされる。帯（しきい値の塗り）は出さない。
+		// 管理線は既定で無効。有効にしたペン（上限 = H 0）だけ線が出て、そのペンの線を H の色で
+		// 重ね描きする層（管理線の clip `-lim-`）ができる。帯（しきい値の塗り）は出さない。
 		// 凡例は押せない一覧。単位は範囲の後に 1 回だけ（#1247）。
 		await expect(trend.locator('.bi-trend__limit title')).toHaveText(['H']);
-		await expect(trend.locator('g[clip-path] path.bi-trend__line').first()).toBeAttached({
+		await expect(trend.locator('g[clip-path*="-lim-"] path.bi-trend__line').first()).toBeAttached({
 			timeout: 20_000
 		});
 		await expect(trend.locator('.bi-trend__band')).toHaveCount(0);
