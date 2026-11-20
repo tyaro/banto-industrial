@@ -56,24 +56,75 @@ export function saveLastFreeTrend(storage: Pick<Storage, 'setItem'> | undefined,
 
 /** 削除の完了後にすること。 */
 export interface FreeTrendDeleteFollowUp {
+	/** 消したものの下書き（削除を始めた持ち主のもの）を捨てる。 */
+	clearDraft: boolean;
+	/** 成功を通知する。 */
+	notify: boolean;
+	/** 手元の一覧から外す。 */
+	applyToPage: boolean;
 	/** URL の `?id=` を外す（replace の遷移）。 */
 	clearUrl: boolean;
 	/** 一覧を読み直す。 */
 	reload: boolean;
 }
 
+/** 削除を始めた時点のセッション（持ち主・世代）と、完了時点のそれ。 */
+export interface FreeTrendDeleteSession {
+	startedOwner: string | null;
+	currentOwner: string | null;
+	startedSessionGen: number;
+	currentSessionGen: number;
+}
+
+function sameDeleteSession(args: FreeTrendDeleteSession): boolean {
+	return (
+		args.startedSessionGen === args.currentSessionGen && args.startedOwner === args.currentOwner
+	);
+}
+
 /**
- * 削除の応答を待つ間に画面が破棄された・別の自由トレンドが選ばれた場合に、後から来た完了が
- * 遷移や選択を上書きしないための判断（純関数）。破棄後は何もしない。URL は、その時点の `?id=`
- * が削除した ID を指したままのときだけ整理する。
+ * 削除の応答を待つ間に画面が破棄された・別の自由トレンドが選ばれた・セッションが替わった場合に、
+ * 後から来た完了が遷移や選択を上書きしないための判断（純関数）。前のセッションの完了では何もしない
+ * （通知も、保存領域も。#1258 再レビュー P2）。同じセッションで画面が破棄されただけなら、下書きを
+ * 捨てて通知だけする。URL は、その時点の `?id=` が削除した ID を指したままのときだけ整理する。
  */
-export function afterFreeTrendDelete(args: {
-	destroyed: boolean;
-	currentRequestedId: number | null;
-	deletedId: number;
-}): FreeTrendDeleteFollowUp {
-	if (args.destroyed) return { clearUrl: false, reload: false };
-	return { clearUrl: args.currentRequestedId === args.deletedId, reload: true };
+export function afterFreeTrendDelete(
+	args: FreeTrendDeleteSession & {
+		destroyed: boolean;
+		currentRequestedId: number | null;
+		deletedId: number;
+		/** 完了時点で別の移動が終わっていない（`navigating.to` が `null` でない）。 */
+		navigating: boolean;
+	}
+): FreeTrendDeleteFollowUp {
+	if (!sameDeleteSession(args)) {
+		return { clearDraft: false, notify: false, applyToPage: false, clearUrl: false, reload: false };
+	}
+	if (args.destroyed) {
+		return { clearDraft: true, notify: true, applyToPage: false, clearUrl: false, reload: false };
+	}
+	return {
+		clearDraft: true,
+		notify: true,
+		applyToPage: true,
+		clearUrl: args.currentRequestedId === args.deletedId && !args.navigating,
+		reload: true
+	};
+}
+
+/** 削除の失敗の後にすること。 */
+export interface FreeTrendDeleteFailureFollowUp {
+	/** 失敗を通知する（前のセッションの完了では出さない。破棄されただけなら今のまま出す）。 */
+	notify: boolean;
+	/** 一覧を読み直す（画面が生きていて、同じセッションのとき）。 */
+	reload: boolean;
+}
+
+export function afterFreeTrendDeleteFailure(
+	args: FreeTrendDeleteSession & { destroyed: boolean }
+): FreeTrendDeleteFailureFollowUp {
+	if (!sameDeleteSession(args)) return { notify: false, reload: false };
+	return { notify: true, reload: !args.destroyed };
 }
 
 /** 画面で選び直した時間窓（どの自由トレンドのものか持つ）。 */
