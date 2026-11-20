@@ -8,7 +8,7 @@
  * - 非有限の値の線は捨てる。縦軸の範囲の外の線は引かない（`lines` に入れない）が、越えた区間
  *   には効く（上限が縦軸より上なら越える区間は無い。下限が縦軸より上なら全部が越えている）。
  * - 越えた区間は描画域 `[0, plotHeight]` で切り、高さ 0 は出さない。並びの順を保つ
- *   （後ろの線の色が前の上に重なる。H → HH の順に渡せば HH の色が勝つ）。
+ *   （後ろの線の色が前の上に重なる。H → L → HH → LL の順に渡せば危険の色が勝つ）。
  * - 縦軸の範囲が不正（有限でない・lo >= hi）・`plotHeight` が 0 以下・`limits` が null なら空。
  */
 
@@ -44,6 +44,11 @@ export interface LimitLayout {
 }
 
 const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+
+/** 管理線の名前の y。線が上端に近く、文字（約 12px）が描画域の外に出るときだけ線の下に置く。 */
+export function limitLabelY(y: number): number {
+	return y < 12 ? y + 11 : y - 2;
+}
 
 export function limitLayout(
 	limits: readonly TrendLimit[] | null | undefined,

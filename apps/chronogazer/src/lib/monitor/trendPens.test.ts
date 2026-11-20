@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { resolveYDomain, type Bin } from '@banto-industrial/trend';
-import { trendPenInfos } from './trendLogic';
+import { limitLayout, resolveYDomain, type Bin } from '@banto-industrial/trend';
+import { trendPenInfos, TREND_DANGER_COLOR } from './trendLogic';
 import { tagIdOfTrendPenId, toTrendLimits, toTrendPens, trendPenId } from './trendPens';
 
 describe('ペンの ID と部品のペン', () => {
@@ -193,15 +193,23 @@ describe('ペンの ID と部品のペン', () => {
 	});
 
 	describe('管理線', () => {
-		it('H → HH → L → LL の並びで、値の無いものは入れない（後ろが勝つので危険を後ろに）', () => {
+		it('H → L → HH → LL の並びで、値の無いものは入れない（後ろが勝つので危険を後ろに）', () => {
 			expect(toTrendLimits({ hh: 90, h: 80, l: 20, ll: 10 })).toEqual([
 				{ value: 80, side: 'upper', colorVar: 'var(--banto-warning)', label: 'H' },
-				{ value: 90, side: 'upper', colorVar: 'var(--banto-danger)', label: 'HH' },
 				{ value: 20, side: 'lower', colorVar: 'var(--banto-warning)', label: 'L' },
+				{ value: 90, side: 'upper', colorVar: 'var(--banto-danger)', label: 'HH' },
 				{ value: 10, side: 'lower', colorVar: 'var(--banto-danger)', label: 'LL' }
 			]);
 			expect(toTrendLimits({ hh: null, h: 0, l: null, ll: null })).toHaveLength(1);
 			expect(toTrendLimits(null)).toEqual([]);
+		});
+
+		it('上限と下限が重なる区間（HH 90・L 100 の値 95）は、最後に重なる色が危険', () => {
+			const lay = limitLayout(toTrendLimits({ hh: 90, h: null, l: 100, ll: 10 }), [0, 200], 200);
+			const y95 = 200 - 95;
+			const hit = lay.rects.filter((r) => r.y <= y95 && y95 <= r.y + r.height);
+			expect(hit.length).toBe(2);
+			expect(hit[hit.length - 1].colorVar).toBe(TREND_DANGER_COLOR);
 		});
 
 		it('ペンに limits があるときだけ部品のペンに載る', () => {

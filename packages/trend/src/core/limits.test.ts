@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { limitLayout, type TrendLimit } from './limits';
+import { limitLabelY, limitLayout, type TrendLimit } from './limits';
 
 const up = (value: number, label = 'H', colorVar = 'c1'): TrendLimit => ({
 	value,
@@ -65,5 +65,14 @@ describe('limitLayout', () => {
 		expect(limitLayout([up(50)], D, 0)).toEqual(empty);
 		expect(limitLayout([up(50)], [5, 5], 200)).toEqual(empty);
 		expect(limitLayout([up(50)], [NaN, 5], 200)).toEqual(empty);
+	});
+});
+
+describe('limitLabelY', () => {
+	it('上端に近いときだけ線の下、それ以外は線の上', () => {
+		expect(limitLabelY(0)).toBe(11);
+		expect(limitLabelY(11.9)).toBeCloseTo(22.9);
+		expect(limitLabelY(12)).toBe(10);
+		expect(limitLabelY(100)).toBe(98);
 	});
 });

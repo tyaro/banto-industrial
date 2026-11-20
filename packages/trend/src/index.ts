@@ -98,6 +98,7 @@ export {
 } from './core/bands';
 export {
 	limitLayout,
+	limitLabelY,
 	type TrendLimit,
 	type LimitLine,
 	type LimitRect,

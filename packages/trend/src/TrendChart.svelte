@@ -23,7 +23,7 @@
 	import type { Snippet } from 'svelte';
 	import { linearScale, niceTicks } from '@banto/charts';
 	import { bandLayout, type TrendBands } from './core/bands';
-	import { limitLayout } from './core/limits';
+	import { limitLabelY, limitLayout } from './core/limits';
 	import { cursorReadout } from './core/cursor';
 	import { drawableSeries, type TrendData } from './core/data';
 	import { envelopePath, hasFiniteValue } from './core/geometry';
@@ -405,7 +405,7 @@
 							<text
 								class="bi-trend__limit-label"
 								x={plotWidth - 4}
-								y={l.y - 2}
+								y={limitLabelY(l.y)}
 								text-anchor="end"
 								fill={l.colorVar}>{l.label}</text
 							>

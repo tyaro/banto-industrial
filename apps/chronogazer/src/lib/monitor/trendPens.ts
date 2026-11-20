@@ -28,7 +28,7 @@ export function tagIdOfTrendPenId(penId: string): number | null {
 }
 
 /**
- * 部品の管理線。並びは H → HH → L → LL（越えた区間の色は後ろが勝つので、より危険な HH・LL を後ろに）。
+ * 部品の管理線。並びは H → L → HH → LL（越えた区間の色は後ろが勝つので、注意を両方先、より危険な HH・LL を両方後ろに。上限と下限が重なる区間でも危険が勝つ）。
  * 値の無いものは入れない。
  */
 export function toTrendLimits(limits: ResolvedLimits | null): TrendLimit[] {
@@ -38,8 +38,8 @@ export function toTrendLimits(limits: ResolvedLimits | null): TrendLimit[] {
 		if (value !== null) out.push({ value, side, colorVar, label });
 	};
 	add(limits.h, 'upper', 'H', TREND_WARNING_COLOR);
-	add(limits.hh, 'upper', 'HH', TREND_DANGER_COLOR);
 	add(limits.l, 'lower', 'L', TREND_WARNING_COLOR);
+	add(limits.hh, 'upper', 'HH', TREND_DANGER_COLOR);
 	add(limits.ll, 'lower', 'LL', TREND_DANGER_COLOR);
 	return out;
 }
