@@ -333,6 +333,8 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		rewriteTagAddress(path.join(dbDir, DB_FILE_NAME), invalid.id, 'D3000');
 
 		const pen = (id: number) => ({ tagId: id, colorSlot: null });
+		// 管理線は既定で無効（ペンの属性 `limitLines`）。トレンドの「上限」のペンだけ有効にする。
+		const limitPen = (id: number) => ({ ...pen(id), limitLines: true });
 		for (const [name, kind, pens] of [
 			[GROUP_1, 'digital', [ramp.id, invalid.id, high.id]],
 			[GROUP_2, 'digital', [high.id]],
@@ -346,7 +348,7 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 				name,
 				kind,
 				attributes: {},
-				pens: pens.map(pen)
+				pens: pens.map((id) => (name === GROUP_TREND && id === high.id ? limitPen(id) : pen(id)))
 			});
 			groupIds[name] = created.id;
 		}
@@ -603,7 +605,7 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		);
 	});
 
-	test('7. トレンド: 線が伸び、時刻の目盛・選んだペンの帯・端末ごとの時間窓・止めた間の切れ目', async () => {
+	test('7. トレンド: 線が伸び、時刻の目盛・管理線・端末ごとの時間窓・止めた間の切れ目', async () => {
 		await page.goto(`/monitor?group=${groupIds[GROUP_TREND]}`);
 		await expect(tab(GROUP_TREND)).toHaveAttribute('aria-selected', 'true');
 		const trend = panel().getByRole('region', { name: `${GROUP_TREND} のトレンド表示` });
@@ -622,25 +624,16 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 			/^(\d{1,2}\/\d{1,2} )?\d{2}:\d{2}(:\d{2})?$/
 		);
 
-		// 帯の既定は、しきい値のある最初のペン（上限 = H 0、上が開いた注意の帯）。
-		// 凡例の名前は単位を含まない（単位は範囲の後に 1 回だけ。#1247）。
-		const rampPen = trend.getByRole('button', { name: new RegExp(`^${TAG_RAMP}\\s*[^（]*cnt`) });
-		const highPen = trend.getByRole('button', { name: new RegExp(`^${TAG_HIGH}`) });
-		await expect(highPen).toHaveAttribute('aria-pressed', 'true');
-		await expect(rampPen).toHaveAttribute('aria-pressed', 'false');
-		await expect(trend.locator('.bi-trend__band title')).toHaveText(['H']);
-		await expect(trend.locator('.sr-only')).toContainText(
-			`しきい値の帯: ${TAG_HIGH}（H 0 以上 注意）。`
-		);
-		// しきい値の無いペンを選ぶと帯は消え、文でもそう言う。
-		await rampPen.click();
-		await expect(rampPen).toHaveAttribute('aria-pressed', 'true');
-		await expect(trend.locator('.bi-trend__band title')).toHaveCount(0);
-		await expect(trend.locator('.sr-only')).toContainText(
-			`しきい値の帯: ${TAG_RAMP}（しきい値の設定なし）。`
-		);
-		await highPen.click();
-		await expect(trend.locator('.bi-trend__band title')).toHaveText(['H']);
+		// 管理線は既定で無効。有効にしたペン（上限 = H 0）だけ線が出て、ランプの値は 0 以上なので
+		// 越えた区間が H の色で重ね描きされる。帯（しきい値の塗り）は出さない。
+		// 凡例は押せない一覧。単位は範囲の後に 1 回だけ（#1247）。
+		await expect(trend.locator('.bi-trend__limit title')).toHaveText(['H']);
+		await expect(trend.locator('g[clip-path] path.bi-trend__line').first()).toBeAttached({
+			timeout: 20_000
+		});
+		await expect(trend.locator('.bi-trend__band')).toHaveCount(0);
+		await expect(trend.locator('.bi-trend__sr').first()).toContainText('管理線 H 0');
+		await expect(trend.getByRole('list', { name: 'ペン' }).getByRole('button')).toHaveCount(0);
 
 		// 左へパン（← キー）で追従をやめ、「最新へ」で追従に戻る。
 		const latest = trend.getByRole('button', { name: '最新へ' });

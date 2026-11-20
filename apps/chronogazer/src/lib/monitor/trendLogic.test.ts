@@ -2,8 +2,8 @@
  * 監視画面のトレンドの純関数（`trendLogic.ts`）の表。
  *
  * 追従の状態遷移（追従・左へパンで止める・右端を今へ戻すと再開）・履歴を読み直す条件
- * （追従中に毎秒は読まない・範囲を出たら・幅が変わったら・途切れの後）・しきい値の帯
- * （無い・同じ値・端の無い側）・端末ごとの時間窓（壊れた localStorage を含む）・説明文と注記・
+ * （追従中に毎秒は読まない・範囲を出たら・幅が変わったら・途切れの後）・管理線の値
+ * （ペンの上書き → タグのしきい値・bit・無効）・端末ごとの時間窓（壊れた localStorage を含む）・説明文と注記・
  * 表示の時計。
  */
 import { describe, expect, it } from 'vitest';
@@ -21,8 +21,6 @@ import {
 	FOLLOW_TOLERANCE_MS,
 	HISTORY_UNAVAILABLE_NOTE,
 	SIMULATION_NOTE,
-	TREND_DANGER_COLOR,
-	TREND_WARNING_COLOR,
 	TREND_WINDOWS_SEC,
 	TREND_WINDOW_STORAGE_KEY,
 	groupDefaultWindowSec,
@@ -30,7 +28,7 @@ import {
 	needsHistoryReload,
 	penLegendLabel,
 	rangeChangeFollow,
-	resolveBandPen,
+	resolveLimits,
 	resolveTrendWindowSec,
 	saveTrendWindowOverride,
 	startFollow,
@@ -38,7 +36,6 @@ import {
 	serverClockNow,
 	tickFollow,
 	type ServerClock,
-	thresholdBands,
 	trendDescription,
 	trendNotices,
 	trendPenInfos,
@@ -74,8 +71,7 @@ function dataOf(penIds: readonly string[], columns: readonly (number | null)[][]
 function describeOf(
 	windowSec: number,
 	pens: readonly TrendPenInfo[],
-	columns: readonly (number | null)[][],
-	bandTagId: number | null
+	columns: readonly (number | null)[][]
 ): string {
 	const penIds = pens.map((_, i) => `p${i}`);
 	return trendDescription({
@@ -84,8 +80,7 @@ function describeOf(
 		following: true,
 		pens,
 		penIds,
-		data: columns.length > 0 ? dataOf(penIds, columns) : null,
-		bandTagId
+		data: columns.length > 0 ? dataOf(penIds, columns) : null
 	});
 }
 
@@ -246,130 +241,46 @@ describe('履歴を読み直すか（needsHistoryReload）', () => {
 	});
 });
 
-describe('thresholdBands', () => {
-	it('設定なし・null は帯なし', () => {
-		expect(thresholdBands(NONE)).toEqual([]);
-		expect(thresholdBands(null)).toEqual([]);
+describe('resolveLimits', () => {
+	const tag = { thresholdHh: 90, thresholdH: 80, thresholdL: null, thresholdLl: 10 };
+
+	it('既定（limitLines が null・false）・bit は引かない', () => {
+		expect(resolveLimits({}, tag, false)).toBeNull();
+		expect(resolveLimits({ limitLines: null }, tag, false)).toBeNull();
+		expect(resolveLimits({ limitLines: false }, tag, false)).toBeNull();
+		expect(resolveLimits({ limitLines: true }, tag, true)).toBeNull();
 	});
 
-	it('4 つとも: HH..+∞ 危険、H..HH 注意、LL..L 注意、-∞..LL 危険', () => {
+	it('有効なら、上書き → タグのしきい値（上書きだけの値は 0 も使う）', () => {
+		expect(resolveLimits({ limitLines: true }, tag, false)).toEqual({
+			hh: 90,
+			h: 80,
+			l: null,
+			ll: 10
+		});
+		expect(resolveLimits({ limitLines: true, limitH: 0, limitL: 5 }, tag, false)).toEqual({
+			hh: 90,
+			h: 0,
+			l: 5,
+			ll: 10
+		});
+	});
+
+	it('タグを読めていなければ上書きだけ。4 つとも無ければ null', () => {
+		expect(resolveLimits({ limitLines: true, limitHh: 7 }, undefined, false)).toEqual({
+			hh: 7,
+			h: null,
+			l: null,
+			ll: null
+		});
+		expect(resolveLimits({ limitLines: true }, undefined, false)).toBeNull();
 		expect(
-			thresholdBands({ thresholdHh: 90, thresholdH: 80, thresholdL: 20, thresholdLl: 10 })
-		).toEqual([
-			{ from: 90, to: null, label: 'HH', colorVar: TREND_DANGER_COLOR },
-			{ from: 80, to: 90, label: 'H', colorVar: TREND_WARNING_COLOR },
-			{ from: 10, to: 20, label: 'L', colorVar: TREND_WARNING_COLOR },
-			{ from: null, to: 10, label: 'LL', colorVar: TREND_DANGER_COLOR }
-		]);
-	});
-
-	it('H だけ・L だけは反対の端が開く', () => {
-		expect(thresholdBands({ ...NONE, thresholdH: 0 })).toEqual([
-			{ from: 0, to: null, label: 'H', colorVar: TREND_WARNING_COLOR }
-		]);
-		expect(thresholdBands({ ...NONE, thresholdL: 5 })).toEqual([
-			{ from: null, to: 5, label: 'L', colorVar: TREND_WARNING_COLOR }
-		]);
-	});
-
-	it('同じ値（H = HH、L = LL）は幅 0 の注意の帯を出さない', () => {
-		expect(
-			thresholdBands({ thresholdHh: 60, thresholdH: 60, thresholdL: 30, thresholdLl: 30 })
-		).toEqual([
-			{ from: 60, to: null, label: 'HH', colorVar: TREND_DANGER_COLOR },
-			{ from: null, to: 30, label: 'LL', colorVar: TREND_DANGER_COLOR }
-		]);
-	});
-
-	it('L = H（正しい設定）は上下の注意の帯が接するだけ', () => {
-		expect(thresholdBands({ ...NONE, thresholdH: 50, thresholdL: 50 })).toEqual([
-			{ from: 50, to: null, label: 'H', colorVar: TREND_WARNING_COLOR },
-			{ from: null, to: 50, label: 'L', colorVar: TREND_WARNING_COLOR }
-		]);
-	});
-});
-
-describe('resolveBandPen', () => {
-	const pens = [
-		{ tagId: 1, thresholds: null },
-		{ tagId: 2, thresholds: { ...NONE, thresholdH: 5 } },
-		{ tagId: 3, thresholds: { ...NONE, thresholdL: 1 } }
-	];
-
-	it.each([
-		['選んでいなければ、しきい値のある最初のペン', null, 2],
-		['選んだペン（しきい値が無くても選べる）', 1, 1],
-		['選んだペンがグループに居なければ既定', 42, 2]
-	])('%s', (_name, selected, expected) => {
-		expect(resolveBandPen(pens, selected)).toBe(expected);
-	});
-
-	it('どのペンにもしきい値が無ければ null', () => {
-		expect(resolveBandPen([{ tagId: 1, thresholds: null }], null)).toBeNull();
-	});
-});
-
-describe('端末ごとの時間窓（Q4）', () => {
-	function memoryStorage(initial: Record<string, string> = {}) {
-		const data = new Map(Object.entries(initial));
-		return {
-			getItem: (key: string) => data.get(key) ?? null,
-			setItem: (key: string, value: string) => void data.set(key, value),
-			data
-		};
-	}
-
-	it('覚えが無ければグループの既定、それも無ければ 10 分', () => {
-		expect(resolveTrendWindowSec({ timeWindowSec: 300 }, null)).toBe(300);
-		expect(resolveTrendWindowSec({}, null)).toBe(DEFAULT_TREND_WINDOW_SEC);
-		expect(groupDefaultWindowSec({ timeWindowSec: 42 })).toBe(DEFAULT_TREND_WINDOW_SEC);
-		expect(resolveTrendWindowSec({ timeWindowSec: 300 }, 60)).toBe(60);
-	});
-
-	it('グループごとに覚え、既定と同じ窓を選んだら覚えを消す', () => {
-		const storage = memoryStorage();
-		saveTrendWindowOverride(storage, 1, 60, 600);
-		saveTrendWindowOverride(storage, 2, 3600, 600);
-		expect(loadTrendWindowOverride(storage, 1)).toBe(60);
-		expect(loadTrendWindowOverride(storage, 2)).toBe(3600);
-		expect(loadTrendWindowOverride(storage, 3)).toBeNull();
-		saveTrendWindowOverride(storage, 1, 600, 600);
-		expect(loadTrendWindowOverride(storage, 1)).toBeNull();
-		expect(JSON.parse(storage.data.get(TREND_WINDOW_STORAGE_KEY) ?? '')).toEqual({ '2': 3600 });
-	});
-
-	it.each([
-		['壊れた JSON', '{'],
-		['配列', '[60]'],
-		['選択肢に無い値', '{"1": 42}'],
-		['文字列の値', '{"1": "60"}']
-	])('%s は覚え無しとして読む', (_name, raw) => {
-		expect(loadTrendWindowOverride(memoryStorage({ [TREND_WINDOW_STORAGE_KEY]: raw }), 1)).toBe(
-			null
-		);
-	});
-
-	it('壊れた覚えがあっても保存できる。選択肢に無い窓は保存しない', () => {
-		const storage = memoryStorage({ [TREND_WINDOW_STORAGE_KEY]: '{' });
-		saveTrendWindowOverride(storage, 1, 60, 600);
-		expect(loadTrendWindowOverride(storage, 1)).toBe(60);
-		saveTrendWindowOverride(storage, 1, 42, 600);
-		expect(loadTrendWindowOverride(storage, 1)).toBe(60);
-	});
-
-	it('ストレージが無い・投げるときも画面を止めない', () => {
-		const throwing = {
-			getItem: () => {
-				throw new Error('denied');
-			},
-			setItem: () => {
-				throw new Error('denied');
-			}
-		};
-		expect(loadTrendWindowOverride(undefined, 1)).toBeNull();
-		expect(loadTrendWindowOverride(throwing, 1)).toBeNull();
-		expect(() => saveTrendWindowOverride(throwing, 1, 60, 600)).not.toThrow();
-		expect(() => saveTrendWindowOverride(undefined, 1, 60, 600)).not.toThrow();
+			resolveLimits(
+				{ limitLines: true },
+				{ ...tag, thresholdHh: null, thresholdH: null, thresholdLl: null },
+				false
+			)
+		).toBeNull();
 	});
 });
 
@@ -453,7 +364,7 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 				lineWidth: null,
 				marker: null,
 				markerSize: null,
-				thresholds: { thresholdHh: 90, thresholdH: 80, thresholdL: null, thresholdLl: null }
+				limits: null
 			},
 			{
 				tagId: 2,
@@ -470,7 +381,7 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 				lineWidth: null,
 				marker: null,
 				markerSize: null,
-				thresholds: null
+				limits: null
 			},
 			{
 				tagId: 9,
@@ -487,14 +398,14 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 				lineWidth: null,
 				marker: null,
 				markerSize: null,
-				thresholds: null
+				limits: null
 			}
 		]);
 		expect(penLegendLabel(pens[0])).toBe('温度（℃）');
 		expect(penLegendLabel(pens[1])).toBe('圧力');
 	});
 
-	it('説明文: ペン・単位・窓・値の範囲・選んだペンの帯', () => {
+	it('説明文: ペン・単位・窓・値の範囲', () => {
 		const pens = trendPenInfos(
 			{
 				pens: [
@@ -508,13 +419,12 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 			[10, null],
 			[85.25, 3]
 		];
-		expect(describeOf(600, pens, rows, 1)).toBe(
-			'直近 10 分のトレンド。ペン: 温度（℃）、圧力。縦軸はペンごとの自動スケール。表示中の値の範囲: 温度 10.0〜85.3、圧力 3。しきい値の帯: 温度（HH 90.0 以上 危険、H 80.0〜90.0 注意）。'
+		expect(describeOf(600, pens, rows)).toBe(
+			'直近 10 分のトレンド。ペン: 温度（℃）、圧力。縦軸はペンごとの自動スケール。表示中の値の範囲: 温度 10.0〜85.3、圧力 3。'
 		);
-		expect(describeOf(60, pens, [], 2)).toBe(
-			'直近 1 分のトレンド。ペン: 温度（℃）、圧力。表示できる値はまだありません。しきい値の帯: 圧力（しきい値の設定なし）。'
+		expect(describeOf(60, pens, [])).toBe(
+			'直近 1 分のトレンド。ペン: 温度（℃）、圧力。表示できる値はまだありません。'
 		);
-		expect(describeOf(60, pens, [], null)).toContain('しきい値の帯: なし。');
 	});
 
 	it('説明文: ペンごとの範囲を言い、合算の範囲は言わない。値が無いペンは値なし', () => {
@@ -530,15 +440,10 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 		const pens = [mk(1, 'A'), mk(2, 'B'), mk(3, 'C')] as unknown as Parameters<
 			typeof trendDescription
 		>[0]['pens'];
-		const text = describeOf(
-			60,
-			pens,
-			[
-				[0, 100, null],
-				[10, 200, null]
-			],
-			null
-		);
+		const text = describeOf(60, pens, [
+			[0, 100, null],
+			[10, 200, null]
+		]);
 		expect(text).toContain('表示中の値の範囲: A 0〜10、B 100〜200、C 値なし。');
 		expect(text).not.toContain('A 0〜200');
 		expect(text).not.toContain('全ペン共通');
@@ -559,16 +464,16 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 			[0, 1],
 			[1, 1]
 		];
-		expect(describeOf(60, bits, rows, null)).toBe(
-			'直近 1 分のトレンド。ペン: 運転中、異常。縦軸は 0 と 1 で、表示中の値は 0〜1。しきい値の帯: なし。'
+		expect(describeOf(60, bits, rows)).toBe(
+			'直近 1 分のトレンド。ペン: 運転中、異常。縦軸は 0 と 1 で、表示中の値は 0〜1。'
 		);
 		// 値が 1 種類だけのとき。
-		expect(describeOf(60, bits, [[1, 1]], null)).toContain('表示中の値は 1。');
+		expect(describeOf(60, bits, [[1, 1]])).toContain('表示中の値は 1。');
 
 		// 混在: 数値の範囲で言う。
 		const mixed = trendPenInfos(g(2, 3), withBit);
 		expect(isAllBitTrend(mixed)).toBe(false);
-		const text = describeOf(60, mixed, [[5, 1]], null);
+		const text = describeOf(60, mixed, [[5, 1]]);
 		expect(text).toContain('縦軸はペンごとの自動スケール。表示中の値の範囲: 圧力 5、運転中 1。');
 		expect(text).toContain('bit のペン（運転中）は 0 が False、1 が True。');
 
@@ -598,8 +503,7 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 			following: false,
 			pens,
 			penIds: ['p0'],
-			data,
-			bandTagId: null
+			data
 		});
 		expect(text).toMatch(/^.+〜.+ のトレンド（追従を止めています）。ペン: 圧力。/);
 		expect(text).toContain('表示中の値の範囲: 圧力 2〜7。');

@@ -228,7 +228,7 @@ test.describe.serial('chronogazer 「表示グループ」ページ（#393）', 
 	});
 
 	// #1231 PR 2b: ヒストリカル画面は共通の部品 `TrendChart` で描く。作ったグループのペンが
-	// 図（role="application"）と凡例（押すとしきい値の帯のペンを選ぶボタン）に出ることだけを見る
+	// 図（role="application"）と凡例（押せない一覧）に出ることだけを見る
 	// （記録は無いので線は出ない）。終わったら表示グループのページへ戻し、次の試験の前提を保つ。
 	test('2-2. ヒストリカル画面で、作ったグループが共通のトレンドの図で開く', async () => {
 		await page
@@ -241,11 +241,9 @@ test.describe.serial('chronogazer 「表示グループ」ページ（#393）', 
 		await expect(
 			page.getByRole('application', { name: `${GROUP_NAME} のヒストリカル` })
 		).toBeVisible();
-		const legend = page.getByRole('list', {
-			name: 'ペン（押すと、しきい値の帯をそのペンで表示します）'
-		});
-		await expect(legend.getByRole('button')).toHaveCount(2);
-		await expect(legend.getByRole('button', { name: new RegExp(TAG_A) })).toBeVisible();
+		const legend = page.getByRole('list', { name: 'ペン' });
+		await expect(legend.getByRole('listitem')).toHaveCount(2);
+		await expect(legend.getByText(new RegExp(TAG_A))).toBeVisible();
 
 		await page
 			.locator('aside nav')

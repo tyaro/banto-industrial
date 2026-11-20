@@ -6,7 +6,7 @@
 	 * リングバッファ、過去は履歴の区間）。
 	 *
 	 * 他のパネルと同じく、**グループの定義・ペンごとの表示・描画データを props で受け取るだけ**で、
-	 * 自分ではデータを取りに行かない（§3.7.4 の関所のプレビューが使い回す）。帯・説明文の
+	 * 自分ではデータを取りに行かない（§3.7.4 の関所のプレビューが使い回す）。管理線・説明文の
 	 * 判断は `trendLogic.ts`、データの持ち主は画面の `trendFeed.svelte.ts`。
 	 *
 	 * - **描画データ**は `hybridData` の結果（`data`）。表示範囲（`view`）は画面が持ち、
@@ -16,30 +16,17 @@
 	 * - **縦軸はペンごと**（部品の既定。単位は凡例に、Q7）。bit のペンは縦軸 0〜1（小数桁は指定しない）
 	 *   （`toTrendPens`。ヒストリカルと共通）。
 	 * - **系列の色はペンの色の枠（`colorSlot`）**。部品が `--banto-chart-<枠>` で塗る。
-	 * - **凡例は部品のもの**。ペンを押すとしきい値の帯を出すペンが替わる（Q5: 帯は選んだ 1 ペン
-	 *   だけ。`aria-pressed`、印は `legendBadge`）。同じタグを 2 回置いたときは、帯は先のペンで、
-	 *   押した印もそのペンだけに付く（ヒストリカルと同じ）。
-	 * - 部品の図は中が読まれないので、ペン・単位・窓・値の範囲・帯を画面外の文
+	 * - **凡例は部品のもの**（押せない一覧）。管理線はペンの属性で、部品が描く（`toTrendPens`）。
+	 * - 部品の図は中が読まれないので、ペン・単位・窓・値の範囲を画面外の文
 	 *   （`trendDescription`）で伝える（D-2 の `meterDescription` と同じ作法）。
 	 * - 時間窓は端末ごと（Q4）。選んだ窓は画面が localStorage に覚え、グループの定義には
 	 *   書かない。窓を選び直すと追従に戻る。
 	 * - `width` は**描画域そのものの幅**（余白を除く。画面が履歴の区間の数を決めるのに使う）。
 	 */
-	import {
-		TrendChart,
-		type TimeRange,
-		type TrendBands,
-		type TrendData
-	} from '@banto-industrial/trend';
+	import { TrendChart, type TimeRange, type TrendData } from '@banto-industrial/trend';
 	import type { DisplayGroup } from '#lib/banto/displayGroupsAdmin.js';
-	import {
-		thresholdBands,
-		trendDescription,
-		trendWindowLabel,
-		hasThresholds,
-		type TrendPenInfo
-	} from './trendLogic';
-	import { tagIdOfTrendPenId, toTrendPens } from './trendPens';
+	import { trendDescription, trendWindowLabel, type TrendPenInfo } from './trendLogic';
+	import { toTrendPens } from './trendPens';
 
 	interface Props {
 		group: Pick<DisplayGroup, 'name'>;
@@ -57,9 +44,6 @@
 		onRangeChange: (range: TimeRange) => void;
 		/** 「最新へ」。 */
 		onFollowLatest: () => void;
-		/** 帯を出すペンのタグ ID（`null` = 帯なし）。 */
-		bandTagId: number | null;
-		onSelectBandPen: (tagId: number) => void;
 		/** パネルの上に添える注記（履歴を読めない・不明なタグ・シミュレーション）。 */
 		notices: readonly string[];
 		/** 履歴を読み込み中。 */
@@ -81,8 +65,6 @@
 		onWindowChange,
 		onRangeChange,
 		onFollowLatest,
-		bandTagId,
-		onSelectBandPen,
 		notices,
 		historyLoading,
 		nowMs,
@@ -93,35 +75,6 @@
 	const penIds = $derived(trendPens.map((pen) => pen.id));
 	const range = $derived(view ?? { startMs: 0, endMs: windowSec * 1000 });
 
-	/** 帯のペン（同じタグが 2 回あれば先のペン）。 */
-	const bandIndex = $derived(
-		bandTagId === null ? -1 : pens.findIndex((p) => p.tagId === bandTagId)
-	);
-	const bandPen = $derived(bandIndex >= 0 ? pens[bandIndex] : null);
-	const bandPenId = $derived(bandIndex >= 0 ? (trendPens[bandIndex]?.id ?? null) : null);
-	const bands: TrendBands | null = $derived(
-		bandPen && bandPenId !== null
-			? {
-					penId: bandPenId,
-					items: thresholdBands(bandPen.thresholds).map((b) => ({
-						from: b.from,
-						to: b.to,
-						colorVar: b.colorVar ?? 'var(--banto-warning)',
-						label: b.label ?? ''
-					}))
-				}
-			: null
-	);
-
-	function onPenSelect(penId: string): void {
-		const tagId = tagIdOfTrendPenId(penId);
-		if (tagId !== null) onSelectBandPen(tagId);
-	}
-	function penHasThresholds(penId: string): boolean {
-		const tagId = tagIdOfTrendPenId(penId);
-		return hasThresholds(pens.find((p) => p.tagId === tagId)?.thresholds);
-	}
-
 	const description = $derived(
 		trendDescription({
 			windowSec,
@@ -129,8 +82,7 @@
 			following,
 			pens,
 			penIds,
-			data,
-			bandTagId: bandPen?.tagId ?? null
+			data
 		})
 	);
 </script>
@@ -170,20 +122,11 @@
 		{data}
 		height={320}
 		emptyMessage="表示できる値はまだありません"
-		{bands}
 		bind:width
 		nowMs={nowMs ?? undefined}
 		{onRangeChange}
-		{onPenSelect}
-		selectedPenId={bandPenId}
-		legendLabel="ペン（押すと、しきい値の帯をそのペンで表示します）"
-	>
-		{#snippet legendBadge(pen)}
-			{#if pen.id === bandPenId}
-				<span class="band-mark">{penHasThresholds(pen.id) ? '帯' : '帯（設定なし）'}</span>
-			{/if}
-		{/snippet}
-	</TrendChart>
+		legendLabel="ペン"
+	/>
 </section>
 
 <style>
@@ -236,14 +179,6 @@
 		background: var(--banto-warning-tint);
 		padding: 0.35rem 0.6rem;
 		border-radius: var(--banto-radius);
-	}
-
-	.band-mark {
-		padding: 0 0.3rem;
-		border-radius: var(--banto-radius);
-		background: var(--banto-warning-tint);
-		color: var(--banto-warning-tint-text);
-		font-weight: 400;
 	}
 
 	.sr-only {

@@ -86,7 +86,6 @@
 		collectPeriodMsOf,
 		groupDefaultWindowSec,
 		loadTrendWindowOverride,
-		resolveBandPen,
 		resolveTrendWindowSec,
 		saveTrendWindowOverride,
 		observeServerClock,
@@ -248,8 +247,6 @@
 	 * localStorage の覚えを読む（Q4）。
 	 */
 	let windowChoice = $state<Record<number, number | null>>({});
-	/** しきい値の帯を出すペン（グループごと。グループを替えたら既定に戻る）。 */
-	let bandChoice = $state<{ groupId: number; tagId: number } | null>(null);
 
 	const trendTarget = $derived(pollTarget && pollTarget.kind === 'trend' ? pollTarget : null);
 	const trendWindowSec = $derived.by(() => {
@@ -260,14 +257,6 @@
 		return resolveTrendWindowSec(trendTarget.attributes, override);
 	});
 	const trendPens = $derived(trendTarget ? trendPenInfos(trendTarget, tags) : []);
-	const bandTagId = $derived(
-		trendTarget
-			? resolveBandPen(
-					trendPens,
-					bandChoice && bandChoice.groupId === trendTarget.id ? bandChoice.tagId : null
-				)
-			: null
-	);
 	/** フィードが今のグループのものか（違えば前のグループの線を出さない）。 */
 	const trendFeedCurrent = $derived(
 		trendTarget !== null && trendFeed.groupId === trendTarget.id && trendFeed.view !== null
@@ -352,10 +341,6 @@
 		const groupDefault = groupDefaultWindowSec(trendTarget.attributes);
 		saveTrendWindowOverride(deviceStorage(), trendTarget.id, sec, groupDefault);
 		windowChoice = { ...windowChoice, [trendTarget.id]: sec === groupDefault ? null : sec };
-	}
-
-	function onSelectBandPen(tagId: number): void {
-		if (trendTarget) bandChoice = { groupId: trendTarget.id, tagId };
 	}
 
 	function onVisibilityChange(): void {
@@ -520,8 +505,6 @@
 							onWindowChange={onTrendWindowChange}
 							onRangeChange={(range) => trendFeed.rangeChange(range)}
 							onFollowLatest={() => trendFeed.followLatest()}
-							{bandTagId}
-							{onSelectBandPen}
 							notices={trendNoticeLines}
 							historyLoading={trendFeedCurrent && trendFeed.historyState === 'loading'}
 							nowMs={trendFeed.nowMs}

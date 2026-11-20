@@ -5,8 +5,8 @@
 	 * 包絡で描く。描画は共通の部品 `TrendChart`（`@banto-industrial/trend`）。
 	 *
 	 * - **描くタグは表示グループで決める**（2026-11-19 オーナー決定）。ペンの割当て・色・
-	 *   しきい値の帯は監視画面と同じ（`trendPenInfos`・`thresholdBands`・`resolveBandPen`）。
-	 *   タグをその場で足し引きしない。帯のペンは凡例を押して選ぶ。
+	 *   管理線（ペンの属性）は監視画面と同じ（`trendPenInfos`）。
+	 *   タグをその場で足し引きしない。
 	 * - **期間は 31 日まで**。候補（1・8・24 時間・7・31 日）・任意の開始/終了・前へ/次へ。
 	 *   外れたら読みに行かず、日本語で案内する（`checkRange`）。サーバーの 422 も日本語。
 	 * - **拡大・縮小・パンで読み直す**: 図の操作（Ctrl+ホイール・Shift+ホイール・ドラッグ・
@@ -26,7 +26,6 @@
 		TrendChart,
 		createRangeLoader,
 		type TimeRange,
-		type TrendBands,
 		type TrendData,
 		type TrendPen
 	} from '@banto-industrial/trend';
@@ -53,13 +52,7 @@
 		tagsForDisplay,
 		type LoadResult
 	} from '#lib/monitor/monitorLogic.js';
-	import {
-		hasThresholds,
-		penLegendLabel,
-		resolveBandPen,
-		thresholdBands,
-		trendPenInfos
-	} from '#lib/monitor/trendLogic.js';
+	import { penLegendLabel, trendPenInfos } from '#lib/monitor/trendLogic.js';
 	import ExportDialog from '#lib/historical/ExportDialog.svelte';
 	import {
 		HISTORY_DEBOUNCE_MS,
@@ -91,7 +84,7 @@
 		type HistoryExtras,
 		type HistoryRange
 	} from '#lib/historical/historyLogic.js';
-	import { tagIdOfTrendPenId, toTrendPens } from '#lib/monitor/trendPens.js';
+	import { toTrendPens } from '#lib/monitor/trendPens.js';
 
 	const available = isTagRegistryAvailable() && isCollectAvailable();
 	const canEdit = $derived(canWriteResources(sessionStore.role) && !sessionStore.publicViewer);
@@ -278,40 +271,6 @@
 	const trendPens: TrendPen[] = $derived(toTrendPens(pens));
 	const penIds = $derived(trendPens.map((pen) => pen.id));
 
-	let bandChoice = $state<{ groupId: number; tagId: number } | null>(null);
-	const bandTagId = $derived(
-		selectedGroup
-			? resolveBandPen(pens, bandChoice?.groupId === selectedGroup.id ? bandChoice.tagId : null)
-			: null
-	);
-	/** 帯のペン（同じタグが 2 回あれば先のペン）。 */
-	const bandIndex = $derived(
-		bandTagId === null ? -1 : pens.findIndex((p) => p.tagId === bandTagId)
-	);
-	const bandPen = $derived(bandIndex >= 0 ? pens[bandIndex] : null);
-	const bandPenId = $derived(bandIndex >= 0 ? (trendPens[bandIndex]?.id ?? null) : null);
-	const bands: TrendBands | null = $derived(
-		bandPen && bandPenId !== null
-			? {
-					penId: bandPenId,
-					items: thresholdBands(bandPen.thresholds).map((b) => ({
-						from: b.from,
-						to: b.to,
-						colorVar: b.colorVar ?? 'var(--banto-warning)',
-						label: b.label ?? ''
-					}))
-				}
-			: null
-	);
-	function onPenSelect(penId: string): void {
-		const tagId = tagIdOfTrendPenId(penId);
-		if (selectedGroup && tagId !== null) bandChoice = { groupId: selectedGroup.id, tagId };
-	}
-	function penHasThresholds(penId: string): boolean {
-		const tagId = tagIdOfTrendPenId(penId);
-		return hasThresholds(pens.find((p) => p.tagId === tagId)?.thresholds);
-	}
-
 	// --- 履歴の読み出し ---------------------------------------------------------
 
 	/** 描画域の幅（px。`TrendChart` から返る）。 */
@@ -408,8 +367,7 @@
 		historyDescription({
 			range,
 			penLabels: pens.map(penLegendLabel),
-			extent: historyExtent(data, view),
-			bandPenName: bandPen?.name ?? null
+			extent: historyExtent(data, view)
 		})
 	);
 	const emptyMessage = $derived(
@@ -610,20 +568,10 @@
 							{data}
 							{loading}
 							{emptyMessage}
-							{bands}
 							bind:width
 							{onRangeChange}
-							{onPenSelect}
-							selectedPenId={bandPenId}
-							legendLabel="ペン（押すと、しきい値の帯をそのペンで表示します）"
-						>
-							{#snippet legendBadge(pen)}
-								{#if pen.id === bandPenId}
-									<span class="band-mark">{penHasThresholds(pen.id) ? '帯' : '帯（設定なし）'}</span
-									>
-								{/if}
-							{/snippet}
-						</TrendChart>
+							legendLabel="ペン"
+						/>
 					</section>
 				{/if}
 			</div>
@@ -822,14 +770,6 @@
 		border-radius: var(--banto-radius);
 		background: var(--banto-surface);
 		min-width: 0;
-	}
-
-	.band-mark {
-		padding: 0 0.3rem;
-		border-radius: var(--banto-radius);
-		background: var(--banto-warning-tint);
-		color: var(--banto-warning-tint-text);
-		font-weight: 400;
 	}
 
 	.sr-only {

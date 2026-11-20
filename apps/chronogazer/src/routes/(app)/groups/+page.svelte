@@ -134,6 +134,7 @@
 		MAX_PEN_LABEL_CHARS,
 		MAX_PEN_UNIT_CHARS,
 		axisText,
+		type PenNumberField,
 		MAX_DISPLAY_GROUPS,
 		MAX_BUNDLE_CHARS,
 		MAX_PENS,
@@ -481,8 +482,27 @@
 		draft.pens[index][key] = value === '' ? null : Number(value);
 	}
 
-	function setPenAxisText(index: number, key: 'yMinText' | 'yMaxText', value: string): void {
-		draft.pens[index][key] = value;
+	function setPenAxisText(index: number, key: PenNumberField, value: string): void {
+		draft.pens[index].texts = { ...draft.pens[index].texts, [key]: value };
+	}
+
+	function setPenLimitLines(index: number, checked: boolean): void {
+		draft.pens[index].limitLines = checked ? true : null;
+	}
+
+	/** 管理線の入力の欄（HH → LL の並び）。placeholder にはタグのしきい値を出す。 */
+	const LIMIT_FIELDS = [
+		['limitHh', 'HH', 'thresholdHh'],
+		['limitH', 'H', 'thresholdH'],
+		['limitL', 'L', 'thresholdL'],
+		['limitLl', 'LL', 'thresholdLl']
+	] as const;
+	function limitPlaceholder(
+		tag: unknown,
+		key: 'thresholdHh' | 'thresholdH' | 'thresholdL' | 'thresholdLl'
+	): string {
+		const value = (tag as Partial<Record<typeof key, number | null>> | undefined)?.[key];
+		return typeof value === 'number' ? `タグ: ${value}` : 'タグの設定なし';
 	}
 
 	const LINE_STYLE_OPTIONS = [
@@ -1313,7 +1333,7 @@
 									type="text"
 									inputmode="decimal"
 									value={axisText(pen, 'yMin')}
-									oninput={(e) => setPenAxisText(index, 'yMinText', e.currentTarget.value)}
+									oninput={(e) => setPenAxisText(index, 'yMin', e.currentTarget.value)}
 								/>
 							</label>
 							<label class="field">
@@ -1322,10 +1342,37 @@
 									type="text"
 									inputmode="decimal"
 									value={axisText(pen, 'yMax')}
-									oninput={(e) => setPenAxisText(index, 'yMaxText', e.currentTarget.value)}
+									oninput={(e) => setPenAxisText(index, 'yMax', e.currentTarget.value)}
 								/>
 								<span class="meta">最小・最大が空の側は、タグの工学値レンジ → データの範囲。</span>
 							</label>
+							<h5 class="sub-heading">管理線</h5>
+							<label class="check">
+								<input
+									type="checkbox"
+									checked={pen.limitLines === true}
+									onchange={(e) => setPenLimitLines(index, e.currentTarget.checked)}
+								/>
+								ペン {index + 1} の管理線を引く
+							</label>
+							{#each LIMIT_FIELDS as [field, label, tagKey] (field)}
+								<label class="field">
+									<span>ペン {index + 1} の管理線の {label}</span>
+									<input
+										type="text"
+										inputmode="decimal"
+										value={axisText(pen, field)}
+										placeholder={limitPlaceholder(penTag, tagKey)}
+										oninput={(e) => setPenAxisText(index, field, e.currentTarget.value)}
+									/>
+								</label>
+							{/each}
+							<p class="note">
+								空はタグのしきい値。上書きした値は表示だけに使い、しきい値のイベントは変えません。チェックを外していても値は保存されます。
+							</p>
+							{#if penTag?.dataType === 'bit'}
+								<p class="note">bit のタグには管理線を引きません。</p>
+							{/if}
 						</fieldset>
 						{#each fieldErrors.penRows[index] ?? [] as message, i (i)}
 							<p class="field-error">{message}</p>
@@ -2116,6 +2163,13 @@
 	.sub-heading {
 		margin: 0.5rem 0 0;
 		font-size: 0.9rem;
+	}
+
+	.check {
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
+		font-size: 0.85rem;
 	}
 
 	.field .meta {

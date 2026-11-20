@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { resolveYDomain, type Bin } from '@banto-industrial/trend';
 import { trendPenInfos } from './trendLogic';
-import { tagIdOfTrendPenId, toTrendPens, trendPenId } from './trendPens';
+import { tagIdOfTrendPenId, toTrendLimits, toTrendPens, trendPenId } from './trendPens';
 
 describe('ペンの ID と部品のペン', () => {
 	it('並びとタグ ID から作り、同じタグが 2 回でも衝突しない', () => {
@@ -27,7 +27,7 @@ describe('ペンの ID と部品のペン', () => {
 				lineWidth: null,
 				marker: null,
 				markerSize: null,
-				thresholds: null
+				limits: null
 			},
 			{
 				tagId: 2,
@@ -44,7 +44,7 @@ describe('ペンの ID と部品のペン', () => {
 				lineWidth: null,
 				marker: null,
 				markerSize: null,
-				thresholds: null
+				limits: null
 			}
 		]);
 		expect(pens[0]).toEqual({
@@ -72,7 +72,7 @@ describe('ペンの ID と部品のペン', () => {
 			lineWidth: null,
 			marker: null,
 			markerSize: null,
-			thresholds: null
+			limits: null
 		};
 		const [plain, styled, bit] = toTrendPens([
 			{ ...base, isBit: false },
@@ -112,7 +112,7 @@ describe('ペンの ID と部品のペン', () => {
 			lineWidth: null,
 			marker: null,
 			markerSize: null,
-			thresholds: null
+			limits: null
 		};
 		const [num, bit, half, plain] = toTrendPens([
 			{ ...base, isBit: false },
@@ -183,12 +183,53 @@ describe('ペンの ID と部品のペン', () => {
 					lineWidth: null,
 					marker: null,
 					markerSize: null,
-					thresholds: null
+					limits: null
 				}
 			]);
 			expect(pen).toMatchObject({ yMin: 0, yMax: 1 });
 			expect('engRange' in pen).toBe(false);
 			expect(resolveYDomain(pen, bins([0, 1]))).toEqual([0, 1]);
+		});
+	});
+
+	describe('管理線', () => {
+		it('H → HH → L → LL の並びで、値の無いものは入れない（後ろが勝つので危険を後ろに）', () => {
+			expect(toTrendLimits({ hh: 90, h: 80, l: 20, ll: 10 })).toEqual([
+				{ value: 80, side: 'upper', colorVar: 'var(--banto-warning)', label: 'H' },
+				{ value: 90, side: 'upper', colorVar: 'var(--banto-danger)', label: 'HH' },
+				{ value: 20, side: 'lower', colorVar: 'var(--banto-warning)', label: 'L' },
+				{ value: 10, side: 'lower', colorVar: 'var(--banto-danger)', label: 'LL' }
+			]);
+			expect(toTrendLimits({ hh: null, h: 0, l: null, ll: null })).toHaveLength(1);
+			expect(toTrendLimits(null)).toEqual([]);
+		});
+
+		it('ペンに limits があるときだけ部品のペンに載る', () => {
+			const base = {
+				tagId: 1,
+				name: 'x',
+				unit: null,
+				decimals: null,
+				isBit: false,
+				colorSlot: 1,
+				axis: null,
+				yMin: null,
+				yMax: null,
+				engRange: null,
+				lineStyle: null,
+				lineWidth: null,
+				marker: null,
+				markerSize: null,
+				limits: null
+			} as const;
+			const [none, some] = toTrendPens([
+				base,
+				{ ...base, limits: { hh: null, h: 5, l: null, ll: null } }
+			]);
+			expect('limits' in none).toBe(false);
+			expect(some.limits).toEqual([
+				{ value: 5, side: 'upper', colorVar: 'var(--banto-warning)', label: 'H' }
+			]);
 		});
 	});
 });
