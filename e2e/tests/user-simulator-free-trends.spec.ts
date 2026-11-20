@@ -7,6 +7,9 @@
  * 3. 選択を替えると URL の `?id=` が替わる。一覧に無い `?id=` は「見つかりません」と出し、
  *    一覧の選択は使える。
  * 4. 作った人（admin）には「削除」が出る。確認のうえ消すと、一覧から消え、`?id=` が外れる。
+ * 5. （8b2a）UI で新しく作る（名前・ペン 2 本）→ 保存 → 一覧に出て `?id=` が付く。
+ * 6. （8b2a）既存のペンを 1 本外す → 再読み込みしても下書きが残る → 保存で反映され下書きは消える。
+ * 7. （8b2a）REST で先に更新してから UI で保存 → 版の食い違いの文言と「保存されたものを読み込む」。
  *
  * ## ファイル名（実行順）
  *
@@ -38,6 +41,8 @@ const FREE_TREND_PREFIX = 'E2E-FT-自由';
 const RUN_ID = String(Date.now());
 const FT_ONE = `${FREE_TREND_PREFIX}1-${RUN_ID}`;
 const FT_TWO = `${FREE_TREND_PREFIX}2-${RUN_ID}`;
+const FT_NEW = `${FREE_TREND_PREFIX}新規-${RUN_ID}`;
+const FT_EDIT = `${FREE_TREND_PREFIX}編集-${RUN_ID}`;
 
 interface NamedRow {
 	id: number;
@@ -51,6 +56,9 @@ interface ConnectionRow extends NamedRow {
 interface FreeTrendRow extends NamedRow {
 	createdBy: string;
 	canEdit: boolean;
+	revision: number;
+	timeWindowSec: number;
+	pens: { tagId: number; colorSlot: number | null }[];
 }
 
 async function fetchApiHeaders(request: APIRequestContext): Promise<ApiHeaders> {
@@ -145,6 +153,7 @@ test.describe.serial('chronogazer 自由トレンドの画面（#1207・#1231 PR
 	let headers: ApiHeaders;
 	let disabledByUs: ConnectionRow[] = [];
 	const trends: Record<string, FreeTrendRow> = {};
+	const tagIds: Record<string, number> = {};
 
 	test.beforeAll(async ({ browser }) => {
 		page = await browser.newPage();
@@ -182,6 +191,8 @@ test.describe.serial('chronogazer 自由トレンドの画面（#1207・#1231 PR
 			name: TAG_SECOND,
 			address: '40004'
 		});
+		tagIds[TAG_RAMP] = ramp.id;
+		tagIds[TAG_SECOND] = second.id;
 		const pen = (id: number) => ({ tagId: id });
 		trends[FT_ONE] = await postJson<FreeTrendRow>(page.request, headers, '/api/free-trends', {
 			name: FT_ONE,
@@ -269,5 +280,129 @@ test.describe.serial('chronogazer 自由トレンドの画面（#1207・#1231 PR
 		await expect(picker().locator('option', { hasText: FT_TWO })).toHaveCount(0);
 		await expect(page).not.toHaveURL(/id=/);
 		await expect(picker().locator('option', { hasText: FT_ONE })).toHaveCount(1);
+	});
+	test('5. UI で新しく作る（名前・ペン 2 本）と、保存して一覧に出て ?id= が付く', async () => {
+		await page.goto(`/free-trends?id=${trends[FT_ONE].id}`);
+		await page.getByTestId('free-trend-new').click();
+		const pane = page.getByTestId('free-trend-pane');
+		await expect(pane).toBeVisible();
+		await page.getByTestId('free-trend-name').fill(FT_NEW);
+		await page.getByTestId('free-trend-window').selectOption('300');
+
+		await page.getByTestId('free-trend-add-pens').click();
+		// 接続先 → 収集グループの木から選ぶ。検索で絞り、チェックして 2 件まとめて追加する。
+		await pane.getByRole('searchbox').fill('E2E-FT-');
+		const rows = pane.getByRole('row').filter({ hasText: /E2E-FT-(ランプ|第2)/ });
+		await expect(rows).toHaveCount(2);
+		await rows.nth(0).getByRole('checkbox').check();
+		await rows.nth(1).getByRole('checkbox').check();
+		await pane.getByRole('button', { name: /選んだ 2 件を追加/ }).click();
+		await pane.getByRole('button', { name: /戻る/ }).click();
+		await expect(page.getByTestId('free-trend-pen-row')).toHaveCount(2);
+
+		const created = page.waitForResponse(
+			(res) => res.url().endsWith('/api/free-trends') && res.request().method() === 'POST'
+		);
+		await page.getByTestId('free-trend-save').click();
+		const response = await created;
+		expect(response.status()).toBe(200);
+		const body = (await response.json()) as FreeTrendRow;
+		expect(body.name).toBe(FT_NEW);
+		expect(body.pens).toHaveLength(2);
+		trends[FT_NEW] = body;
+
+		await expect(page).toHaveURL(new RegExp(`/free-trends\\?id=${body.id}$`));
+		await expect(picker().locator('option', { hasText: FT_NEW })).toHaveCount(1);
+		await expect(picker()).toHaveValue(String(body.id));
+		await expect(page.getByTestId('free-trend-pane')).toHaveCount(0);
+		await expect(page.getByTestId('free-trend-draft-badge')).toHaveCount(0);
+	});
+
+	test('6. 既存のペンを外すと下書きになり、再読み込みしても残り、保存で反映される', async () => {
+		// 属性つきのペンでも保存で落ちないことを見るため、REST で線種を付けてから UI で触る。
+		const seeded = await page.request.post('/api/free-trends', {
+			headers,
+			data: {
+				name: FT_EDIT,
+				timeWindowSec: 600,
+				pens: [
+					{ tagId: tagIds[TAG_RAMP], colorSlot: 4, lineStyle: 'dashed', lineWidth: 2 },
+					{ tagId: tagIds[TAG_SECOND], colorSlot: null }
+				]
+			}
+		});
+		expect(seeded.ok(), await seeded.text()).toBe(true);
+		const row = (await seeded.json()) as FreeTrendRow;
+		trends[FT_EDIT] = row;
+
+		await page.goto(`/free-trends?id=${row.id}`);
+		await page.getByTestId('free-trend-edit').click();
+		await expect(page.getByTestId('free-trend-pen-row')).toHaveCount(2);
+		await page.getByTestId('free-trend-pen-remove').nth(1).click();
+		await expect(page.getByTestId('free-trend-pen-row')).toHaveCount(1);
+		await expect(page.getByTestId('free-trend-draft-discard')).toBeVisible();
+
+		await page.reload();
+		await expect(page.getByTestId('free-trend-draft-badge')).toBeVisible();
+		await page.getByTestId('free-trend-edit').click();
+		await expect(page.getByTestId('free-trend-pen-row')).toHaveCount(1);
+
+		const updated = page.waitForResponse(
+			(res) => res.url().endsWith(`/api/free-trends/${row.id}`) && res.request().method() === 'PUT'
+		);
+		await page.getByTestId('free-trend-save').click();
+		const response = await updated;
+		expect(response.status()).toBe(200);
+		const body = (await response.json()) as FreeTrendRow & {
+			pens: { tagId: number; lineStyle: string | null; lineWidth: number | null }[];
+		};
+		expect(body.pens).toHaveLength(1);
+		// 保存済みの属性は、下書きと保存でそのまま保たれる。
+		expect(body.pens[0]).toMatchObject({
+			tagId: tagIds[TAG_RAMP],
+			lineStyle: 'dashed',
+			lineWidth: 2
+		});
+		trends[FT_EDIT] = body;
+
+		await expect(page.getByTestId('free-trend-pane')).toHaveCount(0);
+		await expect(page.getByTestId('free-trend-draft-badge')).toHaveCount(0);
+		await page.reload();
+		await expect(page.getByTestId('free-trend-draft-badge')).toHaveCount(0);
+	});
+
+	test('7. 先に REST で更新されていると、保存は版の食い違いで止まり、読み込み直せる', async () => {
+		const target = trends[FT_EDIT];
+		await page.goto(`/free-trends?id=${target.id}`);
+		await page.getByTestId('free-trend-edit').click();
+		await page.getByTestId('free-trend-name').fill(`${FT_EDIT}-UI`);
+
+		// UI が読んだ版のあとに、別の人が先に変えた。
+		const other = await page.request.put(`/api/free-trends/${target.id}`, {
+			headers,
+			data: {
+				name: `${FT_EDIT}-REST`,
+				timeWindowSec: 600,
+				pens: [{ tagId: tagIds[TAG_RAMP], colorSlot: null }],
+				expectedRevision: target.revision
+			}
+		});
+		expect(other.ok(), await other.text()).toBe(true);
+
+		const conflicted = page.waitForResponse(
+			(res) =>
+				res.url().endsWith(`/api/free-trends/${target.id}`) && res.request().method() === 'PUT'
+		);
+		await page.getByTestId('free-trend-save').click();
+		expect((await conflicted).status()).toBe(409);
+		const notice = page.getByTestId('free-trend-conflict');
+		await expect(notice).toContainText('ほかの人が先に変えました');
+		// 押すまで下書きは残る。
+		await expect(page.getByTestId('free-trend-name')).toHaveValue(`${FT_EDIT}-UI`);
+
+		await page.getByTestId('free-trend-load-saved').click();
+		await expect(page.getByTestId('free-trend-conflict')).toHaveCount(0);
+		await expect(page.getByTestId('free-trend-name')).toHaveValue(`${FT_EDIT}-REST`);
+		await expect(page.getByTestId('free-trend-draft-badge')).toHaveCount(0);
 	});
 });

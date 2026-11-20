@@ -189,6 +189,12 @@ test.describe.serial('ChronoGazer viewer-public mode', () => {
 		// 編集者向けの表示グループへのリンクは、本文にも（サイドバーと同じく）出さない。
 		await expect(page.getByText('表示グループが未設定です')).toBeVisible();
 		await expect(page.getByRole('link', { name: '表示グループ' })).toHaveCount(0);
+
+		// 自由トレンド（#1207・#1231 PR 8b2a）: 閲覧公開は開くだけ。作る・編集するボタンを出さない。
+		await page.goto('/free-trends');
+		await expect(page.getByText('保存された自由トレンドはありません')).toBeVisible();
+		await expect(page.getByTestId('free-trend-new')).toHaveCount(0);
+		await expect(page.getByTestId('free-trend-edit')).toHaveCount(0);
 	});
 
 	test('4. "ログイン" leads to the setup screen; signing in switches to a normal session', async () => {
