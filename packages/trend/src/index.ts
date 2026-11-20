@@ -121,7 +121,15 @@ export {
 	type BitBandLayout,
 	type BitSpan
 } from './core/bitBands';
-export { binAt, cursorReadout, type CursorValue } from './core/cursor';
+export {
+	binAt,
+	cursorDiff,
+	cursorReadout,
+	formatDuration,
+	placeCursor,
+	type CursorPair,
+	type CursorValue
+} from './core/cursor';
 export {
 	createRangeLoader,
 	isAbortError,
