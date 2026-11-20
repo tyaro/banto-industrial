@@ -19,10 +19,28 @@ fn payload(name: &str, tag_ids: &[i64]) -> FreeTrendPayload {
     }
 }
 
-/// REST のセッションと同じ、名前だけのアカウントの主体（ID は保存の中で `users` から引く）。
+/// 試験で使う名前のアカウントと、その `users.id`（`localDesktop` は予約名と同じ名前の古いアカウント）。
+/// ID は [`service_with_tags`] がこの値で入れる。
+const SEEDED_USERS: [(&str, i64); 4] = [
+    ("alice", 101),
+    ("bob", 102),
+    ("eve", 103),
+    ("localDesktop", 104),
+];
+
+/// 認証の時点の ID を持つアカウントの主体（REST の stamp・Tauri の `UserIdentity.id` と同じ）。
+/// 名前は [`SEEDED_USERS`] の ID に写す（無い名前は `users` に無い ID）。
 fn account(username: &str, role: Role) -> FreeTrendActor {
+    let user_id = SEEDED_USERS
+        .iter()
+        .find(|(name, _)| *name == username)
+        .map_or(999, |(_, id)| *id);
+    account_with_id(username, user_id, role)
+}
+
+fn account_with_id(username: &str, user_id: i64, role: Role) -> FreeTrendActor {
     FreeTrendActor::Account {
-        user_id: None,
+        user_id,
         username: username.to_string(),
         role,
     }
@@ -40,8 +58,18 @@ async fn seed_user(pool: &SqlitePool, username: &str) -> i64 {
     .expect("seed user")
 }
 
-/// 試験で使う名前のアカウント（`localDesktop` は予約名と同じ名前の古いアカウント）。
-const SEEDED_USERS: [&str; 4] = ["alice", "bob", "eve", "localDesktop"];
+/// `users` に ID を決めてアカウントを足す。
+async fn seed_user_with_id(pool: &SqlitePool, username: &str, id: i64) {
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, display_name) VALUES (?, ?, 'x', ?)",
+    )
+    .bind(id)
+    .bind(username)
+    .bind(username)
+    .execute(pool)
+    .await
+    .expect("seed user");
+}
 
 fn fields(err: BantoError) -> Vec<String> {
     match err {
@@ -55,8 +83,8 @@ fn fields(err: BantoError) -> Vec<String> {
 async fn service_with_tags(n: usize) -> (FreeTrendService, TagService, Vec<i64>, SqlitePool) {
     let pool = crate::db::init_db_memory().await.expect("init_db_memory");
     let (tags, ids) = seed_tags(&pool, n).await;
-    for username in SEEDED_USERS {
-        seed_user(&pool, username).await;
+    for (username, id) in SEEDED_USERS {
+        seed_user_with_id(&pool, username, id).await;
     }
     (FreeTrendService::new(pool.clone()), tags, ids, pool)
 }
@@ -141,24 +169,47 @@ fn pen_payload_ignores_hub_tag_and_requires_tag_id() {
 fn actor_mapping_uses_the_session_origin_not_the_name() {
     // grant の無いセッションはアカウント（名前が予約名でも）。
     assert_eq!(
-        FreeTrendActor::from_session("localDesktop", "viewer", None),
+        FreeTrendActor::from_session("localDesktop", "viewer", None, Some(104)),
         account("localDesktop", Role::Viewer)
     );
     assert_eq!(
-        FreeTrendActor::from_session("localDesktop", "editor", Some("localDesktop")),
+        FreeTrendActor::from_session("localDesktop", "editor", Some("localDesktop"), None),
         FreeTrendActor::LocalDesktop { role: Role::Editor }
     );
     assert_eq!(
-        FreeTrendActor::from_session("public", "viewer", Some("publicViewer")),
+        FreeTrendActor::from_session("public", "viewer", Some("publicViewer"), None),
         FreeTrendActor::ReadOnly
     );
     assert_eq!(
-        FreeTrendActor::from_session("someone", "superuser", None),
+        FreeTrendActor::from_session("someone", "superuser", None, Some(1)),
         FreeTrendActor::ReadOnly
     );
     assert!(account("a", Role::Viewer).can_create());
     assert!(FreeTrendActor::LocalDesktop { role: Role::Viewer }.can_create());
     assert!(!FreeTrendActor::ReadOnly.can_create());
+}
+
+/// オーナーの P2（2026-11-20）: REST のアカウントの主体は stamp の ID をそのまま使い、名前から引き
+/// 直さない。stamp の無いアカウントのセッションは名前で補わず開くだけ。
+#[test]
+fn from_session_takes_the_stamp_account_id_and_refuses_a_session_without_one() {
+    // 名前が別のアカウントの名前でも、ID は stamp の物。
+    assert_eq!(
+        FreeTrendActor::from_session("alice", "viewer", None, Some(7)),
+        account_with_id("alice", 7, Role::Viewer)
+    );
+    assert_eq!(
+        FreeTrendActor::from_session("alice", "editor", None, Some(101)),
+        account_with_id("alice", 101, Role::Editor)
+    );
+    let unstamped = FreeTrendActor::from_session("alice", "admin", None, None);
+    assert_eq!(unstamped, FreeTrendActor::ReadOnly);
+    assert!(!unstamped.can_create());
+    // grant のセッションは stamp を見ない（`localDesktop` は ID なしで書ける）。
+    assert_eq!(
+        FreeTrendActor::from_session("localDesktop", "viewer", Some("localDesktop"), Some(3)),
+        FreeTrendActor::LocalDesktop { role: Role::Viewer }
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -341,7 +392,7 @@ async fn ownership_decides_who_can_change_and_can_edit_follows_it() {
 
 /// オーナーの P2（2026-11-20）: 作った人はアカウントの ID で見分ける。viewer の alice が作る →
 /// alice を消す → 同じ名前で作り直す。新しい alice は名前が同じでも別人（変更・削除は `Forbidden`、
-/// `canEdit` は false）、editor は変えられる。名前の無い主体（`users` に無い REST のセッション）は書けない。
+/// `canEdit` は false）、editor は変えられる。消した ID の主体（認証の後に消されたアカウント）は書けない。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_recreated_account_with_the_same_name_is_not_the_owner() {
     let (service, _tags, ids, pool) = service_with_tags(1).await;
@@ -362,15 +413,9 @@ async fn a_recreated_account_with_the_same_name_is_not_the_owner() {
         stored,
         ("account".to_string(), Some(old_id), "alice".to_string())
     );
-    // Tauri と同じ、ID を持つ主体でも同じ人。
-    let alice_by_id = FreeTrendActor::Account {
-        user_id: Some(old_id),
-        username: "alice".to_string(),
-        role: Role::Viewer,
-    };
-    assert!(service.get(&alice_by_id, mine.id).await.unwrap().can_edit);
+    assert!(service.get(&alice, mine.id).await.unwrap().can_edit);
 
-    // 消した直後: 名前が `users` に無い REST の主体は書けない。
+    // 消した直後: 消した ID の主体は書けない（作った物の ID と一致していても）。
     sqlx::query("DELETE FROM users WHERE id = ?")
         .bind(old_id)
         .execute(&pool)
@@ -385,15 +430,9 @@ async fn a_recreated_account_with_the_same_name_is_not_the_owner() {
     // 同じ名前で作り直す: ID は再利用されない（AUTOINCREMENT）。
     let new_id = seed_user(&pool, "alice").await;
     assert_ne!(new_id, old_id);
+    let new_alice = account_with_id("alice", new_id, Role::Viewer);
     let edit = payload("A改", &ids);
-    for actor in [
-        alice.clone(),
-        FreeTrendActor::Account {
-            user_id: Some(new_id),
-            username: "alice".to_string(),
-            role: Role::Viewer,
-        },
-    ] {
+    for actor in [alice.clone(), new_alice.clone()] {
         assert!(!service.get(&actor, mine.id).await.unwrap().can_edit);
         assert!(!service.list(&actor).await.unwrap()[0].can_edit);
         assert!(matches!(
@@ -406,7 +445,10 @@ async fn a_recreated_account_with_the_same_name_is_not_the_owner() {
         ));
     }
     // 新しい alice の作った物は新しい alice の物。
-    let theirs = service.create(&alice, &payload("N", &[])).await.unwrap();
+    let theirs = service
+        .create(&new_alice, &payload("N", &[]))
+        .await
+        .unwrap();
     assert!(theirs.can_edit);
     // editor は消えたアカウントの物も変えられ、表示用の名前は当時のまま残る。
     let editor = account("eve", Role::Editor);
@@ -423,7 +465,7 @@ async fn the_201st_free_trend_is_refused() {
         sqlx::query(
             "INSERT INTO free_trends \
              (name, created_by_kind, created_by_user_id, created_by, updated_by) \
-             VALUES (?, 'account', 1, 'alice', 'alice')",
+             VALUES (?, 'account', 101, 'alice', 'alice')",
         )
         .bind(format!("t{i}"))
         .execute(&pool)

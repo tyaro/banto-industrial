@@ -459,3 +459,66 @@ async fn a_recreated_account_with_the_same_name_cannot_change_the_old_free_trend
     let (status, _) = send(&router, &editor, "DELETE", &path, None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
+
+/// #1252 のオーナー P2（2026-11-20）: 作った人の判定は認証の時点のアカウントの ID（stamp）を使い、
+/// 名前から引き直さない。照合の無い `AuthState`（stamp の付かないアカウントのセッション）では、
+/// 自分が作った物でも editor でも書けない（作成・変更・削除は 403 で `denied`、`canEdit` は false）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_account_session_without_a_stamp_cannot_write_free_trends() {
+    let (router, _admin, editor, _viewer, pool, _hub, _auth) =
+        crate::rest::tests::router_with_role_tokens_pool_hub_and_auth_validated(false).await;
+    let (_tags, ids) = seed_tags(&pool, 1).await;
+    // editor 本人の ID で作った物（stamp があれば作った人として書ける）。
+    let editor_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'editor'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let owner = crate::free_trends::FreeTrendActor::Account {
+        user_id: editor_id,
+        username: "editor".to_string(),
+        role: Role::Editor,
+    };
+    let payload: crate::free_trends::FreeTrendPayload =
+        serde_json::from_value(body("A", &ids, None)).unwrap();
+    let mine = crate::free_trends::FreeTrendService::new(pool.clone())
+        .create(&owner, &payload)
+        .await
+        .expect("create");
+    let path = format!("/api/free-trends/{}", mine.id);
+
+    let who = Who::Session(&editor);
+    let (status, list) = send(&router, &who, "GET", "/api/free-trends", None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(can_edit_by_name(&list), vec![("A".to_string(), false)]);
+    let (status, one) = send(&router, &who, "GET", &path, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(one["canEdit"], false);
+    let (status, _) = send(
+        &router,
+        &who,
+        "POST",
+        "/api/free-trends",
+        Some(body("B", &ids, None)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(&router, &who, "PUT", &path, Some(body("A改", &ids, None))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(&router, &who, "DELETE", &path, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let denied: Vec<_> = audit_rows(&pool)
+        .await
+        .into_iter()
+        .filter(|row| row.1 == "denied")
+        .collect();
+    assert_eq!(denied.len(), 3, "{denied:?}");
+    assert!(denied
+        .iter()
+        .all(|row| row.2 == "rest" && row.3 == "editor" && row.4 == "editor"));
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM free_trends")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}

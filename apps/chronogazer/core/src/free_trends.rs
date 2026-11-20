@@ -62,10 +62,14 @@
 //! - アカウントの削除（banto の `UsersService`）は `users` の行を消す（論理削除ではない）。`users.id` は
 //!   AUTOINCREMENT なので消した ID は再利用されず、消したアカウントの物はだれの物でもなくなる（変えられる
 //!   のは editor 以上だけ）。`created_by_user_id` に FK は張らない（0109 の注記）。
-//! - 主体の ID: Tauri はアカウントのセッションの `UserIdentity.id` をそのまま渡す。REST のセッションは
-//!   名前（`identity.id`）しか持たないので、保存（・読み取り）のトランザクションの中で `users` から
-//!   名前 → ID を引く（[`FreeTrendActor::Account`] の `user_id: None`）。引けなければ書けない主体として
-//!   扱う（作成・変更・削除は `Forbidden`、`canEdit` は false）。
+//! - 主体の ID は認証の時点のアカウントの ID を使い、名前から引き直さない（2026-11-20 オーナーの P2。
+//!   認証と判定の間にアカウントの行が入れ替わっても、認証された主体と判定の主体がずれない）。Tauri は
+//!   アカウントのセッションの `UserIdentity.id`、REST は banto の `AuthenticatedSession::stamp` の
+//!   `account_id`（本番の `user_auth_state` は `SessionValidation::Lookup` なので、アカウントの
+//!   セッションには必ず付く）。REST のアカウントのセッションに stamp が無ければ（照合の無い
+//!   `AuthState`）、名前で補わず開くだけの主体にする（[`FreeTrendActor::from_session`]）。
+//! - 保存（・読み取り）のトランザクションの中で、その ID が今も `users` にあるかを確かめ、無ければ
+//!   書けない主体として扱う（作成・変更・削除は `Forbidden`、`canEdit` は false。[`writer_on`]）。
 //! - 断ったときは経路の側が `denied` を監査して 403（`Forbidden`）にする。サービスは権限が無いとき
 //!   `BantoError::Forbidden` を返すだけ（作った人の確認は保存と同じトランザクションの中）。
 //!
@@ -140,10 +144,11 @@ impl OwnerKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FreeTrendActor {
     /// アカウントのログイン（REST の grant の無いセッション、Tauri のアカウントのセッション）。
-    /// `user_id` は `users.id`。`None` は保存のトランザクションの中で `username` から引く（REST の
-    /// セッションは名前しか持たない。モジュール doc「権限」）。`username` は記録の表示用の名前。
+    /// `user_id` は認証の時点の `users.id`（REST は `AuthenticatedSession::stamp` の `account_id`、
+    /// Tauri は `UserIdentity.id`。モジュール doc「権限」）。`username` は記録の表示用の名前で、判定に
+    /// 使わない。
     Account {
-        user_id: Option<i64>,
+        user_id: i64,
         username: String,
         role: Role,
     },
@@ -154,17 +159,27 @@ pub enum FreeTrendActor {
 }
 
 impl FreeTrendActor {
-    /// REST のセッションの主体から（`grant` は `AuthenticatedSession::grant` の kind。`None` = アカウント）。
-    /// 役割が読めないセッションは開くだけにする（閉じる側に倒す）。
-    pub fn from_session(username: &str, role: &str, grant: Option<&str>) -> Self {
+    /// REST のセッションの主体から（`grant` は `AuthenticatedSession::grant` の kind。`None` = アカウント。
+    /// `account_id` は `AuthenticatedSession::stamp` の `account_id`）。役割が読めないセッションと、
+    /// stamp の無いアカウントのセッション（照合の無い `AuthState`）は開くだけにする（閉じる側に倒す。
+    /// 名前から ID を補わない）。
+    pub fn from_session(
+        username: &str,
+        role: &str,
+        grant: Option<&str>,
+        account_id: Option<i64>,
+    ) -> Self {
         let Ok(role) = Role::from_str(role) else {
             return Self::ReadOnly;
         };
         match grant {
-            None => Self::Account {
-                user_id: None,
-                username: username.to_string(),
-                role,
+            None => match account_id {
+                Some(user_id) => Self::Account {
+                    user_id,
+                    username: username.to_string(),
+                    role,
+                },
+                None => Self::ReadOnly,
             },
             Some(kind) if kind == crate::local_grant::LOCAL_DESKTOP_GRANT_KIND => {
                 Self::LocalDesktop { role }
@@ -180,7 +195,7 @@ impl FreeTrendActor {
         }
     }
 
-    /// 作れる種類・役割か（viewer 以上のアカウント・`localDesktop`）。REST のアカウントが今も
+    /// 作れる種類・役割か（viewer 以上のアカウント・`localDesktop`）。アカウントの ID が今も
     /// `users` にあるかは、保存のトランザクションの中で確かめる（[`writer_on`]）。
     pub fn can_create(&self) -> bool {
         !matches!(self, Self::ReadOnly)
@@ -221,7 +236,7 @@ enum Writer<'a> {
         name: &'a str,
         role: Role,
     },
-    /// 書けない主体（開くだけ、または REST の名前が `users` に無い）。
+    /// 書けない主体（開くだけ、またはアカウントの ID が `users` に無い）。
     None,
 }
 
@@ -241,8 +256,9 @@ impl Writer<'_> {
     }
 }
 
-/// 主体を確かめる（モジュール doc「権限」）。REST のアカウント（`user_id: None`）は `users` から名前 →
-/// ID を引き、無ければ書けない主体にする。呼ぶ側は同じトランザクションで保存・読み取りを行う。
+/// 主体を確かめる（モジュール doc「権限」）。アカウントは認証の時点の ID をそのまま使い（名前から
+/// 引き直さない）、その ID が今も `users` に無ければ書けない主体にする（認証の後に消されたアカウント。
+/// ID は再利用されない）。呼ぶ側は同じトランザクションで保存・読み取りを行う。
 async fn writer_on<'a>(
     conn: &mut SqliteConnection,
     actor: &'a FreeTrendActor,
@@ -253,17 +269,14 @@ async fn writer_on<'a>(
             username,
             role,
         } => {
-            let id = match user_id {
-                Some(id) => Some(*id),
-                None => sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
-                    .bind(username)
-                    .fetch_optional(&mut *conn)
-                    .await
-                    .map_err(storage)?,
-            };
-            match id {
-                Some(id) => Writer::Some {
-                    owner: Owner::Account(id),
+            let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE id = ?")
+                .bind(user_id)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(storage)?;
+            match exists {
+                Some(_) => Writer::Some {
+                    owner: Owner::Account(*user_id),
                     name: username,
                     role: *role,
                 },

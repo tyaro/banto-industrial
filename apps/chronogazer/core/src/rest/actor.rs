@@ -98,10 +98,15 @@ pub(crate) enum Actor {
     /// `Some(kind)` = grant のセッション（`localDesktop`・`publicViewer`）。アカウントか
     /// どうかは名前ではなくこれで見分ける（予約名と同じ名前の古いアカウントがありうる、
     /// `crate::local_grant::RESERVED_USERNAMES`。自由トレンドの権限 #1207・#1231 PR 8a）。
+    /// `account_id` は認証の時点のアカウントの `users.id`（`AuthenticatedSession::stamp` の
+    /// `account_id`）。grant のセッションと、照合（`SessionValidation::Lookup`）の無い
+    /// `AuthState` のセッションは `None`。自由トレンドの作った人の判定はこれを使い、名前から
+    /// ID を引き直さない（2026-11-20 オーナーの P2）。
     Session {
         username: String,
         role: String,
         grant: Option<String>,
+        account_id: Option<i64>,
     },
     /// API キー。`label` は監査に載せる `名前（prefix）`。
     ApiKey {
@@ -153,7 +158,13 @@ impl Actor {
                 username,
                 role,
                 grant,
-            } => crate::free_trends::FreeTrendActor::from_session(username, role, grant.as_deref()),
+                account_id,
+            } => crate::free_trends::FreeTrendActor::from_session(
+                username,
+                role,
+                grant.as_deref(),
+                *account_id,
+            ),
             Self::ApiKey { .. } => crate::free_trends::FreeTrendActor::ReadOnly,
         }
     }
@@ -230,6 +241,7 @@ impl<S: Send + Sync> FromRequestParts<S> for Actor {
                 username: session.identity.id.clone(),
                 role: session.identity.role.clone(),
                 grant: session.grant.as_ref().map(|kind| kind.as_str().to_string()),
+                account_id: session.stamp.map(|stamp| stamp.account_id),
             });
         }
         Err(unauthorized_response())
@@ -535,6 +547,7 @@ mod tests {
             username: "v".into(),
             role: "viewer".into(),
             grant: None,
+            account_id: Some(1),
         };
         assert!(viewer.can_read());
         assert!(!viewer.can_configure());
@@ -543,6 +556,7 @@ mod tests {
             username: "e".into(),
             role: "editor".into(),
             grant: None,
+            account_id: Some(1),
         };
         assert!(editor.can_configure());
         assert!(editor.can_operate_collect());
@@ -550,6 +564,7 @@ mod tests {
             username: "x".into(),
             role: "superuser".into(),
             grant: None,
+            account_id: Some(1),
         };
         assert!(!unknown.can_read());
     }

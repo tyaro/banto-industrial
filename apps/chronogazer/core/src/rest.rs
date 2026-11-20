@@ -2647,6 +2647,25 @@ mod tests {
         crate::hub::HubService,
         AuthState,
     ) {
+        router_with_role_tokens_pool_hub_and_auth_validated(true).await
+    }
+
+    /// [`router_with_role_tokens_pool_hub_and_auth`] の照合を選べる版。`lookup = false` は
+    /// `SessionValidation::DisabledNoRevocation`（アカウントのセッションに stamp が付かない。
+    /// 自由トレンドが stamp の無いアカウントのセッションを書けない主体にすることの試験用、
+    /// #1252 のオーナー P2）。
+    #[allow(clippy::type_complexity)]
+    pub(super) async fn router_with_role_tokens_pool_hub_and_auth_validated(
+        lookup: bool,
+    ) -> (
+        Router,
+        String,
+        String,
+        String,
+        sqlx::SqlitePool,
+        crate::hub::HubService,
+        AuthState,
+    ) {
         let pool = migrate_memory().await.expect("migrate_memory");
         let (tx, _rx) = broadcast::channel(16);
         let users = UsersService::new(Db::Sqlite(pool.clone()));
@@ -2687,7 +2706,11 @@ mod tests {
                     }
                 })
             },
-            SessionValidation::lookup(user_session_lookup(users.clone())),
+            if lookup {
+                SessionValidation::lookup(user_session_lookup(users.clone()))
+            } else {
+                SessionValidation::DisabledNoRevocation
+            },
         );
 
         let admin_token = auth

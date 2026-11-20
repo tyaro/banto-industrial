@@ -2913,7 +2913,7 @@ async fn free_trends_session(
     let actor = match session {
         // 作った人はアカウントの ID で見分ける（名前を同じにして作り直したアカウントは別人）。
         DesktopSession::Account(account) => FreeTrendActor::Account {
-            user_id: Some(account.id),
+            user_id: account.id,
             username: account.username,
             role: account.role,
         },
