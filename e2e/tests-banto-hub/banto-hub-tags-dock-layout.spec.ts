@@ -10,6 +10,10 @@
  * 4. 広い幅から狭い幅へ切り替わる途中の一時の配置は保存しない（タグモニタの 7 と同じ型）。
  * 5. #1159: 1366×768・125%（CSS では 1093×614）で右の属性を含めて「保存」まで届き、狭い幅では
  *    編集がモーダルで届く。畳んだ右も帯のタブから開ける。
+ * 6. PR #1269 のレビュー: 広い幅で属性を隠してから狭い幅で編集を始め、広い幅へ戻すと、属性が
+ *    出て編集のフォームが見え、入力した値が残っている（値はページの状態。DOM は入れ替わる）。
+ * 7. PR #1269 のレビュー: 狭い幅で「表示」メニューから属性をキーボードで開くと、フォーカスが
+ *    引き出した pane の中へ入り、Esc で閉じてフォーカスが帯のタブへ戻る。
  *
  * どのテストも既定の配置で終える（後の spec に残さない）。ファイル名は
  * `banto-hub-smoke.spec.ts` より辞書順で後（`banto-hub-auth.ts` の注記）。前提データは REST で
@@ -289,6 +293,70 @@ test.describe.serial('banto-hub タグ登録のドックの枠 (#1253)', () => {
 		await page.getByPlaceholder('名前・アドレスで検索').fill('');
 		// 既定の配置のまま終える。
 		await expect(treeToggle()).toHaveAttribute('aria-pressed', 'true');
+		await expect(attributeToggle()).toHaveAttribute('aria-pressed', 'true');
+	});
+	test('6. 狭い幅で始めた編集は、隠していた属性を広い幅へ戻したときに出す（PR #1269 のレビュー）', async () => {
+		await openTags();
+		const hidden = dockSetting('PUT');
+		await attributeToggle().click();
+		await expect(attributeToggle()).toHaveAttribute('aria-pressed', 'false');
+		expect((await hidden).ok()).toBe(true);
+
+		try {
+			await page.setViewportSize(NARROW);
+			await expect(treeToggle()).toHaveCount(0);
+			await openEditor();
+			await expect(editDrawer()).toBeVisible();
+			await editDrawer().getByLabel('単位').fill('kPa');
+		} finally {
+			await page.setViewportSize(WIDE);
+		}
+		await expect(editDrawer()).toHaveCount(0);
+		await expect(attributeToggle()).toHaveAttribute('aria-pressed', 'true');
+		await expect(editPane()).toBeVisible();
+		await expect(editPane().getByLabel('単位')).toHaveValue('kPa');
+
+		// 後片付け: 入力を捨てて閉じ、既定の配置へ戻す。
+		page.once('dialog', (dialog) => void dialog.accept());
+		await editPane().getByRole('button', { name: '閉じる' }).click();
+		await expect(editPane()).toHaveCount(0);
+		await page.getByPlaceholder('名前・アドレスで検索').fill('');
+		await resetLayout();
+		await expect(treeToggle()).toHaveAttribute('aria-pressed', 'true');
+		await expect(attributeToggle()).toHaveAttribute('aria-pressed', 'true');
+	});
+
+	test('7. 狭い幅の「表示」→「属性」をキーボードで開くと、Esc で閉じて帯のタブへ戻る（PR #1269 のレビュー）', async () => {
+		await page.setViewportSize(NARROW);
+		try {
+			await openTags();
+			await expect(treeToggle()).toHaveCount(0);
+			const flyout = page.locator('[data-dock-flyout="right"]');
+			const bandTab = page.locator('button[data-dock-band-tab="right"]');
+			await expect(bandTab).toBeVisible();
+
+			const viewMenu = page.getByTestId('tag-view-menu');
+			await viewMenu.focus();
+			await page.keyboard.press('Enter');
+			const item = page.getByRole('menuitem', { name: '属性', exact: true });
+			await expect(item).toBeVisible();
+			await item.focus();
+			await page.keyboard.press('Enter');
+
+			await expect(page.getByTestId('tag-attribute-empty')).toBeVisible();
+			// フォーカスは引き出した pane の中（「表示」に戻っていない）。
+			await expect
+				.poll(() =>
+					page.evaluate(() => !!document.activeElement?.closest('[data-dock-flyout="right"]'))
+				)
+				.toBe(true);
+
+			await page.keyboard.press('Escape');
+			await expect(flyout).toBeHidden();
+			await expect(bandTab).toBeFocused();
+		} finally {
+			await page.setViewportSize(WIDE);
+		}
 		await expect(attributeToggle()).toHaveAttribute('aria-pressed', 'true');
 	});
 });

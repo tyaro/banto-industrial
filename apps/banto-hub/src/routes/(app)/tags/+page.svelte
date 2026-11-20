@@ -28,10 +28,16 @@
 	 * 今までどおり URL（`?target=`・`&tab=`）、パネルの配置は利用者ごとの保存
 	 * （`#lib/dockLayoutStore.ts`、キー `tags`）で URL には載せない。
 	 *
-	 * - 右（属性）は据え置き（`persistent`）。隠す（✕・メニュー・ツールバー）・浮かせる・
-	 *   ドッキングし直す・狭い表示への切り替え・「既定に戻す」のどれでも中身の DOM を
-	 *   作り直さない（入力の途中・IME・スクロールが残る）。フォームの値はもともとページの
-	 *   状態（`editForm` など）にある。中身を捨てる `closePanel` はこのページでは呼ばない。
+	 * - 保たれる物は 2 つに分かれる（PR #1269 のレビュー）:
+	 *   - **バインドした値**（`editForm`・`createForm` など）はページの状態にあるので、
+	 *     広い ⇄ 狭いの切り替え（フォームが右の pane と `<Drawer>`／`<Modal>` の間で
+	 *     入れ替わる）でも残る。
+	 *   - **フォームの DOM・IME の変換の途中・キャレット・スクロール**は、右（属性）を
+	 *     据え置き（`persistent`）にしたことで、**広い表示の中で**隠す（✕・メニュー・
+	 *     ツールバー）・浮かせる・ドッキングし直す・「既定に戻す」をしたときだけ残る。
+	 *     広い ⇄ 狭いの切り替えでは `{#if editPaneOpen}` のフォームと Drawer／Modal の中の
+	 *     フォームが入れ替わるので残らない（`persistent` が保つのは外側の pane）。
+	 *   中身を捨てる `closePanel` はこのページでは呼ばない。
 	 * - 狭い幅（ビューポート判定）は部品の狭い表示に任せ、ツリーは左端の帯から引き出す
 	 *   （Esc・外の押下・選択で戻り、フォーカスは帯のタブへ。#378・#381 の約束の置き換え）。
 	 *   編集のフォームは今までどおり狭い幅ではモーダルの `<Drawer>`／`<Modal>` に出す
@@ -68,7 +74,13 @@
 		restoreFocus,
 		Tabs
 	} from '@banto/ui';
-	import { createDockState, defaultDockMessages, ThreePaneDock } from '@banto/dock-svelte';
+	import {
+		createDockState,
+		defaultDockMessages,
+		ThreePaneDock,
+		type DockLayout,
+		type DockNode
+	} from '@banto/dock-svelte';
 	import { createDockLayoutStore } from '#lib/dockLayoutStore.js';
 	import { persistThreePaneLayout } from '#lib/dockLayoutPersist.svelte.js';
 	import { canWriteResources } from '#lib/permissions.js';
@@ -2100,8 +2112,10 @@
 	 * - `treeShown`・`rightShown` は広い表示での左右の表示・非表示（「表示」メニューの
 	 *   チェックと同じ 1 か所の状態、部品の `leftOpen`・`rightOpen`）。
 	 * - 右（属性）を隠しても編集は閉じない（据え置きなので中身も残る）。式欄も見えなく
-	 *   なるので「一覧から挿入」は隠している間は出さない（`insertToggleAvailable`）。
-	 *   モードや編集対象が変わったら出し直す（下のモード遷移 `$effect`）。
+	 *   なるので「一覧から挿入」は、右が実際に見えて操作できる間だけ出す（隠す・折りたたむ・
+	 *   自動で隠す・タブの裏に回すと解除。`rightPaneOperable`・`insertToggleAvailable`）。
+	 *   モードや編集対象が変わったら出し直す（下のモード遷移 `$effect`）。狭い表示で始めた
+	 *   編集は、広い表示へ戻ったときに出し直す（その下の `$effect`）。
 	 */
 	const dock = createDockState();
 	const dockLayoutStore = createDockLayoutStore('tags');
@@ -2109,6 +2123,40 @@
 	let threePane: ReturnType<typeof ThreePaneDock> | undefined = $state();
 	let treeShown = $state(true);
 	let rightShown = $state(true);
+
+	/**
+	 * PR #1269 のレビュー（P2）: 右（属性）が**実際に見えていて操作できるか**。部品の
+	 * `rightOpen`（= `rightShown`、`dock.panels` の `visible`）は、折りたたんで帯にした・
+	 * 自動で隠した（ピン解除）・タブの裏に回ったときも「見えている」に数えるので、式欄へ
+	 * 挿入してよいかの判定には使えない。配置（`dock.layout`）から読む:
+	 * - 浮かせた窓: 開いていて、タイトルバーへ畳んでいない。
+	 * - 自動で隠した帯: 引き出していても操作できるとは数えない（一覧を押すと外の押下で
+	 *   戻るため）。
+	 * - ドッキング: その region（pane 自身、またはタブの組）が折りたたまれておらず、
+	 *   タブの組なら表のタブが右。
+	 * 狭い表示（右は帯に退き、編集はモーダル）では常に偽。
+	 */
+	const rightPaneOperable = $derived(!layoutNarrow && paneOperableIn(dock.layout, 'right'));
+
+	function paneOperableIn(layout: DockLayout, id: string): boolean {
+		const win = layout.floating.find((w) => w.id === id);
+		if (win) return win.open && win.collapsed !== true;
+		if ((layout.autoHidden ?? []).length > 0 && dock.isAutoHidden(id)) return false;
+		return dockedOperable(layout.docked, id, null);
+	}
+
+	function dockedOperable(node: DockNode | null, id: string, parent: DockNode | null): boolean {
+		if (!node) return false;
+		if (node.type === 'panel') {
+			if (node.id !== id) return false;
+			if (node.collapsed === true) return false;
+			if (parent?.type === 'tabs') {
+				return parent.collapsed !== true && parent.children[parent.activeIndex]?.id === id;
+			}
+			return true;
+		}
+		return node.children.some((child) => dockedOperable(child, id, node));
+	}
 	/** 既定の配置の右（属性）の幅（px）。今までの編集ペインの幅（`drawerWidth` の 480px）。 */
 	const EDIT_PANE_DEFAULT_WIDTH = 480;
 	/** 狭い表示で、ツリーが帯から引き出されているか（#378 の「開いている」）。 */
@@ -2158,16 +2206,30 @@
 	 */
 	function selectViewItem(item: { id: string; onSelect: () => void }): void {
 		item.onSelect();
-		if (item.id !== 'panel:left' || !layoutNarrow) return;
-		void tick().then(() =>
-			requestAnimationFrame(() => {
-				if (dock.flyoutPanel !== 'left') return;
-				const target =
-					treePaneEl?.querySelector<HTMLElement>('[role="treeitem"][tabindex="0"]') ??
-					treePaneEl?.querySelector<HTMLElement>('[role="tree"]');
-				target?.focus();
-			})
-		);
+		if (!layoutNarrow) return;
+		const id = item.id === 'panel:left' ? 'left' : item.id === 'panel:right' ? 'right' : null;
+		if (id === null) return;
+		// PR #1269 のレビュー（P2）: 右（属性）も同じ形でフォーカスを pane の中へ入れる
+		// （帯のタブで開いたときと同じ `.body`）。入れないとフォーカスは「表示」に戻り、
+		// 引き出した pane の中の Esc が届かない。隠していた pane は部品が配置を替えてから
+		// 引き出すので、引き出されるまで数フレーム待つ。
+		void tick().then(() => focusFlyoutWhenOpen(id, 10));
+	}
+
+	function focusFlyoutWhenOpen(id: 'left' | 'right', framesLeft: number): void {
+		requestAnimationFrame(() => {
+			if (!layoutNarrow) return;
+			if (dock.flyoutPanel !== id) {
+				if (framesLeft > 0) focusFlyoutWhenOpen(id, framesLeft - 1);
+				return;
+			}
+			const target =
+				id === 'left'
+					? (treePaneEl?.querySelector<HTMLElement>('[role="treeitem"][tabindex="0"]') ??
+						treePaneEl?.querySelector<HTMLElement>('[role="tree"]'))
+					: contentEl?.querySelector<HTMLElement>('[data-dock-flyout="right"] .body');
+			target?.focus();
+		});
 	}
 
 	// --- #342 段階C: 一覧から式欄への click-to-insert ------------------------
@@ -2214,7 +2276,7 @@
 	const insertToggleAvailable = $derived(
 		canWrite &&
 			editPaneOpen &&
-			rightShown &&
+			rightPaneOperable &&
 			((drawerMode === 'create' && createForm.tagKind === 'computed') ||
 				(drawerMode === 'edit' && selected !== null && editForm.tagKind === 'computed'))
 	);
@@ -2270,6 +2332,23 @@
 			// #1253: 右（属性）を隠していたら、編集を開いた・対象が変わったときに出し直す
 			// （部品の `rightOpen` へ書く = `setVisible`）。狭い表示では編集はモーダルなので触らない。
 			if (paneCapableMode && !layoutNarrow) rightShown = true;
+		});
+	});
+
+	/**
+	 * PR #1269 のレビュー（P2）: 狭い表示で（Drawer／Modal から）始めた編集・新規作成は、
+	 * 広い表示へ戻ったときにも見えるようにする。広い表示で先に右（属性）を隠していると、
+	 * 部品は隠した広い配置へ戻すので、上のモード遷移の `$effect`（モードと編集対象だけを
+	 * 見る）では出し直されない。狭い → 広いへ切り替わった時点（部品が切り替えを確定して
+	 * `narrow` を書き出し、`rightOpen` を広い配置から書き直した後）に、編集中なら出す。
+	 * 部品の切り替えの確定を待つ必要は無い（`layoutNarrow` が偽になるのは確定の後）。
+	 */
+	let narrowSeen = false;
+	$effect(() => {
+		const narrowNow = layoutNarrow;
+		untrack(() => {
+			if (narrowSeen && !narrowNow && paneCapableMode) rightShown = true;
+			narrowSeen = narrowNow;
 		});
 	});
 
@@ -2383,6 +2462,31 @@
 	 * `ExpressionCheckController`（`oninput` 駆動の debounce チェック）も
 	 * 走らない。前後の空白補完はしない（演算子はユーザーが打つ）。
 	 */
+	/**
+	 * PR #1269 のレビュー（P2）: 挿入 ON の行クリック。押した時点でも式欄が実際に見えて
+	 * 操作できるかを確かめ（`insertToggleEnabled` は配置から読んだ判定、加えて式欄の要素
+	 * そのものが描かれているか）、見えなければ挿入を解除して通常の選択として扱う
+	 * （見えない式欄へ黙って挿入しない）。
+	 */
+	function handleInsertRowClick(t: Tag): void {
+		if (insertToggleEnabled && expressionTextareaShown()) {
+			insertTagRefIntoExpression(t);
+			return;
+		}
+		insertArmed = false;
+		if (selectionMode) toggleSelectRow(t);
+		else selectTag(t);
+	}
+
+	/** 式欄の `<textarea>` が画面に描かれているか（`hidden`・`display: none` の祖先が無いか）。 */
+	function expressionTextareaShown(): boolean {
+		const el = exprTextareaEl;
+		if (!el || !el.isConnected) return false;
+		// jsdom などで `checkVisibility` が無いときは、配置の判定（`insertToggleEnabled`）に任せる。
+		if (typeof el.checkVisibility !== 'function') return true;
+		return el.checkVisibility({ visibilityProperty: true });
+	}
+
 	function insertTagRefIntoExpression(t: Tag): void {
 		const reason = insertBlockedReasons.get(t.id);
 		if (reason !== undefined) {
@@ -6946,9 +7050,12 @@
 			消したりすると部品の構造の変更になる）、編集のフォームは広い表示で編集中の
 			ときだけ描く（`editPaneOpen`）。ランドマーク（`complementary`）と名前
 			（`drawerTitle`）はこの `<aside>` が持つ（部品のパネルの名前は「属性」）。
-			据え置き（`persistent`）なので、隠す・浮かせる・ドッキングし直す・狭い表示への
-			切り替え・既定に戻すで中身を作り直さない。部品の ✕ は隠すだけ（フォームは
-			閉じない。閉じるのはヘッダーの「閉じる」= 未保存の確認つき）。
+			据え置き（`persistent`）なので、広い表示の中で隠す・浮かせる・ドッキングし直す・
+			既定に戻すをしても pane の DOM を作り直さない（フォームの DOM・IME・キャレット・
+			スクロールが残る）。広い ⇄ 狭いの切り替えでは、この `{#if editPaneOpen}` の
+			フォームと Drawer／Modal の中のフォームが入れ替わるので DOM は残らず、残るのは
+			ページの状態にあるバインドした値だけ（冒頭の doc）。部品の ✕ は隠すだけ
+			（フォームは閉じない。閉じるのはヘッダーの「閉じる」= 未保存の確認つき）。
 		-->
 		{#snippet editPane()}
 			{#if editPaneOpen}
@@ -6995,7 +7102,8 @@
 			フォーカスはタブへ戻る）。狭幅の判定は従来どおりビューポート
 			（`mobileNavStore.isNarrow`、`narrowOverride`。2026-11-18 オーナー決定、#1182）で、
 			`layoutNarrow` へ書き出す。ツリーは引き出すたびに作り直さない（`keepMounted`。
-			展開の状態を保つ）。右（属性）は据え置き（上の `editPane` のコメント）。
+			展開の状態を保つ）。右（属性）は据え置き（`persistent`。保つのは広い表示の中の
+			pane の DOM で、広い ⇄ 狭いをまたいで残るのはバインドした値だけ。上の `editPane` のコメント）。
 			中央のツールバーには、閉じていても何で絞り込まれているかが分かるよう、現在の
 			ツリー選択名を出す。
 		-->
@@ -7727,7 +7835,7 @@
 														getRowId={(t) => t.id}
 														onRowClick={canWrite
 															? insertArmed
-																? insertTagRefIntoExpression
+																? handleInsertRowClick
 																: selectionMode
 																	? toggleSelectRow
 																	: selectTag
