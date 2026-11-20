@@ -110,7 +110,12 @@ describe('(app) guard before startup has finished (Issue #321)', () => {
 describe('(app) guard: public-viewer screen allowlist (viewer-public-plan §3.1-6)', () => {
 	beforeEach(() => {
 		mocks.ready = true;
-		mocks.publicNavItems = [{ path: '/monitor' }, { path: '/historical' }, { path: '/events' }];
+		mocks.publicNavItems = [
+			{ path: '/monitor' },
+			{ path: '/free-trends' },
+			{ path: '/historical' },
+			{ path: '/events' }
+		];
 		vi.clearAllMocks();
 		mocks.getSessionController.mockReturnValue({});
 		mocks.resolveSettled.mockResolvedValue({
@@ -124,6 +129,7 @@ describe('(app) guard: public-viewer screen allowlist (viewer-public-plan §3.1-
 
 	it('lets an allowlisted screen and its sub-paths open', async () => {
 		await expect(load(at('/monitor'))).resolves.toEqual({ sessionGeneration: 3 });
+		await expect(load(at('/free-trends'))).resolves.toEqual({ sessionGeneration: 3 });
 		await expect(load(at('/historical'))).resolves.toEqual({ sessionGeneration: 3 });
 		await expect(load(at('/events'))).resolves.toEqual({ sessionGeneration: 3 });
 		await expect(load(at('/events/42'))).resolves.toEqual({ sessionGeneration: 3 });

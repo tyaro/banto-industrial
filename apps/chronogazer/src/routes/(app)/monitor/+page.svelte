@@ -41,15 +41,7 @@
 	import { canWriteResources } from '#lib/permissions.js';
 	import { monitorGroupHref, resolveAppPath } from '#lib/navigation.js';
 	import { collectTimeLabel, getCollectValues } from '#lib/banto/collectAdmin.js';
-	import {
-		DEMO_MODE_MESSAGE,
-		isTagRegistryAvailable,
-		listCollectionGroups,
-		listTags,
-		type CollectionGroup,
-		type Tag
-	} from '#lib/banto/tagRegistryAdmin.js';
-	import { listTagThresholds } from '#lib/banto/tagThresholdsAdmin.js';
+	import { DEMO_MODE_MESSAGE, isTagRegistryAvailable } from '#lib/banto/tagRegistryAdmin.js';
 	import { displayGroupCatalog } from '#lib/monitor/displayGroupCatalog.svelte.js';
 	import { ValuesPoller } from '#lib/monitor/valuesPoller.svelte.js';
 	import {
@@ -57,7 +49,6 @@
 		applyTagMetaLoad,
 		tagMetaNotices,
 		tagsForDisplay,
-		type LoadResult,
 		KIND_NOT_READY_MESSAGE,
 		groupPenViews,
 		isKindRendered,
@@ -80,7 +71,8 @@
 	import BarPanel from '#lib/monitor/BarPanel.svelte';
 	import GaugePanel from '#lib/monitor/GaugePanel.svelte';
 	import TrendPanel from '#lib/monitor/TrendPanel.svelte';
-	import { TrendFeed } from '#lib/monitor/trendFeed.svelte.js';
+	import { loadTagMetaResults } from '#lib/monitor/tagMetaLoad.js';
+	import { LiveTrend } from '#lib/monitor/liveTrend.svelte.js';
 	import {
 		TREND_WINDOWS_SEC,
 		collectPeriodMsOf,
@@ -88,9 +80,6 @@
 		loadTrendWindowOverride,
 		resolveTrendWindowSec,
 		saveTrendWindowOverride,
-		observeServerClock,
-		serverClockNow,
-		type ServerClock,
 		trendNotices,
 		trendPenInfos
 	} from '#lib/monitor/trendLogic.js';
@@ -169,24 +158,8 @@
 	const collectionGroups = $derived(tagMeta.collectionGroups);
 	const tagMetaNoticeLines = $derived(tagMetaNotices(tagMeta));
 
-	function errorText(err: unknown): string {
-		return err instanceof Error ? err.message : String(err);
-	}
-
 	async function loadTagMeta(): Promise<void> {
-		const metaLoad: Promise<LoadResult<{ tags: Tag[]; collectionGroups: CollectionGroup[] }>> =
-			Promise.all([listTags(), listCollectionGroups()]).then(
-				([tagRows, groupRows]) => ({
-					ok: true as const,
-					value: { tags: tagRows, collectionGroups: groupRows }
-				}),
-				(err: unknown) => ({ ok: false as const, error: errorText(err) })
-			);
-		const thresholdsLoad = listTagThresholds().then(
-			(rows) => ({ ok: true as const, value: rows }),
-			(err: unknown) => ({ ok: false as const, error: errorText(err) })
-		);
-		const [meta, thresholds] = await Promise.all([metaLoad, thresholdsLoad]);
+		const { meta, thresholds } = await loadTagMetaResults();
 		tagMeta = applyTagMetaLoad(tagMeta, meta, thresholds);
 	}
 
@@ -236,7 +209,8 @@
 
 	// --- トレンド（D-3b） ---------------------------------------------------------
 
-	const trendFeed = new TrendFeed();
+	const liveTrend = new LiveTrend();
+	const trendFeed = liveTrend.feed;
 	/**
 	 * トレンドの描画域の幅（px、`TrendChart` が返す余白を除いた幅）。履歴の区間の数を決めるのに使う。
 	 * 余白は縦軸の有無だけで決まり、データを替えても幅は変わらない。
@@ -276,18 +250,7 @@
 		return collectPeriodMsOf(tags, collectionGroups, tagId);
 	}
 
-	/**
-	 * 表示の時計（`trendLogic.ts` の `observeServerClock`）。現在値の応答の `serverNowMs`
-	 * （応答を作った時点のサーバーの時刻）を基準に、端末の単調な経過時間で進める。サーバーの
-	 * 時刻を受け取るまでは `null` で、トレンドを作らない（端末の時計で書かない）。時計はサーバー
-	 * 全体のものなので、グループを替えても残す。
-	 */
-	let serverClock: ServerClock = null;
-	/** 時計に反映済みの現在値のスナップショット（成功のたびに新しいオブジェクト）。 */
-	let observedValues: object | null = null;
-	/** 前回見た連続失敗の回数（増えたらリングバッファに途切れを知らせる）。 */
-	let seenFailures = 0;
-
+	/** 現在値のポーラーの結果をトレンドへ流す段取り（サーバーの時計・途切れ・対象の切り替え）。 */
 	$effect(() => {
 		const target = trendTarget;
 		const current = values;
@@ -297,42 +260,16 @@
 		const views = penViews;
 		const visible = pageVisible;
 		untrack(() => {
-			if (target === null) {
-				trendFeed.reset();
-				return;
-			}
-			// グループが替わったら、新しいグループの値が来る前でも前の線を捨てる。
-			if (trendFeed.groupId !== null && trendFeed.groupId !== target.id) trendFeed.reset();
-			// 途切れ: 読み取りの失敗（連続失敗が増えた）・収集の停止・タブが隠れた（ポーリングを
-			// 止めた）。その間の値はリングバッファに無いので、履歴で描く。
-			const failures = current?.failures ?? 0;
-			if (!visible || current === null || current.phase !== 'ready' || failures > seenFailures) {
-				trendFeed.breakLive();
-			}
-			seenFailures = failures;
-			if (current === null || current.phase !== 'ready' || current.values === null) return;
-			if (current.values !== observedValues) {
-				observedValues = current.values;
-				serverClock = observeServerClock(serverClock, current.serverNowMs, performance.now());
-			}
-			const now = serverClockNow(serverClock, performance.now());
-			if (now === null || width <= 0) return;
-			const penTagIds = target.pens.map((pen) => pen.tagId);
-			trendFeed.sync(
-				{
-					groupId: target.id,
-					penTagIds,
-					windowMs: windowSec * 1000,
-					plotWidthPx: width,
-					// サンプル間隔: タグの収集周期とポーリングの周期の長い方（どちらより短くは届かない）。
-					sampleIntervalMs: penTagIds.map(
-						(tagId) => Math.max(collectPeriodOf(tagId) ?? 0, period ?? 0) || null
-					)
-				},
-				now,
-				current.values,
-				views.map((view) => view.value)
-			);
+			liveTrend.update({
+				target,
+				current,
+				width,
+				windowSec,
+				periodMs: period,
+				views,
+				visible,
+				collectPeriodOf
+			});
 		});
 	});
 
