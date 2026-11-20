@@ -8,16 +8,30 @@ const SAVED = {
 };
 
 describe('dockLayoutKeys', () => {
-	it('ページごとに localStorage とサーバーのキーを分ける', () => {
-		expect(dockLayoutKeys('monitor')).toEqual({
-			local: 'banto.dock.monitor',
+	it('ページごとに分け、localStorage の写しはさらに持ち主ごと', () => {
+		expect(dockLayoutKeys('monitor', 'account:1')).toEqual({
+			local: 'banto.dock.monitor.account%3A1',
 			setting: 'hub.dock.monitor'
 		});
-		expect(dockLayoutKeys('tags').setting).toBe('hub.dock.tags');
+		expect(dockLayoutKeys('tags', 'commissioning').local).toBe('banto.dock.tags.commissioning');
+		expect(dockLayoutKeys('tags', 'account:1').setting).toBe('hub.dock.tags');
+	});
+
+	it('持ち主の記号・区切りはエスケープする', () => {
+		expect(dockLayoutKeys('monitor', 'account:a.b/c').local).toBe(
+			'banto.dock.monitor.account%3Aa%2Eb%2Fc'
+		);
+	});
+
+	it.each([null, ''])('持ち主が %j なら写しのキーは無い', (owner) => {
+		expect(dockLayoutKeys('monitor', owner)).toEqual({
+			local: undefined,
+			setting: 'hub.dock.monitor'
+		});
 	});
 
 	it.each(['', 'Monitor', 'a.b', 'a/b', 'x'.repeat(41)])('不正なページ名 %j は例外', (page) => {
-		expect(() => dockLayoutKeys(page)).toThrow();
+		expect(() => dockLayoutKeys(page, 'account:1')).toThrow();
 	});
 });
 

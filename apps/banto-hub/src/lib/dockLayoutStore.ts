@@ -3,8 +3,10 @@
  * `/monitor` と `/tags` が同じ口を使い、ページの名前でキーを分ける。
  *
  * 置き場は `settings.svelte.ts` と同じ二層:
- * - localStorage（`banto.dock.<page>`）: 写し。最初の描画（`ThreePaneDock` の `initialLayout`）に使う。
- *   書けなくても（容量・無効）黙って続ける。
+ * - localStorage（`banto.dock.<page>.<持ち主>`）: 写し。最初の描画（`ThreePaneDock` の
+ *   `initialLayout`）に使う。書けなくても（容量・無効）黙って続ける。持ち主（今のセッションの
+ *   `owner`）は作った時点で決める。分からなければ写しを読まず（既定の配置）書きもしない。
+ *   作った後に持ち主が替わっていたら（別のタブで別の利用者がログイン）、写しを書かない。
  * - `UiSettingsProvider`（`hub.dock.<page>`、Hub のサーバー・利用者ごと）: 本体。デスクトップ版は
  *   起動ごとに origin が変わり localStorage が消えるので、マウント後に読み直して当てる。
  *   送信は `@banto/admin-core` の `createSavedSetting`（即時の形）に任せる: 送っている間は 1 本、
@@ -19,7 +21,11 @@
  * - サーバーの値は `loadSaved()` が返す。読み終わる前に利用者が配置を変えていたら返さず、
  *   その変更をサーバーへ送る（利用者の最新の操作が勝つ）。
  */
-import { createSavedSetting, type UiSettingsProvider } from '@banto/admin-core';
+import {
+	createSavedSetting,
+	getSessionController,
+	type UiSettingsProvider
+} from '@banto/admin-core';
 import { getUiSettings } from './banto/setup';
 import {
 	dockLayoutKeys,
@@ -43,6 +49,20 @@ export interface DockLayoutStoreDeps {
 	provider?: UiSettingsProvider;
 	/** 既定は `globalThis.localStorage`（無い・使えないときは写しを使わない）。 */
 	storage?: () => Pick<Storage, 'getItem' | 'setItem'> | undefined;
+	/**
+	 * 今のログインの持ち主（`SessionSnapshot.owner`）。既定は既定の `SessionController` の
+	 * 確定したセッション（`active` でなければ `null`）。
+	 */
+	owner?: () => string | null;
+}
+
+function defaultOwner(): string | null {
+	try {
+		const snapshot = getSessionController().snapshot;
+		return snapshot.status === 'active' ? snapshot.owner : null;
+	} catch {
+		return null;
+	}
 }
 
 function defaultStorage(): Pick<Storage, 'getItem' | 'setItem'> | undefined {
@@ -57,7 +77,10 @@ export function createDockLayoutStore(
 	page: string,
 	deps: DockLayoutStoreDeps = {}
 ): DockLayoutStore {
-	const keys = dockLayoutKeys(page);
+	const currentOwner = deps.owner ?? defaultOwner;
+	const owner = currentOwner();
+	const keys = dockLayoutKeys(page, owner);
+	const localKey = keys.local;
 	const storage = deps.storage ?? defaultStorage;
 	const setting = createSavedSetting<StoredDockLayout | null>({
 		provider: deps.provider ?? getUiSettings(),
@@ -69,16 +92,18 @@ export function createDockLayoutStore(
 	});
 
 	function readLocal(): StoredDockLayout | undefined {
+		if (localKey === undefined) return undefined;
 		try {
-			return parseStoredDockLayout(storage()?.getItem(keys.local));
+			return parseStoredDockLayout(storage()?.getItem(localKey));
 		} catch {
 			return undefined;
 		}
 	}
 
 	function writeLocal(raw: string): void {
+		if (localKey === undefined || currentOwner() !== owner) return;
 		try {
-			storage()?.setItem(keys.local, raw);
+			storage()?.setItem(localKey, raw);
 		} catch {
 			// 写しは best-effort（本体はサーバー）。
 		}

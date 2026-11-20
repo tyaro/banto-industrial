@@ -203,4 +203,47 @@ test.describe.serial('banto-hub モニタ Tree/検索 + 確認導線ディープ
 		await expect(page.getByText(EXTERNAL_A)).toBeVisible();
 		await expect(tree).toBeVisible();
 	});
+	test('6. 狭い幅での「既定に戻す」も保存される（#1253、PR #1268 レビュー P2）', async () => {
+		// 狭い表示の reset は、表示（dock.layout）を先に換え、`await` の後で保存の対象
+		// （控えた広い配置）を確定する。後の確定を拾えないと、ここで PUT が来ない。
+		const dockSetting = (method: string) =>
+			page.waitForResponse(
+				(r) =>
+					r.url().includes('/api/ui-settings/hub.dock.monitor') && r.request().method() === method
+			);
+		const tree = page.getByRole('tree');
+		const toggle = page.getByTestId('monitor-tree-toggle');
+		const wide = page.viewportSize() ?? { width: 1280, height: 720 };
+
+		await page.goto('/monitor');
+		await expect(page.getByText(EXTERNAL_A)).toBeVisible();
+		await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+		const hidden = dockSetting('PUT');
+		await toggle.click();
+		await expect(tree).toBeHidden();
+		expect((await hidden).ok()).toBe(true);
+
+		try {
+			// 狭い幅（900px 以下）で開き直し、サーバーの保存値を読み終えてから戻す。
+			await page.setViewportSize({ width: 800, height: wide.height });
+			const loaded = dockSetting('GET');
+			await page.reload();
+			await expect(page.getByText(EXTERNAL_A)).toBeVisible();
+			await loaded;
+			await expect(toggle).toHaveCount(0);
+
+			const reset = dockSetting('PUT');
+			await page.getByTestId('monitor-view-menu').click();
+			await page.getByRole('menuitem', { name: 'レイアウトを既定に戻す' }).click();
+			expect((await reset).ok()).toBe(true);
+		} finally {
+			await page.setViewportSize(wide);
+		}
+
+		// 広い幅で開き直すと既定の配置（ツリーが出ている）。後の spec にも既定を残す。
+		await page.reload();
+		await expect(page.getByText(EXTERNAL_A)).toBeVisible();
+		await expect(tree).toBeVisible();
+		await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+	});
 });

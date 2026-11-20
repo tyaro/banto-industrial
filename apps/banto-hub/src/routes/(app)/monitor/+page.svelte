@@ -104,6 +104,7 @@
 	import { Menu, MenuItem, MenuSeparator } from '@banto/ui';
 	import { createDockState, defaultDockMessages, ThreePaneDock } from '@banto/dock-svelte';
 	import { createDockLayoutStore } from '#lib/dockLayoutStore.js';
+	import { persistThreePaneLayout } from '#lib/dockLayoutPersist.svelte.js';
 	import ConnectionTree from '#lib/components/ConnectionTree.svelte';
 	import type { ConnectionTreeNodeData } from '#lib/components/connectionTreeTypes.js';
 	import { isProviderError } from '@banto/admin-core';
@@ -276,7 +277,7 @@
 	});
 
 	/**
-	 * #1253: ドックの枠（`ThreePaneDock`）。`dock` を自分で持ち、`dock.layout` の変化で
+	 * #1253: ドックの枠（`ThreePaneDock`）。`dock` を自分で持ち、`layoutSnapshot()` の変化で
 	 * 配置を保存する（`layoutSnapshot()` を保存する。狭い表示の間は控えた広い配置を返すので、
 	 * 狭い表示の一時の配置は保存しない）。
 	 *
@@ -308,12 +309,9 @@
 	);
 
 	// 配置の保存。最初の 1 回（マウントした時点の配置）は保存の口が基準として受け取るだけ。
-	$effect(() => {
-		void dock.layout;
-		const pane = threePane;
-		if (!pane) return;
-		untrack(() => dockLayoutStore.save(pane.layoutSnapshot()));
-	});
+	// `layoutSnapshot()` の読み取りを追跡する（狭い表示の「既定に戻す」・復元で、`dock.layout`
+	// の後に確定する控えた広い配置も拾う。PR #1268 レビュー P2）。
+	persistThreePaneLayout(() => threePane, dockLayoutStore);
 
 	// サーバーの保存値（利用者ごと）を、枠のマウント後に 1 回だけ読んで当てる。
 	let savedLayoutRequested = false;

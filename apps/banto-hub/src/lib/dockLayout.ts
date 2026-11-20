@@ -1,11 +1,16 @@
 /**
  * ドックの枠（`@banto/dock-svelte` の `ThreePaneDock`）の配置の保存値の、キーと読み込み（#1253。
  * docs/hub/banto-hub-ui-improvement-proposal.md §ドック型の配置）。runes を使わない純粋な
- * モジュールなので単体テストできる（`dockLayout.svelte.ts` が localStorage と
+ * モジュールなので単体テストできる（`dockLayoutStore.ts` が localStorage と
  * `UiSettingsProvider` への配線を持つ。`navLayout.ts` と `settings.svelte.ts` の分け方と同じ）。
  *
  * - 配置は利用者ごとの保存に任せ、URL には載せない（選択中の対象は今の `?target=` のまま）。
- * - キーはページごと（`/monitor` は `monitor`、`/tags` は `tags`）。
+ * - キーはページごと（`/monitor` は `monitor`、`/tags` は `tags`）。localStorage の写しは、さらに
+ *   ログインの利用者ごと（`banto.dock.<page>.<持ち主>`）。同じブラウザで別の利用者が
+ *   ログインしたとき、前の利用者の配置を最初の描画に使わない（PR #1268 レビュー）。
+ *   持ち主は `@banto/admin-core` の `SessionSnapshot.owner`（`account:<id>`・grant の kind）。
+ *   持ち主が分からなければ写しのキーは無い（読まない・書かない）。前のページ名だけのキー
+ *   `banto.dock.<page>` は読まない（移行しない）。
  * - ここでの検証は「自分が書いた形か」だけ（`ThreePaneSavedLayout` の外形: `schema: 1`・
  *   `panels`・`layout`）。中身の検証（知らない id・壊れた木・今のパネルとの照合）は部品の
  *   `reconcileThreePaneLayout` が行うので、ここでは繰り返さない。
@@ -15,16 +20,27 @@
 const PAGE_PATTERN = /^[a-z0-9-]{1,40}$/;
 
 export interface DockLayoutKeys {
-	/** localStorage の写し（ログイン前・サーバーの応答の前の最初の描画に使う）。 */
-	local: string;
+	/**
+	 * localStorage の写し（サーバーの応答の前の最初の描画に使う）。持ち主が分からなければ
+	 * `undefined`（写しを使わない）。
+	 */
+	local: string | undefined;
 	/** `UiSettingsProvider`（Hub のサーバー、利用者ごと）のキー。本体。 */
 	setting: string;
 }
 
-/** ページごとの保存先のキー。ページ名が不正なら例外（開発時の誤り）。 */
-export function dockLayoutKeys(page: string): DockLayoutKeys {
+/**
+ * ページごと（写しはさらに持ち主ごと）の保存先のキー。ページ名が不正なら例外（開発時の誤り）。
+ * 持ち主はキーの区切り（`.`）や記号を含みうるので `encodeURIComponent` で包む（`.` も
+ * `%2E` にする。`account:1` は `account%3A1`）。
+ */
+export function dockLayoutKeys(page: string, owner: string | null): DockLayoutKeys {
 	if (!PAGE_PATTERN.test(page)) throw new Error(`invalid dock layout page: ${page}`);
-	return { local: `banto.dock.${page}`, setting: `hub.dock.${page}` };
+	const local =
+		owner === null || owner === ''
+			? undefined
+			: `banto.dock.${page}.${encodeURIComponent(owner).replace(/\./g, '%2E')}`;
+	return { local, setting: `hub.dock.${page}` };
 }
 
 /** 保存する値の外形（`ThreePaneSavedLayout` と同じ。中身は部品が照らす）。 */
