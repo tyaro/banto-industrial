@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
 	afterFreeTrendDelete,
+	afterFreeTrendDeleteFailure,
 	LAST_FREE_TREND_STORAGE_KEY,
 	loadLastFreeTrend,
 	parseFreeTrendParam,
@@ -69,15 +70,59 @@ describe('端末の覚え', () => {
 });
 
 describe('afterFreeTrendDelete', () => {
-	const base = { destroyed: false, currentRequestedId: 3, deletedId: 3, navigating: false };
+	const session = {
+		startedOwner: 'account:alice' as string | null,
+		currentOwner: 'account:alice' as string | null,
+		startedSessionGen: 2,
+		currentSessionGen: 2
+	};
+	const base = {
+		...session,
+		destroyed: false,
+		currentRequestedId: 3 as number | null,
+		deletedId: 3,
+		navigating: false
+	};
 	it.each([
-		['破棄済み', { destroyed: true }, false, false],
-		['今の ?id が削除対象', {}, true, true],
-		['別の ID を選んでいる', { currentRequestedId: 7 }, false, true],
-		['?id が無い', { currentRequestedId: null }, false, true],
-		['別の移動の最中', { navigating: true }, false, true]
-	])('%s', (_name, patch, clearUrl, reload) => {
-		expect(afterFreeTrendDelete({ ...base, ...patch })).toEqual({ clearUrl, reload });
+		['今の ?id が削除対象', {}, [true, true, true, true, true]],
+		['別の ID を選んでいる', { currentRequestedId: 7 }, [true, true, true, false, true]],
+		['?id が無い', { currentRequestedId: null }, [true, true, true, false, true]],
+		['別の移動の最中', { navigating: true }, [true, true, true, false, true]],
+		['同じセッションで破棄済み', { destroyed: true }, [true, true, false, false, false]],
+		['セッションの世代が進んだ', { currentSessionGen: 3 }, [false, false, false, false, false]],
+		['持ち主が変わった', { currentOwner: 'account:bob' }, [false, false, false, false, false]],
+		[
+			'セッションが替わり破棄済み',
+			{ currentSessionGen: 3, destroyed: true },
+			[false, false, false, false, false]
+		]
+	])('%s', (_name, patch, [clearDraft, notify, applyToPage, clearUrl, reload]) => {
+		expect(afterFreeTrendDelete({ ...base, ...patch })).toEqual({
+			clearDraft,
+			notify,
+			applyToPage,
+			clearUrl,
+			reload
+		});
+	});
+});
+
+describe('afterFreeTrendDeleteFailure', () => {
+	const session = {
+		startedOwner: 'account:alice' as string | null,
+		currentOwner: 'account:alice' as string | null,
+		startedSessionGen: 2,
+		currentSessionGen: 2
+	};
+	it.each([
+		['同じセッション', {}, { notify: true, reload: true }],
+		['同じセッションで破棄済み', { destroyed: true }, { notify: true, reload: false }],
+		['セッションの世代が進んだ', { currentSessionGen: 3 }, { notify: false, reload: false }],
+		['持ち主がなくなった', { currentOwner: null }, { notify: false, reload: false }]
+	])('%s', (_name, patch, expected) => {
+		expect(afterFreeTrendDeleteFailure({ ...session, destroyed: false, ...patch })).toEqual(
+			expected
+		);
 	});
 });
 

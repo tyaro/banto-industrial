@@ -392,21 +392,42 @@ export interface FreeTrendSaveContext {
 	/** 保存を始めたときの下書きの持ち主と、完了時点のそれ。 */
 	startedOwner: string | null;
 	currentOwner: string | null;
+	/** 保存を始めたときのセッションの世代（`draftSessionGeneration()`）と、完了時点のそれ。 */
+	startedSessionGen: number;
+	currentSessionGen: number;
 }
 
-/** 完了が、保存を始めた編集の文脈（対象・世代・持ち主）のままか。 */
+/**
+ * 完了が、始めたときと同じセッション（世代・持ち主）のままか。違えば前のセッションの完了なので、
+ * 通知も画面の状態も保存領域も触らない（#1258 再レビュー P2）。
+ */
+export function sameSession(args: {
+	startedOwner: string | null;
+	currentOwner: string | null;
+	startedSessionGen: number;
+	currentSessionGen: number;
+}): boolean {
+	return (
+		args.startedSessionGen === args.currentSessionGen && args.startedOwner === args.currentOwner
+	);
+}
+
+/** 完了が、保存を始めた編集の文脈（対象・世代・持ち主・セッション）のままか。 */
 function sameEditContext(args: FreeTrendSaveContext): boolean {
 	return (
 		!args.destroyed &&
 		args.currentTarget === args.startedFor &&
 		args.currentGen === args.startedGen &&
-		args.currentOwner === args.startedOwner
+		sameSession(args)
 	);
 }
 
 /** 保存の完了後にすること。 */
 export interface FreeTrendSaveFollowUp {
-	/** 下書き（保存を始めた対象・持ち主のもの）を捨てる。保存は済んでいるので、離れていても捨てる。 */
+	/**
+	 * 下書き（保存を始めた対象・持ち主のもの）を、送った中身と同じなら捨てる。保存は済んでいるので、
+	 * 画面を離れていても捨てる。前のセッションの完了では捨てない（境界で全部捨ててある）。
+	 */
 	clearDraft: boolean;
 	/** 編集欄を閉じる（保存を始めた編集のままのときだけ）。 */
 	closeEditor: boolean;
@@ -414,21 +435,50 @@ export interface FreeTrendSaveFollowUp {
 	navigate: boolean;
 	/** 一覧を読み直す。 */
 	reload: boolean;
+	/** 成功を通知する（前のセッションの完了では出さない）。 */
+	notify: boolean;
+	/** 手元の一覧・下書きの状態に保存したものを反映する（同じセッションで、画面が生きているとき）。 */
+	applyToPage: boolean;
 }
 
 /**
  * 保存の応答を待つ間に画面を離れた・別のものを選んだ・編集欄を開き直した・持ち主が変わった・
- * 別の移動が始まった場合に、後から来た完了が画面の状態や遷移を上書きしないための判断（純関数。
- * `afterFreeTrendDelete` と同じ考え方）。`navigating` は完了時点で別の移動が終わっていないか。
+ * 別の移動が始まった・セッションが替わった場合に、後から来た完了が画面の状態や遷移を上書きしない
+ * ための判断（純関数。`afterFreeTrendDelete` と同じ考え方）。`navigating` は完了時点で別の移動が
+ * 終わっていないか。前のセッションの完了では何もしない（通知も、保存領域も）。
  */
 export function afterFreeTrendSave(
 	args: FreeTrendSaveContext & { navigating: boolean }
 ): FreeTrendSaveFollowUp {
+	if (!sameSession(args)) {
+		return {
+			clearDraft: false,
+			closeEditor: false,
+			navigate: false,
+			reload: false,
+			notify: false,
+			applyToPage: false
+		};
+	}
 	if (args.destroyed) {
-		return { clearDraft: true, closeEditor: false, navigate: false, reload: false };
+		return {
+			clearDraft: true,
+			closeEditor: false,
+			navigate: false,
+			reload: false,
+			notify: true,
+			applyToPage: false
+		};
 	}
 	const same = sameEditContext(args);
-	return { clearDraft: true, closeEditor: same, navigate: same && !args.navigating, reload: true };
+	return {
+		clearDraft: true,
+		closeEditor: same,
+		navigate: same && !args.navigating,
+		reload: true,
+		notify: true,
+		applyToPage: true
+	};
 }
 
 /**
@@ -454,17 +504,22 @@ export interface FreeTrendSaveFailureFollowUp {
 	applyToEditor: boolean;
 	/** 一覧を読み直す。 */
 	reload: boolean;
+	/** 失敗を通知する（画面が破棄された・前のセッションの完了では出さない）。 */
+	notify: boolean;
 }
 
 /**
  * 保存の失敗を、保存を始めた編集欄だけに出すための判断（純関数）。待つ間に別のものを選んで
- * 編集欄を開いていた・同じ対象を閉じて開き直した・持ち主が変わったなら、その欄に誤った競合・誤りを立てない。
+ * 編集欄を開いていた・同じ対象を閉じて開き直したなら、その欄に誤った競合・誤りを立てない。
+ * 画面が破棄された・前のセッションの完了なら何もしない。
  */
 export function afterFreeTrendSaveFailure(
 	args: FreeTrendSaveContext
 ): FreeTrendSaveFailureFollowUp {
-	if (args.destroyed) return { applyToEditor: false, reload: false };
-	return { applyToEditor: sameEditContext(args), reload: true };
+	if (args.destroyed || !sameSession(args)) {
+		return { applyToEditor: false, reload: false, notify: false };
+	}
+	return { applyToEditor: sameEditContext(args), reload: true, notify: true };
 }
 
 /** 保存のエラーを画面のどこに出すか。 */

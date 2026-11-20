@@ -15,8 +15,13 @@
 		isNavigationSettled,
 		trackFirstNavigation
 	} from '#lib/banto/navigationSettled.svelte.js';
+	import { startDraftSessionWatch } from '#lib/monitor/freeTrendDraftSessionWatch.js';
 
 	let { children } = $props();
+
+	// 自由トレンドの下書きは、セッションの境界（ログアウト・失効・持ち主の替わり）で全部捨てる
+	// （#1258 再レビュー P2）。ログイン画面でも動くよう、ルートで 1 回だけ始める。
+	startDraftSessionWatch();
 
 	// Start theme handling (applies persisted mode, watches OS changes).
 	$effect(() => {

@@ -55,6 +55,7 @@
 	} from '#lib/monitor/monitorLogic.js';
 	import {
 		afterFreeTrendDelete,
+		afterFreeTrendDeleteFailure,
 		loadLastFreeTrend,
 		parseFreeTrendParam,
 		saveLastFreeTrend,
@@ -81,6 +82,7 @@
 		pruneDrafts,
 		remainingPens,
 		removePenAt,
+		sameSession,
 		saveDraft,
 		sessionDraftStorage,
 		shouldDiscardSavedDraft,
@@ -89,6 +91,7 @@
 		type DraftTarget,
 		type FreeTrendDraft
 	} from '#lib/monitor/freeTrendDraft.js';
+	import { draftSessionGeneration } from '#lib/monitor/freeTrendDraftSessionWatch.js';
 	import { loadTagMetaResults } from '#lib/monitor/tagMetaLoad.js';
 	import { LiveTrend } from '#lib/monitor/liveTrend.svelte.js';
 	import TrendPanel from '#lib/monitor/TrendPanel.svelte';
@@ -129,10 +132,22 @@
 	async function reloadList(): Promise<void> {
 		const seq = ++loadSeq;
 		loading = true;
+		// 始めた時点のセッション。前のセッションの応答は、一覧にも下書きの掃除にも使わない（#1258 再レビュー P2）。
+		const startedOwner = owner;
+		const startedSessionGen = draftSessionGeneration();
+		const stale = () =>
+			destroyed ||
+			seq !== loadSeq ||
+			!sameSession({
+				startedOwner,
+				currentOwner: owner,
+				startedSessionGen,
+				currentSessionGen: draftSessionGeneration()
+			});
 		try {
 			const rows = await listFreeTrends();
-			// 破棄済みの画面の遅れた応答では、一覧も下書きの掃除も触らない（新しい画面の下書きを捨てない）。
-			if (destroyed || seq !== loadSeq) return;
+			// 破棄済みの画面・前のセッションの遅れた応答では、一覧も下書きの掃除も触らない（新しい画面の下書きを捨てない）。
+			if (stale()) return;
 			list = rows;
 			listError = null;
 			// 今の持ち主以外・古い形・一覧に無い ID の下書きは捨てる（消された・別の端末で消えたもの）。
@@ -142,7 +157,7 @@
 				rows.map((item) => item.id)
 			);
 		} catch (err) {
-			if (destroyed || seq !== loadSeq) return;
+			if (stale()) return;
 			listError = errorText(err);
 		} finally {
 			if (!destroyed && seq === loadSeq) loading = false;
@@ -386,6 +401,7 @@
 		// 保存を始めた時点の持ち主・編集の世代。応答はこの文脈にだけ反映する。
 		const startedOwner = owner;
 		const startedGen = editGen;
+		const startedSessionGen = draftSessionGeneration();
 		const context = () => ({
 			destroyed,
 			startedFor,
@@ -393,15 +409,23 @@
 			startedGen,
 			currentGen: editGen,
 			startedOwner,
-			currentOwner: owner
+			currentOwner: owner,
+			startedSessionGen,
+			currentSessionGen: draftSessionGeneration()
 		});
 		try {
 			const saved =
 				mode === 'update' && startedFor !== 'new'
 					? await updateFreeTrend(startedFor, draftToInput(draft, true))
 					: await createFreeTrend(draftToInput(draft, false));
-			toastStore.push('success', `${saved.name} を${mode === 'update' ? '更新' : '作成'}しました`);
+			// 前のセッションの完了なら、通知も画面も保存領域も触らない（判断は `afterFreeTrendSave`）。
 			const next = afterFreeTrendSave({ ...context(), navigating: navigating.to !== null });
+			if (next.notify) {
+				toastStore.push(
+					'success',
+					`${saved.name} を${mode === 'update' ? '更新' : '作成'}しました`
+				);
+			}
 			// 保存を始めた後に変えた下書きは捨てない（送った中身と同じときだけ捨てる）。
 			// ストレージは送った時点の持ち主のキーだけを触る。
 			const storage = sessionDraftStorage();
@@ -411,13 +435,11 @@
 			) {
 				clearDraft(storage, startedOwner, startedFor);
 			}
-			// 画面の状態は、持ち主が同じときだけ触る。
-			if (startedOwner === owner) {
-				if (startedFor === 'new') {
-					if (newDraft && shouldDiscardSavedDraft(newDraft, draft)) newDraft = null;
-				} else if (selection.id === startedFor) {
-					if (storedDraft && shouldDiscardSavedDraft(storedDraft, draft)) storedDraft = null;
-				}
+			if (!next.applyToPage) return;
+			if (startedFor === 'new') {
+				if (newDraft && shouldDiscardSavedDraft(newDraft, draft)) newDraft = null;
+			} else if (selection.id === startedFor) {
+				if (storedDraft && shouldDiscardSavedDraft(storedDraft, draft)) storedDraft = null;
 			}
 			// 読み直しが返るまで保存したものを選べるよう、手元の一覧へ入れる（飛行中の古い応答は捨てる）。
 			loadSeq++;
@@ -435,7 +457,8 @@
 			if (next.reload) await reloadList();
 		} catch (err) {
 			const after = afterFreeTrendSaveFailure(context());
-			if (destroyed) return;
+			// 画面が破棄された・前のセッションの完了なら何もしない。
+			if (!after.notify) return;
 			const failure = classifySaveFailure(err, isRevisionConflict, errorMessage);
 			if (!after.applyToEditor) {
 				// 別のものを編集している間の失敗。その編集欄には何も立てず、どれの失敗かを通知する。
@@ -621,27 +644,39 @@
 		if (deleting || !target || !target.canEdit) return;
 		if (!window.confirm(`${target.name} を削除しますか？`)) return;
 		deleting = true;
-		const deleteOwner = owner;
+		// 始めた時点のセッション。前のセッションの完了は、通知も画面も保存領域も触らない。
+		const startedOwner = owner;
+		const startedSessionGen = draftSessionGeneration();
+		const session = () => ({
+			startedOwner,
+			currentOwner: owner,
+			startedSessionGen,
+			currentSessionGen: draftSessionGeneration()
+		});
 		try {
 			await deleteFreeTrend(target.id);
-			// 送った時点の持ち主のキーだけを触る。
-			clearDraft(sessionDraftStorage(), deleteOwner, target.id);
-			toastStore.push('success', `${target.name} を削除しました`);
-			// 読み直しが返るまで消えた物を選び続けないよう、手元の一覧から外す（飛行中の古い応答は捨てる）。
-			loadSeq++;
-			if (list) list = list.filter((item) => item.id !== target.id);
 			const next = afterFreeTrendDelete({
+				...session(),
 				destroyed,
 				currentRequestedId: parseFreeTrendParam(page.url.searchParams.get('id')),
 				deletedId: target.id,
 				navigating: navigating.to !== null
 			});
+			// 送った時点の持ち主のキーだけを触る。
+			if (next.clearDraft) clearDraft(sessionDraftStorage(), startedOwner, target.id);
+			if (next.notify) toastStore.push('success', `${target.name} を削除しました`);
+			// 読み直しが返るまで消えた物を選び続けないよう、手元の一覧から外す（飛行中の古い応答は捨てる）。
+			if (next.applyToPage) {
+				loadSeq++;
+				if (list) list = list.filter((item) => item.id !== target.id);
+			}
 			if (next.clearUrl) void goto(freeTrendHref(null), { replaceState: true });
 			if (next.reload) await reloadList();
 		} catch (err) {
-			toastStore.push('error', errorText(err));
+			const after = afterFreeTrendDeleteFailure({ ...session(), destroyed });
+			if (after.notify) toastStore.push('error', errorText(err));
 			// 他の人が先に消した・権限が変わったときは、一覧を読み直して実際の状態に合わせる。
-			if (!destroyed) await reloadList();
+			if (after.reload) await reloadList();
 		} finally {
 			deleting = false;
 		}

@@ -352,7 +352,7 @@ describe('shouldDiscardSavedDraft', () => {
 	});
 });
 
-describe('保存の完了後の判断（持ち主・世代）', () => {
+describe('保存の完了後の判断（持ち主・世代・セッション）', () => {
 	const ctx = {
 		destroyed: false,
 		startedFor: 7 as number | 'new',
@@ -360,15 +360,31 @@ describe('保存の完了後の判断（持ち主・世代）', () => {
 		startedGen: 3,
 		currentGen: 3,
 		startedOwner: 'account:alice' as string | null,
-		currentOwner: 'account:alice' as string | null
+		currentOwner: 'account:alice' as string | null,
+		startedSessionGen: 5,
+		currentSessionGen: 5
+	};
+	const nothing = {
+		clearDraft: false,
+		closeEditor: false,
+		navigate: false,
+		reload: false,
+		notify: false,
+		applyToPage: false
 	};
 	it('同じ編集なら編集欄に出し・閉じて移る', () => {
-		expect(afterFreeTrendSaveFailure(ctx)).toEqual({ applyToEditor: true, reload: true });
+		expect(afterFreeTrendSaveFailure(ctx)).toEqual({
+			applyToEditor: true,
+			reload: true,
+			notify: true
+		});
 		expect(afterFreeTrendSave({ ...ctx, navigating: false })).toEqual({
 			clearDraft: true,
 			closeEditor: true,
 			navigate: true,
-			reload: true
+			reload: true,
+			notify: true,
+			applyToPage: true
 		});
 		expect(
 			afterFreeTrendSave({ ...ctx, startedFor: 'new', currentTarget: 'new', navigating: false })
@@ -379,37 +395,60 @@ describe('保存の完了後の判断（持ち主・世代）', () => {
 		['別の対象', { currentTarget: 8 }],
 		['編集欄を閉じた', { currentTarget: null }],
 		['新規へ移った', { currentTarget: 'new' as const }],
-		['同じ対象を閉じて開き直した（世代が進んだ）', { currentGen: 4 }],
-		['持ち主が変わった', { currentOwner: 'account:bob' }],
-		['持ち主がなくなった', { currentOwner: null }]
+		['同じ対象を閉じて開き直した（世代が進んだ）', { currentGen: 4 }]
 	])('%s: 編集欄に反映しない。下書きは送った持ち主のものを捨て、一覧は読み直す', (_n, patch) => {
 		const c = { ...ctx, ...patch };
-		expect(afterFreeTrendSaveFailure(c)).toEqual({ applyToEditor: false, reload: true });
+		expect(afterFreeTrendSaveFailure(c)).toEqual({
+			applyToEditor: false,
+			reload: true,
+			notify: true
+		});
 		expect(afterFreeTrendSave({ ...c, navigating: false })).toEqual({
 			clearDraft: true,
 			closeEditor: false,
 			navigate: false,
-			reload: true
+			reload: true,
+			notify: true,
+			applyToPage: true
 		});
+	});
+	it.each([
+		['セッションの世代が進んだ', { currentSessionGen: 6 }],
+		['持ち主が変わった', { currentOwner: 'account:bob' }],
+		['持ち主がなくなった', { currentOwner: null }],
+		['セッションが替わり、画面も破棄された', { currentSessionGen: 6, destroyed: true }]
+	])('%s: 前のセッションの完了なので、通知も画面も下書きも触らない', (_n, patch) => {
+		const c = { ...ctx, ...patch };
+		expect(afterFreeTrendSaveFailure(c)).toEqual({
+			applyToEditor: false,
+			reload: false,
+			notify: false
+		});
+		expect(afterFreeTrendSave({ ...c, navigating: false })).toEqual(nothing);
 	});
 	it('別の移動の最中なら、編集欄は閉じるが移らない', () => {
 		expect(afterFreeTrendSave({ ...ctx, navigating: true })).toEqual({
 			clearDraft: true,
 			closeEditor: true,
 			navigate: false,
-			reload: true
+			reload: true,
+			notify: true,
+			applyToPage: true
 		});
 	});
-	it('画面を離れたあとは何もしない（下書きだけ捨てる）', () => {
+	it('同じセッションで画面を離れたあとは、下書きを捨てて成功だけ通知する（失敗は出さない）', () => {
 		expect(afterFreeTrendSaveFailure({ ...ctx, destroyed: true })).toEqual({
 			applyToEditor: false,
-			reload: false
+			reload: false,
+			notify: false
 		});
 		expect(afterFreeTrendSave({ ...ctx, destroyed: true, navigating: false })).toEqual({
 			clearDraft: true,
 			closeEditor: false,
 			navigate: false,
-			reload: false
+			reload: false,
+			notify: true,
+			applyToPage: false
 		});
 	});
 });
