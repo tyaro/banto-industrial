@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
+	afterFreeTrendDelete,
 	LAST_FREE_TREND_STORAGE_KEY,
 	loadLastFreeTrend,
 	parseFreeTrendParam,
 	saveLastFreeTrend,
-	selectFreeTrend
+	selectFreeTrend,
+	windowChoiceAfterSelection
 } from './freeTrendLogic';
 
 const list = [{ id: 3 }, { id: 7 }, { id: 9 }];
@@ -63,5 +65,38 @@ describe('端末の覚え', () => {
 		};
 		expect(loadLastFreeTrend(throwing)).toBeNull();
 		expect(() => saveLastFreeTrend(throwing, 1)).not.toThrow();
+	});
+});
+
+describe('afterFreeTrendDelete', () => {
+	it.each([
+		['破棄済み', { destroyed: true, currentRequestedId: 3, deletedId: 3 }, false, false],
+		['今の ?id が削除対象', { destroyed: false, currentRequestedId: 3, deletedId: 3 }, true, true],
+		[
+			'別の ID を選んでいる',
+			{ destroyed: false, currentRequestedId: 7, deletedId: 3 },
+			false,
+			true
+		],
+		['?id が無い', { destroyed: false, currentRequestedId: null, deletedId: 3 }, false, true]
+	])('%s', (_name, args, clearUrl, reload) => {
+		expect(afterFreeTrendDelete(args)).toEqual({ clearUrl, reload });
+	});
+});
+
+describe('windowChoiceAfterSelection', () => {
+	it('同じ自由トレンドなら残す', () => {
+		const choice = { id: 3, sec: 60 };
+		expect(windowChoiceAfterSelection(choice, 3)).toBe(choice);
+	});
+	it('A → B で捨てる（A に戻っても復活しない）', () => {
+		let choice = windowChoiceAfterSelection({ id: 3, sec: 60 }, 7);
+		expect(choice).toBeNull();
+		choice = windowChoiceAfterSelection(choice, 3);
+		expect(choice).toBeNull();
+	});
+	it('選択が無くなったら捨てる・一時値が無ければ無いまま', () => {
+		expect(windowChoiceAfterSelection({ id: 3, sec: 60 }, null)).toBeNull();
+		expect(windowChoiceAfterSelection(null, 3)).toBeNull();
 	});
 });

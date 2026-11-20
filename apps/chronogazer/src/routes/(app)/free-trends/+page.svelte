@@ -34,10 +34,13 @@
 		valuesStaleNote
 	} from '#lib/monitor/monitorLogic.js';
 	import {
+		afterFreeTrendDelete,
 		loadLastFreeTrend,
 		parseFreeTrendParam,
 		saveLastFreeTrend,
-		selectFreeTrend
+		selectFreeTrend,
+		windowChoiceAfterSelection,
+		type FreeTrendWindowChoice
 	} from '#lib/monitor/freeTrendLogic.js';
 	import { loadTagMetaResults } from '#lib/monitor/tagMetaLoad.js';
 	import { LiveTrend } from '#lib/monitor/liveTrend.svelte.js';
@@ -159,7 +162,14 @@
 	 * この画面で選び直した時間窓（どの自由トレンドのものか持つ）。保存も端末への記憶もしない
 	 * （下書きは PR 8b2）。自由トレンドを切り替えたら保存された値に戻る。
 	 */
-	let windowChoice = $state<{ id: number; sec: number } | null>(null);
+	let windowChoice = $state<FreeTrendWindowChoice | null>(null);
+	// 表示中の自由トレンドが変わったら（選択・戻る進む・削除）一時値を捨てる。A → B → A でも戻らない。
+	$effect(() => {
+		const id = selection.id;
+		untrack(() => {
+			windowChoice = windowChoiceAfterSelection(windowChoice, id);
+		});
+	});
 	const trendWindowSec = $derived(
 		selected
 			? windowChoice !== null && windowChoice.id === selected.id
@@ -215,6 +225,8 @@
 	// --- 削除 -------------------------------------------------------------------
 
 	let deleting = $state(false);
+	/** 画面が破棄された印。削除の応答を待つ間に離れても、後から遷移や読み直しをしない。 */
+	let destroyed = false;
 
 	async function remove(): Promise<void> {
 		const target = selected;
@@ -227,12 +239,17 @@
 			// 読み直しが返るまで消えた物を選び続けないよう、手元の一覧から外す（飛行中の古い応答は捨てる）。
 			loadSeq++;
 			if (list) list = list.filter((item) => item.id !== target.id);
-			void goto(freeTrendHref(null), { replaceState: true });
-			await reloadList();
+			const next = afterFreeTrendDelete({
+				destroyed,
+				currentRequestedId: parseFreeTrendParam(page.url.searchParams.get('id')),
+				deletedId: target.id
+			});
+			if (next.clearUrl) void goto(freeTrendHref(null), { replaceState: true });
+			if (next.reload) await reloadList();
 		} catch (err) {
 			toastStore.push('error', errorText(err));
 			// 他の人が先に消した・権限が変わったときは、一覧を読み直して実際の状態に合わせる。
-			await reloadList();
+			if (!destroyed) await reloadList();
 		} finally {
 			deleting = false;
 		}
@@ -250,6 +267,7 @@
 	});
 
 	onDestroy(() => {
+		destroyed = true;
 		poller.stop();
 		liveTrend.reset();
 		if (typeof document !== 'undefined') {

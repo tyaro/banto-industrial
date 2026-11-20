@@ -53,3 +53,39 @@ export function saveLastFreeTrend(storage: Pick<Storage, 'setItem'> | undefined,
 		// 端末の便利機能なので、失敗しても表示は続ける。
 	}
 }
+
+/** 削除の完了後にすること。 */
+export interface FreeTrendDeleteFollowUp {
+	/** URL の `?id=` を外す（replace の遷移）。 */
+	clearUrl: boolean;
+	/** 一覧を読み直す。 */
+	reload: boolean;
+}
+
+/**
+ * 削除の応答を待つ間に画面が破棄された・別の自由トレンドが選ばれた場合に、後から来た完了が
+ * 遷移や選択を上書きしないための判断（純関数）。破棄後は何もしない。URL は、その時点の `?id=`
+ * が削除した ID を指したままのときだけ整理する。
+ */
+export function afterFreeTrendDelete(args: {
+	destroyed: boolean;
+	currentRequestedId: number | null;
+	deletedId: number;
+}): FreeTrendDeleteFollowUp {
+	if (args.destroyed) return { clearUrl: false, reload: false };
+	return { clearUrl: args.currentRequestedId === args.deletedId, reload: true };
+}
+
+/** 画面で選び直した時間窓（どの自由トレンドのものか持つ）。 */
+export interface FreeTrendWindowChoice {
+	id: number;
+	sec: number;
+}
+
+/** 表示中の自由トレンドが変わったら、選び直した時間窓を捨てる（保存値に戻る）。 */
+export function windowChoiceAfterSelection(
+	choice: FreeTrendWindowChoice | null,
+	selectedId: number | null
+): FreeTrendWindowChoice | null {
+	return choice !== null && choice.id === selectedId ? choice : null;
+}
