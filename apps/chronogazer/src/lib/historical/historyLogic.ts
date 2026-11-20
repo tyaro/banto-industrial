@@ -326,7 +326,6 @@ export function historyDescription(input: {
 	range: HistoryRange;
 	penLabels: readonly string[];
 	extent: { min: number; max: number } | null;
-	bandPenName: string | null;
 }): string {
 	const parts = [
 		`${rangeLabel(input.range)} のトレンド（各区間の最小と最大）。ペン: ${input.penLabels.join('、')}。`
@@ -335,9 +334,6 @@ export function historyDescription(input: {
 		input.extent === null
 			? 'この期間に表示できる値はありません。'
 			: `縦軸はペンごとの範囲で、表示中の値の範囲は ${input.extent.min}〜${input.extent.max}。`
-	);
-	parts.push(
-		input.bandPenName === null ? 'しきい値の帯: なし。' : `しきい値の帯: ${input.bandPenName}。`
 	);
 	return parts.join('');
 }

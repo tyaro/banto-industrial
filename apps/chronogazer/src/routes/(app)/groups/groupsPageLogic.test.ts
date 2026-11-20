@@ -29,6 +29,7 @@ import {
 	tagsUsedByOtherPens,
 	thresholdSummary,
 	penThresholdText,
+	limitPlaceholder,
 	THRESHOLDS_UNREADABLE,
 	type GroupDraft
 } from './groupsPageLogic';
@@ -177,6 +178,23 @@ describe('penThresholdText（#532: 読めなかったことを「しきい値な
 		['設定の無いタグ（既定）', 3, true, loaded, false, 'しきい値なし']
 	])('%s', (_label, tagId, tagKnown, thresholds, failed, expected) => {
 		expect(penThresholdText(tagId, tagKnown, thresholds, failed)).toBe(expected);
+	});
+});
+
+describe('limitPlaceholder（管理線の入力はタグのしきい値の設定から読む）', () => {
+	const loaded = new Map([
+		[2, { thresholdLl: null, thresholdL: null, thresholdH: 80, thresholdHh: null }]
+	]);
+	it.each<
+		[string, number | null, typeof loaded | null, boolean, 'thresholdH' | 'thresholdHh', string]
+	>([
+		['タグがまだ無い', null, loaded, false, 'thresholdH', 'タグの設定なし'],
+		['読めなかった', 2, null, true, 'thresholdH', `タグのしきい値: ${THRESHOLDS_UNREADABLE}`],
+		['まだ読んでいない', 2, null, false, 'thresholdH', ''],
+		['値がある', 2, loaded, false, 'thresholdH', 'タグ: 80'],
+		['値が無い', 2, loaded, false, 'thresholdHh', 'タグの設定なし']
+	])('%s', (_label, tagId, thresholds, failed, key, expected) => {
+		expect(limitPlaceholder(tagId, thresholds, failed, key)).toBe(expected);
 	});
 });
 
@@ -572,19 +590,19 @@ describe('ペンの属性の入力（#1207・#1231 PR 6b-2）', () => {
 		expect(parseAxisText('-')).toBe('invalid');
 		expect(parseAxisText('1e')).toBe('invalid');
 		expect(parseAxisText('Infinity')).toBe('invalid');
-		expect(draftProblems(pen({ yMinText: '-' }))).toContain(
+		expect(draftProblems(pen({ texts: { yMin: '-' } }))).toContain(
 			'ペン 1 の縦軸の最小が数ではありません'
 		);
-		expect(draftProblems(pen({ yMaxText: '1e' }))).toContain(
+		expect(draftProblems(pen({ texts: { yMax: '1e' } }))).toContain(
 			'ペン 1 の縦軸の最大が数ではありません'
 		);
-		expect(draftProblems(pen({ yMinText: '1', yMaxText: '2' }))).toEqual([]);
+		expect(draftProblems(pen({ texts: { yMin: '1', yMax: '2' } }))).toEqual([]);
 	});
 
 	it('最小 ≥ 最大は止める（値でも入力の文字でも）', () => {
-		expect(draftProblems(pen({ yMinText: '5', yMaxText: '5' }))).toHaveLength(1);
+		expect(draftProblems(pen({ texts: { yMin: '5', yMax: '5' } }))).toHaveLength(1);
 		expect(draftProblems(pen({ yMin: 9, yMax: 3 }))).toHaveLength(1);
-		expect(draftProblems(pen({ yMinText: '', yMaxText: '5' }))).toEqual([]);
+		expect(draftProblems(pen({ texts: { yMin: '', yMax: '5' } }))).toEqual([]);
 	});
 
 	it('入力して元の値に戻したら未保存ではない。往復で属性が変わらない', () => {
@@ -593,14 +611,46 @@ describe('ペンの属性の入力（#1207・#1231 PR 6b-2）', () => {
 			pens: [{ tagId: 1, colorSlot: null, ...EMPTY_PEN_STYLE, yMin: 1.5, label: 'A' }]
 		});
 		expect(axisText(base.pens[0], 'yMin')).toBe('1.5');
-		const edited = { ...base, pens: [{ ...base.pens[0], yMinText: '2' }] };
+		const edited = { ...base, pens: [{ ...base.pens[0], texts: { yMin: '2' } }] };
 		expect(isDraftDirty(edited, base)).toBe(true);
-		const back = { ...base, pens: [{ ...base.pens[0], yMinText: '1.50' }] };
+		const back = { ...base, pens: [{ ...base.pens[0], texts: { yMin: '1.50' } }] };
 		expect(isDraftDirty(back, base)).toBe(false);
-		const partial = { ...base, pens: [{ ...base.pens[0], yMinText: '-' }] };
+		const partial = { ...base, pens: [{ ...base.pens[0], texts: { yMin: '-' } }] };
 		expect(isDraftDirty(partial, base)).toBe(true);
 		expect(draftToInput(base).pens[0]).toMatchObject({ yMin: 1.5, label: 'A', yMax: null });
 		expect(draftToInput(edited).pens[0]).toMatchObject({ yMin: 2 });
+	});
+
+	it('管理線の入力: 数でなければ止め、上書きどうしの順序（LL ≦ L ≦ H ≦ HH）を設定したものだけ比べる', () => {
+		expect(draftProblems(pen({ texts: { limitHh: '9x' } }))).toContain(
+			'ペン 1 の管理線の HH が数ではありません'
+		);
+		expect(draftProblems(pen({ texts: { limitLl: '-' } }))).toContain(
+			'ペン 1 の管理線の LL が数ではありません'
+		);
+		expect(
+			draftProblems(pen({ texts: { limitHh: '90', limitH: '80', limitL: '20', limitLl: '10' } }))
+		).toEqual([]);
+		expect(draftProblems(pen({ texts: { limitHh: '70', limitH: '80' } }))).toHaveLength(1);
+		expect(draftProblems(pen({ limitH: 5, limitL: 6 }))).toHaveLength(1);
+		// 設定していない間は比べない（HH と LL だけ）。
+		expect(draftProblems(pen({ limitHh: 10, limitLl: 1 }))).toEqual([]);
+		expect(draftProblems(pen({ limitH: 5, limitL: 5 }))).toEqual([]);
+	});
+
+	it('管理線の入力して元の値に戻したら未保存ではない。チェックを外しても値は残る', () => {
+		const base = draftFromGroup({
+			...group,
+			pens: [{ tagId: 1, colorSlot: null, ...EMPTY_PEN_STYLE, limitLines: true, limitH: 80 }]
+		});
+		const edited = { ...base, pens: [{ ...base.pens[0], texts: { limitH: '85' } }] };
+		expect(isDraftDirty(edited, base)).toBe(true);
+		expect(draftToInput(edited).pens[0]).toMatchObject({ limitH: 85, limitLines: true });
+		const back = { ...base, pens: [{ ...base.pens[0], texts: { limitH: '80.0' } }] };
+		expect(isDraftDirty(back, base)).toBe(false);
+		const off = { ...base, pens: [{ ...base.pens[0], limitLines: null }] };
+		expect(draftToInput(off).pens[0]).toMatchObject({ limitLines: null, limitH: 80 });
+		expect(isDraftDirty(off, base)).toBe(true);
 	});
 
 	it('凡例の名前・単位は trim して空は null、文字数（code point）の上限で止める', () => {

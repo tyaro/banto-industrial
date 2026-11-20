@@ -3,8 +3,13 @@
  * ヒストリカル画面が同じペンの ID・`TrendPen` を使う（取得した履歴・格子の系列を、ペンの
  * ID で部品へ渡すため）。
  */
-import type { TrendPen } from '@banto-industrial/trend';
-import type { TrendPenInfo } from './trendLogic';
+import type { TrendLimit, TrendPen } from '@banto-industrial/trend';
+import {
+	TREND_DANGER_COLOR,
+	TREND_WARNING_COLOR,
+	type ResolvedLimits,
+	type TrendPenInfo
+} from './trendLogic';
 
 /**
  * 部品のペンの ID。並びの位置とタグ ID から作る（同じタグを 2 回置いても衝突しない）。
@@ -20,6 +25,23 @@ export function tagIdOfTrendPenId(penId: string): number | null {
 	if (!m) return null;
 	const n = Number(m[1]);
 	return Number.isSafeInteger(n) ? n : null;
+}
+
+/**
+ * 部品の管理線。並びは H → L → HH → LL（越えた区間の色は後ろが勝つので、注意を両方先、より危険な HH・LL を両方後ろに。上限と下限が重なる区間でも危険が勝つ）。
+ * 値の無いものは入れない。
+ */
+export function toTrendLimits(limits: ResolvedLimits | null): TrendLimit[] {
+	if (limits === null) return [];
+	const out: TrendLimit[] = [];
+	const add = (value: number | null, side: 'upper' | 'lower', label: string, colorVar: string) => {
+		if (value !== null) out.push({ value, side, colorVar, label });
+	};
+	add(limits.h, 'upper', 'H', TREND_WARNING_COLOR);
+	add(limits.l, 'lower', 'L', TREND_WARNING_COLOR);
+	add(limits.hh, 'upper', 'HH', TREND_DANGER_COLOR);
+	add(limits.ll, 'lower', 'LL', TREND_DANGER_COLOR);
+	return out;
 }
 
 /**
@@ -39,6 +61,7 @@ export function toTrendPens(pens: readonly TrendPenInfo[]): TrendPen[] {
 		...(pen.lineWidth !== null ? { lineWidth: pen.lineWidth } : {}),
 		...(pen.marker !== null ? { marker: pen.marker } : {}),
 		...(pen.markerSize !== null ? { markerSize: pen.markerSize } : {}),
+		...(pen.limits !== null ? { limits: toTrendLimits(pen.limits) } : {}),
 		...(pen.isBit
 			? { yMin: 0, yMax: 1 }
 			: {

@@ -12,6 +12,10 @@
     （線なしは path を出さない）、マーカーは線の上に 1 本の path（`fill` = ペンの色、stroke なし）。
     凡例の見本は `TrendPenSwatch`（線 + 中央のマーカーの小さな SVG）。
   - 帯（`bands`）は指定したペンの縦軸で、描画域の背景（線の下）に描く（`core/bands.ts`）。
+  - 管理線（`pen.limits`、`core/limits.ts`）はそのペンの縦軸で、帯の後・ペンの線の前に、描画域の
+    幅いっぱいの細い破線と右端の内側の `label` で描く。越えた区間は、区間の矩形の clipPath で
+    ペンの線・マーカーと同じ形を `colorVar` で重ね描きする（並びの順。線なしのペンは線を重ねず
+    マーカーだけ）。どれも描画域の clip の内側。要約には管理線の値を足す（単位は付けない）。
   - 凡例は `onPenSelect` を渡すとペンを選ぶボタンになる（押した印は `selectedPenId`、
     利用側の印は `legendBadge`）。どのペンを選ぶと何が変わるかは利用側が決める。
 -->
@@ -19,6 +23,7 @@
 	import type { Snippet } from 'svelte';
 	import { linearScale, niceTicks } from '@banto/charts';
 	import { bandLayout, type TrendBands } from './core/bands';
+	import { limitLabelY, limitLayout } from './core/limits';
 	import { cursorReadout } from './core/cursor';
 	import { drawableSeries, type TrendData } from './core/data';
 	import { envelopePath, hasFiniteValue } from './core/geometry';
@@ -154,6 +159,9 @@
 				})
 			: []
 	);
+	const limitLayouts = $derived(
+		valid ? pens.map((p, i) => limitLayout(p.limits, domains[i], plotHeight)) : []
+	);
 	const bandRectList = $derived(valid ? bandLayout(bands, pens, domains, plotHeight) : []);
 	const xTicks = $derived(valid ? timeTicks(range, plotWidth) : []);
 	const yTickCount = $derived(Math.max(2, Math.floor(plotHeight / 40)));
@@ -190,11 +198,17 @@
 		const unit = pen.unit ? ` ${pen.unit}` : '';
 		return `${formatValue(d[0], pen.decimals)}〜${formatValue(d[1], pen.decimals)}${unit}`;
 	}
+	function limitsText(p: TrendPen): string {
+		const ls = (p.limits ?? []).filter((l) => Number.isFinite(l.value));
+		return ls.length > 0
+			? `（管理線 ${ls.map((l) => `${l.label} ${formatValue(l.value, p.decimals)}`).join('・')}）`
+			: '';
+	}
 	const summary = $derived(
 		isValidRange(range)
 			? `${formatDateTime(range.startMs)}〜${formatDateTime(range.endMs)}。ペン ${pens.length} 本` +
 					(pens.length > 0
-						? `: ${pens.map((p, i) => `${p.label}（${rangeText(p, domains[i])}）`).join('、')}。`
+						? `: ${pens.map((p, i) => `${p.label}（${rangeText(p, domains[i])}）${limitsText(p)}`).join('、')}。`
 						: '。') +
 					(onRangeChange
 						? '左右の矢印キーで移動、+ と - で拡大・縮小、Ctrl+ホイールで拡大・縮小、Shift+ホイールかドラッグで移動、Esc でカーソルを消す。'
@@ -322,6 +336,13 @@
 				<clipPath id="{uid}-clip">
 					<rect x="0" y="0" width={plotWidth} height={plotHeight} />
 				</clipPath>
+				{#each limitLayouts as lay, i (pens[i].id)}
+					{#each lay.rects as r, j (j)}
+						<clipPath id="{uid}-lim-{i}-{j}">
+							<rect x="0" y={r.y} width={plotWidth} height={r.height} />
+						</clipPath>
+					{/each}
+				{/each}
 			</defs>
 			<g transform="translate({marginLeft},{MARGIN_TOP})">
 				{#each gridTicks as t (t.v)}
@@ -371,6 +392,25 @@
 							fill={b.colorVar}><title>{b.label}</title></rect
 						>
 					{/each}
+					{#each limitLayouts as lay, i (pens[i].id)}
+						{#each lay.lines as l, j (j)}
+							<line
+								class="bi-trend__limit"
+								x1="0"
+								x2={plotWidth}
+								y1={l.y}
+								y2={l.y}
+								stroke={l.colorVar}><title>{l.label}</title></line
+							>
+							<text
+								class="bi-trend__limit-label"
+								x={plotWidth - 4}
+								y={limitLabelY(l.y)}
+								text-anchor="end"
+								fill={l.colorVar}>{l.label}</text
+							>
+						{/each}
+					{/each}
 					{#each pens as pen, i (pen.id)}
 						{#if paths[i] && resolveLineStyle(pen.lineStyle) !== 'none'}
 							<path
@@ -384,6 +424,22 @@
 						{#if markerPaths[i]}
 							<path class="bi-trend__marker" d={markerPaths[i]} fill={penColorVar(pen.colorSlot)} />
 						{/if}
+						{#each limitLayouts[i]?.rects ?? [] as r, j (j)}
+							<g clip-path="url(#{uid}-lim-{i}-{j})">
+								{#if paths[i] && resolveLineStyle(pen.lineStyle) !== 'none'}
+									<path
+										class="bi-trend__line"
+										d={paths[i]}
+										stroke={r.colorVar}
+										stroke-width={resolveLineWidth(pen.lineWidth)}
+										stroke-dasharray={dashArray(pen.lineStyle, pen.lineWidth) ?? undefined}
+									/>
+								{/if}
+								{#if markerPaths[i]}
+									<path class="bi-trend__marker" d={markerPaths[i]} fill={r.colorVar} />
+								{/if}
+							</g>
+						{/each}
 					{/each}
 					{#if cursorX !== null}
 						<line class="bi-trend__cursor" x1={cursorX} x2={cursorX} y1="0" y2={plotHeight} />
@@ -489,6 +545,14 @@
 	}
 	.bi-trend__marker {
 		stroke: none;
+	}
+	.bi-trend__limit {
+		stroke-width: 1;
+		stroke-dasharray: 6 3;
+		vector-effect: non-scaling-stroke;
+	}
+	.bi-trend__limit-label {
+		font-size: var(--banto-font-size-xs);
 	}
 	.bi-trend__band {
 		opacity: 0.12;

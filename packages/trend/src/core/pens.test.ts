@@ -40,6 +40,34 @@ describe('resolveYDomain', () => {
 		expect(resolveYDomain(pen(), bins)).toEqual([-1, 5]);
 		expect(resolveYDomain(pen(), [])).toEqual([0, 1]);
 	});
+	it('データの範囲で決める側だけ、管理線の値も範囲に含める', () => {
+		const lim = (value: number) => ({
+			value,
+			side: 'upper' as const,
+			colorVar: '--c',
+			label: 'H'
+		});
+		// データ [-1, 5]。管理線 8 と -3 で両側が広がる。
+		expect(resolveYDomain(pen({ limits: [lim(8), lim(-3)] }), bins)).toEqual([-3, 8]);
+		// 範囲の内側の管理線は動かさない。
+		expect(resolveYDomain(pen({ limits: [lim(2)] }), bins)).toEqual([-1, 5]);
+		// ペンの指定・工学値レンジで決まる側は広げない。
+		expect(resolveYDomain(pen({ yMax: 10, limits: [lim(20), lim(-3)] }), bins)).toEqual([-3, 10]);
+		expect(
+			resolveYDomain(pen({ engRange: { min: 0, max: 50 }, limits: [lim(80), lim(-9)] }), bins)
+		).toEqual([0, 50]);
+	});
+	it('データが無く管理線だけでも、管理線の値で決める。非有限は無視する', () => {
+		const lim = (value: number) => ({
+			value,
+			side: 'upper' as const,
+			colorVar: '--c',
+			label: 'H'
+		});
+		expect(resolveYDomain(pen({ limits: [lim(10), lim(20)] }), [])).toEqual([10, 20]);
+		expect(resolveYDomain(pen({ limits: [lim(Number.NaN), lim(Infinity)] }), [])).toEqual([0, 1]);
+		expect(resolveYDomain(pen({ limits: [lim(Number.NaN), lim(9)] }), bins)).toEqual([-1, 9]);
+	});
 	it('片側だけの指定は、もう片側を次の順位から取る', () => {
 		expect(resolveYDomain(pen({ yMin: 0 }), bins)).toEqual([0, 5]);
 		expect(resolveYDomain(pen({ yMax: 10 }), bins)).toEqual([-1, 10]);

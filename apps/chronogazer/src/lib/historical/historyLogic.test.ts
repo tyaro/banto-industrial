@@ -317,14 +317,14 @@ describe('説明文', () => {
 		expect(historyExtent(null, { startMs: 0, endMs: 2000 })).toBeNull();
 	});
 
-	it('値が無ければその旨、帯のペンを言う', () => {
+	it('値が無ければその旨を言う', () => {
 		const range = { fromMs: 0, toMs: HOUR };
-		expect(
-			historyDescription({ range, penLabels: ['A'], extent: null, bandPenName: null })
-		).toContain('この期間に表示できる値はありません。しきい値の帯: なし。');
-		expect(
-			historyDescription({ range, penLabels: ['A'], extent: { min: 1, max: 2 }, bandPenName: 'A' })
-		).toContain('表示中の値の範囲は 1〜2。しきい値の帯: A。');
+		expect(historyDescription({ range, penLabels: ['A'], extent: null })).toContain(
+			'この期間に表示できる値はありません。'
+		);
+		expect(historyDescription({ range, penLabels: ['A'], extent: { min: 1, max: 2 } })).toContain(
+			'表示中の値の範囲は 1〜2。'
+		);
 	});
 });
 

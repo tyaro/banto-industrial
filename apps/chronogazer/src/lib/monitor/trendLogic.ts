@@ -35,13 +35,11 @@
  * - 読み取りの失敗・収集の停止・タブが隠れた間は、リングバッファに途切れを知らせる
  *   （`liveBreakAll`。その範囲は履歴で描く）。`bad` / `stale` の値は `null`（欠測）のサンプル。
  *
- * ## しきい値の帯（Q5）
+ * ## 管理線（#1207・#1231 PR 7）
  *
- * 帯は**選んだ 1 ペンだけ**（記録計の側の設定、#532）。上側は H..HH が注意、HH..+∞ が
- * 危険、下側は LL..L が注意、-∞..LL が危険（[`thresholdBands`]）。設定の無いペンは
- * 帯を出さない。既定で選ぶのは、しきい値のある最初のペン。
+ * 管理線は**ペンの属性**（`limitLines`。既定は無効）。引く値は、ペンの上書き → タグのしきい値
+ * （[`resolveLimits`]）。描くのは部品（`TrendLimit`。越えた区間の色替えも部品）。
  */
-import type { OpenThresholdBand } from '@banto/charts';
 import {
 	drawableSeries,
 	followRange,
@@ -272,49 +270,38 @@ export function needsHistoryReload(input: {
 	return !input.following && needEnd > requested.range.endMs;
 }
 
-// --- しきい値の帯 ------------------------------------------------------------
-
-export function hasThresholds(t: ThresholdFields | undefined | null): boolean {
-	return (
-		!!t &&
-		(t.thresholdHh !== null ||
-			t.thresholdH !== null ||
-			t.thresholdL !== null ||
-			t.thresholdLl !== null)
-	);
-}
+// --- 管理線 ------------------------------------------------------------
 
 export const TREND_WARNING_COLOR = 'var(--banto-warning)';
 export const TREND_DANGER_COLOR = 'var(--banto-danger)';
 
-/**
- * しきい値の帯（純関数）。判定（`thresholdLevel`）と同じ境目: 上側は HH 以上が危険・
- * H 以上 HH 未満が注意、下側は LL 以下が危険・LL より上 L 以下が注意。端の無い側は
- * `null`（banto の `OpenThresholdBand` が描画域の端まで伸ばす）。同じ値のしきい値
- * （`H === HH` など。正しい設定）は幅 0 の注意の帯を出さない。設定が無ければ空。
- */
-export function thresholdBands(t: ThresholdFields | undefined | null): OpenThresholdBand[] {
-	if (!t) return [];
-	const { thresholdHh: hh, thresholdH: h, thresholdL: l, thresholdLl: ll } = t;
-	const bands: OpenThresholdBand[] = [];
-	if (hh !== null) bands.push({ from: hh, to: null, label: 'HH', colorVar: TREND_DANGER_COLOR });
-	if (h !== null && (hh === null || h < hh)) {
-		bands.push({ from: h, to: hh, label: 'H', colorVar: TREND_WARNING_COLOR });
-	}
-	if (l !== null && (ll === null || l > ll)) {
-		bands.push({ from: ll, to: l, label: 'L', colorVar: TREND_WARNING_COLOR });
-	}
-	if (ll !== null) bands.push({ from: null, to: ll, label: 'LL', colorVar: TREND_DANGER_COLOR });
-	return bands;
+/** 解決した管理線の値（各 `null` = 引かない）。 */
+export interface ResolvedLimits {
+	hh: number | null;
+	h: number | null;
+	l: number | null;
+	ll: number | null;
 }
 
-/** 帯を出すペン: 選んだペン（グループに居れば）→ しきい値のある最初のペン → なし。 */
-export function resolveBandPen(
-	pens: readonly { tagId: number; thresholds: ThresholdFields | null }[],
-	selectedTagId: number | null
-): number | null {
-	if (selectedTagId !== null && pens.some((p) => p.tagId === selectedTagId)) return selectedTagId;
-	return pens.find((p) => hasThresholds(p.thresholds))?.tagId ?? null;
+/**
+ * 管理線の値を決める（純関数）。`limitLines === true` で bit でないときだけ。各値 = ペンの上書き →
+ * タグのしきい値（タグを読めていなければ上書きだけ）。4 つとも無ければ `null`。
+ */
+export function resolveLimits(
+	pen: Partial<Pick<PenStyle, 'limitLines' | 'limitHh' | 'limitH' | 'limitL' | 'limitLl'>>,
+	tag: Partial<ThresholdFields> | undefined,
+	isBit: boolean
+): ResolvedLimits | null {
+	if (pen.limitLines !== true || isBit) return null;
+	const limits: ResolvedLimits = {
+		hh: pen.limitHh ?? tag?.thresholdHh ?? null,
+		h: pen.limitH ?? tag?.thresholdH ?? null,
+		l: pen.limitL ?? tag?.thresholdL ?? null,
+		ll: pen.limitLl ?? tag?.thresholdLl ?? null
+	};
+	return limits.hh === null && limits.h === null && limits.l === null && limits.ll === null
+		? null
+		: limits;
 }
 
 // --- パネルの表示 -------------------------------------------------------------
@@ -341,7 +328,8 @@ export interface TrendPenInfo {
 	lineWidth: number | null;
 	marker: PenStyle['marker'];
 	markerSize: number | null;
-	thresholds: ThresholdFields | null;
+	/** 引く管理線の値（`null` = 引かない。ペンの属性が無効・bit・値が無いとき）。 */
+	limits: ResolvedLimits | null;
 }
 
 /** タグの工学値レンジ。両方が有限で `engLo < engHi` のときだけ返す。 */
@@ -357,8 +345,7 @@ export function tagEngRange(
 
 /**
  * グループのペンをパネルの形にする（純関数）。タグを読めていなければ「タグ ID n」で
- * 単位・小数桁・しきい値なし。しきい値は設定のあるタグだけ（`tagsForDisplay` が
- * 読めなかったときに空にしたものをそのまま使う）。
+ * 単位・小数桁・管理線の値はペンの上書きだけ。
  */
 export function trendPenInfos(
 	group: { pens: readonly (Pick<Pen, 'tagId' | 'colorSlot'> & Partial<PenStyle>)[] },
@@ -366,13 +353,14 @@ export function trendPenInfos(
 ): TrendPenInfo[] {
 	return group.pens.map((pen, index) => {
 		const tag = tags.find((t) => t.id === pen.tagId);
+		const isBit = isBitTag(tag);
 		return {
 			tagId: pen.tagId,
 			// ペンの属性（#1207・#1231 PR 6a）: 凡例の名前・単位・小数桁は、あればタグの値より優先。
 			name: pen.label ?? tag?.name ?? `タグ ID ${pen.tagId}`,
 			unit: pen.unit ?? (tag?.unit ? tag.unit : null),
 			decimals: pen.decimals ?? (tag ? tag.decimals : null),
-			isBit: isBitTag(tag),
+			isBit,
 			colorSlot: pen.colorSlot ?? index + 1,
 			axis: pen.axis ?? null,
 			yMin: pen.yMin ?? null,
@@ -382,15 +370,7 @@ export function trendPenInfos(
 			lineWidth: pen.lineWidth ?? null,
 			marker: pen.marker ?? null,
 			markerSize: pen.markerSize ?? null,
-			thresholds:
-				tag && hasThresholds(tag)
-					? {
-							thresholdHh: tag.thresholdHh,
-							thresholdH: tag.thresholdH,
-							thresholdL: tag.thresholdL,
-							thresholdLl: tag.thresholdLl
-						}
-					: null
+			limits: resolveLimits(pen, tag, isBit)
 		};
 	});
 }
@@ -425,15 +405,6 @@ function formatNumber(n: number, decimals: number | null): string {
 	return decimals === null ? String(n) : formatValue(n, decimals);
 }
 
-/** 帯 1 つの説明（「H 80〜90 注意」など）。 */
-function bandText(band: OpenThresholdBand, decimals: number | null): string {
-	const tone = band.colorVar === TREND_DANGER_COLOR ? '危険' : '注意';
-	const from = band.from === null ? null : formatNumber(band.from, decimals);
-	const to = band.to === null ? null : formatNumber(band.to, decimals);
-	const range = from === null ? `${to} 以下` : to === null ? `${from} 以上` : `${from}〜${to}`;
-	return `${band.label} ${range} ${tone}`;
-}
-
 /** 描画データのうち表示範囲に描かれる値の最小と最大（ペン 1 本）。値が無ければ `null`。 */
 function visibleExtent(
 	data: TrendData | null,
@@ -457,7 +428,7 @@ function visibleExtent(
 /**
  * 画面外の説明文（純関数、D-2 の `meterDescription` と同じ役目）。図は `role="img"`
  * で中が読まれないので、ペン・単位・窓（追従を止めていれば表示中の期間）・表示範囲に描かれる
- * 値の範囲・帯を文で伝える。値は描画データ（`hybridData` の結果）を表示範囲で絞って読む。
+ * 値の範囲を文で伝える。値は描画データ（`hybridData` の結果）を表示範囲で絞って読む。
  */
 export function trendDescription(input: {
 	/** 時間窓（表示範囲がまだ無いときの言い方に使う）。 */
@@ -469,7 +440,6 @@ export function trendDescription(input: {
 	/** ペンの並びどおりの部品のペンの ID（`trendPenId`）。 */
 	penIds: readonly string[];
 	data: TrendData | null;
-	bandTagId: number | null;
 }): string {
 	const { view, pens } = input;
 	const parts: string[] = [];
@@ -504,17 +474,6 @@ export function trendDescription(input: {
 		if (bits.length > 0) {
 			parts.push(`bit のペン（${bits.map((p) => p.name).join('、')}）は 0 が False、1 が True。`);
 		}
-	}
-	const bandPen = input.pens.find((p) => p.tagId === input.bandTagId) ?? null;
-	if (bandPen === null) {
-		parts.push('しきい値の帯: なし。');
-	} else {
-		const bands = thresholdBands(bandPen.thresholds);
-		parts.push(
-			bands.length === 0
-				? `しきい値の帯: ${bandPen.name}（しきい値の設定なし）。`
-				: `しきい値の帯: ${bandPen.name}（${bands.map((b) => bandText(b, bandPen.decimals)).join('、')}）。`
-		);
 	}
 	return parts.join('');
 }

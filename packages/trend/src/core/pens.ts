@@ -5,6 +5,8 @@
  * 区間は欠測で、線をつながない。片方だけ有限なら、その値 1 つの区間として扱う。
  */
 
+import type { TrendLimit } from './limits';
+
 /** 区間 1 つの値。`tMs` は区間の始まり（UTC ミリ秒）。 */
 export interface Bin {
 	tMs: number;
@@ -37,6 +39,8 @@ export interface TrendPen {
 	marker?: MarkerKind | null;
 	/** マーカーの大きさ（px、2〜8）。未指定・null は 4。 */
 	markerSize?: number | null;
+	/** 管理線。null・空 = 引かない。越えた区間の色は、並びの後ろのものが前のものの上に重なる（H → HH の順に渡せば HH の色が勝つ）。 */
+	limits?: readonly TrendLimit[] | null;
 }
 
 export type LineStyle = 'solid' | 'dashed' | 'dashDot' | 'dashDotDot' | 'none';
@@ -71,6 +75,10 @@ function padFor(v: number): number {
  * ペンの縦軸の範囲。側ごとに、ペンの指定（`yMin`/`yMax`）→ 工学値レンジ → データの
  * 範囲 → `[0, 1]` の順に決める。
  *
+ * - データの範囲で決める側（ペンの指定も工学値レンジも無い側）だけ、`pen.limits` の有限の
+ *   値も範囲に含める（下の側は最小、上の側は最大を広げる。データが無く管理線だけでも
+ *   管理線の値で決める）。管理線が縦軸の外に出て見えなくなるのを防ぐ。ペンの指定・
+ *   工学値レンジで決まる側は広げない。
  * - 結果が lo == hi なら幅を持たせる。ペンの指定で固定された側は動かさず、もう片方を
  *   広げる（両側とも指定・両側とも未指定なら上下に広げる）。
  * - lo > hi になったら（例: `yMin` だけ指定し、データがそれより下）、両側とも指定なら
@@ -82,8 +90,15 @@ export function resolveYDomain(pen: TrendPen, bins: readonly Bin[]): YDomain {
 	const data = dataExtent(bins);
 	const fixedLo = isNum(pen.yMin);
 	const fixedHi = isNum(pen.yMax);
-	let lo = fixedLo ? (pen.yMin as number) : eng ? eng.min : data ? data[0] : 0;
-	let hi = fixedHi ? (pen.yMax as number) : eng ? eng.max : data ? data[1] : 1;
+	const limitValues = (pen.limits ?? []).map((l) => l.value).filter(isNum);
+	let ext: [number, number] | null = data;
+	if (limitValues.length > 0) {
+		const lows = data ? [data[0], ...limitValues] : limitValues;
+		const highs = data ? [data[1], ...limitValues] : limitValues;
+		ext = [Math.min(...lows), Math.max(...highs)];
+	}
+	let lo = fixedLo ? (pen.yMin as number) : eng ? eng.min : ext ? ext[0] : 0;
+	let hi = fixedHi ? (pen.yMax as number) : eng ? eng.max : ext ? ext[1] : 1;
 
 	if (lo > hi) {
 		if (fixedLo === fixedHi) [lo, hi] = [hi, lo];
