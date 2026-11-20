@@ -334,7 +334,20 @@ export interface TrendPenInfo {
 	/** ペンの属性の縦軸の最小・最大（`null` = 工学値レンジ）。bit のタグでは使わない（0〜1 固定）。 */
 	yMin: number | null;
 	yMax: number | null;
+	/** タグの工学値レンジ（`engLo < engHi` で両方有限のときだけ。縦軸の指定の無い側に使う）。 */
+	engRange: { min: number; max: number } | null;
 	thresholds: ThresholdFields | null;
+}
+
+/** タグの工学値レンジ。両方が有限で `engLo < engHi` のときだけ返す。 */
+export function tagEngRange(
+	tag: { engLo?: number | null; engHi?: number | null } | undefined
+): { min: number; max: number } | null {
+	const lo = tag?.engLo;
+	const hi = tag?.engHi;
+	if (typeof lo !== 'number' || typeof hi !== 'number') return null;
+	if (!Number.isFinite(lo) || !Number.isFinite(hi) || lo >= hi) return null;
+	return { min: lo, max: hi };
 }
 
 /**
@@ -359,6 +372,7 @@ export function trendPenInfos(
 			axis: pen.axis ?? null,
 			yMin: pen.yMin ?? null,
 			yMax: pen.yMax ?? null,
+			engRange: tagEngRange(tag),
 			thresholds:
 				tag && hasThresholds(tag)
 					? {

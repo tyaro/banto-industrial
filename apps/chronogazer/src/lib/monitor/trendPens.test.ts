@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { resolveYDomain, type Bin } from '@banto-industrial/trend';
+import { trendPenInfos } from './trendLogic';
 import { tagIdOfTrendPenId, toTrendPens, trendPenId } from './trendPens';
 
 describe('ペンの ID と部品のペン', () => {
@@ -20,6 +22,7 @@ describe('ペンの ID と部品のペン', () => {
 				axis: null,
 				yMin: null,
 				yMax: null,
+				engRange: null,
 				thresholds: null
 			},
 			{
@@ -32,6 +35,7 @@ describe('ペンの ID と部品のペン', () => {
 				axis: null,
 				yMin: null,
 				yMax: null,
+				engRange: null,
 				thresholds: null
 			}
 		]);
@@ -55,6 +59,7 @@ describe('ペンの ID と部品のペン', () => {
 			axis: 'right' as const,
 			yMin: -5,
 			yMax: 50,
+			engRange: null,
 			thresholds: null
 		};
 		const [num, bit, half, plain] = toTrendPens([
@@ -68,5 +73,66 @@ describe('ペンの ID と部品のペン', () => {
 		expect(half.yMin).toBe(-5);
 		expect('yMax' in half).toBe(false);
 		expect('axis' in plain || 'yMin' in plain || 'yMax' in plain).toBe(false);
+	});
+
+	describe('縦軸の範囲にタグの工学値レンジを使う', () => {
+		const bins = (vs: number[]): Bin[] =>
+			vs.map((v, i) => ({ tMs: i * 1000, min: v, max: v }) as unknown as Bin);
+		const domainOf = (
+			tag: Record<string, unknown>,
+			pen: { yMin?: number | null; yMax?: number | null },
+			data: number[]
+		) => {
+			const infos = trendPenInfos({ pens: [{ tagId: 1, colorSlot: null, ...pen }] }, [
+				{
+					id: 1,
+					name: 'x',
+					unit: '',
+					decimals: 1,
+					thresholdHh: null,
+					thresholdH: null,
+					thresholdL: null,
+					thresholdLl: null,
+					...tag
+				}
+			] as unknown as Parameters<typeof trendPenInfos>[1]);
+			return resolveYDomain(toTrendPens(infos)[0], bins(data));
+		};
+
+		it('工学値レンジ 0〜100 で yMin=10 だけ指定、データ 20〜30 なら 10〜100', () => {
+			expect(domainOf({ engLo: 0, engHi: 100 }, { yMin: 10 }, [20, 30])).toEqual([10, 100]);
+		});
+
+		it('両側とも指定しなければ 0〜100', () => {
+			expect(domainOf({ engLo: 0, engHi: 100 }, {}, [20, 30])).toEqual([0, 100]);
+		});
+
+		it('工学値レンジが無い・逆順・同値・非有限ならデータの範囲', () => {
+			expect(domainOf({ engLo: null, engHi: null }, {}, [20, 30])).toEqual([20, 30]);
+			expect(domainOf({ engLo: 100, engHi: 0 }, {}, [20, 30])).toEqual([20, 30]);
+			expect(domainOf({ engLo: 5, engHi: 5 }, {}, [20, 30])).toEqual([20, 30]);
+			expect(domainOf({ engLo: 0, engHi: Number.NaN }, {}, [20, 30])).toEqual([20, 30]);
+		});
+
+		it('bit のタグは工学値レンジがあっても 0〜1 のまま', () => {
+			const [pen] = toTrendPens([
+				{
+					tagId: 1,
+					name: 'b',
+					unit: null,
+					decimals: null,
+					isBit: true,
+					colorSlot: 1,
+					axis: null,
+					yMin: null,
+					yMax: null,
+					engRange: { min: 0, max: 100 },
+					thresholds: null
+				}
+			]);
+			expect(pen).toMatchObject({ yMin: 0, yMax: 1 });
+			expect('engRange' in pen).toBe(false);
+			expect(resolveYDomain(pen, bins([0, 1]))).toEqual([0, 1]);
+		});
 	});
 });

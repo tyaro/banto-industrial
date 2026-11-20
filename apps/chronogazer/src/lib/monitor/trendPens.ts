@@ -38,7 +38,8 @@ export function toTrendPens(pens: readonly TrendPenInfo[]): TrendPen[] {
 			? { yMin: 0, yMax: 1 }
 			: {
 					...(pen.yMin !== null ? { yMin: pen.yMin } : {}),
-					...(pen.yMax !== null ? { yMax: pen.yMax } : {})
+					...(pen.yMax !== null ? { yMax: pen.yMax } : {}),
+					...(pen.engRange !== null ? { engRange: pen.engRange } : {})
 				})
 	}));
 }

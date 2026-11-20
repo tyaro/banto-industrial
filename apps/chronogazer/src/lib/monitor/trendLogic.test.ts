@@ -448,6 +448,7 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 				axis: null,
 				yMin: null,
 				yMax: null,
+				engRange: null,
 				thresholds: { thresholdHh: 90, thresholdH: 80, thresholdL: null, thresholdLl: null }
 			},
 			{
@@ -460,6 +461,7 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 				axis: null,
 				yMin: null,
 				yMax: null,
+				engRange: null,
 				thresholds: null
 			},
 			{
@@ -472,6 +474,7 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 				axis: null,
 				yMin: null,
 				yMax: null,
+				engRange: null,
 				thresholds: null
 			}
 		]);
