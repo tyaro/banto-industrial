@@ -52,9 +52,20 @@
 //! - API キーは読むだけ（`config` のキーでも書けない）。MCP のツールは足さない（後で）。
 //! - **見分け方は名前ではなくセッションの出どころ**: REST は banto の `AuthenticatedSession::grant`
 //!   （`None` = アカウント、`Some("localDesktop")`、それ以外の grant）、Tauri はデスクトップの
-//!   セッションの種類（アカウントか、ログイン不要モードの合成のセッションか）。予約名
-//!   （`crate::local_grant::RESERVED_USERNAMES`）と同じ名前の古いアカウントがありうるので、作った人も
-//!   `created_by_kind`（`account`・`localDesktop`）と名前の 2 つで持ち、両方が合うときだけ同じ人とする。
+//!   セッションの種類（アカウントか、ログイン不要モードの合成のセッションか）。
+//! - **作った人はアカウントの ID で見分ける**（2026-11-20 オーナーの P2）: 作った人は
+//!   `created_by_kind`（`account`・`localDesktop`）と `created_by_user_id`（account のときの
+//!   `users.id`）で持ち、account は ID の一致、localDesktop は種類の一致で同じ人とする。`created_by` は
+//!   表示用の当時の名前で、判定に使わない。名前で比べると、予約名（`crate::local_grant::RESERVED_USERNAMES`）
+//!   と同じ名前の古いアカウントや、消したアカウントと同じ名前で作り直したアカウントが、前の人の物を
+//!   自分の物にできてしまう。
+//! - アカウントの削除（banto の `UsersService`）は `users` の行を消す（論理削除ではない）。`users.id` は
+//!   AUTOINCREMENT なので消した ID は再利用されず、消したアカウントの物はだれの物でもなくなる（変えられる
+//!   のは editor 以上だけ）。`created_by_user_id` に FK は張らない（0109 の注記）。
+//! - 主体の ID: Tauri はアカウントのセッションの `UserIdentity.id` をそのまま渡す。REST のセッションは
+//!   名前（`identity.id`）しか持たないので、保存（・読み取り）のトランザクションの中で `users` から
+//!   名前 → ID を引く（[`FreeTrendActor::Account`] の `user_id: None`）。引けなければ書けない主体として
+//!   扱う（作成・変更・削除は `Forbidden`、`canEdit` は false）。
 //! - 断ったときは経路の側が `denied` を監査して 403（`Forbidden`）にする。サービスは権限が無いとき
 //!   `BantoError::Forbidden` を返すだけ（作った人の確認は保存と同じトランザクションの中）。
 //!
@@ -129,7 +140,13 @@ impl OwnerKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FreeTrendActor {
     /// アカウントのログイン（REST の grant の無いセッション、Tauri のアカウントのセッション）。
-    Account { username: String, role: Role },
+    /// `user_id` は `users.id`。`None` は保存のトランザクションの中で `username` から引く（REST の
+    /// セッションは名前しか持たない。モジュール doc「権限」）。`username` は記録の表示用の名前。
+    Account {
+        user_id: Option<i64>,
+        username: String,
+        role: Role,
+    },
     /// この PC からの接続（REST の `localDesktop` の grant のセッション）。`role` は grant の役割。
     LocalDesktop { role: Role },
     /// 開くだけの主体（ログイン不要モード・閲覧公開・ほかの grant・API キー）。
@@ -145,6 +162,7 @@ impl FreeTrendActor {
         };
         match grant {
             None => Self::Account {
+                user_id: None,
                 username: username.to_string(),
                 role,
             },
@@ -162,30 +180,103 @@ impl FreeTrendActor {
         }
     }
 
-    /// 作成・変更の記録に残す主体（`None` = 書けない主体）。
-    fn owner(&self) -> Option<(OwnerKind, &str)> {
-        match self {
-            Self::Account { username, .. } => Some((OwnerKind::Account, username)),
-            Self::LocalDesktop { .. } => Some((OwnerKind::LocalDesktop, LOCAL_GRANT_ACTOR_ID)),
-            Self::ReadOnly => None,
-        }
-    }
-
-    /// 作れるか（viewer 以上のアカウント・`localDesktop`）。
+    /// 作れる種類・役割か（viewer 以上のアカウント・`localDesktop`）。REST のアカウントが今も
+    /// `users` にあるかは、保存のトランザクションの中で確かめる（[`writer_on`]）。
     pub fn can_create(&self) -> bool {
-        self.owner().is_some() && self.role().is_some_and(|role| role.at_least(Role::Viewer))
+        !matches!(self, Self::ReadOnly)
+            && self.role().is_some_and(|role| role.at_least(Role::Viewer))
+    }
+}
+
+/// 作った人（DB の `created_by_kind`・`created_by_user_id`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    /// `users.id`。
+    Account(i64),
+    LocalDesktop,
+}
+
+impl Owner {
+    fn kind(self) -> OwnerKind {
+        match self {
+            Self::Account(_) => OwnerKind::Account,
+            Self::LocalDesktop => OwnerKind::LocalDesktop,
+        }
     }
 
-    /// `created_by_kind`・`created_by` の自由トレンドを変えられるか（作った人か editor 以上）。
-    fn can_edit(&self, kind: OwnerKind, created_by: &str) -> bool {
-        if !self.can_create() {
-            return false;
+    fn user_id(self) -> Option<i64> {
+        match self {
+            Self::Account(id) => Some(id),
+            Self::LocalDesktop => None,
         }
-        if self.role().is_some_and(|role| role.at_least(Role::Editor)) {
-            return true;
-        }
-        self.owner() == Some((kind, created_by))
     }
+}
+
+/// トランザクションの中で確かめた主体（[`writer_on`]）。作った人の判定はこれで行う。
+#[derive(Debug, Clone, Copy)]
+enum Writer<'a> {
+    /// 書ける主体: 作った人としての ID・記録に残す名前・役割。
+    Some {
+        owner: Owner,
+        name: &'a str,
+        role: Role,
+    },
+    /// 書けない主体（開くだけ、または REST の名前が `users` に無い）。
+    None,
+}
+
+impl Writer<'_> {
+    fn can_create(&self) -> bool {
+        matches!(self, Self::Some { role, .. } if role.at_least(Role::Viewer))
+    }
+
+    /// 作った人が `owner` の自由トレンドを変えられるか（作った人か editor 以上）。
+    fn can_edit(&self, owner: Owner) -> bool {
+        match self {
+            Self::Some {
+                owner: me, role, ..
+            } => role.at_least(Role::Viewer) && (role.at_least(Role::Editor) || *me == owner),
+            Self::None => false,
+        }
+    }
+}
+
+/// 主体を確かめる（モジュール doc「権限」）。REST のアカウント（`user_id: None`）は `users` から名前 →
+/// ID を引き、無ければ書けない主体にする。呼ぶ側は同じトランザクションで保存・読み取りを行う。
+async fn writer_on<'a>(
+    conn: &mut SqliteConnection,
+    actor: &'a FreeTrendActor,
+) -> Result<Writer<'a>, BantoError> {
+    Ok(match actor {
+        FreeTrendActor::Account {
+            user_id,
+            username,
+            role,
+        } => {
+            let id = match user_id {
+                Some(id) => Some(*id),
+                None => sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
+                    .bind(username)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(storage)?,
+            };
+            match id {
+                Some(id) => Writer::Some {
+                    owner: Owner::Account(id),
+                    name: username,
+                    role: *role,
+                },
+                None => Writer::None,
+            }
+        }
+        FreeTrendActor::LocalDesktop { role } => Writer::Some {
+            owner: Owner::LocalDesktop,
+            name: LOCAL_GRANT_ACTOR_ID,
+            role: *role,
+        },
+        FreeTrendActor::ReadOnly => Writer::None,
+    })
 }
 
 /// 自由トレンド（読み取りの応答）。
@@ -552,6 +643,7 @@ struct TrendRow {
     time_window_sec: i64,
     revision: i64,
     created_by_kind: String,
+    created_by_user_id: Option<i64>,
     created_by: String,
     created_at: String,
     updated_by: String,
@@ -559,17 +651,22 @@ struct TrendRow {
 }
 
 impl TrendRow {
-    fn owner_kind(&self) -> Result<OwnerKind, BantoError> {
-        OwnerKind::parse(&self.created_by_kind).ok_or_else(|| {
-            BantoError::Storage(format!(
-                "free_trends.created_by_kind に未知の値があります: {}",
-                self.created_by_kind
-            ))
-        })
+    fn owner(&self) -> Result<Owner, BantoError> {
+        match (
+            OwnerKind::parse(&self.created_by_kind),
+            self.created_by_user_id,
+        ) {
+            (Some(OwnerKind::Account), Some(id)) => Ok(Owner::Account(id)),
+            (Some(OwnerKind::LocalDesktop), None) => Ok(Owner::LocalDesktop),
+            _ => Err(BantoError::Storage(format!(
+                "free_trends の作った人が読めません: created_by_kind = {}, created_by_user_id = {:?}",
+                self.created_by_kind, self.created_by_user_id
+            ))),
+        }
     }
 
-    fn into_trend(self, pens: Vec<Pen>, actor: &FreeTrendActor) -> Result<FreeTrend, BantoError> {
-        let can_edit = actor.can_edit(self.owner_kind()?, &self.created_by);
+    fn into_trend(self, pens: Vec<Pen>, writer: &Writer<'_>) -> Result<FreeTrend, BantoError> {
+        let can_edit = writer.can_edit(self.owner()?);
         Ok(FreeTrend {
             id: self.id,
             name: self.name,
@@ -594,8 +691,8 @@ struct PenRow {
 
 const PEN_TABLE: &str = "free_trend_pens";
 
-const TREND_COLUMNS: &str = "id, name, time_window_sec, revision, created_by_kind, created_by, \
-     created_at, updated_by, updated_at";
+const TREND_COLUMNS: &str = "id, name, time_window_sec, revision, created_by_kind, \
+     created_by_user_id, created_by, created_at, updated_by, updated_at";
 
 /// 自由トレンドのサービス（REST・Tauri 共通）。`Clone` で同じ pool を共有する。
 #[derive(Clone)]
@@ -612,6 +709,7 @@ impl FreeTrendService {
     /// 2 つの SELECT の間に更新が入っても、古い版に新しいペンが混ざらない）。
     pub async fn list(&self, actor: &FreeTrendActor) -> Result<Vec<FreeTrend>, BantoError> {
         let mut tx = self.pool.begin().await.map_err(storage)?;
+        let writer = writer_on(&mut tx, actor).await?;
         let rows: Vec<TrendRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {TREND_COLUMNS} FROM free_trends ORDER BY name, id"
         )))
@@ -635,7 +733,7 @@ impl FreeTrendService {
         rows.into_iter()
             .map(|row| {
                 let pens = pens_by_trend.remove(&row.id).unwrap_or_default();
-                row.into_trend(pens, actor)
+                row.into_trend(pens, &writer)
             })
             .collect()
     }
@@ -643,7 +741,8 @@ impl FreeTrendService {
     /// 1 つ。
     pub async fn get(&self, actor: &FreeTrendActor, id: i64) -> Result<FreeTrend, BantoError> {
         let mut tx = self.pool.begin().await.map_err(storage)?;
-        let trend = get_on(&mut tx, actor, id).await?;
+        let writer = writer_on(&mut tx, actor).await?;
+        let trend = get_on(&mut tx, &writer, id).await?;
         tx.commit().await.map_err(storage)?;
         Ok(trend)
     }
@@ -654,29 +753,41 @@ impl FreeTrendService {
         actor: &FreeTrendActor,
         payload: &FreeTrendPayload,
     ) -> Result<FreeTrend, BantoError> {
-        let Some((kind, by)) = actor.owner().filter(|_| actor.can_create()) else {
+        if !actor.can_create() {
             return Err(BantoError::Forbidden);
-        };
+        }
         let mut tx = self
             .pool
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(storage)?;
+        let writer = writer_on(&mut tx, actor).await?;
+        let Writer::Some {
+            owner, name: by, ..
+        } = writer
+        else {
+            return Err(BantoError::Forbidden);
+        };
+        if !writer.can_create() {
+            return Err(BantoError::Forbidden);
+        }
         let valid = validate_free_trend(&mut tx, payload, None).await?;
         let id: i64 = sqlx::query_scalar(
-            "INSERT INTO free_trends (name, time_window_sec, created_by_kind, created_by, updated_by) \
-             VALUES (?, ?, ?, ?, ?) RETURNING id",
+            "INSERT INTO free_trends \
+             (name, time_window_sec, created_by_kind, created_by_user_id, created_by, updated_by) \
+             VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(&valid.name)
         .bind(valid.time_window_sec)
-        .bind(kind.as_str())
+        .bind(owner.kind().as_str())
+        .bind(owner.user_id())
         .bind(by)
         .bind(by)
         .fetch_one(&mut *tx)
         .await
         .map_err(map_write_error)?;
         insert_pens(&mut tx, id, &valid.pens).await?;
-        let trend = get_on(&mut tx, actor, id).await?;
+        let trend = get_on(&mut tx, &writer, id).await?;
         tx.commit().await.map_err(storage)?;
         Ok(trend)
     }
@@ -695,10 +806,11 @@ impl FreeTrendService {
             .await
             .map_err(storage)?;
         let row = row_on(&mut tx, id).await?;
-        let Some((_, by)) = actor.owner() else {
+        let writer = writer_on(&mut tx, actor).await?;
+        let Writer::Some { name: by, .. } = writer else {
             return Err(BantoError::Forbidden);
         };
-        if !actor.can_edit(row.owner_kind()?, &row.created_by) {
+        if !writer.can_edit(row.owner()?) {
             return Err(BantoError::Forbidden);
         }
         if let Some(expected) = payload.expected_revision {
@@ -724,7 +836,7 @@ impl FreeTrendService {
             .await
             .map_err(storage)?;
         insert_pens(&mut tx, id, &valid.pens).await?;
-        let trend = get_on(&mut tx, actor, id).await?;
+        let trend = get_on(&mut tx, &writer, id).await?;
         tx.commit().await.map_err(storage)?;
         Ok(trend)
     }
@@ -737,7 +849,8 @@ impl FreeTrendService {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(storage)?;
-        let existing = get_on(&mut tx, actor, id).await?;
+        let writer = writer_on(&mut tx, actor).await?;
+        let existing = get_on(&mut tx, &writer, id).await?;
         if !existing.can_edit {
             return Err(BantoError::Forbidden);
         }
@@ -764,7 +877,7 @@ async fn row_on(conn: &mut SqliteConnection, id: i64) -> Result<TrendRow, BantoE
 
 async fn get_on(
     conn: &mut SqliteConnection,
-    actor: &FreeTrendActor,
+    writer: &Writer<'_>,
     id: i64,
 ) -> Result<FreeTrend, BantoError> {
     let row = row_on(conn, id).await?;
@@ -779,7 +892,7 @@ async fn get_on(
         .into_iter()
         .map(|row| row.pen.into_pen(PEN_TABLE))
         .collect::<Result<Vec<_>, _>>()?;
-    row.into_trend(pens, actor)
+    row.into_trend(pens, writer)
 }
 
 async fn insert_pens(

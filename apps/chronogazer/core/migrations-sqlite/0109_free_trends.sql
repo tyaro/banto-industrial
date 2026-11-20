@@ -3,9 +3,14 @@
 -- （利用者ごとにしない）。保存は全体で 200 まで（`free_trends::MAX_FREE_TRENDS`）、名前は重ならない。
 --
 -- 作った人は `created_by_kind`（'account' = アカウントのログイン、'localDesktop' = この PC からの
--- 接続の grant）と `created_by`（アカウント名、または 'localDesktop'）の 2 つで持つ。名前だけで
--- 比べると、予約名と同じ名前の古いアカウント（`local_grant::RESERVED_USERNAMES`）が grant の
--- 作ったものを自分の物として変えられてしまうため。
+-- 接続の grant）と `created_by_user_id`（account のときの `users.id`、localDesktop のときは NULL）で
+-- 判定する。`created_by` は表示用の当時の名前（アカウント名、または 'localDesktop'）で、判定には
+-- 使わない。名前で比べると、(1) 予約名と同じ名前の古いアカウント（`local_grant::RESERVED_USERNAMES`）
+-- が grant の作ったものを、(2) 消したアカウントと同じ名前で作り直したアカウントが前の人の作ったものを、
+-- 自分の物として変えられてしまうため。`users.id` は AUTOINCREMENT なので再利用されない。
+-- `created_by_user_id` に `users(id)` への FK は張らない: アカウントの削除（banto の `UsersService`、
+-- 行を消す）が自由トレンドに妨げられないように、また作った人が消えても自由トレンドは残す
+-- （消えたアカウントの物は editor 以上が変える）ため。
 --
 -- 検証は `src/free_trends.rs` の `validate_free_trend` 1 か所で行う（ペンの属性は表示グループと
 -- 同じ `display_groups::validate_pen_style`）。ここの CHECK / UNIQUE はその取りこぼしを防ぐ最後の砦
@@ -19,6 +24,8 @@ CREATE TABLE free_trends (
   -- 楽観ロック用の版。作成で 1、更新のたびに +1。
   revision INTEGER NOT NULL DEFAULT 1,
   created_by_kind TEXT NOT NULL CHECK (created_by_kind IN ('account', 'localDesktop')),
+  created_by_user_id INTEGER
+    CHECK ((created_by_kind = 'account') = (created_by_user_id IS NOT NULL)),
   created_by TEXT NOT NULL
     CHECK (created_by_kind <> 'localDesktop' OR created_by = 'localDesktop'),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),

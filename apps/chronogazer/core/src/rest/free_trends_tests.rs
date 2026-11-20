@@ -395,3 +395,67 @@ async fn validation_errors_are_422_and_a_session_still_needs_the_csrf_header() {
         .unwrap();
     assert_eq!(count, 0);
 }
+
+/// オーナーの P2（2026-11-20）: 作った人はアカウントの ID で見分ける。viewer の alice が作る →
+/// alice を消す → 同じ名前の viewer を作り直す。新しい alice は変更・削除が 403 で `canEdit` は
+/// false、editor は変えられる（応答の `createdBy` は当時の名前のまま）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recreated_account_with_the_same_name_cannot_change_the_old_free_trend() {
+    let (router, _admin, editor, _viewer, pool, _hub, auth) =
+        router_with_role_tokens_pool_hub_and_auth().await;
+    let (_tags, ids) = seed_tags(&pool, 1).await;
+    let users = UsersService::new(Db::Sqlite(pool.clone()));
+    let old = users
+        .create_user("alice", "password123", "アリス", Role::Viewer)
+        .await
+        .expect("create alice");
+    let old_token = auth.login("alice", "password123").await.expect("login");
+    let (status, created) = send(
+        &router,
+        &Who::Session(&old_token),
+        "POST",
+        "/api/free-trends",
+        Some(body("A", &ids, None)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    assert_eq!(created["canEdit"], true);
+    let path = format!("/api/free-trends/{}", created["id"]);
+
+    users.delete_user(old.id, None).await.expect("delete alice");
+    let new = users
+        .create_user("alice", "password456", "アリス 2", Role::Viewer)
+        .await
+        .expect("recreate alice");
+    assert_ne!(new.id, old.id);
+    let new_token = auth.login("alice", "password456").await.expect("login");
+    let alice = Who::Session(&new_token);
+
+    let (status, list) = send(&router, &alice, "GET", "/api/free-trends", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(can_edit_by_name(&list), vec![("A".to_string(), false)]);
+    let (status, one) = send(&router, &alice, "GET", &path, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(one["canEdit"], false);
+    assert_eq!(one["createdBy"], "alice");
+    let (status, _) = send(&router, &alice, "PUT", &path, Some(body("A改", &ids, None))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(&router, &alice, "DELETE", &path, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // editor は消えたアカウントの物も変えられる。
+    let editor = Who::Session(&editor);
+    let (status, changed) = send(
+        &router,
+        &editor,
+        "PUT",
+        &path,
+        Some(body("A改", &ids, None)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{changed}");
+    assert_eq!(changed["createdBy"], "alice");
+    assert_eq!(changed["canEdit"], true);
+    let (status, _) = send(&router, &editor, "DELETE", &path, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}

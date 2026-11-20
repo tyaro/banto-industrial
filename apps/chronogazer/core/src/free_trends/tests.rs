@@ -19,12 +19,29 @@ fn payload(name: &str, tag_ids: &[i64]) -> FreeTrendPayload {
     }
 }
 
+/// REST のセッションと同じ、名前だけのアカウントの主体（ID は保存の中で `users` から引く）。
 fn account(username: &str, role: Role) -> FreeTrendActor {
     FreeTrendActor::Account {
+        user_id: None,
         username: username.to_string(),
         role,
     }
 }
+
+/// `users` にアカウントを足して ID を返す（役割は主体の側で持つので、ここでは既定のまま）。
+async fn seed_user(pool: &SqlitePool, username: &str) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO users (username, password_hash, display_name) VALUES (?, 'x', ?) RETURNING id",
+    )
+    .bind(username)
+    .bind(username)
+    .fetch_one(pool)
+    .await
+    .expect("seed user")
+}
+
+/// 試験で使う名前のアカウント（`localDesktop` は予約名と同じ名前の古いアカウント）。
+const SEEDED_USERS: [&str; 4] = ["alice", "bob", "eve", "localDesktop"];
 
 fn fields(err: BantoError) -> Vec<String> {
     match err {
@@ -38,6 +55,9 @@ fn fields(err: BantoError) -> Vec<String> {
 async fn service_with_tags(n: usize) -> (FreeTrendService, TagService, Vec<i64>, SqlitePool) {
     let pool = crate::db::init_db_memory().await.expect("init_db_memory");
     let (tags, ids) = seed_tags(&pool, n).await;
+    for username in SEEDED_USERS {
+        seed_user(&pool, username).await;
+    }
     (FreeTrendService::new(pool.clone()), tags, ids, pool)
 }
 
@@ -319,13 +339,91 @@ async fn ownership_decides_who_can_change_and_can_edit_follows_it() {
     );
 }
 
+/// オーナーの P2（2026-11-20）: 作った人はアカウントの ID で見分ける。viewer の alice が作る →
+/// alice を消す → 同じ名前で作り直す。新しい alice は名前が同じでも別人（変更・削除は `Forbidden`、
+/// `canEdit` は false）、editor は変えられる。名前の無い主体（`users` に無い REST のセッション）は書けない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recreated_account_with_the_same_name_is_not_the_owner() {
+    let (service, _tags, ids, pool) = service_with_tags(1).await;
+    let alice = account("alice", Role::Viewer);
+    let mine = service.create(&alice, &payload("A", &ids)).await.unwrap();
+    let old_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'alice'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let stored: (String, Option<i64>, String) = sqlx::query_as(
+        "SELECT created_by_kind, created_by_user_id, created_by FROM free_trends WHERE id = ?",
+    )
+    .bind(mine.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored,
+        ("account".to_string(), Some(old_id), "alice".to_string())
+    );
+    // Tauri と同じ、ID を持つ主体でも同じ人。
+    let alice_by_id = FreeTrendActor::Account {
+        user_id: Some(old_id),
+        username: "alice".to_string(),
+        role: Role::Viewer,
+    };
+    assert!(service.get(&alice_by_id, mine.id).await.unwrap().can_edit);
+
+    // 消した直後: 名前が `users` に無い REST の主体は書けない。
+    sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(old_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(!service.get(&alice, mine.id).await.unwrap().can_edit);
+    assert!(matches!(
+        service.create(&alice, &payload("B", &[])).await,
+        Err(BantoError::Forbidden)
+    ));
+
+    // 同じ名前で作り直す: ID は再利用されない（AUTOINCREMENT）。
+    let new_id = seed_user(&pool, "alice").await;
+    assert_ne!(new_id, old_id);
+    let edit = payload("A改", &ids);
+    for actor in [
+        alice.clone(),
+        FreeTrendActor::Account {
+            user_id: Some(new_id),
+            username: "alice".to_string(),
+            role: Role::Viewer,
+        },
+    ] {
+        assert!(!service.get(&actor, mine.id).await.unwrap().can_edit);
+        assert!(!service.list(&actor).await.unwrap()[0].can_edit);
+        assert!(matches!(
+            service.update(&actor, mine.id, &edit).await,
+            Err(BantoError::Forbidden)
+        ));
+        assert!(matches!(
+            service.delete(&actor, mine.id).await,
+            Err(BantoError::Forbidden)
+        ));
+    }
+    // 新しい alice の作った物は新しい alice の物。
+    let theirs = service.create(&alice, &payload("N", &[])).await.unwrap();
+    assert!(theirs.can_edit);
+    // editor は消えたアカウントの物も変えられ、表示用の名前は当時のまま残る。
+    let editor = account("eve", Role::Editor);
+    assert!(service.get(&editor, mine.id).await.unwrap().can_edit);
+    let changed = service.update(&editor, mine.id, &edit).await.unwrap();
+    assert_eq!(changed.created_by, "alice");
+    service.delete(&editor, mine.id).await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_201st_free_trend_is_refused() {
     let (service, _tags, _ids, pool) = service_with_tags(0).await;
     for i in 0..MAX_FREE_TRENDS {
         sqlx::query(
-            "INSERT INTO free_trends (name, created_by_kind, created_by, updated_by) \
-             VALUES (?, 'account', 'alice', 'alice')",
+            "INSERT INTO free_trends \
+             (name, created_by_kind, created_by_user_id, created_by, updated_by) \
+             VALUES (?, 'account', 1, 'alice', 'alice')",
         )
         .bind(format!("t{i}"))
         .execute(&pool)

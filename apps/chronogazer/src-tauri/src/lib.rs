@@ -2911,7 +2911,9 @@ async fn free_trends_session(
         return Err(BantoError::Forbidden);
     }
     let actor = match session {
+        // 作った人はアカウントの ID で見分ける（名前を同じにして作り直したアカウントは別人）。
         DesktopSession::Account(account) => FreeTrendActor::Account {
+            user_id: Some(account.id),
             username: account.username,
             role: account.role,
         },
@@ -11047,6 +11049,62 @@ mod tests {
             "expectedRevision": revision,
         }))
         .expect("FreeTrendPayload")
+    }
+
+    /// オーナーの P2（2026-11-20）: 作った人はアカウントの ID で見分ける。viewer の alice が作る →
+    /// alice を消す → 同じ名前の viewer を作り直す。新しい alice は変更・削除が `Forbidden` で
+    /// `canEdit` は false、editor は変えられる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recreated_account_with_the_same_name_cannot_change_the_old_free_trend() {
+        let state = app_state().await;
+        let users = &state.services.users;
+        let old = users
+            .create_user("alice", "password123", "alice", Role::Viewer)
+            .await
+            .expect("create alice");
+        let editor = users
+            .create_user("editor", "password123", "editor", Role::Editor)
+            .await
+            .expect("create editor");
+        state.set_session_for_test(Some(DesktopSession::Account(old.clone())));
+        let created = free_trends_create_body(&state, free_trend_input("A", &[], None))
+            .await
+            .expect("alice create");
+        assert!(created.can_edit);
+
+        users.delete_user(old.id, None).await.expect("delete alice");
+        let new = users
+            .create_user("alice", "password456", "alice", Role::Viewer)
+            .await
+            .expect("recreate alice");
+        assert_ne!(new.id, old.id);
+        state.set_session_for_test(Some(DesktopSession::Account(new)));
+        assert!(
+            !free_trends_get_body(&state, created.id)
+                .await
+                .unwrap()
+                .can_edit
+        );
+        assert!(!free_trends_list_body(&state).await.unwrap()[0].can_edit);
+        let err =
+            free_trends_update_body(&state, created.id, free_trend_input("A改", &[], Some(1)))
+                .await
+                .expect_err("作り直した同じ名前のアカウントが前の人の物を変えられた");
+        assert!(matches!(err, BantoError::Forbidden), "{err:?}");
+        let err = free_trends_delete_body(&state, created.id)
+            .await
+            .expect_err("作り直した同じ名前のアカウントが前の人の物を消せた");
+        assert!(matches!(err, BantoError::Forbidden), "{err:?}");
+
+        state.set_session_for_test(Some(DesktopSession::Account(editor)));
+        let updated =
+            free_trends_update_body(&state, created.id, free_trend_input("A改", &[], Some(1)))
+                .await
+                .expect("editor update");
+        assert_eq!(updated.created_by, "alice");
+        free_trends_delete_body(&state, created.id)
+            .await
+            .expect("editor delete");
     }
 
     /// **#1207・#1231 PR 8a（Tauri 経路）**: 自由トレンドの権限（2026-11-20 オーナー決定）。
