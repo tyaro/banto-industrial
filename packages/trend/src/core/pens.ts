@@ -5,6 +5,8 @@
  * 区間は欠測で、線をつながない。片方だけ有限なら、その値 1 つの区間として扱う。
  */
 
+import type { TrendLimit } from './limits';
+
 /** 区間 1 つの値。`tMs` は区間の始まり（UTC ミリ秒）。 */
 export interface Bin {
 	tMs: number;
@@ -37,6 +39,8 @@ export interface TrendPen {
 	marker?: MarkerKind | null;
 	/** マーカーの大きさ（px、2〜8）。未指定・null は 4。 */
 	markerSize?: number | null;
+	/** 管理線。null・空 = 引かない。越えた区間の色は、並びの後ろのものが前のものの上に重なる（H → HH の順に渡せば HH の色が勝つ）。 */
+	limits?: readonly TrendLimit[] | null;
 }
 
 export type LineStyle = 'solid' | 'dashed' | 'dashDot' | 'dashDotDot' | 'none';

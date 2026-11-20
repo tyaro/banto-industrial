@@ -79,6 +79,10 @@
 
 `TrendPen` の任意の `lineStyle`（`solid`・`dashed`・`dashDot`・`dashDotDot`・`none`）・`lineWidth`（1〜4 px、既定 1.5）・`marker`（`none`・`circle`・`square`・`triangle`・`diamond`）・`markerSize`（2〜8 px、既定 4）。`null`・未指定は既定、範囲外は丸める。計算は `dashArray`・`markerPoints`・`markerPath`（`core/style.ts`、描画の層から独立）。凡例の見本は `TrendPenSwatch`（`pen` を渡すと線 + 中央のマーカーの小さな SVG になり、表示グループのページでも使える）。
 
+## 管理線と、越えた区間の色替え
+
+`TrendPen.limits`（`{ value, side: 'upper' | 'lower', colorVar, label }[]`、null・空は引かない）。そのペンの縦軸で、描画域の幅いっぱいの細い破線を引き、右端の内側に `label` を添える。`upper` は値より上、`lower` は値より下を「越えた」区間とし、その区間だけペンの線とマーカーを `colorVar` で重ね描きする（並びの後ろが前の上に重なるので、H → HH の順に渡せば HH の色が勝つ）。縦軸の外の線は引かないが、越えた区間には効く。線なし（`lineStyle: 'none'`）のペンは線を重ねず、マーカーだけ。要約（aria）に「管理線 HH 90・H 80」と値を足す。計算は `limitLayout`（`core/limits.ts`、描画の層から独立）。
+
 ## 操作
 
 | 操作                     | 動き                               |
