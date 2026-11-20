@@ -388,6 +388,44 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 		{ id: 2, name: '圧力', unit: '', decimals: 0, ...NONE }
 	] as unknown as Parameters<typeof trendPenInfos>[1];
 
+	it('ペンの属性（label・unit・decimals・axis・yMin・yMax）はタグの値より優先し、null はタグのまま', () => {
+		const [over, plain] = trendPenInfos(
+			{
+				pens: [
+					{
+						tagId: 1,
+						colorSlot: null,
+						label: '入口',
+						unit: 'K',
+						decimals: 3,
+						axis: 'right',
+						yMin: 0,
+						yMax: 10
+					},
+					{ tagId: 2, colorSlot: null, label: null, unit: null, decimals: null }
+				]
+			},
+			tags
+		);
+		expect(over).toMatchObject({
+			name: '入口',
+			unit: 'K',
+			decimals: 3,
+			axis: 'right',
+			yMin: 0,
+			yMax: 10
+		});
+		expect(penLegendLabel(over)).toBe('入口（K）');
+		expect(plain).toMatchObject({
+			name: '圧力',
+			unit: null,
+			decimals: 0,
+			axis: null,
+			yMin: null,
+			yMax: null
+		});
+	});
+
 	it('タグの名前・単位・しきい値。読めないタグは「タグ ID n」、色の枠は既定で位置 + 1', () => {
 		const pens = trendPenInfos(
 			{
@@ -407,6 +445,9 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 				decimals: 1,
 				isBit: false,
 				colorSlot: 5,
+				axis: null,
+				yMin: null,
+				yMax: null,
 				thresholds: { thresholdHh: 90, thresholdH: 80, thresholdL: null, thresholdLl: null }
 			},
 			{
@@ -416,6 +457,9 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 				decimals: 0,
 				isBit: false,
 				colorSlot: 2,
+				axis: null,
+				yMin: null,
+				yMax: null,
 				thresholds: null
 			},
 			{
@@ -425,6 +469,9 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 				decimals: null,
 				isBit: false,
 				colorSlot: 3,
+				axis: null,
+				yMin: null,
+				yMax: null,
 				thresholds: null
 			}
 		]);

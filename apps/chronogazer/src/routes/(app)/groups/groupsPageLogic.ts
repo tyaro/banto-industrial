@@ -12,11 +12,13 @@
  * recorder-requirements.md §3.7.4）- 画面に同じ規則を書き写さず、上限や
  * 選択肢は「選べるものだけ出す」ことで守る。
  */
-import type {
-	DisplayGroup,
-	DisplayGroupInput,
-	DisplayKind,
-	PenInput
+import {
+	EMPTY_PEN_STYLE,
+	type DisplayGroup,
+	type DisplayGroupInput,
+	type DisplayKind,
+	type PenInput,
+	type PenStyle
 } from '#lib/banto/displayGroupsAdmin.js';
 import type { HubTagRow } from '#lib/banto/tagRegistryAdmin.js';
 import {
@@ -69,7 +71,7 @@ export const DEFAULT_HUB_GROUP_NAME = 'Hub のタグ';
  * 選んでいない行）。`hubTag` は Hub のカタログの行で、保存で記録項目に登録されて
  * ペンに割り当たる（#1179 PR5・PR6b）。
  */
-export interface PenDraft {
+export interface PenDraft extends PenStyle {
 	/** 登録済みの記録項目。 */
 	tagId: number | null;
 	/** まだ記録項目になっていない Hub のタグ（保存で登録）。 */
@@ -123,13 +125,34 @@ export function penKey(pen: Pick<PenDraft, 'tagId' | 'hubTag'>): string | null {
 	return null;
 }
 
+/** ペンの属性だけを取り出す（保存の本文・未保存の判定・往復で同じ形にする）。 */
+function styleOf(pen: PenStyle): PenStyle {
+	return {
+		label: pen.label ?? null,
+		unit: pen.unit ?? null,
+		decimals: pen.decimals ?? null,
+		lineStyle: pen.lineStyle ?? null,
+		lineWidth: pen.lineWidth ?? null,
+		marker: pen.marker ?? null,
+		markerSize: pen.markerSize ?? null,
+		axis: pen.axis ?? null,
+		yMin: pen.yMin ?? null,
+		yMax: pen.yMax ?? null
+	};
+}
+
 export function draftFromGroup(group: DisplayGroup): GroupDraft {
 	return {
 		name: group.name,
 		bundle: group.bundle ?? '',
 		kind: group.kind,
 		timeWindowSec: group.attributes.timeWindowSec ?? DEFAULT_TIME_WINDOW_SEC,
-		pens: group.pens.map((pen) => ({ tagId: pen.tagId, hubTag: null, colorSlot: pen.colorSlot })),
+		pens: group.pens.map((pen) => ({
+			tagId: pen.tagId,
+			hubTag: null,
+			colorSlot: pen.colorSlot,
+			...styleOf(pen)
+		})),
 		hubTarget: null
 	};
 }
@@ -146,8 +169,8 @@ export function draftToInput(draft: GroupDraft, expectedRevision?: number): Disp
 		attributes: draft.kind === 'trend' ? { timeWindowSec: draft.timeWindowSec } : {},
 		pens: draft.pens.map((pen): PenInput =>
 			pen.hubTag !== null
-				? { hubTag: pen.hubTag, colorSlot: pen.colorSlot }
-				: { tagId: pen.tagId as number, colorSlot: pen.colorSlot }
+				? { hubTag: pen.hubTag, colorSlot: pen.colorSlot, ...styleOf(pen) }
+				: { tagId: pen.tagId as number, colorSlot: pen.colorSlot, ...styleOf(pen) }
 		)
 	};
 	if (hasHubPens(draft) && draft.hubTarget !== null) {
@@ -168,7 +191,7 @@ function draftKey(draft: GroupDraft): string {
 		bundle: draft.bundle.trim(),
 		kind: draft.kind,
 		timeWindowSec: draft.kind === 'trend' ? draft.timeWindowSec : null,
-		pens: draft.pens.map((pen) => [penKey(pen), pen.colorSlot]),
+		pens: draft.pens.map((pen) => [penKey(pen), pen.colorSlot, styleOf(pen)]),
 		// 登録先は `hubTag` のペンがあるときだけ未保存の判定に入る。
 		hubTarget: hasHubPens(draft) ? draft.hubTarget : null
 	});
@@ -203,7 +226,10 @@ export function canAddPen(draft: GroupDraft): boolean {
 
 export function addPen(draft: GroupDraft): GroupDraft {
 	if (!canAddPen(draft)) return draft;
-	return { ...draft, pens: [...draft.pens, { tagId: null, hubTag: null, colorSlot: null }] };
+	return {
+		...draft,
+		pens: [...draft.pens, { tagId: null, hubTag: null, colorSlot: null, ...EMPTY_PEN_STYLE }]
+	};
 }
 
 /** あと何本ペンを足せるか。 */
@@ -230,7 +256,7 @@ export function appendPens(
 	};
 }
 
-/** 1 本のペンのタグを置き換える（色は保つ）。 */
+/** 1 本のペンのタグを置き換える（色は保つ。属性はタグごとの値なので `pick` のもの = 既定に戻す）。 */
 export function replacePenTag(
 	draft: GroupDraft,
 	index: number,

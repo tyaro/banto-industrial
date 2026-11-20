@@ -598,8 +598,27 @@
             "items": {
               "additionalProperties": false,
               "properties": {
+                "axis": {
+                  "description": "縦軸の側。null・省略は left。",
+                  "enum": [
+                    "left",
+                    "right",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "colorSlot": {
                   "description": "系列色の枠（1〜16）。省略は既定。",
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "decimals": {
+                  "description": "小数の桁（0〜6）。null・省略はタグの設定。",
                   "type": [
                     "integer",
                     "null"
@@ -643,9 +662,81 @@
                   ],
                   "type": "object"
                 },
+                "label": {
+                  "description": "凡例の名前（前後の空白を除いて 64 文字まで、制御文字は不可）。null・省略はタグの名前。",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "lineStyle": {
+                  "description": "線種。null・省略は solid。none は線なし。",
+                  "enum": [
+                    "solid",
+                    "dashed",
+                    "dashDot",
+                    "dashDotDot",
+                    "none",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "lineWidth": {
+                  "description": "線幅（px、1〜4 の 0.5 刻み）。null・省略は 1.5。",
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "marker": {
+                  "description": "マーカー。null・省略は none。",
+                  "enum": [
+                    "none",
+                    "circle",
+                    "square",
+                    "triangle",
+                    "diamond",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "markerSize": {
+                  "description": "マーカーの大きさ（px、2〜8）。null・省略は 4。",
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
                 "tagId": {
                   "description": "登録済みの記録項目の id。hubTag と同時には指定できない。",
                   "type": "integer"
+                },
+                "unit": {
+                  "description": "単位（16 文字まで）。null・省略はタグの単位。",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "yMax": {
+                  "description": "縦軸の最大。null・省略は工学値レンジ。",
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "yMin": {
+                  "description": "縦軸の最小。null・省略は工学値レンジ。yMax と両方あるときは yMin < yMax。",
+                  "type": [
+                    "number",
+                    "null"
+                  ]
                 }
               },
               "type": "object"
@@ -738,8 +829,27 @@
             "items": {
               "additionalProperties": false,
               "properties": {
+                "axis": {
+                  "description": "縦軸の側。null・省略は left。",
+                  "enum": [
+                    "left",
+                    "right",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "colorSlot": {
                   "description": "系列色の枠（1〜16）。省略は既定。",
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "decimals": {
+                  "description": "小数の桁（0〜6）。null・省略はタグの設定。",
                   "type": [
                     "integer",
                     "null"
@@ -783,9 +893,81 @@
                   ],
                   "type": "object"
                 },
+                "label": {
+                  "description": "凡例の名前（前後の空白を除いて 64 文字まで、制御文字は不可）。null・省略はタグの名前。",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "lineStyle": {
+                  "description": "線種。null・省略は solid。none は線なし。",
+                  "enum": [
+                    "solid",
+                    "dashed",
+                    "dashDot",
+                    "dashDotDot",
+                    "none",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "lineWidth": {
+                  "description": "線幅（px、1〜4 の 0.5 刻み）。null・省略は 1.5。",
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "marker": {
+                  "description": "マーカー。null・省略は none。",
+                  "enum": [
+                    "none",
+                    "circle",
+                    "square",
+                    "triangle",
+                    "diamond",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "markerSize": {
+                  "description": "マーカーの大きさ（px、2〜8）。null・省略は 4。",
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
                 "tagId": {
                   "description": "登録済みの記録項目の id。hubTag と同時には指定できない。",
                   "type": "integer"
+                },
+                "unit": {
+                  "description": "単位（16 文字まで）。null・省略はタグの単位。",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "yMax": {
+                  "description": "縦軸の最大。null・省略は工学値レンジ。",
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "yMin": {
+                  "description": "縦軸の最小。null・省略は工学値レンジ。yMax と両方あるときは yMin < yMax。",
+                  "type": [
+                    "number",
+                    "null"
+                  ]
                 }
               },
               "type": "object"

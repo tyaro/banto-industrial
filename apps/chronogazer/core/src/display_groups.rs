@@ -29,10 +29,19 @@
 //!   空。種別に無い項目は検証で拒否する（黙って捨てない）。項目を足すのは
 //!   「語彙を広げる」ことで、要件の改訂（オーナー決定）として行う。
 //! - `pens`: 最大 [`MAX_PENS_PER_GROUP`]（16）。各ペンはタグへの参照（ID）と表示属性。
-//!   表示属性は今は色だけで、`colorSlot` = banto チャートの系列色の枠
+//!   表示属性は色（`colorSlot`）と、#1207・#1231 PR 6a で足したトレンドの語彙（下の「ペンの属性」）。
+//!   `colorSlot` = banto チャートの系列色の枠
 //!   （1..=16。1..=8 は `--banto-chart-N`、9..=16 は `--bi-chart-N`）。`null` は既定（ペンの位置 + 1 の枠、
 //!   `@banto/charts` の `seriesColorVar(index)` と同じ割り当て）。任意の色コード
 //!   にしないのは、テーマ（ライト / ダーク）に追従させるため。
+//!   - ペンの属性（すべて任意、`null`・キー無し = 既定。応答は全部のキーを出す）:
+//!     `label`（凡例の名前、[`MAX_PEN_LABEL_CHARS`] 文字まで、既定はタグの名前）・`unit`
+//!     （[`MAX_PEN_UNIT_CHARS`] 文字まで、既定はタグの単位）・`decimals`（0〜[`MAX_PEN_DECIMALS`]、
+//!     既定はタグの設定）・`lineStyle`（[`LineStyle`]）・`lineWidth`（1〜4 の 0.5 刻み、
+//!     既定 [`DEFAULT_LINE_WIDTH`]）・`marker`（[`Marker`]）・`markerSize`（2〜8、既定
+//!     [`DEFAULT_MARKER_SIZE`]）・`axis`（[`Axis`]、既定 left）・`yMin`・`yMax`（有限の数、両方
+//!     あれば `yMin < yMax`、既定は工学値レンジ）。種別を問わず保存する（種別は後で変えられる）が、
+//!     画面で効くのはトレンドだけ。管理線・bit の表し方は PR 7 で足す。
 //! - **しきい値は持たない**。しきい値は記録計の側のタグごとの設定
 //!   （`crate::tag_thresholds`、#532。2026-10-08 オーナー決定）で、表示グループ
 //!   からは参照するだけ（画面はその設定を読み取り専用で見せる）。
@@ -154,6 +163,127 @@ pub const REVISION_CONFLICT_MESSAGE: &str = "他の人（または別の画面�
 /// 参照されているタグの削除を拒否するときのフィールド名。
 pub const TAG_REFERENCED_FIELD: &str = "displayGroups";
 
+/// ペンの凡例の名前の最大文字数（char 数）。
+pub const MAX_PEN_LABEL_CHARS: usize = 64;
+
+/// ペンの単位の最大文字数（char 数）。
+pub const MAX_PEN_UNIT_CHARS: usize = 16;
+
+/// ペンの小数の桁の上限（下限は 0）。
+pub const MAX_PEN_DECIMALS: i64 = 6;
+
+/// ペンの線幅（px）の範囲。範囲内の 0.5 刻みだけ。
+pub const LINE_WIDTH_RANGE: (f64, f64) = (1.0, 4.0);
+
+/// `lineWidth` が `null` のときの線幅（px）。描画は PR 6b。TS 側
+/// （`displayGroupsAdmin.ts` の `DEFAULT_LINE_WIDTH`）と同じ値にする。
+pub const DEFAULT_LINE_WIDTH: f64 = 1.5;
+
+/// ペンのマーカーの大きさ（px）の範囲。
+pub const MARKER_SIZE_RANGE: (i64, i64) = (2, 8);
+
+/// `markerSize` が `null` のときの大きさ（px）。TS 側の `DEFAULT_MARKER_SIZE` と同じ値にする。
+pub const DEFAULT_MARKER_SIZE: i64 = 4;
+
+/// ペンの線種。`null` = 実線。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
+pub enum LineStyle {
+    Solid,
+    Dashed,
+    DashDot,
+    DashDotDot,
+    None,
+}
+
+impl LineStyle {
+    pub const ALL: [LineStyle; 5] = [
+        LineStyle::Solid,
+        LineStyle::Dashed,
+        LineStyle::DashDot,
+        LineStyle::DashDotDot,
+        LineStyle::None,
+    ];
+
+    /// ワイヤ・DB での名前。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LineStyle::Solid => "solid",
+            LineStyle::Dashed => "dashed",
+            LineStyle::DashDot => "dashDot",
+            LineStyle::DashDotDot => "dashDotDot",
+            LineStyle::None => "none",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.as_str() == value)
+    }
+}
+
+/// ペンのマーカー。`null` = なし。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
+pub enum Marker {
+    None,
+    Circle,
+    Square,
+    Triangle,
+    Diamond,
+}
+
+impl Marker {
+    pub const ALL: [Marker; 5] = [
+        Marker::None,
+        Marker::Circle,
+        Marker::Square,
+        Marker::Triangle,
+        Marker::Diamond,
+    ];
+
+    /// ワイヤ・DB での名前。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Marker::None => "none",
+            Marker::Circle => "circle",
+            Marker::Square => "square",
+            Marker::Triangle => "triangle",
+            Marker::Diamond => "diamond",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.as_str() == value)
+    }
+}
+
+/// ペンの縦軸の側。`null` = 左。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
+pub enum Axis {
+    Left,
+    Right,
+}
+
+impl Axis {
+    pub const ALL: [Axis; 2] = [Axis::Left, Axis::Right];
+
+    /// ワイヤ・DB での名前。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Axis::Left => "left",
+            Axis::Right => "right",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.as_str() == value)
+    }
+}
+
 /// 表示種別（§3.2 の 4 種固定）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -218,8 +348,9 @@ pub struct DisplayAttributes {
     pub time_window_sec: Option<i64>,
 }
 
-/// ペン（検証済み）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// ペン（検証済み）。属性の `None` は既定（各項目の doc とモジュール doc）。
+/// 応答は全部のキーを常に出す（既定のものは `null`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[derive(utoipa::ToSchema)]
 pub struct Pen {
@@ -227,10 +358,46 @@ pub struct Pen {
     pub tag_id: i64,
     /// 系列色の枠（1..=16）。`None` = 既定（ペンの位置 + 1）。
     pub color_slot: Option<i64>,
+    /// 凡例の名前。`None` = タグの名前。
+    pub label: Option<String>,
+    /// 単位。`None` = タグの単位。
+    pub unit: Option<String>,
+    /// 小数の桁（0..=6）。`None` = タグの設定。
+    pub decimals: Option<i64>,
+    /// 線種。`None` = 実線。
+    pub line_style: Option<LineStyle>,
+    /// 線幅（px、1〜4 の 0.5 刻み）。`None` = [`DEFAULT_LINE_WIDTH`]。
+    pub line_width: Option<f64>,
+    /// マーカー。`None` = なし。
+    pub marker: Option<Marker>,
+    /// マーカーの大きさ（px、2..=8）。`None` = [`DEFAULT_MARKER_SIZE`]。
+    pub marker_size: Option<i64>,
+    /// 縦軸の側。`None` = 左。
+    pub axis: Option<Axis>,
+    /// 縦軸の最小。`None` = 工学値レンジ。
+    pub y_min: Option<f64>,
+    /// 縦軸の最大。`None` = 工学値レンジ。
+    pub y_max: Option<f64>,
+}
+
+impl Pen {
+    /// 色以外の属性を 1 つでも持つか（監査の要約用）。
+    fn has_style(&self) -> bool {
+        self.label.is_some()
+            || self.unit.is_some()
+            || self.decimals.is_some()
+            || self.line_style.is_some()
+            || self.line_width.is_some()
+            || self.marker.is_some()
+            || self.marker_size.is_some()
+            || self.axis.is_some()
+            || self.y_min.is_some()
+            || self.y_max.is_some()
+    }
 }
 
 /// 表示グループ（読み取りの応答）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[derive(utoipa::ToSchema)]
 pub struct DisplayGroup {
@@ -278,7 +445,7 @@ pub struct DisplayGroupPayload {
 
 /// ペンの本文。`tagId`（登録済みの記録項目）か `hubTag`（Hub のカタログのタグ、
 /// #1179 PR5）の**ちょうど 1 つ**。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[derive(utoipa::ToSchema)]
 pub struct PenPayload {
@@ -288,6 +455,28 @@ pub struct PenPayload {
     pub hub_tag: Option<HubTagRow>,
     #[serde(default)]
     pub color_slot: Option<i64>,
+    /// 属性（#1207・#1231 PR 6a）。キー無し = `null` = 既定。列挙は緩い型で受け、
+    /// 誤りは `validate_shape` が `pens[i].lineStyle` などの `field_errors` で返す。
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub unit: Option<String>,
+    #[serde(default)]
+    pub decimals: Option<i64>,
+    #[serde(default)]
+    pub line_style: Option<String>,
+    #[serde(default)]
+    pub line_width: Option<f64>,
+    #[serde(default)]
+    pub marker: Option<String>,
+    #[serde(default)]
+    pub marker_size: Option<i64>,
+    #[serde(default)]
+    pub axis: Option<String>,
+    #[serde(default)]
+    pub y_min: Option<f64>,
+    #[serde(default)]
+    pub y_max: Option<f64>,
 }
 
 impl PenPayload {
@@ -295,8 +484,8 @@ impl PenPayload {
     pub fn tag(tag_id: i64, color_slot: Option<i64>) -> Self {
         Self {
             tag_id: Some(tag_id),
-            hub_tag: None,
             color_slot,
+            ..Self::default()
         }
     }
 }
@@ -383,7 +572,7 @@ where
 }
 
 /// 検証を通った定義（保存する形）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ValidDisplayGroup {
     /// 前後の空白を除いた名前。
     pub name: String,
@@ -393,6 +582,128 @@ pub struct ValidDisplayGroup {
     pub kind: DisplayKind,
     pub attributes: DisplayAttributes,
     pub pens: Vec<Pen>,
+}
+
+/// ペンの属性の検証。誤りは `pens[index].<項目>` の `field_errors` に積む。返す `Pen` の
+/// `tag_id`・`color_slot` は呼び出し側が埋める（誤りのある項目は `None`）。
+fn validate_pen_style(pen: &PenPayload, index: usize, errors: &mut Vec<FieldError>) -> Pen {
+    let mut bad = |name: &str, message: String| {
+        errors.push(field_error(format!("pens[{index}].{name}"), message));
+    };
+    let text = |value: &Option<String>,
+                name: &str,
+                max: usize,
+                bad: &mut dyn FnMut(&str, String)|
+     -> Option<String> {
+        let trimmed = value.as_deref()?.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if trimmed.chars().any(char::is_control) {
+            bad(name, "制御文字は使えません".to_string());
+            return None;
+        }
+        if trimmed.chars().count() > max {
+            bad(name, format!("{max} 文字以内にしてください"));
+            return None;
+        }
+        Some(trimmed.to_string())
+    };
+    let label = text(&pen.label, "label", MAX_PEN_LABEL_CHARS, &mut bad);
+    let unit = text(&pen.unit, "unit", MAX_PEN_UNIT_CHARS, &mut bad);
+    let decimals = pen.decimals.and_then(|d| {
+        if (0..=MAX_PEN_DECIMALS).contains(&d) {
+            Some(d)
+        } else {
+            bad(
+                "decimals",
+                format!("小数の桁は 0〜{MAX_PEN_DECIMALS} にしてください"),
+            );
+            None
+        }
+    });
+    let line_style = pen.line_style.as_deref().and_then(|v| {
+        let parsed = LineStyle::parse(v);
+        if parsed.is_none() {
+            bad(
+                "lineStyle",
+                "線種は solid・dashed・dashDot・dashDotDot・none から選んでください".to_string(),
+            );
+        }
+        parsed
+    });
+    let line_width = pen.line_width.and_then(|w| {
+        let (lo, hi) = LINE_WIDTH_RANGE;
+        if w.is_finite() && (lo..=hi).contains(&w) && (w * 2.0).fract() == 0.0 {
+            Some(w)
+        } else {
+            bad(
+                "lineWidth",
+                format!("線幅は {lo}〜{hi} の 0.5 刻みにしてください"),
+            );
+            None
+        }
+    });
+    let marker = pen.marker.as_deref().and_then(|v| {
+        let parsed = Marker::parse(v);
+        if parsed.is_none() {
+            bad(
+                "marker",
+                "マーカーは none・circle・square・triangle・diamond から選んでください".to_string(),
+            );
+        }
+        parsed
+    });
+    let marker_size = pen.marker_size.and_then(|s| {
+        let (lo, hi) = MARKER_SIZE_RANGE;
+        if (lo..=hi).contains(&s) {
+            Some(s)
+        } else {
+            bad(
+                "markerSize",
+                format!("マーカーの大きさは {lo}〜{hi} にしてください"),
+            );
+            None
+        }
+    });
+    let axis = pen.axis.as_deref().and_then(|v| {
+        let parsed = Axis::parse(v);
+        if parsed.is_none() {
+            bad("axis", "縦軸は left・right から選んでください".to_string());
+        }
+        parsed
+    });
+    let finite = |value: Option<f64>, name: &str, bad: &mut dyn FnMut(&str, String)| {
+        value.and_then(|v| {
+            if v.is_finite() {
+                Some(v)
+            } else {
+                bad(name, "有限の数にしてください".to_string());
+                None
+            }
+        })
+    };
+    let y_min = finite(pen.y_min, "yMin", &mut bad);
+    let y_max = finite(pen.y_max, "yMax", &mut bad);
+    if let (Some(lo), Some(hi)) = (y_min, y_max) {
+        if lo >= hi {
+            bad("yMax", "縦軸の最大は最小より大きくしてください".to_string());
+        }
+    }
+    Pen {
+        tag_id: 0,
+        color_slot: None,
+        label,
+        unit,
+        decimals,
+        line_style,
+        line_width,
+        marker,
+        marker_size,
+        axis,
+        y_min,
+        y_max,
+    }
 }
 
 fn field_error(field: impl Into<String>, message: impl Into<String>) -> FieldError {
@@ -544,6 +855,7 @@ fn check_shape(
     let mut seen = HashSet::new();
     let mut pens = Vec::with_capacity(payload.pens.len());
     for (index, pen) in payload.pens.iter().enumerate() {
+        let style = validate_pen_style(pen, index, errors);
         match (pen.tag_id, &pen.hub_tag) {
             (Some(tag_id), None) => {
                 if !seen.insert(tag_id) {
@@ -555,6 +867,7 @@ fn check_shape(
                 pens.push(Pen {
                     tag_id,
                     color_slot: pen.color_slot,
+                    ..style
                 });
             }
             (None, Some(_)) => {
@@ -673,6 +986,8 @@ pub fn audit_detail(group: &DisplayGroup) -> Value {
         "bundle": group.bundle,
         "kind": group.kind.as_str(),
         "pens": group.pens.len(),
+        // 色以外の属性を持つペンの数（値そのものではなく要約）。
+        "styledPens": group.pens.iter().filter(|pen| pen.has_style()).count(),
     })
 }
 
@@ -707,6 +1022,52 @@ struct PenRow {
     group_id: i64,
     tag_id: i64,
     color_slot: Option<i64>,
+    label: Option<String>,
+    unit: Option<String>,
+    decimals: Option<i64>,
+    line_style: Option<String>,
+    line_width: Option<f64>,
+    marker: Option<String>,
+    marker_size: Option<i64>,
+    axis: Option<String>,
+    y_min: Option<f64>,
+    y_max: Option<f64>,
+}
+
+/// DB の列挙の文字列を読む（CHECK で守っているので、未知の値は壊れた DB）。
+fn parse_column<T>(
+    value: Option<String>,
+    column: &str,
+    parse: fn(&str) -> Option<T>,
+) -> Result<Option<T>, BantoError> {
+    value
+        .map(|v| {
+            parse(&v).ok_or_else(|| {
+                BantoError::Storage(format!(
+                    "display_group_pens.{column} に未知の値があります: {v}"
+                ))
+            })
+        })
+        .transpose()
+}
+
+impl PenRow {
+    fn into_pen(self) -> Result<Pen, BantoError> {
+        Ok(Pen {
+            tag_id: self.tag_id,
+            color_slot: self.color_slot,
+            label: self.label,
+            unit: self.unit,
+            decimals: self.decimals,
+            line_style: parse_column(self.line_style, "line_style", LineStyle::parse)?,
+            line_width: self.line_width,
+            marker: parse_column(self.marker, "marker", Marker::parse)?,
+            marker_size: self.marker_size,
+            axis: parse_column(self.axis, "axis", Axis::parse)?,
+            y_min: self.y_min,
+            y_max: self.y_max,
+        })
+    }
 }
 
 fn storage(err: sqlx::Error) -> BantoError {
@@ -1261,13 +1622,24 @@ async fn insert_pens(
 ) -> Result<(), BantoError> {
     for (position, pen) in pens.iter().enumerate() {
         sqlx::query(
-            "INSERT INTO display_group_pens (group_id, position, tag_id, color_slot) \
-             VALUES (?, ?, ?, ?)",
+            "INSERT INTO display_group_pens (group_id, position, tag_id, color_slot, label, unit, \
+             decimals, line_style, line_width, marker, marker_size, axis, y_min, y_max) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(group_id)
         .bind(position as i64)
         .bind(pen.tag_id)
         .bind(pen.color_slot)
+        .bind(&pen.label)
+        .bind(&pen.unit)
+        .bind(pen.decimals)
+        .bind(pen.line_style.map(LineStyle::as_str))
+        .bind(pen.line_width)
+        .bind(pen.marker.map(Marker::as_str))
+        .bind(pen.marker_size)
+        .bind(pen.axis.map(Axis::as_str))
+        .bind(pen.y_min)
+        .bind(pen.y_max)
         .execute(&mut *conn)
         .await
         .map_err(storage)?;
@@ -1333,18 +1705,18 @@ async fn list_on(
     if let Some(pause) = pause {
         pause.hold().await;
     }
-    let pen_rows: Vec<PenRow> = sqlx::query_as(
-        "SELECT group_id, tag_id, color_slot FROM display_group_pens ORDER BY group_id, position",
-    )
+    let pen_rows: Vec<PenRow> = sqlx::query_as("SELECT group_id, tag_id, color_slot, label, unit, decimals, line_style, line_width, marker, 
+         marker_size, axis, y_min, y_max FROM display_group_pens ORDER BY group_id, position")
     .fetch_all(&mut *conn)
     .await
     .map_err(storage)?;
     let mut pens_by_group: BTreeMap<i64, Vec<Pen>> = BTreeMap::new();
     for pen in pen_rows {
-        pens_by_group.entry(pen.group_id).or_default().push(Pen {
-            tag_id: pen.tag_id,
-            color_slot: pen.color_slot,
-        });
+        let group_id = pen.group_id;
+        pens_by_group
+            .entry(group_id)
+            .or_default()
+            .push(pen.into_pen()?);
     }
     rows.into_iter()
         .map(|row| {
@@ -1372,10 +1744,8 @@ async fn get_on(
     if let Some(pause) = pause {
         pause.hold().await;
     }
-    let pens: Vec<PenRow> = sqlx::query_as(
-        "SELECT group_id, tag_id, color_slot FROM display_group_pens WHERE group_id = ? \
-         ORDER BY position",
-    )
+    let pens: Vec<PenRow> = sqlx::query_as("SELECT group_id, tag_id, color_slot, label, unit, decimals, line_style, line_width, marker, 
+         marker_size, axis, y_min, y_max FROM display_group_pens WHERE group_id = ? ORDER BY position")
     .bind(id)
     .fetch_all(&mut *conn)
     .await
@@ -1383,11 +1753,8 @@ async fn get_on(
     into_group(
         row,
         pens.into_iter()
-            .map(|pen| Pen {
-                tag_id: pen.tag_id,
-                color_slot: pen.color_slot,
-            })
-            .collect(),
+            .map(PenRow::into_pen)
+            .collect::<Result<Vec<_>, _>>()?,
     )
 }
 

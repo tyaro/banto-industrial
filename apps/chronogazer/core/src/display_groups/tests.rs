@@ -226,8 +226,8 @@ async fn the_response_round_trips_as_a_payload() {
             "kind": "trend",
             "attributes": { "timeWindowSec": 1800 },
             "pens": [
-                { "tagId": ids[0], "colorSlot": null },
-                { "tagId": ids[1], "colorSlot": 5 }
+                { "tagId": ids[0], "colorSlot": null, "label": null, "unit": null, "decimals": null, "lineStyle": null, "lineWidth": null, "marker": null, "markerSize": null, "axis": null, "yMin": null, "yMax": null },
+                { "tagId": ids[1], "colorSlot": 5, "label": null, "unit": null, "decimals": null, "lineStyle": null, "lineWidth": null, "marker": null, "markerSize": null, "axis": null, "yMin": null, "yMax": null }
             ],
             "revision": 1
         })
@@ -675,7 +675,7 @@ fn hub_pen(external_name: &str, name: &str, data_type: &str) -> PenPayload {
             unit: None,
             decimals: None,
         }),
-        color_slot: None,
+        ..PenPayload::default()
     }
 }
 
@@ -1062,4 +1062,198 @@ async fn bundle_is_limited_to_fifty_chars() {
     p.bundle = Some(Some("あ".repeat(50)));
     let created = svc.create(&p).await.expect("50 chars");
     assert_eq!(created.bundle.map(|b| b.chars().count()), Some(50));
+}
+
+// ---- ペンの属性（#1207・#1231 PR 6a） ----
+
+fn pen_json(extra: Value) -> PenPayload {
+    let mut v = json!({ "tagId": 1 });
+    v.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    serde_json::from_value(v).expect("pen payload")
+}
+
+fn pen_fields(extra: Value) -> Vec<String> {
+    let mut p = payload("g", "trend", &[]);
+    p.pens = vec![pen_json(extra)];
+    shape_fields(&p)
+}
+
+fn valid_pen(extra: Value) -> Pen {
+    let mut p = payload("g", "trend", &[]);
+    p.pens = vec![pen_json(extra)];
+    validate_shape(&p).expect("valid").pens.remove(0)
+}
+
+/// 受ける端・断る端（各項目）。
+#[test]
+fn pen_attribute_edges() {
+    let long_ok = "あ".repeat(64);
+    let long_bad = "あ".repeat(65);
+    for ok in [
+        json!({ "label": long_ok }),
+        json!({ "unit": "a".repeat(16) }),
+        json!({ "decimals": 0 }),
+        json!({ "decimals": 6 }),
+        json!({ "lineWidth": 1 }),
+        json!({ "lineWidth": 1.5 }),
+        json!({ "lineWidth": 4 }),
+        json!({ "markerSize": 2 }),
+        json!({ "markerSize": 8 }),
+        json!({ "yMin": -5.5, "yMax": 5.5 }),
+        json!({ "yMin": 3 }),
+        json!({ "yMax": -3 }),
+        json!({ "lineStyle": "dashDotDot", "marker": "diamond", "axis": "right" }),
+    ] {
+        assert!(pen_fields(ok.clone()).is_empty(), "{ok}");
+    }
+    for (bad, field) in [
+        (json!({ "label": long_bad }), "label"),
+        (json!({ "label": "a\nb" }), "label"),
+        (json!({ "unit": "a".repeat(17) }), "unit"),
+        (json!({ "unit": "a\u{7}b" }), "unit"),
+        (json!({ "decimals": -1 }), "decimals"),
+        (json!({ "decimals": 7 }), "decimals"),
+        (json!({ "lineWidth": 0.5 }), "lineWidth"),
+        (json!({ "lineWidth": 4.5 }), "lineWidth"),
+        (json!({ "lineWidth": 1.2 }), "lineWidth"),
+        (json!({ "markerSize": 1 }), "markerSize"),
+        (json!({ "markerSize": 9 }), "markerSize"),
+        (json!({ "yMin": 1, "yMax": 1 }), "yMax"),
+        (json!({ "yMin": 2, "yMax": 1 }), "yMax"),
+        (json!({ "lineStyle": "dotted" }), "lineStyle"),
+        (json!({ "lineStyle": "Solid" }), "lineStyle"),
+        (json!({ "marker": "star" }), "marker"),
+        (json!({ "axis": "top" }), "axis"),
+    ] {
+        assert_eq!(
+            pen_fields(bad.clone()),
+            vec![format!("pens[0].{field}")],
+            "{bad}"
+        );
+    }
+}
+
+/// 前後の空白は落とし、空・空白だけは null。
+#[test]
+fn pen_label_and_unit_are_trimmed_and_blank_is_null() {
+    let pen = valid_pen(json!({ "label": "  温度 ", "unit": "   " }));
+    assert_eq!(pen.label.as_deref(), Some("温度"));
+    assert_eq!(pen.unit, None);
+    let pen = valid_pen(json!({ "label": "" }));
+    assert_eq!(pen.label, None);
+    // 空白を落としたあとで 64 文字ちょうどなら通る。
+    let padded = format!("  {}  ", "あ".repeat(64));
+    assert_eq!(
+        valid_pen(json!({ "label": padded }))
+            .label
+            .map(|l| l.chars().count()),
+        Some(64)
+    );
+}
+
+/// 全項目ありで保存 → 読み直しで同じ値。キー無しのペンは全部 null で、応答は全キーを出す。
+#[tokio::test]
+async fn pen_attributes_round_trip_through_the_db() {
+    let (svc, _tags, ids) = service_with_tags(2).await;
+    let mut p = payload("属性", "trend", &[]);
+    p.pens = vec![
+        pen_json(json!({
+            "tagId": ids[0], "colorSlot": 3, "label": "入口温度", "unit": "℃", "decimals": 2,
+            "lineStyle": "dashDot", "lineWidth": 2.5, "marker": "triangle", "markerSize": 6,
+            "axis": "right", "yMin": -10.5, "yMax": 99.5
+        })),
+        pen_json(json!({ "tagId": ids[1] })),
+    ];
+    let created = svc.create(&p).await.expect("create");
+    let got = svc.get(created.id).await.unwrap();
+    assert_eq!(got, created);
+    let listed = svc.list().await.unwrap();
+    assert_eq!(listed[0], created);
+    let json = serde_json::to_value(&got.pens).unwrap();
+    assert_eq!(
+        json[0],
+        json!({
+            "tagId": ids[0], "colorSlot": 3, "label": "入口温度", "unit": "℃", "decimals": 2,
+            "lineStyle": "dashDot", "lineWidth": 2.5, "marker": "triangle", "markerSize": 6,
+            "axis": "right", "yMin": -10.5, "yMax": 99.5
+        })
+    );
+    assert_eq!(
+        json[1],
+        json!({
+            "tagId": ids[1], "colorSlot": null, "label": null, "unit": null, "decimals": null,
+            "lineStyle": null, "lineWidth": null, "marker": null, "markerSize": null,
+            "axis": null, "yMin": null, "yMax": null
+        })
+    );
+    // 応答をそのまま本文に戻して更新しても属性が変わらない。
+    let mut back: DisplayGroupPayload =
+        serde_json::from_value(serde_json::to_value(&got).unwrap()).unwrap();
+    back.expected_revision = Some(got.revision);
+    let updated = svc.update(got.id, &back).await.expect("update");
+    assert_eq!(updated.pens, got.pens);
+    // 本文のキー無しは null に戻る（ペンの並びは丸ごと置き換え）。
+    let mut bare = payload("属性", "trend", &ids);
+    bare.expected_revision = Some(updated.revision);
+    let cleared = svc.update(got.id, &bare).await.expect("update");
+    assert!(cleared.pens.iter().all(|pen| pen.label.is_none()
+        && pen.line_style.is_none()
+        && pen.line_width.is_none()
+        && pen.y_max.is_none()));
+}
+
+/// migration 0106 が当たり、CHECK が最後の砦として働く（NULL は通る）。
+#[tokio::test]
+async fn migration_0106_adds_pen_columns_with_checks() {
+    let (svc, _tags, ids) = service_with_tags(1).await;
+    let created = svc
+        .create(&payload("m", "trend", &ids))
+        .await
+        .expect("create");
+    let pool = svc.pool.clone();
+    let columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('display_group_pens')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    for name in [
+        "label",
+        "unit",
+        "decimals",
+        "line_style",
+        "line_width",
+        "marker",
+        "marker_size",
+        "axis",
+        "y_min",
+        "y_max",
+    ] {
+        assert!(columns.iter().any(|c| c == name), "{name}");
+    }
+    for set in [
+        "line_width = 0.5",
+        "line_width = 5",
+        "decimals = 7",
+        "marker_size = 1",
+        "line_style = 'dotted'",
+        "marker = 'star'",
+        "axis = 'top'",
+        "label = ''",
+        "y_min = 5, y_max = 5",
+    ] {
+        let res = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE display_group_pens SET {set} WHERE group_id = ?"
+        )))
+        .bind(created.id)
+        .execute(&pool)
+        .await;
+        assert!(res.is_err(), "{set} は CHECK で断られる");
+    }
+    sqlx::query("UPDATE display_group_pens SET y_min = 1, y_max = 2, line_width = 4, axis = 'right' WHERE group_id = ?")
+        .bind(created.id)
+        .execute(&pool)
+        .await
+        .expect("端は通る");
 }

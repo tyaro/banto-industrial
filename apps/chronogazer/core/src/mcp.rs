@@ -403,6 +403,49 @@ fn display_group_schema(update: bool) -> Value {
                             "type": ["integer", "null"],
                             "description": "系列色の枠（1〜16）。省略は既定。",
                         },
+                        "label": {
+                            "type": ["string", "null"],
+                            "description": "凡例の名前（前後の空白を除いて 64 文字まで、制御文字は不可）。null・省略はタグの名前。",
+                        },
+                        "unit": {
+                            "type": ["string", "null"],
+                            "description": "単位（16 文字まで）。null・省略はタグの単位。",
+                        },
+                        "decimals": {
+                            "type": ["integer", "null"],
+                            "description": "小数の桁（0〜6）。null・省略はタグの設定。",
+                        },
+                        "lineStyle": {
+                            "type": ["string", "null"],
+                            "enum": ["solid", "dashed", "dashDot", "dashDotDot", "none", null],
+                            "description": "線種。null・省略は solid。none は線なし。",
+                        },
+                        "lineWidth": {
+                            "type": ["number", "null"],
+                            "description": "線幅（px、1〜4 の 0.5 刻み）。null・省略は 1.5。",
+                        },
+                        "marker": {
+                            "type": ["string", "null"],
+                            "enum": ["none", "circle", "square", "triangle", "diamond", null],
+                            "description": "マーカー。null・省略は none。",
+                        },
+                        "markerSize": {
+                            "type": ["integer", "null"],
+                            "description": "マーカーの大きさ（px、2〜8）。null・省略は 4。",
+                        },
+                        "axis": {
+                            "type": ["string", "null"],
+                            "enum": ["left", "right", null],
+                            "description": "縦軸の側。null・省略は left。",
+                        },
+                        "yMin": {
+                            "type": ["number", "null"],
+                            "description": "縦軸の最小。null・省略は工学値レンジ。yMax と両方あるときは yMin < yMax。",
+                        },
+                        "yMax": {
+                            "type": ["number", "null"],
+                            "description": "縦軸の最大。null・省略は工学値レンジ。",
+                        },
                     },
                     "additionalProperties": false,
                 },

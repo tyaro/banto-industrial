@@ -32,9 +32,50 @@ export interface DisplayAttributes {
 	timeWindowSec?: number;
 }
 
-export interface Pen {
+export type PenLineStyle = 'solid' | 'dashed' | 'dashDot' | 'dashDotDot' | 'none';
+export type PenMarker = 'none' | 'circle' | 'square' | 'triangle' | 'diamond';
+export type PenAxis = 'left' | 'right';
+
+/** `lineWidth` が `null` のときの線幅（px）。Rust の `DEFAULT_LINE_WIDTH` と同じ値。描画は PR 6b。 */
+export const DEFAULT_LINE_WIDTH = 1.5;
+/** `markerSize` が `null` のときの大きさ（px）。Rust の `DEFAULT_MARKER_SIZE` と同じ値。 */
+export const DEFAULT_MARKER_SIZE = 4;
+
+/**
+ * ペンの属性（#1207・#1231 PR 6a。Mirrors the attribute fields of `Pen`）。すべて任意で、
+ * `null` = 既定（`label`・`unit`・`decimals` はタグの設定、線は実線 `DEFAULT_LINE_WIDTH` px、
+ * マーカーなし、縦軸は左・工学値レンジ）。
+ */
+export interface PenStyle {
+	label: string | null;
+	unit: string | null;
+	decimals: number | null;
+	lineStyle: PenLineStyle | null;
+	lineWidth: number | null;
+	marker: PenMarker | null;
+	markerSize: number | null;
+	axis: PenAxis | null;
+	yMin: number | null;
+	yMax: number | null;
+}
+
+/** 全部が既定のペンの属性。 */
+export const EMPTY_PEN_STYLE: Readonly<PenStyle> = {
+	label: null,
+	unit: null,
+	decimals: null,
+	lineStyle: null,
+	lineWidth: null,
+	marker: null,
+	markerSize: null,
+	axis: null,
+	yMin: null,
+	yMax: null
+};
+
+export interface Pen extends PenStyle {
 	tagId: number;
-	/** banto チャートの系列色の枠（1..8）。`null` = 既定（ペンの位置 + 1）。 */
+	/** banto チャートの系列色の枠（1..16）。`null` = 既定（ペンの位置 + 1）。 */
 	colorSlot: number | null;
 }
 
@@ -42,8 +83,10 @@ export interface Pen {
  * 保存で送るペン（Mirrors `PenPayload`、#1179 PR5）。`tagId`（登録済みの記録項目）か
  * `hubTag`（Hub のカタログの行。保存で記録項目に登録される）の**どちらか一つ**。
  */
-export type PenInput =
-	{ tagId: number; colorSlot: number | null } | { hubTag: HubTagRow; colorSlot: number | null };
+export type PenInput = (
+	{ tagId: number; colorSlot: number | null } | { hubTag: HubTagRow; colorSlot: number | null }
+) &
+	PenStyle;
 
 /** `hubTag` のペンの登録先（Mirrors `HubTagGroupPayload`）。どちらか一つ。 */
 export type HubTagGroupInput =
