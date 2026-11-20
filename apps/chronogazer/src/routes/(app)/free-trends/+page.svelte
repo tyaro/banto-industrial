@@ -131,7 +131,8 @@
 		loading = true;
 		try {
 			const rows = await listFreeTrends();
-			if (seq !== loadSeq) return;
+			// 破棄済みの画面の遅れた応答では、一覧も下書きの掃除も触らない（新しい画面の下書きを捨てない）。
+			if (destroyed || seq !== loadSeq) return;
 			list = rows;
 			listError = null;
 			// 今の持ち主以外・古い形・一覧に無い ID の下書きは捨てる（消された・別の端末で消えたもの）。
@@ -141,10 +142,10 @@
 				rows.map((item) => item.id)
 			);
 		} catch (err) {
-			if (seq !== loadSeq) return;
+			if (destroyed || seq !== loadSeq) return;
 			listError = errorText(err);
 		} finally {
-			if (seq === loadSeq) loading = false;
+			if (!destroyed && seq === loadSeq) loading = false;
 		}
 	}
 
@@ -659,6 +660,8 @@
 
 	onDestroy(() => {
 		destroyed = true;
+		// 飛行中の一覧の要求を無効にする（遅れた応答が下書きを掃除しないように）。
+		loadSeq++;
 		poller.stop();
 		liveTrend.reset();
 		if (typeof document !== 'undefined') {
