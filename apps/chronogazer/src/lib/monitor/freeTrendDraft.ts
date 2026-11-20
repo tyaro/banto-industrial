@@ -38,7 +38,7 @@ export function draftOwner(session: {
 	authDisabled: boolean;
 	publicViewer: boolean;
 	localDesktop: boolean;
-	/** アカウントのログインの ID（名前ではなく安定した ID）。無ければ `null`。 */
+	/** アカウントのログインの `identity.id`（ChronoGazer ではログイン名）。無ければ `null`。下書きはタブの中だけなので、同じ名前のアカウントの作り直しは考えない。 */
 	accountId: string | null;
 }): string | null {
 	if (session.authDisabled || session.publicViewer) return null;
