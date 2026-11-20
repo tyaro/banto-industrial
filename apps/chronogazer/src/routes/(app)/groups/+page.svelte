@@ -164,6 +164,7 @@
 		sortFieldErrors,
 		tagsUsedByOtherPens,
 		penThresholdText,
+		limitPlaceholder,
 		type GroupDraft
 	} from './groupsPageLogic';
 
@@ -497,14 +498,6 @@
 		['limitL', 'L', 'thresholdL'],
 		['limitLl', 'LL', 'thresholdLl']
 	] as const;
-	function limitPlaceholder(
-		tag: unknown,
-		key: 'thresholdHh' | 'thresholdH' | 'thresholdL' | 'thresholdLl'
-	): string {
-		const value = (tag as Partial<Record<typeof key, number | null>> | undefined)?.[key];
-		return typeof value === 'number' ? `タグ: ${value}` : 'タグの設定なし';
-	}
-
 	const LINE_STYLE_OPTIONS = [
 		['solid', '実線'],
 		['dashed', '破線'],
@@ -1362,7 +1355,12 @@
 										type="text"
 										inputmode="decimal"
 										value={axisText(pen, field)}
-										placeholder={limitPlaceholder(penTag, tagKey)}
+										placeholder={limitPlaceholder(
+											pen.tagId,
+											thresholdsByTag,
+											thresholdsError !== null,
+											tagKey
+										)}
 										oninput={(e) => setPenAxisText(index, field, e.currentTarget.value)}
 									/>
 								</label>

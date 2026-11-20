@@ -29,6 +29,7 @@ import {
 	tagsUsedByOtherPens,
 	thresholdSummary,
 	penThresholdText,
+	limitPlaceholder,
 	THRESHOLDS_UNREADABLE,
 	type GroupDraft
 } from './groupsPageLogic';
@@ -177,6 +178,23 @@ describe('penThresholdText（#532: 読めなかったことを「しきい値な
 		['設定の無いタグ（既定）', 3, true, loaded, false, 'しきい値なし']
 	])('%s', (_label, tagId, tagKnown, thresholds, failed, expected) => {
 		expect(penThresholdText(tagId, tagKnown, thresholds, failed)).toBe(expected);
+	});
+});
+
+describe('limitPlaceholder（管理線の入力はタグのしきい値の設定から読む）', () => {
+	const loaded = new Map([
+		[2, { thresholdLl: null, thresholdL: null, thresholdH: 80, thresholdHh: null }]
+	]);
+	it.each<
+		[string, number | null, typeof loaded | null, boolean, 'thresholdH' | 'thresholdHh', string]
+	>([
+		['タグがまだ無い', null, loaded, false, 'thresholdH', 'タグの設定なし'],
+		['読めなかった', 2, null, true, 'thresholdH', `タグのしきい値: ${THRESHOLDS_UNREADABLE}`],
+		['まだ読んでいない', 2, null, false, 'thresholdH', ''],
+		['値がある', 2, loaded, false, 'thresholdH', 'タグ: 80'],
+		['値が無い', 2, loaded, false, 'thresholdHh', 'タグの設定なし']
+	])('%s', (_label, tagId, thresholds, failed, key, expected) => {
+		expect(limitPlaceholder(tagId, thresholds, failed, key)).toBe(expected);
 	});
 });
 

@@ -474,6 +474,28 @@ export function penThresholdText(
 }
 
 /**
+ * 管理線の入力の placeholder（純関数）。タグ側のしきい値を目安に出す。
+ *
+ * - タグがまだ無い（未登録の Hub のタグ）→ 「タグの設定なし」
+ * - しきい値を読めなかった → 読めなかったことを出す（設定なしに潰さない）
+ * - まだ読んでいない → 空
+ * - 値があれば「タグ: <値>」、無ければ「タグの設定なし」
+ */
+export function limitPlaceholder(
+	tagId: number | null,
+	thresholds: ReadonlyMap<number, TagThresholds> | null,
+	thresholdsFailed: boolean,
+	key: 'thresholdHh' | 'thresholdH' | 'thresholdL' | 'thresholdLl'
+): string {
+	if (tagId === null) return 'タグの設定なし';
+	if (thresholds === null) {
+		return thresholdsFailed ? `タグのしきい値: ${THRESHOLDS_UNREADABLE}` : '';
+	}
+	const value = thresholds.get(tagId)?.[key];
+	return typeof value === 'number' ? `タグ: ${value}` : 'タグの設定なし';
+}
+
+/**
  * 一覧の中で 1 つ動かした後の ID の並び（`reorderDisplayGroups` に渡す）。
  * 端・見つからないときは `null`（送らない）。
  */
