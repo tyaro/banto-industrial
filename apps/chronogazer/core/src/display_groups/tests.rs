@@ -226,8 +226,8 @@ async fn the_response_round_trips_as_a_payload() {
             "kind": "trend",
             "attributes": { "timeWindowSec": 1800 },
             "pens": [
-                { "tagId": ids[0], "colorSlot": null, "label": null, "unit": null, "decimals": null, "lineStyle": null, "lineWidth": null, "marker": null, "markerSize": null, "axis": null, "yMin": null, "yMax": null, "limitLines": null, "limitHh": null, "limitH": null, "limitL": null, "limitLl": null },
-                { "tagId": ids[1], "colorSlot": 5, "label": null, "unit": null, "decimals": null, "lineStyle": null, "lineWidth": null, "marker": null, "markerSize": null, "axis": null, "yMin": null, "yMax": null, "limitLines": null, "limitHh": null, "limitH": null, "limitL": null, "limitLl": null }
+                { "tagId": ids[0], "colorSlot": null, "label": null, "unit": null, "decimals": null, "lineStyle": null, "lineWidth": null, "marker": null, "markerSize": null, "axis": null, "yMin": null, "yMax": null, "limitLines": null, "limitHh": null, "limitH": null, "limitL": null, "limitLl": null, "bitStyle": null, "bitBandHeight": null },
+                { "tagId": ids[1], "colorSlot": 5, "label": null, "unit": null, "decimals": null, "lineStyle": null, "lineWidth": null, "marker": null, "markerSize": null, "axis": null, "yMin": null, "yMax": null, "limitLines": null, "limitHh": null, "limitH": null, "limitL": null, "limitLl": null, "bitStyle": null, "bitBandHeight": null }
             ],
             "revision": 1
         })
@@ -1109,6 +1109,9 @@ fn pen_attribute_edges() {
         json!({ "limitHh": 5, "limitH": 5, "limitL": 5, "limitLl": 5 }),
         json!({ "limitH": 1, "limitLl": -3 }),
         json!({ "limitHh": -1 }),
+        json!({ "bitStyle": "step" }),
+        json!({ "bitStyle": "band", "bitBandHeight": 8 }),
+        json!({ "bitBandHeight": 32 }),
         json!({ "lineStyle": "dashDotDot", "marker": "diamond", "axis": "right" }),
     ] {
         assert!(pen_fields(ok.clone()).is_empty(), "{ok}");
@@ -1131,6 +1134,10 @@ fn pen_attribute_edges() {
         (json!({ "lineStyle": "Solid" }), "lineStyle"),
         (json!({ "marker": "star" }), "marker"),
         (json!({ "axis": "top" }), "axis"),
+        (json!({ "bitStyle": "Band" }), "bitStyle"),
+        (json!({ "bitStyle": "line" }), "bitStyle"),
+        (json!({ "bitBandHeight": 7 }), "bitBandHeight"),
+        (json!({ "bitBandHeight": 33 }), "bitBandHeight"),
         (json!({ "limitH": 5, "limitHh": 4 }), "limitHh"),
         (json!({ "limitL": 5, "limitH": 4 }), "limitH"),
         (json!({ "limitLl": 5, "limitL": 4 }), "limitL"),
@@ -1172,7 +1179,8 @@ async fn pen_attributes_round_trip_through_the_db() {
             "tagId": ids[0], "colorSlot": 3, "label": "入口温度", "unit": "℃", "decimals": 2,
             "lineStyle": "dashDot", "lineWidth": 2.5, "marker": "triangle", "markerSize": 6,
             "axis": "right", "yMin": -10.5, "yMax": 99.5, "limitLines": true, "limitHh": 90.5,
-            "limitH": 80.5, "limitL": 10.5, "limitLl": -5.5
+            "limitH": 80.5, "limitL": 10.5, "limitLl": -5.5,
+            "bitStyle": "band", "bitBandHeight": 24
         })),
         pen_json(json!({ "tagId": ids[1] })),
     ];
@@ -1188,7 +1196,8 @@ async fn pen_attributes_round_trip_through_the_db() {
             "tagId": ids[0], "colorSlot": 3, "label": "入口温度", "unit": "℃", "decimals": 2,
             "lineStyle": "dashDot", "lineWidth": 2.5, "marker": "triangle", "markerSize": 6,
             "axis": "right", "yMin": -10.5, "yMax": 99.5, "limitLines": true, "limitHh": 90.5,
-            "limitH": 80.5, "limitL": 10.5, "limitLl": -5.5
+            "limitH": 80.5, "limitL": 10.5, "limitLl": -5.5,
+            "bitStyle": "band", "bitBandHeight": 24
         })
     );
     assert_eq!(
@@ -1197,7 +1206,8 @@ async fn pen_attributes_round_trip_through_the_db() {
             "tagId": ids[1], "colorSlot": null, "label": null, "unit": null, "decimals": null,
             "lineStyle": null, "lineWidth": null, "marker": null, "markerSize": null,
             "axis": null, "yMin": null, "yMax": null, "limitLines": null, "limitHh": null,
-            "limitH": null, "limitL": null, "limitLl": null
+            "limitH": null, "limitL": null, "limitLl": null,
+            "bitStyle": null, "bitBandHeight": null
         })
     );
     // 応答をそのまま本文に戻して更新しても属性が変わらない。
@@ -1246,6 +1256,8 @@ async fn migration_0106_adds_pen_columns_with_checks() {
         "limit_h",
         "limit_l",
         "limit_ll",
+        "bit_style",
+        "bit_band_height",
     ] {
         assert!(columns.iter().any(|c| c == name), "{name}");
     }
@@ -1263,6 +1275,9 @@ async fn migration_0106_adds_pen_columns_with_checks() {
         "limit_h = 5, limit_hh = 4",
         "limit_l = 5, limit_h = 4",
         "limit_ll = 5, limit_hh = 4",
+        "bit_style = 'line'",
+        "bit_band_height = 7",
+        "bit_band_height = 33",
     ] {
         let res = sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE display_group_pens SET {set} WHERE group_id = ?"
@@ -1282,6 +1297,13 @@ async fn migration_0106_adds_pen_columns_with_checks() {
         .execute(&pool)
         .await
         .expect("管理線の端は通る");
+    sqlx::query(
+        "UPDATE display_group_pens SET bit_style = 'band', bit_band_height = 8 WHERE group_id = ?",
+    )
+    .bind(created.id)
+    .execute(&pool)
+    .await
+    .expect("bit の表しの端は通る");
 }
 
 /// 管理線の誤りは設定したものだけを比べ、非有限の数は断る（誤りは大きいはずの側の欄に付く）。

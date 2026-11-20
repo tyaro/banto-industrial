@@ -46,7 +46,8 @@ export function toTrendLimits(limits: ResolvedLimits | null): TrendLimit[] {
 
 /**
  * 部品のペン（純関数）。色の枠はペンの `colorSlot`（`--banto-chart-<枠>`）。bit のタグは
- * 縦軸を 0〜1 に固定し、小数桁は指定しない（0・1 はそのまま、区間の中点は 0.5 と出る）。
+ * 縦軸を 0〜1 に固定し、小数桁は指定しない。部品へ `bit: true` を渡すので、凡例・カーソル・要約は
+ * False / True で出る。表し方（`bitStyle`・`bitBandHeight`）は bit のペンにだけ渡す。
  */
 export function toTrendPens(pens: readonly TrendPenInfo[]): TrendPen[] {
 	return pens.map((pen, index) => ({
@@ -61,6 +62,13 @@ export function toTrendPens(pens: readonly TrendPenInfo[]): TrendPen[] {
 		...(pen.lineWidth !== null ? { lineWidth: pen.lineWidth } : {}),
 		...(pen.marker !== null ? { marker: pen.marker } : {}),
 		...(pen.markerSize !== null ? { markerSize: pen.markerSize } : {}),
+		...(pen.isBit
+			? {
+					bit: true,
+					...(pen.bitStyle !== null ? { bitStyle: pen.bitStyle } : {}),
+					...(pen.bitBandHeight !== null ? { bitBandHeight: pen.bitBandHeight } : {})
+				}
+			: {}),
 		...(pen.limits !== null ? { limits: toTrendLimits(pen.limits) } : {}),
 		...(pen.isBit
 			? { yMin: 0, yMax: 1 }

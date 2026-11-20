@@ -83,6 +83,12 @@
 
 `TrendPen.limits`（`{ value, side: 'upper' | 'lower', colorVar, label }[]`、null・空は引かない）。そのペンの縦軸で、描画域の幅いっぱいの細い破線を引き、右端の内側に `label` を添える。`upper` は値より上、`lower` は値より下を「越えた」区間とし、その区間だけペンの線とマーカーを `colorVar` で重ね描きする（並びの後ろが前の上に重なるので、H → HH の順に渡せば HH の色が勝つ）。縦軸の外の線は引かないが、越えた区間には効く。線なし（`lineStyle: 'none'`）のペンは線を重ねず、マーカーだけ。要約（aria）に「管理線 HH 90・H 80」と値を足す。計算は `limitLayout`（`core/limits.ts`、描画の層から独立）。
 
+## bit のペンの帯と True / False
+
+`TrendPen.bit` が真のペンは、値 0 / 1 を `False` / `True`（0.5 以上が True）と出す。カーソルの値は `False`・`True`・区間の中で変わったら `False〜True`、凡例の範囲と要約は `False / True`、縦軸の持ち主が bit のペンなら 0・1 の目盛りが `False`・`True` になる。`formatBitValue`（`core/pens.ts`）。
+
+`bitStyle: 'band'` なら描画域の下の帯（タイムチャート）で描く。`bitBandHeight`（px、既定 16、8〜32）。ペンの並びの順に下から積み、帯の間は 2px。帯の合計が描画域の半分を超えたら太さを同じ割合で縮める。アナログのペンの縦の長さは帯の分だけ縮み、帯のペンは線・マーカー・管理線・縦軸の目盛りの持ち主から外れる。True は濃い塗り、区間の中で変わった区間は薄い塗り（opacity 0.4）、False・欠測は塗らない。計算は `bitBandLayout`・`bitSpans`（`core/bitBands.ts`、描画の層から独立）。未指定・`'step'` は今までどおりの線（段差）。
+
 ## 操作
 
 | 操作                     | 動き                               |

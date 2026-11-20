@@ -11,6 +11,8 @@
  *   左右の 2 軸、16 色の枠。
  * - 区間（bins）の数と、MIN/MAX の包絡の形（`core/bins.ts`・`core/geometry.ts`）。
  * - 管理線と、越えた区間の線の色替えの位置（`core/limits.ts`）。ペンの属性 `limits`
+ * - bit のペンの帯（タイムチャート）の置き場と塗り（`core/bitBands.ts`）。ペンの属性
+ *   `bit`・`bitStyle`・`bitBandHeight`。bit の値は False / True と出す（`formatBitValue`）。
  * - しきい値などの横の帯の位置（`core/bands.ts`）。指定したペンの縦軸で、線の下に描く
  *   （汎用の `{ from, to, colorVar, label }`。管理線に置き換えるときに見直す）。
  * - カーソル 1 本の値（`core/cursor.ts`）と、範囲が変わったときの読み直しの段取り
@@ -61,6 +63,9 @@ export {
 	axisOwners,
 	penColorVar,
 	formatValue,
+	formatBitValue,
+	isBitBand,
+	BIT_RANGE_TEXT,
 	type Bin,
 	type TrendPen,
 	type LineStyle,
@@ -104,6 +109,18 @@ export {
 	type LimitRect,
 	type LimitLayout
 } from './core/limits';
+export {
+	BIT_BAND_DEFAULT,
+	BIT_BAND_MIN,
+	BIT_BAND_MAX,
+	BIT_BAND_GAP,
+	resolveBitBandHeight,
+	bitBandLayout,
+	bitSpans,
+	type BitBandSlot,
+	type BitBandLayout,
+	type BitSpan
+} from './core/bitBands';
 export { binAt, cursorReadout, type CursorValue } from './core/cursor';
 export {
 	createRangeLoader,

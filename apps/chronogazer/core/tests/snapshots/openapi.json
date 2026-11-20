@@ -8,6 +8,13 @@
         ],
         "type": "string"
       },
+      "BitStyle": {
+        "enum": [
+          "step",
+          "band"
+        ],
+        "type": "string"
+      },
       "CollectDailyReport": {
         "properties": {
           "day": {
@@ -1201,6 +1208,23 @@
               }
             ]
           },
+          "bitBandHeight": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "bitStyle": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BitStyle"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "colorSlot": {
             "format": "int64",
             "type": [
@@ -1322,6 +1346,19 @@
       "PenPayload": {
         "properties": {
           "axis": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "bitBandHeight": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "bitStyle": {
             "type": [
               "string",
               "null"

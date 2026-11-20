@@ -41,6 +41,12 @@ export const DEFAULT_LINE_WIDTH = 1.5;
 /** `markerSize` が `null` のときの大きさ（px）。Rust の `DEFAULT_MARKER_SIZE` と同じ値。 */
 export const DEFAULT_MARKER_SIZE = 4;
 
+/** bit の表し方。`null` = 段差（`step`）。帯は描画域の下から自動で積む（縦の位置は持たない）。 */
+export type BitStyle = 'step' | 'band';
+
+/** `bitBandHeight` が `null` のときの帯の高さ（px）。Rust の `DEFAULT_BIT_BAND_HEIGHT` と同じ値。 */
+export const DEFAULT_BIT_BAND_HEIGHT = 16;
+
 /**
  * ペンの属性（#1207・#1231 PR 6a。Mirrors the attribute fields of `Pen`）。すべて任意で、
  * `null` = 既定（`label`・`unit`・`decimals` はタグの設定、線は実線 `DEFAULT_LINE_WIDTH` px、
@@ -68,6 +74,12 @@ export interface PenStyle {
 	limitH: number | null;
 	limitL: number | null;
 	limitLl: number | null;
+	/**
+	 * bit の表し（#1207・#1231 PR 7c）。`bitStyle` は `null` = 段差、`bitBandHeight` は整数 8〜32（px）、
+	 * `null` = 16。種別・タグの型を問わず保存し、効くのはトレンドの bit のタグだけ。
+	 */
+	bitStyle: BitStyle | null;
+	bitBandHeight: number | null;
 }
 
 /** 全部が既定のペンの属性。 */
@@ -86,7 +98,9 @@ export const EMPTY_PEN_STYLE: Readonly<PenStyle> = {
 	limitHh: null,
 	limitH: null,
 	limitL: null,
-	limitLl: null
+	limitLl: null,
+	bitStyle: null,
+	bitBandHeight: null
 };
 
 export interface Pen extends PenStyle {

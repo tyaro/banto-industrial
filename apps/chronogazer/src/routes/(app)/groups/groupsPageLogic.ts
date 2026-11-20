@@ -194,7 +194,9 @@ function styleOf(pen: PenStyle & Pick<PenDraft, 'texts'>): PenStyle {
 		limitHh: axisOf('limitHh'),
 		limitH: axisOf('limitH'),
 		limitL: axisOf('limitL'),
-		limitLl: axisOf('limitLl')
+		limitLl: axisOf('limitLl'),
+		bitStyle: pen.bitStyle ?? null,
+		bitBandHeight: pen.bitBandHeight ?? null
 	};
 }
 
@@ -536,7 +538,7 @@ export interface SortedFieldErrors {
 }
 
 const PEN_FIELD =
-	/^pens\[(\d+)\]\.(tagId|colorSlot|label|unit|decimals|lineStyle|lineWidth|marker|markerSize|axis|yMin|yMax|limitLines|limitHh|limitH|limitL|limitLl|hubTag(\..+)?)$/;
+	/^pens\[(\d+)\]\.(tagId|colorSlot|label|unit|decimals|lineStyle|lineWidth|marker|markerSize|axis|yMin|yMax|limitLines|limitHh|limitH|limitL|limitLl|bitStyle|bitBandHeight|hubTag(\..+)?)$/;
 const HUB_TAG_GROUP_FIELD = /^hubTagGroup(\..+)?$/;
 
 export function sortFieldErrors(fieldErrors: readonly FieldErrorLike[]): SortedFieldErrors {

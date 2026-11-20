@@ -523,7 +523,9 @@ describe('ペンの属性の往復（#1207・#1231 PR 6a）', () => {
 				limitHh: 8,
 				limitH: 7,
 				limitL: 1,
-				limitLl: null
+				limitLl: null,
+				bitStyle: 'band',
+				bitBandHeight: 24
 			},
 			{ tagId: 2, colorSlot: null, ...EMPTY_PEN_STYLE }
 		]
@@ -537,7 +539,9 @@ describe('ペンの属性の往復（#1207・#1231 PR 6a）', () => {
 			axis: 'right',
 			yMax: 9,
 			limitLines: true,
-			limitH: 7
+			limitH: 7,
+			bitStyle: 'band',
+			bitBandHeight: 24
 		});
 		const input = draftToInput(draft, styled.revision);
 		expect(input.pens).toEqual([styled.pens[0], styled.pens[1]]);
@@ -557,7 +561,9 @@ describe('ペンの属性の往復（#1207・#1231 PR 6a）', () => {
 			{ lineStyle: 'solid' as const },
 			{ yMin: 0 },
 			{ limitLines: false },
-			{ limitH: 6 }
+			{ limitH: 6 },
+			{ bitStyle: 'step' as const },
+			{ bitBandHeight: 16 }
 		]) {
 			const pens = [{ ...baseline.pens[0], ...change }, baseline.pens[1]];
 			expect(isDraftDirty({ ...baseline, pens }, baseline)).toBe(true);

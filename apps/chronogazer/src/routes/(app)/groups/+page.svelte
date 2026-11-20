@@ -113,6 +113,7 @@
 		updateDisplayGroup,
 		deleteDisplayGroup,
 		reorderDisplayGroups,
+		DEFAULT_BIT_BAND_HEIGHT,
 		DEFAULT_LINE_WIDTH,
 		DEFAULT_MARKER_SIZE,
 		type DisplayGroup,
@@ -467,7 +468,7 @@
 		draft.pens[index][key] = value;
 	}
 
-	function setPenChoice<K extends 'lineStyle' | 'marker' | 'axis'>(
+	function setPenChoice<K extends 'lineStyle' | 'marker' | 'axis' | 'bitStyle'>(
 		index: number,
 		key: K,
 		value: string
@@ -477,7 +478,7 @@
 
 	function setPenNumber(
 		index: number,
-		key: 'decimals' | 'lineWidth' | 'markerSize',
+		key: 'decimals' | 'lineWidth' | 'markerSize' | 'bitBandHeight',
 		value: string
 	): void {
 		draft.pens[index][key] = value === '' ? null : Number(value);
@@ -513,6 +514,17 @@
 		['diamond', 'ひし形']
 	] as const;
 	const LINE_WIDTH_VALUES = [1, 1.5, 2, 2.5, 3, 3.5, 4];
+	const BIT_STYLE_OPTIONS = [
+		['step', '段差'],
+		['band', '帯']
+	] as const;
+	const BIT_BAND_HEIGHT_VALUES = [8, 12, 16, 20, 24, 28, 32];
+	/** 帯の太さの選択肢。保存されている値が並びに無ければ、その値も出す。 */
+	function bitBandHeightOptions(current: number | null): number[] {
+		return current === null || BIT_BAND_HEIGHT_VALUES.includes(current)
+			? BIT_BAND_HEIGHT_VALUES
+			: [...BIT_BAND_HEIGHT_VALUES, current].sort((a, b) => a - b);
+	}
 
 	async function save(): Promise<void> {
 		if (busy || selected === null || !draftReady) return;
@@ -1224,6 +1236,8 @@
 							{/if}
 							{#if penTag?.dataType === 'bit'}
 								<p class="note">bit のタグは 0〜1 固定で、小数の桁・最小・最大は使いません。</p>
+							{:else}
+								<p class="note">「bit の表し」「帯の太さ」は bit のタグだけに効きます。</p>
 							{/if}
 							<label class="field">
 								<span>ペン {index + 1} の凡例の名前</span>
@@ -1278,6 +1292,31 @@
 									<option value="">既定（{DEFAULT_LINE_WIDTH} px）</option>
 									{#each LINE_WIDTH_VALUES as w (w)}
 										<option value={String(w)}>{w} px</option>
+									{/each}
+								</select>
+							</label>
+							<label class="field">
+								<span>ペン {index + 1} の bit の表し</span>
+								<select
+									value={pen.bitStyle ?? ''}
+									onchange={(e) => setPenChoice(index, 'bitStyle', e.currentTarget.value)}
+								>
+									<option value="">既定（段差）</option>
+									{#each BIT_STYLE_OPTIONS as [value, label] (value)}
+										<option {value}>{label}</option>
+									{/each}
+								</select>
+							</label>
+							<label class="field">
+								<span>ペン {index + 1} の帯の太さ</span>
+								<select
+									value={pen.bitBandHeight === null ? '' : String(pen.bitBandHeight)}
+									disabled={pen.bitStyle !== 'band'}
+									onchange={(e) => setPenNumber(index, 'bitBandHeight', e.currentTarget.value)}
+								>
+									<option value="">既定（{DEFAULT_BIT_BAND_HEIGHT} px）</option>
+									{#each bitBandHeightOptions(pen.bitBandHeight) as h (h)}
+										<option value={String(h)}>{h} px</option>
 									{/each}
 								</select>
 							</label>

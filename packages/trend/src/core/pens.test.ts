@@ -1,8 +1,12 @@
+import { niceTicks } from '@banto/charts';
 import { describe, expect, it } from 'vitest';
 import {
 	axisOwners,
+	axisTickValues,
 	dataExtent,
+	formatBitValue,
 	formatValue,
+	isBitBand,
 	penColorVar,
 	resolveYDomain,
 	type Bin,
@@ -105,6 +109,35 @@ describe('axisOwners', () => {
 	});
 });
 
+describe('帯の bit ペン', () => {
+	it('isBitBand は bit かつ band のときだけ', () => {
+		expect(isBitBand(pen({ bit: true, bitStyle: 'band' }))).toBe(true);
+		expect(isBitBand(pen({ bit: true, bitStyle: 'step' }))).toBe(false);
+		expect(isBitBand(pen({ bit: true }))).toBe(false);
+		expect(isBitBand(pen({ bit: false, bitStyle: 'band' }))).toBe(false);
+	});
+	it('axisOwners は帯のペンを持ち主にしない', () => {
+		const band = pen({ bit: true, bitStyle: 'band' });
+		expect(axisOwners([band, pen()])).toEqual({ left: 1, right: null });
+		expect(axisOwners([band, pen({ axis: 'right' })])).toEqual({ left: null, right: 1 });
+		expect(axisOwners([band])).toEqual({ left: null, right: null });
+		expect(axisOwners([pen({ bit: true, bitStyle: 'step' })])).toEqual({ left: 0, right: null });
+	});
+});
+
+describe('formatBitValue', () => {
+	it('0.5 以上が True、未満が False、跨ぐなら False〜True、欠測は —', () => {
+		expect(formatBitValue(1, 1)).toBe('True');
+		expect(formatBitValue(0, 0)).toBe('False');
+		expect(formatBitValue(0, 1)).toBe('False〜True');
+		expect(formatBitValue(0.5, 0.5)).toBe('True');
+		expect(formatBitValue(0.4, 0.4)).toBe('False');
+		expect(formatBitValue(null, 1)).toBe('True');
+		expect(formatBitValue(null, null)).toBe('—');
+		expect(formatBitValue(NaN, undefined)).toBe('—');
+	});
+});
+
 describe('penColorVar', () => {
 	it('1〜8 は banto、9〜16 は --bi-chart-N に banto の色の予備', () => {
 		expect(penColorVar(1)).toBe('var(--banto-chart-1)');
@@ -133,5 +166,21 @@ describe('formatValue', () => {
 		expect(formatValue(null)).toBe('—');
 		expect(formatValue(undefined)).toBe('—');
 		expect(formatValue(NaN, 2)).toBe('—');
+	});
+});
+
+describe('axisTickValues', () => {
+	it('bit のペンは 0 と 1 だけ', () => {
+		expect(axisTickValues(pen({ bit: true }), [0, 1], 6)).toEqual([0, 1]);
+		expect(axisTickValues(pen({ bit: true }), [-0.5, 1.5], 10)).toEqual([0, 1]);
+	});
+	it('bit でなければ niceTicks を範囲で絞ったもの', () => {
+		expect(axisTickValues(pen(), [0, 100], 5)).toEqual(
+			niceTicks(0, 100, 5).filter((v) => v >= 0 && v <= 100)
+		);
+	});
+	it('bit で範囲が 0〜1 を含まなければ、含まないものは出さない', () => {
+		expect(axisTickValues(pen({ bit: true }), [0.5, 2], 5)).toEqual([1]);
+		expect(axisTickValues(pen({ bit: true }), [2, 5], 5)).toEqual([]);
 	});
 });
