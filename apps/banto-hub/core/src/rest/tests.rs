@@ -12,6 +12,7 @@ mod i3_router;
 mod ingest;
 mod ingest_status;
 mod ingest_ws;
+mod log_feed;
 mod parse_addresses;
 mod postgres_connections;
 mod r2b1d_secrets;
