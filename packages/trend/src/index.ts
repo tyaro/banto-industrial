@@ -15,7 +15,7 @@
  *   `bit`・`bitStyle`・`bitBandHeight`。bit の値は False / True と出す（`formatBitValue`）。
  * - しきい値などの横の帯の位置（`core/bands.ts`）。指定したペンの縦軸で、線の下に描く
  *   （汎用の `{ from, to, colorVar, label }`。管理線に置き換えるときに見直す）。
- * - カーソル 1 本の値（`core/cursor.ts`）と、範囲が変わったときの読み直しの段取り
+ * - カーソルの値と、カーソル A・B（置き方・差・時間の差）（`core/cursor.ts`）と、範囲が変わったときの読み直しの段取り
  *   （`core/loader.ts`。debounce・abort・古い結果を捨てる）。
  * - ハイブリッドの純粋な核（設計書 §8）。ペンごとのリングバッファと `liveFrom`（`core/live.ts`）、
  *   履歴の区間とのつなぎ合わせ・境界をまたぐ区間の読み直しの計画と段取り（`core/hybrid.ts`）。

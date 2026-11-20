@@ -331,7 +331,7 @@
 	function onpointerdown(e: PointerEvent) {
 		if (e.button !== 0 || !isValidRange(range)) return;
 		drag = { pointerId: e.pointerId, x0: e.clientX, y0: e.clientY, range0: range, moved: false };
-		if (onRangeChange) (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+		(e.currentTarget as Element).setPointerCapture?.(e.pointerId);
 	}
 	function place(tMs: number) {
 		const r = placeCursor(fixed, tMs);
