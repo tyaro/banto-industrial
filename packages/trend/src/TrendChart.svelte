@@ -16,6 +16,12 @@
     幅いっぱいの細い破線と右端の内側の `label` で描く。越えた区間は、区間の矩形の clipPath で
     ペンの線・マーカーと同じ形を `colorVar` で重ね描きする（並びの順。線なしのペンは線を重ねず
     マーカーだけ）。どれも描画域の clip の内側。要約には管理線の値を足す（単位は付けない）。
+  - bit のペンで `bitStyle: 'band'` のものは帯（タイムチャート）で描く（`core/bitBands.ts`）。描画域の
+    下に、ペンの並びの順に積む（1 本目が一番下）。帯の分だけアナログの縦の長さは縮み（帯の合計は
+    描画域の半分まで）、帯のペンは線・マーカー・管理線・縦軸の目盛りの持ち主から外れる。横の格子・
+    カーソルの線は描画域の全体に引く。True は濃い塗り、区間の中で変わったものは薄い塗り、帯の左端の
+    内側にペンの `label`。bit のペンの値は False / True と出す（カーソル・凡例の範囲・要約。縦軸が
+    bit のペンのときは 0・1 の目盛りも）。
   - 凡例は `onPenSelect` を渡すとペンを選ぶボタンになる（押した印は `selectedPenId`、
     利用側の印は `legendBadge`）。どのペンを選ぶと何が変わるかは利用側が決める。
 -->
@@ -37,7 +43,15 @@
 		resolveMarkerSize
 	} from './core/style';
 	import TrendPenSwatch from './TrendPenSwatch.svelte';
-	import { axisOwners, formatValue, penColorVar, resolveYDomain } from './core/pens';
+	import { bitBandLayout, bitSpans } from './core/bitBands';
+	import {
+		axisOwners,
+		BIT_RANGE_TEXT,
+		formatValue,
+		isBitBand,
+		penColorVar,
+		resolveYDomain
+	} from './core/pens';
 	import type { TrendPen, YDomain } from './core/pens';
 	import { isValidRange, panRange, zoomRange, type TimeRange } from './core/range';
 	import { timeTicks } from './core/timeTicks';
@@ -117,6 +131,9 @@
 		width = plotWidth;
 	});
 
+	// 帯の置き場と、アナログの縦の長さ（帯の分を除く）。
+	const bitLayout = $derived(bitBandLayout(pens, plotHeight));
+	const analogHeight = $derived(bitLayout.analogHeight);
 	const xScale = $derived(linearScale([range.startMs, range.endMs], [0, plotWidth]));
 	// 取得範囲 ∩ 表示範囲と重なる区間だけを、縦軸・空の判定・線・カーソルで共用する。
 	const drawable = $derived(drawableSeries(data, range));
@@ -129,8 +146,8 @@
 			? pens.map((p, i) => {
 					const s = drawable.series[p.id];
 					const eff = drawable.effective;
-					if (!s || !eff) return '';
-					return envelopePath(s.bins, s.binMs, xScale, linearScale(domains[i], [plotHeight, 0]), {
+					if (!s || !eff || isBitBand(p)) return '';
+					return envelopePath(s.bins, s.binMs, xScale, linearScale(domains[i], [analogHeight, 0]), {
 						startMs: eff.startMs,
 						endMs: eff.endMs
 					});
@@ -144,33 +161,51 @@
 					const kind = resolveMarkerKind(p.marker);
 					const s = drawable.series[p.id];
 					const eff = drawable.effective;
-					if (kind === 'none' || !s || !eff) return '';
+					if (kind === 'none' || !s || !eff || isBitBand(p)) return '';
 					const size = resolveMarkerSize(p.markerSize);
 					const pts = markerPoints(
 						s.bins,
 						s.binMs,
 						xScale,
-						linearScale(domains[i], [plotHeight, 0]),
+						linearScale(domains[i], [analogHeight, 0]),
 						{ startMs: eff.startMs, endMs: eff.endMs },
 						size,
-						{ width: plotWidth, height: plotHeight }
+						{ width: plotWidth, height: analogHeight }
 					);
 					return markerPath(pts, kind, size);
 				})
 			: []
 	);
 	const limitLayouts = $derived(
-		valid ? pens.map((p, i) => limitLayout(p.limits, domains[i], plotHeight)) : []
+		valid
+			? pens.map((p, i) =>
+					isBitBand(p) ? { lines: [], rects: [] } : limitLayout(p.limits, domains[i], analogHeight)
+				)
+			: []
 	);
-	const bandRectList = $derived(valid ? bandLayout(bands, pens, domains, plotHeight) : []);
+	const bandRectList = $derived(valid ? bandLayout(bands, pens, domains, analogHeight) : []);
+	// bit の帯: 位置と塗り。
+	const bitBandViews = $derived(
+		valid
+			? bitLayout.bands.map((slot) => {
+					const s = drawable.series[pens[slot.penIndex].id];
+					const eff = drawable.effective;
+					return {
+						...slot,
+						pen: pens[slot.penIndex],
+						spans: s && eff ? bitSpans(s.bins, s.binMs, xScale, eff) : []
+					};
+				})
+			: []
+	);
 	const xTicks = $derived(valid ? timeTicks(range, plotWidth) : []);
-	const yTickCount = $derived(Math.max(2, Math.floor(plotHeight / 40)));
+	const yTickCount = $derived(Math.max(2, Math.floor(analogHeight / 40)));
 
 	function axisTicks(index: number | null): { v: number; y: number }[] {
 		if (index === null || !valid) return [];
 		const [lo, hi] = domains[index];
 		const eps = (hi - lo) * 1e-9;
-		const y = linearScale([lo, hi], [plotHeight, 0]);
+		const y = linearScale([lo, hi], [analogHeight, 0]);
 		return niceTicks(lo, hi, yTickCount)
 			.filter((v) => v >= lo - eps && v <= hi + eps)
 			.map((v) => ({ v, y: y(v) }));
@@ -178,6 +213,14 @@
 	const leftTicks = $derived(axisTicks(owners.left));
 	const rightTicks = $derived(axisTicks(owners.right));
 	const gridTicks = $derived(owners.left !== null ? leftTicks : rightTicks);
+	/** 縦軸の目盛りの文字。持ち主が bit のペン（段差）のときは 0・1 を False・True と出す。 */
+	function tickText(index: number | null, v: number): string {
+		if (index !== null && pens[index].bit) {
+			if (v === 0) return 'False';
+			if (v === 1) return 'True';
+		}
+		return formatValue(v);
+	}
 
 	const hasData = $derived(
 		pens.some((p) => hasFiniteValue(drawable.series[p.id]?.bins ?? emptyBins))
@@ -195,6 +238,7 @@
 		return withSeconds ? `${base}:${pad2(d.getSeconds())}` : base;
 	}
 	function rangeText(pen: TrendPen, d: YDomain): string {
+		if (pen.bit) return BIT_RANGE_TEXT;
 		const unit = pen.unit ? ` ${pen.unit}` : '';
 		return `${formatValue(d[0], pen.decimals)}〜${formatValue(d[1], pen.decimals)}${unit}`;
 	}
@@ -365,7 +409,7 @@
 				{#if owners.left !== null}
 					{#each leftTicks as t (t.v)}
 						<text class="bi-trend__tick" x="-6" y={t.y} text-anchor="end" dominant-baseline="middle"
-							>{formatValue(t.v)}</text
+							>{tickText(owners.left, t.v)}</text
 						>
 					{/each}
 				{/if}
@@ -376,7 +420,7 @@
 							x={plotWidth + 6}
 							y={t.y}
 							text-anchor="start"
-							dominant-baseline="middle">{formatValue(t.v)}</text
+							dominant-baseline="middle">{tickText(owners.right, t.v)}</text
 						>
 					{/each}
 				{/if}
@@ -390,6 +434,25 @@
 							width={plotWidth}
 							height={b.height}
 							fill={b.colorVar}><title>{b.label}</title></rect
+						>
+					{/each}
+					{#each bitBandViews as bb (bb.pen.id)}
+						<rect class="bi-trend__bit-bg" x="0" y={bb.y} width={plotWidth} height={bb.height} />
+						{#each bb.spans as sp, j (j)}
+							<rect
+								x={sp.x}
+								y={bb.y}
+								width={sp.width}
+								height={bb.height}
+								fill={penColorVar(bb.pen.colorSlot)}
+								opacity={sp.state === 'true' ? 1 : 0.4}
+							/>
+						{/each}
+						<text
+							class="bi-trend__bit-label"
+							x="4"
+							y={bb.y + bb.height / 2}
+							dominant-baseline="middle">{bb.pen.label}</text
 						>
 					{/each}
 					{#each limitLayouts as lay, i (pens[i].id)}
@@ -552,6 +615,15 @@
 		vector-effect: non-scaling-stroke;
 	}
 	.bi-trend__limit-label {
+		font-size: var(--banto-font-size-xs);
+	}
+	.bi-trend__bit-bg {
+		fill: none;
+		stroke: var(--banto-chart-grid);
+		stroke-width: 1;
+	}
+	.bi-trend__bit-label {
+		fill: var(--banto-text-muted);
 		font-size: var(--banto-font-size-xs);
 	}
 	.bi-trend__band {

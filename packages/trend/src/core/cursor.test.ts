@@ -77,4 +77,15 @@ describe('cursorReadout', () => {
 		});
 		expect(out.map((c) => c.text)).toEqual(['—', '1']);
 	});
+	it('bit のペンは False・True・False〜True で出す（単位・桁は付けない）', () => {
+		const bit: TrendPen = { id: 'x', label: 'X', colorSlot: 1, bit: true, unit: 'V', decimals: 2 };
+		const bb: Bin[] = [
+			{ tMs: 0, min: 0, max: 0 },
+			{ tMs: 10, min: 1, max: 1 },
+			{ tMs: 20, min: 0, max: 1 },
+			{ tMs: 30, min: null, max: null }
+		];
+		const t = (ms: number) => cursorReadout([bit], { x: S(bb, 10) }, ms, ALL)[0].text;
+		expect([t(5), t(15), t(25), t(35)]).toEqual(['False', 'True', 'False〜True', '—']);
+	});
 });

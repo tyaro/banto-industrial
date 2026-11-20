@@ -4,7 +4,7 @@
 
 import type { TrendSeries } from './data';
 import { binEndMs } from './geometry';
-import { formatValue, MISSING_TEXT, type Bin, type TrendPen } from './pens';
+import { formatBitValue, formatValue, MISSING_TEXT, type Bin, type TrendPen } from './pens';
 import type { TimeRange } from './range';
 
 const fin = (v: number | null | undefined): v is number =>
@@ -62,6 +62,7 @@ export function cursorReadout(
 		const max = b ? (fin(b.max) ? b.max : min) : null;
 		if (min === null || max === null)
 			return { penId: pen.id, min: null, max: null, text: MISSING_TEXT };
+		if (pen.bit) return { penId: pen.id, min, max, text: formatBitValue(min, max) };
 		const unit = pen.unit ? ` ${pen.unit}` : '';
 		const a = formatValue(min, pen.decimals);
 		const z = formatValue(max, pen.decimals);

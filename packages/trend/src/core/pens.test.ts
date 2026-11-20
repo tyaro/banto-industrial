@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import {
 	axisOwners,
 	dataExtent,
+	formatBitValue,
 	formatValue,
+	isBitBand,
 	penColorVar,
 	resolveYDomain,
 	type Bin,
@@ -102,6 +104,35 @@ describe('axisOwners', () => {
 		).toEqual({ left: 1, right: 0 });
 		expect(axisOwners([pen()])).toEqual({ left: 0, right: null });
 		expect(axisOwners([])).toEqual({ left: null, right: null });
+	});
+});
+
+describe('帯の bit ペン', () => {
+	it('isBitBand は bit かつ band のときだけ', () => {
+		expect(isBitBand(pen({ bit: true, bitStyle: 'band' }))).toBe(true);
+		expect(isBitBand(pen({ bit: true, bitStyle: 'step' }))).toBe(false);
+		expect(isBitBand(pen({ bit: true }))).toBe(false);
+		expect(isBitBand(pen({ bit: false, bitStyle: 'band' }))).toBe(false);
+	});
+	it('axisOwners は帯のペンを持ち主にしない', () => {
+		const band = pen({ bit: true, bitStyle: 'band' });
+		expect(axisOwners([band, pen()])).toEqual({ left: 1, right: null });
+		expect(axisOwners([band, pen({ axis: 'right' })])).toEqual({ left: null, right: 1 });
+		expect(axisOwners([band])).toEqual({ left: null, right: null });
+		expect(axisOwners([pen({ bit: true, bitStyle: 'step' })])).toEqual({ left: 0, right: null });
+	});
+});
+
+describe('formatBitValue', () => {
+	it('0.5 以上が True、未満が False、跨ぐなら False〜True、欠測は —', () => {
+		expect(formatBitValue(1, 1)).toBe('True');
+		expect(formatBitValue(0, 0)).toBe('False');
+		expect(formatBitValue(0, 1)).toBe('False〜True');
+		expect(formatBitValue(0.5, 0.5)).toBe('True');
+		expect(formatBitValue(0.4, 0.4)).toBe('False');
+		expect(formatBitValue(null, 1)).toBe('True');
+		expect(formatBitValue(null, null)).toBe('—');
+		expect(formatBitValue(NaN, undefined)).toBe('—');
 	});
 });
 

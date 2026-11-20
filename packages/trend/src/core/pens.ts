@@ -41,6 +41,12 @@ export interface TrendPen {
 	markerSize?: number | null;
 	/** 管理線。null・空 = 引かない。越えた区間の色は、並びの後ろのものが前のものの上に重なる（H → HH の順に渡せば HH の色が勝つ）。 */
 	limits?: readonly TrendLimit[] | null;
+	/** bit のペン。値 0 / 1 を False / True と出す（凡例の範囲・カーソル・要約）。 */
+	bit?: boolean;
+	/** bit の表し。'band' は描画域の下の帯（タイムチャート）。未指定・'step' は今までどおり線（段差）。bit でないペンでは無視。 */
+	bitStyle?: 'step' | 'band' | null;
+	/** 帯の太さ（px）。未指定は 16、8〜32 に丸める。 */
+	bitBandHeight?: number | null;
 }
 
 export type LineStyle = 'solid' | 'dashed' | 'dashDot' | 'dashDotDot' | 'none';
@@ -117,7 +123,12 @@ export function resolveYDomain(pen: TrendPen, bins: readonly Bin[]): YDomain {
 	return [lo, hi];
 }
 
-/** 左右の軸の目盛りを描くペン（その側の先頭）の添字。無ければ null。 */
+/** 帯（タイムチャート）で描く bit のペンか。帯のペンは縦軸・線・マーカー・管理線の持ち主にならない。 */
+export function isBitBand(pen: Pick<TrendPen, 'bit' | 'bitStyle'>): boolean {
+	return pen.bit === true && pen.bitStyle === 'band';
+}
+
+/** 左右の軸の目盛りを描くペン（その側の先頭。帯のペンは除く）の添字。無ければ null。 */
 export function axisOwners(pens: readonly TrendPen[]): {
 	left: number | null;
 	right: number | null;
@@ -125,6 +136,7 @@ export function axisOwners(pens: readonly TrendPen[]): {
 	let left: number | null = null;
 	let right: number | null = null;
 	pens.forEach((p, i) => {
+		if (isBitBand(p)) return;
 		if ((p.axis ?? 'left') === 'right') {
 			if (right === null) right = i;
 		} else if (left === null) left = i;
@@ -148,6 +160,22 @@ export function penColorVar(slot: number): string {
 
 /** 欠測の表示。 */
 export const MISSING_TEXT = '—';
+
+/** bit のペンの凡例の範囲・要約の文字。 */
+export const BIT_RANGE_TEXT = 'False / True';
+
+/** bit の値の書式。0.5 以上を True とする。幅があって跨ぐ（区間の中で変わった）なら `False〜True`。欠測は「—」。 */
+export function formatBitValue(
+	min: number | null | undefined,
+	max: number | null | undefined
+): string {
+	const lo = isNum(min) ? min : isNum(max) ? max : null;
+	const hi = isNum(max) ? max : lo;
+	if (lo === null || hi === null) return MISSING_TEXT;
+	if (lo >= 0.5) return 'True';
+	if (hi < 0.5) return 'False';
+	return 'False〜True';
+}
 
 /**
  * 値の書式。null・非有限は「—」。`decimals` が 0〜10 の整数ならその桁で固定、

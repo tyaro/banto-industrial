@@ -3,7 +3,7 @@
   （幅 32px、線 + 中央のマーカー）。計算は `core/style.ts`。線なし・マーカーなしでも幅は保つ。
 -->
 <script lang="ts">
-	import { penColorVar, type TrendPen } from './core/pens';
+	import { isBitBand, penColorVar, type TrendPen } from './core/pens';
 	import {
 		swatchDashArray,
 		swatchWidth,
@@ -16,7 +16,10 @@
 	let {
 		pen
 	}: {
-		pen: Pick<TrendPen, 'colorSlot' | 'lineStyle' | 'lineWidth' | 'marker' | 'markerSize'>;
+		pen: Pick<
+			TrendPen,
+			'colorSlot' | 'lineStyle' | 'lineWidth' | 'marker' | 'markerSize' | 'bit' | 'bitStyle'
+		>;
 	} = $props();
 
 	const W = 32;
@@ -35,7 +38,9 @@
 </script>
 
 <svg class="bi-trend__swatch" width={W} height={H} viewBox="0 0 {W} {H}" aria-hidden="true">
-	{#if lineOn}
+	{#if isBitBand(pen)}
+		<rect x="1" y="2" width={W - 2} height={H - 4} fill={color} opacity="0.85" />
+	{:else if lineOn}
 		<line
 			x1="1"
 			x2={W - 1}
@@ -47,7 +52,7 @@
 			stroke-dasharray={dash ?? undefined}
 		/>
 	{/if}
-	{#if markerD}<path d={markerD} fill={color} />{/if}
+	{#if markerD && !isBitBand(pen)}<path d={markerD} fill={color} />{/if}
 </svg>
 
 <style>
