@@ -770,19 +770,40 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await page.goto('/monitor');
 		await expect(page.getByRole('heading', { level: 2, name: 'タグモニタ' })).toBeVisible();
 
-		const monitorTreePane = page.locator(TREE_PANE_SELECTOR);
-		const monitorToggle = page.locator(TREE_TOGGLE_SELECTOR);
-		await expect(monitorTreePane).toBeHidden();
-		await expect(monitorToggle).toBeVisible();
+		// #1253: タグモニタの枠は `@banto/dock-svelte` の `ThreePaneDock`。狭い表示では
+		// ツリーが左端の自動で隠す帯へ退き、帯のタブ（`data-dock-band-tab`）が開く経路。
+		const monitorTree = page.getByRole('tree');
+		const monitorBandTab = page.locator('button[data-dock-band-tab="left"]');
+		await expect(monitorTree).toBeHidden();
+		await expect(monitorBandTab).toBeVisible();
+		// 広い表示のトグルは出さない（帯のタブと重ねない）。
+		await expect(page.getByTestId('monitor-tree-toggle')).toHaveCount(0);
 
-		await monitorToggle.click();
-		await expect(monitorTreePane).toBeVisible();
+		await monitorBandTab.click();
+		await expect(monitorTree).toBeVisible();
 
 		await groupNodeByName(page, GROUP_B).click();
 
-		await expect(monitorTreePane).toBeHidden();
+		await expect(monitorTree).toBeHidden();
 		await expect(page.getByTestId('monitor-tree-selection')).toHaveText(GROUP_B);
 		await expect(page.getByRole('cell', { name: TAG_B_EXTERNAL, exact: true })).toBeVisible();
+
+		// #378・#381 の約束: Esc で閉じ、フォーカスは開いた元（帯のタブ）へ戻る。
+		await monitorBandTab.click();
+		await expect(monitorTree).toBeVisible();
+		await page.keyboard.press('Escape');
+		await expect(monitorTree).toBeHidden();
+		await expect(monitorBandTab).toBeFocused();
+
+		// 「表示」メニューからも開け、フォーカスはツリーへ入る（Esc で閉じられる）。
+		await page.getByTestId('monitor-view-menu').click();
+		await page.getByRole('menuitem', { name: '接続とグループ' }).click();
+		await expect(monitorTree).toBeVisible();
+		await expect
+			.poll(() => page.evaluate(() => !!document.activeElement?.closest('[role="tree"]')))
+			.toBe(true);
+		await page.keyboard.press('Escape');
+		await expect(monitorTree).toBeHidden();
 	});
 
 	test('22. モーダルを閉じた直後（outro 中）の Esc でも、次の層が閉じる（#381 レビュー対応12回目）', async () => {

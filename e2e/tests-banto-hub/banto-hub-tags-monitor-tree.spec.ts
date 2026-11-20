@@ -165,4 +165,42 @@ test.describe.serial('banto-hub モニタ Tree/検索 + 確認導線ディープ
 		await expect(highlighted).toHaveCount(1);
 		await expect(highlighted).toContainText(EXTERNAL_A);
 	});
+
+	test('5. ツリーを隠した配置は利用者ごとに保存され、「表示」メニューで既定に戻せる（#1253）', async () => {
+		const savedLayout = () =>
+			page.waitForResponse(
+				(r) =>
+					r.url().includes('/api/ui-settings/hub.dock.monitor') && r.request().method() === 'PUT'
+			);
+		const tree = page.getByRole('tree');
+		const toggle = page.getByTestId('monitor-tree-toggle');
+
+		await page.goto('/monitor');
+		await expect(page.getByText(EXTERNAL_A)).toBeVisible();
+		await expect(tree).toBeVisible();
+		await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+
+		const hidden = savedLayout();
+		await toggle.click();
+		await expect(tree).toBeHidden();
+		await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+		expect((await hidden).ok()).toBe(true);
+
+		// 再読み込みしても隠したまま（URL には載せない）。
+		await page.reload();
+		await expect(page.getByText(EXTERNAL_A)).toBeVisible();
+		await expect(tree).toBeHidden();
+		await expect(page).toHaveURL(/\/monitor$/);
+
+		// 「表示」メニューの「レイアウトを既定に戻す」で戻り、それも保存される
+		// （後の spec のために既定へ戻しておく意味もある）。
+		const reset = savedLayout();
+		await page.getByTestId('monitor-view-menu').click();
+		await page.getByRole('menuitem', { name: 'レイアウトを既定に戻す' }).click();
+		await expect(tree).toBeVisible();
+		expect((await reset).ok()).toBe(true);
+		await page.reload();
+		await expect(page.getByText(EXTERNAL_A)).toBeVisible();
+		await expect(tree).toBeVisible();
+	});
 });
