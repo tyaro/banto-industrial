@@ -29,7 +29,18 @@ export interface TrendPen {
 	yMax?: number | null;
 	/** 工学値レンジ。縦軸の指定が無い側に使う。 */
 	engRange?: { min: number; max: number } | null;
+	/** 線の種類。未指定・null は実線（`core/style.ts`）。 */
+	lineStyle?: LineStyle | null;
+	/** 線幅（px、1〜4）。未指定・null は 1.5。 */
+	lineWidth?: number | null;
+	/** マーカーの形。未指定・null はなし。 */
+	marker?: MarkerKind | null;
+	/** マーカーの大きさ（px、2〜8）。未指定・null は 4。 */
+	markerSize?: number | null;
 }
+
+export type LineStyle = 'solid' | 'dashed' | 'dashDot' | 'dashDotDot' | 'none';
+export type MarkerKind = 'none' | 'circle' | 'square' | 'triangle' | 'diamond';
 
 /** 縦軸の範囲 `[lo, hi]`（lo < hi）。 */
 export type YDomain = [number, number];

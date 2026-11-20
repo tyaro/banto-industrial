@@ -75,6 +75,10 @@
 
 帯の型は汎用の形で、利用側の型（ChronoGazer のしきい値など）は利用側で変換して渡す。管理線（設計書 §10 の 7）に置き換えるときに見直す。
 
+## ペンの線種・線幅・マーカー
+
+`TrendPen` の任意の `lineStyle`（`solid`・`dashed`・`dashDot`・`dashDotDot`・`none`）・`lineWidth`（1〜4 px、既定 1.5）・`marker`（`none`・`circle`・`square`・`triangle`・`diamond`）・`markerSize`（2〜8 px、既定 4）。`null`・未指定は既定、範囲外は丸める。計算は `dashArray`・`markerPoints`・`markerPath`（`core/style.ts`、描画の層から独立）。凡例の見本は `TrendPenSwatch`（`pen` を渡すと線 + 中央のマーカーの小さな SVG になり、表示グループのページでも使える）。
+
 ## 操作
 
 | 操作                     | 動き                               |

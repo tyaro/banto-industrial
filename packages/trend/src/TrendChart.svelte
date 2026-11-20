@@ -8,6 +8,9 @@
     ドラッグで横のパン。素のホイールはページのスクロールに任せる。キーボードは ← → で
     幅の 10% のパン、+ / - で中央基準の拡大・縮小、Esc でカーソルを消す。
   - 色はペンの `penColorVar`、文字・線・背景は `--banto-*` のトークンだけ。
+  - 線種・線幅・マーカーはペンの属性（`core/style.ts`）。線は `stroke-width`・`stroke-dasharray`
+    （線なしは path を出さない）、マーカーは線の上に 1 本の path（`fill` = ペンの色、stroke なし）。
+    凡例の見本は `TrendPenSwatch`（線 + 中央のマーカーの小さな SVG）。
   - 帯（`bands`）は指定したペンの縦軸で、描画域の背景（線の下）に描く（`core/bands.ts`）。
   - 凡例は `onPenSelect` を渡すとペンを選ぶボタンになる（押した印は `selectedPenId`、
     利用側の印は `legendBadge`）。どのペンを選ぶと何が変わるかは利用側が決める。
@@ -19,6 +22,16 @@
 	import { cursorReadout } from './core/cursor';
 	import { drawableSeries, type TrendData } from './core/data';
 	import { envelopePath, hasFiniteValue } from './core/geometry';
+	import {
+		dashArray,
+		markerPath,
+		markerPoints,
+		resolveLineStyle,
+		resolveLineWidth,
+		resolveMarkerKind,
+		resolveMarkerSize
+	} from './core/style';
+	import TrendPenSwatch from './TrendPenSwatch.svelte';
 	import { axisOwners, formatValue, penColorVar, resolveYDomain } from './core/pens';
 	import type { TrendPen, YDomain } from './core/pens';
 	import { isValidRange, panRange, zoomRange, type TimeRange } from './core/range';
@@ -116,6 +129,27 @@
 						startMs: eff.startMs,
 						endMs: eff.endMs
 					});
+				})
+			: []
+	);
+	// マーカーは線と同じ区間・範囲で、ペンごとに 1 本の path（形は `core/style.ts`）。
+	const markerPaths = $derived(
+		valid
+			? pens.map((p, i) => {
+					const kind = resolveMarkerKind(p.marker);
+					const s = drawable.series[p.id];
+					const eff = drawable.effective;
+					if (kind === 'none' || !s || !eff) return '';
+					const size = resolveMarkerSize(p.markerSize);
+					const pts = markerPoints(
+						s.bins,
+						s.binMs,
+						xScale,
+						linearScale(domains[i], [plotHeight, 0]),
+						{ startMs: eff.startMs, endMs: eff.endMs },
+						size
+					);
+					return markerPath(pts, kind, size);
 				})
 			: []
 	);
@@ -337,8 +371,17 @@
 						>
 					{/each}
 					{#each pens as pen, i (pen.id)}
-						{#if paths[i]}
-							<path class="bi-trend__line" d={paths[i]} stroke={penColorVar(pen.colorSlot)} />
+						{#if paths[i] && resolveLineStyle(pen.lineStyle) !== 'none'}
+							<path
+								class="bi-trend__line"
+								d={paths[i]}
+								stroke={penColorVar(pen.colorSlot)}
+								stroke-width={resolveLineWidth(pen.lineWidth)}
+								stroke-dasharray={dashArray(pen.lineStyle, pen.lineWidth) ?? undefined}
+							/>
+						{/if}
+						{#if markerPaths[i]}
+							<path class="bi-trend__marker" d={markerPaths[i]} fill={penColorVar(pen.colorSlot)} />
 						{/if}
 					{/each}
 					{#if cursorX !== null}
@@ -388,7 +431,7 @@
 </div>
 
 {#snippet legendBody(pen: TrendPen, i: number)}
-	<span class="bi-trend__swatch" style:background={penColorVar(pen.colorSlot)}></span>
+	<TrendPenSwatch {pen} />
 	<span class="bi-trend__legend-label">{pen.label}</span>
 	{#if pen.axis === 'right'}<span class="bi-trend__muted">（右軸）</span>{/if}
 	<span class="bi-trend__muted">{rangeText(pen, domains[i])}</span>
@@ -439,10 +482,12 @@
 	}
 	.bi-trend__line {
 		fill: none;
-		stroke-width: 1.5;
 		stroke-linejoin: round;
 		stroke-linecap: round;
 		vector-effect: non-scaling-stroke;
+	}
+	.bi-trend__marker {
+		stroke: none;
 	}
 	.bi-trend__band {
 		opacity: 0.12;
@@ -489,12 +534,6 @@
 	.bi-trend__legend-button:focus-visible {
 		outline: none;
 		box-shadow: var(--banto-focus-ring);
-	}
-	.bi-trend__swatch {
-		display: inline-block;
-		width: 0.75rem;
-		height: 0.25rem;
-		border-radius: var(--banto-radius);
 	}
 	.bi-trend__muted,
 	.bi-trend__cursor-time {

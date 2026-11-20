@@ -62,9 +62,23 @@ export {
 	formatValue,
 	type Bin,
 	type TrendPen,
+	type LineStyle,
+	type MarkerKind,
 	type YDomain
 } from './core/pens';
-export { envelopePath, visibleBins, hasFiniteValue } from './core/geometry';
+export { envelopePath, visibleBins, hasFiniteValue, binCenterMs } from './core/geometry';
+export {
+	DEFAULT_LINE_WIDTH,
+	DEFAULT_MARKER_SIZE,
+	resolveLineStyle,
+	resolveLineWidth,
+	resolveMarkerKind,
+	resolveMarkerSize,
+	dashArray,
+	markerPoints,
+	markerPath,
+	type MarkerPoint
+} from './core/style';
 export {
 	intersectRange,
 	drawableSeries,
@@ -121,3 +135,4 @@ export {
 	type BoundaryLoaderOptions
 } from './core/hybrid';
 export { default as TrendChart } from './TrendChart.svelte';
+export { default as TrendPenSwatch } from './TrendPenSwatch.svelte';

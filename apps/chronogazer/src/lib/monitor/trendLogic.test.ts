@@ -449,6 +449,10 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 				yMin: null,
 				yMax: null,
 				engRange: null,
+				lineStyle: null,
+				lineWidth: null,
+				marker: null,
+				markerSize: null,
 				thresholds: { thresholdHh: 90, thresholdH: 80, thresholdL: null, thresholdLl: null }
 			},
 			{
@@ -462,6 +466,10 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 				yMin: null,
 				yMax: null,
 				engRange: null,
+				lineStyle: null,
+				lineWidth: null,
+				marker: null,
+				markerSize: null,
 				thresholds: null
 			},
 			{
@@ -475,6 +483,10 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 				yMin: null,
 				yMax: null,
 				engRange: null,
+				lineStyle: null,
+				lineWidth: null,
+				marker: null,
+				markerSize: null,
 				thresholds: null
 			}
 		]);

@@ -41,7 +41,7 @@ export function binEndMs(tMs: number, binMs: number, nextTMs?: number): number {
 }
 
 /** 区間が表示範囲 `[startMs, endMs)` と重ならないか（`envelopePath`・`visibleBins` の共通の判定）。 */
-function isOutsideRange(
+export function isOutsideRange(
 	tMs: number,
 	binMs: number,
 	nextTMs: number | undefined,
@@ -69,6 +69,23 @@ export function visibleBins(
 /** 有限の min か max を持つ区間が 1 つでもあるか。 */
 export function hasFiniteValue(bins: readonly Bin[]): boolean {
 	return bins.some((b) => fin(b.min) || fin(b.max));
+}
+
+/**
+ * 区間の x に使う時刻（区間の実際の範囲の中央）。`range` を渡すと表示範囲で切った範囲の中央。
+ * `binMs` が正の有限でないときは `tMs`。`envelopePath` とマーカーの点（`core/style.ts`）で共用する。
+ */
+export function binCenterMs(
+	tMs: number,
+	binMs: number,
+	nextTMs: number | undefined,
+	range?: { startMs?: number; endMs?: number }
+): number {
+	if (!(fin(binMs) && binMs > 0)) return tMs;
+	const s = range && fin(range.startMs) ? Math.max(tMs, range.startMs) : tMs;
+	const end = binEndMs(tMs, binMs, nextTMs);
+	const e = range && fin(range.endMs) ? Math.min(end, range.endMs) : end;
+	return (s + e) / 2;
 }
 
 /** 包絡の path の `d`。点が無ければ空文字。 */
@@ -106,20 +123,13 @@ export function envelopePath(
 	const binOk = fin(binMs) && binMs > 0;
 	const startMs = options?.startMs;
 	const endMs = options?.endMs;
-	const centerOf = (tMs: number, nextTMs: number | undefined, clip: boolean): number => {
-		if (!binOk) return tMs;
-		const s = clip && fin(startMs) ? Math.max(tMs, startMs) : tMs;
-		const end = binEndMs(tMs, binMs, nextTMs);
-		const e = clip && fin(endMs) ? Math.min(end, endMs) : end;
-		return (s + e) / 2;
-	};
 	for (let i = 0; i < bins.length; i++) {
 		const b = bins[i];
 		const nextT = bins[i + 1]?.tMs;
 		if (options && fin(b.tMs) && isOutsideRange(b.tMs, binMs, nextT, startMs, endMs)) continue;
 		const lo = fin(b.min) ? b.min : fin(b.max) ? b.max : null;
 		const hi = fin(b.max) ? b.max : lo;
-		const px = fin(b.tMs) ? x(centerOf(b.tMs, nextT, !!options)) : NaN;
+		const px = fin(b.tMs) ? x(binCenterMs(b.tMs, binMs, nextT, options)) : NaN;
 		if (lo === null || hi === null || !Number.isFinite(px)) {
 			endSegment();
 			continue;

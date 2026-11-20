@@ -4,7 +4,7 @@
  * ID で部品へ渡すため）。
  */
 import type { TrendPen } from '@banto-industrial/trend';
-import { penLegendLabel, type TrendPenInfo } from './trendLogic';
+import type { TrendPenInfo } from './trendLogic';
 
 /**
  * 部品のペンの ID。並びの位置とタグ ID から作る（同じタグを 2 回置いても衝突しない）。
@@ -29,11 +29,16 @@ export function tagIdOfTrendPenId(penId: string): number | null {
 export function toTrendPens(pens: readonly TrendPenInfo[]): TrendPen[] {
 	return pens.map((pen, index) => ({
 		id: trendPenId(index, pen.tagId),
-		label: penLegendLabel(pen),
+		// 単位は部品が凡例の範囲・カーソルの値・要約に足すので、名前だけを渡す（二重に出さない）。
+		label: pen.name,
 		colorSlot: pen.colorSlot,
 		unit: pen.unit,
 		decimals: pen.isBit ? null : pen.decimals,
 		...(pen.axis !== null ? { axis: pen.axis } : {}),
+		...(pen.lineStyle !== null ? { lineStyle: pen.lineStyle } : {}),
+		...(pen.lineWidth !== null ? { lineWidth: pen.lineWidth } : {}),
+		...(pen.marker !== null ? { marker: pen.marker } : {}),
+		...(pen.markerSize !== null ? { markerSize: pen.markerSize } : {}),
 		...(pen.isBit
 			? { yMin: 0, yMax: 1 }
 			: {
