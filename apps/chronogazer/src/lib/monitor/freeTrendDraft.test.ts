@@ -165,6 +165,23 @@ describe('下書きの読み書き', () => {
 		expect(loadDraft(storage, 'account:a', 7)).toBeNull();
 		expect(loadDraft(storage, 'account:a:7', 'new')).toEqual(emptyDraft());
 	});
+	it.each([
+		['書ける', memoryStorage(), 'account:a', true],
+		['ストレージ無し', undefined, 'account:a', false],
+		['持ち主 null', memoryStorage(), null, false],
+		[
+			'setItem が例外',
+			{
+				setItem: () => {
+					throw new Error('quota');
+				}
+			},
+			'account:a',
+			false
+		]
+	])('saveDraft の戻り値: %s', (_name, storage, owner, expected) => {
+		expect(saveDraft(storage, owner, 'new', emptyDraft())).toBe(expected);
+	});
 	it('キー無しの属性は null と読む', () => {
 		const text = JSON.stringify({
 			baseRevision: null,

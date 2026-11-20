@@ -38,6 +38,7 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { sessionStore } from '#lib/session.svelte.js';
+	import { toastStore } from '#lib/toast.svelte.js';
 	import { canWriteResources } from '#lib/permissions.js';
 	import { monitorGroupHref, resolveAppPath } from '#lib/navigation.js';
 	import { collectTimeLabel, getCollectValues } from '#lib/banto/collectAdmin.js';
@@ -317,7 +318,13 @@
 			return;
 		}
 		const { draft, skipped } = draftFromDisplayGroup(trendTarget, trendWindowSec);
-		saveDraft(storage, owner, 'new', draft);
+		if (!saveDraft(storage, owner, 'new', draft)) {
+			toastStore.push(
+				'error',
+				'下書きをこのタブに保存できなかったため、自由トレンドの画面へ移れませんでした（ブラウザの保存領域が使えないか、いっぱいです）。'
+			);
+			return;
+		}
 		const query = skipped > 0 ? `?new=1&skipped=${skipped}` : '?new=1';
 		void goto(`${resolveAppPath('/free-trends')}${query}`);
 	}

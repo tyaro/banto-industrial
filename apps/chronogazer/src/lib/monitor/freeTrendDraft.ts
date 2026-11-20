@@ -231,18 +231,23 @@ export function loadDraft(
 	}
 }
 
-/** 下書きを書く（ベストエフォート）。 */
+/**
+ * 下書きを書く（ベストエフォート）。書けたら `true`、ストレージが無い・持ち主が無い・書き込みが
+ * 例外のときは `false`（例外は投げない）。
+ */
 export function saveDraft(
 	storage: Pick<Storage, 'setItem'> | undefined,
 	owner: string | null,
 	target: DraftTarget,
 	draft: FreeTrendDraft
-): void {
-	if (!storage || owner === null) return;
+): boolean {
+	if (!storage || owner === null) return false;
 	try {
 		storage.setItem(draftStorageKey(owner, target), JSON.stringify(draft));
+		return true;
 	} catch {
 		// 容量超過・無効化。下書きが残らないだけで、編集は続ける。
+		return false;
 	}
 }
 
