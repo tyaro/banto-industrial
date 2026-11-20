@@ -627,11 +627,12 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		// 管理線は既定で無効。有効にしたペン（上限 = H 0）だけ線が出て、そのペンの線を H の色で
 		// 重ね描きする層（管理線の clip `-lim-`）ができる。帯（しきい値の塗り）は出さない。
 		// 凡例は押せない一覧。単位は範囲の後に 1 回だけ（#1247）。
-		// 値が 0 より大きいので縦軸は値の近くに決まり、H = 0 は縦軸の外。縦軸の外の管理線は引かない
-		// 決めなので、線の名前（.bi-trend__limit title）は確かめない。
+		// 「上限」のペンには工学値レンジもペンの縦軸の指定も無く、縦軸をデータの範囲で決めるので、
+		// 管理線の値（H = 0）も範囲に含まれ、線が引かれる。
 		await expect(trend.locator('g[clip-path*="-lim-"] path.bi-trend__line').first()).toBeAttached({
 			timeout: 20_000
 		});
+		await expect(trend.locator('.bi-trend__limit title')).toHaveText(['H']);
 		await expect(trend.locator('.bi-trend__band')).toHaveCount(0);
 		await expect(trend.locator('.bi-trend__sr').first()).toContainText('管理線 H 0');
 		await expect(trend.getByRole('list', { name: 'ペン' }).getByRole('button')).toHaveCount(0);
