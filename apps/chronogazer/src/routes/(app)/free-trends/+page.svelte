@@ -22,7 +22,7 @@
 	import { onDestroy, onMount, untrack } from 'svelte';
 	import { isProviderError } from '@banto/admin-core';
 	import { goto } from '$app/navigation';
-	import { page } from '$app/state';
+	import { navigating, page } from '$app/state';
 	import { resolveAppPath } from '#lib/navigation.js';
 	import { collectTimeLabel, getCollectValues } from '#lib/banto/collectAdmin.js';
 	import { DEMO_MODE_MESSAGE, isTagRegistryAvailable } from '#lib/banto/tagRegistryAdmin.js';
@@ -66,6 +66,7 @@
 		addPens,
 		afterFreeTrendSave,
 		afterFreeTrendSaveFailure,
+		draftOwner,
 		canCreateFreeTrend,
 		classifySaveFailure,
 		clearDraft,
@@ -133,9 +134,10 @@
 			if (seq !== loadSeq) return;
 			list = rows;
 			listError = null;
-			// 一覧に無い ID の下書きは捨てる（消された・別の端末で消えたもの）。
+			// 今の持ち主以外・古い形・一覧に無い ID の下書きは捨てる（消された・別の端末で消えたもの）。
 			pruneDrafts(
 				sessionDraftStorage(),
+				owner,
 				rows.map((item) => item.id)
 			);
 		} catch (err) {
@@ -157,6 +159,18 @@
 	});
 
 	// --- 下書き・編集の状態 -----------------------------------------------------
+
+	/** 下書きの持ち主。分からなければ `null` = 下書きを読まない・書かない。 */
+	const owner = $derived(
+		draftOwner({
+			authDisabled: sessionStore.authDisabled,
+			publicViewer: sessionStore.publicViewer,
+			localDesktop: sessionStore.localDesktop,
+			accountId: sessionStore.identity?.id ?? null
+		})
+	);
+	/** 編集の世代。編集欄を開く・閉じる・対象が替わるたびに進める（保存の完了が、開き直した欄を触らないため）。 */
+	let editGen = 0;
 
 	const canCreate = $derived(
 		canCreateFreeTrend({
@@ -209,11 +223,16 @@
 
 	// 表示中の自由トレンドが変わったら、その下書きを読み、編集欄を閉じる（下書きはストレージに残る）。
 	// `selection` は一覧を読み直すたびに別のオブジェクトになるので、ID（数）の変化だけを見る。
+	// 持ち主が変わったとき・下書きを始められなくなったときも読み直す（別の利用者の下書きを使わない）。
+	// 下書きを始められない人には、保存されたものだけでチャートを描く。
 	const selectedId = $derived(selection.id);
 	$effect(() => {
 		const id = selectedId;
+		const who = owner;
+		const drafting = canDraftSelected;
 		untrack(() => {
-			storedDraft = id === null ? null : loadDraft(sessionDraftStorage(), id);
+			editGen += 1;
+			storedDraft = id === null || !drafting ? null : loadDraft(sessionDraftStorage(), who, id);
 			editing = false;
 			creating = false;
 			picking = false;
@@ -222,27 +241,36 @@
 		});
 	});
 
+	// 新規の下書き（持ち主・作れるかが変わったら読み直す）。
+	$effect(() => {
+		const who = owner;
+		const allowed = canCreate;
+		untrack(() => {
+			newDraft = allowed ? loadDraft(sessionDraftStorage(), who, 'new') : null;
+		});
+	});
+
 	/** 編集の結果を持つ（元と同じなら下書きを持たない）。ストレージにも書く。 */
 	function applyEdit(next: FreeTrendDraft): void {
 		const storage = sessionDraftStorage();
 		if (creating) {
 			newDraft = draftToKeep(next, emptyDraft());
-			if (newDraft) saveDraft(storage, 'new', newDraft);
-			else clearDraft(storage, 'new');
+			if (newDraft) saveDraft(storage, owner, 'new', newDraft);
+			else clearDraft(storage, owner, 'new');
 		} else if (selected) {
 			storedDraft = draftToKeep(next, draftFromFreeTrend(selected));
-			if (storedDraft) saveDraft(storage, selected.id, storedDraft);
-			else clearDraft(storage, selected.id);
+			if (storedDraft) saveDraft(storage, owner, selected.id, storedDraft);
+			else clearDraft(storage, owner, selected.id);
 		}
 	}
 
 	function discardDraft(): void {
 		if (creating) {
 			newDraft = null;
-			clearDraft(sessionDraftStorage(), 'new');
+			clearDraft(sessionDraftStorage(), owner, 'new');
 		} else if (selected) {
 			storedDraft = null;
-			clearDraft(sessionDraftStorage(), selected.id);
+			clearDraft(sessionDraftStorage(), owner, selected.id);
 		}
 		saveErrors = emptyFreeTrendFieldErrors();
 		conflict = false;
@@ -251,13 +279,14 @@
 	function discardSelectedDraft(): void {
 		if (!selected) return;
 		storedDraft = null;
-		clearDraft(sessionDraftStorage(), selected.id);
+		clearDraft(sessionDraftStorage(), owner, selected.id);
 		saveErrors = emptyFreeTrendFieldErrors();
 		conflict = false;
 	}
 
 	function startCreate(): void {
 		if (!canCreate || createBlock !== null) return;
+		editGen += 1;
 		creating = true;
 		editing = false;
 		picking = false;
@@ -268,6 +297,7 @@
 
 	function startEdit(): void {
 		if (!canDraftSelected) return;
+		editGen += 1;
 		editing = true;
 		creating = false;
 		picking = false;
@@ -277,6 +307,7 @@
 	}
 
 	function closePane(): void {
+		editGen += 1;
 		editing = false;
 		creating = false;
 		picking = false;
@@ -351,26 +382,41 @@
 		saving = true;
 		saveErrors = emptyFreeTrendFieldErrors();
 		conflict = false;
+		// 保存を始めた時点の持ち主・編集の世代。応答はこの文脈にだけ反映する。
+		const startedOwner = owner;
+		const startedGen = editGen;
+		const context = () => ({
+			destroyed,
+			startedFor,
+			currentTarget: editTarget,
+			startedGen,
+			currentGen: editGen,
+			startedOwner,
+			currentOwner: owner
+		});
 		try {
 			const saved =
 				mode === 'update' && startedFor !== 'new'
 					? await updateFreeTrend(startedFor, draftToInput(draft, true))
 					: await createFreeTrend(draftToInput(draft, false));
 			toastStore.push('success', `${saved.name} を${mode === 'update' ? '更新' : '作成'}しました`);
-			const next = afterFreeTrendSave({
-				destroyed,
-				startedFor,
-				currentTarget: editTarget
-			});
+			const next = afterFreeTrendSave({ ...context(), navigating: navigating.to !== null });
 			// 保存を始めた後に変えた下書きは捨てない（送った中身と同じときだけ捨てる）。
+			// ストレージは送った時点の持ち主のキーだけを触る。
 			const storage = sessionDraftStorage();
-			if (next.clearDraft && shouldDiscardSavedDraft(loadDraft(storage, startedFor), draft)) {
-				clearDraft(storage, startedFor);
+			if (
+				next.clearDraft &&
+				shouldDiscardSavedDraft(loadDraft(storage, startedOwner, startedFor), draft)
+			) {
+				clearDraft(storage, startedOwner, startedFor);
 			}
-			if (startedFor === 'new') {
-				if (newDraft && shouldDiscardSavedDraft(newDraft, draft)) newDraft = null;
-			} else if (selection.id === startedFor) {
-				if (storedDraft && shouldDiscardSavedDraft(storedDraft, draft)) storedDraft = null;
+			// 画面の状態は、持ち主が同じときだけ触る。
+			if (startedOwner === owner) {
+				if (startedFor === 'new') {
+					if (newDraft && shouldDiscardSavedDraft(newDraft, draft)) newDraft = null;
+				} else if (selection.id === startedFor) {
+					if (storedDraft && shouldDiscardSavedDraft(storedDraft, draft)) storedDraft = null;
+				}
 			}
 			// 読み直しが返るまで保存したものを選べるよう、手元の一覧へ入れる（飛行中の古い応答は捨てる）。
 			loadSeq++;
@@ -379,21 +425,15 @@
 					? list.map((item) => (item.id === saved.id ? saved : item))
 					: [...list, saved];
 			}
-			if (next.navigate) {
-				editing = false;
-				creating = false;
-				picking = false;
-				if (parseFreeTrendParam(page.url.searchParams.get('id')) !== saved.id) {
+			if (next.closeEditor) {
+				closePane();
+				if (next.navigate && parseFreeTrendParam(page.url.searchParams.get('id')) !== saved.id) {
 					void goto(freeTrendHref(saved.id));
 				}
 			}
 			if (next.reload) await reloadList();
 		} catch (err) {
-			const after = afterFreeTrendSaveFailure({
-				destroyed,
-				startedFor,
-				currentTarget: editTarget
-			});
+			const after = afterFreeTrendSaveFailure(context());
 			if (destroyed) return;
 			const failure = classifySaveFailure(err, isRevisionConflict, errorMessage);
 			if (!after.applyToEditor) {
@@ -580,9 +620,11 @@
 		if (deleting || !target || !target.canEdit) return;
 		if (!window.confirm(`${target.name} を削除しますか？`)) return;
 		deleting = true;
+		const deleteOwner = owner;
 		try {
 			await deleteFreeTrend(target.id);
-			clearDraft(sessionDraftStorage(), target.id);
+			// 送った時点の持ち主のキーだけを触る。
+			clearDraft(sessionDraftStorage(), deleteOwner, target.id);
 			toastStore.push('success', `${target.name} を削除しました`);
 			// 読み直しが返るまで消えた物を選び続けないよう、手元の一覧から外す（飛行中の古い応答は捨てる）。
 			loadSeq++;
@@ -590,7 +632,8 @@
 			const next = afterFreeTrendDelete({
 				destroyed,
 				currentRequestedId: parseFreeTrendParam(page.url.searchParams.get('id')),
-				deletedId: target.id
+				deletedId: target.id,
+				navigating: navigating.to !== null
 			});
 			if (next.clearUrl) void goto(freeTrendHref(null), { replaceState: true });
 			if (next.reload) await reloadList();
@@ -611,7 +654,6 @@
 		if (!available) return;
 		pageVisible = document.visibilityState === 'visible';
 		document.addEventListener('visibilitychange', onVisibilityChange);
-		newDraft = loadDraft(sessionDraftStorage(), 'new');
 		void reload();
 	});
 

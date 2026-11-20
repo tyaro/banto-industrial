@@ -29,8 +29,26 @@ export const DRAFT_STORAGE_PREFIX = 'chronogazer.freeTrends.draft:';
 
 export type DraftStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem' | 'key' | 'length'>;
 
-export function draftStorageKey(target: DraftTarget): string {
-	return `${DRAFT_STORAGE_PREFIX}${target}`;
+/**
+ * 下書きの持ち主（認証済みの主体）。アカウントのログインはアカウントの ID、この PC からの接続は
+ * `localDesktop`。ログイン不要モード・閲覧公開・ID が分からないときは `null` = 下書きを読まない・書かない
+ * （未保存の下書きを、別の利用者や閲覧公開に引き継がない。共有は保存済みのものだけ）。
+ */
+export function draftOwner(session: {
+	authDisabled: boolean;
+	publicViewer: boolean;
+	localDesktop: boolean;
+	/** アカウントのログインの ID（名前ではなく安定した ID）。無ければ `null`。 */
+	accountId: string | null;
+}): string | null {
+	if (session.authDisabled || session.publicViewer) return null;
+	if (session.localDesktop) return 'localDesktop';
+	return session.accountId ? `account:${session.accountId}` : null;
+}
+
+/** `chronogazer.freeTrends.draft:<持ち主（URL エンコード）>:<id|new>`。 */
+export function draftStorageKey(owner: string, target: DraftTarget): string {
+	return `${DRAFT_STORAGE_PREFIX}${encodeURIComponent(owner)}:${target}`;
 }
 
 /** 空の新規の下書き。 */
@@ -188,11 +206,12 @@ export function parseDraft(raw: unknown): FreeTrendDraft | null {
 /** 下書きを読む。無い・壊れている・ストレージが使えないときは `null`（例外を投げない）。 */
 export function loadDraft(
 	storage: Pick<Storage, 'getItem'> | undefined,
+	owner: string | null,
 	target: DraftTarget
 ): FreeTrendDraft | null {
-	if (!storage) return null;
+	if (!storage || owner === null) return null;
 	try {
-		const text = storage.getItem(draftStorageKey(target));
+		const text = storage.getItem(draftStorageKey(owner, target));
 		if (text === null) return null;
 		return parseDraft(JSON.parse(text));
 	} catch {
@@ -203,12 +222,13 @@ export function loadDraft(
 /** 下書きを書く（ベストエフォート）。 */
 export function saveDraft(
 	storage: Pick<Storage, 'setItem'> | undefined,
+	owner: string | null,
 	target: DraftTarget,
 	draft: FreeTrendDraft
 ): void {
-	if (!storage) return;
+	if (!storage || owner === null) return;
 	try {
-		storage.setItem(draftStorageKey(target), JSON.stringify(draft));
+		storage.setItem(draftStorageKey(owner, target), JSON.stringify(draft));
 	} catch {
 		// 容量超過・無効化。下書きが残らないだけで、編集は続ける。
 	}
@@ -217,35 +237,43 @@ export function saveDraft(
 /** 下書きを捨てる（ベストエフォート）。 */
 export function clearDraft(
 	storage: Pick<Storage, 'removeItem'> | undefined,
+	owner: string | null,
 	target: DraftTarget
 ): void {
-	if (!storage) return;
+	if (!storage || owner === null) return;
 	try {
-		storage.removeItem(draftStorageKey(target));
+		storage.removeItem(draftStorageKey(owner, target));
 	} catch {
 		// 捨てられなくても表示は続ける。
 	}
 }
 
 /**
- * ストレージにある下書きのキーのうち、捨てる対象の判定。一覧に無い ID と、形の違う
- * （数でも `new` でもない）接頭辞つきのキーを捨てる。`new` は ID の不在とは関係ないので残す。
+ * ストレージにある下書きのキーのうち、捨てる対象の判定。今の持ち主以外のキー（`owner` が `null` なら
+ * すべて）、古い形（持ち主の無い `draft:<id|new>`）、一覧に無い ID、形の違うキーを捨てる。
+ * `new` は ID の不在とは関係ないので残す。
  */
 export function draftKeysToDiscard(
 	keys: readonly string[],
-	existingIds: ReadonlySet<number>
+	existingIds: ReadonlySet<number>,
+	owner: string | null
 ): string[] {
+	const mine = owner === null ? null : encodeURIComponent(owner);
 	return keys.filter((key) => {
 		if (!key.startsWith(DRAFT_STORAGE_PREFIX)) return false;
 		const rest = key.slice(DRAFT_STORAGE_PREFIX.length);
-		if (rest === 'new') return false;
-		return !(/^\d+$/.test(rest) && existingIds.has(Number(rest)));
+		const sep = rest.lastIndexOf(':');
+		if (sep < 0 || mine === null || rest.slice(0, sep) !== mine) return true;
+		const target = rest.slice(sep + 1);
+		if (target === 'new') return false;
+		return !(/^\d+$/.test(target) && existingIds.has(Number(target)));
 	});
 }
 
-/** 一覧を読んだら、一覧に無い ID の下書きを捨てる（ベストエフォート）。 */
+/** 一覧を読んだら、今の持ち主以外・古い形・一覧に無い ID の下書きを捨てる（ベストエフォート）。 */
 export function pruneDrafts(
 	storage: DraftStorage | undefined,
+	owner: string | null,
 	existingIds: readonly number[]
 ): void {
 	if (!storage) return;
@@ -255,7 +283,9 @@ export function pruneDrafts(
 			const key = storage.key(i);
 			if (key !== null) keys.push(key);
 		}
-		for (const key of draftKeysToDiscard(keys, new Set(existingIds))) storage.removeItem(key);
+		for (const key of draftKeysToDiscard(keys, new Set(existingIds), owner)) {
+			storage.removeItem(key);
+		}
 	} catch {
 		// 掃除は便利機能。失敗しても表示は続ける。
 	}
@@ -351,32 +381,54 @@ export function createBlocker(args: {
 
 // --- 保存 -------------------------------------------------------------------
 
+/** 保存を始めた時点の編集の文脈と、完了時点のそれ。 */
+export interface FreeTrendSaveContext {
+	destroyed: boolean;
+	startedFor: DraftTarget;
+	currentTarget: DraftTarget | null;
+	/** 保存を始めたときの編集の世代（編集欄を開く・閉じる・対象が替わるたびに進む）。 */
+	startedGen: number;
+	currentGen: number;
+	/** 保存を始めたときの下書きの持ち主と、完了時点のそれ。 */
+	startedOwner: string | null;
+	currentOwner: string | null;
+}
+
+/** 完了が、保存を始めた編集の文脈（対象・世代・持ち主）のままか。 */
+function sameEditContext(args: FreeTrendSaveContext): boolean {
+	return (
+		!args.destroyed &&
+		args.currentTarget === args.startedFor &&
+		args.currentGen === args.startedGen &&
+		args.currentOwner === args.startedOwner
+	);
+}
+
 /** 保存の完了後にすること。 */
 export interface FreeTrendSaveFollowUp {
-	/** 下書き（保存を始めた対象のもの）を捨てる。保存は済んでいるので、離れていても捨てる。 */
+	/** 下書き（保存を始めた対象・持ち主のもの）を捨てる。保存は済んでいるので、離れていても捨てる。 */
 	clearDraft: boolean;
-	/** 編集欄を閉じて、保存したものの `?id=` へ移る。 */
+	/** 編集欄を閉じる（保存を始めた編集のままのときだけ）。 */
+	closeEditor: boolean;
+	/** 保存したものの `?id=` へ移る（`closeEditor` で、ほかの移動の最中でないとき）。 */
 	navigate: boolean;
 	/** 一覧を読み直す。 */
 	reload: boolean;
 }
 
 /**
- * 保存の応答を待つ間に画面を離れた・別のものを選んだ場合に、後から来た完了が遷移や選択を
- * 上書きしないための判断（純関数。`afterFreeTrendDelete` と同じ考え方）。`startedFor` は保存を
- * 始めたときの編集の対象、`currentTarget` は完了時点で編集している対象（編集欄が閉じていれば `null`）。
+ * 保存の応答を待つ間に画面を離れた・別のものを選んだ・編集欄を開き直した・持ち主が変わった・
+ * 別の移動が始まった場合に、後から来た完了が画面の状態や遷移を上書きしないための判断（純関数。
+ * `afterFreeTrendDelete` と同じ考え方）。`navigating` は完了時点で別の移動が終わっていないか。
  */
-export function afterFreeTrendSave(args: {
-	destroyed: boolean;
-	startedFor: DraftTarget;
-	currentTarget: DraftTarget | null;
-}): FreeTrendSaveFollowUp {
-	if (args.destroyed) return { clearDraft: true, navigate: false, reload: false };
-	return {
-		clearDraft: true,
-		navigate: args.currentTarget === args.startedFor,
-		reload: true
-	};
+export function afterFreeTrendSave(
+	args: FreeTrendSaveContext & { navigating: boolean }
+): FreeTrendSaveFollowUp {
+	if (args.destroyed) {
+		return { clearDraft: true, closeEditor: false, navigate: false, reload: false };
+	}
+	const same = sameEditContext(args);
+	return { clearDraft: true, closeEditor: same, navigate: same && !args.navigating, reload: true };
 }
 
 /**
@@ -406,15 +458,13 @@ export interface FreeTrendSaveFailureFollowUp {
 
 /**
  * 保存の失敗を、保存を始めた編集欄だけに出すための判断（純関数）。待つ間に別のものを選んで
- * 編集欄を開いていたら、その欄に誤った競合・誤りを立てない。
+ * 編集欄を開いていた・同じ対象を閉じて開き直した・持ち主が変わったなら、その欄に誤った競合・誤りを立てない。
  */
-export function afterFreeTrendSaveFailure(args: {
-	destroyed: boolean;
-	startedFor: DraftTarget;
-	currentTarget: DraftTarget | null;
-}): FreeTrendSaveFailureFollowUp {
+export function afterFreeTrendSaveFailure(
+	args: FreeTrendSaveContext
+): FreeTrendSaveFailureFollowUp {
 	if (args.destroyed) return { applyToEditor: false, reload: false };
-	return { applyToEditor: args.currentTarget === args.startedFor, reload: true };
+	return { applyToEditor: sameEditContext(args), reload: true };
 }
 
 /** 保存のエラーを画面のどこに出すか。 */

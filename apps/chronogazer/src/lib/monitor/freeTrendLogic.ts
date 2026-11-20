@@ -71,9 +71,14 @@ export function afterFreeTrendDelete(args: {
 	destroyed: boolean;
 	currentRequestedId: number | null;
 	deletedId: number;
+	/** 完了時点で別の移動が終わっていない（`navigating.to` が `null` でない）。 */
+	navigating: boolean;
 }): FreeTrendDeleteFollowUp {
 	if (args.destroyed) return { clearUrl: false, reload: false };
-	return { clearUrl: args.currentRequestedId === args.deletedId, reload: true };
+	return {
+		clearUrl: args.currentRequestedId === args.deletedId && !args.navigating,
+		reload: true
+	};
 }
 
 /** 画面で選び直した時間窓（どの自由トレンドのものか持つ）。 */

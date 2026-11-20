@@ -69,18 +69,15 @@ describe('端末の覚え', () => {
 });
 
 describe('afterFreeTrendDelete', () => {
+	const base = { destroyed: false, currentRequestedId: 3, deletedId: 3, navigating: false };
 	it.each([
-		['破棄済み', { destroyed: true, currentRequestedId: 3, deletedId: 3 }, false, false],
-		['今の ?id が削除対象', { destroyed: false, currentRequestedId: 3, deletedId: 3 }, true, true],
-		[
-			'別の ID を選んでいる',
-			{ destroyed: false, currentRequestedId: 7, deletedId: 3 },
-			false,
-			true
-		],
-		['?id が無い', { destroyed: false, currentRequestedId: null, deletedId: 3 }, false, true]
-	])('%s', (_name, args, clearUrl, reload) => {
-		expect(afterFreeTrendDelete(args)).toEqual({ clearUrl, reload });
+		['破棄済み', { destroyed: true }, false, false],
+		['今の ?id が削除対象', {}, true, true],
+		['別の ID を選んでいる', { currentRequestedId: 7 }, false, true],
+		['?id が無い', { currentRequestedId: null }, false, true],
+		['別の移動の最中', { navigating: true }, false, true]
+	])('%s', (_name, patch, clearUrl, reload) => {
+		expect(afterFreeTrendDelete({ ...base, ...patch })).toEqual({ clearUrl, reload });
 	});
 });
 

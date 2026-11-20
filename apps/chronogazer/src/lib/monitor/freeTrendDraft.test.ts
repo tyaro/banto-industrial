@@ -11,6 +11,7 @@ import {
 	DRAFT_STORAGE_PREFIX,
 	draftFromFreeTrend,
 	draftKeysToDiscard,
+	draftOwner,
 	draftStorageKey,
 	draftToInput,
 	draftToKeep,
@@ -113,17 +114,38 @@ describe('draftToKeep', () => {
 });
 
 describe('下書きの読み書き', () => {
-	it('対象ごとのキーで往復し、属性を保つ', () => {
+	const OWNER = 'account:alice';
+	const K = (owner: string, t: string | number) =>
+		`${DRAFT_STORAGE_PREFIX}${encodeURIComponent(owner)}:${t}`;
+	it('持ち主と対象ごとのキーで往復し、属性を保つ', () => {
 		const storage = memoryStorage();
 		const draft = draftFromFreeTrend(saved);
-		saveDraft(storage, 7, draft);
-		saveDraft(storage, 'new', emptyDraft());
-		expect(storage.data.has(`${DRAFT_STORAGE_PREFIX}7`)).toBe(true);
-		expect(draftStorageKey('new')).toBe(`${DRAFT_STORAGE_PREFIX}new`);
-		expect(loadDraft(storage, 7)).toEqual(draft);
-		clearDraft(storage, 7);
-		expect(loadDraft(storage, 7)).toBeNull();
-		expect(loadDraft(storage, 'new')).toEqual(emptyDraft());
+		saveDraft(storage, OWNER, 7, draft);
+		saveDraft(storage, OWNER, 'new', emptyDraft());
+		expect(storage.data.has(K(OWNER, 7))).toBe(true);
+		expect(draftStorageKey(OWNER, 'new')).toBe(K(OWNER, 'new'));
+		expect(loadDraft(storage, OWNER, 7)).toEqual(draft);
+		clearDraft(storage, OWNER, 7);
+		expect(loadDraft(storage, OWNER, 7)).toBeNull();
+		expect(loadDraft(storage, OWNER, 'new')).toEqual(emptyDraft());
+	});
+	it('別の持ち主の下書きは読めない。持ち主なしは読まない・書かない・消さない', () => {
+		const storage = memoryStorage();
+		saveDraft(storage, OWNER, 7, draftFromFreeTrend(saved));
+		expect(loadDraft(storage, 'account:bob', 7)).toBeNull();
+		expect(loadDraft(storage, 'localDesktop', 7)).toBeNull();
+		expect(loadDraft(storage, null, 7)).toBeNull();
+		saveDraft(storage, null, 7, emptyDraft());
+		expect([...storage.data.keys()]).toEqual([K(OWNER, 7)]);
+		clearDraft(storage, null, 7);
+		clearDraft(storage, 'account:bob', 7);
+		expect(loadDraft(storage, OWNER, 7)).not.toBeNull();
+	});
+	it('持ち主の ID にコロンがあっても取り違えない', () => {
+		const storage = memoryStorage();
+		saveDraft(storage, 'account:a:7', 'new', emptyDraft());
+		expect(loadDraft(storage, 'account:a', 7)).toBeNull();
+		expect(loadDraft(storage, 'account:a:7', 'new')).toEqual(emptyDraft());
 	});
 	it('キー無しの属性は null と読む', () => {
 		const text = JSON.stringify({
@@ -165,8 +187,8 @@ describe('下書きの読み書き', () => {
 		expect(parseDraft({ ...ok, pens: many })).toBeNull();
 	});
 	it('壊れた JSON・投げるストレージでも例外にしない', () => {
-		const storage = memoryStorage({ [`${DRAFT_STORAGE_PREFIX}1`]: '{oops' });
-		expect(loadDraft(storage, 1)).toBeNull();
+		const storage = memoryStorage({ [`${DRAFT_STORAGE_PREFIX}account%3Aa:1`]: '{oops' });
+		expect(loadDraft(storage, 'account:a', 1)).toBeNull();
 		const throwing = {
 			getItem: () => {
 				throw new Error('denied');
@@ -178,39 +200,69 @@ describe('下書きの読み書き', () => {
 				throw new Error('denied');
 			}
 		};
-		expect(loadDraft(throwing, 1)).toBeNull();
-		expect(() => saveDraft(throwing, 1, emptyDraft())).not.toThrow();
-		expect(() => clearDraft(throwing, 1)).not.toThrow();
-		expect(loadDraft(undefined, 1)).toBeNull();
+		expect(loadDraft(throwing, 'o', 1)).toBeNull();
+		expect(() => saveDraft(throwing, 'o', 1, emptyDraft())).not.toThrow();
+		expect(() => clearDraft(throwing, 'o', 1)).not.toThrow();
+		expect(loadDraft(undefined, 'o', 1)).toBeNull();
 	});
 });
 
-describe('一覧に無い ID の下書きを捨てる', () => {
-	it('判定', () => {
+describe('不要な下書きを捨てる', () => {
+	const mine = 'account:alice';
+	const K = (owner: string, t: string | number) =>
+		`${DRAFT_STORAGE_PREFIX}${encodeURIComponent(owner)}:${t}`;
+	it('判定: 一覧に無い ID・形の違うキー・他の持ち主・古い形を捨てる', () => {
 		const keys = [
+			K(mine, 1),
+			K(mine, 2),
+			K(mine, 'new'),
+			K(mine, 'abc'),
+			K('localDesktop', 1),
+			K('account:bob', 'new'),
 			`${DRAFT_STORAGE_PREFIX}1`,
-			`${DRAFT_STORAGE_PREFIX}2`,
 			`${DRAFT_STORAGE_PREFIX}new`,
-			`${DRAFT_STORAGE_PREFIX}abc`,
 			'other'
 		];
-		expect(draftKeysToDiscard(keys, new Set([1]))).toEqual([
-			`${DRAFT_STORAGE_PREFIX}2`,
-			`${DRAFT_STORAGE_PREFIX}abc`
+		expect(draftKeysToDiscard(keys, new Set([1]), mine)).toEqual([
+			K(mine, 2),
+			K(mine, 'abc'),
+			K('localDesktop', 1),
+			K('account:bob', 'new'),
+			`${DRAFT_STORAGE_PREFIX}1`,
+			`${DRAFT_STORAGE_PREFIX}new`
 		]);
 	});
-	it('ストレージから消す。new と無関係なキーは残す', () => {
+	it('持ち主なしなら、下書きのキーをすべて捨てる（無関係なキーは残す）', () => {
+		const keys = [K(mine, 1), K(mine, 'new'), `${DRAFT_STORAGE_PREFIX}new`, 'other'];
+		expect(draftKeysToDiscard(keys, new Set([1]), null)).toEqual(keys.slice(0, 3));
+	});
+	it('ストレージから消す。自分の new と無関係なキーは残す', () => {
 		const storage = memoryStorage({
-			[`${DRAFT_STORAGE_PREFIX}1`]: '{}',
-			[`${DRAFT_STORAGE_PREFIX}2`]: '{}',
+			[K(mine, 1)]: '{}',
+			[K(mine, 2)]: '{}',
+			[K(mine, 'new')]: '{}',
+			[K('account:bob', 'new')]: '{}',
 			[`${DRAFT_STORAGE_PREFIX}new`]: '{}',
 			other: 'x'
 		});
-		pruneDrafts(storage, [1]);
-		expect([...storage.data.keys()].sort()).toEqual(
-			[`${DRAFT_STORAGE_PREFIX}1`, `${DRAFT_STORAGE_PREFIX}new`, 'other'].sort()
-		);
-		expect(() => pruneDrafts(undefined, [])).not.toThrow();
+		pruneDrafts(storage, mine, [1]);
+		expect([...storage.data.keys()].sort()).toEqual([K(mine, 1), K(mine, 'new'), 'other'].sort());
+		expect(() => pruneDrafts(undefined, mine, [])).not.toThrow();
+	});
+});
+
+describe('draftOwner', () => {
+	const base = { authDisabled: false, publicViewer: false, localDesktop: false, accountId: null };
+	it.each([
+		['アカウント', { ...base, accountId: 'alice' }, 'account:alice'],
+		['この PC からの接続', { ...base, localDesktop: true }, 'localDesktop'],
+		['ID が分からない', base, null],
+		['空の ID', { ...base, accountId: '' }, null],
+		['ログイン不要モード', { ...base, authDisabled: true, accountId: 'alice' }, null],
+		['閲覧公開', { ...base, publicViewer: true, accountId: 'alice' }, null],
+		['閲覧公開（localDesktop も立つ）', { ...base, publicViewer: true, localDesktop: true }, null]
+	])('%s', (_name, session, expected) => {
+		expect(draftOwner(session)).toBe(expected);
 	});
 });
 
@@ -296,62 +348,66 @@ describe('shouldDiscardSavedDraft', () => {
 	it('無い・壊れている（読めず null）なら捨てるものが無い', () => {
 		expect(shouldDiscardSavedDraft(null, sent)).toBe(false);
 		const storage = { getItem: () => '{broken' };
-		expect(shouldDiscardSavedDraft(loadDraft(storage, 7), sent)).toBe(false);
+		expect(shouldDiscardSavedDraft(loadDraft(storage, 'o', 7), sent)).toBe(false);
 	});
 });
 
-describe('afterFreeTrendSaveFailure', () => {
-	it('同じ対象を編集中なら編集欄に出し、一覧を読み直す', () => {
-		expect(
-			afterFreeTrendSaveFailure({ destroyed: false, startedFor: 7, currentTarget: 7 })
-		).toEqual({ applyToEditor: true, reload: true });
-		expect(
-			afterFreeTrendSaveFailure({ destroyed: false, startedFor: 'new', currentTarget: 'new' })
-		).toEqual({ applyToEditor: true, reload: true });
-	});
-	it('別のものを編集中・編集欄を閉じたなら編集欄に出さない', () => {
-		const other = { applyToEditor: false, reload: true };
-		expect(
-			afterFreeTrendSaveFailure({ destroyed: false, startedFor: 7, currentTarget: 8 })
-		).toEqual(other);
-		expect(
-			afterFreeTrendSaveFailure({ destroyed: false, startedFor: 7, currentTarget: null })
-		).toEqual(other);
-		expect(
-			afterFreeTrendSaveFailure({ destroyed: false, startedFor: 'new', currentTarget: 7 })
-		).toEqual(other);
-	});
-	it('画面を離れたあとは何もしない', () => {
-		expect(afterFreeTrendSaveFailure({ destroyed: true, startedFor: 7, currentTarget: 7 })).toEqual(
-			{ applyToEditor: false, reload: false }
-		);
-	});
-});
-
-describe('afterFreeTrendSave', () => {
-	it('同じ対象を編集中なら移る。下書きは捨て、一覧を読み直す', () => {
-		expect(afterFreeTrendSave({ destroyed: false, startedFor: 7, currentTarget: 7 })).toEqual({
+describe('保存の完了後の判断（持ち主・世代）', () => {
+	const ctx = {
+		destroyed: false,
+		startedFor: 7 as number | 'new',
+		currentTarget: 7 as number | 'new' | null,
+		startedGen: 3,
+		currentGen: 3,
+		startedOwner: 'account:alice' as string | null,
+		currentOwner: 'account:alice' as string | null
+	};
+	it('同じ編集なら編集欄に出し・閉じて移る', () => {
+		expect(afterFreeTrendSaveFailure(ctx)).toEqual({ applyToEditor: true, reload: true });
+		expect(afterFreeTrendSave({ ...ctx, navigating: false })).toEqual({
 			clearDraft: true,
+			closeEditor: true,
 			navigate: true,
 			reload: true
 		});
 		expect(
-			afterFreeTrendSave({ destroyed: false, startedFor: 'new', currentTarget: 'new' }).navigate
+			afterFreeTrendSave({ ...ctx, startedFor: 'new', currentTarget: 'new', navigating: false })
+				.navigate
 		).toBe(true);
 	});
-	it('待つ間に別のものへ移った・編集欄を閉じたら、移らない', () => {
-		const other = afterFreeTrendSave({ destroyed: false, startedFor: 7, currentTarget: 8 });
-		expect(other).toEqual({ clearDraft: true, navigate: false, reload: true });
-		expect(
-			afterFreeTrendSave({ destroyed: false, startedFor: 7, currentTarget: null }).navigate
-		).toBe(false);
-		expect(
-			afterFreeTrendSave({ destroyed: false, startedFor: 'new', currentTarget: 7 }).navigate
-		).toBe(false);
-	});
-	it('画面が破棄されていたら、下書きだけ捨てて何もしない', () => {
-		expect(afterFreeTrendSave({ destroyed: true, startedFor: 7, currentTarget: 7 })).toEqual({
+	it.each([
+		['別の対象', { currentTarget: 8 }],
+		['編集欄を閉じた', { currentTarget: null }],
+		['新規へ移った', { currentTarget: 'new' as const }],
+		['同じ対象を閉じて開き直した（世代が進んだ）', { currentGen: 4 }],
+		['持ち主が変わった', { currentOwner: 'account:bob' }],
+		['持ち主がなくなった', { currentOwner: null }]
+	])('%s: 編集欄に反映しない。下書きは送った持ち主のものを捨て、一覧は読み直す', (_n, patch) => {
+		const c = { ...ctx, ...patch };
+		expect(afterFreeTrendSaveFailure(c)).toEqual({ applyToEditor: false, reload: true });
+		expect(afterFreeTrendSave({ ...c, navigating: false })).toEqual({
 			clearDraft: true,
+			closeEditor: false,
+			navigate: false,
+			reload: true
+		});
+	});
+	it('別の移動の最中なら、編集欄は閉じるが移らない', () => {
+		expect(afterFreeTrendSave({ ...ctx, navigating: true })).toEqual({
+			clearDraft: true,
+			closeEditor: true,
+			navigate: false,
+			reload: true
+		});
+	});
+	it('画面を離れたあとは何もしない（下書きだけ捨てる）', () => {
+		expect(afterFreeTrendSaveFailure({ ...ctx, destroyed: true })).toEqual({
+			applyToEditor: false,
+			reload: false
+		});
+		expect(afterFreeTrendSave({ ...ctx, destroyed: true, navigating: false })).toEqual({
+			clearDraft: true,
+			closeEditor: false,
 			navigate: false,
 			reload: false
 		});
