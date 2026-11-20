@@ -34,6 +34,7 @@ import {
 const group: DisplayGroup = {
 	id: 7,
 	name: 'ライン1',
+	bundle: null,
 	sortOrder: 0,
 	kind: 'trend',
 	attributes: { timeWindowSec: 1800 },
@@ -57,6 +58,7 @@ describe('下書きと保存の形（#393）', () => {
 		const draft = draftFromGroup(group);
 		expect(draftToInput(draft, group.revision)).toEqual({
 			name: 'ライン1',
+			bundle: null,
 			kind: 'trend',
 			attributes: { timeWindowSec: 1800 },
 			pens: [
@@ -203,6 +205,7 @@ describe('サーバーの検証エラーの振り分け', () => {
 		]);
 		expect(sorted).toEqual({
 			name: ['既に使用されています'],
+			bundle: [],
 			kind: ['種別'],
 			timeWindowSec: ['時間窓'],
 			pens: ['8 本まで'],
@@ -450,5 +453,28 @@ describe('Hub のタグのペン（#1179 PR6b）', () => {
 		expect(
 			fieldErrorTabs(sortFieldErrors([{ field: 'hubTagGroup.collectionGroupId', message: 'x' }]))
 		).toEqual({ settings: false, pens: true });
+	});
+});
+
+describe('束（#1207・#1231 PR 5b）', () => {
+	it('束の入力は前後の空白を除いて送り、空は null（束なし）にする', () => {
+		const draft = draftFromGroup(group);
+		expect(draftToInput({ ...draft, bundle: '  ライン A ' }).bundle).toBe('ライン A');
+		expect(draftToInput({ ...draft, bundle: '   ' }).bundle).toBeNull();
+		expect(draftToInput({ ...draft, bundle: '' }).bundle).toBeNull();
+	});
+
+	it('読み込んだ束は下書きに入り、変えると未保存になる', () => {
+		const baseline = draftFromGroup({ ...group, bundle: 'A' });
+		expect(baseline.bundle).toBe('A');
+		expect(draftFromGroup(group).bundle).toBe('');
+		expect(isDraftDirty({ ...baseline, bundle: 'B' }, baseline)).toBe(true);
+		expect(isDraftDirty({ ...baseline, bundle: ' A ' }, baseline)).toBe(false);
+	});
+
+	it('束の誤りは「設定」のタブに出す', () => {
+		const sorted = sortFieldErrors([{ field: 'bundle', message: '50 文字以内' }]);
+		expect(sorted.bundle).toEqual(['50 文字以内']);
+		expect(fieldErrorTabs(sorted)).toEqual({ settings: true, pens: false });
 	});
 });

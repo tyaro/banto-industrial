@@ -69,6 +69,12 @@
 		valuesStaleNote
 	} from '#lib/monitor/monitorLogic.js';
 	import { kindLabel } from '../groups/groupsPageLogic';
+	import {
+		bundleKeyOf,
+		bundleTabs,
+		groupsOfBundle,
+		tabKeyTarget
+	} from '#lib/monitor/bundleLogic.js';
 	import { meterViews } from '#lib/monitor/meterLogic.js';
 	import DigitalPanel from '#lib/monitor/DigitalPanel.svelte';
 	import BarPanel from '#lib/monitor/BarPanel.svelte';
@@ -121,18 +127,37 @@
 		void goto(monitorGroupHref(id), { reset: false });
 	}
 
-	/** タブの左右キー（WAI-ARIA のタブの作法）。 */
+	// 束（#1207・#1231 PR 5b）: 束が 1 つも無ければ `bundles` は null で、画面は平らなタブ 1 列。
+	// 選んだ束は選択中のグループから求める（`?group=` と前回のグループの記憶がそのまま効く）。
+	const bundles = $derived(bundleTabs(groups ?? []));
+	const selectedBundleKey = $derived(selectedGroup === null ? null : bundleKeyOf(selectedGroup));
+	const visibleGroups = $derived(
+		bundles === null ? (groups ?? []) : groupsOfBundle(groups ?? [], selectedBundleKey)
+	);
+
+	/** 束のタブを押すと、その束の最初のグループを見せる。 */
+	function showBundle(key: string | null): void {
+		const first = groupsOfBundle(groups ?? [], key)[0];
+		if (first) showGroup(first.id);
+	}
+
+	/** グループのタブの左右キー（WAI-ARIA のタブの作法）。 */
 	function onTabKeydown(event: KeyboardEvent, index: number): void {
-		if (!groups || groups.length === 0) return;
-		let next: number | null = null;
-		if (event.key === 'ArrowRight') next = (index + 1) % groups.length;
-		else if (event.key === 'ArrowLeft') next = (index - 1 + groups.length) % groups.length;
-		else if (event.key === 'Home') next = 0;
-		else if (event.key === 'End') next = groups.length - 1;
+		const next = tabKeyTarget(event.key, index, visibleGroups.length);
 		if (next === null) return;
 		event.preventDefault();
-		showGroup(groups[next].id);
-		document.getElementById(`monitor-tab-${groups[next].id}`)?.focus();
+		showGroup(visibleGroups[next].id);
+		document.getElementById(`monitor-tab-${visibleGroups[next].id}`)?.focus();
+	}
+
+	/** 束のタブの左右キー。 */
+	function onBundleKeydown(event: KeyboardEvent, index: number): void {
+		const tabs = bundles ?? [];
+		const next = tabKeyTarget(event.key, index, tabs.length);
+		if (next === null) return;
+		event.preventDefault();
+		showBundle(tabs[next].key);
+		document.getElementById(`monitor-bundle-tab-${next}`)?.focus();
 	}
 
 	// --- タグ情報（単位・小数桁・しきい値・収集周期） ---------------------------
@@ -394,8 +419,26 @@
 				表示グループの一覧を読み直せませんでした（{displayGroupCatalog.error}）。前に読めた一覧を表示しています。
 			</p>
 		{/if}
+		{#if bundles !== null}
+			<div class="tabs bundle-tabs" role="tablist" aria-label="束">
+				{#each bundles as bundle, index (bundle.key ?? '')}
+					<button
+						type="button"
+						role="tab"
+						id={`monitor-bundle-tab-${index}`}
+						aria-selected={bundle.key === selectedBundleKey}
+						tabindex={bundle.key === selectedBundleKey ? 0 : -1}
+						class:active={bundle.key === selectedBundleKey}
+						onclick={() => showBundle(bundle.key)}
+						onkeydown={(event) => onBundleKeydown(event, index)}
+					>
+						{bundle.label}
+					</button>
+				{/each}
+			</div>
+		{/if}
 		<div class="tabs" role="tablist" aria-label="表示グループ">
-			{#each groups as group, index (group.id)}
+			{#each visibleGroups as group, index (group.id)}
 				<button
 					type="button"
 					role="tab"

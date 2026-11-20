@@ -125,6 +125,13 @@ pub(super) async fn create(
     Ok(Json(created))
 }
 
+/// PUT の入力のスキーマ名だけを持つ印（OpenAPI 用）。中身は `rest/openapi.rs` の
+/// `add_display_group_update_schema` が `DisplayGroupPayload` の写し + `bundle` 必須で
+/// 差し替える。実際の本文は [`DisplayGroupPayload`] として読む。
+#[allow(dead_code)]
+#[derive(utoipa::ToSchema)]
+pub(super) struct DisplayGroupUpdatePayload {}
+
 #[utoipa::path(
     put,
     path = "/api/display-groups/{id}",
@@ -133,7 +140,7 @@ pub(super) async fn create(
     summary = "表示グループの更新",
     description = "表示グループを更新する（全項目を送る。本文の `sortOrder` は無視され、並びは `/api/display-groups/order` だけで変える）。書き込み（`config` キーが要る）。成功した書き込みは監査ログに残る。ペンの `hubTag`・`hubTagGroup` は作成と同じ。",
     params(("id" = i64, Path, description = "対象の id")),
-    request_body = DisplayGroupPayload,
+    request_body = DisplayGroupUpdatePayload,
     responses(
         (status = 200, description = "更新後の表示グループ（今回登録した記録項目があれば `registeredTags`）", body = DisplayGroupSaveResponse),
         (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),

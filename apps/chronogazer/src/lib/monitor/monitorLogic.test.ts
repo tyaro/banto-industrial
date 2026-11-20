@@ -74,6 +74,7 @@ function group(overrides: Partial<DisplayGroup> = {}): DisplayGroup {
 	return {
 		id: 1,
 		name: 'G',
+		bundle: null,
 		sortOrder: 0,
 		kind: 'digital',
 		attributes: {},

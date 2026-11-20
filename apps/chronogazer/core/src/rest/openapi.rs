@@ -91,6 +91,38 @@ fn strip_schema_descriptions(value: &mut serde_json::Value) {
     }
 }
 
+/// 表示グループの更新（PUT）の入力 `DisplayGroupUpdatePayload` を、生成された
+/// `DisplayGroupPayload` の写しに `bundle` の必須を足して作る。作成（POST）は `bundle`
+/// を省略できるが、更新はキーが無いと 422 になる（古い本文が束を黙って外さないため）。
+/// 別の Rust 型を持たない（プロパティの食い違いを避ける）。
+pub(super) const UPDATE_PAYLOAD_SCHEMA: &str = "DisplayGroupUpdatePayload";
+
+fn add_display_group_update_schema(components: &mut utoipa::openapi::Components) {
+    let Some(base) = components.schemas.get("DisplayGroupPayload") else {
+        return;
+    };
+    let mut value = serde_json::to_value(base).expect("schema serialize");
+    if let Some(object) = value.as_object_mut() {
+        let required = object
+            .entry("required")
+            .or_insert_with(|| serde_json::json!([]));
+        if let Some(list) = required.as_array_mut() {
+            list.push(serde_json::json!("bundle"));
+            list.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+        }
+        object.insert(
+            "description".into(),
+            serde_json::json!(
+                "更新では `bundle` を必ず送る（束を保つときは読んだ値、外すときは null）。"
+            ),
+        );
+    }
+    components.schemas.insert(
+        UPDATE_PAYLOAD_SCHEMA.to_string(),
+        serde_json::from_value(value).expect("schema deserialize"),
+    );
+}
+
 impl Modify for SecurityAddon {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
         if let Some(components) = openapi.components.as_mut() {
@@ -99,6 +131,7 @@ impl Modify for SecurityAddon {
             components.schemas = serde_json::from_value(schemas).expect("schemas deserialize");
         }
         let components = openapi.components.get_or_insert_with(Default::default);
+        add_display_group_update_schema(components);
         components.add_security_scheme(
             "api_key",
             SecurityScheme::Http(
