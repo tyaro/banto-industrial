@@ -218,7 +218,7 @@ ChronoGazer のトレンドを、記録計としての使い方（時刻の軸�
      - 未確認: 実画面・Tauri・E2E。
 9. SCADA から使うためのタグを打ち、temp-scada へ知らせる。決めたこと（2026-11-20 オーナー決定）:
    - タグは部品だけの版の `trend-v0.1.0`（アプリのリリースの `v0.3.0-alpha.N` と分け、`packages/trend/package.json` の `version` と揃える。このリポジトリにタグで動くワークフローは無い）。参照は `github:tyaro/banto-industrial#trend-v0.1.0&path:packages/trend`。
-   - temp-scada は svelte 5.57.2 に固定しているので、部品の `peerDependencies` を `^5.57.2` に緩めてからタグを打つ。部品は `@banto/charts` を v7.8.0 で引く（依存の無い単独のパッケージなので、temp-scada の banto v7.9.0 の他のパッケージとは重ならない。#1230 で上げる）。9〜16 色の `--bi-chart-N` が無いテーマでは banto の 1〜8 色に戻る。
+   - temp-scada は svelte 5.57.2 に固定しているので、部品の `peerDependencies` を `^5.57.2` に緩めてからタグを打つ。部品は `@banto/charts` を v7.8.0 で引く（依存の無い単独のパッケージなので、temp-scada の banto v7.9.0 の他のパッケージとは重ならない。#1230 で main は v7.9.0 に上げた。`trend-v0.1.0` は v7.8.0 のままで、temp-scada に v7.9.0 の版を渡すときは次のタグを打つ）。9〜16 色の `--bi-chart-N` が無いテーマでは banto の 1〜8 色に戻る。
    - temp-scada への知らせは Issue で行う。
    - 済み（2026-11-20）: #1263（`68170bc0`）のマージ後に `trend-v0.1.0` を打ち、temp-scada#359 で知らせた。
 
