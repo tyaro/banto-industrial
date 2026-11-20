@@ -38,6 +38,7 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { sessionStore } from '#lib/session.svelte.js';
+	import { toastStore } from '#lib/toast.svelte.js';
 	import { canWriteResources } from '#lib/permissions.js';
 	import { monitorGroupHref, resolveAppPath } from '#lib/navigation.js';
 	import { collectTimeLabel, getCollectValues } from '#lib/banto/collectAdmin.js';
@@ -73,6 +74,16 @@
 	import TrendPanel from '#lib/monitor/TrendPanel.svelte';
 	import { loadTagMetaResults } from '#lib/monitor/tagMetaLoad.js';
 	import { LiveTrend } from '#lib/monitor/liveTrend.svelte.js';
+	import { draftSessionGeneration } from '#lib/monitor/freeTrendDraftSessionWatch.js';
+	import { offerGroupHandoff } from '#lib/monitor/freeTrendGroupHandoff.js';
+	import {
+		canCreateFreeTrend,
+		draftFromDisplayGroup,
+		draftOwner,
+		loadDraft,
+		saveDraft,
+		sessionDraftStorage
+	} from '#lib/monitor/freeTrendDraft.js';
 	import {
 		TREND_WINDOWS_SEC,
 		collectPeriodMsOf,
@@ -280,6 +291,46 @@
 		windowChoice = { ...windowChoice, [trendTarget.id]: sec === groupDefault ? null : sec };
 	}
 
+	// --- 表示グループの組から自由トレンドを作る（8c） -------------------------
+
+	const canCreateFree = $derived(
+		canCreateFreeTrend({
+			authDisabled: sessionStore.authDisabled,
+			publicViewer: sessionStore.publicViewer,
+			localDesktop: sessionStore.localDesktop,
+			signedIn: sessionStore.identity !== null
+		})
+	);
+
+	/** 今のグループのペンから新規の下書きを作り、自由トレンドの新規の編集欄へ移る（保存はしない）。 */
+	function saveAsFreeTrend(): void {
+		if (!trendTarget || !canCreateFree) return;
+		const owner = draftOwner({
+			authDisabled: sessionStore.authDisabled,
+			publicViewer: sessionStore.publicViewer,
+			localDesktop: sessionStore.localDesktop,
+			accountId: sessionStore.identity?.id ?? null
+		});
+		if (owner === null) return;
+		const storage = sessionDraftStorage();
+		if (
+			loadDraft(storage, owner, 'new') !== null &&
+			!window.confirm('作りかけの新しい自由トレンドの下書きを置き換えますか？')
+		) {
+			return;
+		}
+		const { draft, skipped } = draftFromDisplayGroup(trendTarget, trendWindowSec);
+		if (!saveDraft(storage, owner, 'new', draft)) {
+			toastStore.push(
+				'error',
+				'下書きをこのタブに保存できなかったため、自由トレンドの画面へ移れませんでした（ブラウザの保存領域が使えないか、いっぱいです）。'
+			);
+			return;
+		}
+		offerGroupHandoff({ owner, generation: draftSessionGeneration(), skipped });
+		void goto(`${resolveAppPath('/free-trends')}?new=1`);
+	}
+
 	function onVisibilityChange(): void {
 		pageVisible = document.visibilityState === 'visible';
 	}
@@ -431,6 +482,18 @@
 							</p>
 						</div>
 					{:else if selectedGroup.kind === 'trend'}
+						{#if canCreateFree}
+							<p class="note">
+								<button
+									type="button"
+									class="secondary"
+									data-testid="save-as-free-trend"
+									onclick={saveAsFreeTrend}
+								>
+									この組を自由トレンドとして保存
+								</button>
+							</p>
+						{/if}
 						<TrendPanel
 							group={selectedGroup}
 							pens={trendPens}

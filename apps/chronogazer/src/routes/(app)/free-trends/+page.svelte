@@ -108,6 +108,7 @@
 		type FreeTrendDraft
 	} from '#lib/monitor/freeTrendDraft.js';
 	import { draftSessionGeneration } from '#lib/monitor/freeTrendDraftSessionWatch.js';
+	import { groupHandoffDecision, takeGroupHandoff } from '#lib/monitor/freeTrendGroupHandoff.js';
 	import { loadTagMetaResults } from '#lib/monitor/tagMetaLoad.js';
 	import { LiveTrend } from '#lib/monitor/liveTrend.svelte.js';
 	import TrendPanel from '#lib/monitor/TrendPanel.svelte';
@@ -343,6 +344,41 @@
 		resetPenStyleState();
 		void ensureConnections();
 	}
+
+	// 監視画面の「この組を自由トレンドとして保存」から来たとき（`?new=1`。下書きは移る前に保存済み）、
+	// 一覧が読めたら 1 回だけ、移る前に置いた引き継ぎの印を今の持ち主・世代・下書きと照合して決める。
+	// 合えば新規の編集欄を開き、セッションが替わっていれば開かずに知らせ、上限・作れないときは黙って開かない（下書きは残る）。クエリは replace で外す（8c・P2）。
+	let fromGroupHandled = false;
+	/** 表示グループの組から写せなかったペンの本数（新規の編集欄に注記を出す）。 */
+	let fromGroupSkipped = $state(0);
+	$effect(() => {
+		if (fromGroupHandled || list === null) return;
+		if (page.url.searchParams.get('new') !== '1') return;
+		fromGroupHandled = true;
+		untrack(() => {
+			const handoff = takeGroupHandoff();
+			const decision = groupHandoffDecision(handoff, {
+				owner,
+				generation: draftSessionGeneration(),
+				hasDraft: owner !== null && loadDraft(sessionDraftStorage(), owner, 'new') !== null,
+				canCreate,
+				createBlocked: createBlock !== null
+			});
+			if (decision === 'open' && handoff) {
+				startCreate();
+				fromGroupSkipped = handoff.skipped > 0 ? handoff.skipped : 0;
+			} else if (decision === 'stale') {
+				toastStore.push(
+					'info',
+					'セッションが替わったため、表示グループから写した下書きは開きませんでした。'
+				);
+			}
+		});
+		void goto(freeTrendHref(null), { replaceState: true });
+	});
+	$effect(() => {
+		if (!creating) fromGroupSkipped = 0;
+	});
 
 	function startEdit(): void {
 		if (!canDraftSelected) return;
@@ -893,6 +929,11 @@
 						<p class="empty-hint">
 							新しい自由トレンドを作っています。右の欄で名前とペンを決めて、保存してください。
 						</p>
+						{#if fromGroupSkipped > 0}
+							<p class="note warn" role="status" data-testid="free-trend-from-group-note">
+								表示グループのペンのうち {fromGroupSkipped} 本は、未登録・同じタグの重複・16 本の上限のため写していません。
+							</p>
+						{/if}
 					</div>
 				{:else if list.length === 0}
 					<div class="empty-state">

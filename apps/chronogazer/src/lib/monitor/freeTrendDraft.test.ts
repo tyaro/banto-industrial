@@ -10,6 +10,7 @@ import {
 	clearDraft,
 	createBlocker,
 	DRAFT_STORAGE_PREFIX,
+	draftFromDisplayGroup,
 	draftFromFreeTrend,
 	draftKeysToDiscard,
 	draftOwner,
@@ -39,6 +40,7 @@ import {
 	type FreeTrendDraft
 } from './freeTrendDraft';
 import type { FreeTrend } from '../banto/freeTrendsAdmin';
+import { EMPTY_PEN_STYLE, type Pen } from '../banto/displayGroupsAdmin';
 
 function memoryStorage(initial: Record<string, string> = {}): DraftStorage & {
 	data: Map<string, string>;
@@ -162,6 +164,23 @@ describe('下書きの読み書き', () => {
 		saveDraft(storage, 'account:a:7', 'new', emptyDraft());
 		expect(loadDraft(storage, 'account:a', 7)).toBeNull();
 		expect(loadDraft(storage, 'account:a:7', 'new')).toEqual(emptyDraft());
+	});
+	it.each([
+		['書ける', memoryStorage(), 'account:a', true],
+		['ストレージ無し', undefined, 'account:a', false],
+		['持ち主 null', memoryStorage(), null, false],
+		[
+			'setItem が例外',
+			{
+				setItem: () => {
+					throw new Error('quota');
+				}
+			},
+			'account:a',
+			false
+		]
+	])('saveDraft の戻り値: %s', (_name, storage, owner, expected) => {
+		expect(saveDraft(storage, owner, 'new', emptyDraft())).toBe(expected);
 	});
 	it('キー無しの属性は null と読む', () => {
 		const text = JSON.stringify({
@@ -575,5 +594,78 @@ describe('ペンの属性（8b2b）', () => {
 		expect(withoutPenTexts({ 5: { yMin: 'x' }, 9: { yMax: '1' } }, 5)).toEqual({
 			9: { yMax: '1' }
 		});
+	});
+});
+
+describe('draftFromDisplayGroup（8c）', () => {
+	const pen = (tagId: number, extra: Record<string, unknown> = {}) =>
+		({ ...EMPTY_PEN_STYLE, tagId, colorSlot: null, ...extra }) as Pen;
+
+	it('ペンを順に写し、色の枠と属性を落とさない', () => {
+		const { draft, skipped } = draftFromDisplayGroup(
+			{
+				name: ' ライン A ',
+				pens: [
+					pen(3, {
+						colorSlot: 5,
+						label: '温度',
+						lineStyle: 'dashed',
+						limitHh: 90,
+						bitStyle: 'band'
+					}),
+					pen(1)
+				]
+			},
+			300
+		);
+		expect(skipped).toBe(0);
+		expect(draft.baseRevision).toBeNull();
+		expect(draft.name).toBe('ライン A');
+		expect(draft.timeWindowSec).toBe(300);
+		expect(draft.pens.map((p) => p.tagId)).toEqual([3, 1]);
+		expect(draft.pens[0]).toMatchObject({
+			colorSlot: 5,
+			label: '温度',
+			lineStyle: 'dashed',
+			limitHh: 90,
+			bitStyle: 'band'
+		});
+	});
+
+	it('tagId の無いペンは外し、同じタグは最初の 1 本だけ', () => {
+		const { draft, skipped } = draftFromDisplayGroup(
+			{
+				name: 'g',
+				pens: [
+					pen(2),
+					pen(0),
+					{ ...pen(4), tagId: null } as unknown as Pen,
+					pen(2, { colorSlot: 9 }),
+					pen(7)
+				]
+			},
+			600
+		);
+		expect(draft.pens.map((p) => p.tagId)).toEqual([2, 7]);
+		expect(draft.pens[0].colorSlot).toBeNull();
+		expect(skipped).toBe(3);
+	});
+
+	it('16 本を超えたら先頭 16 本', () => {
+		const pens = Array.from({ length: 20 }, (_, i) => pen(i + 1));
+		const { draft, skipped } = draftFromDisplayGroup({ name: 'g', pens }, 600);
+		expect(draft.pens).toHaveLength(16);
+		expect(draft.pens[15].tagId).toBe(16);
+		expect(skipped).toBe(4);
+	});
+
+	it('名前は 64 文字に切る', () => {
+		const { draft } = draftFromDisplayGroup({ name: 'あ'.repeat(70), pens: [] }, 600);
+		expect([...draft.name]).toHaveLength(64);
+	});
+
+	it('選択肢に無い時間窓は 600 に置き換える', () => {
+		expect(draftFromDisplayGroup({ name: 'g', pens: [] }, 7200).draft.timeWindowSec).toBe(600);
+		expect(draftFromDisplayGroup({ name: 'g', pens: [] }, 60).draft.timeWindowSec).toBe(60);
 	});
 });
