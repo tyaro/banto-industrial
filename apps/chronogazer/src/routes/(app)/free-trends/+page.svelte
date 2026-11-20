@@ -108,6 +108,7 @@
 		type FreeTrendDraft
 	} from '#lib/monitor/freeTrendDraft.js';
 	import { draftSessionGeneration } from '#lib/monitor/freeTrendDraftSessionWatch.js';
+	import { groupHandoffDecision, takeGroupHandoff } from '#lib/monitor/freeTrendGroupHandoff.js';
 	import { loadTagMetaResults } from '#lib/monitor/tagMetaLoad.js';
 	import { LiveTrend } from '#lib/monitor/liveTrend.svelte.js';
 	import TrendPanel from '#lib/monitor/TrendPanel.svelte';
@@ -345,20 +346,32 @@
 	}
 
 	// 監視画面の「この組を自由トレンドとして保存」から来たとき（`?new=1`。下書きは移る前に保存済み）、
-	// 一覧が読めて作れると分かった後に新規の編集欄を 1 回だけ開き、クエリは replace で外す（8c）。
+	// 一覧が読めたら 1 回だけ、移る前に置いた引き継ぎの印を今の持ち主・世代・下書きと照合して決める。
+	// 合えば新規の編集欄を開き、合わなければ開かずに知らせる。クエリは replace で外す（8c・P2）。
 	let fromGroupHandled = false;
 	/** 表示グループの組から写せなかったペンの本数（新規の編集欄に注記を出す）。 */
 	let fromGroupSkipped = $state(0);
 	$effect(() => {
 		if (fromGroupHandled || list === null) return;
 		if (page.url.searchParams.get('new') !== '1') return;
-		if (!canCreate) return;
 		fromGroupHandled = true;
-		const skipped = Number(page.url.searchParams.get('skipped'));
 		untrack(() => {
-			if (createBlock === null) {
+			const handoff = takeGroupHandoff();
+			const decision = groupHandoffDecision(handoff, {
+				owner,
+				generation: draftSessionGeneration(),
+				hasDraft: owner !== null && loadDraft(sessionDraftStorage(), owner, 'new') !== null,
+				canCreate,
+				createBlocked: createBlock !== null
+			});
+			if (decision === 'open' && handoff) {
 				startCreate();
-				fromGroupSkipped = Number.isInteger(skipped) && skipped > 0 ? skipped : 0;
+				fromGroupSkipped = handoff.skipped > 0 ? handoff.skipped : 0;
+			} else if (decision === 'stale') {
+				toastStore.push(
+					'info',
+					'セッションが替わったため、表示グループから写した下書きは開きませんでした。'
+				);
 			}
 		});
 		void goto(freeTrendHref(null), { replaceState: true });

@@ -74,6 +74,8 @@
 	import TrendPanel from '#lib/monitor/TrendPanel.svelte';
 	import { loadTagMetaResults } from '#lib/monitor/tagMetaLoad.js';
 	import { LiveTrend } from '#lib/monitor/liveTrend.svelte.js';
+	import { draftSessionGeneration } from '#lib/monitor/freeTrendDraftSessionWatch.js';
+	import { offerGroupHandoff } from '#lib/monitor/freeTrendGroupHandoff.js';
 	import {
 		canCreateFreeTrend,
 		draftFromDisplayGroup,
@@ -325,8 +327,8 @@
 			);
 			return;
 		}
-		const query = skipped > 0 ? `?new=1&skipped=${skipped}` : '?new=1';
-		void goto(`${resolveAppPath('/free-trends')}${query}`);
+		offerGroupHandoff({ owner, generation: draftSessionGeneration(), skipped });
+		void goto(`${resolveAppPath('/free-trends')}?new=1`);
 	}
 
 	function onVisibilityChange(): void {
