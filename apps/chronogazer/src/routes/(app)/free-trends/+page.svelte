@@ -17,6 +17,7 @@
 	 * - 下書きは sessionStorage に対象ごと（既存は ID、新規は `new`）。タブを閉じるまで残るので、
 	 *   画面を離れるときの確認は付けない。下書きがあれば、チャートは下書きのペンで描く。
 	 * - ペンは登録済みのタグだけ（§9 Q9）。作れるのはアカウントのログインか localDesktop。
+	 * - 狭い幅（720px 以下）では編集欄をチャートの下に積む。880px では横並びで足りる。400px で潰れた（2026-11-20 の実画面の確認）。チャートは中身の高さで、縦のスクロールは `.body` が持つ。
 	 *
 	 * 8b2b（#1207・#1231）: ペンの属性の編集欄。ペンの行の「表示の設定」で、表示グループのページと
 	 * 同じ部品（`PenStyleEditor`）を出す。変更は下書きに入り、チャートは下書きのペンで描く。
@@ -1462,5 +1463,25 @@
 		display: flex;
 		flex-wrap: wrap;
 		gap: 0.5rem;
+	}
+
+	@media (max-width: 720px) {
+		.body {
+			flex-direction: column;
+			overflow: auto;
+		}
+
+		.main {
+			flex: 0 0 auto;
+			min-height: 18rem;
+		}
+
+		.edit-pane {
+			flex: 0 0 auto;
+			border-left: none;
+			padding-left: 0;
+			border-top: 1px solid var(--banto-border);
+			padding-top: 0.75rem;
+		}
 	}
 </style>
