@@ -20,14 +20,14 @@
     下に、ペンの並びの順に積む（1 本目が一番下）。帯の分だけアナログの縦の長さは縮み（帯の合計は
     描画域の半分まで）、帯のペンは線・マーカー・管理線・縦軸の目盛りの持ち主から外れる。横の格子・
     カーソルの線は描画域の全体に引く。True は濃い塗り、区間の中で変わったものは薄い塗り、帯の左端の
-    内側にペンの `label`。bit のペンの値は False / True と出す（カーソル・凡例の範囲・要約。縦軸が
+    内側にペンの `label`。縦軸の持ち主が bit のペンなら目盛り（と横の格子）は 0・1 の 2 つだけ（`axisTickValues`）。bit のペンの値は False / True と出す（カーソル・凡例の範囲・要約。縦軸が
     bit のペンのときは 0・1 の目盛りも）。
   - 凡例は `onPenSelect` を渡すとペンを選ぶボタンになる（押した印は `selectedPenId`、
     利用側の印は `legendBadge`）。どのペンを選ぶと何が変わるかは利用側が決める。
 -->
 <script lang="ts">
 	import type { Snippet } from 'svelte';
-	import { linearScale, niceTicks } from '@banto/charts';
+	import { linearScale } from '@banto/charts';
 	import { bandLayout, type TrendBands } from './core/bands';
 	import { limitLabelY, limitLayout } from './core/limits';
 	import { cursorReadout } from './core/cursor';
@@ -46,6 +46,7 @@
 	import { bitBandLayout, bitSpans } from './core/bitBands';
 	import {
 		axisOwners,
+		axisTickValues,
 		BIT_RANGE_TEXT,
 		formatValue,
 		isBitBand,
@@ -204,11 +205,8 @@
 	function axisTicks(index: number | null): { v: number; y: number }[] {
 		if (index === null || !valid) return [];
 		const [lo, hi] = domains[index];
-		const eps = (hi - lo) * 1e-9;
 		const y = linearScale([lo, hi], [analogHeight, 0]);
-		return niceTicks(lo, hi, yTickCount)
-			.filter((v) => v >= lo - eps && v <= hi + eps)
-			.map((v) => ({ v, y: y(v) }));
+		return axisTickValues(pens[index], [lo, hi], yTickCount).map((v) => ({ v, y: y(v) }));
 	}
 	const leftTicks = $derived(axisTicks(owners.left));
 	const rightTicks = $derived(axisTicks(owners.right));

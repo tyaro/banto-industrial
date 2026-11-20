@@ -1,6 +1,8 @@
+import { niceTicks } from '@banto/charts';
 import { describe, expect, it } from 'vitest';
 import {
 	axisOwners,
+	axisTickValues,
 	dataExtent,
 	formatBitValue,
 	formatValue,
@@ -164,5 +166,21 @@ describe('formatValue', () => {
 		expect(formatValue(null)).toBe('—');
 		expect(formatValue(undefined)).toBe('—');
 		expect(formatValue(NaN, 2)).toBe('—');
+	});
+});
+
+describe('axisTickValues', () => {
+	it('bit のペンは 0 と 1 だけ', () => {
+		expect(axisTickValues(pen({ bit: true }), [0, 1], 6)).toEqual([0, 1]);
+		expect(axisTickValues(pen({ bit: true }), [-0.5, 1.5], 10)).toEqual([0, 1]);
+	});
+	it('bit でなければ niceTicks を範囲で絞ったもの', () => {
+		expect(axisTickValues(pen(), [0, 100], 5)).toEqual(
+			niceTicks(0, 100, 5).filter((v) => v >= 0 && v <= 100)
+		);
+	});
+	it('bit で範囲が 0〜1 を含まなければ、含まないものは出さない', () => {
+		expect(axisTickValues(pen({ bit: true }), [0.5, 2], 5)).toEqual([1]);
+		expect(axisTickValues(pen({ bit: true }), [2, 5], 5)).toEqual([]);
 	});
 });

@@ -5,6 +5,7 @@
  * 区間は欠測で、線をつながない。片方だけ有限なら、その値 1 つの区間として扱う。
  */
 
+import { niceTicks } from '@banto/charts';
 import type { TrendLimit } from './limits';
 
 /** 区間 1 つの値。`tMs` は区間の始まり（UTC ミリ秒）。 */
@@ -187,4 +188,19 @@ export function formatValue(v: number | null | undefined, decimals?: number | nu
 		return v.toFixed(decimals);
 	}
 	return String(Number(v.toPrecision(6)));
+}
+
+/**
+ * 縦軸の目盛りの値。持ち主のペンが bit なら 0 と 1 だけ（範囲の中にあるものだけ）、
+ * それ以外は `niceTicks` を範囲で絞ったもの。
+ */
+export function axisTickValues(
+	pen: Pick<TrendPen, 'bit'>,
+	domain: YDomain,
+	count: number
+): number[] {
+	const [lo, hi] = domain;
+	const eps = (hi - lo) * 1e-9;
+	const values = pen.bit === true ? [0, 1] : niceTicks(lo, hi, count);
+	return values.filter((v) => v >= lo - eps && v <= hi + eps);
 }
