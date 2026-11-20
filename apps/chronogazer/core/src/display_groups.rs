@@ -45,7 +45,9 @@
 //!     管理線（PR 7a）: `limitLines`（true で HH・H・L・LL の線を引く。`null`・false = 引かない）・
 //!     `limitHh`・`limitH`・`limitL`・`limitLl`（有限の数。`null` = タグのしきい値を使う。値は
 //!     表示だけに使い、しきい値のイベントは変えない。設定したものどうしは `LL <= L <= H <= HH`、
-//!     `crate::tag_thresholds` と同じ決まり。`limitLines` が無効でも保存する）。bit の表し方は PR 7c。
+//!     `crate::tag_thresholds` と同じ決まり。`limitLines` が無効でも保存する）。
+//!     bit の表し方（PR 7c）: `bitStyle`（[`BitStyle`]、既定 step）・`bitBandHeight`（8〜32、既定
+//!     [`DEFAULT_BIT_BAND_HEIGHT`]）。帯は描画域の下から自動で積み、縦の位置は持たない。
 //! - **しきい値は持たない**。しきい値は記録計の側のタグごとの設定
 //!   （`crate::tag_thresholds`、#532。2026-10-08 オーナー決定）で、表示グループ
 //!   からは参照するだけ（画面はその設定を読み取り専用で見せる）。
@@ -189,6 +191,12 @@ pub const MARKER_SIZE_RANGE: (i64, i64) = (2, 8);
 /// `markerSize` が `null` のときの大きさ（px）。TS 側の `DEFAULT_MARKER_SIZE` と同じ値にする。
 pub const DEFAULT_MARKER_SIZE: i64 = 4;
 
+/// ペンの bit の帯の高さ（px）の範囲。
+pub const BIT_BAND_HEIGHT_RANGE: (i64, i64) = (8, 32);
+
+/// `bitBandHeight` が `null` のときの帯の高さ（px）。TS 側の `DEFAULT_BIT_BAND_HEIGHT` と同じ値にする。
+pub const DEFAULT_BIT_BAND_HEIGHT: i64 = 16;
+
 /// ペンの線種。`null` = 実線。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -280,6 +288,31 @@ impl Axis {
         match self {
             Axis::Left => "left",
             Axis::Right => "right",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.as_str() == value)
+    }
+}
+
+/// bit のタグの表し方。`null` = 段差。帯は描画域の下から自動で積む（縦の位置は持たない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
+pub enum BitStyle {
+    Step,
+    Band,
+}
+
+impl BitStyle {
+    pub const ALL: [BitStyle; 2] = [BitStyle::Step, BitStyle::Band];
+
+    /// ワイヤ・DB での名前。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BitStyle::Step => "step",
+            BitStyle::Band => "band",
         }
     }
 
@@ -392,6 +425,10 @@ pub struct Pen {
     pub limit_l: Option<f64>,
     /// 管理線の LL の上書き。`None` = タグのしきい値。
     pub limit_ll: Option<f64>,
+    /// bit の表し方。`None` = 段差。
+    pub bit_style: Option<BitStyle>,
+    /// bit の帯の高さ（px、8..=32）。`None` = [`DEFAULT_BIT_BAND_HEIGHT`]。
+    pub bit_band_height: Option<i64>,
 }
 
 impl Pen {
@@ -412,6 +449,8 @@ impl Pen {
             || self.limit_h.is_some()
             || self.limit_l.is_some()
             || self.limit_ll.is_some()
+            || self.bit_style.is_some()
+            || self.bit_band_height.is_some()
     }
 }
 
@@ -507,6 +546,11 @@ pub struct PenPayload {
     pub limit_l: Option<f64>,
     #[serde(default)]
     pub limit_ll: Option<f64>,
+    /// bit の表しの属性（#1207・#1231 PR 7c）。キー無し = `null` = 既定。
+    #[serde(default)]
+    pub bit_style: Option<String>,
+    #[serde(default)]
+    pub bit_band_height: Option<i64>,
 }
 
 impl PenPayload {
@@ -703,6 +747,28 @@ fn validate_pen_style(pen: &PenPayload, index: usize, errors: &mut Vec<FieldErro
         }
         parsed
     });
+    let bit_style = pen.bit_style.as_deref().and_then(|v| {
+        let parsed = BitStyle::parse(v);
+        if parsed.is_none() {
+            bad(
+                "bitStyle",
+                "bit の表しは step・band から選んでください".to_string(),
+            );
+        }
+        parsed
+    });
+    let bit_band_height = pen.bit_band_height.and_then(|h| {
+        let (lo, hi) = BIT_BAND_HEIGHT_RANGE;
+        if (lo..=hi).contains(&h) {
+            Some(h)
+        } else {
+            bad(
+                "bitBandHeight",
+                format!("帯の高さは {lo}〜{hi} にしてください"),
+            );
+            None
+        }
+    });
     let finite = |value: Option<f64>, name: &str, bad: &mut dyn FnMut(&str, String)| {
         value.and_then(|v| {
             if v.is_finite() {
@@ -762,6 +828,8 @@ fn validate_pen_style(pen: &PenPayload, index: usize, errors: &mut Vec<FieldErro
         limit_h,
         limit_l,
         limit_ll,
+        bit_style,
+        bit_band_height,
     }
 }
 
@@ -1096,6 +1164,8 @@ struct PenRow {
     limit_h: Option<f64>,
     limit_l: Option<f64>,
     limit_ll: Option<f64>,
+    bit_style: Option<String>,
+    bit_band_height: Option<i64>,
 }
 
 /// DB の列挙の文字列を読む（CHECK で守っているので、未知の値は壊れた DB）。
@@ -1135,6 +1205,8 @@ impl PenRow {
             limit_h: self.limit_h,
             limit_l: self.limit_l,
             limit_ll: self.limit_ll,
+            bit_style: parse_column(self.bit_style, "bit_style", BitStyle::parse)?,
+            bit_band_height: self.bit_band_height,
         })
     }
 }
@@ -1692,8 +1764,8 @@ async fn insert_pens(
     for (position, pen) in pens.iter().enumerate() {
         sqlx::query(
             "INSERT INTO display_group_pens (group_id, position, tag_id, color_slot, label, unit, \
-             decimals, line_style, line_width, marker, marker_size, axis, y_min, y_max, limit_lines, limit_hh, limit_h, limit_l, limit_ll) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             decimals, line_style, line_width, marker, marker_size, axis, y_min, y_max, limit_lines, limit_hh, limit_h, limit_l, limit_ll, bit_style, bit_band_height) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(group_id)
         .bind(position as i64)
@@ -1714,6 +1786,8 @@ async fn insert_pens(
         .bind(pen.limit_h)
         .bind(pen.limit_l)
         .bind(pen.limit_ll)
+        .bind(pen.bit_style.map(BitStyle::as_str))
+        .bind(pen.bit_band_height)
         .execute(&mut *conn)
         .await
         .map_err(storage)?;
@@ -1780,7 +1854,7 @@ async fn list_on(
         pause.hold().await;
     }
     let pen_rows: Vec<PenRow> = sqlx::query_as("SELECT group_id, tag_id, color_slot, label, unit, decimals, line_style, line_width, marker, 
-         marker_size, axis, y_min, y_max, limit_lines, limit_hh, limit_h, limit_l, limit_ll FROM display_group_pens ORDER BY group_id, position")
+         marker_size, axis, y_min, y_max, limit_lines, limit_hh, limit_h, limit_l, limit_ll, bit_style, bit_band_height FROM display_group_pens ORDER BY group_id, position")
     .fetch_all(&mut *conn)
     .await
     .map_err(storage)?;
@@ -1819,7 +1893,7 @@ async fn get_on(
         pause.hold().await;
     }
     let pens: Vec<PenRow> = sqlx::query_as("SELECT group_id, tag_id, color_slot, label, unit, decimals, line_style, line_width, marker, 
-         marker_size, axis, y_min, y_max, limit_lines, limit_hh, limit_h, limit_l, limit_ll FROM display_group_pens WHERE group_id = ? ORDER BY position")
+         marker_size, axis, y_min, y_max, limit_lines, limit_hh, limit_h, limit_l, limit_ll, bit_style, bit_band_height FROM display_group_pens WHERE group_id = ? ORDER BY position")
     .bind(id)
     .fetch_all(&mut *conn)
     .await

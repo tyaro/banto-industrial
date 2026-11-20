@@ -610,6 +610,25 @@
                     "null"
                   ]
                 },
+                "bitBandHeight": {
+                  "description": "bit の帯の高さ（px、8〜32）。null・省略は 16。",
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "bitStyle": {
+                  "description": "bit のタグの表し方。null・省略は step（段差）。band は帯で、描画域の下から自動で積む。",
+                  "enum": [
+                    "step",
+                    "band",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "colorSlot": {
                   "description": "系列色の枠（1〜16）。省略は既定。",
                   "type": [
@@ -869,6 +888,25 @@
                   "enum": [
                     "left",
                     "right",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "bitBandHeight": {
+                  "description": "bit の帯の高さ（px、8〜32）。null・省略は 16。",
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "bitStyle": {
+                  "description": "bit のタグの表し方。null・省略は step（段差）。band は帯で、描画域の下から自動で積む。",
+                  "enum": [
+                    "step",
+                    "band",
                     null
                   ],
                   "type": [

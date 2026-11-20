@@ -466,6 +466,15 @@ fn display_group_schema(update: bool) -> Value {
                             "type": ["number", "null"],
                             "description": "管理線 LL の上書き。null・省略はタグのしきい値。",
                         },
+                        "bitStyle": {
+                            "type": ["string", "null"],
+                            "enum": ["step", "band", null],
+                            "description": "bit のタグの表し方。null・省略は step（段差）。band は帯で、描画域の下から自動で積む。",
+                        },
+                        "bitBandHeight": {
+                            "type": ["integer", "null"],
+                            "description": "bit の帯の高さ（px、8〜32）。null・省略は 16。",
+                        },
                     },
                     "additionalProperties": false,
                 },
