@@ -69,3 +69,60 @@ export function cursorReadout(
 		return { penId: pen.id, min, max, text: a === z ? `${a}${unit}` : `${a}〜${z}${unit}` };
 	});
 }
+
+/** 固定カーソル A・B の時刻（UTC ms）。置いていない側は null。 */
+export interface CursorPair {
+	a: number | null;
+	b: number | null;
+}
+
+/**
+ * クリックの時刻に A・B を置く規則。1 回目は A、2 回目は B。
+ * 3 回目以降は、クリックの時刻に近い方を移す（同じ距離なら A）。
+ */
+export function placeCursor(
+	state: CursorPair,
+	tMs: number
+): { state: CursorPair; placed: 'a' | 'b' } {
+	if (state.a === null) return { state: { a: tMs, b: state.b }, placed: 'a' };
+	if (state.b === null) return { state: { a: state.a, b: tMs }, placed: 'b' };
+	const placed = Math.abs(tMs - state.a) <= Math.abs(tMs - state.b) ? 'a' : 'b';
+	return {
+		state: placed === 'a' ? { a: tMs, b: state.b } : { a: state.a, b: tMs },
+		placed
+	};
+}
+
+/**
+ * ペンごとの差（B − A）。符号は常に付ける。どちらかが欠測なら「—」、bit は差を出さず「—」。
+ * 両方が 1 つの値（min === max）なら `B − A`、どちらかに幅があれば中点どうしの差に「約」を付ける。
+ */
+export function cursorDiff(pen: TrendPen, a: CursorValue, b: CursorValue): string {
+	if (pen.bit) return MISSING_TEXT;
+	if (!fin(a.min) || !fin(a.max) || !fin(b.min) || !fin(b.max)) return MISSING_TEXT;
+	const exact = a.min === a.max && b.min === b.max;
+	const d = (b.min + b.max) / 2 - (a.min + a.max) / 2;
+	const body = formatValue(Math.abs(d), pen.decimals);
+	const sign = d < 0 && /[1-9]/.test(body) ? '-' : '+';
+	const unit = pen.unit ? ` ${pen.unit}` : '';
+	return `${exact ? '' : '約 '}${sign}${body}${unit}`;
+}
+
+/**
+ * 時間の差（ミリ秒、符号付き）。`1時間02分03秒`・`5分00秒`・`12秒`、1 日以上は `2日03時間04分`。
+ * 秒の端数は切り捨て。0 は `0秒`。
+ */
+export function formatDuration(ms: number): string {
+	if (!fin(ms)) return MISSING_TEXT;
+	const total = Math.floor(Math.abs(ms) / 1000);
+	const sign = ms < 0 && total > 0 ? '-' : '';
+	const d = Math.floor(total / 86400);
+	const h = Math.floor((total % 86400) / 3600);
+	const m = Math.floor((total % 3600) / 60);
+	const s = total % 60;
+	const p2 = (n: number) => String(n).padStart(2, '0');
+	if (d > 0) return `${sign}${d}日${p2(h)}時間${p2(m)}分`;
+	if (h > 0) return `${sign}${h}時間${p2(m)}分${p2(s)}秒`;
+	if (m > 0) return `${sign}${m}分${p2(s)}秒`;
+	return `${sign}${s}秒`;
+}

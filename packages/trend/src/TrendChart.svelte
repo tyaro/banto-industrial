@@ -31,7 +31,13 @@
 	import { linearScale } from '@banto/charts';
 	import { bandLayout, type TrendBands } from './core/bands';
 	import { limitLabelY, limitLayout } from './core/limits';
-	import { cursorReadout } from './core/cursor';
+	import {
+		cursorDiff,
+		cursorReadout,
+		formatDuration,
+		placeCursor,
+		type CursorPair
+	} from './core/cursor';
 	import { drawableSeries, type TrendData } from './core/data';
 	import { envelopePath, hasFiniteValue } from './core/geometry';
 	import {
@@ -120,7 +126,20 @@
 	let outerWidth = $state(0);
 	let plotEl = $state<HTMLDivElement | null>(null);
 	let cursorMs = $state<number | null>(null);
-	let drag: { pointerId: number; x0: number; range0: TimeRange } | null = null;
+	/** 固定カーソル A・B（時刻 UTC ms）。範囲が動いても時刻で持つので線もいっしょに流れる。 */
+	let fixed = $state<CursorPair>({ a: null, b: null });
+	let announce = $state('');
+	/** この px 以上動いたらクリックではなくドラッグ（パン）。 */
+	const CLICK_SLOP = 4;
+	let drag: {
+		pointerId: number;
+		x0: number;
+		y0: number;
+		range0: TimeRange;
+		moved: boolean;
+		/** 押した位置が描画域の中か（外から押したときはカーソルを置かない）。 */
+		inPlot: boolean;
+	} | null = null;
 
 	const owners = $derived(axisOwners(pens));
 	const marginLeft = $derived(owners.left !== null ? AXIS_W : EDGE_PAD);
@@ -228,6 +247,19 @@
 		cursorMs !== null ? cursorReadout(pens, drawable.series, cursorMs, drawable.effective) : null
 	);
 	const cursorX = $derived(cursorMs !== null && valid ? xScale(cursorMs) : null);
+	const readoutA = $derived(
+		fixed.a !== null ? cursorReadout(pens, drawable.series, fixed.a, drawable.effective) : null
+	);
+	const readoutB = $derived(
+		fixed.b !== null ? cursorReadout(pens, drawable.series, fixed.b, drawable.effective) : null
+	);
+	/** 表示範囲の中にある固定カーソルの x（外は null で線を描かない）。 */
+	function fixedX(t: number | null): number | null {
+		if (t === null || !valid || t < range.startMs || t > range.endMs) return null;
+		return xScale(t);
+	}
+	const fixedAX = $derived(fixedX(fixed.a));
+	const fixedBX = $derived(fixedX(fixed.b));
 
 	const pad2 = (n: number) => String(n).padStart(2, '0');
 	// withSeconds: カーソルは横軸の秒の目盛りと照合できるよう秒まで出す（範囲の要約は分まで）。
@@ -254,8 +286,9 @@
 						? `: ${pens.map((p, i) => `${p.label}（${rangeText(p, domains[i])}）${limitsText(p)}`).join('、')}。`
 						: '。') +
 					(onRangeChange
-						? '左右の矢印キーで移動、+ と - で拡大・縮小、Ctrl+ホイールで拡大・縮小、Shift+ホイールかドラッグで移動、Esc でカーソルを消す。'
-						: '')
+						? '左右の矢印キーで移動、+ と - で拡大・縮小、Ctrl+ホイールで拡大・縮小、Shift+ホイールかドラッグで移動。'
+						: '') +
+					'クリックでカーソル A・B を置く（3 回目からは近い方を移す）、Esc でカーソルを消す。'
 			: '表示範囲が不正です。'
 	);
 
@@ -279,6 +312,15 @@
 		if (!plotEl || plotWidth <= 0) return null;
 		return clientX - plotEl.getBoundingClientRect().left - marginLeft;
 	}
+	function plotY(clientY: number): number | null {
+		if (!plotEl || plotHeight <= 0) return null;
+		return clientY - plotEl.getBoundingClientRect().top - MARGIN_TOP;
+	}
+	function inPlotArea(clientX: number, clientY: number): boolean {
+		const px = plotX(clientX);
+		const py = plotY(clientY);
+		return px !== null && py !== null && px >= 0 && px <= plotWidth && py >= 0 && py <= plotHeight;
+	}
 	function timeAt(clientX: number): number | null {
 		const px = plotX(clientX);
 		if (px === null || !isValidRange(range)) return null;
@@ -288,16 +330,43 @@
 	function onpointermove(e: PointerEvent) {
 		const px = plotX(e.clientX);
 		if (drag && drag.pointerId === e.pointerId && plotWidth > 0) {
+			if (!drag.moved && Math.hypot(e.clientX - drag.x0, e.clientY - drag.y0) >= CLICK_SLOP)
+				drag.moved = true;
 			const w = drag.range0.endMs - drag.range0.startMs;
-			emit(panRange(drag.range0, (-(e.clientX - drag.x0) / plotWidth) * w, now()));
+			if (drag.moved && onRangeChange)
+				emit(panRange(drag.range0, (-(e.clientX - drag.x0) / plotWidth) * w, now()));
 		}
 		if (px !== null && px >= 0 && px <= plotWidth) cursorMs = timeAt(e.clientX);
 		else if (!drag) cursorMs = null;
 	}
 	function onpointerdown(e: PointerEvent) {
-		if (e.button !== 0 || !onRangeChange || !isValidRange(range)) return;
-		drag = { pointerId: e.pointerId, x0: e.clientX, range0: range };
+		if (e.button !== 0 || !isValidRange(range)) return;
+		drag = {
+			pointerId: e.pointerId,
+			x0: e.clientX,
+			y0: e.clientY,
+			range0: range,
+			moved: false,
+			inPlot: inPlotArea(e.clientX, e.clientY)
+		};
 		(e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+	}
+	function place(tMs: number) {
+		const r = placeCursor(fixed, tMs);
+		fixed = r.state;
+		announce = `カーソル ${r.placed === 'a' ? 'A' : 'B'} ${formatDateTime(tMs, true)}`;
+	}
+	function onpointerup(e: PointerEvent) {
+		const click =
+			drag !== null &&
+			drag.pointerId === e.pointerId &&
+			!drag.moved &&
+			Math.hypot(e.clientX - drag.x0, e.clientY - drag.y0) < CLICK_SLOP;
+		const downInPlot = drag?.inPlot ?? false;
+		endDrag(e);
+		if (!click || !downInPlot || !inPlotArea(e.clientX, e.clientY)) return;
+		const t = timeAt(e.clientX);
+		if (t !== null) place(t);
 	}
 	function endDrag(e: PointerEvent) {
 		if (!drag || drag.pointerId !== e.pointerId) return;
@@ -311,8 +380,10 @@
 
 	function onkeydown(e: KeyboardEvent) {
 		if (e.key === 'Escape') {
-			if (cursorMs !== null) {
+			if (cursorMs !== null || fixed.a !== null || fixed.b !== null) {
+				if (fixed.a !== null || fixed.b !== null) announce = 'カーソルを消しました';
 				cursorMs = null;
+				fixed = { a: null, b: null };
 				e.preventDefault();
 			}
 			return;
@@ -370,7 +441,7 @@
 		{onkeydown}
 		{onpointermove}
 		{onpointerdown}
-		onpointerup={endDrag}
+		{onpointerup}
 		onpointercancel={endDrag}
 		{onpointerleave}
 	>
@@ -519,6 +590,24 @@
 					{#if cursorX !== null}
 						<line class="bi-trend__cursor" x1={cursorX} x2={cursorX} y1="0" y2={plotHeight} />
 					{/if}
+					{#each [{ name: 'A', x: fixedAX }, { name: 'B', x: fixedBX }] as c (c.name)}
+						{#if c.x !== null}
+							<line
+								class="bi-trend__fixed"
+								x1={c.x}
+								x2={c.x}
+								y1="0"
+								y2={plotHeight}
+								data-cursor={c.name}
+							/>
+							<text
+								class="bi-trend__fixed-name"
+								x={c.x > plotWidth - 14 ? c.x - 3 : c.x + 3}
+								text-anchor={c.x > plotWidth - 14 ? 'end' : 'start'}
+								y="10">{c.name}</text
+							>
+						{/if}
+					{/each}
 				</g>
 
 				{#if loading || (!hasData && valid)}
@@ -536,6 +625,7 @@
 
 	<p id="{uid}-summary" class="bi-trend__sr">{label}。{summary}</p>
 	<p class="bi-trend__sr" aria-live="polite">{loading ? '読み込み中' : ''}</p>
+	<p class="bi-trend__sr" aria-live="polite">{announce}</p>
 
 	{#if pens.length > 0}
 		<ul class="bi-trend__legend" aria-label={legendLabel}>
@@ -560,6 +650,15 @@
 	{#if cursorMs !== null}
 		<p class="bi-trend__cursor-time">{formatDateTime(cursorMs, true)}</p>
 	{/if}
+	{#if fixed.a !== null || fixed.b !== null}
+		<p class="bi-trend__cursor-time">
+			{#if fixed.a !== null}A {formatDateTime(fixed.a, true)}{/if}
+			{#if fixed.b !== null}
+				B {formatDateTime(fixed.b, true)}{/if}
+			{#if fixed.a !== null && fixed.b !== null}
+				Δt {formatDuration(fixed.b - fixed.a)}{/if}
+		</p>
+	{/if}
 </div>
 
 {#snippet legendBody(pen: TrendPen, i: number)}
@@ -569,6 +668,11 @@
 	<span class="bi-trend__muted">{rangeText(pen, domains[i])}</span>
 	{#if readout}
 		<span class="bi-trend__value">{readout[i].text}</span>
+	{/if}
+	{#if readoutA}<span class="bi-trend__value">A {readoutA[i].text}</span>{/if}
+	{#if readoutB}<span class="bi-trend__value">B {readoutB[i].text}</span>{/if}
+	{#if readoutA && readoutB}
+		<span class="bi-trend__value">差 {cursorDiff(pen, readoutA[i], readoutB[i])}</span>
 	{/if}
 	{#if legendBadge}{@render legendBadge(pen)}{/if}
 {/snippet}
@@ -645,6 +749,15 @@
 		stroke: var(--banto-text-muted);
 		stroke-width: 1;
 		stroke-dasharray: 4 3;
+	}
+	.bi-trend__fixed {
+		stroke: var(--banto-text);
+		stroke-width: 1.5;
+	}
+	.bi-trend__fixed-name {
+		fill: var(--banto-text);
+		font-size: var(--banto-font-size-xs);
+		font-weight: 600;
 	}
 	.bi-trend__message {
 		fill: var(--banto-text-muted);

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { binAt, cursorReadout } from './cursor';
+import { binAt, cursorDiff, cursorReadout, formatDuration, placeCursor } from './cursor';
 import type { TrendSeries } from './data';
 import type { Bin, TrendPen } from './pens';
 
@@ -87,5 +87,76 @@ describe('cursorReadout', () => {
 		];
 		const t = (ms: number) => cursorReadout([bit], { x: S(bb, 10) }, ms, ALL)[0].text;
 		expect([t(5), t(15), t(25), t(35)]).toEqual(['False', 'True', 'False〜True', '—']);
+	});
+});
+
+describe('placeCursor', () => {
+	it('1 回目は A、2 回目は B', () => {
+		const r1 = placeCursor({ a: null, b: null }, 100);
+		expect(r1).toEqual({ state: { a: 100, b: null }, placed: 'a' });
+		expect(placeCursor(r1.state, 200)).toEqual({ state: { a: 100, b: 200 }, placed: 'b' });
+	});
+	it('3 回目以降は近い方を移す', () => {
+		expect(placeCursor({ a: 100, b: 200 }, 120)).toEqual({
+			state: { a: 120, b: 200 },
+			placed: 'a'
+		});
+		expect(placeCursor({ a: 100, b: 200 }, 190)).toEqual({
+			state: { a: 100, b: 190 },
+			placed: 'b'
+		});
+		expect(placeCursor({ a: 200, b: 100 }, 90).placed).toBe('b');
+	});
+	it('同じ距離なら A', () => {
+		expect(placeCursor({ a: 100, b: 200 }, 150).placed).toBe('a');
+	});
+});
+
+describe('cursorDiff', () => {
+	const pen = (o: Partial<TrendPen> = {}): TrendPen =>
+		({ id: 'x', label: 'x', colorSlot: 1, unit: '℃', decimals: 1, ...o }) as TrendPen;
+	const v = (min: number | null, max: number | null = min) => ({
+		penId: 'x',
+		min,
+		max,
+		text: ''
+	});
+	it('1 値どうしは B − A、符号は常に付く', () => {
+		expect(cursorDiff(pen(), v(10), v(12.34))).toBe('+2.3 ℃');
+		expect(cursorDiff(pen(), v(12.34), v(10))).toBe('-2.3 ℃');
+		expect(cursorDiff(pen(), v(5), v(5))).toBe('+0.0 ℃');
+	});
+	it('幅があれば中点どうしの差に「約」', () => {
+		expect(cursorDiff(pen(), v(0, 2), v(4))).toBe('約 +3.0 ℃');
+		expect(cursorDiff(pen(), v(4), v(0, 2))).toBe('約 -3.0 ℃');
+	});
+	it('桁と単位はペンに従う', () => {
+		expect(cursorDiff(pen({ decimals: 0, unit: '' }), v(1), v(4.4))).toBe('+3');
+	});
+	it('欠測と bit は「—」', () => {
+		expect(cursorDiff(pen(), v(null), v(1))).toBe('—');
+		expect(cursorDiff(pen(), v(1), v(null))).toBe('—');
+		expect(cursorDiff(pen({ bit: true }), v(0), v(1))).toBe('—');
+	});
+});
+
+describe('formatDuration', () => {
+	it('境界', () => {
+		expect(formatDuration(0)).toBe('0秒');
+		expect(formatDuration(999)).toBe('0秒');
+		expect(formatDuration(12_000)).toBe('12秒');
+		expect(formatDuration(59_000)).toBe('59秒');
+		expect(formatDuration(300_000)).toBe('5分00秒');
+		expect(formatDuration(3_600_000)).toBe('1時間00分00秒');
+		expect(formatDuration(3_723_000)).toBe('1時間02分03秒');
+		expect(formatDuration(86_400_000)).toBe('1日00時間00分');
+		expect(formatDuration(2 * 86_400_000 + 3 * 3_600_000 + 4 * 60_000 + 59_000)).toBe(
+			'2日03時間04分'
+		);
+	});
+	it('負は符号を付ける', () => {
+		expect(formatDuration(-5_000)).toBe('-5秒');
+		expect(formatDuration(-3_723_000)).toBe('-1時間02分03秒');
+		expect(formatDuration(-500)).toBe('0秒');
 	});
 });
