@@ -34,7 +34,8 @@
 //!   （キーの主体はそのまま通し、それ以外は banto の `require_auth`）。床は
 //!   [`require_actor_at_least`]（セッションは banto の `require_role_at_least`
 //!   と同じ、キーはスコープ）と、ハンドラの中の `require_editor`（[`Actor`] を
-//!   受ける）。
+//!   受ける）。自由トレンド（#1207・#1231 PR 8a）は読み取りのためにこの集まりに
+//!   入れ、書き込みはハンドラがキーを断る（[`Actor::free_trend_actor`]）。
 //! - **キーを通さない集まり**（ユーザー管理・サーバー設定・HUB 連携・
 //!   バックアップ・監査ログ・API キー・認証・UI 設定・SSE）: 集まり全体に
 //!   [`reject_api_key`] を掛け、キーの主体は 403（`denied` を記録）。
@@ -92,8 +93,21 @@ const API_KEYS_RESOURCE: &str = "api_keys";
 #[derive(Debug, Clone)]
 pub(crate) enum Actor {
     /// 今のログイン（閲覧公開・この PC からの接続の grant を含む）。値は banto の
-    /// `require_auth` が確かめた `AuthenticatedSession` の物。
-    Session { username: String, role: String },
+    /// `require_auth` が確かめた `AuthenticatedSession` の物。`grant` はセッションの
+    /// 出どころ（`AuthenticatedSession::grant`）: `None` = アカウントのログイン、
+    /// `Some(kind)` = grant のセッション（`localDesktop`・`publicViewer`）。アカウントか
+    /// どうかは名前ではなくこれで見分ける（予約名と同じ名前の古いアカウントがありうる、
+    /// `crate::local_grant::RESERVED_USERNAMES`。自由トレンドの権限 #1207・#1231 PR 8a）。
+    /// `account_id` は認証の時点のアカウントの `users.id`（`AuthenticatedSession::stamp` の
+    /// `account_id`）。grant のセッションと、照合（`SessionValidation::Lookup`）の無い
+    /// `AuthState` のセッションは `None`。自由トレンドの作った人の判定はこれを使い、名前から
+    /// ID を引き直さない（2026-11-20 オーナーの P2）。
+    Session {
+        username: String,
+        role: String,
+        grant: Option<String>,
+        account_id: Option<i64>,
+    },
     /// API キー。`label` は監査に載せる `名前（prefix）`。
     ApiKey {
         // 表 `api_keys` の id。REST も MCP（#1161 PR5b）も監査には `label` を
@@ -136,10 +150,29 @@ impl Actor {
         }
     }
 
+    /// 自由トレンドの主体（#1207・#1231 PR 8a、`crate::free_trends` のモジュール doc「権限」）。
+    /// アカウントか grant かは `grant` で見分ける（名前では見分けない）。API キーは開くだけ。
+    pub(crate) fn free_trend_actor(&self) -> crate::free_trends::FreeTrendActor {
+        match self {
+            Self::Session {
+                username,
+                role,
+                grant,
+                account_id,
+            } => crate::free_trends::FreeTrendActor::from_session(
+                username,
+                role,
+                grant.as_deref(),
+                *account_id,
+            ),
+            Self::ApiKey { .. } => crate::free_trends::FreeTrendActor::ReadOnly,
+        }
+    }
+
     /// 監査に載せる `(actor_username, actor_role)`。
     fn audit_actor(&self) -> (&str, &str) {
         match self {
-            Self::Session { username, role } => (username, role),
+            Self::Session { username, role, .. } => (username, role),
             Self::ApiKey { label, .. } => (label, API_KEY_ACTOR_ROLE),
         }
     }
@@ -207,6 +240,8 @@ impl<S: Send + Sync> FromRequestParts<S> for Actor {
             return Ok(Actor::Session {
                 username: session.identity.id.clone(),
                 role: session.identity.role.clone(),
+                grant: session.grant.as_ref().map(|kind| kind.as_str().to_string()),
+                account_id: session.stamp.map(|stamp| stamp.account_id),
             });
         }
         Err(unauthorized_response())
@@ -511,6 +546,8 @@ mod tests {
         let viewer = Actor::Session {
             username: "v".into(),
             role: "viewer".into(),
+            grant: None,
+            account_id: Some(1),
         };
         assert!(viewer.can_read());
         assert!(!viewer.can_configure());
@@ -518,12 +555,16 @@ mod tests {
         let editor = Actor::Session {
             username: "e".into(),
             role: "editor".into(),
+            grant: None,
+            account_id: Some(1),
         };
         assert!(editor.can_configure());
         assert!(editor.can_operate_collect());
         let unknown = Actor::Session {
             username: "x".into(),
             role: "superuser".into(),
+            grant: None,
+            account_id: Some(1),
         };
         assert!(!unknown.can_read());
     }

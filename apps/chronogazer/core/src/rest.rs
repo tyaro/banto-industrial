@@ -275,6 +275,12 @@ mod display_groups;
 // （`rest/tag_thresholds.rs`）に置く。
 use crate::tag_thresholds::TagThresholdService;
 mod tag_thresholds;
+// #1207・#1231 PR 8a: 自由トレンド。ルーターは子モジュール（`rest/free_trends.rs`）に置き、
+// 権限の表のテストは `rest/free_trends_tests.rs`。
+use crate::free_trends::FreeTrendService;
+mod free_trends;
+#[cfg(test)]
+mod free_trends_tests;
 // #437: 監査の保留の REST の経路（保留・流し込み・状態の口）のテスト。
 #[cfg(test)]
 mod audit_spool_tests;
@@ -1897,6 +1903,8 @@ async fn tags_create(
 enum RevisionConflictRejection {
     Api(ApiError),
     RevisionConflict(BantoError),
+    /// 切り離したタスクが最後まで走らなかった（`local_grant::run_detached`、応答は `500`）。
+    Detached(crate::local_grant::DetachedTaskFailed),
 }
 
 impl From<BantoError> for RevisionConflictRejection {
@@ -1915,10 +1923,17 @@ impl From<ApiError> for RevisionConflictRejection {
     }
 }
 
+impl From<crate::local_grant::DetachedTaskFailed> for RevisionConflictRejection {
+    fn from(err: crate::local_grant::DetachedTaskFailed) -> Self {
+        Self::Detached(err)
+    }
+}
+
 impl IntoResponse for RevisionConflictRejection {
     fn into_response(self) -> Response {
         match self {
             Self::Api(err) => err.into_response(),
+            Self::Detached(err) => err.into_response(),
             Self::RevisionConflict(err) => (
                 StatusCode::CONFLICT,
                 Json(banto_core::ErrorBody::from(&err)),
@@ -2216,6 +2231,13 @@ fn api_key_routes(
         // `DisplayGroupService::pool` の doc）。
         .merge(tag_thresholds::tag_thresholds_router(
             TagThresholdService::new(display_groups.pool().clone()),
+            audit.clone(),
+            auth.clone(),
+        ))
+        // #1207・#1231 PR 8a: 自由トレンドも同じ pool。読み取りのためにキーを通し、書き込みは
+        // ハンドラ（`FreeTrendOps`）がキーを断る。
+        .merge(free_trends::free_trends_router(
+            FreeTrendService::new(display_groups.pool().clone()),
             audit.clone(),
             auth.clone(),
         ))
@@ -2607,6 +2629,43 @@ mod tests {
         sqlx::SqlitePool,
         crate::hub::HubService,
     ) {
+        let (router, admin, editor, viewer, pool, hub, _auth) =
+            router_with_role_tokens_pool_hub_and_auth().await;
+        (router, admin, editor, viewer, pool, hub)
+    }
+
+    /// [`router_with_role_tokens_pool_and_hub`] plus the router's `AuthState`（#1207・#1231
+    /// PR 8a: 自由トレンドの権限の表のテストが、grant のセッション（`localDesktop`・閲覧公開）の
+    /// トークンと、別のアカウントのログインを同じ `AuthState` で作るため。`Clone` は同じ実体）。
+    #[allow(clippy::type_complexity)]
+    pub(super) async fn router_with_role_tokens_pool_hub_and_auth() -> (
+        Router,
+        String,
+        String,
+        String,
+        sqlx::SqlitePool,
+        crate::hub::HubService,
+        AuthState,
+    ) {
+        router_with_role_tokens_pool_hub_and_auth_validated(true).await
+    }
+
+    /// [`router_with_role_tokens_pool_hub_and_auth`] の照合を選べる版。`lookup = false` は
+    /// `SessionValidation::DisabledNoRevocation`（アカウントのセッションに stamp が付かない。
+    /// 自由トレンドが stamp の無いアカウントのセッションを書けない主体にすることの試験用、
+    /// #1252 のオーナー P2）。
+    #[allow(clippy::type_complexity)]
+    pub(super) async fn router_with_role_tokens_pool_hub_and_auth_validated(
+        lookup: bool,
+    ) -> (
+        Router,
+        String,
+        String,
+        String,
+        sqlx::SqlitePool,
+        crate::hub::HubService,
+        AuthState,
+    ) {
         let pool = migrate_memory().await.expect("migrate_memory");
         let (tx, _rx) = broadcast::channel(16);
         let users = UsersService::new(Db::Sqlite(pool.clone()));
@@ -2647,7 +2706,11 @@ mod tests {
                     }
                 })
             },
-            SessionValidation::lookup(user_session_lookup(users.clone())),
+            if lookup {
+                SessionValidation::lookup(user_session_lookup(users.clone()))
+            } else {
+                SessionValidation::DisabledNoRevocation
+            },
         );
 
         let admin_token = auth
@@ -2675,7 +2738,7 @@ mod tests {
                 tags,
                 collect,
                 display_groups,
-                auth,
+                auth.clone(),
                 tx,
                 false,
                 HostAccess::closed(),
@@ -2685,6 +2748,7 @@ mod tests {
             viewer_token,
             pool,
             hub,
+            auth,
         )
     }
 

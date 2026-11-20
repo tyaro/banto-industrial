@@ -111,6 +111,11 @@ use chronogazer_core::display_groups::{
     DisplayGroupSaveResponse, DisplayGroupSaved, DisplayGroupService,
     AUDIT_RESOURCE as DISPLAY_GROUPS_RESOURCE,
 };
+// #1207・#1231 PR 8a: 自由トレンド（REST と同じサービス・同じ検証・同じ権限の決まり）。
+use chronogazer_core::free_trends::{
+    audit_detail as free_trend_audit_detail, FreeTrend, FreeTrendActor, FreeTrendPayload,
+    FreeTrendService, AUDIT_RESOURCE as FREE_TRENDS_RESOURCE,
+};
 // #392 B1-2: 起動と終了は `banto-serve` と共有のエンジン。
 use chronogazer_core::engine::{
     EngineConfig, EngineListen, EngineRuntime, EngineServices, RunningEngine, ServerSlot,
@@ -2881,6 +2886,175 @@ async fn display_groups_reorder_body(
     Ok(groups)
 }
 
+// --- #1207・#1231 PR 8a: 自由トレンド ----------------------------------------------
+
+/// 自由トレンドのサービス。`tag_thresholds_service` と同じく `AppState` の pool から都度組む。
+fn free_trends_service(state: &AppState) -> FreeTrendService {
+    FreeTrendService::new(state.services.pool.clone())
+}
+
+/// 自由トレンドの操作の主体（`chronogazer_core::free_trends` のモジュール doc「権限」）。
+/// viewer 以上のセッションが要り（無ければ `Unauthorized`、足りなければ `denied` を監査して
+/// `Forbidden` - [`require_role`] と同じ）、主体の種類は**デスクトップのセッションの種類**で
+/// 決める: アカウント（[`DesktopSession::Account`]）は作れて、作った人か editor 以上が変えられる。
+/// ログイン不要モードの合成のセッション（[`DesktopSession::AuthDisabledLocal`]）は役割に
+/// 関わらず開くだけ（名前の `local` では見分けない。同じ名前のアカウントがありうるため）。
+async fn free_trends_session(
+    state: &AppState,
+) -> Result<(UserIdentity, FreeTrendActor), BantoError> {
+    let Some(session) = current_session(state).await? else {
+        return Err(BantoError::Unauthorized);
+    };
+    let identity = session.identity().clone();
+    if !identity.role.at_least(Role::Viewer) {
+        record_free_trend_denied(state, &identity).await;
+        return Err(BantoError::Forbidden);
+    }
+    let actor = match session {
+        // 作った人はアカウントの ID で見分ける（名前を同じにして作り直したアカウントは別人）。
+        DesktopSession::Account(account) => FreeTrendActor::Account {
+            user_id: account.id,
+            username: account.username,
+            role: account.role,
+        },
+        DesktopSession::AuthDisabledLocal(_) => FreeTrendActor::ReadOnly,
+    };
+    Ok((identity, actor))
+}
+
+/// 断った書き込みの `denied`（[`require_role`] と同じ形、`origin: "tauri"`）。
+async fn record_free_trend_denied(state: &AppState, identity: &UserIdentity) {
+    state
+        .services
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&identity.username),
+            actor_role: Some(identity.role.as_str()),
+            action: "denied",
+            resource: FREE_TRENDS_RESOURCE,
+            entity_id: None,
+            detail: None,
+            origin: "tauri",
+            result: "denied",
+        })
+        .await;
+}
+
+/// サービスの結果が `Forbidden` なら `denied` を監査する（作った人の確認はサービスの
+/// トランザクションの中なので、拒否はその結果で知る。REST の `FreeTrendOps` と同じ）。
+async fn free_trend_denied_on_forbidden<T>(
+    state: &AppState,
+    identity: &UserIdentity,
+    result: Result<T, BantoError>,
+) -> Result<T, BantoError> {
+    if matches!(result, Err(BantoError::Forbidden)) {
+        record_free_trend_denied(state, identity).await;
+    }
+    result
+}
+
+/// `viewer`+: 自由トレンドの一覧（名前順。各件に今の主体の `canEdit`）。
+#[tauri::command]
+async fn free_trends_list(state: State<'_, AppState>) -> Result<Vec<FreeTrend>, BantoError> {
+    free_trends_list_body(&state).await
+}
+
+async fn free_trends_list_body(state: &AppState) -> Result<Vec<FreeTrend>, BantoError> {
+    let (_, actor) = free_trends_session(state).await?;
+    free_trends_service(state).list(&actor).await
+}
+
+/// `viewer`+: 自由トレンドを 1 つ。
+#[tauri::command]
+async fn free_trends_get(state: State<'_, AppState>, id: i64) -> Result<FreeTrend, BantoError> {
+    free_trends_get_body(&state, id).await
+}
+
+async fn free_trends_get_body(state: &AppState, id: i64) -> Result<FreeTrend, BantoError> {
+    let (_, actor) = free_trends_session(state).await?;
+    free_trends_service(state).get(&actor, id).await
+}
+
+/// 自由トレンドの作成（viewer 以上のアカウント。ログイン不要モードは `Forbidden`）。
+#[tauri::command]
+async fn free_trends_create(
+    state: State<'_, AppState>,
+    input: FreeTrendPayload,
+) -> Result<FreeTrend, BantoError> {
+    free_trends_create_body(&state, input).await
+}
+
+async fn free_trends_create_body(
+    state: &AppState,
+    input: FreeTrendPayload,
+) -> Result<FreeTrend, BantoError> {
+    let (identity, actor) = free_trends_session(state).await?;
+    let result = free_trends_service(state).create(&actor, &input).await;
+    let created = free_trend_denied_on_forbidden(state, &identity, result).await?;
+    record_ok(
+        &state.services.audit,
+        &identity,
+        "create",
+        FREE_TRENDS_RESOURCE,
+        Some(&created.id.to_string()),
+        Some(free_trend_audit_detail(&created)),
+    )
+    .await;
+    Ok(created)
+}
+
+/// 自由トレンドの更新（作った人か editor 以上。版の食い違いは REST の `409` と同じ本文の検証エラー）。
+#[tauri::command]
+async fn free_trends_update(
+    state: State<'_, AppState>,
+    id: i64,
+    input: FreeTrendPayload,
+) -> Result<FreeTrend, BantoError> {
+    free_trends_update_body(&state, id, input).await
+}
+
+async fn free_trends_update_body(
+    state: &AppState,
+    id: i64,
+    input: FreeTrendPayload,
+) -> Result<FreeTrend, BantoError> {
+    let (identity, actor) = free_trends_session(state).await?;
+    let result = free_trends_service(state).update(&actor, id, &input).await;
+    let updated = free_trend_denied_on_forbidden(state, &identity, result).await?;
+    record_ok(
+        &state.services.audit,
+        &identity,
+        "update",
+        FREE_TRENDS_RESOURCE,
+        Some(&id.to_string()),
+        Some(free_trend_audit_detail(&updated)),
+    )
+    .await;
+    Ok(updated)
+}
+
+/// 自由トレンドの削除（作った人か editor 以上）。
+#[tauri::command]
+async fn free_trends_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoError> {
+    free_trends_delete_body(&state, id).await
+}
+
+async fn free_trends_delete_body(state: &AppState, id: i64) -> Result<(), BantoError> {
+    let (identity, actor) = free_trends_session(state).await?;
+    let result = free_trends_service(state).delete(&actor, id).await;
+    let deleted = free_trend_denied_on_forbidden(state, &identity, result).await?;
+    record_ok(
+        &state.services.audit,
+        &identity,
+        "delete",
+        FREE_TRENDS_RESOURCE,
+        Some(&id.to_string()),
+        Some(serde_json::json!({ "name": deleted.name })),
+    )
+    .await;
+    Ok(())
+}
+
 // --- #532: 記録計の側のタグごとのしきい値 ---------------------------------------
 
 /// しきい値のサービス。`display_groups_service` と同じく `AppState` の pool から
@@ -5106,6 +5280,11 @@ pub fn run() {
             display_groups_update,
             display_groups_delete,
             display_groups_reorder,
+            free_trends_list,
+            free_trends_get,
+            free_trends_create,
+            free_trends_update,
+            free_trends_delete,
             tag_thresholds_list,
             tag_thresholds_get,
             tag_thresholds_update,
@@ -10834,6 +11013,261 @@ mod tests {
                 result.to_string(),
                 "tauri".to_string()
             ))
+        );
+    }
+
+    /// `free_trends` の監査の (action, result, origin, actor_username)。
+    async fn free_trend_audit(state: &AppState) -> Vec<(String, String, String, String)> {
+        let page = state
+            .services
+            .audit
+            .list(ListParams::default())
+            .await
+            .expect("audit list");
+        let mut rows: Vec<_> = page
+            .rows
+            .into_iter()
+            .filter(|row| row.resource == "free_trends")
+            .collect();
+        rows.sort_by_key(|row| row.id);
+        rows.into_iter()
+            .map(|row| {
+                (
+                    row.action,
+                    row.result,
+                    row.origin,
+                    row.actor_username.unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    fn free_trend_input(name: &str, tag_ids: &[i64], revision: Option<i64>) -> FreeTrendPayload {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "pens": tag_ids.iter().map(|id| serde_json::json!({ "tagId": id })).collect::<Vec<_>>(),
+            "expectedRevision": revision,
+        }))
+        .expect("FreeTrendPayload")
+    }
+
+    /// オーナーの P2（2026-11-20）: 作った人はアカウントの ID で見分ける。viewer の alice が作る →
+    /// alice を消す → 同じ名前の viewer を作り直す。新しい alice は変更・削除が `Forbidden` で
+    /// `canEdit` は false、editor は変えられる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recreated_account_with_the_same_name_cannot_change_the_old_free_trend() {
+        let state = app_state().await;
+        let users = &state.services.users;
+        let old = users
+            .create_user("alice", "password123", "alice", Role::Viewer)
+            .await
+            .expect("create alice");
+        let editor = users
+            .create_user("editor", "password123", "editor", Role::Editor)
+            .await
+            .expect("create editor");
+        state.set_session_for_test(Some(DesktopSession::Account(old.clone())));
+        let created = free_trends_create_body(&state, free_trend_input("A", &[], None))
+            .await
+            .expect("alice create");
+        assert!(created.can_edit);
+
+        users.delete_user(old.id, None).await.expect("delete alice");
+        let new = users
+            .create_user("alice", "password456", "alice", Role::Viewer)
+            .await
+            .expect("recreate alice");
+        assert_ne!(new.id, old.id);
+        state.set_session_for_test(Some(DesktopSession::Account(new)));
+        assert!(
+            !free_trends_get_body(&state, created.id)
+                .await
+                .unwrap()
+                .can_edit
+        );
+        assert!(!free_trends_list_body(&state).await.unwrap()[0].can_edit);
+        let err =
+            free_trends_update_body(&state, created.id, free_trend_input("A改", &[], Some(1)))
+                .await
+                .expect_err("作り直した同じ名前のアカウントが前の人の物を変えられた");
+        assert!(matches!(err, BantoError::Forbidden), "{err:?}");
+        let err = free_trends_delete_body(&state, created.id)
+            .await
+            .expect_err("作り直した同じ名前のアカウントが前の人の物を消せた");
+        assert!(matches!(err, BantoError::Forbidden), "{err:?}");
+
+        state.set_session_for_test(Some(DesktopSession::Account(editor)));
+        let updated =
+            free_trends_update_body(&state, created.id, free_trend_input("A改", &[], Some(1)))
+                .await
+                .expect("editor update");
+        assert_eq!(updated.created_by, "alice");
+        free_trends_delete_body(&state, created.id)
+            .await
+            .expect("editor delete");
+    }
+
+    /// **#1207・#1231 PR 8a（Tauri 経路）**: 自由トレンドの権限（2026-11-20 オーナー決定）。
+    /// viewer のアカウントは作れて自分の物を変えられる、他人（viewer）の物は `Forbidden` で
+    /// `denied` を監査、editor は他人の物も変えられる、ログイン不要モードの合成のセッションは
+    /// 役割（admin でも）に関わらず開くだけ。各件の `canEdit` は主体ごと。ペンに使っている
+    /// タグの `tags_delete` は自由トレンドの名前つきで断る。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn free_trend_commands_follow_the_owner_decision() {
+        let state = app_state().await;
+        let mut accounts = Vec::new();
+        for (name, role) in [
+            ("viewer", Role::Viewer),
+            ("viewer2", Role::Viewer),
+            ("editor", Role::Editor),
+        ] {
+            accounts.push(
+                state
+                    .services
+                    .users
+                    .create_user(name, "password123", name, role)
+                    .await
+                    .expect("create user"),
+            );
+        }
+        let [viewer, viewer2, editor] = <[UserIdentity; 3]>::try_from(accounts).unwrap();
+
+        let conn = state
+            .services
+            .plc_connections
+            .create_settings(connection_payload("plc", "modbus-tcp").into_create_input())
+            .await
+            .expect("create connection");
+        let group = state
+            .services
+            .collection_groups
+            .create(
+                CollectionGroupPayload {
+                    name: "cg".to_string(),
+                    plc_connection_id: conn.id,
+                    period_ms: 1000,
+                    enabled: true,
+                }
+                .into(),
+            )
+            .await
+            .expect("create collection group");
+        let tag = state
+            .services
+            .tags
+            .create(tag_payload("t1", group.id, "40001").into())
+            .await
+            .expect("create tag");
+
+        // viewer: 作れて、自分の物は canEdit。
+        state.set_session_for_test(Some(DesktopSession::Account(viewer.clone())));
+        let created = free_trends_create_body(&state, free_trend_input("V", &[tag.id], None))
+            .await
+            .expect("viewer create");
+        assert_eq!(created.created_by, "viewer");
+        assert!(created.can_edit);
+
+        // ペンに使っているタグは消せない（editor でも）。
+        state.set_session_for_test(Some(DesktopSession::Account(editor.clone())));
+        let err = tags_delete_body(&state, tag.id)
+            .await
+            .expect_err("参照されているタグが消えてしまった");
+        assert_eq!(only_field_error(err).field, "freeTrends");
+
+        // viewer2: 開けるが、他人の物は変えられない・消せない。
+        state.set_session_for_test(Some(DesktopSession::Account(viewer2)));
+        assert!(
+            !free_trends_get_body(&state, created.id)
+                .await
+                .unwrap()
+                .can_edit
+        );
+        let err =
+            free_trends_update_body(&state, created.id, free_trend_input("V改", &[], Some(1)))
+                .await
+                .expect_err("viewer2 が他人の物を変えられた");
+        assert!(matches!(err, BantoError::Forbidden), "{err:?}");
+        let err = free_trends_delete_body(&state, created.id)
+            .await
+            .expect_err("viewer2 が他人の物を消せた");
+        assert!(matches!(err, BantoError::Forbidden), "{err:?}");
+
+        // editor: 他人の物を変えられる。
+        state.set_session_for_test(Some(DesktopSession::Account(editor)));
+        let updated =
+            free_trends_update_body(&state, created.id, free_trend_input("V改", &[], Some(1)))
+                .await
+                .expect("editor update");
+        assert_eq!(updated.updated_by, "editor");
+        assert_eq!(updated.created_by, "viewer");
+
+        // ログイン不要モード（admin の役割でも）: 開くだけ。
+        let mut config = state.services.settings.auth_config().await.unwrap();
+        config.disabled = true;
+        config.disabled_role = Role::Admin;
+        state
+            .services
+            .settings
+            .set_auth_config(&config)
+            .await
+            .unwrap();
+        state.set_session_for_test(Some(DesktopSession::AuthDisabledLocal(UserIdentity {
+            id: LOCAL_SESSION_ID,
+            username: "local".to_string(),
+            display_name: "ローカルユーザー".to_string(),
+            role: Role::Admin,
+            auth_epoch: 0,
+        })));
+        let list = free_trends_list_body(&state).await.expect("local list");
+        assert_eq!(list.len(), 1);
+        assert!(!list[0].can_edit);
+        for err in [
+            free_trends_create_body(&state, free_trend_input("L", &[], None))
+                .await
+                .expect_err("ログイン不要モードで作れた"),
+            free_trends_update_body(&state, created.id, free_trend_input("L", &[], Some(2)))
+                .await
+                .expect_err("ログイン不要モードで変えられた"),
+            free_trends_delete_body(&state, created.id)
+                .await
+                .expect_err("ログイン不要モードで消せた"),
+        ] {
+            assert!(matches!(err, BantoError::Forbidden), "{err:?}");
+        }
+        config.disabled = false;
+        state
+            .services
+            .settings
+            .set_auth_config(&config)
+            .await
+            .unwrap();
+
+        // 作った人（viewer）は自分の物を消せる。
+        state.set_session_for_test(Some(DesktopSession::Account(viewer)));
+        free_trends_delete_body(&state, created.id)
+            .await
+            .expect("viewer delete");
+
+        let s = |a: &str, r: &str, u: &str| {
+            (
+                a.to_string(),
+                r.to_string(),
+                "tauri".to_string(),
+                u.to_string(),
+            )
+        };
+        assert_eq!(
+            free_trend_audit(&state).await,
+            vec![
+                s("create", "ok", "viewer"),
+                s("denied", "denied", "viewer2"),
+                s("denied", "denied", "viewer2"),
+                s("update", "ok", "editor"),
+                s("denied", "denied", "local"),
+                s("denied", "denied", "local"),
+                s("denied", "denied", "local"),
+                s("delete", "ok", "viewer"),
+            ]
         );
     }
 

@@ -86,7 +86,8 @@
 //! を REST の `DELETE /api/tags/{id}` と Tauri の `tags_delete` の両方が呼ぶ。
 //! `tags` への FK は張らない（migration の注記: banto-tags は `tags` を作り直す
 //! ことがある）ので、`BEGIN IMMEDIATE` の中で「参照元の確認 → 削除」を行い、
-//! 確認と削除の間にペンが足されないようにしている。
+//! 確認と削除の間にペンが足されないようにしている。自由トレンド（`crate::free_trends`、
+//! #1207・#1231 PR 8a）のペンが使うタグも同じトランザクションの中で断る（欄 `freeTrends`）。
 //!
 //! ## Hub のタグをペンにする一括保存（#1179 PR5）
 //!
@@ -433,7 +434,7 @@ pub struct Pen {
 
 impl Pen {
     /// 色以外の属性を 1 つでも持つか（監査の要約用）。
-    fn has_style(&self) -> bool {
+    pub(crate) fn has_style(&self) -> bool {
         self.label.is_some()
             || self.unit.is_some()
             || self.decimals.is_some()
@@ -660,7 +661,12 @@ pub struct ValidDisplayGroup {
 
 /// ペンの属性の検証。誤りは `pens[index].<項目>` の `field_errors` に積む。返す `Pen` の
 /// `tag_id`・`color_slot` は呼び出し側が埋める（誤りのある項目は `None`）。
-fn validate_pen_style(pen: &PenPayload, index: usize, errors: &mut Vec<FieldError>) -> Pen {
+/// 自由トレンド（`crate::free_trends`、#1207・#1231 PR 8a）も同じ関数でペンの属性を確かめる。
+pub(crate) fn validate_pen_style(
+    pen: &PenPayload,
+    index: usize,
+    errors: &mut Vec<FieldError>,
+) -> Pen {
     let mut bad = |name: &str, message: String| {
         errors.push(field_error(format!("pens[{index}].{name}"), message));
     };
@@ -833,7 +839,19 @@ fn validate_pen_style(pen: &PenPayload, index: usize, errors: &mut Vec<FieldErro
     }
 }
 
-fn field_error(field: impl Into<String>, message: impl Into<String>) -> FieldError {
+/// ペンの色の枠（1..=[`COLOR_SLOTS`]）の検証。誤りは `pens[index].colorSlot`（自由トレンドと共通）。
+pub(crate) fn check_color_slot(slot: Option<i64>, index: usize, errors: &mut Vec<FieldError>) {
+    if let Some(slot) = slot {
+        if !(1..=COLOR_SLOTS).contains(&slot) {
+            errors.push(field_error(
+                format!("pens[{index}].colorSlot"),
+                format!("色は 1〜{COLOR_SLOTS} の枠から選んでください"),
+            ));
+        }
+    }
+}
+
+pub(crate) fn field_error(field: impl Into<String>, message: impl Into<String>) -> FieldError {
     FieldError {
         field: field.into(),
         message: message.into(),
@@ -1008,14 +1026,7 @@ fn check_shape(
             }
             _ => errors.push(field_error(format!("pens[{index}]"), PEN_SOURCE_MESSAGE)),
         }
-        if let Some(slot) = pen.color_slot {
-            if !(1..=COLOR_SLOTS).contains(&slot) {
-                errors.push(field_error(
-                    format!("pens[{index}].colorSlot"),
-                    format!("色は 1〜{COLOR_SLOTS} の枠から選んでください"),
-                ));
-            }
-        }
+        check_color_slot(pen.color_slot, index, errors);
     }
 
     match kind {
@@ -1120,17 +1131,21 @@ pub fn audit_detail(group: &DisplayGroup) -> Value {
 
 /// タグの削除を拒否するときのエラー（参照元を並べる）。
 pub fn tag_referenced_error(referrers: &[DisplayGroupRef]) -> BantoError {
+    BantoError::Validation {
+        field_errors: vec![tag_referenced_field_error(referrers)],
+    }
+}
+
+fn tag_referenced_field_error(referrers: &[DisplayGroupRef]) -> FieldError {
     let names = referrers
         .iter()
         .map(|group| format!("「{}」", group.name))
         .collect::<Vec<_>>()
         .join("");
-    BantoError::Validation {
-        field_errors: vec![field_error(
-            TAG_REFERENCED_FIELD,
-            format!("このタグは表示グループ{names}のペンに割り当てられているため削除できません。先に「表示グループ」ページでペンから外してください"),
-        )],
-    }
+    field_error(
+        TAG_REFERENCED_FIELD,
+        format!("このタグは表示グループ{names}のペンに割り当てられているため削除できません。先に「表示グループ」ページでペンから外してください"),
+    )
 }
 
 #[derive(sqlx::FromRow)]
@@ -1144,9 +1159,22 @@ struct GroupRow {
     revision: i64,
 }
 
+/// ペンの列（`tag_id` と属性。`display_group_pens` と `free_trend_pens` で同じ列の名前・型・CHECK）。
+/// 読み書きは [`PenColumnsRow`]・[`bind_pen_columns`] がこの並びで行う。
+pub(crate) const PEN_COLUMNS: &str = "tag_id, color_slot, label, unit, decimals, line_style, \
+     line_width, marker, marker_size, axis, y_min, y_max, limit_lines, limit_hh, limit_h, limit_l, \
+     limit_ll, bit_style, bit_band_height";
+
 #[derive(sqlx::FromRow)]
 struct PenRow {
     group_id: i64,
+    #[sqlx(flatten)]
+    pen: PenColumnsRow,
+}
+
+/// [`PEN_COLUMNS`] の行（表示グループと自由トレンドで共有する）。
+#[derive(sqlx::FromRow)]
+pub(crate) struct PenColumnsRow {
     tag_id: i64,
     color_slot: Option<i64>,
     label: Option<String>,
@@ -1171,33 +1199,33 @@ struct PenRow {
 /// DB の列挙の文字列を読む（CHECK で守っているので、未知の値は壊れた DB）。
 fn parse_column<T>(
     value: Option<String>,
+    table: &str,
     column: &str,
     parse: fn(&str) -> Option<T>,
 ) -> Result<Option<T>, BantoError> {
     value
         .map(|v| {
             parse(&v).ok_or_else(|| {
-                BantoError::Storage(format!(
-                    "display_group_pens.{column} に未知の値があります: {v}"
-                ))
+                BantoError::Storage(format!("{table}.{column} に未知の値があります: {v}"))
             })
         })
         .transpose()
 }
 
-impl PenRow {
-    fn into_pen(self) -> Result<Pen, BantoError> {
+impl PenColumnsRow {
+    /// `table` は壊れた DB の誤りの文に出す表の名前。
+    pub(crate) fn into_pen(self, table: &str) -> Result<Pen, BantoError> {
         Ok(Pen {
             tag_id: self.tag_id,
             color_slot: self.color_slot,
             label: self.label,
             unit: self.unit,
             decimals: self.decimals,
-            line_style: parse_column(self.line_style, "line_style", LineStyle::parse)?,
+            line_style: parse_column(self.line_style, table, "line_style", LineStyle::parse)?,
             line_width: self.line_width,
-            marker: parse_column(self.marker, "marker", Marker::parse)?,
+            marker: parse_column(self.marker, table, "marker", Marker::parse)?,
             marker_size: self.marker_size,
-            axis: parse_column(self.axis, "axis", Axis::parse)?,
+            axis: parse_column(self.axis, table, "axis", Axis::parse)?,
             y_min: self.y_min,
             y_max: self.y_max,
             limit_lines: self.limit_lines.map(|v| v != 0),
@@ -1205,10 +1233,44 @@ impl PenRow {
             limit_h: self.limit_h,
             limit_l: self.limit_l,
             limit_ll: self.limit_ll,
-            bit_style: parse_column(self.bit_style, "bit_style", BitStyle::parse)?,
+            bit_style: parse_column(self.bit_style, table, "bit_style", BitStyle::parse)?,
             bit_band_height: self.bit_band_height,
         })
     }
+}
+
+impl PenRow {
+    fn into_pen(self) -> Result<Pen, BantoError> {
+        self.pen.into_pen("display_group_pens")
+    }
+}
+
+/// [`PEN_COLUMNS`] の 19 列を、その順で `query` に bind する（表示グループと自由トレンドの
+/// INSERT で共有する。呼び出し側は親の id と `position` を先に bind する）。
+pub(crate) fn bind_pen_columns<'q>(
+    query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
+    pen: &Pen,
+) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments> {
+    query
+        .bind(pen.tag_id)
+        .bind(pen.color_slot)
+        .bind(pen.label.clone())
+        .bind(pen.unit.clone())
+        .bind(pen.decimals)
+        .bind(pen.line_style.map(LineStyle::as_str))
+        .bind(pen.line_width)
+        .bind(pen.marker.map(Marker::as_str))
+        .bind(pen.marker_size)
+        .bind(pen.axis.map(Axis::as_str))
+        .bind(pen.y_min)
+        .bind(pen.y_max)
+        .bind(pen.limit_lines.map(i64::from))
+        .bind(pen.limit_hh)
+        .bind(pen.limit_h)
+        .bind(pen.limit_l)
+        .bind(pen.limit_ll)
+        .bind(pen.bit_style.map(BitStyle::as_str))
+        .bind(pen.bit_band_height)
 }
 
 fn storage(err: sqlx::Error) -> BantoError {
@@ -1455,8 +1517,17 @@ impl DisplayGroupService {
             .await
             .map_err(storage)?;
         let referrers = referrers_on(&mut tx, tag_id).await?;
-        if !referrers.is_empty() {
-            return Err(tag_referenced_error(&referrers));
+        // #1207・#1231 PR 8a: 自由トレンドのペンが使うタグも同じく断る（両方なら両方の誤りを並べる）。
+        let free_trends = crate::free_trends::referrers_on(&mut tx, tag_id).await?;
+        if !referrers.is_empty() || !free_trends.is_empty() {
+            let mut field_errors = Vec::new();
+            if !referrers.is_empty() {
+                field_errors.push(tag_referenced_field_error(&referrers));
+            }
+            if !free_trends.is_empty() {
+                field_errors.push(crate::free_trends::tag_referenced_field_error(&free_trends));
+            }
+            return Err(BantoError::Validation { field_errors });
         }
         tags.delete_tx(&mut tx, tag_id).await?;
         // #532: 記録計の側のしきい値の行も同じトランザクションで消す（FK は
@@ -1761,36 +1832,18 @@ async fn insert_pens(
     group_id: i64,
     pens: &[Pen],
 ) -> Result<(), BantoError> {
+    let sql = format!(
+        "INSERT INTO display_group_pens (group_id, position, {PEN_COLUMNS}) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    );
     for (position, pen) in pens.iter().enumerate() {
-        sqlx::query(
-            "INSERT INTO display_group_pens (group_id, position, tag_id, color_slot, label, unit, \
-             decimals, line_style, line_width, marker, marker_size, axis, y_min, y_max, limit_lines, limit_hh, limit_h, limit_l, limit_ll, bit_style, bit_band_height) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(group_id)
-        .bind(position as i64)
-        .bind(pen.tag_id)
-        .bind(pen.color_slot)
-        .bind(&pen.label)
-        .bind(&pen.unit)
-        .bind(pen.decimals)
-        .bind(pen.line_style.map(LineStyle::as_str))
-        .bind(pen.line_width)
-        .bind(pen.marker.map(Marker::as_str))
-        .bind(pen.marker_size)
-        .bind(pen.axis.map(Axis::as_str))
-        .bind(pen.y_min)
-        .bind(pen.y_max)
-        .bind(pen.limit_lines.map(i64::from))
-        .bind(pen.limit_hh)
-        .bind(pen.limit_h)
-        .bind(pen.limit_l)
-        .bind(pen.limit_ll)
-        .bind(pen.bit_style.map(BitStyle::as_str))
-        .bind(pen.bit_band_height)
-        .execute(&mut *conn)
-        .await
-        .map_err(storage)?;
+        let query = sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
+            .bind(group_id)
+            .bind(position as i64);
+        bind_pen_columns(query, pen)
+            .execute(&mut *conn)
+            .await
+            .map_err(storage)?;
     }
     Ok(())
 }
@@ -1853,8 +1906,9 @@ async fn list_on(
     if let Some(pause) = pause {
         pause.hold().await;
     }
-    let pen_rows: Vec<PenRow> = sqlx::query_as("SELECT group_id, tag_id, color_slot, label, unit, decimals, line_style, line_width, marker, 
-         marker_size, axis, y_min, y_max, limit_lines, limit_hh, limit_h, limit_l, limit_ll, bit_style, bit_band_height FROM display_group_pens ORDER BY group_id, position")
+    let pen_rows: Vec<PenRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT group_id, {PEN_COLUMNS} FROM display_group_pens ORDER BY group_id, position"
+    )))
     .fetch_all(&mut *conn)
     .await
     .map_err(storage)?;
@@ -1892,8 +1946,9 @@ async fn get_on(
     if let Some(pause) = pause {
         pause.hold().await;
     }
-    let pens: Vec<PenRow> = sqlx::query_as("SELECT group_id, tag_id, color_slot, label, unit, decimals, line_style, line_width, marker, 
-         marker_size, axis, y_min, y_max, limit_lines, limit_hh, limit_h, limit_l, limit_ll, bit_style, bit_band_height FROM display_group_pens WHERE group_id = ? ORDER BY position")
+    let pens: Vec<PenRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT group_id, {PEN_COLUMNS} FROM display_group_pens WHERE group_id = ? ORDER BY position"
+    )))
     .bind(id)
     .fetch_all(&mut *conn)
     .await
