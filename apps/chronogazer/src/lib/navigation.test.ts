@@ -12,9 +12,10 @@ import {
 const paths = (items: NavItem[]) => items.map((item) => item.path);
 
 describe('navItems の並び（改善案の順、#1159）', () => {
-	it('監視 / ヒストリカル / 日報 / イベント / 記録 / 表示グループ / 管理 / 設定', () => {
+	it('監視 / 自由トレンド / ヒストリカル / 日報 / イベント / 記録 / 表示グループ / 管理 / 設定', () => {
 		expect(navItems.map((item) => item.label)).toEqual([
 			'監視',
+			'自由トレンド',
 			'ヒストリカル',
 			'日報',
 			'イベント',
@@ -38,6 +39,7 @@ describe('visibleNavItems', () => {
 		expect(visible.some((item) => item.adminOnly)).toBe(false);
 		expect(paths(visible)).toEqual([
 			'/monitor',
+			'/free-trends',
 			'/historical',
 			'/daily-report',
 			'/events',
@@ -53,6 +55,7 @@ describe('visibleNavItems', () => {
 		}
 		expect(paths(publicNavItems())).toEqual([
 			'/monitor',
+			'/free-trends',
 			'/historical',
 			'/daily-report',
 			'/events'
@@ -61,12 +64,13 @@ describe('visibleNavItems', () => {
 });
 
 describe('navBarEntries', () => {
-	it('admin: 監視 / ヒストリカル / 日報 / イベント / 記録 / 表示グループ / 管理(グループ) / 設定 の並び', () => {
+	it('admin: 監視 / 自由トレンド / ヒストリカル / 日報 / イベント / 記録 / 表示グループ / 管理(グループ) / 設定 の並び', () => {
 		const entries = navBarEntries(visibleNavItems({ role: 'admin' }));
 		expect(
 			entries.map((entry) => (entry.kind === 'item' ? entry.item.label : `[${entry.key}]`))
 		).toEqual([
 			'監視',
+			'自由トレンド',
 			'ヒストリカル',
 			'日報',
 			'イベント',
@@ -86,14 +90,15 @@ describe('navBarEntries', () => {
 	it('admin 以外にはグループごと出さない', () => {
 		const entries = navBarEntries(visibleNavItems({ role: 'viewer' }));
 		expect(entries.every((entry) => entry.kind === 'item')).toBe(true);
-		expect(entries).toHaveLength(7);
+		expect(entries).toHaveLength(8);
 	});
 
-	it('閲覧公開: 4 項目の単独リンクだけ（グループも設定も無い）', () => {
+	it('閲覧公開: 5 項目の単独リンクだけ（グループも設定も無い）', () => {
 		const entries = navBarEntries(visibleNavItems({ role: 'viewer', publicViewer: true }));
 		expect(entries.every((entry) => entry.kind === 'item')).toBe(true);
 		expect(entries.map((entry) => entry.kind === 'item' && entry.item.label)).toEqual([
 			'監視',
+			'自由トレンド',
 			'ヒストリカル',
 			'日報',
 			'イベント'

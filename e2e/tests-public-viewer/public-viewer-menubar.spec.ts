@@ -2,7 +2,7 @@
  * ChronoGazer の閲覧公開（LAN の viewer-public セッション）でのメニューバー表示（#1159、
  * banto の `e2e/tests-public-viewer/public-viewer-menubar.spec.ts` と同じ形、
  * nav-menubar-plan.md §4.11）: ヘッダーのナビは `visibleNavItems()` が絞った許可リスト
- * （監視・ヒストリカル・イベント）だけを持ち、サイドバーも管理グループも出ない。合成の
+ * （監視・自由トレンド・ヒストリカル・イベント）だけを持ち、サイドバーも管理グループも出ない。合成の
  * 閲覧者に保存済みの置き場所は無いので、`GET /api/ui-settings/shell.navLayout` は route で
  * 答える（サーバーには何も残さない）。自前のコンテキストで、シナリオ側の
  * `public-viewer.spec.ts` には影響しない。
@@ -38,7 +38,7 @@ test('viewer-public: メニューバーは許可リストの項目だけで、�
 			.evaluateAll((links) =>
 				links.map((link) => new URL((link as HTMLAnchorElement).href).pathname)
 			);
-		for (const allowed of ['/monitor', '/historical', '/daily-report', '/events']) {
+		for (const allowed of ['/monitor', '/free-trends', '/historical', '/daily-report', '/events']) {
 			expect(paths).toContain(allowed);
 		}
 		for (const hidden of ['/tags', '/groups', '/users', '/audit-log', '/settings/appearance']) {
