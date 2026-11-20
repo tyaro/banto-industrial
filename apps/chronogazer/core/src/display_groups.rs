@@ -45,7 +45,7 @@
 //!     管理線（PR 7a）: `limitLines`（true で HH・H・L・LL の線を引く。`null`・false = 引かない）・
 //!     `limitHh`・`limitH`・`limitL`・`limitLl`（有限の数。`null` = タグのしきい値を使う。値は
 //!     表示だけに使い、しきい値のイベントは変えない。設定したものどうしは `LL <= L <= H <= HH`、
-//!     `crate::tag_thresholds` と同じ決まり。`limitLines` が無効でも保存する）。bit の表し方は PR 7b 以降。
+//!     `crate::tag_thresholds` と同じ決まり。`limitLines` が無効でも保存する）。bit の表し方は PR 7c。
 //! - **しきい値は持たない**。しきい値は記録計の側のタグごとの設定
 //!   （`crate::tag_thresholds`、#532。2026-10-08 オーナー決定）で、表示グループ
 //!   からは参照するだけ（画面はその設定を読み取り専用で見せる）。
