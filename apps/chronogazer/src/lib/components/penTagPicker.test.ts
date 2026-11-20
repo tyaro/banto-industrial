@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { EMPTY_PEN_STYLE } from '#lib/banto/displayGroupsAdmin.js';
 import type { HubTag } from '#lib/banto/hubAdmin.js';
 import type { CollectionGroup, PlcConnection, Tag } from '#lib/banto/tagRegistryAdmin.js';
 import {
@@ -242,7 +243,8 @@ describe('行の状態・印・追加', () => {
 			tagId: 1,
 			hubTag: null,
 			hubSource: null,
-			colorSlot: null
+			colorSlot: null,
+			...EMPTY_PEN_STYLE
 		});
 		const pen = penFromRow(find('hub:H/G/T2'));
 		expect(pen.tagId).toBeNull();

@@ -10,7 +10,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { CurrentSampleView } from '../banto/collectAdmin';
-import type { DisplayGroup } from '../banto/displayGroupsAdmin';
+import { EMPTY_PEN_STYLE, type DisplayGroup } from '../banto/displayGroupsAdmin';
 // #532: しきい値はタグではなく記録計の側の設定。画面はタグにしきい値を添えた形
 // （`withThresholds`）で判定するので、テストもその形で組む。
 import type { TagWithThresholds as Tag } from '../banto/tagThresholdsAdmin';
@@ -84,7 +84,7 @@ function group(overrides: Partial<DisplayGroup> = {}): DisplayGroup {
 	};
 }
 
-const PEN = { tagId: 1, colorSlot: null };
+const PEN = { tagId: 1, colorSlot: null, ...EMPTY_PEN_STYLE };
 
 describe('sortDisplayGroups / parseGroupParam / selectGroup', () => {
 	it('sortOrder 昇順、同じなら ID 昇順。元の配列は変えない', () => {
@@ -185,7 +185,7 @@ describe('pollPeriodMs（最短の収集周期を 500ms〜5s に丸める）', (
 		[[], MONITOR_POLL_DEFAULT_MS],
 		[[99], MONITOR_POLL_DEFAULT_MS]
 	])('タグ %j → %i ms', (tagIds, expected) => {
-		const pens = tagIds.map((tagId) => ({ tagId, colorSlot: null }));
+		const pens = tagIds.map((tagId) => ({ tagId, colorSlot: null, ...EMPTY_PEN_STYLE }));
 		expect(pollPeriodMs({ pens }, tags, cgs)).toBe(expected);
 	});
 
@@ -489,8 +489,8 @@ describe('penView の value（バー・計器の描画用、D-2）', () => {
 describe('groupPenViews', () => {
 	const g = group({
 		pens: [
-			{ tagId: 1, colorSlot: null },
-			{ tagId: 2, colorSlot: null }
+			{ tagId: 1, colorSlot: null, ...EMPTY_PEN_STYLE },
+			{ tagId: 2, colorSlot: null, ...EMPTY_PEN_STYLE }
 		]
 	});
 	it('値がまだ無ければ空（画面は状態の説明を出す）', () => {

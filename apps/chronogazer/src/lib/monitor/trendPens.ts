@@ -31,7 +31,15 @@ export function toTrendPens(pens: readonly TrendPenInfo[]): TrendPen[] {
 		id: trendPenId(index, pen.tagId),
 		label: penLegendLabel(pen),
 		colorSlot: pen.colorSlot,
+		unit: pen.unit,
 		decimals: pen.isBit ? null : pen.decimals,
-		...(pen.isBit ? { yMin: 0, yMax: 1 } : {})
+		...(pen.axis !== null ? { axis: pen.axis } : {}),
+		...(pen.isBit
+			? { yMin: 0, yMax: 1 }
+			: {
+					...(pen.yMin !== null ? { yMin: pen.yMin } : {}),
+					...(pen.yMax !== null ? { yMax: pen.yMax } : {}),
+					...(pen.engRange !== null ? { engRange: pen.engRange } : {})
+				})
 	}));
 }

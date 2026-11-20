@@ -57,8 +57,8 @@ use crate::collect::{
     QualityView, Readout, ValuesResponse,
 };
 use crate::display_groups::{
-    DisplayAttributes, DisplayGroup, DisplayGroupPayload, DisplayGroupSaveResponse, DisplayKind,
-    HubTagGroupPayload, Pen, PenPayload, ReorderPayload,
+    Axis, DisplayAttributes, DisplayGroup, DisplayGroupPayload, DisplayGroupSaveResponse,
+    DisplayKind, HubTagGroupPayload, LineStyle, Marker, Pen, PenPayload, ReorderPayload,
 };
 use crate::hub_tags::{HubTagRow, NewHubGroup};
 use crate::tag_thresholds::{TagThresholds, TagThresholdsPayload};
@@ -234,6 +234,9 @@ impl Modify for SecurityAddon {
         CollectionGroupPayload,
         TagPayload,
         DisplayKind,
+        LineStyle,
+        Marker,
+        Axis,
         DisplayAttributes,
         Pen,
         PenPayload,

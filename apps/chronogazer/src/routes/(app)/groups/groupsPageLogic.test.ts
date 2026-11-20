@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { DisplayGroup } from '#lib/banto/displayGroupsAdmin.js';
+import { EMPTY_PEN_STYLE, type DisplayGroup } from '#lib/banto/displayGroupsAdmin.js';
 import {
 	MAX_PENS,
 	addPen,
@@ -39,8 +39,8 @@ const group: DisplayGroup = {
 	kind: 'trend',
 	attributes: { timeWindowSec: 1800 },
 	pens: [
-		{ tagId: 1, colorSlot: null },
-		{ tagId: 2, colorSlot: 5 }
+		{ tagId: 1, colorSlot: null, ...EMPTY_PEN_STYLE },
+		{ tagId: 2, colorSlot: 5, ...EMPTY_PEN_STYLE }
 	],
 	revision: 3
 };
@@ -49,7 +49,7 @@ function withPens(...tagIds: (number | null)[]): GroupDraft {
 	return {
 		...emptyDraft(),
 		name: 'g',
-		pens: tagIds.map((tagId) => ({ tagId, hubTag: null, colorSlot: null }))
+		pens: tagIds.map((tagId) => ({ tagId, hubTag: null, colorSlot: null, ...EMPTY_PEN_STYLE }))
 	};
 }
 
@@ -62,8 +62,8 @@ describe('下書きと保存の形（#393）', () => {
 			kind: 'trend',
 			attributes: { timeWindowSec: 1800 },
 			pens: [
-				{ tagId: 1, colorSlot: null },
-				{ tagId: 2, colorSlot: 5 }
+				{ tagId: 1, colorSlot: null, ...EMPTY_PEN_STYLE },
+				{ tagId: 2, colorSlot: 5, ...EMPTY_PEN_STYLE }
 			],
 			expectedRevision: 3
 		});
@@ -343,7 +343,7 @@ const hubRow = {
 };
 
 function hubPen(colorSlot: number | null = null) {
-	return { tagId: null, hubTag: hubRow, colorSlot };
+	return { tagId: null, hubTag: hubRow, colorSlot, ...EMPTY_PEN_STYLE };
 }
 
 describe('Hub のタグのペン（#1179 PR6b）', () => {
@@ -355,8 +355,8 @@ describe('Hub のタグのペン（#1179 PR6b）', () => {
 		const withHub = { ...draft, pens: [...draft.pens, hubPen(3)] };
 		const input = draftToInput(withHub);
 		expect(input.pens).toEqual([
-			{ tagId: 1, colorSlot: null },
-			{ hubTag: hubRow, colorSlot: 3 }
+			{ tagId: 1, colorSlot: null, ...EMPTY_PEN_STYLE },
+			{ hubTag: hubRow, colorSlot: 3, ...EMPTY_PEN_STYLE }
 		]);
 		expect(input.hubTagGroup).toEqual({ collectionGroupId: 9 });
 	});
@@ -432,7 +432,10 @@ describe('Hub のタグのペン（#1179 PR6b）', () => {
 	});
 
 	it('replacePenTag: タグを置き換えても色は保つ', () => {
-		const draft = { ...withPens(1, 2), pens: [{ tagId: 1, hubTag: null, colorSlot: 6 }] };
+		const draft = {
+			...withPens(1, 2),
+			pens: [{ tagId: 1, hubTag: null, colorSlot: 6, ...EMPTY_PEN_STYLE }]
+		};
 		const replaced = replacePenTag(draft, 0, hubPen(), target);
 		expect(replaced.pens[0]).toMatchObject({ tagId: null, hubTag: hubRow, colorSlot: 6 });
 		expect(replaced.hubTarget).toEqual(target);
@@ -476,5 +479,63 @@ describe('束（#1207・#1231 PR 5b）', () => {
 		const sorted = sortFieldErrors([{ field: 'bundle', message: '50 文字以内' }]);
 		expect(sorted.bundle).toEqual(['50 文字以内']);
 		expect(fieldErrorTabs(sorted)).toEqual({ settings: true, pens: false });
+	});
+});
+
+describe('ペンの属性の往復（#1207・#1231 PR 6a）', () => {
+	const styled: DisplayGroup = {
+		...group,
+		pens: [
+			{
+				tagId: 1,
+				colorSlot: 3,
+				label: '入口',
+				unit: '℃',
+				decimals: 2,
+				lineStyle: 'dashDot',
+				lineWidth: 2.5,
+				marker: 'diamond',
+				markerSize: 6,
+				axis: 'right',
+				yMin: -1,
+				yMax: 9
+			},
+			{ tagId: 2, colorSlot: null, ...EMPTY_PEN_STYLE }
+		]
+	};
+
+	it('読んだ属性を保存の本文にそのまま載せる（画面で保存し直しても消えない）', () => {
+		const draft = draftFromGroup(styled);
+		expect(draft.pens[0]).toMatchObject({ label: '入口', lineWidth: 2.5, axis: 'right', yMax: 9 });
+		const input = draftToInput(draft, styled.revision);
+		expect(input.pens).toEqual([styled.pens[0], styled.pens[1]]);
+	});
+
+	it('サーバーがキーを省いても null として送る', () => {
+		const bare = { ...group, pens: [{ tagId: 1, colorSlot: null }] } as unknown as DisplayGroup;
+		const input = draftToInput(draftFromGroup(bare));
+		expect(input.pens[0]).toEqual({ tagId: 1, colorSlot: null, ...EMPTY_PEN_STYLE });
+	});
+
+	it('属性の違いは未保存として拾い、同じなら拾わない', () => {
+		const baseline = draftFromGroup(styled);
+		expect(isDraftDirty(draftFromGroup(styled), baseline)).toBe(false);
+		for (const change of [{ label: '出口' }, { lineStyle: 'solid' as const }, { yMin: 0 }]) {
+			const pens = [{ ...baseline.pens[0], ...change }, baseline.pens[1]];
+			expect(isDraftDirty({ ...baseline, pens }, baseline)).toBe(true);
+		}
+	});
+
+	it('足したペン・タグを置き換えたペンの属性は全部 null（置き換えでも色だけ保つ）', () => {
+		const added = addPen(draftFromGroup(styled));
+		expect(added.pens[2]).toMatchObject(EMPTY_PEN_STYLE);
+		const draft = draftFromGroup(styled);
+		const replaced = replacePenTag(
+			draft,
+			0,
+			{ tagId: 9, hubTag: null, colorSlot: null, ...EMPTY_PEN_STYLE },
+			defaultHubTarget([])
+		);
+		expect(replaced.pens[0]).toMatchObject({ tagId: 9, colorSlot: 3, ...EMPTY_PEN_STYLE });
 	});
 });

@@ -50,7 +50,7 @@ import {
 	type TimeRange,
 	type TrendData
 } from '@banto-industrial/trend';
-import type { DisplayGroup } from '../banto/displayGroupsAdmin';
+import type { Pen, PenStyle } from '../banto/displayGroupsAdmin';
 import type { TagWithThresholds, ThresholdFields } from '../banto/tagThresholdsAdmin';
 import { formatValue, isBitTag } from './monitorLogic';
 
@@ -329,7 +329,25 @@ export interface TrendPenInfo {
 	/** bit のタグ（縦軸は 0〜1、小数桁は指定せず、値は数値の 0 / 1 のまま）。 */
 	isBit: boolean;
 	colorSlot: number;
+	/** ペンの属性の縦軸の側（`null` = 左）。bit でも効く。 */
+	axis: 'left' | 'right' | null;
+	/** ペンの属性の縦軸の最小・最大（`null` = 工学値レンジ）。bit のタグでは使わない（0〜1 固定）。 */
+	yMin: number | null;
+	yMax: number | null;
+	/** タグの工学値レンジ（`engLo < engHi` で両方有限のときだけ。縦軸の指定の無い側に使う）。 */
+	engRange: { min: number; max: number } | null;
 	thresholds: ThresholdFields | null;
+}
+
+/** タグの工学値レンジ。両方が有限で `engLo < engHi` のときだけ返す。 */
+export function tagEngRange(
+	tag: { engLo?: number | null; engHi?: number | null } | undefined
+): { min: number; max: number } | null {
+	const lo = tag?.engLo;
+	const hi = tag?.engHi;
+	if (typeof lo !== 'number' || typeof hi !== 'number') return null;
+	if (!Number.isFinite(lo) || !Number.isFinite(hi) || lo >= hi) return null;
+	return { min: lo, max: hi };
 }
 
 /**
@@ -338,18 +356,23 @@ export interface TrendPenInfo {
  * 読めなかったときに空にしたものをそのまま使う）。
  */
 export function trendPenInfos(
-	group: Pick<DisplayGroup, 'pens'>,
+	group: { pens: readonly (Pick<Pen, 'tagId' | 'colorSlot'> & Partial<PenStyle>)[] },
 	tags: readonly TagWithThresholds[]
 ): TrendPenInfo[] {
 	return group.pens.map((pen, index) => {
 		const tag = tags.find((t) => t.id === pen.tagId);
 		return {
 			tagId: pen.tagId,
-			name: tag?.name ?? `タグ ID ${pen.tagId}`,
-			unit: tag?.unit ? tag.unit : null,
-			decimals: tag ? tag.decimals : null,
+			// ペンの属性（#1207・#1231 PR 6a）: 凡例の名前・単位・小数桁は、あればタグの値より優先。
+			name: pen.label ?? tag?.name ?? `タグ ID ${pen.tagId}`,
+			unit: pen.unit ?? (tag?.unit ? tag.unit : null),
+			decimals: pen.decimals ?? (tag ? tag.decimals : null),
 			isBit: isBitTag(tag),
 			colorSlot: pen.colorSlot ?? index + 1,
+			axis: pen.axis ?? null,
+			yMin: pen.yMin ?? null,
+			yMax: pen.yMax ?? null,
+			engRange: tagEngRange(tag),
 			thresholds:
 				tag && hasThresholds(tag)
 					? {

@@ -1,6 +1,13 @@
 {
   "components": {
     "schemas": {
+      "Axis": {
+        "enum": [
+          "left",
+          "right"
+        ],
+        "type": "string"
+      },
       "CollectDailyReport": {
         "properties": {
           "day": {
@@ -1146,6 +1153,26 @@
         ],
         "type": "object"
       },
+      "LineStyle": {
+        "enum": [
+          "solid",
+          "dashed",
+          "dashDot",
+          "dashDotDot",
+          "none"
+        ],
+        "type": "string"
+      },
+      "Marker": {
+        "enum": [
+          "none",
+          "circle",
+          "square",
+          "triangle",
+          "diamond"
+        ],
+        "type": "string"
+      },
       "NewHubGroup": {
         "properties": {
           "name": {
@@ -1164,7 +1191,64 @@
       },
       "Pen": {
         "properties": {
+          "axis": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Axis"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "colorSlot": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "decimals": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lineStyle": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/LineStyle"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "lineWidth": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "marker": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Marker"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "markerSize": {
             "format": "int64",
             "type": [
               "integer",
@@ -1174,6 +1258,26 @@
           "tagId": {
             "format": "int64",
             "type": "integer"
+          },
+          "unit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "yMax": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "yMin": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
           }
         },
         "required": [
@@ -1183,7 +1287,20 @@
       },
       "PenPayload": {
         "properties": {
+          "axis": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "colorSlot": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "decimals": {
             "format": "int64",
             "type": [
               "integer",
@@ -1200,10 +1317,62 @@
               }
             ]
           },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lineStyle": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lineWidth": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "marker": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "markerSize": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "tagId": {
             "format": "int64",
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "unit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "yMax": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "yMin": {
+            "format": "double",
+            "type": [
+              "number",
               "null"
             ]
           }

@@ -22,6 +22,7 @@
 import type { TreeNode } from '@banto/tree-svelte';
 import type { HubStatus, HubTag } from '#lib/banto/hubAdmin.js';
 import { availabilityLabel, isRegistrableDataType } from '#lib/banto/hubRegistration.js';
+import { EMPTY_PEN_STYLE, type PenStyle } from '#lib/banto/displayGroupsAdmin.js';
 import type {
 	CollectionGroup,
 	HubTagRow,
@@ -402,16 +403,17 @@ export function penFromRow(row: PickerRow): {
 	hubTag: HubTagRow | null;
 	hubSource: { connection: string; group: string } | null;
 	colorSlot: null;
-} {
+} & PenStyle {
 	const pick = row.pick;
 	if (pick === null) throw new Error('追加できない行です');
 	return pick.kind === 'tag'
-		? { tagId: pick.tagId, hubTag: null, hubSource: null, colorSlot: null }
+		? { tagId: pick.tagId, hubTag: null, hubSource: null, colorSlot: null, ...EMPTY_PEN_STYLE }
 		: {
 				tagId: null,
 				hubTag: pick.hubTag,
 				hubSource: { connection: pick.connection, group: pick.group },
-				colorSlot: null
+				colorSlot: null,
+				...EMPTY_PEN_STYLE
 			};
 }
 
