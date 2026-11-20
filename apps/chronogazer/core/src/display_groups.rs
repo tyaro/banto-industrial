@@ -175,7 +175,7 @@ pub const MAX_PEN_DECIMALS: i64 = 6;
 /// ペンの線幅（px）の範囲。範囲内の 0.5 刻みだけ。
 pub const LINE_WIDTH_RANGE: (f64, f64) = (1.0, 4.0);
 
-/// `lineWidth` が `null` のときの線幅（px）。描画は PR 6b。TS 側
+/// `lineWidth` が `null` のときの線幅（px）。TS 側
 /// （`displayGroupsAdmin.ts` の `DEFAULT_LINE_WIDTH`）と同じ値にする。
 pub const DEFAULT_LINE_WIDTH: f64 = 1.5;
 

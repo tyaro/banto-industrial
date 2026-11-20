@@ -15,6 +15,8 @@ import {
 	draftFromGroup,
 	draftProblems,
 	draftToInput,
+	parseAxisText,
+	axisText,
 	fieldErrorTabs,
 	effectiveColorSlot,
 	emptyDraft,
@@ -537,5 +539,68 @@ describe('ペンの属性の往復（#1207・#1231 PR 6a）', () => {
 			defaultHubTarget([])
 		);
 		expect(replaced.pens[0]).toMatchObject({ tagId: 9, colorSlot: 3, ...EMPTY_PEN_STYLE });
+	});
+});
+
+describe('ペンの属性の入力（#1207・#1231 PR 6b-2）', () => {
+	const pen = (extra: Record<string, unknown>) => ({
+		...withPens(1),
+		pens: [{ ...withPens(1).pens[0], ...extra }]
+	});
+
+	it('縦軸の入力の文字: 空は null、途中の文字は黙って null にせず保存を止める', () => {
+		expect(parseAxisText('')).toBeNull();
+		expect(parseAxisText(' 1.5 ')).toBe(1.5);
+		expect(parseAxisText('-')).toBe('invalid');
+		expect(parseAxisText('1e')).toBe('invalid');
+		expect(parseAxisText('Infinity')).toBe('invalid');
+		expect(draftProblems(pen({ yMinText: '-' }))).toContain(
+			'ペン 1 の縦軸の最小が数ではありません'
+		);
+		expect(draftProblems(pen({ yMaxText: '1e' }))).toContain(
+			'ペン 1 の縦軸の最大が数ではありません'
+		);
+		expect(draftProblems(pen({ yMinText: '1', yMaxText: '2' }))).toEqual([]);
+	});
+
+	it('最小 ≥ 最大は止める（値でも入力の文字でも）', () => {
+		expect(draftProblems(pen({ yMinText: '5', yMaxText: '5' }))).toHaveLength(1);
+		expect(draftProblems(pen({ yMin: 9, yMax: 3 }))).toHaveLength(1);
+		expect(draftProblems(pen({ yMinText: '', yMaxText: '5' }))).toEqual([]);
+	});
+
+	it('入力して元の値に戻したら未保存ではない。往復で属性が変わらない', () => {
+		const base = draftFromGroup({
+			...group,
+			pens: [{ tagId: 1, colorSlot: null, ...EMPTY_PEN_STYLE, yMin: 1.5, label: 'A' }]
+		});
+		expect(axisText(base.pens[0], 'yMin')).toBe('1.5');
+		const edited = { ...base, pens: [{ ...base.pens[0], yMinText: '2' }] };
+		expect(isDraftDirty(edited, base)).toBe(true);
+		const back = { ...base, pens: [{ ...base.pens[0], yMinText: '1.50' }] };
+		expect(isDraftDirty(back, base)).toBe(false);
+		const partial = { ...base, pens: [{ ...base.pens[0], yMinText: '-' }] };
+		expect(isDraftDirty(partial, base)).toBe(true);
+		expect(draftToInput(base).pens[0]).toMatchObject({ yMin: 1.5, label: 'A', yMax: null });
+		expect(draftToInput(edited).pens[0]).toMatchObject({ yMin: 2 });
+	});
+
+	it('凡例の名前・単位は trim して空は null、文字数（code point）の上限で止める', () => {
+		const input = draftToInput(pen({ label: '  温度 ', unit: '   ' }));
+		expect(input.pens[0]).toMatchObject({ label: '温度', unit: null });
+		expect(draftProblems(pen({ label: '😀'.repeat(64) }))).toEqual([]);
+		expect(draftProblems(pen({ label: '😀'.repeat(65) }))).toHaveLength(1);
+		expect(draftProblems(pen({ unit: 'a'.repeat(17) }))).toHaveLength(1);
+		expect(isDraftDirty(pen({ label: ' ' }), pen({ label: null }))).toBe(false);
+	});
+
+	it('属性の field_errors はペンの行に出る（other に落とさない）', () => {
+		const sorted = sortFieldErrors([
+			{ field: 'pens[1].label', message: 'a' },
+			{ field: 'pens[1].yMax', message: 'b' },
+			{ field: 'pens[0].markerSize', message: 'c' }
+		]);
+		expect(sorted.penRows).toEqual({ 1: ['a', 'b'], 0: ['c'] });
+		expect(sorted.other).toEqual([]);
 	});
 });

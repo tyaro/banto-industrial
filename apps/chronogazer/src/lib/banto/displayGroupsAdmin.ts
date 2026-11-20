@@ -36,7 +36,7 @@ export type PenLineStyle = 'solid' | 'dashed' | 'dashDot' | 'dashDotDot' | 'none
 export type PenMarker = 'none' | 'circle' | 'square' | 'triangle' | 'diamond';
 export type PenAxis = 'left' | 'right';
 
-/** `lineWidth` が `null` のときの線幅（px）。Rust の `DEFAULT_LINE_WIDTH` と同じ値。描画は PR 6b。 */
+/** `lineWidth` が `null` のときの線幅（px）。Rust の `DEFAULT_LINE_WIDTH` と同じ値。 */
 export const DEFAULT_LINE_WIDTH = 1.5;
 /** `markerSize` が `null` のときの大きさ（px）。Rust の `DEFAULT_MARKER_SIZE` と同じ値。 */
 export const DEFAULT_MARKER_SIZE = 4;
