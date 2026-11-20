@@ -4,6 +4,7 @@ import {
 	afterFreeTrendSave,
 	afterFreeTrendSaveFailure,
 	shouldDiscardSavedDraft,
+	applyPenNumberText,
 	canCreateFreeTrend,
 	classifySaveFailure,
 	clearDraft,
@@ -19,14 +20,21 @@ import {
 	loadDraft,
 	movePenAt,
 	parseDraft,
+	penStyleRowProblems,
 	penToInput,
 	pruneDrafts,
 	removePenAt,
 	remainingPens,
 	saveDraft,
 	setPenColor,
+	setPenStyle,
+	emptyFreeTrendFieldErrors,
 	sortFreeTrendFieldErrors,
+	penRowErrorsByTag,
+	resolvePenRowErrors,
+	withoutPenErrors,
 	usedTagKeys,
+	withoutPenTexts,
 	type DraftStorage,
 	type FreeTrendDraft
 } from './freeTrendDraft';
@@ -99,6 +107,14 @@ describe('draftFromFreeTrend / draftToInput', () => {
 	it('FreeTrend の余分なキーを持ち込まない', () => {
 		const pen = penToInput({ ...styled, extra: 1 } as never);
 		expect(Object.keys(pen)).not.toContain('extra');
+	});
+	it('保存の入力では凡例の名前・単位の前後の空白を落とし、空は null（8b2b）', () => {
+		const draft = { ...emptyDraft(), pens: [{ ...styled, label: ' 温度 ', unit: '  ' }] };
+		const input = draftToInput(draft, false);
+		expect(input.pens[0].label).toBe('温度');
+		expect(input.pens[0].unit).toBeNull();
+		// 下書きの中の空白はそのまま（入力の途中を消さない）。
+		expect(draft.pens[0].label).toBe(' 温度 ');
 	});
 });
 
@@ -469,6 +485,38 @@ describe('保存の失敗', () => {
 		expect(sorted.penRows[2]).toEqual(['r2', 'r2b']);
 		expect(sorted.other).toEqual(['o']);
 	});
+	it('行の誤りはタグ ID に写り、並べ替えの後も同じペンに出る', () => {
+		const rows = { 0: ['a の誤り'], 2: ['c の誤り'] };
+		const before = [{ tagId: 10 }, { tagId: 20 }, { tagId: 30 }];
+		const byTag = penRowErrorsByTag(rows, before).byTag;
+		expect(byTag).toEqual({ 10: ['a の誤り'], 30: ['c の誤り'] });
+		// 10 を下へ動かしても、誤りは 10 に付いたまま（20 には出ない）。
+		const moved = [{ tagId: 20 }, { tagId: 10 }, { tagId: 30 }];
+		const errors = resolvePenRowErrors({ ...emptyFreeTrendFieldErrors(), penRows: rows }, before);
+		expect(errors.penRows).toEqual({});
+		expect(errors.penErrorsByTag[10]).toEqual(['a の誤り']);
+		expect(moved.map((p) => errors.penErrorsByTag[p.tagId] ?? [])).toEqual([
+			[],
+			['a の誤り'],
+			['c の誤り']
+		]);
+	});
+	it('範囲外の行番号の誤りは捨てずに全体の誤りへ回す', () => {
+		const errors = resolvePenRowErrors(
+			{ ...emptyFreeTrendFieldErrors(), pens: ['既存'], penRows: { 5: ['はみ出し'] } },
+			[{ tagId: 1 }]
+		);
+		expect(errors.pens).toEqual(['既存', 'はみ出し']);
+		expect(errors.penErrorsByTag).toEqual({});
+	});
+	it('ペンを外すとそのタグ ID の誤りも消える', () => {
+		const errors = resolvePenRowErrors(
+			{ ...emptyFreeTrendFieldErrors(), penRows: { 0: ['x'], 1: ['y'] } },
+			[{ tagId: 1 }, { tagId: 2 }]
+		);
+		expect(withoutPenErrors(errors, 1).penErrorsByTag).toEqual({ 2: ['y'] });
+		expect(withoutPenErrors(errors, 9)).toBe(errors);
+	});
 	it('版の食い違い・検証・その他を分類する', () => {
 		const conflict = {
 			body: { kind: 'validation', field_errors: [{ field: 'expectedRevision', message: 'x' }] }
@@ -486,5 +534,46 @@ describe('保存の失敗', () => {
 			message: 'boom'
 		});
 		expect(classifySaveFailure(null, isConflict, fallback).kind).toBe('other');
+	});
+});
+
+describe('ペンの属性（8b2b）', () => {
+	const base = (): FreeTrendDraft => ({
+		...emptyDraft(),
+		pens: [styled, penToInput({ tagId: 9, colorSlot: null } as never)]
+	});
+	it('タグ ID で引いて属性を変える。空の名前・単位は null。無いタグは何もしない', () => {
+		const d = base();
+		const next = setPenStyle(d, 9, { lineStyle: 'dashed', limitLines: true, label: '' });
+		expect(next.pens[1]).toMatchObject({ lineStyle: 'dashed', limitLines: true, label: null });
+		expect(next.pens[0]).toEqual(styled);
+		expect(setPenStyle(d, 5, { unit: '' }).pens[0].unit).toBeNull();
+		expect(setPenStyle(d, 99, { lineStyle: 'dashed' })).toBe(d);
+	});
+	it('数の欄は読めた値だけを入れる。読めない文字・同じ値は下書きを変えない', () => {
+		const d = base();
+		expect(applyPenNumberText(d, 9, 'yMin', ' 1.5 ').pens[1].yMin).toBe(1.5);
+		expect(applyPenNumberText(d, 5, 'limitH', '').pens[0].limitH).toBeNull();
+		expect(applyPenNumberText(d, 9, 'yMin', '-')).toBe(d);
+		expect(applyPenNumberText(d, 5, 'yMax', '100')).toBe(d);
+		expect(applyPenNumberText(d, 99, 'yMin', '1')).toBe(d);
+	});
+	it('保存の前の誤りは行ごと（入力の文字を含めて、表示グループと同じ規則）', () => {
+		const d = base();
+		expect(penStyleRowProblems(d.pens, {})).toEqual({});
+		expect(penStyleRowProblems(d.pens, { 9: { yMin: 'abc' } })).toEqual({
+			1: ['ペン 2 の縦軸の最小が数ではありません']
+		});
+		expect(penStyleRowProblems(d.pens, { 5: { yMin: '200' } })[0]).toEqual([
+			'ペン 1 の縦軸は、最小を最大より小さくしてください'
+		]);
+		expect(penStyleRowProblems([{ ...styled, limitH: 95 }], {})[0]).toEqual([
+			'ペン 1 の管理線は、LL ≦ L ≦ H ≦ HH の順にしてください（H が HH より大きい）'
+		]);
+	});
+	it('ペンを外したら、そのタグの入力の文字を捨てる', () => {
+		expect(withoutPenTexts({ 5: { yMin: 'x' }, 9: { yMax: '1' } }, 5)).toEqual({
+			9: { yMax: '1' }
+		});
 	});
 });

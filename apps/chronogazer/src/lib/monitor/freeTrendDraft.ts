@@ -4,15 +4,23 @@
  *
  * - 下書きは **sessionStorage**（タブを閉じるまで。再読み込み・画面の移動では残る。2026-11-20
  *   オーナー決定）に、対象ごと（既存は ID、新規は `new`）に 1 つ。ペンの属性（線種・線幅・
- *   マーカー・管理線・bit など）もそのまま持つ（編集欄は 8b2b。保存済みの属性を下書きと保存で
- *   落とさない）。
+ *   マーカー・管理線・bit など）もそのまま持つ（保存済みの属性を下書きと保存で落とさない）。
+ *   属性の編集欄（8b2b）の数の欄の入力の文字は下書きに入れない（数として読めた値だけが入る。
+ *   文字は画面の状態に持つ）。
  * - 読み込みは**黙って捨てる**（壊れた JSON・形の違い・上限超え・型違いは `null`。例外を投げない）。
  *   ストレージのアクセスが投げても表示は続ける。
  */
 import { MAX_FREE_TREND_NAME_CHARS, MAX_PENS_PER_FREE_TREND } from '../banto/freeTrendsAdmin';
 import type { FreeTrend, FreeTrendInput, FreeTrendPenInput } from '../banto/freeTrendsAdmin';
-import type { Pen } from '../banto/displayGroupsAdmin';
+import type { Pen, PenStyle } from '../banto/displayGroupsAdmin';
 import { DEFAULT_TREND_WINDOW_SEC, isTrendWindowSec } from './trendLogic';
+import {
+	parseAxisText,
+	penStyleProblems,
+	styleOf,
+	type PenNumberField,
+	type PenNumberTexts
+} from '../components/penStyleEditor';
 
 /** 下書きの対象。既存の自由トレンドは ID、新規は `'new'`。 */
 export type DraftTarget = number | 'new';
@@ -91,12 +99,16 @@ export function draftFromFreeTrend(trend: FreeTrend): FreeTrendDraft {
 	};
 }
 
-/** 保存の入力へ変える。`expectedRevision` は更新のときだけ付ける（属性はそのまま送る）。 */
+/**
+ * 保存の入力へ変える。`expectedRevision` は更新のときだけ付ける。属性は表示グループと同じ
+ * `styleOf` で整える（凡例の名前・単位の前後の空白を落とし、空は `null`。8b2b）。下書きの
+ * 中では空白を残す（入力の途中の空白を消さないため）。
+ */
 export function draftToInput(draft: FreeTrendDraft, withRevision: boolean): FreeTrendInput {
 	const input: FreeTrendInput = {
 		name: draft.name,
 		timeWindowSec: draft.timeWindowSec,
-		pens: draft.pens.map(penToInput)
+		pens: draft.pens.map((pen) => ({ ...penToInput(pen), ...styleOf(pen) }))
 	};
 	if (withRevision && draft.baseRevision !== null) input.expectedRevision = draft.baseRevision;
 	return input;
@@ -353,6 +365,66 @@ export function setPenColor(
 	};
 }
 
+// --- ペンの属性（8b2b） -------------------------------------------------------
+
+/**
+ * ペン（タグ ID で引く。自由トレンドでは同じタグを 2 本にしない）の属性を変える。凡例の名前・
+ * 単位の空は `null`（既定。元と同じになったら下書きを持たないため）。
+ */
+export function setPenStyle(
+	draft: FreeTrendDraft,
+	tagId: number,
+	patch: Partial<PenStyle>
+): FreeTrendDraft {
+	if (!draft.pens.some((pen) => pen.tagId === tagId)) return draft;
+	const next: Partial<PenStyle> = { ...patch };
+	if (next.label === '') next.label = null;
+	if (next.unit === '') next.unit = null;
+	return {
+		...draft,
+		pens: draft.pens.map((pen) => (pen.tagId === tagId ? { ...pen, ...next } : pen))
+	};
+}
+
+/**
+ * 数の欄の入力の文字を下書きに当てる。数として読めた値（空 = `null`）だけを入れ、読めない文字の
+ * ときは下書きを変えない（文字は画面が持ち、`penStyleRowProblems` が保存を止める）。
+ */
+export function applyPenNumberText(
+	draft: FreeTrendDraft,
+	tagId: number,
+	field: PenNumberField,
+	text: string
+): FreeTrendDraft {
+	const parsed = parseAxisText(text);
+	const pen = draft.pens.find((p) => p.tagId === tagId);
+	if (parsed === 'invalid' || pen === undefined || pen[field] === parsed) return draft;
+	return setPenStyle(draft, tagId, { [field]: parsed });
+}
+
+/** 保存の前に止めるペンの属性の誤り（行ごと、0 始まり。誤りの無い行は持たない）。 */
+export function penStyleRowProblems(
+	pens: readonly FreeTrendPenInput[],
+	texts: Readonly<Record<number, PenNumberTexts>>
+): Record<number, string[]> {
+	const rows: Record<number, string[]> = {};
+	pens.forEach((pen, index) => {
+		const problems = penStyleProblems({ ...pen, texts: texts[pen.tagId] }, index + 1);
+		if (problems.length > 0) rows[index] = problems;
+	});
+	return rows;
+}
+
+/** 数の欄の入力の文字から、指定したタグの分を外す（ペンを外したとき）。 */
+export function withoutPenTexts(
+	texts: Readonly<Record<number, PenNumberTexts>>,
+	tagId: number
+): Record<number, PenNumberTexts> {
+	const next = { ...texts };
+	delete next[tagId];
+	return next;
+}
+
 // --- 権限・入口 -------------------------------------------------------------
 
 /** 新しく作れるか（画面の出し分け。サーバーも断る）。 */
@@ -530,12 +602,60 @@ export interface FreeTrendFieldErrors {
 	pens: string[];
 	/** ペンの行ごと（0 始まり）。 */
 	penRows: Record<number, string[]>;
+	/**
+	 * ペンの行ごとの誤りを、タグ ID をキーにして持ち直したもの（`resolvePenRowErrors` が作る）。
+	 * 行番号のままだと、ペンを動かす・外した後に別のペンへ出てしまう。画面はこちらを引く。
+	 */
+	penErrorsByTag: Record<number, string[]>;
 	/** どの欄にも出せないもの。 */
 	other: string[];
 }
 
 export function emptyFreeTrendFieldErrors(): FreeTrendFieldErrors {
-	return { name: [], timeWindowSec: [], pens: [], penRows: {}, other: [] };
+	return { name: [], timeWindowSec: [], pens: [], penRows: {}, penErrorsByTag: {}, other: [] };
+}
+
+/**
+ * 行番号の誤りを、その時点のペンの並びでタグ ID に写す。範囲外の行番号は捨てずに全体の誤り
+ * （`pens`）へ回す。
+ */
+export function penRowErrorsByTag(
+	rows: Record<number, string[]>,
+	pens: readonly { tagId: number }[]
+): { byTag: Record<number, string[]>; orphans: string[] } {
+	const byTag: Record<number, string[]> = {};
+	const orphans: string[] = [];
+	for (const [key, messages] of Object.entries(rows)) {
+		const pen = pens[Number(key)];
+		if (pen) byTag[pen.tagId] = [...(byTag[pen.tagId] ?? []), ...messages];
+		else orphans.push(...messages);
+	}
+	return { byTag, orphans };
+}
+
+/** `penRows` を `penErrorsByTag` に移す（`penRows` は空にする）。誤りを立てた時点のペンの並びで呼ぶ。 */
+export function resolvePenRowErrors(
+	errors: FreeTrendFieldErrors,
+	pens: readonly { tagId: number }[]
+): FreeTrendFieldErrors {
+	const { byTag, orphans } = penRowErrorsByTag(errors.penRows, pens);
+	return {
+		...errors,
+		pens: [...errors.pens, ...orphans],
+		penRows: {},
+		penErrorsByTag: byTag
+	};
+}
+
+/** ペンを外したとき、そのタグ ID の誤りも捨てる。 */
+export function withoutPenErrors(
+	errors: FreeTrendFieldErrors,
+	tagId: number
+): FreeTrendFieldErrors {
+	if (!(tagId in errors.penErrorsByTag)) return errors;
+	const rest = { ...errors.penErrorsByTag };
+	delete rest[tagId];
+	return { ...errors, penErrorsByTag: rest };
 }
 
 /** サーバーの `field_errors` を欄ごとに振り分ける（`pens[i].<項目>`・`name`・`timeWindowSec`・`pens`）。 */
