@@ -824,6 +824,62 @@
           }
         ]
       },
+      "DisplayGroupUpdatePayload": {
+        "description": "更新では `bundle` を必ず送る（束を保つときは読んだ値、外すときは null）。",
+        "properties": {
+          "attributes": {
+            "type": "object"
+          },
+          "bundle": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expectedRevision": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "hubTagGroup": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HubTagGroupPayload"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "pens": {
+            "items": {
+              "$ref": "#/components/schemas/PenPayload"
+            },
+            "type": "array"
+          },
+          "sortOrder": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "bundle",
+          "kind",
+          "name"
+        ],
+        "type": "object"
+      },
       "DisplayKind": {
         "enum": [
           "trend",
@@ -3084,7 +3140,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/DisplayGroupPayload"
+                "$ref": "#/components/schemas/DisplayGroupUpdatePayload"
               }
             }
           },

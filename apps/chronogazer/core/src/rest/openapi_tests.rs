@@ -286,3 +286,49 @@ async fn display_group_response_keys_match_the_schema() {
         .collect();
     assert_eq!(actual_keys, schema_keys);
 }
+
+/// 表示グループの更新（PUT）の入力は作成（POST）と別スキーマで、`bundle` だけが
+/// 更新で必須（キーが無い更新は 422 になる）。プロパティは作成と食い違わない。
+#[test]
+fn display_group_update_schema_requires_bundle_only() {
+    let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
+    let schemas = &doc["components"]["schemas"];
+    let create = &schemas["DisplayGroupPayload"];
+    let update = &schemas["DisplayGroupUpdatePayload"];
+    let required = |schema: &Value| -> BTreeSet<String> {
+        schema["required"]
+            .as_array()
+            .expect("required")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    };
+    let create_required = required(create);
+    let update_required = required(update);
+    assert!(!create_required.contains("bundle"));
+    assert!(update_required.contains("bundle"));
+    let mut expected = create_required.clone();
+    expected.insert("bundle".to_string());
+    assert_eq!(update_required, expected);
+    // プロパティは完全に同じ（別の型を持たないので、ずれたらここで落ちる）。
+    assert_eq!(create["properties"], update["properties"]);
+    for schema in [create, update] {
+        let ty = schema["properties"]["bundle"]["type"].to_string();
+        assert!(ty.contains("string") && ty.contains("null"), "{ty}");
+    }
+    // 操作の参照先: POST は作成、PUT は更新。
+    let body_ref = |op: &Value| {
+        op["requestBody"]["content"]["application/json"]["schema"]["$ref"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(
+        body_ref(&doc["paths"]["/api/display-groups"]["post"]),
+        "#/components/schemas/DisplayGroupPayload"
+    );
+    assert_eq!(
+        body_ref(&doc["paths"]["/api/display-groups/{id}"]["put"]),
+        "#/components/schemas/DisplayGroupUpdatePayload"
+    );
+}
