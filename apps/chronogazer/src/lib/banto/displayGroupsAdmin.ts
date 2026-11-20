@@ -53,6 +53,8 @@ export type HubTagGroupInput =
 export interface DisplayGroup {
 	id: number;
 	name: string;
+	/** 束の名前（`null` = 束なし）。同じ名前のグループが 1 つの束になる。 */
+	bundle: string | null;
 	sortOrder: number;
 	kind: DisplayKind;
 	attributes: DisplayAttributes;
@@ -69,6 +71,8 @@ export type DisplayGroupSaveResponse = DisplayGroup & { registeredTags?: Tag[] }
 /** Mirrors `chronogazer_core::display_groups::DisplayGroupPayload`. */
 export interface DisplayGroupInput {
 	name: string;
+	/** 束の名前（任意、50 文字以内）。空は `null`（束なし）。更新でも書き込まれる。 */
+	bundle?: string | null;
 	/** 作成のときだけ使う（省略で末尾）。**更新では無視される**（並びは `reorderDisplayGroups` だけで変える）。この画面は送らない。 */
 	sortOrder?: number;
 	kind: DisplayKind;

@@ -31,6 +31,8 @@ import { penColorVar } from '@banto-industrial/trend';
 export const MAX_DISPLAY_GROUPS = 36;
 /** 1 グループのペンの上限（trend-design.md §6。旧 8 → 16）。 */
 export const MAX_PENS = 16;
+/** 束の名前の最大文字数（`chronogazer_core::display_groups::MAX_BUNDLE_CHARS`）。 */
+export const MAX_BUNDLE_CHARS = 50;
 /**
  * 色の枠の数。1〜8 は banto チャートの系列色（`--banto-chart-N`）、9〜16 は industrial の
  * テーマの `--bi-chart-N`（trend-design.md §9 Q4）。
@@ -79,6 +81,8 @@ export interface PenDraft {
 
 export interface GroupDraft {
 	name: string;
+	/** 束の名前（任意。空は束なし）。 */
+	bundle: string;
 	kind: DisplayKind;
 	/** トレンドのときだけ保存に使う（他の種別では送らない）。 */
 	timeWindowSec: number;
@@ -93,6 +97,7 @@ export interface GroupDraft {
 export function emptyDraft(): GroupDraft {
 	return {
 		name: '',
+		bundle: '',
 		kind: 'trend',
 		timeWindowSec: DEFAULT_TIME_WINDOW_SEC,
 		pens: [],
@@ -121,6 +126,7 @@ export function penKey(pen: Pick<PenDraft, 'tagId' | 'hubTag'>): string | null {
 export function draftFromGroup(group: DisplayGroup): GroupDraft {
 	return {
 		name: group.name,
+		bundle: group.bundle ?? '',
 		kind: group.kind,
 		timeWindowSec: group.attributes.timeWindowSec ?? DEFAULT_TIME_WINDOW_SEC,
 		pens: group.pens.map((pen) => ({ tagId: pen.tagId, hubTag: null, colorSlot: pen.colorSlot })),
@@ -135,6 +141,7 @@ export function draftFromGroup(group: DisplayGroup): GroupDraft {
 export function draftToInput(draft: GroupDraft, expectedRevision?: number): DisplayGroupInput {
 	const input: DisplayGroupInput = {
 		name: draft.name,
+		bundle: draft.bundle.trim() === '' ? null : draft.bundle.trim(),
 		kind: draft.kind,
 		attributes: draft.kind === 'trend' ? { timeWindowSec: draft.timeWindowSec } : {},
 		pens: draft.pens.map((pen): PenInput =>
@@ -158,6 +165,7 @@ export function draftToInput(draft: GroupDraft, expectedRevision?: number): Disp
 function draftKey(draft: GroupDraft): string {
 	return JSON.stringify({
 		name: draft.name,
+		bundle: draft.bundle.trim(),
 		kind: draft.kind,
 		timeWindowSec: draft.kind === 'trend' ? draft.timeWindowSec : null,
 		pens: draft.pens.map((pen) => [penKey(pen), pen.colorSlot]),
@@ -358,6 +366,7 @@ export interface FieldErrorLike {
 /** サーバーの `field_errors` を、画面のどこに出すかで振り分けたもの。 */
 export interface SortedFieldErrors {
 	name: string[];
+	bundle: string[];
 	kind: string[];
 	timeWindowSec: string[];
 	/** ペンの数など、ペンの一覧全体への誤り。 */
@@ -378,6 +387,7 @@ const HUB_TAG_GROUP_FIELD = /^hubTagGroup(\..+)?$/;
 export function sortFieldErrors(fieldErrors: readonly FieldErrorLike[]): SortedFieldErrors {
 	const sorted: SortedFieldErrors = {
 		name: [],
+		bundle: [],
 		kind: [],
 		timeWindowSec: [],
 		pens: [],
@@ -392,6 +402,7 @@ export function sortFieldErrors(fieldErrors: readonly FieldErrorLike[]): SortedF
 			const row = Number(pen[1]);
 			(sorted.penRows[row] ??= []).push(fe.message);
 		} else if (fe.field === 'name') sorted.name.push(fe.message);
+		else if (fe.field === 'bundle') sorted.bundle.push(fe.message);
 		else if (fe.field === 'kind') sorted.kind.push(fe.message);
 		else if (fe.field === 'attributes.timeWindowSec') sorted.timeWindowSec.push(fe.message);
 		else if (fe.field === 'pens') sorted.pens.push(fe.message);
@@ -412,7 +423,11 @@ export function emptyFieldErrors(): SortedFieldErrors {
  */
 export function fieldErrorTabs(errors: SortedFieldErrors): { settings: boolean; pens: boolean } {
 	return {
-		settings: errors.name.length > 0 || errors.kind.length > 0 || errors.timeWindowSec.length > 0,
+		settings:
+			errors.name.length > 0 ||
+			errors.bundle.length > 0 ||
+			errors.kind.length > 0 ||
+			errors.timeWindowSec.length > 0,
 		pens:
 			errors.pens.length > 0 ||
 			errors.hubTagGroup.length > 0 ||

@@ -72,6 +72,7 @@ async fn service_with_tags(n: usize) -> (DisplayGroupService, TagService, Vec<i6
 pub(crate) fn payload(name: &str, kind: &str, tag_ids: &[i64]) -> DisplayGroupPayload {
     DisplayGroupPayload {
         name: name.to_string(),
+        bundle: None,
         sort_order: None,
         kind: kind.to_string(),
         attributes: Map::new(),
@@ -219,6 +220,7 @@ async fn the_response_round_trips_as_a_payload() {
         json!({
             "id": created.id,
             "name": "往復",
+            "bundle": null,
             "sortOrder": 0,
             "kind": "trend",
             "attributes": { "timeWindowSec": 1800 },
@@ -971,4 +973,46 @@ async fn a_pen_needs_exactly_one_of_tag_id_and_hub_tag() {
     let err = svc.create_with_hub_tags(&reg, &neither).await.unwrap_err();
     assert_eq!(fields(&err), ["pens[1]"]);
     assert!(svc.list().await.unwrap().is_empty());
+}
+
+/// 束は作成・更新で往復し、空白は除かれ、空は束なしに戻り、更新（PUT）が書いて
+/// 版を進める（#1207・#1231 PR 5b）。
+#[tokio::test]
+async fn bundle_round_trips_trims_and_clears_through_create_and_update() {
+    let (svc, _tags, ids) = service_with_tags(1).await;
+    let mut p = payload("束あり", "trend", &ids);
+    p.bundle = Some("  ライン A  ".to_string());
+    let created = svc.create(&p).await.expect("create");
+    assert_eq!(created.bundle.as_deref(), Some("ライン A"));
+    assert_eq!(
+        svc.get(created.id).await.expect("get").bundle.as_deref(),
+        Some("ライン A")
+    );
+    assert_eq!(
+        svc.list().await.expect("list")[0].bundle.as_deref(),
+        Some("ライン A")
+    );
+
+    p.bundle = Some("ライン B".to_string());
+    p.expected_revision = Some(created.revision);
+    let updated = svc.update(created.id, &p).await.expect("update");
+    assert_eq!(updated.bundle.as_deref(), Some("ライン B"));
+    assert_eq!(updated.revision, created.revision + 1);
+
+    p.bundle = Some("   ".to_string());
+    p.expected_revision = Some(updated.revision);
+    let cleared = svc.update(created.id, &p).await.expect("clear");
+    assert_eq!(cleared.bundle, None);
+}
+
+#[tokio::test]
+async fn bundle_is_limited_to_fifty_chars() {
+    let (svc, _tags, ids) = service_with_tags(1).await;
+    let mut p = payload("束の長さ", "trend", &ids);
+    p.bundle = Some("あ".repeat(51));
+    let err = svc.create(&p).await.expect_err("51 chars");
+    assert_eq!(fields(&err), vec!["bundle".to_string()]);
+    p.bundle = Some("あ".repeat(50));
+    let created = svc.create(&p).await.expect("50 chars");
+    assert_eq!(created.bundle.map(|b| b.chars().count()), Some(50));
 }

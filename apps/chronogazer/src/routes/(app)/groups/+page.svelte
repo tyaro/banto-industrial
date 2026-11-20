@@ -130,6 +130,7 @@
 		COLOR_SLOTS,
 		KIND_OPTIONS,
 		MAX_DISPLAY_GROUPS,
+		MAX_BUNDLE_CHARS,
 		MAX_PENS,
 		DEFAULT_HUB_GROUP_NAME,
 		TIME_WINDOW_OPTIONS,
@@ -267,6 +268,10 @@
 	}
 
 	/** Hub 接続の下の収集グループ（`hubTag` の登録先の候補）と、登録先の既定。 */
+	/** 既存の束の名前（入力欄の候補。重複なし、並びは一覧の順）。 */
+	const bundleNames = $derived([
+		...new Set((groups ?? []).flatMap((group) => (group.bundle === null ? [] : [group.bundle])))
+	]);
 	const hubGroups = $derived(hubGroupsOf(connections, collectionGroups));
 	const fallbackTarget = $derived(defaultHubTarget(hubGroups));
 
@@ -1232,6 +1237,9 @@
 													disabled={busy}
 												>
 													<span class="group-name">{group.name}</span>
+													{#if group.bundle !== null}
+														<span class="group-bundle" title="束">{group.bundle}</span>
+													{/if}
 													<span class="group-meta"
 														>{kindLabel(group.kind)}・ペン {group.pens.length} 本</span
 													>
@@ -1592,6 +1600,27 @@
 											</label>
 
 											<label class="field">
+												<span>束（任意）</span>
+												<input
+													type="text"
+													maxlength={MAX_BUNDLE_CHARS}
+													list="group-bundle-names"
+													bind:value={draft.bundle}
+												/>
+												<datalist id="group-bundle-names">
+													{#each bundleNames as bundle (bundle)}
+														<option value={bundle}></option>
+													{/each}
+												</datalist>
+												<span class="note"
+													>同じ名前の束を付けたグループは、監視画面で 1 つの束にまとまります。</span
+												>
+												{#each fieldErrors.bundle as message, i (i)}
+													<span class="field-error">{message}</span>
+												{/each}
+											</label>
+
+											<label class="field">
 												<span>表示種別</span>
 												<select
 													value={draft.kind}
@@ -1846,6 +1875,19 @@
 
 	.group-list li.selected .group-open {
 		border-color: var(--banto-primary);
+	}
+
+	.group-bundle {
+		flex: none;
+		max-width: 8rem;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		padding: 0 0.4rem;
+		border: 1px solid var(--banto-border);
+		border-radius: 999px;
+		color: var(--banto-text-muted);
+		font-size: 0.75rem;
 	}
 
 	.group-meta {

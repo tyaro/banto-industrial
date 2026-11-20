@@ -710,6 +710,12 @@
           "attributes": {
             "$ref": "#/components/schemas/DisplayAttributes"
           },
+          "bundle": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "format": "int64",
             "type": "integer"
@@ -750,6 +756,12 @@
         "properties": {
           "attributes": {
             "type": "object"
+          },
+          "bundle": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "expectedRevision": {
             "format": "int64",

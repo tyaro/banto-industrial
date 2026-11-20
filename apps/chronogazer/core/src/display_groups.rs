@@ -10,7 +10,7 @@
 //! ```json
 //! {
 //!   "id": 1, "revision": 3,
-//!   "name": "ライン1", "sortOrder": 0, "kind": "trend",
+//!   "name": "ライン1", "bundle": "ライン A", "sortOrder": 0, "kind": "trend",
 //!   "attributes": { "timeWindowSec": 600 },
 //!   "pens": [ { "tagId": 12, "colorSlot": null }, { "tagId": 13, "colorSlot": 4 } ]
 //! }
@@ -36,6 +36,11 @@
 //! - **しきい値は持たない**。しきい値は記録計の側のタグごとの設定
 //!   （`crate::tag_thresholds`、#532。2026-10-08 オーナー決定）で、表示グループ
 //!   からは参照するだけ（画面はその設定を読み取り専用で見せる）。
+//! - `bundle`: 束の名前（任意、`null` = 束なし。前後の空白を除いて空なら `null`、
+//!   [`MAX_BUNDLE_CHARS`]（50）文字以内）。同じ名前のグループが 1 つの束になる
+//!   名前だけの 1 階層の入れ物で、束のテーブルは持たない（trend-design.md §9 Q5、
+//!   2026-11-20 オーナー決定）。`sortOrder` と違い内容なので、更新（PUT）が書き、
+//!   版（`revision`）を進める。
 //! - `sortOrder`: 一覧の並び順（昇順、同じ値は `id` 順。0〜[`MAX_SORT_ORDER`]、
 //!   DB の CHECK でも縛る）。作成で省略すると末尾（溢れるなら振り直す）。
 //!   **更新（PUT）の本文の `sortOrder` は無視する** - 並びを変える口は
@@ -117,6 +122,8 @@ pub const MAX_PENS_PER_GROUP: usize = 16;
 
 /// 名前の最大文字数（記録の名前欄と同じ 100）。
 pub const MAX_NAME_CHARS: usize = 100;
+/// 束の名前の最大文字数（`display_groups.bundle` の CHECK と揃える）。
+pub const MAX_BUNDLE_CHARS: usize = 50;
 
 /// `sortOrder` の上限（並べ替えは 0 から詰めるので、36 グループには十分）。
 pub const MAX_SORT_ORDER: i64 = 9999;
@@ -222,6 +229,8 @@ pub struct Pen {
 pub struct DisplayGroup {
     pub id: i64,
     pub name: String,
+    /// 束の名前（`None` = 束なし）。
+    pub bundle: Option<String>,
     pub sort_order: i64,
     pub kind: DisplayKind,
     pub attributes: DisplayAttributes,
@@ -237,6 +246,9 @@ pub struct DisplayGroup {
 #[derive(utoipa::ToSchema)]
 pub struct DisplayGroupPayload {
     pub name: String,
+    /// 束の名前（任意）。空・空白だけは `None` に正規化する。
+    #[serde(default)]
+    pub bundle: Option<String>,
     /// 作成のときだけ使う（省略で末尾）。**更新では無視する**（モジュール doc）。
     #[serde(default)]
     pub sort_order: Option<i64>,
@@ -358,6 +370,8 @@ pub struct DisplayGroupRef {
 pub struct ValidDisplayGroup {
     /// 前後の空白を除いた名前。
     pub name: String,
+    /// 前後の空白を除いた束の名前（空は `None`）。
+    pub bundle: Option<String>,
     pub sort_order: Option<i64>,
     pub kind: DisplayKind,
     pub attributes: DisplayAttributes,
@@ -459,6 +473,21 @@ fn check_shape(
         ));
     }
 
+    let bundle = payload
+        .bundle
+        .as_deref()
+        .map(str::trim)
+        .filter(|bundle| !bundle.is_empty())
+        .map(str::to_string);
+    if let Some(bundle) = &bundle {
+        if bundle.chars().count() > MAX_BUNDLE_CHARS {
+            errors.push(field_error(
+                "bundle",
+                format!("束は {MAX_BUNDLE_CHARS} 文字以内にしてください"),
+            ));
+        }
+    }
+
     if let Some(order) = payload.sort_order {
         if !(0..=MAX_SORT_ORDER).contains(&order) {
             errors.push(field_error(
@@ -529,6 +558,7 @@ fn check_shape(
     match kind {
         Some(kind) if errors.len() == errors_before && !unresolved => Some(ValidDisplayGroup {
             name,
+            bundle,
             sort_order: payload.sort_order,
             kind,
             attributes,
@@ -617,6 +647,7 @@ pub async fn validate_display_group(
 pub fn audit_detail(group: &DisplayGroup) -> Value {
     json!({
         "name": group.name,
+        "bundle": group.bundle,
         "kind": group.kind.as_str(),
         "pens": group.pens.len(),
     })
@@ -641,6 +672,7 @@ pub fn tag_referenced_error(referrers: &[DisplayGroupRef]) -> BantoError {
 struct GroupRow {
     id: i64,
     name: String,
+    bundle: Option<String>,
     sort_order: i64,
     kind: String,
     attributes: String,
@@ -677,6 +709,7 @@ fn into_group(row: GroupRow, pens: Vec<Pen>) -> Result<DisplayGroup, BantoError>
     Ok(DisplayGroup {
         id: row.id,
         name: row.name,
+        bundle: row.bundle,
         sort_order: row.sort_order,
         kind,
         attributes,
@@ -954,10 +987,11 @@ pub(crate) async fn save_on(
                 None => end_sort_order(conn).await?,
             };
             sqlx::query_scalar(
-                "INSERT INTO display_groups (name, sort_order, kind, attributes) \
-                 VALUES (?, ?, ?, ?) RETURNING id",
+                "INSERT INTO display_groups (name, bundle, sort_order, kind, attributes) \
+                 VALUES (?, ?, ?, ?, ?) RETURNING id",
             )
             .bind(&valid.name)
+            .bind(&valid.bundle)
             .bind(sort_order)
             .bind(valid.kind.as_str())
             .bind(&attributes)
@@ -967,10 +1001,11 @@ pub(crate) async fn save_on(
         }
         Some(id) => {
             sqlx::query(
-                "UPDATE display_groups SET name = ?, kind = ?, attributes = ?, \
+                "UPDATE display_groups SET name = ?, bundle = ?, kind = ?, attributes = ?, \
                  revision = revision + 1, updated_at = datetime('now') WHERE id = ?",
             )
             .bind(&valid.name)
+            .bind(&valid.bundle)
             .bind(valid.kind.as_str())
             .bind(&attributes)
             .bind(id)
@@ -1257,7 +1292,7 @@ async fn list_on(
     pause: Option<&ReadPause>,
 ) -> Result<Vec<DisplayGroup>, BantoError> {
     let rows: Vec<GroupRow> = sqlx::query_as(
-        "SELECT id, name, sort_order, kind, attributes, revision FROM display_groups \
+        "SELECT id, name, bundle, sort_order, kind, attributes, revision FROM display_groups \
          ORDER BY sort_order, id",
     )
     .fetch_all(&mut *conn)
@@ -1293,7 +1328,7 @@ async fn get_on(
     pause: Option<&ReadPause>,
 ) -> Result<DisplayGroup, BantoError> {
     let row: Option<GroupRow> = sqlx::query_as(
-        "SELECT id, name, sort_order, kind, attributes, revision FROM display_groups WHERE id = ?",
+        "SELECT id, name, bundle, sort_order, kind, attributes, revision FROM display_groups WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&mut *conn)
