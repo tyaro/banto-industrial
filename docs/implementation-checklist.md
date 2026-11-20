@@ -59,6 +59,7 @@
 - [ ] **「指示に答えが無い分岐は、変更せずに選択肢と推奨を報告して止まる」**と明記。
 - [ ] 報告してほしい項目（PR 番号・判断表・迷った点）を列挙する。
 - [ ] **Hub の REST のルートを足す・消すときは `apps/banto-hub/core/tests/snapshots/routes.txt` も直させる**（`rest::tests::api_keys::routes_snapshot_matches`。名前で絞ったテストでは落ちず CI で落ちた、#816）。
+- [ ] **ChronoGazer の MCP のツールの引数・説明（上限の数を含む）を変えたら、`apps/chronogazer/core/tests/snapshots/mcp_tools_list.json` を `UPDATE_MCP_TOOLS_SNAPSHOT=1` で作り直させる**（`rest::mcp_tests::mcp_tools_list_snapshot_matches`。上限を 8 → 16 にした PR で、`colorSlot` の説明だけ変えて CI で落ちた、#1244）。
 - [ ] 難易度でモデルを選ぶ（機械的 = haiku / 標準 = sonnet / 並行・安全・横断 = opus・fable）。CLAUDE.md の分担に従う。
 
 ## 2. 検証の順序（この順番で、全部）

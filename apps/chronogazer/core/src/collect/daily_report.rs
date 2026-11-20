@@ -30,7 +30,7 @@
 //!
 //! # 上限
 //!
-//! * タグは 1〜[`HISTORY_MAX_TAGS`] 本（重複は 1 本。期間 CSV と同じ文言）、
+//! * タグは 1〜[`DAILY_REPORT_MAX_TAGS`] 本（重複は 1 本。期間 CSV と同じ文言）、
 //! * 期間 `toMs - fromMs` は [`DAILY_REPORT_MIN_WINDOW_MS`]（1 時間）以上
 //!   [`DAILY_REPORT_MAX_WINDOW_MS`]（25 時間）以下。区間の幅は 1 時間固定
 //!   （[`DAILY_REPORT_BIN_MS`]）で、区間は `fromMs + i * 1 時間` から
@@ -56,9 +56,13 @@ use sqlx::SqlitePool;
 
 use super::history::{
     field_error, run_long_read, tag_placements, LongReadStop, TagPlacement,
-    HISTORY_LONG_READ_TIMEOUT, HISTORY_MAX_TAGS,
+    HISTORY_LONG_READ_TIMEOUT,
 };
 use super::{CollectorService, Readout};
+
+/// 日報に載せるタグの本数の上限（1 枚の横幅に収めるため 8 本のまま。
+/// trend-design.md §6、#1207・#1231 PR 5a）。
+pub const DAILY_REPORT_MAX_TAGS: usize = 8;
 
 /// 区間の幅（1 時間、固定）。
 pub const DAILY_REPORT_BIN_MS: i64 = 3_600_000;
@@ -150,11 +154,11 @@ pub fn validate_daily_report_request(
     }
     if unique.is_empty() {
         errors.push(field_error("tagIds", "タグを 1 つ以上指定してください"));
-    } else if unique.len() > HISTORY_MAX_TAGS {
+    } else if unique.len() > DAILY_REPORT_MAX_TAGS {
         errors.push(field_error(
             "tagIds",
             format!(
-                "タグは {HISTORY_MAX_TAGS} 個までです（{} 個）",
+                "タグは {DAILY_REPORT_MAX_TAGS} 個までです（{} 個）",
                 unique.len()
             ),
         ));

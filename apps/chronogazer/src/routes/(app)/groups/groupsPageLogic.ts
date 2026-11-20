@@ -25,13 +25,17 @@ import {
 	type RegistrationTarget
 } from '#lib/banto/hubRegistration.js';
 import { REVISION_CONFLICT_FIELD } from '#lib/banto/revisionConflict.js';
+import { penColorVar } from '@banto-industrial/trend';
 
-/** グループ数の上限（§3.2）。画面は作成ボタンを止めるだけで、拒否はサーバー。 */
-export const MAX_DISPLAY_GROUPS = 16;
-/** 1 グループのペンの上限（§2）。 */
-export const MAX_PENS = 8;
-/** banto チャートの系列色の枠の数（`@banto/charts` の `MAX_CHART_SERIES`）。 */
-export const COLOR_SLOTS = 8;
+/** グループ数の上限（trend-design.md §6。旧 16 → 36）。画面は作成ボタンを止めるだけで、拒否はサーバー。 */
+export const MAX_DISPLAY_GROUPS = 36;
+/** 1 グループのペンの上限（trend-design.md §6。旧 8 → 16）。 */
+export const MAX_PENS = 16;
+/**
+ * 色の枠の数。1〜8 は banto チャートの系列色（`--banto-chart-N`）、9〜16 は industrial の
+ * テーマの `--bi-chart-N`（trend-design.md §9 Q4）。
+ */
+export const COLOR_SLOTS = 16;
 /** トレンドの既定時間窓の既定値（秒、R1-D「既定窓 10 分」）。 */
 export const DEFAULT_TIME_WINDOW_SEC = 600;
 
@@ -260,7 +264,7 @@ export function effectiveColorSlot(pen: { colorSlot: number | null }, index: num
 
 /** 色の枠の CSS 変数（テーマに追従する）。 */
 export function colorSlotVar(slot: number): string {
-	return `var(--banto-chart-${slot})`;
+	return penColorVar(slot);
 }
 
 /**

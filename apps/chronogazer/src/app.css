@@ -2,6 +2,34 @@
 @import '@banto/theme/css';
 @import '@banto/report/print.css';
 
+/* 9〜16 本目のペンの色（trend-design.md §9 Q4、@banto-industrial/trend の `penColorVar`）。
+   banto の系列色は 8 枠（--banto-chart-1〜8）なので、industrial のテーマで足す。
+   banto の 1〜8 と色相・明るさを離し（OKLab の距離 0.06 以上）、背景との比は
+   ライトの白で 3.5:1 以上、ダークの面（neutral-2 相当）で 5:1 以上。それでも 16 色は
+   似た組ができるので、線種の違い・凡例の選択と合わせて見分ける。 */
+:root,
+[data-theme] {
+	--bi-chart-9: #a67c00;
+	--bi-chart-10: #d81b60;
+	--bi-chart-11: #3b82c4;
+	--bi-chart-12: #5c940d;
+	--bi-chart-13: #b5179e;
+	--bi-chart-14: #343a40;
+	--bi-chart-15: #c4472a;
+	--bi-chart-16: #7d8794;
+}
+
+[data-theme='dark'] {
+	--bi-chart-9: #d9c23a;
+	--bi-chart-10: #ff6fa5;
+	--bi-chart-11: #7fb5f0;
+	--bi-chart-12: #a6d44a;
+	--bi-chart-13: #e87ce0;
+	--bi-chart-14: #c9ced4;
+	--bi-chart-15: #ff8a65;
+	--bi-chart-16: #8a97a6;
+}
+
 body {
 	margin: 0;
 	min-height: 100vh;

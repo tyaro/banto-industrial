@@ -135,10 +135,12 @@ describe('ペンの操作', () => {
 	});
 
 	it('色の既定はペンの位置 + 1 の枠（8 で頭打ち）、指定があればそれ', () => {
-		expect([0, 1, 7, 8, 20].map(defaultColorSlot)).toEqual([1, 2, 8, 8, 8]);
+		expect([0, 1, 7, 8, 15, 20].map(defaultColorSlot)).toEqual([1, 2, 8, 9, 16, 16]);
 		expect(effectiveColorSlot({ colorSlot: null }, 2)).toBe(3);
 		expect(effectiveColorSlot({ colorSlot: 6 }, 2)).toBe(6);
 		expect(colorSlotVar(4)).toBe('var(--banto-chart-4)');
+		expect(colorSlotVar(9)).toBe('var(--bi-chart-9, var(--banto-chart-1))');
+		expect(colorSlotVar(16)).toBe('var(--bi-chart-16, var(--banto-chart-8))');
 	});
 });
 
@@ -409,12 +411,12 @@ describe('Hub のタグのペン（#1179 PR6b）', () => {
 	});
 
 	it('appendPens: 残りを超えるなら黙って一部だけ足さず、何も足さない。hubTag を足すと登録先が決まる', () => {
-		const draft = withPens(1, 2, 3, 4, 5, 6);
+		const draft = withPens(...Array.from({ length: MAX_PENS - 2 }, (_, i) => i + 1));
 		expect(remainingPens(draft)).toBe(2);
 		const three = [hubPen(), hubPen(), hubPen()];
 		expect(appendPens(draft, three, target)).toBe(draft);
 		const added = appendPens(draft, [hubPen()], target);
-		expect(added.pens).toHaveLength(7);
+		expect(added.pens).toHaveLength(MAX_PENS - 1);
 		expect(added.hubTarget).toEqual(target);
 		expect(hasHubPens(added)).toBe(true);
 		// 登録先が決まっているときは保つ。

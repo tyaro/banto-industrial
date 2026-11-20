@@ -46,10 +46,11 @@ fn the_window_limit_is_31_days() {
         ),
         vec!["toMs"]
     );
-    // 長い期間でも点の予算は外れたまま通らない。
+    // 長い期間でも bins の上限は外れたまま通らない（本数 × bins の予算は、16 本 × 2000 で
+    // ちょうど 32000 なので、いまの上限では bins の上限が先に効く）。
     assert_eq!(
         field_names(
-            validate_history_request(&[1, 2, 3, 4, 5], 0, HISTORY_MAX_WINDOW_MS, 2000).unwrap_err()
+            validate_history_request(&[1, 2, 3, 4, 5], 0, HISTORY_MAX_WINDOW_MS, 2001).unwrap_err()
         ),
         vec!["bins"]
     );
@@ -175,9 +176,11 @@ fn request_limits_accept_the_boundary_and_reject_one_beyond() {
     validate_history_request(&[1], 0, 1, HISTORY_MAX_BINS as u64)
         .expect("bins = 上限ちょうどは通る");
 
-    let nine: Vec<i64> = (1..=9).collect();
+    let sixteen: Vec<i64> = (1..=16).collect();
+    validate_history_request(&sixteen, 0, 1, 1).expect("16 本ちょうどは通る");
+    let seventeen: Vec<i64> = (1..=17).collect();
     assert_eq!(
-        field_names(validate_history_request(&nine, 0, 1, 1).unwrap_err()),
+        field_names(validate_history_request(&seventeen, 0, 1, 1).unwrap_err()),
         vec!["tagIds"]
     );
     assert_eq!(
@@ -226,29 +229,29 @@ fn request_limits_accept_the_boundary_and_reject_one_beyond() {
 /// 系列あたりの `bins` の上限（`HISTORY_MAX_BINS`）の境界。PR #536 の
 /// オーナーレビュー P1（`MAX_TARGET_BINS` を HTTP の上限にしていた）。
 ///
-/// 反証: 予算の判定を外すと「8 本 × 1001」が通って落ちる。
+/// 反証: 本数の上限を 16 より大きくすると 17 本の誤りの判定が落ちる。
 #[test]
 fn the_response_budget_accepts_the_boundary_and_rejects_one_beyond() {
     let eight: Vec<i64> = (1..=8).collect();
     let five: Vec<i64> = (1..=5).collect();
+    let sixteen: Vec<i64> = (1..=16).collect();
     assert_eq!(HISTORY_MAX_BINS, 2000);
-    assert_eq!(HISTORY_MAX_POINTS, 8000);
+    assert_eq!(HISTORY_MAX_POINTS, 32000);
 
-    // ちょうど予算（8 × 1000 = 5 × 1600 = 4 × 2000 = 8000）は通る。
-    validate_history_request(&eight, 0, 1, 1000).expect("8 × 1000 は通る");
-    validate_history_request(&five, 0, 1, 1600).expect("5 × 1600 は通る");
+    // ちょうど予算（16 × 2000 = 32000）と、それ以下は通る。
+    validate_history_request(&sixteen, 0, 1, 2000).expect("16 × 2000 は通る");
+    validate_history_request(&eight, 0, 1, 2000).expect("8 × 2000 は通る");
+    validate_history_request(&five, 0, 1, 2000).expect("5 × 2000 は通る");
     validate_history_request(&[1, 2, 3, 4], 0, 1, 2000).expect("4 × 2000 は通る");
     // 重複は 1 本に数える（16 個並べても 8 本）。
     let doubled: Vec<i64> = eight.iter().chain(eight.iter()).copied().collect();
-    validate_history_request(&doubled, 0, 1, 1000).expect("重複は数えない");
+    validate_history_request(&doubled, 0, 1, 2000).expect("重複は数えない");
 
-    // 1 つでも超えたら bins の誤り。
+    // 1 つでも超えたら bins の誤り（本数 × bins が 32000 を超える組は、
+    // bins ≤ 2000 の上限で 16 本までは起きない。予算の判定そのものは
+    // 本数が増えたときの保険として残してある）。
     assert_eq!(
-        field_names(validate_history_request(&eight, 0, 1, 1001).unwrap_err()),
-        vec!["bins"]
-    );
-    assert_eq!(
-        field_names(validate_history_request(&five, 0, 1, 1601).unwrap_err()),
+        field_names(validate_history_request(&sixteen, 0, 1, 2001).unwrap_err()),
         vec!["bins"]
     );
     // 系列あたりの上限は本数に依らない。
@@ -257,9 +260,9 @@ fn the_response_budget_accepts_the_boundary_and_rejects_one_beyond() {
         vec!["bins"]
     );
     // 本数の誤りがあるときは予算の誤りを重ねない。
-    let nine: Vec<i64> = (1..=9).collect();
+    let seventeen: Vec<i64> = (1..=17).collect();
     assert_eq!(
-        field_names(validate_history_request(&nine, 0, 1, 1000).unwrap_err()),
+        field_names(validate_history_request(&seventeen, 0, 1, 2000).unwrap_err()),
         vec!["tagIds"]
     );
 }
@@ -874,7 +877,7 @@ async fn the_gap_only_path_never_exceeds_bins_at_the_budget() {
 }
 
 /// 性能の計測（手元用）: 1 秒周期・8 タグ・31 日分の日次ファイルに対する、
-/// 31 日窓・bins 1000（8 本 × 1000 = 予算ちょうど）の読み出し時間。
+/// 31 日窓・bins 1000（8 本 × 1000）の読み出し時間。
 /// `cargo test -p chronogazer-core --release history_31d_perf -- --ignored --nocapture`。
 /// 日数は環境変数 `HISTORY_PERF_DAYS`（既定 31）で減らせる。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

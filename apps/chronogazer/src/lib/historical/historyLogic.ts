@@ -348,7 +348,7 @@ export const HISTORY_UNAVAILABLE_MESSAGE =
 	'データを読み出せませんでした。しばらくしてからもう一度試してください。';
 export const HISTORY_EMPTY_MESSAGE = 'この期間に記録された値はありません。';
 export const HISTORY_LIMIT_MESSAGE =
-	'期間は 31 日まで、ペンは 8 本までです。条件を見直してください。';
+	'期間は 31 日まで、ペンは 16 本までです。条件を見直してください。';
 
 /** 履歴の読み出しが投げたもの → 日本語の文言（422 も日本語にする）。 */
 export function historyErrorMessage(err: unknown): string {

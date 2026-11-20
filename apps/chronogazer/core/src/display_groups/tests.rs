@@ -116,9 +116,9 @@ fn shape_validation_table() {
         ("大文字の種別", |p| p.kind = "Trend".into(), vec!["kind"]),
         ("負の並び順", |p| p.sort_order = Some(-1), vec!["sortOrder"]),
         (
-            "9 本のペン",
+            "17 本のペン",
             |p| {
-                p.pens = (1..=9)
+                p.pens = (1..=17)
                     .map(|tag_id| PenPayload::tag(tag_id, None))
                     .collect()
             },
@@ -135,8 +135,8 @@ fn shape_validation_table() {
             vec!["pens[0].colorSlot"],
         ),
         (
-            "色の枠 9",
-            |p| p.pens[1].color_slot = Some(9),
+            "色の枠 17",
+            |p| p.pens[1].color_slot = Some(17),
             vec!["pens[1].colorSlot"],
         ),
         (
@@ -176,13 +176,13 @@ fn shape_validation_table() {
     }
 }
 
-/// 8 本ちょうど・色の枠の端・4 種すべては通り、属性の既定値が埋まる。
+/// 16 本ちょうど・色の枠の端（1 と 16）・4 種すべては通り、属性の既定値が埋まる。
 #[test]
 fn shape_validation_accepts_the_edges_and_fills_defaults() {
-    let mut p = payload("  ライン1  ", "trend", &[1, 2, 3, 4, 5, 6, 7, 8]);
+    let mut p = payload("  ライン1  ", "trend", &(1..=16).collect::<Vec<i64>>());
     p.pens[0].color_slot = Some(1);
-    p.pens[7].color_slot = Some(8);
-    let valid = validate_shape(&p).expect("8 本は通る");
+    p.pens[15].color_slot = Some(16);
+    let valid = validate_shape(&p).expect("16 本は通る");
     assert_eq!(valid.name, "ライン1");
     assert_eq!(
         valid.attributes.time_window_sec,
@@ -240,6 +240,22 @@ async fn the_response_round_trips_as_a_payload() {
         },
         created
     );
+}
+
+/// 16 本・色の枠 16 まで DB に保存でき、読み戻せる（0104 の CHECK の広げ方。
+/// 17 本目・色の枠 17 は検証で断られるので、ここでは境界の保存だけを見る）。
+#[tokio::test]
+async fn sixteen_pens_with_color_slot_sixteen_round_trip_through_the_db() {
+    let (svc, _tags, ids) = service_with_tags(16).await;
+    let mut p = payload("16 本", "trend", &ids);
+    p.pens[15].color_slot = Some(16);
+    p.pens[8].color_slot = Some(9);
+    let created = svc.create(&p).await.expect("16 本は作れる");
+    let got = svc.get(created.id).await.unwrap();
+    assert_eq!(got.pens.len(), 16);
+    assert_eq!(got.pens[15].color_slot, Some(16));
+    assert_eq!(got.pens[8].color_slot, Some(9));
+    assert_eq!(got.pens.iter().map(|p| p.tag_id).collect::<Vec<_>>(), ids);
 }
 
 #[tokio::test]
@@ -311,15 +327,15 @@ async fn validation_against_the_database() {
     for i in 1..MAX_DISPLAY_GROUPS {
         svc.create(&payload(&format!("G{i}"), "digital", &[]))
             .await
-            .expect("16 個までは作れる");
+            .expect("36 個までは作れる");
     }
     let err = svc
-        .create(&payload("G16", "digital", &[]))
+        .create(&payload("G36", "digital", &[]))
         .await
-        .expect_err("17 個目");
+        .expect_err("37 個目");
     assert_eq!(fields(&err), ["displayGroups"]);
     assert_eq!(svc.list().await.unwrap().len(), MAX_DISPLAY_GROUPS);
-    // 上限は作成だけ。16 個の状態でも更新はできる。
+    // 上限は作成だけ。36 個の状態でも更新はできる。
     svc.update(first.id, &payload("A", "gauge", &ids))
         .await
         .expect("上限に達していても更新はできる");
@@ -808,7 +824,7 @@ async fn an_unregistered_hub_tag_needs_exactly_one_target() {
 }
 
 /// **巻き戻り**: 登録は通るが表示グループの検証で落ちる（名前の重複・ペンが
-/// 9 本）と、登録した記録項目も、暗黙に作った hub 接続・収集グループも残らない。
+/// 17 本）と、登録した記録項目も、暗黙に作った hub 接続・収集グループも残らない。
 ///
 /// 反証（2026-11-18 実施）: `save_on` の中で登録の後に `conn` を一度 commit する
 /// （登録を別のトランザクションにする）と、このテストの `row_counts` の比較が落ちる。
@@ -830,12 +846,15 @@ async fn a_display_group_failure_after_registration_rolls_back_the_registration(
         .unwrap()
         .is_empty());
 
-    let mut nine = payload("L2", "trend", &[]);
-    nine.pens = (0..9)
+    let mut seventeen = payload("L2", "trend", &[]);
+    seventeen.pens = (0..17)
         .map(|i| hub_pen(&format!("L.G.{i}"), &format!("t{i}"), "f32"))
         .collect();
-    nine.hub_tag_group = new_hub_group("hub-g");
-    let err = svc.create_with_hub_tags(&reg, &nine).await.unwrap_err();
+    seventeen.hub_tag_group = new_hub_group("hub-g");
+    let err = svc
+        .create_with_hub_tags(&reg, &seventeen)
+        .await
+        .unwrap_err();
     assert_eq!(fields(&err), ["pens"]);
     assert_eq!(row_counts(&svc.pool).await, before);
 }

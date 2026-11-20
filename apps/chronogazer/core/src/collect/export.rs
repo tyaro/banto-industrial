@@ -28,7 +28,7 @@
 //!
 //! # 上限（viewer にも開いているため）
 //!
-//! * タグは 1〜[`HISTORY_MAX_TAGS`] 本（重複は 1 本）、期間は `fromMs <= toMs` で
+//! * タグは 1〜[`EXPORT_MAX_TAGS`] 本（重複は 1 本）、期間は `fromMs <= toMs` で
 //!   幅 [`HISTORY_MAX_WINDOW_MS`]（31 日）以内（履歴と同じ。`fromMs == toMs` は
 //!   両端を含むので 1 時刻だけ読める）、
 //! * 行数は [`EXPORT_MAX_ROWS`]（10 万。`banto_tsquery::DEFAULT_MAX_RAW_ROWS`・
@@ -77,9 +77,13 @@ use sqlx::SqlitePool;
 
 use super::history::{
     field_error, run_long_read, tag_placements, LongReadStop, TagPlacement,
-    HISTORY_LONG_READ_TIMEOUT, HISTORY_MAX_TAGS, HISTORY_MAX_WINDOW_MS,
+    HISTORY_LONG_READ_TIMEOUT, HISTORY_MAX_WINDOW_MS,
 };
 use super::{CollectorService, Readout};
+
+/// 期間 CSV に出せるタグの本数の上限（トレンドの履歴の口は 16 本まで読めるが、
+/// CSV は 8 本のまま。trend-design.md §6、#1207・#1231 PR 5a）。
+pub const EXPORT_MAX_TAGS: usize = 8;
 
 /// 1 回の出力の行数の上限（10 万行）。`banto_tsquery` の
 /// `DEFAULT_MAX_RAW_ROWS` / `MAX_STAT_BINS` と同じ値。
@@ -193,13 +197,10 @@ pub fn validate_export_request(
     }
     if unique.is_empty() {
         errors.push(field_error("tagIds", "タグを 1 つ以上指定してください"));
-    } else if unique.len() > HISTORY_MAX_TAGS {
+    } else if unique.len() > EXPORT_MAX_TAGS {
         errors.push(field_error(
             "tagIds",
-            format!(
-                "タグは {HISTORY_MAX_TAGS} 個までです（{} 個）",
-                unique.len()
-            ),
+            format!("タグは {EXPORT_MAX_TAGS} 個までです（{} 個）", unique.len()),
         ));
     }
 

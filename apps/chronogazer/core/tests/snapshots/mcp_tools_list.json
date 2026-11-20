@@ -592,7 +592,7 @@
               "additionalProperties": false,
               "properties": {
                 "colorSlot": {
-                  "description": "系列色の枠（1〜8）。省略は既定。",
+                  "description": "系列色の枠（1〜16）。省略は既定。",
                   "type": [
                     "integer",
                     "null"
@@ -725,7 +725,7 @@
               "additionalProperties": false,
               "properties": {
                 "colorSlot": {
-                  "description": "系列色の枠（1〜8）。省略は既定。",
+                  "description": "系列色の枠（1〜16）。省略は既定。",
                   "type": [
                     "integer",
                     "null"

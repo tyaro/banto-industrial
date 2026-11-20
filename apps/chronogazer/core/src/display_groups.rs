@@ -28,9 +28,9 @@
 //!   既定 600 = R1-D の「既定窓 10 分・選択可」）だけで、デジタル・バー・計器は
 //!   空。種別に無い項目は検証で拒否する（黙って捨てない）。項目を足すのは
 //!   「語彙を広げる」ことで、要件の改訂（オーナー決定）として行う。
-//! - `pens`: 最大 [`MAX_PENS_PER_GROUP`]。各ペンはタグへの参照（ID）と表示属性。
+//! - `pens`: 最大 [`MAX_PENS_PER_GROUP`]（16）。各ペンはタグへの参照（ID）と表示属性。
 //!   表示属性は今は色だけで、`colorSlot` = banto チャートの系列色の枠
-//!   （1..=8、`--banto-chart-N`）。`null` は既定（ペンの位置 + 1 の枠、
+//!   （1..=16。1..=8 は `--banto-chart-N`、9..=16 は `--bi-chart-N`）。`null` は既定（ペンの位置 + 1 の枠、
 //!   `@banto/charts` の `seriesColorVar(index)` と同じ割り当て）。任意の色コード
 //!   にしないのは、テーマ（ライト / ダーク）に追従させるため。
 //! - **しきい値は持たない**。しきい値は記録計の側のタグごとの設定
@@ -109,20 +109,21 @@ use crate::hub_tags::{
 /// 監査の `resource`（REST・Tauri 共通）。
 pub const AUDIT_RESOURCE: &str = "display_groups";
 
-/// グループ数の上限（§3.2「グループ数上限（v1 目標）: 16」）。
-pub const MAX_DISPLAY_GROUPS: usize = 16;
+/// グループ数の上限（trend-design.md §6。旧 16 → 36、#1207・#1231 PR 5a）。
+pub const MAX_DISPLAY_GROUPS: usize = 36;
 
-/// 1 グループのペンの上限（§2「最大 8 ペン」）。
-pub const MAX_PENS_PER_GROUP: usize = 8;
+/// 1 グループのペンの上限（trend-design.md §6。旧 8 → 16、#1207・#1231 PR 5a）。
+pub const MAX_PENS_PER_GROUP: usize = 16;
 
 /// 名前の最大文字数（記録の名前欄と同じ 100）。
 pub const MAX_NAME_CHARS: usize = 100;
 
-/// `sortOrder` の上限（並べ替えは 0 から詰めるので、16 グループには十分）。
+/// `sortOrder` の上限（並べ替えは 0 から詰めるので、36 グループには十分）。
 pub const MAX_SORT_ORDER: i64 = 9999;
 
-/// 色の枠の数（`@banto/charts` の `MAX_CHART_SERIES`）。
-pub const COLOR_SLOTS: i64 = 8;
+/// 色の枠の数。1〜8 は banto の系列色（`--banto-chart-N`、`MAX_CHART_SERIES`）、
+/// 9〜16 は industrial のテーマの `--bi-chart-N`（trend-design.md §9 Q4）。
+pub const COLOR_SLOTS: i64 = 16;
 
 /// トレンドの既定時間窓の選択肢（秒）。1 分・5 分・10 分・30 分・1 時間。
 pub const TREND_TIME_WINDOWS_SEC: [i64; 5] = [60, 300, 600, 1800, 3600];
@@ -210,7 +211,7 @@ pub struct DisplayAttributes {
 pub struct Pen {
     /// banto-tags の `tags.id`。
     pub tag_id: i64,
-    /// 系列色の枠（1..=8）。`None` = 既定（ペンの位置 + 1）。
+    /// 系列色の枠（1..=16）。`None` = 既定（ペンの位置 + 1）。
     pub color_slot: Option<i64>,
 }
 
