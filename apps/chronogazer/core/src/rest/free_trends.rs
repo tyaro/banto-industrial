@@ -85,15 +85,14 @@ pub(super) async fn get_one(
     tag = "free-trends",
     operation_id = "free_trends_create",
     summary = "自由トレンドの作成",
-    description = "自由トレンドを作る。アカウントのログイン（viewer 以上）とこの PC からの接続（localDesktop）だけが作れる。**API キーでは作れない**（`config` のキーでも 403）。閲覧公開のセッションも 403。ペンは登録済みのタグ（`tagId`）だけ。",
+    description = "自由トレンドを作る。**API キーでは断る（403）。ログインのセッションが要る**（`Authorization: Bearer` のセッションのトークンと `X-Banto-Client` の見出し。`config` のキーでも書けないので、この操作には `security` を宣言しない）。アカウントのログイン（viewer 以上）とこの PC からの接続（localDesktop）だけが作れる。閲覧公開のセッションも 403。ペンは登録済みのタグ（`tagId`）だけ。",
     request_body = FreeTrendPayload,
     responses(
         (status = 200, description = "作成した自由トレンド", body = FreeTrend),
         (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
-        (status = 403, description = "API キー、または閲覧公開などのログインなしのセッション"),
+        (status = 403, description = "API キー（`read`・`config` とも。ログインのセッションが要る）、または閲覧公開などのログインなしのセッション"),
         (status = 422, description = "入力の検証エラー（`field_errors` に項目ごとの理由）"),
     ),
-    security(("api_key" = [])),
 )]
 pub(super) async fn create(
     State(state): State<FreeTrendOps>,
@@ -122,18 +121,17 @@ pub(super) async fn create(
     tag = "free-trends",
     operation_id = "free_trends_update",
     summary = "自由トレンドの更新",
-    description = "自由トレンドを更新する（全項目を送る。ペンは丸ごと置き換え）。作った人か editor 以上だけ。**API キーでは変えられない**（403）。",
+    description = "自由トレンドを更新する（全項目を送る。ペンは丸ごと置き換え）。**API キーでは断る（403）。ログインのセッションが要る**（`Authorization: Bearer` のセッションのトークンと `X-Banto-Client` の見出し。`config` のキーでも書けないので、この操作には `security` を宣言しない）。作った人か editor 以上だけ。",
     params(("id" = i64, Path, description = "対象の id")),
     request_body = FreeTrendPayload,
     responses(
         (status = 200, description = "更新後の自由トレンド", body = FreeTrend),
         (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
-        (status = 403, description = "作った人でも editor 以上でもない、API キー、またはログインなしのセッション"),
+        (status = 403, description = "API キー（`read`・`config` とも。ログインのセッションが要る）、作った人でも editor 以上でもない、またはログインなしのセッション"),
         (status = 404, description = "指定の id が無い"),
         (status = 409, description = "`expectedRevision` が古い（他で先に更新された。本文は `kind: validation`、`field_errors` の `expectedRevision`）"),
         (status = 422, description = "入力の検証エラー（`field_errors` に項目ごとの理由）"),
     ),
-    security(("api_key" = [])),
 )]
 pub(super) async fn update(
     State(state): State<FreeTrendOps>,
@@ -164,15 +162,14 @@ pub(super) async fn update(
     tag = "free-trends",
     operation_id = "free_trends_delete",
     summary = "自由トレンドの削除",
-    description = "自由トレンドを削除する。作った人か editor 以上だけ。**API キーでは消せない**（403）。",
+    description = "自由トレンドを削除する。**API キーでは断る（403）。ログインのセッションが要る**（`Authorization: Bearer` のセッションのトークンと `X-Banto-Client` の見出し。`config` のキーでも書けないので、この操作には `security` を宣言しない）。作った人か editor 以上だけ。",
     params(("id" = i64, Path, description = "対象の id")),
     responses(
         (status = 204, description = "削除した"),
         (status = 401, description = "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"),
-        (status = 403, description = "作った人でも editor 以上でもない、API キー、またはログインなしのセッション"),
+        (status = 403, description = "API キー（`read`・`config` とも。ログインのセッションが要る）、作った人でも editor 以上でもない、またはログインなしのセッション"),
         (status = 404, description = "指定の id が無い"),
     ),
-    security(("api_key" = [])),
 )]
 pub(super) async fn delete(
     State(state): State<FreeTrendOps>,

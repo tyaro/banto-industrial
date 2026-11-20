@@ -3742,7 +3742,7 @@
         ]
       },
       "post": {
-        "description": "自由トレンドを作る。アカウントのログイン（viewer 以上）とこの PC からの接続（localDesktop）だけが作れる。**API キーでは作れない**（`config` のキーでも 403）。閲覧公開のセッションも 403。ペンは登録済みのタグ（`tagId`）だけ。",
+        "description": "自由トレンドを作る。**API キーでは断る（403）。ログインのセッションが要る**（`Authorization: Bearer` のセッションのトークンと `X-Banto-Client` の見出し。`config` のキーでも書けないので、この操作には `security` を宣言しない）。アカウントのログイン（viewer 以上）とこの PC からの接続（localDesktop）だけが作れる。閲覧公開のセッションも 403。ペンは登録済みのタグ（`tagId`）だけ。",
         "operationId": "free_trends_create",
         "requestBody": {
           "content": {
@@ -3769,17 +3769,12 @@
             "description": "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"
           },
           "403": {
-            "description": "API キー、または閲覧公開などのログインなしのセッション"
+            "description": "API キー（`read`・`config` とも。ログインのセッションが要る）、または閲覧公開などのログインなしのセッション"
           },
           "422": {
             "description": "入力の検証エラー（`field_errors` に項目ごとの理由）"
           }
         },
-        "security": [
-          {
-            "api_key": []
-          }
-        ],
         "summary": "自由トレンドの作成",
         "tags": [
           "free-trends"
@@ -3788,7 +3783,7 @@
     },
     "/api/free-trends/{id}": {
       "delete": {
-        "description": "自由トレンドを削除する。作った人か editor 以上だけ。**API キーでは消せない**（403）。",
+        "description": "自由トレンドを削除する。**API キーでは断る（403）。ログインのセッションが要る**（`Authorization: Bearer` のセッションのトークンと `X-Banto-Client` の見出し。`config` のキーでも書けないので、この操作には `security` を宣言しない）。作った人か editor 以上だけ。",
         "operationId": "free_trends_delete",
         "parameters": [
           {
@@ -3810,17 +3805,12 @@
             "description": "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"
           },
           "403": {
-            "description": "作った人でも editor 以上でもない、API キー、またはログインなしのセッション"
+            "description": "API キー（`read`・`config` とも。ログインのセッションが要る）、作った人でも editor 以上でもない、またはログインなしのセッション"
           },
           "404": {
             "description": "指定の id が無い"
           }
         },
-        "security": [
-          {
-            "api_key": []
-          }
-        ],
         "summary": "自由トレンドの削除",
         "tags": [
           "free-trends"
@@ -3870,7 +3860,7 @@
         ]
       },
       "put": {
-        "description": "自由トレンドを更新する（全項目を送る。ペンは丸ごと置き換え）。作った人か editor 以上だけ。**API キーでは変えられない**（403）。",
+        "description": "自由トレンドを更新する（全項目を送る。ペンは丸ごと置き換え）。**API キーでは断る（403）。ログインのセッションが要る**（`Authorization: Bearer` のセッションのトークンと `X-Banto-Client` の見出し。`config` のキーでも書けないので、この操作には `security` を宣言しない）。作った人か editor 以上だけ。",
         "operationId": "free_trends_update",
         "parameters": [
           {
@@ -3909,7 +3899,7 @@
             "description": "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"
           },
           "403": {
-            "description": "作った人でも editor 以上でもない、API キー、またはログインなしのセッション"
+            "description": "API キー（`read`・`config` とも。ログインのセッションが要る）、作った人でも editor 以上でもない、またはログインなしのセッション"
           },
           "404": {
             "description": "指定の id が無い"
@@ -3921,11 +3911,6 @@
             "description": "入力の検証エラー（`field_errors` に項目ごとの理由）"
           }
         },
-        "security": [
-          {
-            "api_key": []
-          }
-        ],
         "summary": "自由トレンドの更新",
         "tags": [
           "free-trends"
