@@ -500,7 +500,12 @@ describe('ペンの属性の往復（#1207・#1231 PR 6a）', () => {
 				markerSize: 6,
 				axis: 'right',
 				yMin: -1,
-				yMax: 9
+				yMax: 9,
+				limitLines: true,
+				limitHh: 8,
+				limitH: 7,
+				limitL: 1,
+				limitLl: null
 			},
 			{ tagId: 2, colorSlot: null, ...EMPTY_PEN_STYLE }
 		]
@@ -508,7 +513,14 @@ describe('ペンの属性の往復（#1207・#1231 PR 6a）', () => {
 
 	it('読んだ属性を保存の本文にそのまま載せる（画面で保存し直しても消えない）', () => {
 		const draft = draftFromGroup(styled);
-		expect(draft.pens[0]).toMatchObject({ label: '入口', lineWidth: 2.5, axis: 'right', yMax: 9 });
+		expect(draft.pens[0]).toMatchObject({
+			label: '入口',
+			lineWidth: 2.5,
+			axis: 'right',
+			yMax: 9,
+			limitLines: true,
+			limitH: 7
+		});
 		const input = draftToInput(draft, styled.revision);
 		expect(input.pens).toEqual([styled.pens[0], styled.pens[1]]);
 	});
@@ -522,7 +534,13 @@ describe('ペンの属性の往復（#1207・#1231 PR 6a）', () => {
 	it('属性の違いは未保存として拾い、同じなら拾わない', () => {
 		const baseline = draftFromGroup(styled);
 		expect(isDraftDirty(draftFromGroup(styled), baseline)).toBe(false);
-		for (const change of [{ label: '出口' }, { lineStyle: 'solid' as const }, { yMin: 0 }]) {
+		for (const change of [
+			{ label: '出口' },
+			{ lineStyle: 'solid' as const },
+			{ yMin: 0 },
+			{ limitLines: false },
+			{ limitH: 6 }
+		]) {
 			const pens = [{ ...baseline.pens[0], ...change }, baseline.pens[1]];
 			expect(isDraftDirty({ ...baseline, pens }, baseline)).toBe(true);
 		}

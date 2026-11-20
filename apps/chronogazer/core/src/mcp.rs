@@ -446,6 +446,26 @@ fn display_group_schema(update: bool) -> Value {
                             "type": ["number", "null"],
                             "description": "縦軸の最大。null・省略は工学値レンジ。",
                         },
+                        "limitLines": {
+                            "type": ["boolean", "null"],
+                            "description": "true で管理線（HH・H・L・LL）を引く。null・省略・false は引かない。",
+                        },
+                        "limitHh": {
+                            "type": ["number", "null"],
+                            "description": "管理線 HH の上書き。null・省略はタグのしきい値。表示だけに使い、しきい値のイベントは変えない。設定した管理線どうしは LL <= L <= H <= HH。",
+                        },
+                        "limitH": {
+                            "type": ["number", "null"],
+                            "description": "管理線 H の上書き。null・省略はタグのしきい値。",
+                        },
+                        "limitL": {
+                            "type": ["number", "null"],
+                            "description": "管理線 L の上書き。null・省略はタグのしきい値。",
+                        },
+                        "limitLl": {
+                            "type": ["number", "null"],
+                            "description": "管理線 LL の上書き。null・省略はタグのしきい値。",
+                        },
                     },
                     "additionalProperties": false,
                 },

@@ -1221,6 +1221,40 @@
               "null"
             ]
           },
+          "limitH": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "limitHh": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "limitL": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "limitLines": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "limitLl": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
           "lineStyle": {
             "oneOf": [
               {
@@ -1320,6 +1354,40 @@
           "label": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "limitH": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "limitHh": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "limitL": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "limitLines": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "limitLl": {
+            "format": "double",
+            "type": [
+              "number",
               "null"
             ]
           },
