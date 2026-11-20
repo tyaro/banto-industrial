@@ -311,7 +311,12 @@
 	// 配置の保存。最初の 1 回（マウントした時点の配置）は保存の口が基準として受け取るだけ。
 	// `layoutSnapshot()` の読み取りを追跡する（狭い表示の「既定に戻す」・復元で、`dock.layout`
 	// の後に確定する控えた広い配置も拾う。PR #1268 レビュー P2）。
-	persistThreePaneLayout(() => threePane, dockLayoutStore);
+	// 広い ⇄ 狭いの切り替えの途中（求める表示と出している表示が食い違う間）は保存しない
+	// （狭い表示の一時の木を書かない。PR #1268 再レビュー P2）。
+	persistThreePaneLayout(() => threePane, dockLayoutStore, {
+		wanted: () => mobileNavStore.isNarrow,
+		shown: () => layoutNarrow
+	});
 
 	// サーバーの保存値（利用者ごと）を、枠のマウント後に 1 回だけ読んで当てる。
 	let savedLayoutRequested = false;

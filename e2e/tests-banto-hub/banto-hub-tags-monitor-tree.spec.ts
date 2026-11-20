@@ -16,7 +16,7 @@
  * `banto-hub-tags-monitor-*`（`tags` > `smoke`）にしている。共有 DB を
  * 壊さないよう固定名は `RUN_ID` で一意化し、リトライ再走用の冪等掃除を持つ。
  */
-import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
+import { expect, test, type APIRequestContext, type Page, type Request } from '@playwright/test';
 import { CSRF_HEADERS, fetchAuthToken, injectAuthToken } from './banto-hub-auth';
 
 const RUN_ID = Date.now();
@@ -245,5 +245,55 @@ test.describe.serial('banto-hub モニタ Tree/検索 + 確認導線ディープ
 		await expect(page.getByText(EXTERNAL_A)).toBeVisible();
 		await expect(tree).toBeVisible();
 		await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+	});
+
+	test('7. 広い幅から狭い幅へ切り替わる途中の一時の配置は保存しない（#1253、PR #1268 レビュー P2）', async () => {
+		// 部品の切り替えは、狭い表示の木を先に `dock.layout` へ当て、フォーカスの直し
+		// （`await tick()`。フォーカスが枠の中にあるときだけ）の後で控えの広い配置と
+		// `narrow` を確定する。その間に保存すると、狭い表示の一時の木が PUT・写しに残る。
+		const puts: string[] = [];
+		const onRequest = (req: Request) => {
+			if (req.url().includes('/api/ui-settings/hub.dock.monitor') && req.method() === 'PUT')
+				puts.push(req.postData() ?? '');
+		};
+		const localCopies = () =>
+			page.evaluate(() =>
+				Object.keys(localStorage)
+					.filter((k) => k.startsWith('banto.dock.monitor.'))
+					.sort()
+					.map((k) => [k, localStorage.getItem(k)])
+			);
+		const tree = page.getByRole('tree');
+		const toggle = page.getByTestId('monitor-tree-toggle');
+		const wide = page.viewportSize() ?? { width: 1280, height: 720 };
+
+		const loaded = page.waitForResponse(
+			(r) => r.url().includes('/api/ui-settings/hub.dock.monitor') && r.request().method() === 'GET'
+		);
+		await page.goto('/monitor');
+		await expect(page.getByText(EXTERNAL_A)).toBeVisible();
+		await loaded;
+		await expect(tree).toBeVisible();
+		const before = await localCopies();
+
+		page.on('request', onRequest);
+		try {
+			// ツリーの中にフォーカスを置いたまま狭い幅（900px 以下）へ。
+			await tree.getByRole('treeitem').first().focus();
+			await page.setViewportSize({ width: 800, height: wide.height });
+			await expect(toggle).toHaveCount(0);
+			await page.waitForTimeout(800);
+			expect(puts).toEqual([]);
+			expect(await localCopies()).toEqual(before);
+		} finally {
+			page.off('request', onRequest);
+			await page.setViewportSize(wide);
+		}
+
+		// 広い幅に戻すと既定の配置のまま。後の spec にも既定を残す。
+		await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+		await page.reload();
+		await expect(page.getByText(EXTERNAL_A)).toBeVisible();
+		await expect(tree).toBeVisible();
 	});
 });

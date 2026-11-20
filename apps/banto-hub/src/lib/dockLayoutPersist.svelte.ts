@@ -10,6 +10,21 @@
  * 読むので、effect の中で `untrack` の外で呼べば、そのどれが換わっても走り直す。`untrack` は
  * 保存（`store.save`）だけに掛ける（保存の口の中の読み書きを依存にしない）。
  *
+ * **広い ⇄ 狭いの切り替えの途中は保存しない**（PR #1268 再レビュー P2）。部品の `switchNarrow`
+ * は、行き先の木を `DockHost.replaceLayout` で先に `dock.layout` へ当て、その `await`（フォーカス
+ * が枠の中にあれば `tick()` を待ってフォーカスを直す）の後で `wideLayout`・`narrowShown` を確定
+ * する。広い → 狭いの間は `narrowShown` がまだ false なので、`layoutSnapshot()` は狭い表示の一時
+ * の木を返してしまう（狭い → 広いの間は控えた広い配置を返すが、確定前の値には違いないので同じく
+ * 見送る）。部品の公開の口に「確定した」印は無いので、求める表示（`narrowOverride` に渡す値）と
+ * 実際の表示（`bind:narrow`。部品の中で `narrowShown` を `$effect.pre` で写した値）が食い違って
+ * いる間は保存しない。確定すると `narrow` が換わって effect が走り直し、確定後の
+ * `layoutSnapshot()` を渡す（変わっていなければ保存の口が同じ値として書かない）。
+ *
+ * 切り替えが断られた（`beforePanelChange`。今の `/monitor` は使っていない）・入力の変換中で
+ * 待たされているときも食い違ったままになり、その間の配置の変更は保存しない。次に境界をまたぐか
+ * 切り替えが通れば、その時点の配置を保存する（断られた表示は求める表示ではないので、その間の
+ * 変更を見送るのは許す）。
+ *
  * コンポーネントの初期化中（`$effect` を張れる所）に呼ぶ。
  */
 import { untrack } from 'svelte';
@@ -21,13 +36,26 @@ export interface ThreePaneSnapshotSource {
 	layoutSnapshot(): StoredDockLayout;
 }
 
+/** 狭い表示の、求める値と実際の値（食い違っている間は切り替えの途中）。 */
+export interface NarrowDisplay {
+	/** 部品の `narrowOverride` に渡している値（`undefined` = 部品が枠の幅で決める）。 */
+	wanted(): boolean | undefined;
+	/** 部品の `bind:narrow`（いま狭い表示を出しているか）。 */
+	shown(): boolean;
+}
+
 export function persistThreePaneLayout(
 	pane: () => ThreePaneSnapshotSource | undefined,
-	store: Pick<DockLayoutStore, 'save'>
+	store: Pick<DockLayoutStore, 'save'>,
+	narrow?: NarrowDisplay
 ): void {
 	$effect(() => {
 		const current = pane();
 		if (!current) return;
+		if (narrow) {
+			const wanted = narrow.wanted();
+			if (wanted !== undefined && wanted !== narrow.shown()) return;
+		}
 		const snapshot = current.layoutSnapshot();
 		untrack(() => store.save(snapshot));
 	});
