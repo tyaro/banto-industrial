@@ -21,7 +21,7 @@
     描画域の半分まで）、帯のペンは線・マーカー・管理線・縦軸の目盛りの持ち主から外れる。横の格子・
     カーソルの線は描画域の全体に引く。アナログの層（帯・管理線・線・マーカー・越えた区間）は
     `{uid}-analog-clip`（アナログの縦の長さまで）で切り、範囲外の値が bit の帯に重ならないようにする。True は濃い塗り、区間の中で変わったものは薄い塗り、帯の左端の
-    内側にペンの `label`。縦軸の持ち主が bit のペンなら目盛り（と横の格子）は 0・1 の 2 つだけ（`axisTickValues`）。bit のペンの値は False / True と出す（カーソル・凡例の範囲・要約。縦軸が
+    内側にペンの `label`（帯が 10px 未満に縮んだら出さない。`showLabel`）。縦軸の持ち主が bit のペンなら目盛り（と横の格子）は 0・1 の 2 つだけ（`axisTickValues`）。bit のペンの値は False / True と出す（カーソル・凡例の範囲・要約。縦軸が
     bit のペンのときは 0・1 の目盛りも）。
   - 凡例は `onPenSelect` を渡すとペンを選ぶボタンになる（押した印は `selectedPenId`、
     利用側の印は `legendBadge`）。どのペンを選ぶと何が変わるかは利用側が決める。
@@ -452,12 +452,14 @@
 								opacity={sp.state === 'true' ? 1 : 0.4}
 							/>
 						{/each}
-						<text
-							class="bi-trend__bit-label"
-							x="4"
-							y={bb.y + bb.height / 2}
-							dominant-baseline="middle">{bb.pen.label}</text
-						>
+						{#if bb.showLabel}
+							<text
+								class="bi-trend__bit-label"
+								x="4"
+								y={bb.y + bb.height / 2}
+								dominant-baseline="middle">{bb.pen.label}</text
+							>
+						{/if}
 					{/each}
 					<g clip-path="url(#{uid}-analog-clip)">
 						{#each limitLayouts as lay, i (pens[i].id)}

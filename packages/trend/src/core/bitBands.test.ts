@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { bitBandLayout, bitSpans, resolveBitBandHeight } from './bitBands';
+import { bitBandLabelVisible, bitBandLayout, bitSpans, resolveBitBandHeight } from './bitBands';
 import type { Bin, TrendPen } from './pens';
 
 const pen = (over: Partial<TrendPen> = {}): TrendPen => ({
@@ -32,14 +32,14 @@ describe('bitBandLayout', () => {
 	});
 	it('1 本: 下から 16px', () => {
 		const r = bitBandLayout([pen()], 200);
-		expect(r.bands).toEqual([{ penIndex: 0, y: 184, height: 16 }]);
+		expect(r.bands).toEqual([{ penIndex: 0, y: 184, height: 16, showLabel: true }]);
 		expect(r.analogHeight).toBe(184);
 	});
 	it('複数: 並びの順に下から積む。帯でないペンは添字だけ飛ばす', () => {
 		const r = bitBandLayout([pen(), pen({ bit: false }), pen({ bitBandHeight: 10 })], 200);
 		expect(r.bands).toEqual([
-			{ penIndex: 0, y: 184, height: 16 },
-			{ penIndex: 2, y: 172, height: 10 }
+			{ penIndex: 0, y: 184, height: 16, showLabel: true },
+			{ penIndex: 2, y: 172, height: 10, showLabel: true }
 		]);
 		expect(r.analogHeight).toBe(200 - (16 + 10 + 2));
 	});
@@ -52,6 +52,15 @@ describe('bitBandLayout', () => {
 		expect(r.bands[0].y).toBeCloseTo(100 - 32 * k, 6);
 		expect(r.analogHeight).toBeCloseTo(50, 6);
 		expect(r.bands[1].y).toBeGreaterThanOrEqual(0);
+	});
+	it('縮んで細い帯は名前を出さない（高さ 160 に既定の 16 本）', () => {
+		const r = bitBandLayout(
+			Array.from({ length: 16 }, () => pen()),
+			160
+		);
+		expect(r.bands).toHaveLength(16);
+		expect(r.bands[0].height).toBeLessThan(10);
+		expect(r.bands.every((b) => !b.showLabel)).toBe(true);
 	});
 	it('描画域が 0 以下・非有限なら帯なし', () => {
 		expect(bitBandLayout([pen()], 0)).toEqual({ bands: [], analogHeight: 0 });
@@ -105,5 +114,14 @@ describe('bitSpans', () => {
 	it('bins が空・binMs 不正なら空', () => {
 		expect(bitSpans([], 10, X, R)).toEqual([]);
 		expect(bitSpans([b(0, 1)], 0, X, R)).toEqual([]);
+	});
+});
+
+describe('bitBandLabelVisible', () => {
+	it('10px 以上で出し、未満・非有限では出さない', () => {
+		expect(bitBandLabelVisible(10)).toBe(true);
+		expect(bitBandLabelVisible(9.99)).toBe(false);
+		expect(bitBandLabelVisible(16)).toBe(true);
+		expect(bitBandLabelVisible(NaN)).toBe(false);
 	});
 });

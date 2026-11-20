@@ -9,6 +9,8 @@
  * - 帯の合計（太さの和 + 間）が描画域の高さの半分を超えたら、太さも間も同じ割合で縮めて半分に
  *   収める。アナログの描画域の高さは「描画域の高さ − 帯の合計」で、アナログの線と帯は重ならない。
  *   帯が無ければ描画域の高さのまま。
+ * - 縮んで帯が 10px 未満になったら、帯の中の名前は出さない（隣の帯に重なるため。名前は凡例で
+ *   分かる）。判定は `bitBandLabelVisible`、結果は `BitBandSlot.showLabel`。
  * - 帯の中身は、表示範囲と重なる区間ごとに（`envelopePath` と同じ範囲の判定。x の範囲は区間の
  *   実際の範囲 `[max(tMs, startMs), min(終わり, endMs))`）、min・max がともに 0.5 以上なら True
  *   （濃い塗り）、min < 0.5 <= max（区間の中で変わった）なら薄い塗り、ともに 0.5 未満の False と
@@ -27,11 +29,20 @@ export const BIT_BAND_GAP = 2;
 /** 帯の合計が描画域の高さに占める上限。 */
 const MAX_SHARE = 0.5;
 
+/** 帯の中の名前を出す最小の高さ（px）。これ未満は名前を出さない。 */
+export const BIT_BAND_LABEL_MIN_HEIGHT = 10;
+
+export function bitBandLabelVisible(height: number): boolean {
+	return fin(height) && height >= BIT_BAND_LABEL_MIN_HEIGHT;
+}
+
 /** 帯 1 本の位置（px。y は描画域の上から）。`penIndex` は `pens` の添字。 */
 export interface BitBandSlot {
 	penIndex: number;
 	y: number;
 	height: number;
+	/** 帯の中の名前を出すか（`bitBandLabelVisible(height)`）。 */
+	showLabel: boolean;
 }
 
 export interface BitBandLayout {
@@ -64,7 +75,7 @@ export function bitBandLayout(pens: readonly TrendPen[], plotHeight: number): Bi
 	let bottom = h;
 	idx.forEach((penIndex, n) => {
 		const height = heights[n] * k;
-		bands.push({ penIndex, y: bottom - height, height });
+		bands.push({ penIndex, y: bottom - height, height, showLabel: bitBandLabelVisible(height) });
 		bottom -= height + gap;
 	});
 	return { bands, analogHeight: h - raw * k };
