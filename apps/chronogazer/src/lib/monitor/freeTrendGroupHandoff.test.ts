@@ -22,8 +22,15 @@ describe('groupHandoffDecision', () => {
 		['owner 無し', handoff, { owner: null }, 'stale'],
 		['世代違い', handoff, { generation: 4 }, 'stale'],
 		['下書き無し', handoff, { hasDraft: false }, 'stale'],
-		['作れない', handoff, { canCreate: false }, 'stale'],
-		['上限', handoff, { createBlocked: true }, 'stale'],
+		['作れない', handoff, { canCreate: false }, 'blocked'],
+		['上限', handoff, { createBlocked: true }, 'blocked'],
+		['世代違い・上限は stale が先', handoff, { generation: 4, createBlocked: true }, 'stale'],
+		[
+			'owner 違い・作れないは stale が先',
+			handoff,
+			{ owner: 'account:b', canCreate: false },
+			'stale'
+		],
 		['handoff 無し', null, {}, 'none']
 	];
 	for (const [name, h, now, want] of cases) {

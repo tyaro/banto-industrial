@@ -6,6 +6,8 @@
  * そこで移る直前に「持ち主・セッションの世代・写せなかった本数」をこのタブのメモリに置き、受け側が
  * 今の持ち主・世代・下書きの有無と照合して開くか捨てるかを決める。メモリだけなので再読み込みで消えてよい
  * （そのときは `none` で何もしない）。
+ * 照合に合えば開く。セッションが替わった・下書きが無いなら `stale`（開かず知らせる）。作れない・上限のときは
+ * `blocked`（知らせない。上限の注記が画面に出ていて、下書きは残り、後で新規の下書きから続けられる）。
  */
 
 export type GroupHandoff = { owner: string; generation: number; skipped: number };
@@ -32,20 +34,15 @@ export type GroupHandoffNow = {
 	createBlocked: boolean;
 };
 
-/** `open`: 新規の編集欄を開く。`stale`: 照合に合わず開かない（知らせる）。`none`: 引き継ぎが無い。 */
+/** `open`: 開く。`stale`: セッション・下書きが合わず開かない（知らせる）。`blocked`: 作れない・上限（知らせない）。`none`: 引き継ぎ無し。 */
 export function groupHandoffDecision(
 	handoff: GroupHandoff | null,
 	now: GroupHandoffNow
-): 'open' | 'stale' | 'none' {
+): 'open' | 'stale' | 'blocked' | 'none' {
 	if (handoff === null) return 'none';
-	if (
-		handoff.owner === now.owner &&
-		handoff.generation === now.generation &&
-		now.hasDraft &&
-		now.canCreate &&
-		!now.createBlocked
-	) {
-		return 'open';
+	if (handoff.owner !== now.owner || handoff.generation !== now.generation || !now.hasDraft) {
+		return 'stale';
 	}
-	return 'stale';
+	if (!now.canCreate || now.createBlocked) return 'blocked';
+	return 'open';
 }
