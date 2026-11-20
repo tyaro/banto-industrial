@@ -14,6 +14,10 @@
 //! 断って `denied` を監査する（`crate::free_trends` のモジュール doc「権限」）。成功した書き込みは
 //! [`Actor::record`] で監査する（`resource: "free_trends"`、`origin: "rest"`）。CSRF は他の
 //! ルートと同じ（セッションは `X-Banto-Client` が要る。`api_router` の層）。
+//!
+//! 作成・更新・削除は、権限の確かめと監査まで含めて [`run_detached`] で切り離す（接続が切れても、
+//! コミット済みの変更だけが残って監査が欠けないように。`docs/implementation-checklist.md` の
+//! 「handler の中で `await` をまたぐ副作用」）。
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -25,6 +29,7 @@ use banto_server::{ApiError, AuthState};
 use super::{require_session_or_api_key, Actor, RevisionConflictRejection};
 use crate::audit::AuditLogService;
 use crate::free_trends::{FreeTrend, FreeTrendPayload, FreeTrendService};
+use crate::local_grant::run_detached;
 use crate::ops::{FreeTrendOps, Via};
 
 #[utoipa::path(
@@ -94,17 +99,20 @@ pub(super) async fn create(
     State(state): State<FreeTrendOps>,
     actor: Actor,
     Json(payload): Json<FreeTrendPayload>,
-) -> Result<Json<FreeTrend>, ApiError> {
-    let created = state
-        .create(
-            &actor,
-            &Via::Rest {
-                method: "POST",
-                path: "/api/free-trends",
-            },
-            &payload,
-        )
-        .await?;
+) -> Result<Json<FreeTrend>, RevisionConflictRejection> {
+    let created = run_detached("chronogazer: 自由トレンドの作成", async move {
+        state
+            .create(
+                &actor,
+                &Via::Rest {
+                    method: "POST",
+                    path: "/api/free-trends",
+                },
+                &payload,
+            )
+            .await
+    })
+    .await??;
     Ok(Json(created))
 }
 
@@ -133,17 +141,20 @@ pub(super) async fn update(
     Path(id): Path<i64>,
     Json(payload): Json<FreeTrendPayload>,
 ) -> Result<Json<FreeTrend>, RevisionConflictRejection> {
-    let updated = state
-        .update(
-            &actor,
-            &Via::Rest {
-                method: "PUT",
-                path: "/api/free-trends/{id}",
-            },
-            id,
-            &payload,
-        )
-        .await?;
+    let updated = run_detached("chronogazer: 自由トレンドの更新", async move {
+        state
+            .update(
+                &actor,
+                &Via::Rest {
+                    method: "PUT",
+                    path: "/api/free-trends/{id}",
+                },
+                id,
+                &payload,
+            )
+            .await
+    })
+    .await??;
     Ok(Json(updated))
 }
 
@@ -167,17 +178,20 @@ pub(super) async fn delete(
     State(state): State<FreeTrendOps>,
     actor: Actor,
     Path(id): Path<i64>,
-) -> Result<StatusCode, ApiError> {
-    state
-        .delete(
-            &actor,
-            &Via::Rest {
-                method: "DELETE",
-                path: "/api/free-trends/{id}",
-            },
-            id,
-        )
-        .await?;
+) -> Result<StatusCode, RevisionConflictRejection> {
+    run_detached("chronogazer: 自由トレンドの削除", async move {
+        state
+            .delete(
+                &actor,
+                &Via::Rest {
+                    method: "DELETE",
+                    path: "/api/free-trends/{id}",
+                },
+                id,
+            )
+            .await
+    })
+    .await??;
     Ok(StatusCode::NO_CONTENT)
 }
 

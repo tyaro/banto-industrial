@@ -1903,6 +1903,8 @@ async fn tags_create(
 enum RevisionConflictRejection {
     Api(ApiError),
     RevisionConflict(BantoError),
+    /// 切り離したタスクが最後まで走らなかった（`local_grant::run_detached`、応答は `500`）。
+    Detached(crate::local_grant::DetachedTaskFailed),
 }
 
 impl From<BantoError> for RevisionConflictRejection {
@@ -1921,10 +1923,17 @@ impl From<ApiError> for RevisionConflictRejection {
     }
 }
 
+impl From<crate::local_grant::DetachedTaskFailed> for RevisionConflictRejection {
+    fn from(err: crate::local_grant::DetachedTaskFailed) -> Self {
+        Self::Detached(err)
+    }
+}
+
 impl IntoResponse for RevisionConflictRejection {
     fn into_response(self) -> Response {
         match self {
             Self::Api(err) => err.into_response(),
+            Self::Detached(err) => err.into_response(),
             Self::RevisionConflict(err) => (
                 StatusCode::CONFLICT,
                 Json(banto_core::ErrorBody::from(&err)),
