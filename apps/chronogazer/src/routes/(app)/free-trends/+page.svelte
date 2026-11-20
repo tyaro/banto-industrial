@@ -65,6 +65,7 @@
 	import {
 		addPens,
 		afterFreeTrendSave,
+		afterFreeTrendSaveFailure,
 		canCreateFreeTrend,
 		classifySaveFailure,
 		clearDraft,
@@ -81,6 +82,7 @@
 		removePenAt,
 		saveDraft,
 		sessionDraftStorage,
+		shouldDiscardSavedDraft,
 		setPenColor,
 		usedTagKeys,
 		type DraftTarget,
@@ -181,6 +183,8 @@
 	let saveErrors = $state(emptyFreeTrendFieldErrors());
 	/** 保存が版の食い違いで断られた（ほかの人が先に変えた）。 */
 	let conflict = $state(false);
+	/** `conflict` を立てた対象（「保存されたものを読み込む」が捨てる下書きの持ち主）。 */
+	let conflictFor: DraftTarget | null = null;
 
 	const canEditSelected = $derived(selected?.canEdit === true);
 	/** 下書きを始められるのは、作れる人か、その自由トレンドを変えられる人。 */
@@ -358,9 +362,16 @@
 				startedFor,
 				currentTarget: editTarget
 			});
-			if (next.clearDraft) clearDraft(sessionDraftStorage(), startedFor);
-			if (startedFor === 'new') newDraft = null;
-			else if (selection.id === startedFor) storedDraft = null;
+			// 保存を始めた後に変えた下書きは捨てない（送った中身と同じときだけ捨てる）。
+			const storage = sessionDraftStorage();
+			if (next.clearDraft && shouldDiscardSavedDraft(loadDraft(storage, startedFor), draft)) {
+				clearDraft(storage, startedFor);
+			}
+			if (startedFor === 'new') {
+				if (newDraft && shouldDiscardSavedDraft(newDraft, draft)) newDraft = null;
+			} else if (selection.id === startedFor) {
+				if (storedDraft && shouldDiscardSavedDraft(storedDraft, draft)) storedDraft = null;
+			}
 			// 読み直しが返るまで保存したものを選べるよう、手元の一覧へ入れる（飛行中の古い応答は捨てる）。
 			loadSeq++;
 			if (list) {
@@ -378,10 +389,27 @@
 			}
 			if (next.reload) await reloadList();
 		} catch (err) {
+			const after = afterFreeTrendSaveFailure({
+				destroyed,
+				startedFor,
+				currentTarget: editTarget
+			});
 			if (destroyed) return;
 			const failure = classifySaveFailure(err, isRevisionConflict, errorMessage);
-			if (failure.kind === 'conflict') {
+			if (!after.applyToEditor) {
+				// 別のものを編集している間の失敗。その編集欄には何も立てず、どれの失敗かを通知する。
+				const label = startedFor === 'new' ? '新しい自由トレンド' : `自由トレンド #${startedFor}`;
+				const detail =
+					failure.kind === 'conflict'
+						? '他で更新されていたため保存できませんでした'
+						: failure.kind === 'validation'
+							? '入力に誤りがあり保存できませんでした'
+							: failure.message;
+				toastStore.push('error', `${label} の保存に失敗しました: ${detail}`);
+				if (after.reload) await reloadList();
+			} else if (failure.kind === 'conflict') {
 				conflict = true;
+				conflictFor = startedFor;
 				// 今の保存内容を読み直して、食い違いの確認に使えるようにする（下書きは残す）。
 				await reloadList();
 			} else if (failure.kind === 'validation') {
@@ -399,7 +427,8 @@
 
 	/** 版の食い違いのあと: 下書きを捨てて保存されたものを読み込む。 */
 	async function loadSaved(): Promise<void> {
-		discardSelectedDraft();
+		// 競合を立てた対象の下書きだけを捨てる（選択が変わっていれば捨てない）。
+		if (conflictFor !== null && selected && conflictFor === selected.id) discardSelectedDraft();
 		await reloadList();
 	}
 

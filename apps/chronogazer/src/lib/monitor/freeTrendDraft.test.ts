@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import {
 	addPens,
 	afterFreeTrendSave,
+	afterFreeTrendSaveFailure,
+	shouldDiscardSavedDraft,
 	canCreateFreeTrend,
 	classifySaveFailure,
 	clearDraft,
@@ -275,6 +277,54 @@ describe('createBlocker', () => {
 		expect(createBlocker({ canCreate: true, count: 199, max: 200 })).toBeNull();
 		expect(createBlocker({ canCreate: true, count: 200, max: 200 })).toContain('200');
 		expect(createBlocker({ canCreate: false, count: 200, max: 200 })).toBeNull();
+	});
+});
+
+describe('shouldDiscardSavedDraft', () => {
+	const sent = { baseRevision: 3, name: 'a', timeWindowSec: 600, pens: [] };
+	it('送った中身と同じなら捨てる', () => {
+		expect(shouldDiscardSavedDraft({ ...sent }, sent)).toBe(true);
+	});
+	it('保存の後に中身が変わっていれば捨てない', () => {
+		expect(shouldDiscardSavedDraft({ ...sent, name: 'b' }, sent)).toBe(false);
+		expect(shouldDiscardSavedDraft({ ...sent, timeWindowSec: 60 }, sent)).toBe(false);
+	});
+	it('版が違えば捨てない', () => {
+		expect(shouldDiscardSavedDraft({ ...sent, baseRevision: 4 }, sent)).toBe(false);
+		expect(shouldDiscardSavedDraft({ ...sent, baseRevision: null }, sent)).toBe(false);
+	});
+	it('無い・壊れている（読めず null）なら捨てるものが無い', () => {
+		expect(shouldDiscardSavedDraft(null, sent)).toBe(false);
+		const storage = { getItem: () => '{broken' };
+		expect(shouldDiscardSavedDraft(loadDraft(storage, 7), sent)).toBe(false);
+	});
+});
+
+describe('afterFreeTrendSaveFailure', () => {
+	it('同じ対象を編集中なら編集欄に出し、一覧を読み直す', () => {
+		expect(
+			afterFreeTrendSaveFailure({ destroyed: false, startedFor: 7, currentTarget: 7 })
+		).toEqual({ applyToEditor: true, reload: true });
+		expect(
+			afterFreeTrendSaveFailure({ destroyed: false, startedFor: 'new', currentTarget: 'new' })
+		).toEqual({ applyToEditor: true, reload: true });
+	});
+	it('別のものを編集中・編集欄を閉じたなら編集欄に出さない', () => {
+		const other = { applyToEditor: false, reload: true };
+		expect(
+			afterFreeTrendSaveFailure({ destroyed: false, startedFor: 7, currentTarget: 8 })
+		).toEqual(other);
+		expect(
+			afterFreeTrendSaveFailure({ destroyed: false, startedFor: 7, currentTarget: null })
+		).toEqual(other);
+		expect(
+			afterFreeTrendSaveFailure({ destroyed: false, startedFor: 'new', currentTarget: 7 })
+		).toEqual(other);
+	});
+	it('画面を離れたあとは何もしない', () => {
+		expect(afterFreeTrendSaveFailure({ destroyed: true, startedFor: 7, currentTarget: 7 })).toEqual(
+			{ applyToEditor: false, reload: false }
+		);
 	});
 });
 

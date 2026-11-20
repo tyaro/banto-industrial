@@ -379,6 +379,44 @@ export function afterFreeTrendSave(args: {
 	};
 }
 
+/**
+ * 保存の成功後に、保持している下書きを捨てるか。保存を始めた後に編集が続いた（同じ画面でも、
+ * 離れて戻った別の画面でも）場合、いまの下書きには保存に含まれなかった変更があるので捨てない。
+ * 捨てるのは、いまの下書きが送った中身（版も含めて）と同じときだけ。`current` が無い・壊れている
+ * ときは捨てるものが無い。
+ */
+export function shouldDiscardSavedDraft(
+	current: FreeTrendDraft | null,
+	sent: FreeTrendDraft
+): boolean {
+	return (
+		current !== null &&
+		current.baseRevision === sent.baseRevision &&
+		sameDraftContent(current, sent)
+	);
+}
+
+/** 保存の失敗の後にすること。 */
+export interface FreeTrendSaveFailureFollowUp {
+	/** 失敗を編集欄（`conflict`・欄のエラー）に出す。違えば、どれの失敗かを示す通知だけにする。 */
+	applyToEditor: boolean;
+	/** 一覧を読み直す。 */
+	reload: boolean;
+}
+
+/**
+ * 保存の失敗を、保存を始めた編集欄だけに出すための判断（純関数）。待つ間に別のものを選んで
+ * 編集欄を開いていたら、その欄に誤った競合・誤りを立てない。
+ */
+export function afterFreeTrendSaveFailure(args: {
+	destroyed: boolean;
+	startedFor: DraftTarget;
+	currentTarget: DraftTarget | null;
+}): FreeTrendSaveFailureFollowUp {
+	if (args.destroyed) return { applyToEditor: false, reload: false };
+	return { applyToEditor: args.currentTarget === args.startedFor, reload: true };
+}
+
 /** 保存のエラーを画面のどこに出すか。 */
 export interface FreeTrendFieldErrors {
 	name: string[];
