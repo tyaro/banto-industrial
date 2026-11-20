@@ -12,7 +12,7 @@
  */
 import { MAX_FREE_TREND_NAME_CHARS, MAX_PENS_PER_FREE_TREND } from '../banto/freeTrendsAdmin';
 import type { FreeTrend, FreeTrendInput, FreeTrendPenInput } from '../banto/freeTrendsAdmin';
-import type { Pen, PenStyle } from '../banto/displayGroupsAdmin';
+import type { DisplayGroup, Pen, PenStyle } from '../banto/displayGroupsAdmin';
 import { DEFAULT_TREND_WINDOW_SEC, isTrendWindowSec } from './trendLogic';
 import {
 	parseAxisText,
@@ -423,6 +423,45 @@ export function withoutPenTexts(
 	const next = { ...texts };
 	delete next[tagId];
 	return next;
+}
+
+// --- 表示グループの組から作る（8c） -----------------------------------------
+
+/** 表示グループから下書きを作った結果。`skipped` は写せなかったペンの本数（注記用）。 */
+export interface DraftFromGroup {
+	draft: FreeTrendDraft;
+	skipped: number;
+}
+
+/**
+ * 表示グループのペンの組から、新規の自由トレンドの下書きを作る（#1207・#1231 PR 8c）。
+ * ペンはグループの順に `tagId`・色の枠・属性をすべて写す。`tagId` の無いペンは外し、同じタグは
+ * 最初の 1 本だけ、16 本を超えたら先頭 16 本。名前はグループの名前（前後の空白を落とし 64 文字まで）。
+ * 時間窓は `windowSec`（自由トレンドの選択肢に無ければ既定）。保存はしない。
+ */
+export function draftFromDisplayGroup(
+	group: Pick<DisplayGroup, 'name' | 'pens'>,
+	windowSec: number
+): DraftFromGroup {
+	const seen = new Set<number>();
+	const pens: FreeTrendPenInput[] = [];
+	for (const pen of group.pens) {
+		const tagId = (pen as { tagId?: unknown }).tagId;
+		if (typeof tagId !== 'number' || !Number.isInteger(tagId) || tagId <= 0) continue;
+		if (seen.has(tagId)) continue;
+		seen.add(tagId);
+		pens.push(penToInput(pen));
+	}
+	const kept = pens.slice(0, MAX_PENS_PER_FREE_TREND);
+	return {
+		draft: {
+			baseRevision: null,
+			name: [...group.name.trim()].slice(0, MAX_FREE_TREND_NAME_CHARS).join(''),
+			timeWindowSec: isTrendWindowSec(windowSec) ? windowSec : DEFAULT_TREND_WINDOW_SEC,
+			pens: kept
+		},
+		skipped: group.pens.length - kept.length
+	};
 }
 
 // --- 権限・入口 -------------------------------------------------------------

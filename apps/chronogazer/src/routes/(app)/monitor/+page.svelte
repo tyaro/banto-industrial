@@ -74,6 +74,14 @@
 	import { loadTagMetaResults } from '#lib/monitor/tagMetaLoad.js';
 	import { LiveTrend } from '#lib/monitor/liveTrend.svelte.js';
 	import {
+		canCreateFreeTrend,
+		draftFromDisplayGroup,
+		draftOwner,
+		loadDraft,
+		saveDraft,
+		sessionDraftStorage
+	} from '#lib/monitor/freeTrendDraft.js';
+	import {
 		TREND_WINDOWS_SEC,
 		collectPeriodMsOf,
 		groupDefaultWindowSec,
@@ -280,6 +288,40 @@
 		windowChoice = { ...windowChoice, [trendTarget.id]: sec === groupDefault ? null : sec };
 	}
 
+	// --- 表示グループの組から自由トレンドを作る（8c） -------------------------
+
+	const canCreateFree = $derived(
+		canCreateFreeTrend({
+			authDisabled: sessionStore.authDisabled,
+			publicViewer: sessionStore.publicViewer,
+			localDesktop: sessionStore.localDesktop,
+			signedIn: sessionStore.identity !== null
+		})
+	);
+
+	/** 今のグループのペンから新規の下書きを作り、自由トレンドの新規の編集欄へ移る（保存はしない）。 */
+	function saveAsFreeTrend(): void {
+		if (!trendTarget || !canCreateFree) return;
+		const owner = draftOwner({
+			authDisabled: sessionStore.authDisabled,
+			publicViewer: sessionStore.publicViewer,
+			localDesktop: sessionStore.localDesktop,
+			accountId: sessionStore.identity?.id ?? null
+		});
+		if (owner === null) return;
+		const storage = sessionDraftStorage();
+		if (
+			loadDraft(storage, owner, 'new') !== null &&
+			!window.confirm('作りかけの新しい自由トレンドの下書きを置き換えますか？')
+		) {
+			return;
+		}
+		const { draft, skipped } = draftFromDisplayGroup(trendTarget, trendWindowSec);
+		saveDraft(storage, owner, 'new', draft);
+		const query = skipped > 0 ? `?new=1&skipped=${skipped}` : '?new=1';
+		void goto(`${resolveAppPath('/free-trends')}${query}`);
+	}
+
 	function onVisibilityChange(): void {
 		pageVisible = document.visibilityState === 'visible';
 	}
@@ -431,6 +473,18 @@
 							</p>
 						</div>
 					{:else if selectedGroup.kind === 'trend'}
+						{#if canCreateFree}
+							<p class="note">
+								<button
+									type="button"
+									class="secondary"
+									data-testid="save-as-free-trend"
+									onclick={saveAsFreeTrend}
+								>
+									この組を自由トレンドとして保存
+								</button>
+							</p>
+						{/if}
 						<TrendPanel
 							group={selectedGroup}
 							pens={trendPens}

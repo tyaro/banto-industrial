@@ -344,6 +344,29 @@
 		void ensureConnections();
 	}
 
+	// 監視画面の「この組を自由トレンドとして保存」から来たとき（`?new=1`。下書きは移る前に保存済み）、
+	// 一覧が読めて作れると分かった後に新規の編集欄を 1 回だけ開き、クエリは replace で外す（8c）。
+	let fromGroupHandled = false;
+	/** 表示グループの組から写せなかったペンの本数（新規の編集欄に注記を出す）。 */
+	let fromGroupSkipped = $state(0);
+	$effect(() => {
+		if (fromGroupHandled || list === null) return;
+		if (page.url.searchParams.get('new') !== '1') return;
+		if (!canCreate) return;
+		fromGroupHandled = true;
+		const skipped = Number(page.url.searchParams.get('skipped'));
+		untrack(() => {
+			if (createBlock === null) {
+				startCreate();
+				fromGroupSkipped = Number.isInteger(skipped) && skipped > 0 ? skipped : 0;
+			}
+		});
+		void goto(freeTrendHref(null), { replaceState: true });
+	});
+	$effect(() => {
+		if (!creating) fromGroupSkipped = 0;
+	});
+
 	function startEdit(): void {
 		if (!canDraftSelected) return;
 		editGen += 1;
@@ -893,6 +916,11 @@
 						<p class="empty-hint">
 							新しい自由トレンドを作っています。右の欄で名前とペンを決めて、保存してください。
 						</p>
+						{#if fromGroupSkipped > 0}
+							<p class="note warn" role="status" data-testid="free-trend-from-group-note">
+								表示グループのペンのうち {fromGroupSkipped} 本は、未登録・同じタグの重複・16 本の上限のため写していません。
+							</p>
+						{/if}
 					</div>
 				{:else if list.length === 0}
 					<div class="empty-state">
