@@ -38,6 +38,14 @@
  * セレクタは banto を上げると壊れる」）。バックドロップは部品のスクリム
  * （ポインタ専用・名前なし）になったので、枠の右端の座標をクリックする。
  *
+ * #1253: タグ登録の枠も `@banto/dock-svelte` の `ThreePaneDock` へ載せ替えた（タグモニタと
+ * 同じ）。狭い表示ではツリーが左端の自動で隠す帯へ退き、帯のタブ（部品の
+ * `data-dock-band-tab="left"`、`aria-expanded` を持つ）で引き出す。引き出した pane は
+ * 中央を `inert` にせずスクリムも無い（外の押下・外へのフォーカスの移動で戻る）ので、
+ * スクリムのクリックは「外の押下」に、サイドバーとの重なり（8・31・31b）は「サイドバーを
+ * 開くとツリーは戻る（重ならない）」に置き換えた。ツリーのペインはページの
+ * `data-testid="tag-tree-pane"`、広い表示のトグルはツールバーの `tag-tree-toggle` で引く。
+ *
  * 前提データは UI ではなく `page.request` で直接 REST を叩いて作り
  * （`banto-hub-tags-edit-pane.spec.ts` と同じパターン）、後始末は共有ヘルパー
  * `cleanupFixtures` を `beforeAll` の先頭と `afterAll` の両方で呼ぶ
@@ -50,23 +58,29 @@ import { cleanupFixtures } from './banto-hub-fixture-cleanup';
 /** #378 の実測条件そのもの（issue 本文の「400px 幅」）。 */
 const NARROW_VIEWPORT = { width: 400, height: 800 };
 
-/** 退避パネル（`ThreePaneLayout` の左ペイン）とそのトグルの名前（両ページ共通）。 */
-const TREE_PANE_LABEL = '接続とグループ';
-const TREE_PANE_SELECTOR = `aside[aria-label="${TREE_PANE_LABEL}"]`;
-const TREE_TOGGLE_SELECTOR = `button[aria-label="${TREE_PANE_LABEL}"]`;
+/**
+ * タグ登録のツリーのペイン（ページの要素。狭い表示では帯から引き出した pane の中）と、
+ * 狭い表示でそれを開く帯のタブ（部品の印）。広い表示のトグルは `WIDE_TREE_TOGGLE`。
+ */
+const TREE_PANE_SELECTOR = '[data-testid="tag-tree-pane"]';
+const TREE_TOGGLE_SELECTOR = 'button[data-dock-band-tab="left"]';
+const WIDE_TREE_TOGGLE = 'tag-tree-toggle';
 
 /**
- * スクリム（ポインタ専用で名前が無い）のクリック。スクリムは枠全体を覆い、
- * 左端は退避パネル自身が重なっているので、枠（退避パネルの親）の右端寄りを押す。
+ * 引き出した pane の外の押下（旧のスクリムのクリックの置き換え）。押してもほかの操作が
+ * 起きない所 = ページの見出しを押す。
  */
-async function clickScrim(page: Page): Promise<void> {
-	const frame = page.locator(TREE_PANE_SELECTOR).locator('xpath=..');
-	const box = await frame.boundingBox();
-	expect(box).not.toBeNull();
-	await page.mouse.click(
-		(box?.x ?? 0) + (box?.width ?? 0) - 10,
-		(box?.y ?? 0) + (box?.height ?? 0) / 2
-	);
+async function pressOutsideTree(page: Page): Promise<void> {
+	await page.getByRole('heading', { level: 2, name: 'タグ登録' }).click();
+}
+
+/** フォーカスが `<body>` でもツリーのペインの中でもない（隠れた pane に取り残されていない）。 */
+async function focusIsLiveOutsideTree(page: Page): Promise<boolean> {
+	return page.evaluate((selector) => {
+		const active = document.activeElement;
+		if (!active || active === document.body) return false;
+		return !document.querySelector(selector)?.contains(active);
+	}, TREE_PANE_SELECTOR);
 }
 
 const CONNECTION_NAME = 'e2e-tree-oc-plc';
@@ -93,7 +107,7 @@ const CLEANUP_TARGET = {
 test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378)', () => {
 	let page: Page;
 	let authedHeaders: Record<string, string>;
-	/** タグ登録ページの退避パネル（`ThreePaneLayout` の左ペイン）。 */
+	/** タグ登録ページのツリーのペイン（狭い表示では帯から引き出した pane の中）。 */
 	let treePane: Locator;
 	let treeToggle: Locator;
 	let treeSelection: Locator;
@@ -154,7 +168,7 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		}
 
 		treePane = page.locator(TREE_PANE_SELECTOR);
-		// 開いているあいだ帯は `inert`（中央）なので、role ではなく属性で引く。
+		// 帯のタブは部品の印で引く（名前は pane のタイトルと同じで、ほかのボタンと紛れる）。
 		treeToggle = page.locator(TREE_TOGGLE_SELECTOR);
 		treeSelection = page.getByTestId('tag-tree-selection');
 	});
@@ -168,9 +182,8 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await page.goto('/tags');
 		await expect(page.getByRole('heading', { level: 2, name: 'タグ登録' })).toBeVisible();
 
-		// 退避しているので支援技術・テストから見ても「閉じている」
-		// （`visibility: hidden` + `inert` - `ThreePaneLayout` の冒頭コメントの
-		// 約束。`transform` だけだと祖先の `overflow: hidden` で
+		// 退避しているので支援技術・テストから見ても「閉じている」（引き出していない
+		// pane は `hidden`。`transform` だけだと祖先の `overflow: hidden` で
 		// clip されているだけの「見えないが可視」な状態になってしまう）。
 		await expect(treePane).toBeHidden();
 		await expect(treeToggle).toBeVisible();
@@ -293,26 +306,36 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(treeSelection).toHaveText(GROUP_A);
 	});
 
-	test('3. Esc とバックドロップのクリックで閉じ、フォーカスはボタンへ戻る', async () => {
+	test('3. Esc と外の押下で閉じ、フォーカスは帯のタブへ戻る（隠れた pane に残らない）', async () => {
 		await treeToggle.click();
 		await expect(treePane).toBeVisible();
 
 		await page.keyboard.press('Escape');
 		await expect(treePane).toBeHidden();
-		// 開く操作をしたボタンへフォーカスを戻す（`TreeContextMenu.svelte` と
-		// 同じ `triggerEl` の形）。
+		// 開く操作をしたタブへフォーカスを戻す（部品が pane を戻すときに渡す）。
 		await expect(treeToggle).toBeFocused();
 
 		await treeToggle.click();
 		await expect(treePane).toBeVisible();
+		// 帯のタブで開くと、フォーカスは引き出した pane の中へ入る（Esc で閉じられる）。
+		await expect
+			.poll(() =>
+				page.evaluate(() => !!document.activeElement?.closest('[data-dock-flyout="left"]'))
+			)
+			.toBe(true);
 
-		// バックドロップ（部品のスクリム）は枠の中だけを覆い、その左端は退避
-		// パネル自身が重なっている（z-index はパネルが上）。パネルより右側の座標を
-		// 押す（`banto-hub-viewport-offcanvas.spec.ts` のテスト4で実測した罠と同じ）。
-		await clickScrim(page);
+		// #1253: スクリムは無い。外を押すと戻る（押した所は普通に操作される）。
+		await pressOutsideTree(page);
 
 		await expect(treePane).toBeHidden();
-		await expect(treeToggle).toBeFocused();
+		await expect(treeToggle).toHaveAttribute('aria-expanded', 'false');
+		// ポインタで外を押したので、フォーカスは押した所へ移る（隠れた pane には残らない）。
+		expect(
+			await page.evaluate(
+				(selector) => !document.querySelector(selector)?.contains(document.activeElement),
+				TREE_PANE_SELECTOR
+			)
+		).toBe(true);
 	});
 
 	test('4. 退避ツリーの上に開いたモーダルの Esc は、モーダルだけを閉じる', async () => {
@@ -327,12 +350,13 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 
 		await page.keyboard.press('Escape');
 
-		// 手前（z-index 900）のモーダルが閉じ、退避パネル（610）は開いたまま。
+		// 手前のモーダルが閉じ、退避パネルは開いたまま（部品はモーダルの中の操作を
+		// pane の「外」と数えない）。
 		await expect(createModal).toBeHidden();
 		await expect(treePane).toBeVisible();
 
 		// 後片付け: モーダルが無くなった状態の Esc は退避パネルへ届く
-		// （window フォールバック - `ThreePaneLayout` の Esc のコメント）。
+		// （フォーカスはモーダルを開いた pane の中のボタンへ戻っている）。
 		await page.keyboard.press('Escape');
 		await expect(treePane).toBeHidden();
 	});
@@ -346,8 +370,8 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		// 「モーダルと退避パネルが両方閉じる」ことになる。
 		//
 		// モーダルは（テスト4 と同じく）ツリーペイン内の常設ボタンから開く -
-		// 退避パネルが開いている間はバックドロップがグリッド側を覆うので、
-		// 「ツリーもモーダルも開いている」状態を作れる経路はこれになる。
+		// pane の外を押すと pane が戻るので、「ツリーもモーダルも開いている」状態を
+		// 作れる経路はこれになる。
 		await treeToggle.click();
 		await expect(treePane).toBeVisible();
 		await treePane.getByRole('button', { name: 'PLC接続を追加' }).click();
@@ -372,13 +396,14 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(treePane).toBeVisible();
 
 		// 広幅では退避そのものが無効になる: ツリーは常時表示の左ペインへ戻り、
-		// トグルは「畳む」トグルとして帯に残る（#1179 PR2b、`ThreePaneLayout`）。
+		// 帯のタブは消えて、表示・非表示はツールバーのトグル（#1253）。
 		await page.setViewportSize({ width: 1280, height: 800 });
 		await expect(treePane).toBeVisible();
-		await expect(treeToggle).toHaveAttribute('aria-expanded', 'true');
+		await expect(treeToggle).toHaveCount(0);
+		await expect(page.getByTestId(WIDE_TREE_TOGGLE)).toHaveAttribute('aria-pressed', 'true');
 
-		// 狭幅へ戻したとき、`leftDrawerOpen` が残っていて開いた状態で現れては
-		// いけない（部品が広幅遷移で閉じへ戻す）。
+		// 狭幅へ戻したとき、引き出した状態が残っていて開いた状態で現れては
+		// いけない（部品は狭い表示へ入るたびに帯へ置き直す）。
 		await page.setViewportSize(NARROW_VIEWPORT);
 		await expect(treeToggle).toBeVisible();
 		await expect(treeToggle).toHaveAttribute('aria-expanded', 'false');
@@ -395,11 +420,12 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		const menu = page.getByRole('menu', { name: '作成メニュー' });
 		await expect(menu).toBeVisible();
 		// 右クリックでも選択は反映されるが、**退避パネルは開いたまま**
-		// （閉じるとフォーカスの戻り先が `inert` の中に取り残される）。
+		// （閉じるとフォーカスの戻り先が隠れた pane の中に取り残される。#1253 から
+		// メニューは popover なので、メニューへフォーカスが移っても部品は pane を戻さない）。
 		await expect(treePane).toBeVisible();
 		await expect(treeSelection).toHaveText(GROUP_A);
 
-		// メニュー（z-index 1000）の Esc はメニューだけを閉じ、退避パネルは
+		// メニュー（最上位の層）の Esc はメニューだけを閉じ、退避パネルは
 		// 残る。フォーカスは右クリックしたノードへ戻る（`TreeContextMenu` の
 		// `triggerEl` が生きている）。
 		await page.keyboard.press('Escape');
@@ -412,51 +438,38 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(treePane).toBeHidden();
 	});
 
-	test('8. サイドバーと退避ツリーが両方開いていても、Esc は1層ずつ畳む（#381 レビュー対応3回目）', async () => {
+	test('8. 退避ツリーを開いたままサイドバーを開くと、ツリーは戻り 2 層は重ならない（#381 レビュー対応3回目、#1253）', async () => {
+		// #1253 前は枠のスクリムが枠の中だけを覆い、ツリーを開いたまま ☰ を押せた
+		// （2 層を Esc で 1 層ずつ畳むことを見ていた）。部品の引き出した pane は外の押下で
+		// 戻るので、2 層が重なる状態そのものを作らない（ページもサイドバーが開いた遷移で
+		// pane を戻す）。Esc はサイドバーだけを閉じる。
 		await treeToggle.click();
 		await expect(treePane).toBeVisible();
 
-		// ☰ はヘッダーにあり、退避ツリーのスクリム（枠の中だけを覆う）には
-		// 隠れないので、ツリーを開いたままサイドバーも開ける。サイドバー
-		// （z-index 710）はツリー（枠の中の 2）より手前の層。
 		await page.getByRole('button', { name: 'メニューを開く' }).click();
 		await expect(page.getByRole('button', { name: 'メニューを閉じる', exact: true })).toBeVisible();
+		await expect(treePane).toBeHidden();
 
-		// 1回目の Esc: 手前のサイドバーだけが閉じる（レイアウト側の Esc ハンドラが
-		// `preventDefault` してイベントを消費し、`ThreePaneLayout` は譲る）。
 		await page.keyboard.press('Escape');
 		await expect(page.getByRole('button', { name: 'メニューを開く' })).toBeVisible();
-		await expect(treePane).toBeVisible();
-
-		// 2回目の Esc: 今度はツリーが閉じる。
-		await page.keyboard.press('Escape');
 		await expect(treePane).toBeHidden();
 	});
 
-	test('9. ツリー・サイドバー・コマンドパレットが重なっても、Esc は手前から1層ずつ畳む（#381 レビュー対応4回目）', async () => {
-		// 3層を下から順に開く（退避ツリー 610 → サイドバー 710 →
-		// コマンドパレット 1000。`@banto/ui` の `layering.ts` の層の表）。パレットは
-		// `Ctrl+K` で開く - サイドバーのバックドロップがヘッダーの 🔍 を覆うため、
-		// この状態でパレットを開く経路はキーボードになる。
+	test('9. ツリーの上にコマンドパレットを重ねても、Esc は手前から1層ずつ畳む（#381 レビュー対応4回目）', async () => {
+		// #1253: サイドバーはツリーと重ならなくなった（テスト8）ので、ツリーとパレットの
+		// 2 層で見る。パレットは `aria-modal` の層なので、部品はパレットへ移ったフォーカスを
+		// pane の「外」と数えず、ツリーは開いたまま。
 		await treeToggle.click();
 		await expect(treePane).toBeVisible();
-		await page.getByRole('button', { name: 'メニューを開く' }).click();
-		await expect(page.getByRole('button', { name: 'メニューを閉じる', exact: true })).toBeVisible();
 		await page.keyboard.press('Control+k');
 
-		// コマンドパレットは `role="dialog"`（`CommandPalette.svelte`）なので、
-		// 下の2層はどちらもこれを「可視な上位層」として認識して譲る。
 		const palette = page.getByRole('dialog', { name: 'コマンドパレット' });
 		await expect(palette).toBeVisible();
+		await expect(treePane).toBeVisible();
 
 		await page.keyboard.press('Escape');
 		await expect(palette).toHaveCount(0);
-		// サイドバーもツリーも道連れにならない。
-		await expect(page.getByRole('button', { name: 'メニューを閉じる', exact: true })).toBeVisible();
-		await expect(treePane).toBeVisible();
-
-		await page.keyboard.press('Escape');
-		await expect(page.getByRole('button', { name: 'メニューを開く' })).toBeVisible();
+		// ツリーは道連れにならない。
 		await expect(treePane).toBeVisible();
 
 		await page.keyboard.press('Escape');
@@ -465,8 +478,8 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 
 	test('10. メニューを開いたまま狭幅へ変わっても、閉じたフォーカスは生きた要素へ戻る（#381 レビュー対応5回目）', async () => {
 		// 広幅ではツリーが常時表示なので、そこでノードを右クリックしてから狭幅へ
-		// 変える。狭幅になった瞬間に退避パネルは閉じ（`inert`）、メニューが覚えて
-		// いる戻り先（ツリーノード）は不活性の中に取り残される。
+		// 変える。狭幅になった瞬間にツリーは帯へ退き（隠れる）、メニューが覚えて
+		// いる戻り先（ツリーノード）は隠れた pane の中に取り残される。
 		await page.setViewportSize({ width: 1280, height: 800 });
 		await groupNodeByName(page, GROUP_A).click({ button: 'right' });
 		const menu = page.getByRole('menu', { name: '作成メニュー' });
@@ -479,7 +492,7 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await page.keyboard.press('Escape');
 		await expect(menu).toHaveCount(0);
 
-		// フォーカスは `<body>` へ落ちず、開き直せるトグルボタンへ送られる。
+		// フォーカスは `<body>` へ落ちず、開き直せる帯のタブへ送られる。
 		await expect
 			.poll(() =>
 				page.evaluate(
@@ -551,10 +564,11 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(palette).toHaveCount(0);
 	});
 
-	test('13. 広幅でツリー内にフォーカスがある状態で狭幅へ変えると、フォーカスはトグルへ逃げる（#381 レビュー対応7回目）', async () => {
+	test('13. 広幅でツリー内にフォーカスがある状態で狭幅へ変えると、フォーカスは生きた要素へ逃げる（#381 レビュー対応7回目）', async () => {
 		// 広幅ではツリーが常時表示で、ノードは普通にフォーカスできる。狭幅へ
-		// 変わるとペインは閉じたまま `inert` + `visibility: hidden` になるので、
-		// 逃がさないとフォーカスが `<body>` に落ちてキーボード操作の起点を失う。
+		// 変わるとペインは帯へ退いて隠れるので、逃がさないとフォーカスが `<body>` に
+		// 落ちてキーボード操作の起点を失う。#1253 から逃げ先は部品が決める（中央の
+		// パネル。タグモニタと同じ）。帯のタブから開き直せる。
 		await page.setViewportSize({ width: 1280, height: 800 });
 		const node = groupNodeByName(page, GROUP_B);
 		await node.focus();
@@ -563,7 +577,8 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await page.setViewportSize(NARROW_VIEWPORT);
 
 		await expect(treePane).toBeHidden();
-		await expect(treeToggle).toBeFocused();
+		await expect.poll(() => focusIsLiveOutsideTree(page)).toBe(true);
+		await expect(treeToggle).toBeVisible();
 	});
 
 	test('14. 接続 Drawer が開いている間はグループ Drawer を開かない（未保存入力を捨てない、#381 レビュー対応8回目）', async () => {
@@ -647,7 +662,7 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(page.getByRole('button', { name: 'メニューを閉じる', exact: true })).toBeVisible();
 
 		// サイドバーのバックドロップが本文を覆うのでクリックでは届かない -
-		// Tab でヘッダー経由トグルへ到達して押した場合と同じことを直接の click
+		// Tab でヘッダー経由で帯のタブへ到達して押した場合と同じことを直接の click
 		// イベントで再現する（サイドバーはモーダルではないので到達できる）。
 		await treeToggle.dispatchEvent('click');
 
@@ -748,7 +763,7 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(groupDrawer).toHaveCount(0);
 
 		// 戻り先は「右クリックしたノード（退避パネルは開いたままなので生きている）」
-		// か、それが `inert` 等で戻せないときのツリーのトグル。どちらにせよ
+		// か、それが隠れていて戻せないときの帯のタブ。どちらにせよ
 		// `<body>` には落ちない。
 		expect(
 			await page.evaluate(
@@ -838,7 +853,7 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await editDrawer.getByRole('button', { name: '削除', exact: true }).click();
 		await expect(editDrawer).toHaveCount(0);
 
-		// 戻し先の行は消えているので、`focusFallback`（ツリーのトグル）へ。
+		// 戻し先の行は消えているので、`focusFallback`（帯のタブ）へ。
 		await expect
 			.poll(() => page.evaluate(() => document.activeElement?.tagName ?? null))
 			.not.toBe('BODY');
@@ -885,7 +900,7 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 
 		await page.keyboard.press('Escape');
 		await expect(editDrawer).toHaveCount(0);
-		// 戻し先（body）は拒否されるので `focusFallback`（ツリーのトグル）へ。
+		// 戻し先（body）は拒否されるので `focusFallback`（帯のタブ）へ。
 		await expect(treeToggle).toBeFocused();
 		await page.getByPlaceholder('名前・アドレスで検索').fill('');
 	});
@@ -899,8 +914,8 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 
 		// フォーカスをメニューの外へ飛ばす（「見えているのにフォーカスは外」と
 		// いう状態を作らせない）。飛ばし先は開いているツリーのペインの中で、
-		// メニューの外の要素にする（帯のトグルは中央にあり、ドロワーを開いている
-		// あいだ中央は `inert` なので `.focus()` が効かない）。
+		// メニューの外の要素にする（pane の外へ飛ばすと、部品が pane ごと戻すので
+		// 「Esc が下の層へ届く」を見られない）。
 		const movedOut = await page.evaluate((selector) => {
 			const pane = document.querySelector<HTMLElement>(selector);
 			// 候補を順に試し、フォーカスがメニューの外へ出たら止める（フォーカスを
@@ -1042,49 +1057,48 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await editDrawer.getByRole('button', { name: '削除', exact: true }).click();
 		await expect(editDrawer).toHaveCount(0);
 
-		// 古いツリーノードではなく、ページ側の fallback（ツリーのトグル）へ。
+		// 古いツリーノードではなく、ページ側の fallback（帯のタブ）へ。
 		await expect(treeToggle).toBeFocused();
 		await page.getByPlaceholder('名前・アドレスで検索').fill('');
 	});
 
-	test('31. ペイン内にフォーカスがあっても、サイドバーが先に閉じる（#381 レビュー対応15回目）', async () => {
-		// サイドバー（710）は `dialog`/`menu` を名乗らないので、退避ツリー（610）から
-		// 「上の層」として見えず、ペイン内の Esc がツリーを先に閉じていた。
-		// 汎用マーカー `data-esc-layer` で層に入れたので、1層ずつ畳める。
+	test('31. ペイン内にフォーカスがあってもサイドバーを開けば、ツリーは戻り Esc はサイドバーを閉じる（#381 レビュー対応15回目、#1253）', async () => {
+		// #1253 前は、ツリーを開いたままサイドバーを開けたので、ペイン内の Esc がツリーを
+		// 先に閉じないこと（`data-esc-layer`）を見ていた。部品の引き出した pane の Esc は
+		// `@banto/ui` の層を見ないので、ページはサイドバーが開いた遷移で pane を戻す
+		// （2 層を重ねない）。ペインの中へキーボードで入ってから ☰ を押しても同じ。
 		await page.goto('/tags');
 		await treeToggle.click();
 		await expect(treePane).toBeVisible();
+		await treePane.getByRole('button', { name: 'PLC接続を追加' }).focus();
+
 		await page.getByRole('button', { name: 'メニューを開く' }).click();
 		await expect(page.getByRole('button', { name: 'メニューを閉じる', exact: true })).toBeVisible();
-
-		// フォーカスを**ペインの中**へ置く（ここが以前の抜け道）。
-		await treePane.getByRole('button', { name: 'PLC接続を追加' }).focus();
+		await expect(treePane).toBeHidden();
 
 		await page.keyboard.press('Escape');
 		await expect(page.getByRole('button', { name: 'メニューを開く' })).toBeVisible();
-		await expect(treePane).toBeVisible();
-
-		await page.keyboard.press('Escape');
 		await expect(treePane).toBeHidden();
 	});
 
-	test('31b. サイドバーを開いた直後（最初のフレームより前）の Esc でも、サイドバーが先に閉じる（#399）', async () => {
-		// テスト31 が CI でだけ落ちていた原因（#399）。サイドバーの `visibility` を
-		// 開くときも 0.2s で遷移させていたため、**開いてから最初のアニメーション
-		// フレームが進むまで計算値が `hidden`** のままで、`@banto/ui` の `layering.ts` の
-		// `isActiveLayer` が開いたサイドバーを「層ではない」と判定していた。
-		// 遅い CI ランナーでは ☰ のクリックから Esc までにフレームが進まないこと
-		// があり、ペイン内の Esc がツリーを先に閉じた（失敗時の画面は「サイドバー
-		// が開いたまま・ツリーが閉じている」）。
-		//
-		// ローカルの速い環境ではフレームが先に進むので、キー入力では再現しない。
-		// ☰ のクリック・DOM の反映・Esc を**1つのタスクの中で**続けて行い、
-		// フレームが進む前の状態を決定的に作る。
+	test('31b. サイドバーを開いた直後（最初のフレームより前）でも、ツリーとサイドバーは重ならない（#399、#1253）', async () => {
+		// テスト31 が CI でだけ落ちていた原因（#399）は、開いた直後のサイドバーを層と
+		// 見落とすことだった。#1253 から、押下もフォーカスの移動も起きない経路（☰ の
+		// `click()` をプログラムで呼ぶ）で開いても、ページがサイドバーの開いた遷移で
+		// pane を戻す。ペインの中へのフォーカス・☰ のクリック・DOM の反映・Esc を
+		// **1つのタスクの中で**続けて行い、フレームが進む前の状態を決定的に作る。
 		await page.goto('/tags');
 		await treeToggle.click();
 		await expect(treePane).toBeVisible();
 
 		const result = await page.evaluate(async (paneSelector) => {
+			const pane = document.querySelector<HTMLElement>(paneSelector);
+			const paneButton = Array.from(pane?.querySelectorAll<HTMLElement>('button') ?? []).find(
+				(el) => el.textContent?.includes('PLC接続を追加')
+			);
+			if (!pane || !paneButton) return 'no-pane-button';
+			paneButton.focus();
+			if (document.activeElement !== paneButton) return 'focus-failed';
 			const menuButton = document.querySelector<HTMLElement>(
 				'header button[aria-label="メニューを開く"]'
 			);
@@ -1096,45 +1110,32 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 				await Promise.resolve();
 			}
 			if (!document.querySelector('[data-esc-layer="sidebar"]')) return 'sidebar-not-open';
-
-			const paneButton = Array.from(
-				document.querySelectorAll<HTMLElement>(`${paneSelector} button`)
-			).find((el) => el.textContent?.includes('PLC接続を追加'));
-			if (!paneButton) return 'no-pane-button';
-			paneButton.focus();
-			if (document.activeElement !== paneButton) return 'focus-failed';
-			paneButton.dispatchEvent(
+			// pane が戻る（ページの `$effect`）のを同じタスクの中で待つ。
+			for (let i = 0; i < 50 && pane.checkVisibility(); i += 1) await Promise.resolve();
+			if (pane.checkVisibility()) return 'tree-still-open';
+			(document.activeElement ?? document.body).dispatchEvent(
 				new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
 			);
 			return 'dispatched';
 		}, TREE_PANE_SELECTOR);
 		expect(result).toBe('dispatched');
 
-		// 手前のサイドバーだけが閉じ、ツリーは開いたまま。
+		// サイドバーが閉じ、ツリーも閉じたまま。
 		await expect(page.getByRole('button', { name: 'メニューを開く' })).toBeVisible();
-		await expect(treePane).toBeVisible();
-
-		await page.keyboard.press('Escape');
 		await expect(treePane).toBeHidden();
 	});
 
-	test('31c. 開いた直後（同じタスク内）にペインへ移すフォーカスが、visibility: hidden の間に空振りしない（#421）', async () => {
-		// #399/#420 は Sidebar の Esc 誤動作だった。退避ペイン（#1179 PR2b から
-		// `@banto/ui` の `ThreePaneLayout` のドロワー）は、開いた直後
-		// （`tick()` の後、Svelte のマイクロタスク）にペイン内の最初の要素へ
-		// `.focus()` を呼ぶ。これは CSS の `visibility` 遷移が最初のアニメーション
-		// フレームへ進むより前に走りうるため、開くときも `visibility` を遷移させる
-		// と「開いたのに計算値はまだ `hidden`」の瞬間に `.focus()` を呼び、空振り
-		// する（`visibility: hidden` の要素はフォーカスを受けない）。部品は開くとき
-		// `visibility` を遷移させない約束（冒頭コメント）で、それをここで固定する。
+	test('31c. 開いた直後（同じタスク内）にペインへ移すフォーカスが空振りしない（#421）', async () => {
+		// #399/#420 は Sidebar の Esc 誤動作だった。退避ペイン（#1253 から部品の帯から
+		// 引き出す pane）は、開いた直後（`tick()` の後、Svelte のマイクロタスク）に
+		// pane の中へ `.focus()` を呼ぶ。開くときに `visibility` を遷移させると「開いたのに
+		// 計算値はまだ `hidden`」の瞬間に `.focus()` を呼んで空振りする。それをここで固定する。
 		//
-		// ☰ トグルのクリックと直後の判定を `page.evaluate` の 1 タスク内で行い、
+		// 帯のタブのクリックと直後の判定を `page.evaluate` の 1 タスク内で行い、
 		// フレームが進む前の状態を決定的に作る（テスト31b と同じ作法）。
 		await page.goto('/tags');
 		// ハイドレーション完了（`mobileNavStore.isNarrow` の反映）を Playwright の
-		// 自動待機で確認してから、評価の中では素の DOM 操作に切り替える —
-		// ここを待たずに `page.evaluate` へ入ると、トグル自体がまだ描画されて
-		// いない「no-toggle」を拾ってしまい、狙った競合と関係ない失敗になる。
+		// 自動待機で確認してから、評価の中では素の DOM 操作に切り替える。
 		await expect(treeToggle).toBeVisible();
 		await expect(treePane).toBeHidden();
 
@@ -1144,19 +1145,17 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 				if (!toggle) return 'no-toggle';
 				toggle.click();
 				// Svelte の DOM 反映・$effect・`tick()` はマイクロタスク。
-				// requestAnimationFrame は挟まない。開いた印は部品の約束の
-				// `data-esc-layer`（開いているあいだだけ付く）。フォーカスの移動は
-				// その後の `tick()` なので、入るまで（または上限まで）待つ。
+				// requestAnimationFrame は挟まない。フォーカスの移動はその後の `tick()` なので、
+				// 入るまで（または上限まで）待つ。
+				const flyout = () => document.querySelector<HTMLElement>('[data-dock-flyout="left"]');
 				for (let i = 0; i < 50; i += 1) {
-					const pane = document.querySelector<HTMLElement>(paneSelector);
-					if (pane?.hasAttribute('data-esc-layer') && pane.contains(document.activeElement)) break;
+					if (flyout()?.contains(document.activeElement)) break;
 					await Promise.resolve();
 				}
 				const pane = document.querySelector<HTMLElement>(paneSelector);
-				if (!pane) return 'no-pane';
-				if (!pane.hasAttribute('data-esc-layer')) return 'pane-not-open';
+				if (!pane || !flyout()) return 'no-pane';
 				const visibility = getComputedStyle(pane).visibility;
-				const focusedInside = pane.contains(document.activeElement);
+				const focusedInside = !!flyout()?.contains(document.activeElement);
 				return `${visibility}:${focusedInside}`;
 			},
 			[TREE_PANE_SELECTOR, TREE_TOGGLE_SELECTOR] as const
@@ -1168,13 +1167,12 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 
 	test('32. 狭幅→広幅でトグルにフォーカスがあっても body に落ちない（#381 レビュー対応15回目）', async () => {
 		// 自前の `SplitPane` の頃は、狭幅のトグルが広幅への更新と同時に
-		// アンマウントされ、戻し先が無くなっていた。#1179 PR2b から、トグルは
-		// `ThreePaneLayout` の帯に広幅でも（畳むトグルとして）残るので、
-		// フォーカスはトグルに留まる。どちらにせよ `<body>` に落ちないことを見る。
+		// アンマウントされ、戻し先が無くなっていた。#1253 から帯のタブは広い表示で
+		// 消える（ツリーは左にドッキングし直す）ので、フォーカスは部品が中央へ逃がす。
+		// どちらにせよ `<body>` に落ちないことを見る。
 		//
-		// 31c はツリーを開いたまま終わる。開いているあいだトグルは `inert` の中央に
-		// あってフォーカスを受けないので、先に閉じる（Esc で閉じるとフォーカスは
-		// トグルへ戻る）。
+		// 31c はツリーを開いたまま終わるので、先に閉じる（Esc で閉じるとフォーカスは
+		// 帯のタブへ戻る）。
 		await page.keyboard.press('Escape');
 		await expect(treePane).toBeHidden();
 		await treeToggle.focus();
@@ -1191,7 +1189,6 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 				})
 			)
 			.toBe(true);
-		await expect(treeToggle).toBeFocused();
 
 		await page.setViewportSize(NARROW_VIEWPORT);
 	});

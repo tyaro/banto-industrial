@@ -459,11 +459,10 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 
 			// #378（2026-09-16、v0.2.0-alpha.20）: 狭幅では左ツリーがオフキャンバスへ
 			// 退避するようになったので、ノードをクリックする前に枠の帯の
-			// ツリーのトグル（#1179 PR2b から `ThreePaneLayout` の左ペインのトグル、
-			// 名前はペインと同じ「接続とグループ」）で開く（選ぶと自動で閉じる）。
-			// 広幅のケース（このスペックの他のテスト）は従来どおりツリーが常時
-			// 出ているので変更不要。
-			await narrowPage.locator('button[aria-label="接続とグループ"]').click();
+			// ツリーのタブ（#1253 から `ThreePaneDock` の左端の帯のタブ）で開く
+			// （選ぶと自動で閉じる）。広幅のケース（このスペックの他のテスト）は
+			// 従来どおりツリーが常時出ているので変更不要。
+			await narrowPage.locator('button[data-dock-band-tab="left"]').click();
 			await groupNodeByName(narrowPage, CALC_GROUP_NAME).click();
 			await narrowPage.getByRole('button', { name: 'タグを追加' }).click();
 
@@ -528,5 +527,43 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 		// パレットが無くなれば従来どおりトグルが OFF になる。
 		await page.keyboard.press('Escape');
 		await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+	});
+	test('11. 挿入 ON のまま属性を帯に折りたたむと、行クリックは挿入ではなく通常の選択になる（PR #1269 のレビュー）', async () => {
+		await page.goto('/tags');
+		await groupNodeByName(page, CALC_GROUP_NAME).click();
+		await page.getByRole('button', { name: 'タグを追加' }).click();
+		const pane = page.getByRole('complementary', { name: '新規作成' });
+		await expect(pane).toBeVisible();
+		const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
+		const initialCheck = waitForExpressionCheck(page);
+		await expressionField.fill(BASE_EXPRESSION);
+		await initialCheck;
+		const toggle = pane.getByTestId('tag-expression-insert-toggle');
+		await toggle.click();
+		await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+		await groupNodeByName(page, GROUP_NAME).click();
+
+		// 属性（右）を帯に折りたたむ。部品の `rightOpen` は「見えている」のままだが、式欄は操作できない。
+		await page.getByRole('button', { name: '属性を帯に折りたたむ' }).click();
+		await expect(page.getByTestId('tag-insert-armed-badge')).toHaveCount(0);
+
+		// 行クリックは通常の選択（入力済みの新規作成なので破棄の確認が出る = `selectTag`）。
+		// 確認を断って新規作成に留まり、式に何も挿入されていないことを見る。
+		let confirmed = false;
+		page.once('dialog', (dialog) => {
+			confirmed = true;
+			void dialog.dismiss();
+		});
+		await page.getByRole('gridcell', { name: REF_TAG_NAME, exact: true }).click();
+		await expect.poll(() => confirmed).toBe(true);
+
+		await page.getByRole('button', { name: '属性を帯から展開' }).click();
+		await expect(pane).toBeVisible();
+		await expect(expressionField).toHaveValue(BASE_EXPRESSION);
+		await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+
+		// 後片付け: 既定の配置へ戻す（後の spec に折りたたみを残さない）。
+		await page.getByTestId('tag-view-menu').click();
+		await page.getByRole('menuitem', { name: 'レイアウトを既定に戻す' }).click();
 	});
 });

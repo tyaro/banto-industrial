@@ -107,7 +107,8 @@ test.describe.serial('banto-hub タグ Drawer dirty 破棄確認 (TAG-UX-C)', ()
 			void dialog.dismiss();
 		});
 
-		await page.getByRole('button', { name: '閉じる' }).click();
+		// #1253: ドックの枠の ✕（「属性を閉じる」など）と取り違えないよう完全一致で引く。
+		await page.getByRole('button', { name: '閉じる', exact: true }).click();
 
 		// dismiss() 完了を待ってから状態を確認する（dialog イベントは
 		// 非同期に発火するため、クリック直後だと確認前の可能性がある）。
@@ -127,7 +128,8 @@ test.describe.serial('banto-hub タグ Drawer dirty 破棄確認 (TAG-UX-C)', ()
 			void dialog.dismiss();
 		});
 
-		await page.getByRole('button', { name: '閉じる' }).click();
+		// #1253: ドックの枠の ✕（「属性を閉じる」など）と取り違えないよう完全一致で引く。
+		await page.getByRole('button', { name: '閉じる', exact: true }).click();
 
 		await expect(page.getByRole('complementary', { name: `${TAG_NAME} を編集` })).toBeHidden();
 		expect(dialogShown).toBe(false);
