@@ -19,7 +19,8 @@
   - bit のペンで `bitStyle: 'band'` のものは帯（タイムチャート）で描く（`core/bitBands.ts`）。描画域の
     下に、ペンの並びの順に積む（1 本目が一番下）。帯の分だけアナログの縦の長さは縮み（帯の合計は
     描画域の半分まで）、帯のペンは線・マーカー・管理線・縦軸の目盛りの持ち主から外れる。横の格子・
-    カーソルの線は描画域の全体に引く。True は濃い塗り、区間の中で変わったものは薄い塗り、帯の左端の
+    カーソルの線は描画域の全体に引く。アナログの層（帯・管理線・線・マーカー・越えた区間）は
+    `{uid}-analog-clip`（アナログの縦の長さまで）で切り、範囲外の値が bit の帯に重ならないようにする。True は濃い塗り、区間の中で変わったものは薄い塗り、帯の左端の
     内側にペンの `label`。縦軸の持ち主が bit のペンなら目盛り（と横の格子）は 0・1 の 2 つだけ（`axisTickValues`）。bit のペンの値は False / True と出す（カーソル・凡例の範囲・要約。縦軸が
     bit のペンのときは 0・1 の目盛りも）。
   - 凡例は `onPenSelect` を渡すとペンを選ぶボタンになる（押した印は `selectedPenId`、
@@ -378,6 +379,9 @@
 				<clipPath id="{uid}-clip">
 					<rect x="0" y="0" width={plotWidth} height={plotHeight} />
 				</clipPath>
+				<clipPath id="{uid}-analog-clip">
+					<rect x="0" y="0" width={plotWidth} height={analogHeight} />
+				</clipPath>
 				{#each limitLayouts as lay, i (pens[i].id)}
 					{#each lay.rects as r, j (j)}
 						<clipPath id="{uid}-lim-{i}-{j}">
@@ -424,16 +428,18 @@
 				{/if}
 
 				<g clip-path="url(#{uid}-clip)">
-					{#each bandRectList as b, i (i)}
-						<rect
-							class="bi-trend__band"
-							x="0"
-							y={b.y}
-							width={plotWidth}
-							height={b.height}
-							fill={b.colorVar}><title>{b.label}</title></rect
-						>
-					{/each}
+					<g clip-path="url(#{uid}-analog-clip)">
+						{#each bandRectList as b, i (i)}
+							<rect
+								class="bi-trend__band"
+								x="0"
+								y={b.y}
+								width={plotWidth}
+								height={b.height}
+								fill={b.colorVar}><title>{b.label}</title></rect
+							>
+						{/each}
+					</g>
 					{#each bitBandViews as bb (bb.pen.id)}
 						<rect class="bi-trend__bit-bg" x="0" y={bb.y} width={plotWidth} height={bb.height} />
 						{#each bb.spans as sp, j (j)}
@@ -453,55 +459,61 @@
 							dominant-baseline="middle">{bb.pen.label}</text
 						>
 					{/each}
-					{#each limitLayouts as lay, i (pens[i].id)}
-						{#each lay.lines as l, j (j)}
-							<line
-								class="bi-trend__limit"
-								x1="0"
-								x2={plotWidth}
-								y1={l.y}
-								y2={l.y}
-								stroke={l.colorVar}><title>{l.label}</title></line
-							>
-							<text
-								class="bi-trend__limit-label"
-								x={plotWidth - 4}
-								y={limitLabelY(l.y)}
-								text-anchor="end"
-								fill={l.colorVar}>{l.label}</text
-							>
+					<g clip-path="url(#{uid}-analog-clip)">
+						{#each limitLayouts as lay, i (pens[i].id)}
+							{#each lay.lines as l, j (j)}
+								<line
+									class="bi-trend__limit"
+									x1="0"
+									x2={plotWidth}
+									y1={l.y}
+									y2={l.y}
+									stroke={l.colorVar}><title>{l.label}</title></line
+								>
+								<text
+									class="bi-trend__limit-label"
+									x={plotWidth - 4}
+									y={limitLabelY(l.y)}
+									text-anchor="end"
+									fill={l.colorVar}>{l.label}</text
+								>
+							{/each}
 						{/each}
-					{/each}
-					{#each pens as pen, i (pen.id)}
-						{#if paths[i] && resolveLineStyle(pen.lineStyle) !== 'none'}
-							<path
-								class="bi-trend__line"
-								d={paths[i]}
-								stroke={penColorVar(pen.colorSlot)}
-								stroke-width={resolveLineWidth(pen.lineWidth)}
-								stroke-dasharray={dashArray(pen.lineStyle, pen.lineWidth) ?? undefined}
-							/>
-						{/if}
-						{#if markerPaths[i]}
-							<path class="bi-trend__marker" d={markerPaths[i]} fill={penColorVar(pen.colorSlot)} />
-						{/if}
-						{#each limitLayouts[i]?.rects ?? [] as r, j (j)}
-							<g clip-path="url(#{uid}-lim-{i}-{j})">
-								{#if paths[i] && resolveLineStyle(pen.lineStyle) !== 'none'}
-									<path
-										class="bi-trend__line"
-										d={paths[i]}
-										stroke={r.colorVar}
-										stroke-width={resolveLineWidth(pen.lineWidth)}
-										stroke-dasharray={dashArray(pen.lineStyle, pen.lineWidth) ?? undefined}
-									/>
-								{/if}
-								{#if markerPaths[i]}
-									<path class="bi-trend__marker" d={markerPaths[i]} fill={r.colorVar} />
-								{/if}
-							</g>
+						{#each pens as pen, i (pen.id)}
+							{#if paths[i] && resolveLineStyle(pen.lineStyle) !== 'none'}
+								<path
+									class="bi-trend__line"
+									d={paths[i]}
+									stroke={penColorVar(pen.colorSlot)}
+									stroke-width={resolveLineWidth(pen.lineWidth)}
+									stroke-dasharray={dashArray(pen.lineStyle, pen.lineWidth) ?? undefined}
+								/>
+							{/if}
+							{#if markerPaths[i]}
+								<path
+									class="bi-trend__marker"
+									d={markerPaths[i]}
+									fill={penColorVar(pen.colorSlot)}
+								/>
+							{/if}
+							{#each limitLayouts[i]?.rects ?? [] as r, j (j)}
+								<g clip-path="url(#{uid}-lim-{i}-{j})">
+									{#if paths[i] && resolveLineStyle(pen.lineStyle) !== 'none'}
+										<path
+											class="bi-trend__line"
+											d={paths[i]}
+											stroke={r.colorVar}
+											stroke-width={resolveLineWidth(pen.lineWidth)}
+											stroke-dasharray={dashArray(pen.lineStyle, pen.lineWidth) ?? undefined}
+										/>
+									{/if}
+									{#if markerPaths[i]}
+										<path class="bi-trend__marker" d={markerPaths[i]} fill={r.colorVar} />
+									{/if}
+								</g>
+							{/each}
 						{/each}
-					{/each}
+					</g>
 					{#if cursorX !== null}
 						<line class="bi-trend__cursor" x1={cursorX} x2={cursorX} y1="0" y2={plotHeight} />
 					{/if}
