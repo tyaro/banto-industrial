@@ -459,11 +459,10 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 
 			// #378（2026-09-16、v0.2.0-alpha.20）: 狭幅では左ツリーがオフキャンバスへ
 			// 退避するようになったので、ノードをクリックする前に枠の帯の
-			// ツリーのトグル（#1179 PR2b から `ThreePaneLayout` の左ペインのトグル、
-			// 名前はペインと同じ「接続とグループ」）で開く（選ぶと自動で閉じる）。
-			// 広幅のケース（このスペックの他のテスト）は従来どおりツリーが常時
-			// 出ているので変更不要。
-			await narrowPage.locator('button[aria-label="接続とグループ"]').click();
+			// ツリーのタブ（#1253 から `ThreePaneDock` の左端の帯のタブ）で開く
+			// （選ぶと自動で閉じる）。広幅のケース（このスペックの他のテスト）は
+			// 従来どおりツリーが常時出ているので変更不要。
+			await narrowPage.locator('button[data-dock-band-tab="left"]').click();
 			await groupNodeByName(narrowPage, CALC_GROUP_NAME).click();
 			await narrowPage.getByRole('button', { name: 'タグを追加' }).click();
 

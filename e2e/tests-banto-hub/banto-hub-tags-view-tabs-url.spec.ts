@@ -270,8 +270,9 @@ test.describe.serial('banto-hub タグ登録: 中央のタブと URL の状態 (
 	test('7. 狭幅でツリーを開いたまま同じ対象を「再設定」しても、設定フォームへフォーカスが移る', async () => {
 		await page.setViewportSize({ width: 880, height: 800 });
 		try {
-			const treePane = page.locator('aside[aria-label="接続とグループ"]');
-			const treeToggle = page.locator('button[aria-label="接続とグループ"]');
+			// #1253: 狭い表示のツリーは枠（`ThreePaneDock`）の左端の帯から引き出す pane。
+			const treePane = page.getByTestId('tag-tree-pane');
+			const treeToggle = page.locator('button[data-dock-band-tab="left"]');
 			const expectFocusInSettings = async (): Promise<void> => {
 				await expect(treePane).toBeHidden();
 				await expect

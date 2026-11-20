@@ -20,8 +20,24 @@
 	 * `#[serde(default)]` が `None` として受け取る）。`stringLength` は
 	 * `dataType === 'string'` のときのみ表示・送信する（`MIN_STRING_LENGTH`/
 	 * `MAX_STRING_LENGTH` はヒント表示のみ - 実際の検証はバックエンド）。
+	 *
+	 * #1253（docs/hub/banto-hub-ui-improvement-proposal.md §ドック型の配置）: 枠を
+	 * `@banto/ui` の `ThreePaneLayout` から `@banto/dock-svelte` の `ThreePaneDock` へ
+	 * 載せ替えた（左 = 接続とグループのツリー、中央 = タグ一覧・設定のタブ、右 = 属性 =
+	 * 今までの非モーダルの編集ペイン。タグモニタと同じ配線）。選択中の対象とタブは
+	 * 今までどおり URL（`?target=`・`&tab=`）、パネルの配置は利用者ごとの保存
+	 * （`#lib/dockLayoutStore.ts`、キー `tags`）で URL には載せない。
+	 *
+	 * - 右（属性）は据え置き（`persistent`）。隠す（✕・メニュー・ツールバー）・浮かせる・
+	 *   ドッキングし直す・狭い表示への切り替え・「既定に戻す」のどれでも中身の DOM を
+	 *   作り直さない（入力の途中・IME・スクロールが残る）。フォームの値はもともとページの
+	 *   状態（`editForm` など）にある。中身を捨てる `closePanel` はこのページでは呼ばない。
+	 * - 狭い幅（ビューポート判定）は部品の狭い表示に任せ、ツリーは左端の帯から引き出す
+	 *   （Esc・外の押下・選択で戻り、フォーカスは帯のタブへ。#378・#381 の約束の置き換え）。
+	 *   編集のフォームは今までどおり狭い幅ではモーダルの `<Drawer>`／`<Modal>` に出す
+	 *   （右は帯に退くが、引き出しても案内だけ）。
 	 */
-	import { tick, untrack } from 'svelte';
+	import { onDestroy, tick, untrack } from 'svelte';
 	import { page } from '$app/state';
 	import { BantoGrid, type CellEdit, type GridColumn } from '@banto/grid-svelte';
 	import { isProviderError } from '@banto/admin-core';
@@ -45,11 +61,16 @@
 		Drawer,
 		focusablesIn,
 		hasVisibleLayerAbove,
+		Menu,
+		MenuItem,
+		MenuSeparator,
 		Modal,
 		restoreFocus,
-		Tabs,
-		ThreePaneLayout
+		Tabs
 	} from '@banto/ui';
+	import { createDockState, defaultDockMessages, ThreePaneDock } from '@banto/dock-svelte';
+	import { createDockLayoutStore } from '#lib/dockLayoutStore.js';
+	import { persistThreePaneLayout } from '#lib/dockLayoutPersist.svelte.js';
 	import { canWriteResources } from '#lib/permissions.js';
 	import ConnectionTree from '#lib/components/ConnectionTree.svelte';
 	import TreeContextMenu from '#lib/components/TreeContextMenu.svelte';
@@ -2023,9 +2044,8 @@
 
 	// 連続登録・構造体登録・CSVインポートはプレビュー/エラー一覧の
 	// テーブルが横に広いため、通常登録・編集より少し広いドロワー幅を使う。
-	// #375 以降、`edit`/`continuous` では非モーダルの右ペインの幅としても
-	// 同じ値を使う（#1179 PR2b から `ThreePaneLayout` の `rightWidth` の初期値。
-	// 下の `editPaneWidth`）。
+	// #1253 から右ペイン（属性）の幅は利用者が変えて配置ごと保存するので、この値は
+	// 狭幅の `<Drawer>` の幅だけに使う（既定の配置の右の幅は `EDIT_PANE_DEFAULT_WIDTH`）。
 	const drawerWidth = $derived(
 		drawerMode === 'continuous' || drawerMode === 'struct' || drawerMode === 'csv'
 			? '640px'
@@ -2046,10 +2066,13 @@
 	 * 1366×768・125% でツリーと編集ペインを横並びに保つため）。部品が書き出す
 	 * `narrow`（`layoutNarrow`）はその結果で、ページはこれを見る。
 	 *
-	 * 広幅では右ペインを `ThreePaneLayout` の `right` に渡す（非モーダルの
-	 * まま - 部品は広幅の右ペインにフォーカスを移さず、Esc も受けない）。
-	 * 狭幅では `right` を渡さない（部品の右ドロワーはスクリムと中央の `inert` を
-	 * 持ち、#342 段階C の「一覧から挿入」が成り立たないので使わない）。
+	 * 広幅では右ペイン（#1253 から `ThreePaneDock` の右 = 属性）に出す（非モーダルの
+	 * まま - 部品は右ペインにフォーカスを移さず、Esc も受けない）。狭幅では部品の
+	 * 狭い表示が右を帯へ退かせるが、編集は今までどおりモーダルへ落とす（帯から引き出した
+	 * pane は画面の端の一時の窓で、#375・#378・#381 で詰めたモーダルの約束（フォーカスの
+	 * 閉じ込め・未保存の確認・誤爆の防止）を持たないため）。`right` の snippet は幅に
+	 * よらず常に渡す（出したり消したりすると部品の構造の変更になり、保存した配置を
+	 * 照らし直すため）。
 	 *
 	 * #342 段階C 追補（2026-09-15 オーナー決定）: **新規作成（`create`）も
 	 * 同じ型で右ペインへ移す** - 新しい演算タグの式を書く一番多い場面が
@@ -2061,7 +2084,7 @@
 	const paneCapableMode = $derived(
 		drawerMode === 'create' || drawerMode === 'edit' || drawerMode === 'continuous'
 	);
-	/** 枠（`ThreePaneLayout`）が狭幅か（部品の `bind:narrow`、出力専用）。 */
+	/** 枠（`ThreePaneDock`）が狭い表示か（部品の `bind:narrow`、出力専用）。 */
 	let layoutNarrow = $state(false);
 	const editPaneOpen = $derived(paneCapableMode && !layoutNarrow);
 	/** 狭幅フォールバック（`edit`/`continuous` のみ - `create` は `createInModal`）。 */
@@ -2070,27 +2093,82 @@
 	const createInModal = $derived(drawerMode === 'create' && layoutNarrow);
 
 	/**
-	 * #1179 PR2b: 右ペインを帯のトグルで畳んだか（`ThreePaneLayout` の
-	 * `rightCollapsed`）。畳んでもフォームは閉じない（未保存の入力を保つ - 部品は
-	 * ペインをマウントしたまま `hidden` にする）。式欄も見えなくなるので「一覧から
-	 * 挿入」は畳んでいる間は出さない（`insertToggleAvailable`）。モードや編集
-	 * 対象が変わったら開き直す（下のモード遷移 `$effect`）。
+	 * #1253: ドックの枠（`ThreePaneDock`）。`dock` を自分で持ち、`layoutSnapshot()` の変化で
+	 * 配置を保存する（タグモニタと同じ配線。狭い表示の間は控えた広い配置を返すので、
+	 * 狭い表示の一時の配置は保存しない）。
+	 *
+	 * - `treeShown`・`rightShown` は広い表示での左右の表示・非表示（「表示」メニューの
+	 *   チェックと同じ 1 か所の状態、部品の `leftOpen`・`rightOpen`）。
+	 * - 右（属性）を隠しても編集は閉じない（据え置きなので中身も残る）。式欄も見えなく
+	 *   なるので「一覧から挿入」は隠している間は出さない（`insertToggleAvailable`）。
+	 *   モードや編集対象が変わったら出し直す（下のモード遷移 `$effect`）。
 	 */
-	let editPaneCollapsed = $state(false);
+	const dock = createDockState();
+	const dockLayoutStore = createDockLayoutStore('tags');
+	onDestroy(() => dockLayoutStore.dispose());
+	let threePane: ReturnType<typeof ThreePaneDock> | undefined = $state();
+	let treeShown = $state(true);
+	let rightShown = $state(true);
+	/** 既定の配置の右（属性）の幅（px）。今までの編集ペインの幅（`drawerWidth` の 480px）。 */
+	const EDIT_PANE_DEFAULT_WIDTH = 480;
+	/** 狭い表示で、ツリーが帯から引き出されているか（#378 の「開いている」）。 */
+	const treeDrawerOpen = $derived(layoutNarrow && dock.flyoutPanel === 'left');
+	let treePaneEl: HTMLDivElement | undefined = $state();
+	/** 広い表示のツールバーのツリーのトグル（フォーカスの受け皿、`treeToggleElement`）。 */
+	let treeToolbarToggleEl: HTMLButtonElement | undefined = $state();
+	/** 枠の外側（帯のタブをこのページの枠の中から引く）。 */
+	let contentEl: HTMLDivElement | undefined = $state();
 
-	/**
-	 * #1179 PR2b: 右ペインの幅（`ThreePaneLayout` の `rightWidth`、ハンドルで
-	 * 変えられる）。初期値は `drawerWidth`（編集 480 / 連続登録 640）で、その値が
-	 * 変わったとき（連続登録と他のモードの行き来）だけ戻す。永続化はしない。
-	 */
-	const editPaneAskedWidth = $derived(drawerWidth === '640px' ? 640 : 480);
-	let editPaneWidth = $state(480);
-	$effect.pre(() => {
-		const width = editPaneAskedWidth;
-		untrack(() => {
-			editPaneWidth = width;
+	const dockMessages = {
+		...defaultDockMessages,
+		threePaneLeft: () => TREE_PANE_LABEL,
+		threePaneCenter: () => 'タグ',
+		threePaneRight: () => ATTRIBUTE_PANE_LABEL
+	};
+
+	/** 「表示」メニューの項目（左・右・区切り・レイアウトを既定に戻す）。 */
+	const viewItems = $derived(
+		threePane?.viewMenuItems({ resetLayout: 'レイアウトを既定に戻す' }) ?? []
+	);
+
+	// 配置の保存。最初の 1 回（マウントした時点の配置）は保存の口が基準として受け取るだけ。
+	// 広い ⇄ 狭いの切り替えの途中（求める表示と出している表示が食い違う間）は保存しない
+	// （`persistThreePaneLayout` の doc。PR #1268 のレビューで詰めた形をそのまま使う）。
+	persistThreePaneLayout(() => threePane, dockLayoutStore, {
+		wanted: () => mobileNavStore.isNarrow,
+		shown: () => layoutNarrow
+	});
+
+	// サーバーの保存値（利用者ごと）を、枠のマウント後に 1 回だけ読んで当てる。
+	let savedLayoutRequested = false;
+	$effect(() => {
+		const pane = threePane;
+		if (!pane || savedLayoutRequested) return;
+		savedLayoutRequested = true;
+		void dockLayoutStore.loadSaved().then((saved) => {
+			if (saved !== undefined && threePane === pane) void pane.restoreLayout(saved);
 		});
 	});
+
+	/**
+	 * 「表示」メニューの項目を選ぶ。狭い表示でツリーを引き出したときは、フォーカスをツリーへ
+	 * 入れる（帯のタブで開いたときと同じ。Esc で閉じられるように）。メニューが閉じて
+	 * フォーカスをトリガーへ戻した後に移すため、描画を 1 回待つ。狭い表示ではパネルの項目を
+	 * チェックではなく「開く」操作として出す（タグモニタと同じ）。
+	 */
+	function selectViewItem(item: { id: string; onSelect: () => void }): void {
+		item.onSelect();
+		if (item.id !== 'panel:left' || !layoutNarrow) return;
+		void tick().then(() =>
+			requestAnimationFrame(() => {
+				if (dock.flyoutPanel !== 'left') return;
+				const target =
+					treePaneEl?.querySelector<HTMLElement>('[role="treeitem"][tabindex="0"]') ??
+					treePaneEl?.querySelector<HTMLElement>('[role="tree"]');
+				target?.focus();
+			})
+		);
+	}
 
 	// --- #342 段階C: 一覧から式欄への click-to-insert ------------------------
 	//
@@ -2136,7 +2214,7 @@
 	const insertToggleAvailable = $derived(
 		canWrite &&
 			editPaneOpen &&
-			!editPaneCollapsed &&
+			rightShown &&
 			((drawerMode === 'create' && createForm.tagKind === 'computed') ||
 				(drawerMode === 'edit' && selected !== null && editForm.tagKind === 'computed'))
 	);
@@ -2189,7 +2267,9 @@
 		untrack(() => {
 			insertArmed = false;
 			dismissCompletion();
-			editPaneCollapsed = false;
+			// #1253: 右（属性）を隠していたら、編集を開いた・対象が変わったときに出し直す
+			// （部品の `rightOpen` へ書く = `setVisible`）。狭い表示では編集はモーダルなので触らない。
+			if (paneCapableMode && !layoutNarrow) rightShown = true;
 		});
 	});
 
@@ -2219,14 +2299,12 @@
 			// 式欄外での Esc）に依存しないようここでも明示的に条件にする。
 			if (completionOpen) return;
 			// #378: 狭幅で退避したツリーが開いている間の Esc も**ツリーだけ**を
-			// 閉じ、このトグルは ON のままにする（`ThreePaneLayout` がドロワーの
-			// keydown で `stopPropagation` するのでここへは届かないはずだが、
-			// 補完と同じく経路に依存しないようここでも条件にする二重の担保）。
-			// **狭幅も条件にする**（#381 レビュー対応A）: 広幅では退避
-			// そのものが無いので、`treeOpen` の残留で式欄の Esc が効かなくなる
-			// ことがないようにする（部品も広幅遷移で `false` へ戻すが、
-			// その書き戻しに依存しない二重の担保）。
-			if (treeOpen && layoutNarrow) return;
+			// 閉じ、このトグルは ON のままにする（部品の引き出した pane が keydown で
+			// `preventDefault` するので `defaultPrevented` でも止まるが、補完と同じく
+			// 経路に依存しないようここでも条件にする二重の担保）。
+			// **狭幅も条件にする**（#381 レビュー対応A）: `treeDrawerOpen` は狭い表示の
+			// ときだけ真になる。
+			if (treeDrawerOpen) return;
 			// #381 レビュー対応10回目（層の約束・項目2、`@banto/ui` の `layering.ts`）:
 			// **ページ側の window Esc ハンドラも上位層があれば譲る。** このトグルは
 			// 広幅の右ペイン（層としては本文と同じ最下層）に属するので、Drawer/
@@ -3394,14 +3472,13 @@
 			// `focusablesIn` が空になりうる。そのときはペイン自体（`tabindex="-1"`）へ。
 			(first ?? host)?.focus();
 		};
-		if (layoutNarrow && treeOpen) {
-			// 狭幅でツリーのドロワーが開いている間、部品は中央を `inert` にしている
-			// のでフォーカスが入らない。ドロワーを閉じ、(1) 部品が `inert` を外す
-			// DOM 更新、(2) 部品の `tick()` 後の `restoreFocus`（開く前の要素かトグル
-			// へ戻す）、(3) メニューを閉じた直後の `restoreFocus`（ツリーのノードへ
+		if (treeDrawerOpen) {
+			// 狭幅でツリーを帯から引き出している間は、引き出した pane が中央の上に
+			// 重なっている。pane を戻し、(1) 部品が pane を隠す DOM 更新（中のフォーカスは
+			// 帯のタブへ渡る）、(2) メニューを閉じた直後の `restoreFocus`（ツリーのノードへ
 			// 戻そうとする）がすべて終わった**後**に移す。先に移すと後続の戻し処理に
 			// 奪われる。2 回の `tick()` ＋ `requestAnimationFrame` で最後に走らせる。
-			treeOpen = false;
+			dock.closeFlyout();
 			void tick()
 				.then(() => tick())
 				.then(() => requestAnimationFrame(focusForm));
@@ -3412,26 +3489,25 @@
 	}
 
 	/**
-	 * #378（2026-09-16 オーナー決定）: 狭幅で左ツリーを退避したときの開閉状態
-	 * （`ThreePaneLayout` の `leftDrawerOpen`）。狭幅の判定はビューポート基準
-	 * （`layoutNarrow`、`narrowOverride` で上書き）で、広幅へ戻ると部品が
-	 * `false` へ戻す。
+	 * 左ペインとそのトグルの名前（`ThreePaneDock` の `messages.threePaneLeft`）。
+	 * #378（2026-09-16 オーナー決定）の狭幅のツリーの退避は、#1253 から部品の狭い表示
+	 * （左端の帯）で、開いているかは `treeDrawerOpen`（`dock.flyoutPanel`）。
 	 */
-	let treeOpen = $state(false);
-
-	/** 左ペインとそのトグルの名前（`ThreePaneLayout` の `messages.threePaneLeft`）。 */
 	const TREE_PANE_LABEL = '接続とグループ';
+	/** 右ペイン（属性 = 編集のフォーム）の名前（`messages.threePaneRight`）。 */
+	const ATTRIBUTE_PANE_LABEL = '属性';
 
 	/**
-	 * #381 レビュー対応5回目: ツリーのトグル本体（`ThreePaneLayout` の `bind:leftToggleEl`、
-	 * 読むだけ。#1179、banto v7.5.0）。コンテキストメニューを閉じたときに戻り先
-	 * （ツリーノード）が `inert` の中で戻せない場合のフォーカスの受け皿にする
-	 * （`closeTreeContextMenu`）。
+	 * #381 レビュー対応5回目: ツリーを開き直せるトグル。コンテキストメニューを閉じた
+	 * ときに戻り先（ツリーノード）が隠れていて戻せない場合のフォーカスの受け皿にする
+	 * （`closeTreeContextMenu`）。#1253 から、狭い表示では左端の帯のタブ
+	 * （部品の `data-dock-band-tab="left"`）、広い表示ではツールバーのトグル。
 	 */
-	let treeToggleEl: HTMLElement | undefined = $state();
-
 	function treeToggleElement(): HTMLElement | null {
-		return treeToggleEl ?? null;
+		if (layoutNarrow) {
+			return contentEl?.querySelector<HTMLElement>('[data-dock-band-tab="left"]') ?? null;
+		}
+		return treeToolbarToggleEl ?? null;
 	}
 
 	/*
@@ -3450,15 +3526,29 @@
 	 * Esc で下の層から閉じることになる。サイドバーは未保存状態を持たない常設
 	 * ナビなので、閉じて安全（`Sidebar.svelte` のリンククリックでも閉じている）。
 	 *
-	 * #1179 PR2b: トグルは `ThreePaneLayout` の帯にあり、押したことはページから
-	 * 拾えないので、**開いた遷移**（`leftDrawerOpen` が `true` になった）で畳む。
-	 * 依存は `treeOpen` だけ（サイドバーの開閉では再実行しない - ツリーを開いた
-	 * あとでサイドバーを開くのは正しい重なりなので、そこで畳んではいけない）。
+	 * #1179 PR2b: トグルは枠の帯にあり、押したことはページから拾えないので、
+	 * **開いた遷移**で畳む（#1253 から、狭い表示でツリーが帯から引き出された =
+	 * `treeDrawerOpen`）。依存はそれだけ（サイドバーの開閉では再実行しない - ツリーを
+	 * 開いたあとでサイドバーを開くのは正しい重なりなので、そこで畳んではいけない）。
 	 */
 	$effect(() => {
-		if (!treeOpen) return;
+		if (!treeDrawerOpen) return;
 		untrack(() => {
 			if (mobileNavStore.open) mobileNavStore.closeNav();
+		});
+	});
+
+	/**
+	 * #1253: 逆向き（ツリーを引き出したままサイドバーを開いた）も重ねない。部品の引き出した
+	 * pane の Esc は `@banto/ui` の層（`data-esc-layer` のサイドバー）を見ないので、2 つが
+	 * 重なると Esc が下のツリーから閉じてしまう（#381 の「手前から 1 層ずつ」に反する）。
+	 * 押下・フォーカスの移動で開けば部品が先に pane を戻すが、それに頼らずサイドバーが
+	 * 開いた遷移で戻す。依存はサイドバーの開閉だけ（上の `$effect` と打ち消し合わない）。
+	 */
+	$effect(() => {
+		if (!mobileNavStore.open) return;
+		untrack(() => {
+			if (treeDrawerOpen) dock.closeFlyout();
 		});
 	});
 
@@ -3518,7 +3608,8 @@
 		// （狭幅では起きない: `selectionFollowsFocus=false` なので、キーは
 		// 目的の行までフォーカスだけを動かし、Enter・Space・クリックで選ぶ）。
 		// **閉じるのはこの経路だけ** - 右クリック経路は下記参照。
-		if (layoutNarrow) treeOpen = false;
+		// #1253: 退避パネルは枠の帯から引き出した pane。戻すとフォーカスは帯のタブへ移る（部品）。
+		if (treeDrawerOpen) dock.closeFlyout();
 	}
 
 	/**
@@ -3595,6 +3686,8 @@
 		position: { x: number; y: number }
 	): void {
 		// #381 レビュー対応C: 選択は反映するが、**狭幅でも退避パネルは閉じない**
+		// （#1253 から退避パネルは帯から引き出した pane。メニューは popover なので、
+		// メニューへフォーカスが移っても部品は pane を戻さない - `TreeContextMenu`）
 		// （`handleTreeSelect` ではなく `applyTreeSelection` を呼ぶ）。ここで
 		// 閉じると、直後に `TreeContextMenu` が `triggerEl` として覚える
 		// 「右クリックされたノード」が `inert`/`aria-hidden` になった左ペインの
@@ -3652,7 +3745,7 @@
 	 */
 	function resolveDrawerFocusFallback(): HTMLElement | null {
 		if (lastTreeMenuNodeEl && canRestoreFocusTo(lastTreeMenuNodeEl)) return lastTreeMenuNodeEl;
-		// 狭幅はツリーのトグル（ツリーはドロワーの中で閉じていると `inert`）。
+		// 狭幅はツリーのトグル（#1253 から左端の帯のタブ。ツリーは帯に戻すと隠れる）。
 		// 広幅は常に在るツリー本体の先頭ノード（「すべて」）を返す（#381 レビュー
 		// 対応16回目 - 削除で戻し先のノードごと消えたときに `<body>` へ落ちない
 		// ため）。広幅でもツリーを畳んでいれば先頭ノードは戻せないのでトグルへ。
@@ -6839,7 +6932,7 @@
 		<h2>タグ登録</h2>
 	</div>
 
-	<div class="content">
+	<div class="content" bind:this={contentEl}>
 		<!--
 			#375: 非モーダルの編集ペイン。**オーバーレイを持たず、
 			`role="dialog"`/`aria-modal` も付けない** - 編集中も左ツリーと
@@ -6849,66 +6942,79 @@
 			ヘッダーの「閉じる」ボタンと保存成功後だけ（Esc では閉じない
 			- `Drawer.svelte` のような window keydown ハンドラを持たない）。
 
-			#1179 PR2b: `ThreePaneLayout` の `right` として広幅のときだけ渡す
-			（`editPaneOpen`）。部品は広幅の右ペインを行の中に置くだけで、
-			フォーカスを移さず Esc も受けないので、上の約束はそのまま保たれる。
-			ランドマーク（`complementary`）と名前（`drawerTitle`）は部品の `<aside>` が
-			持つ（`messages.threePaneRight`）ので、ここは `<div>` にする。幅は
-			`editPaneWidth`（初期値は `drawerWidth` - 編集 480px / 連続登録 640px）で、
-			部品のハンドルで変えられる。帯のトグルで畳んでもフォームは閉じない
-			（`editPaneCollapsed`）。
+			#1253: `ThreePaneDock` の右（属性）。snippet は幅によらず常に渡し（出したり
+			消したりすると部品の構造の変更になる）、編集のフォームは広い表示で編集中の
+			ときだけ描く（`editPaneOpen`）。ランドマーク（`complementary`）と名前
+			（`drawerTitle`）はこの `<aside>` が持つ（部品のパネルの名前は「属性」）。
+			据え置き（`persistent`）なので、隠す・浮かせる・ドッキングし直す・狭い表示への
+			切り替え・既定に戻すで中身を作り直さない。部品の ✕ は隠すだけ（フォームは
+			閉じない。閉じるのはヘッダーの「閉じる」= 未保存の確認つき）。
 		-->
 		{#snippet editPane()}
-			<div class="edit-pane">
-				<div class="edit-pane-header">
-					<h3>{drawerTitle}</h3>
-					<button
-						type="button"
-						class="edit-pane-close"
-						onclick={requestCloseEditPane}
-						aria-label="閉じる"
-					>
-						×
-					</button>
-				</div>
-				<div class="edit-pane-body">
-					{#if drawerMode === 'edit' && selected && canWrite}
-						{@render editFormBody()}
-					{:else if drawerMode === 'create' && canWrite}
-						<!-- #342 段階C: 新規作成も広幅では同じペインへ（下の `<Modal>` は狭幅専用）。 -->
-						{@render createFormBody()}
-					{:else if drawerMode === 'continuous' && canWrite}
-						{@render continuousFormBody()}
+			{#if editPaneOpen}
+				<aside class="edit-pane" aria-label={drawerTitle}>
+					<div class="edit-pane-header">
+						<h3>{drawerTitle}</h3>
+						<button
+							type="button"
+							class="edit-pane-close"
+							onclick={requestCloseEditPane}
+							aria-label="閉じる"
+						>
+							×
+						</button>
+					</div>
+					<div class="edit-pane-body">
+						{#if drawerMode === 'edit' && selected && canWrite}
+							{@render editFormBody()}
+						{:else if drawerMode === 'create' && canWrite}
+							<!-- #342 段階C: 新規作成も広幅では同じペインへ（下の `<Modal>` は狭幅専用）。 -->
+							{@render createFormBody()}
+						{:else if drawerMode === 'continuous' && canWrite}
+							{@render continuousFormBody()}
+						{/if}
+					</div>
+				</aside>
+			{:else}
+				<div class="attribute-empty" data-testid="tag-attribute-empty">
+					{#if layoutNarrow && paneCapableMode}
+						<p class="note">狭い画面では、編集は画面の手前のダイアログに出ます。</p>
+					{:else if canWrite}
+						<p class="note">
+							一覧のタグを選ぶと、ここに属性を出して編集できます。グループを選ぶと「タグを追加」も使えます。
+						</p>
+					{:else}
+						<p class="note">属性の編集には書き込みの権限が要ります。</p>
 					{/if}
 				</div>
-			</div>
+			{/if}
 		{/snippet}
 		<!--
-			#378（2026-09-16 オーナー決定）: 狭幅では左ツリーをドロワーへ退避する
-			（#1179 PR2b から `@banto/ui` の `ThreePaneLayout`。タグモニタと同じ部品）。
-			狭幅の判定は従来どおりビューポート（`mobileNavStore.isNarrow`）。部品は
-			枠の幅の判定を `narrowOverride` で上書きして
-			ビューポート基準にし（2026-11-18 オーナー決定、#1182、banto v7.5.0）、`layoutNarrow` へ書き出す。退避・トグル・Esc・スクリム・フォーカスの出入りは部品が持つ
-			（部品の冒頭コメントの約束）。帯のトグルの隣には、閉じていても何で
-			絞り込まれているかが分かるよう、現在のツリー選択名を出す。
+			#378（2026-09-16 オーナー決定）: 狭幅では左ツリーを退避する。#1253 から退避は
+			部品の狭い表示（左端の自動で隠す帯。タブで引き出し、Esc・外の押下・選択で戻り、
+			フォーカスはタブへ戻る）。狭幅の判定は従来どおりビューポート
+			（`mobileNavStore.isNarrow`、`narrowOverride`。2026-11-18 オーナー決定、#1182）で、
+			`layoutNarrow` へ書き出す。ツリーは引き出すたびに作り直さない（`keepMounted`。
+			展開の状態を保つ）。右（属性）は据え置き（上の `editPane` のコメント）。
+			中央のツールバーには、閉じていても何で絞り込まれているかが分かるよう、現在の
+			ツリー選択名を出す。
 		-->
-		<ThreePaneLayout
-			narrowOverride={mobileNavStore.isNarrow}
-			bind:leftToggleEl={treeToggleEl}
-			bind:leftDrawerOpen={treeOpen}
+		<ThreePaneDock
+			bind:this={threePane}
+			{dock}
+			initialLayout={dockLayoutStore.initial}
+			bind:leftOpen={treeShown}
+			bind:rightOpen={rightShown}
 			bind:narrow={layoutNarrow}
-			bind:rightCollapsed={editPaneCollapsed}
-			bind:rightWidth={editPaneWidth}
-			right={editPaneOpen ? editPane : undefined}
-			messages={{
-				threePaneLeft: () => TREE_PANE_LABEL,
-				threePaneResizeLeft: () => `${TREE_PANE_LABEL}の幅`,
-				threePaneRight: () => drawerTitle,
-				threePaneResizeRight: () => `${drawerTitle}の幅`
-			}}
+			narrowOverride={mobileNavStore.isNarrow}
+			rightWidth={EDIT_PANE_DEFAULT_WIDTH}
+			keepMounted={(id) => id === 'left'}
+			persistent={(id) => id === 'right'}
+			messages={dockMessages}
+			right={editPane}
 		>
 			{#snippet left()}
-				<div class="tree-pane">
+				<div class="tree-pane" data-testid="tag-tree-pane" bind:this={treePaneEl}>
 					<!--
 						T19 S1-a（docs/hub/banto-hub-t19-design.md §7.1「常時表示の
 						『新規作成』入口」）: 接続・グループの作成は右クリック
@@ -6940,12 +7046,60 @@
 					/>
 				</div>
 			{/snippet}
-			{#snippet titleContent()}
-				<span class="tree-selection" data-testid="tag-tree-selection">
-					{treeSelectionLabel}
-				</span>
-			{/snippet}
 			<div class="right-pane">
+				<!--
+					#1253: 枠の操作のツールバー（`ThreePaneDock` には開閉の帯が無い）。広い表示では
+					ツリーと属性の表示・非表示（「表示」メニューのチェックと同じ状態）、狭い表示では
+					左右の端の帯のタブが開く経路（このトグルは出さない）。「表示」メニューは両方で出す。
+				-->
+				<div class="frame-toolbar">
+					{#if !layoutNarrow}
+						<button
+							type="button"
+							class="tool-button"
+							aria-pressed={treeShown}
+							data-testid="tag-tree-toggle"
+							bind:this={treeToolbarToggleEl}
+							onclick={() => (treeShown = !treeShown)}>{TREE_PANE_LABEL}</button
+						>
+					{/if}
+					<span class="tree-selection" data-testid="tag-tree-selection">
+						{treeSelectionLabel}
+					</span>
+					<span class="frame-toolbar-spacer"></span>
+					{#if !layoutNarrow}
+						<button
+							type="button"
+							class="tool-button"
+							aria-pressed={rightShown}
+							data-testid="tag-attribute-toggle"
+							onclick={() => (rightShown = !rightShown)}>{ATTRIBUTE_PANE_LABEL}</button
+						>
+					{/if}
+					{#if viewItems.length > 0}
+						<Menu label="表示">
+							{#snippet trigger(props)}
+								<button type="button" class="tool-button" data-testid="tag-view-menu" {...props}
+									>表示</button
+								>
+							{/snippet}
+							{#each viewItems as item (item.id)}
+								{#if item.kind === 'separator'}
+									<MenuSeparator />
+								{:else if item.kind === 'checkbox' && !layoutNarrow}
+									<MenuItem
+										label={item.label}
+										kind="checkbox"
+										checked={item.checked}
+										onSelect={() => selectViewItem(item)}
+									/>
+								{:else}
+									<MenuItem label={item.label} onSelect={() => selectViewItem(item)} />
+								{/if}
+							{/each}
+						</Menu>
+					{/if}
+				</div>
 				<!--
 					#1179 PR3a（docs/hub/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、
 					2026-11-17 オーナー決定）: 中央はタブで「タグ一覧」と「設定」を切り替える。
@@ -7596,7 +7750,7 @@
 					</Tabs>
 				</div>
 			</div>
-		</ThreePaneLayout>
+		</ThreePaneDock>
 	</div>
 </div>
 
@@ -8438,15 +8592,18 @@
 	}
 
 	/*
-	 * T19 S1-a: ツリーペイン全体のラッパ。枠（`ThreePaneLayout`）のペインの
-	 * 本体が `overflow: auto` を持つため、ツリー本体と常設ボタンを縦積みにして
+	 * T19 S1-a: ツリーペイン全体のラッパ。ツリー本体と常設ボタンを縦積みにして
 	 * スクロール領域を共有する（別スクロール領域には分けない - ツリーが
-	 * 空/短い環境で不要な二重スクロールバーを避けるため）。
+	 * 空/短い環境で不要な二重スクロールバーを避けるため）。#1253 から枠
+	 * （`ThreePaneDock`）のパネルの高さいっぱいで、スクロールはこの要素が持つ
+	 * （常設ボタンの `sticky` の基準。タグモニタの `.tree-pane` と同じ）。
 	 */
 	.tree-pane {
 		display: flex;
 		flex-direction: column;
-		min-height: 100%;
+		height: 100%;
+		min-height: 0;
+		overflow: auto;
 	}
 
 	/* T19 S1-a: 接続・グループの常設作成ボタン。右ペインの `.toolbar`（タグ用）
@@ -8473,6 +8630,53 @@
 		flex-direction: column;
 		height: 100%;
 		min-height: 0;
+		padding: 1rem 1.25rem;
+	}
+
+	/* #1253: 枠の操作（ツリー・属性の表示・非表示、選択名、「表示」メニュー）。 */
+	.frame-toolbar {
+		flex: 0 0 auto;
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		margin-bottom: 0.6rem;
+		min-width: 0;
+	}
+
+	.frame-toolbar-spacer {
+		flex: 1;
+	}
+
+	/* タグモニタの `.tool-button` と同じ見た目。 */
+	.tool-button {
+		padding: 0.3rem 0.6rem;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
+		background: var(--banto-surface);
+		color: var(--banto-text);
+		font: inherit;
+		font-size: 0.8rem;
+		cursor: pointer;
+		white-space: nowrap;
+	}
+
+	.tool-button[aria-pressed='true'] {
+		background: var(--banto-bg);
+		border-color: var(--banto-primary);
+	}
+
+	/* #378: 何で絞られているか（ツリーを閉じていても見える）。 */
+	.tree-selection {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-size: 0.8rem;
+		font-weight: 600;
+	}
+
+	/* #1253: 右（属性）で編集していないときの案内。 */
+	.attribute-empty {
 		padding: 1rem 1.25rem;
 	}
 
@@ -8560,8 +8764,8 @@
 	}
 
 	/*
-	 * #375: 非モーダルの編集ペイン。幅・左境界線・リサイズのハンドルは枠
-	 * （`ThreePaneLayout` の右ペイン）が持つ（#1179 PR2b）。Drawer と違い
+	 * #375: 非モーダルの編集ペイン。幅・境界線・リサイズは枠
+	 * （#1253 から `ThreePaneDock` の右 = 属性）が持つ。Drawer と違い
 	 * `position: fixed` でもオーバーレイでもないため、左ツリーと中央グリッドは
 	 * そのままクリックできる。見た目だけは Drawer のパネルに揃える（ヘッダー帯・
 	 * 本文の独立スクロール）。

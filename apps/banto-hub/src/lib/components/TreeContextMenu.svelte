@@ -70,8 +70,26 @@
 		if (overflowY > 0) node.style.top = `${Math.max(0, y - overflowY)}px`;
 	}
 
+	/**
+	 * #1253: メニューはブラウザの最上位の層（`popover="manual"` を `showPopover()`）に出す。
+	 * タグ登録のツリーは狭い幅でドックの左端の帯から引き出した pane の中にあり、部品
+	 * （`@banto/dock-svelte` の `DockAutoHide`）は pane の外へフォーカスが移る・外を押すと
+	 * pane を戻す。開いた popover の中は「外」と数えないので、右クリックでメニューを開いても
+	 * ツリーは閉じない（#381 レビュー対応C の約束）。`@banto/ui` の層の判定（`layering.ts`）も
+	 * 開いた popover を最上位と見る。`showPopover` の無い環境（jsdom）は今までどおり固定配置。
+	 */
+	function showInTopLayer(node: HTMLDivElement): void {
+		if (typeof node.showPopover !== 'function') return;
+		try {
+			node.showPopover();
+		} catch {
+			// 既に開いている・文書の外: 固定配置のまま出す。
+		}
+	}
+
 	function focusFirst(node: HTMLDivElement): void {
 		menuEl = node;
+		showInTopLayer(node);
 		clampPosition(node);
 		focusIndex(0);
 	}
@@ -180,6 +198,7 @@
 <div
 	class="context-menu"
 	role="menu"
+	popover="manual"
 	tabindex="-1"
 	aria-label="作成メニュー"
 	style:left={`${x}px`}
@@ -207,6 +226,11 @@
 <style>
 	.context-menu {
 		position: fixed;
+		/* 開いた popover の既定（中央寄せの inset・margin・色）を打ち消し、x・y の位置に出す。 */
+		inset: auto;
+		margin: 0;
+		overflow: visible;
+		color: var(--banto-text);
 		z-index: 1000;
 		display: flex;
 		flex-direction: column;
