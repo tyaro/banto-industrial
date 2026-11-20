@@ -1599,9 +1599,11 @@
 												{/each}
 											</label>
 
-											<label class="field">
-												<span>束（任意）</span>
+											<div class="field">
+												<label for="group-bundle-input">束（任意）</label>
 												<input
+													id="group-bundle-input"
+													aria-describedby="group-bundle-note"
 													type="text"
 													maxlength={MAX_BUNDLE_CHARS}
 													list="group-bundle-names"
@@ -1612,13 +1614,13 @@
 														<option value={bundle}></option>
 													{/each}
 												</datalist>
-												<span class="note"
+												<span class="note" id="group-bundle-note"
 													>同じ名前の束を付けたグループは、監視画面で 1 つの束にまとまります。</span
 												>
 												{#each fieldErrors.bundle as message, i (i)}
 													<span class="field-error">{message}</span>
 												{/each}
-											</label>
+											</div>
 
 											<label class="field">
 												<span>表示種別</span>

@@ -9,7 +9,7 @@
 
 import type { DisplayGroup } from '#lib/banto/displayGroupsAdmin.js';
 
-/** 束なしのグループをまとめる 1 つの束タブの表示名。 */
+/** 束なしのグループをまとめる 1 つの束タブの表示名。Rust の `NO_BUNDLE_LABEL`（束の名前に使えない）と同じ。 */
 export const NO_BUNDLE_LABEL = '束なし';
 
 export interface BundleTab {

@@ -10680,6 +10680,7 @@ mod tests {
     fn display_group_input(name: &str, kind: &str, tag_ids: &[i64]) -> DisplayGroupPayload {
         serde_json::from_value(serde_json::json!({
             "name": name,
+            "bundle": null,
             "kind": kind,
             "pens": tag_ids.iter().map(|id| serde_json::json!({ "tagId": id })).collect::<Vec<_>>(),
         }))

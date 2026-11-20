@@ -36,8 +36,11 @@
 //! - **しきい値は持たない**。しきい値は記録計の側のタグごとの設定
 //!   （`crate::tag_thresholds`、#532。2026-10-08 オーナー決定）で、表示グループ
 //!   からは参照するだけ（画面はその設定を読み取り専用で見せる）。
-//! - `bundle`: 束の名前（任意、`null` = 束なし。前後の空白を除いて空なら `null`、
-//!   [`MAX_BUNDLE_CHARS`]（50）文字以内）。同じ名前のグループが 1 つの束になる
+//! - `bundle`: 束の名前（作成では任意、省略 = 束なし。**更新では必須**で、キーが
+//!   無い本文は拒否する（古い本文が束を黙って外さないため）。束から外すときは
+//!   `null` を送る。前後の空白を除いて空なら `null`、[`MAX_BUNDLE_CHARS`]（50）
+//!   文字以内。[`NO_BUNDLE_LABEL`]（「束なし」）は束に入れないグループの表示名なので、
+//!   束の名前には使えない）。同じ名前のグループが 1 つの束になる
 //!   名前だけの 1 階層の入れ物で、束のテーブルは持たない（trend-design.md §9 Q5、
 //!   2026-11-20 オーナー決定）。`sortOrder` と違い内容なので、更新（PUT）が書き、
 //!   版（`revision`）を進める。
@@ -124,6 +127,9 @@ pub const MAX_PENS_PER_GROUP: usize = 16;
 pub const MAX_NAME_CHARS: usize = 100;
 /// 束の名前の最大文字数（`display_groups.bundle` の CHECK と揃える）。
 pub const MAX_BUNDLE_CHARS: usize = 50;
+/// 束に入れないグループの表示名（画面側 `bundleLogic.ts` の `NO_BUNDLE_LABEL` と同じ）。
+/// 本物の束の名前と衝突するので、束の名前には使えない。
+pub const NO_BUNDLE_LABEL: &str = "束なし";
 
 /// `sortOrder` の上限（並べ替えは 0 から詰めるので、36 グループには十分）。
 pub const MAX_SORT_ORDER: i64 = 9999;
@@ -246,9 +252,11 @@ pub struct DisplayGroup {
 #[derive(utoipa::ToSchema)]
 pub struct DisplayGroupPayload {
     pub name: String,
-    /// 束の名前（任意）。空・空白だけは `None` に正規化する。
-    #[serde(default)]
-    pub bundle: Option<String>,
+    /// 束の名前。キーが無い = `None`（作成では束なし、更新では拒否）、`null` =
+    /// `Some(None)`（束から外す）。空・空白だけは検証で `None` に正規化する。
+    #[serde(default, deserialize_with = "deserialize_present")]
+    #[schema(value_type = Option<String>)]
+    pub bundle: Option<Option<String>>,
     /// 作成のときだけ使う（省略で末尾）。**更新では無視する**（モジュール doc）。
     #[serde(default)]
     pub sort_order: Option<i64>,
@@ -365,6 +373,14 @@ pub struct DisplayGroupRef {
     pub name: String,
 }
 
+/// キーがあれば（`null` でも）`Some` に包む。省略は `default` の `None`。
+fn deserialize_present<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
 /// 検証を通った定義（保存する形）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidDisplayGroup {
@@ -475,12 +491,18 @@ fn check_shape(
 
     let bundle = payload
         .bundle
-        .as_deref()
+        .as_ref()
+        .and_then(|bundle| bundle.as_deref())
         .map(str::trim)
         .filter(|bundle| !bundle.is_empty())
         .map(str::to_string);
     if let Some(bundle) = &bundle {
-        if bundle.chars().count() > MAX_BUNDLE_CHARS {
+        if bundle == NO_BUNDLE_LABEL {
+            errors.push(field_error(
+                "bundle",
+                format!("「{NO_BUNDLE_LABEL}」は束の名前に使えません（束に入れないグループの表示名です）。束に入れないときは空にしてください。"),
+            ));
+        } else if bundle.chars().count() > MAX_BUNDLE_CHARS {
             errors.push(field_error(
                 "bundle",
                 format!("束は {MAX_BUNDLE_CHARS} 文字以内にしてください"),
@@ -971,6 +993,15 @@ pub(crate) async fn save_on(
             if expected != revision {
                 return Err(revision_conflict_error());
             }
+        }
+        // 更新は束を必ず指定する（REST・Tauri・MCP の共通の関所）。
+        if payload.bundle.is_none() {
+            return Err(BantoError::Validation {
+                field_errors: vec![field_error(
+                    "bundle",
+                    "更新では束（bundle）を必ず指定してください。束から外すときは null を送ってください。",
+                )],
+            });
         }
     }
 

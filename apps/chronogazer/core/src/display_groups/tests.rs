@@ -72,7 +72,8 @@ async fn service_with_tags(n: usize) -> (DisplayGroupService, TagService, Vec<i6
 pub(crate) fn payload(name: &str, kind: &str, tag_ids: &[i64]) -> DisplayGroupPayload {
     DisplayGroupPayload {
         name: name.to_string(),
-        bundle: None,
+        // 更新でも使い回せるよう明示の null（キーなしは更新で拒否される）。
+        bundle: Some(None),
         sort_order: None,
         kind: kind.to_string(),
         attributes: Map::new(),
@@ -981,7 +982,7 @@ async fn a_pen_needs_exactly_one_of_tag_id_and_hub_tag() {
 async fn bundle_round_trips_trims_and_clears_through_create_and_update() {
     let (svc, _tags, ids) = service_with_tags(1).await;
     let mut p = payload("束あり", "trend", &ids);
-    p.bundle = Some("  ライン A  ".to_string());
+    p.bundle = Some(Some("  ライン A  ".to_string()));
     let created = svc.create(&p).await.expect("create");
     assert_eq!(created.bundle.as_deref(), Some("ライン A"));
     assert_eq!(
@@ -993,26 +994,72 @@ async fn bundle_round_trips_trims_and_clears_through_create_and_update() {
         Some("ライン A")
     );
 
-    p.bundle = Some("ライン B".to_string());
+    p.bundle = Some(Some("ライン B".to_string()));
     p.expected_revision = Some(created.revision);
     let updated = svc.update(created.id, &p).await.expect("update");
     assert_eq!(updated.bundle.as_deref(), Some("ライン B"));
     assert_eq!(updated.revision, created.revision + 1);
 
-    p.bundle = Some("   ".to_string());
+    p.bundle = Some(Some("   ".to_string()));
     p.expected_revision = Some(updated.revision);
     let cleared = svc.update(created.id, &p).await.expect("clear");
     assert_eq!(cleared.bundle, None);
+}
+
+/// 更新で `bundle` のキーが無い本文は拒否し、保存済みの束は変わらない。
+/// `null` は束から外す。作成ではキーなしでよい。
+#[tokio::test]
+async fn update_requires_bundle_key_but_create_does_not() {
+    let (svc, _tags, ids) = service_with_tags(1).await;
+    let mut p = payload("束あり", "trend", &ids);
+    p.bundle = None;
+    let created = svc.create(&p).await.expect("create without bundle");
+    assert_eq!(created.bundle, None);
+
+    p.bundle = Some(Some("ライン A".to_string()));
+    let with = svc.update(created.id, &p).await.expect("set bundle");
+
+    p.bundle = None;
+    p.name = "改名".to_string();
+    let err = svc.update(created.id, &p).await.expect_err("refused");
+    assert_eq!(fields(&err), vec!["bundle".to_string()]);
+    let kept = svc.get(created.id).await.expect("get");
+    assert_eq!(kept.bundle.as_deref(), Some("ライン A"));
+    assert_eq!(kept.name, "束あり");
+    assert_eq!(kept.revision, with.revision);
+
+    // JSON のキーなしと null の区別。
+    let absent: DisplayGroupPayload =
+        serde_json::from_value(json!({ "name": "x", "kind": "trend" })).expect("absent");
+    assert_eq!(absent.bundle, None);
+    let null: DisplayGroupPayload =
+        serde_json::from_value(json!({ "name": "x", "kind": "trend", "bundle": null }))
+            .expect("null");
+    assert_eq!(null.bundle, Some(None));
+
+    p.bundle = Some(None);
+    let cleared = svc.update(created.id, &p).await.expect("clear");
+    assert_eq!(cleared.bundle, None);
+}
+
+/// 「束なし」は束に入れないグループの表示名なので、束の名前には使えない。
+#[tokio::test]
+async fn bundle_name_no_bundle_label_is_reserved() {
+    let (svc, _tags, ids) = service_with_tags(1).await;
+    let mut p = payload("束なし予約", "trend", &ids);
+    p.bundle = Some(Some(format!("  {NO_BUNDLE_LABEL} ")));
+    let err = svc.create(&p).await.expect_err("reserved");
+    assert_eq!(fields(&err), vec!["bundle".to_string()]);
 }
 
 #[tokio::test]
 async fn bundle_is_limited_to_fifty_chars() {
     let (svc, _tags, ids) = service_with_tags(1).await;
     let mut p = payload("束の長さ", "trend", &ids);
-    p.bundle = Some("あ".repeat(51));
+    p.bundle = Some(Some("あ".repeat(51)));
     let err = svc.create(&p).await.expect_err("51 chars");
     assert_eq!(fields(&err), vec!["bundle".to_string()]);
-    p.bundle = Some("あ".repeat(50));
+    p.bundle = Some(Some("あ".repeat(50)));
     let created = svc.create(&p).await.expect("50 chars");
     assert_eq!(created.bundle.map(|b| b.chars().count()), Some(50));
 }
