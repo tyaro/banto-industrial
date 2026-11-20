@@ -440,12 +440,15 @@
             ]
           },
           "id": {
-            "description": "元の表の `id`（`collect_events.id` か `audit_log.id`。表が違うと重なりうる）。",
+            "description": "元の表の `id`（`collect_events.id` か `audit_log.id`。表が違うと重なりうる）。\n管理者未満への受け入れの切断の行には項目ごと無い（`audit_log.id` を出さない）。",
             "format": "int64",
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "key": {
-            "description": "画面の行の鍵（`c:<collect_events.id>` か `a:<audit_log.id>`）。全種類で一意。",
+            "description": "画面の行の鍵。全種類で一意。`c:<collect_events.id>`、受け入れの切断は管理者に\n`a:<audit_log.id>`、管理者未満に `i:<22 文字>`（HMAC。Hub の起動ごとに替わる）。",
             "type": "string"
           },
           "kind": {
@@ -473,7 +476,6 @@
           }
         },
         "required": [
-          "id",
           "key",
           "ts_ms",
           "kind"
@@ -1901,7 +1903,7 @@
         "operationId": "log_feed",
         "parameters": [
           {
-            "description": "前の応答の cursor（不透明な文字列）。無ければ初回で、各記録の新しい側から最大 limit 件を発生の時刻の降順に混ぜて limit 件に切る",
+            "description": "前の応答の cursor（封をした不透明な文字列）。無ければ初回で、各記録の先頭までの行から発生の時刻の新しい側の最大 limit 件を混ぜて limit 件に切る",
             "in": "query",
             "name": "cursor",
             "required": false,
@@ -1929,13 +1931,16 @@
                 }
               }
             },
-            "description": "接続・書き込み・操作の監査の行（発生の時刻の降順）と続きの位置。管理者未満は接続の行だけで、受け入れの切断は時刻・接続名・切断の区分だけ。書き込みの行は同じ key で更新版が届く"
+            "description": "接続・書き込み・操作の監査の行（発生の時刻の降順）と続きの位置。管理者未満は接続の行だけで、受け入れの切断は時刻・接続名・切断の区分だけ（監査の表の番号は出さず、key は i: の不透明な値）。書き込みの行は同じ key で更新版が届く"
           },
           "400": {
-            "description": "cursor の形が違う"
+            "description": "cursor の形が違う（base64url でない・長さが違う）"
           },
           "401": {
             "description": "画面のセッションが無い（API キーでは使えない）"
+          },
+          "409": {
+            "description": "cursor が使えない（Hub の再起動で鍵が替わった・改ざん・ロールが変わって見せる範囲が違う）。kind は conflict、current.code は cursor_expired。cursor 無しの初回から読み直す"
           }
         },
         "summary": "`GET /api/log-feed` - 下のログのパネルの取得の口（モジュール doc）。",

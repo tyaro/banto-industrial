@@ -100,6 +100,15 @@ async fn admins_see_all_three_and_viewers_see_connections_only() {
         &format!("conn:{plc}"),
     )
     .await;
+    // 管理者向けの操作の監査で番号を飛ばす（管理者未満の応答に番号が出れば、飛びから
+    // 件数がわかる）。受け入れの切断の行は 4242421 になる。
+    sqlx::query(
+        "INSERT INTO audit_log (id, action, resource, origin, result) \
+         VALUES (4242420, 'update', 'items', 'rest', 'ok')",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
     let ingest = audit_row(
         &env,
         "2026-11-21 01:02:03",
@@ -118,6 +127,7 @@ async fn admins_see_all_three_and_viewers_see_connections_only() {
         }),
     )
     .await;
+    assert_eq!(ingest, 4_242_421);
     let operation = audit_row(
         &env,
         "2026-11-21 01:02:04",
@@ -184,7 +194,15 @@ async fn admins_see_all_three_and_viewers_see_connections_only() {
         "{viewer}"
     );
     assert_eq!(entries(&viewer).len(), 2, "{viewer}");
-    let ingest_entry = find(&viewer, &format!("a:{ingest}"));
+    let ingest_entry = entries(&viewer)
+        .iter()
+        .find(|entry| entry["kind"] == "ingest_disconnected")
+        .cloned()
+        .unwrap_or_else(|| panic!("ingest row missing: {viewer}"));
+    // 監査の表の番号は出さない: 数字の id は項目ごと無く、key は不透明な値。
+    assert!(ingest_entry.get("id").is_none(), "{ingest_entry}");
+    let key = ingest_entry["key"].as_str().unwrap();
+    assert!(key.starts_with("i:") && key.len() == 24, "{key}");
     assert_eq!(ingest_entry["connection_name"], "push-line");
     assert_eq!(ingest_entry["transport"], "ws");
     assert_eq!(ingest_entry["reason"], "client_closed");
@@ -197,22 +215,138 @@ async fn admins_see_all_three_and_viewers_see_connections_only() {
         "peer",
         "secret-writer-key",
         "line1.temp",
+        "4242420",
+        "4242421",
+        "4242422",
     ] {
         assert!(!text.contains(leaked), "{leaked} leaked: {text}");
     }
-    // 管理者未満の続きの位置は書き込みの先頭を表さない。
-    assert!(cursor(&viewer).ends_with(".w0"), "{viewer}");
-
-    // 管理者未満が w を含む続きの位置を渡しても、書き込みの行は返らない。
-    let (status, viewer) = feed(&env, &env.viewer_token, "?cursor=c0.a0.w0").await;
-    assert_eq!(status, StatusCode::OK, "{viewer}");
+    // カーソルは封をした不透明な文字列（位置の数字も範囲も読めない）。
+    let viewer_cursor = cursor(&viewer);
+    assert_eq!(viewer_cursor.len(), 72, "{viewer_cursor}");
     assert!(
-        entries(&viewer)
+        viewer_cursor
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+        "{viewer_cursor}"
+    );
+    assert_eq!(cursor(&admin).len(), 72);
+
+    // 管理者未満は自分のカーソルで続きを読める（書き込みの行は返らない）。
+    let (status, next) = feed(&env, &env.viewer_token, &format!("?cursor={viewer_cursor}")).await;
+    assert_eq!(status, StatusCode::OK, "{next}");
+    assert!(
+        entries(&next)
             .iter()
             .all(|entry| entry["source"] == "connection"),
+        "{next}"
+    );
+
+    // 管理者のカーソルを管理者未満が使う（ロールが変わった）と読み直し。逆も同じ。
+    let (status, body) = feed(
+        &env,
+        &env.viewer_token,
+        &format!("?cursor={}", cursor(&admin)),
+    )
+    .await;
+    assert_cursor_expired(status, &body);
+    let (status, body) = feed(&env, &env.admin_token, &format!("?cursor={viewer_cursor}")).await;
+    assert_cursor_expired(status, &body);
+}
+
+/// 読み直しの応答（409、`current.code: "cursor_expired"`）。
+fn assert_cursor_expired(status: StatusCode, body: &Value) {
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["kind"], "conflict", "{body}");
+    assert_eq!(body["current"]["code"], "cursor_expired", "{body}");
+}
+
+/// 初回は位置ではなく発生の時刻で新しい行を選ぶ: 時刻の古い書き込みが後から確定して
+/// 変更の番号の先頭を占めても、時刻の新しい書き込みが `limit=1` の初回に返る。
+#[tokio::test]
+async fn the_first_read_keeps_the_newest_write_when_an_old_one_settles_later() {
+    let env = test_env().await;
+    let write_audit = WriteAuditService::new(env.pool.clone());
+    let old = write_audit.insert_pending(&write_row()).await.unwrap();
+    let newest = write_audit.insert_row(&write_row()).await.unwrap();
+    // `ts` の更新では変更の番号は進まない（0112 のトリガは result・detail だけ）。
+    for (id, ts) in [
+        (old, "2000-01-01 00:00:00"),
+        (newest, "2100-01-01 00:00:00"),
+    ] {
+        sqlx::query("UPDATE hub_write_audit SET ts = ? WHERE id = ?")
+            .bind(ts)
+            .bind(id)
+            .execute(&env.pool)
+            .await
+            .unwrap();
+    }
+    // 古い書き込みが後から確定し、変更の番号の先頭へ。
+    write_audit
+        .set_result(old, WriteAuditResult::Ok, None)
+        .await
+        .unwrap();
+
+    let (status, body) = feed(&env, &env.admin_token, "?limit=1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(entries(&body).len(), 1, "{body}");
+    assert_eq!(entries(&body)[0]["key"], format!("w:{newest}"), "{body}");
+    assert_eq!(entries(&body)[0]["ts_ms"], 4_102_444_800_000_i64);
+}
+
+/// 同じく監査: 保留から古い時刻のまま後で入った行が `id` の先頭を占めても、時刻の新しい
+/// 行が `limit=1` の初回に返る（管理者と管理者未満の両方）。
+#[tokio::test]
+async fn the_first_read_keeps_the_newest_audit_row_when_an_old_one_arrives_later() {
+    let env = test_env().await;
+    let detail = json!({ "connection_name_snapshot": "push-line", "transport": "ws", "reason": "client_closed" });
+    let newest = audit_row(
+        &env,
+        "2100-01-01 00:00:00",
+        "ingest",
+        "ingest_disconnected",
+        "42",
+        detail.clone(),
+    )
+    .await;
+    let late_operation = audit_row(
+        &env,
+        "2000-01-01 00:00:00",
+        "mcp",
+        "update",
+        "1",
+        json!({ "spooled": true }),
+    )
+    .await;
+    let late_ingest = audit_row(
+        &env,
+        "2000-01-01 00:00:00",
+        "ingest",
+        "ingest_disconnected",
+        "42",
+        detail,
+    )
+    .await;
+    assert!(newest < late_operation && late_operation < late_ingest);
+
+    let (status, admin) = feed(&env, &env.admin_token, "?limit=1").await;
+    assert_eq!(status, StatusCode::OK, "{admin}");
+    assert_eq!(entries(&admin).len(), 1, "{admin}");
+    assert_eq!(entries(&admin)[0]["key"], format!("a:{newest}"), "{admin}");
+
+    let (status, viewer) = feed(&env, &env.viewer_token, "?limit=1").await;
+    assert_eq!(status, StatusCode::OK, "{viewer}");
+    assert_eq!(entries(&viewer).len(), 1, "{viewer}");
+    assert_eq!(
+        entries(&viewer)[0]["kind"],
+        "ingest_disconnected",
         "{viewer}"
     );
-    assert!(!viewer.to_string().contains("secret-writer-key"));
+    assert_eq!(
+        entries(&viewer)[0]["ts_ms"],
+        4_102_444_800_000_i64,
+        "{viewer}"
+    );
 }
 
 /// API キー（`bh_`）・セッション無しでは使えない。
@@ -370,8 +504,21 @@ async fn the_limit_sets_more_and_the_rest_follows_and_bad_cursors_are_refused() 
     assert_eq!(entries(&newest).len(), 2, "{newest}");
     assert_eq!(newest["more"], false);
 
-    for bad in ["garbage", "c1.a1", "c1.a1.w1.x1", "c-1.a0.w0"] {
+    for bad in ["garbage", "c1.a1", "c1.a1.w1.x1", "c-1.a0.w0", "c0.a0.w0"] {
         let (status, body) = feed(&env, &env.admin_token, &format!("?cursor={bad}")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
     }
+
+    // 改ざんしたカーソル（形は合う）は読み直し。
+    let good = cursor(&newest);
+    let mut tampered = good.clone().into_bytes();
+    tampered[40] = if tampered[40] == b'A' { b'B' } else { b'A' };
+    let tampered = String::from_utf8(tampered).unwrap();
+    let (status, body) = feed(&env, &env.viewer_token, &format!("?cursor={tampered}")).await;
+    assert_cursor_expired(status, &body);
+
+    // 鍵の違う（Hub を起動し直した）カーソルも読み直し。
+    let other = test_env().await;
+    let (status, body) = feed(&other, &other.viewer_token, &format!("?cursor={good}")).await;
+    assert_cursor_expired(status, &body);
 }
