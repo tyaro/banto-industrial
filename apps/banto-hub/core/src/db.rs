@@ -57,6 +57,13 @@
 //! - `0111_hub_write_audit_correlation.sql`（#1201、2026-11-18）は、`hub_write_audit` に
 //!   `correlation_id`・`operator_claim` を足したもの（`ADD COLUMN`。CHECK を変えない
 //!   ので表は作り直さない。テスト `an_existing_audit_row_survives_the_0111_columns`）。
+//! - `0112_hub_write_audit_change_seq.sql`（#1253、2026-11-21）は、下のログのパネル
+//!   （`GET /api/log-feed`）の続きの位置にする変更の番号 `hub_write_audit.change_seq` を
+//!   足し（既存の行は `id` で埋める）、挿入と `result`・`detail` の更新で番号を進める
+//!   トリガと、受け入れの切断だけを引く `audit_log` の部分索引を足したもの。**今後
+//!   `hub_write_audit` を作り直す migration は、`change_seq` を写してトリガと索引を
+//!   作り直すこと**（テスト `an_existing_audit_row_gets_a_change_seq_from_0112`・
+//!   `the_change_seq_triggers_survive_on_the_latest_schema`）。
 //!
 //! ## なぜ `sqlx::migrate!` に戻せたか
 //!
@@ -438,7 +445,8 @@ mod tests {
         assert_eq!(
             versions,
             vec![
-                2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111
+                2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110,
+                111, 112
             ]
         );
     }
@@ -568,7 +576,8 @@ mod tests {
         assert_eq!(
             versions,
             vec![
-                2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111
+                2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110,
+                111, 112
             ]
         );
         let pending_id: Option<String> =
@@ -656,6 +665,7 @@ mod tests {
                 || name_text.starts_with("0108_")
                 || name_text.starts_with("0109_")
                 || name_text.starts_with("0111_")
+                || name_text.starts_with("0112_")
             {
                 continue;
             }
@@ -730,9 +740,14 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
+        // 0112 の索引は作り直しの後に当たる（作り直しが消さない）。
         assert_eq!(
             indexes,
-            vec!["idx_hub_write_audit_tag", "idx_hub_write_audit_ts"]
+            vec![
+                "idx_hub_write_audit_change_seq",
+                "idx_hub_write_audit_tag",
+                "idx_hub_write_audit_ts"
+            ]
         );
         let leftover: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE name = 'hub_write_audit_new'",
@@ -758,7 +773,10 @@ mod tests {
             let name = entry.file_name();
             // 0111 は 0109 の作り直しより後に当てる(先に当てると列が写らず消える)。
             let name_text = name.to_string_lossy();
-            if name_text.starts_with("0109_") || name_text.starts_with("0111_") {
+            if name_text.starts_with("0109_")
+                || name_text.starts_with("0111_")
+                || name_text.starts_with("0112_")
+            {
                 continue;
             }
             std::fs::copy(entry.path(), old_set.join(&name)).unwrap();
@@ -812,9 +830,14 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
+        // 0112 の索引は作り直しの後に当たる（作り直しが消さない）。
         assert_eq!(
             indexes,
-            vec!["idx_hub_write_audit_tag", "idx_hub_write_audit_ts"]
+            vec![
+                "idx_hub_write_audit_change_seq",
+                "idx_hub_write_audit_tag",
+                "idx_hub_write_audit_ts"
+            ]
         );
         pool.close().await;
     }
@@ -831,7 +854,8 @@ mod tests {
         for entry in std::fs::read_dir(&source).unwrap() {
             let entry = entry.unwrap();
             let name = entry.file_name();
-            if name.to_string_lossy().starts_with("0111_") {
+            let name_text = name.to_string_lossy();
+            if name_text.starts_with("0111_") || name_text.starts_with("0112_") {
                 continue;
             }
             std::fs::copy(entry.path(), old_set.join(&name)).unwrap();
@@ -878,6 +902,129 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(new_row, (Some("c-1".to_string()), Some("山田".to_string())));
+        pool.close().await;
+    }
+
+    /// #1253: `0112` は `hub_write_audit` に `change_seq` を足し、既存の行を `id` で
+    /// 埋める。0111 までを適用済みの DB が 0112 を取り、既存の行の番号が埋まり、次の
+    /// 挿入と更新が既存の最大より大きい番号を取ることを確かめる。
+    #[tokio::test]
+    async fn an_existing_audit_row_gets_a_change_seq_from_0112() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_set = dir.path().join("migrations-before-0112");
+        std::fs::create_dir(&old_set).unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations-sqlite");
+        for entry in std::fs::read_dir(&source).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("0112_") {
+                continue;
+            }
+            std::fs::copy(entry.path(), old_set.join(&name)).unwrap();
+        }
+
+        let db_path = dir.path().join("registry.sqlite3");
+        let pool = banto_storage::connect_sqlite(&db_path).await.unwrap();
+        let mut old = sqlx::migrate::Migrator::new(old_set.as_path())
+            .await
+            .unwrap();
+        old.dangerous_set_table_name(MIGRATIONS_TABLE);
+        old.run(&pool).await.unwrap();
+        let insert = "INSERT INTO hub_write_audit (api_key_id, api_key_name_snapshot, tag_id, \
+             external_name_snapshot, action, result) VALUES (1, 'k', 10, 'line.t', 'write', ?)";
+        for result in ["ok", "failed", "ok"] {
+            sqlx::query(insert)
+                .bind(result)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        pool.close().await;
+
+        let pool = init_db(&db_path)
+            .await
+            .expect("an existing DB must take 0112 on the next startup");
+        let select = "SELECT id, change_seq FROM hub_write_audit ORDER BY id";
+        let rows: Vec<(i64, Option<i64>)> = sqlx::query_as(select).fetch_all(&pool).await.unwrap();
+        assert_eq!(rows, vec![(1, Some(1)), (2, Some(2)), (3, Some(3))]);
+
+        // 暫定の failed を確定させる更新で、番号が既存の最大の次へ進む。
+        sqlx::query("UPDATE hub_write_audit SET result = 'ok' WHERE id = 2")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(insert).bind("ok").execute(&pool).await.unwrap();
+        let rows: Vec<(i64, Option<i64>)> = sqlx::query_as(select).fetch_all(&pool).await.unwrap();
+        assert_eq!(
+            rows,
+            vec![(1, Some(1)), (2, Some(4)), (3, Some(3)), (4, Some(5))]
+        );
+        pool.close().await;
+    }
+
+    /// #1253: 最新の schema で `change_seq` のトリガが有り、挿入・`result`・`detail` の
+    /// 更新で 1 つずつ進み、それ以外の列の更新では進まないこと（トリガが再帰して
+    /// 回り続けないこと）を確かめる。将来 `hub_write_audit` を作り直す migration が
+    /// トリガを作り直し忘れたら、ここで落ちる（0112 の header）。
+    #[tokio::test]
+    async fn the_change_seq_triggers_survive_on_the_latest_schema() {
+        let pool = migrate_memory().await.unwrap();
+        let triggers: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' \
+             AND tbl_name = 'hub_write_audit' ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            triggers,
+            vec![
+                "trg_hub_write_audit_change_seq_insert",
+                "trg_hub_write_audit_change_seq_update"
+            ]
+        );
+
+        async fn seq(pool: &SqlitePool, id: i64) -> Option<i64> {
+            sqlx::query_scalar("SELECT change_seq FROM hub_write_audit WHERE id = ?")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+        let insert = "INSERT INTO hub_write_audit (api_key_id, api_key_name_snapshot, tag_id, \
+             external_name_snapshot, action, result) \
+             VALUES (1, 'k', 10, 'line.t', 'write', 'failed') RETURNING id";
+        let first: i64 = sqlx::query_scalar(insert).fetch_one(&pool).await.unwrap();
+        let second: i64 = sqlx::query_scalar(insert).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            (seq(&pool, first).await, seq(&pool, second).await),
+            (Some(1), Some(2))
+        );
+
+        sqlx::query("UPDATE hub_write_audit SET result = 'ok', detail = NULL WHERE id = ?")
+            .bind(first)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(seq(&pool, first).await, Some(3), "one statement, one step");
+        sqlx::query("UPDATE hub_write_audit SET detail = 'n=2' WHERE id = ?")
+            .bind(second)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(seq(&pool, second).await, Some(4));
+        // feed に関わらない列の更新では進まない。
+        sqlx::query("UPDATE hub_write_audit SET operator_claim = 'x' WHERE id = ?")
+            .bind(first)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(seq(&pool, first).await, Some(3));
+        let max: i64 = sqlx::query_scalar("SELECT MAX(change_seq) FROM hub_write_audit")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(max, 4);
         pool.close().await;
     }
 

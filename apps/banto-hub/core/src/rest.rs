@@ -271,6 +271,12 @@ use admin_status::{
     __path_v1_events, admin_status_router, admin_tag_stream_router, v1_events, EventEntry,
     EventsResponse, ADMIN_TAG_STREAM_PATH,
 };
+// #1253: 下のログのパネルの取得の口（`GET /api/log-feed`）。
+mod log_feed;
+use log_feed::{
+    __path_log_feed, log_feed_router, ConnectionLogEntry, LogFeedEntry, LogFeedResponse,
+    OperationLogEntry, WriteLogEntry,
+};
 use tag_space::{
     __path_v1_status, __path_v1_tags, __path_v1_value_read_now, __path_v1_value_single,
     __path_v1_values, build_catalog_response, build_values_response, resolve_value_names,
@@ -920,6 +926,9 @@ fn api_router_with_controller_mode(
             audit.clone(),
             auth.clone(),
         ))
+        // #1253: 下のログのパネル。画面のセッションだけ（ロールの最低は付けず、見せる
+        // 範囲はハンドラがロールで絞る。`rest::log_feed` のモジュール doc）。
+        .merge(log_feed_router(manager.pool(), auth.clone()))
         .merge(mqtt_settings_router(
             manager.clone(),
             mqtt.clone(),

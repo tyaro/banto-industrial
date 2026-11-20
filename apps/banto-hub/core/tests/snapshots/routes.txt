@@ -16,6 +16,7 @@ GET /api/drivers
 GET /api/events
 GET /api/grpc-settings
 GET /api/ingest/bridge-config
+GET /api/log-feed
 GET /api/mqtt-settings
 GET /api/opcua-settings
 GET /api/opcua-status

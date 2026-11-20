@@ -14,6 +14,11 @@ use super::{
     Router, SingleValueResponse, State, StatusResponse, SwaggerUi, TagEntry, ValueEntry,
     ValuesResponse, WriteValueRequest, WriteValueResponse,
 };
+// #1253: 下のログのパネルの取得の口（GET /api/log-feed、画面のセッションだけ）。
+use super::{
+    __path_log_feed, ConnectionLogEntry, LogFeedEntry, LogFeedResponse, OperationLogEntry,
+    WriteLogEntry,
+};
 // R2a-2c（docs/hub/banto-hub-ingest-design.md §6.2）: 取り込み口の REST の送信口。
 use crate::ingest::rest::{__path_v1_ingest_values, IngestRejectedItem, IngestValuesResponse};
 use crate::ingest::validate::IngestValuesMessage;
@@ -41,7 +46,7 @@ use crate::clock_sync::{
     info(
         title = "banto-hub タグ空間 API",
         version = "v1",
-        description = "banto-hub の /api/v1/* API（docs/hub/tag-server-design.md §5.1）。catalog（/api/v1/tags）はクライアントとの互換性契約である（§4.1）: 外部名・安定 ID・revision を用いたバインディングを前提に、フィールド名や JSON 形はこのスキーマとコードが常に一致するよう utoipa で自動生成している。書き込み（POST /api/v1/values/{tag}、T2-4・§6）は writable タグのみ・write:{tag} スコープの API キー限定。取り込み（POST /api/v1/ingest/{id}/values、docs/hub/banto-hub-ingest-design.md §6.2）は push 接続へ値を送る口で、ingest:#{id} スコープの API キー限定。PLC の時計合わせ（/api/plc-connections/{id}/clock-sync、H2）と時計の読取り（/api/plc-connections/{id}/clock、H3）は管理系の REST で、editor のセッションと X-Banto-Client ヘッダが要る。"
+        description = "banto-hub の /api/v1/* API（docs/hub/tag-server-design.md §5.1）。catalog（/api/v1/tags）はクライアントとの互換性契約である（§4.1）: 外部名・安定 ID・revision を用いたバインディングを前提に、フィールド名や JSON 形はこのスキーマとコードが常に一致するよう utoipa で自動生成している。書き込み（POST /api/v1/values/{tag}、T2-4・§6）は writable タグのみ・write:{tag} スコープの API キー限定。取り込み（POST /api/v1/ingest/{id}/values、docs/hub/banto-hub-ingest-design.md §6.2）は push 接続へ値を送る口で、ingest:#{id} スコープの API キー限定。PLC の時計合わせ（/api/plc-connections/{id}/clock-sync、H2）と時計の読取り（/api/plc-connections/{id}/clock、H3）は管理系の REST で、editor のセッションと X-Banto-Client ヘッダが要る。下のログのパネルの取得の口（GET /api/log-feed、#1253）は画面のセッションと X-Banto-Client ヘッダが要り、API キーでは使えない。管理者未満には接続の行だけを返す。"
     ),
     paths(
         v1_tags,
@@ -57,6 +62,7 @@ use crate::clock_sync::{
         clock_sync_put,
         clock_sync_post,
         plc_clock_get,
+        log_feed,
     ),
     components(schemas(
         TagEntry,
@@ -91,6 +97,11 @@ use crate::clock_sync::{
         ClockReadResult,
         ClockReading,
         ClockReadView,
+        LogFeedResponse,
+        LogFeedEntry,
+        ConnectionLogEntry,
+        WriteLogEntry,
+        OperationLogEntry,
     ))
 )]
 pub(super) struct ApiDoc;
