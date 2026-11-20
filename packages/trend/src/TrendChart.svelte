@@ -137,6 +137,8 @@
 		y0: number;
 		range0: TimeRange;
 		moved: boolean;
+		/** 押した位置が描画域の中か（外から押したときはカーソルを置かない）。 */
+		inPlot: boolean;
 	} | null = null;
 
 	const owners = $derived(axisOwners(pens));
@@ -310,6 +312,15 @@
 		if (!plotEl || plotWidth <= 0) return null;
 		return clientX - plotEl.getBoundingClientRect().left - marginLeft;
 	}
+	function plotY(clientY: number): number | null {
+		if (!plotEl || plotHeight <= 0) return null;
+		return clientY - plotEl.getBoundingClientRect().top - MARGIN_TOP;
+	}
+	function inPlotArea(clientX: number, clientY: number): boolean {
+		const px = plotX(clientX);
+		const py = plotY(clientY);
+		return px !== null && py !== null && px >= 0 && px <= plotWidth && py >= 0 && py <= plotHeight;
+	}
 	function timeAt(clientX: number): number | null {
 		const px = plotX(clientX);
 		if (px === null || !isValidRange(range)) return null;
@@ -330,7 +341,14 @@
 	}
 	function onpointerdown(e: PointerEvent) {
 		if (e.button !== 0 || !isValidRange(range)) return;
-		drag = { pointerId: e.pointerId, x0: e.clientX, y0: e.clientY, range0: range, moved: false };
+		drag = {
+			pointerId: e.pointerId,
+			x0: e.clientX,
+			y0: e.clientY,
+			range0: range,
+			moved: false,
+			inPlot: inPlotArea(e.clientX, e.clientY)
+		};
 		(e.currentTarget as Element).setPointerCapture?.(e.pointerId);
 	}
 	function place(tMs: number) {
@@ -344,11 +362,11 @@
 			drag.pointerId === e.pointerId &&
 			!drag.moved &&
 			Math.hypot(e.clientX - drag.x0, e.clientY - drag.y0) < CLICK_SLOP;
+		const downInPlot = drag?.inPlot ?? false;
 		endDrag(e);
-		if (!click) return;
-		const px = plotX(e.clientX);
+		if (!click || !downInPlot || !inPlotArea(e.clientX, e.clientY)) return;
 		const t = timeAt(e.clientX);
-		if (t !== null && px !== null && px >= 0 && px <= plotWidth) place(t);
+		if (t !== null) place(t);
 	}
 	function endDrag(e: PointerEvent) {
 		if (!drag || drag.pointerId !== e.pointerId) return;
@@ -582,7 +600,12 @@
 								y2={plotHeight}
 								data-cursor={c.name}
 							/>
-							<text class="bi-trend__fixed-name" x={c.x + 3} y="10">{c.name}</text>
+							<text
+								class="bi-trend__fixed-name"
+								x={c.x > plotWidth - 14 ? c.x - 3 : c.x + 3}
+								text-anchor={c.x > plotWidth - 14 ? 'end' : 'start'}
+								y="10">{c.name}</text
+							>
 						{/if}
 					{/each}
 				</g>
