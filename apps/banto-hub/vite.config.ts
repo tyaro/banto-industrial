@@ -26,6 +26,7 @@ export default defineConfig({
 		exclude: [
 			'@banto/admin-core',
 			'@banto/charts',
+			'@banto/dock-svelte',
 			'@banto/forms',
 			'@banto/grid-svelte',
 			'@banto/theme',

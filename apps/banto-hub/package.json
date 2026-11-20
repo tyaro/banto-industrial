@@ -14,6 +14,7 @@
   "dependencies": {
     "@banto/admin-core": "github:tyaro/banto#v7.9.0&path:packages/admin-core",
     "@banto/charts": "github:tyaro/banto#v7.9.0&path:packages/charts",
+    "@banto/dock-svelte": "github:tyaro/banto#v7.9.0&path:packages/dock-svelte",
     "@banto/forms": "github:tyaro/banto#v7.9.0&path:packages/forms",
     "@banto/grid-svelte": "github:tyaro/banto#v7.9.0&path:packages/grid-svelte",
     "@banto/theme": "github:tyaro/banto#v7.9.0&path:packages/theme",

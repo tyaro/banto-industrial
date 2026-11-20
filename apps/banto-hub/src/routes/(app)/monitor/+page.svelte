@@ -47,8 +47,18 @@
 	 * #1179 PR3b（docs/hub/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、段階 ①）:
 	 * ツリーの選択を URL（`?target=`、形はタグ登録と同じ `#lib/banto/tagsView.ts`）に
 	 * 持ち、タグ登録とナビで行き来したときに同じ対象を開く（`#lib/treeSelection.svelte.ts`）。
+	 *
+	 * #1253（docs/hub/banto-hub-ui-improvement-proposal.md §ドック型の配置）: 枠を
+	 * `@banto/ui` の `ThreePaneLayout` から `@banto/dock-svelte` の `ThreePaneDock` へ
+	 * 載せ替えた（左 = ツリー、中央 = 一覧。右は無し。下のログのパネルは次の PR で
+	 * `panels` に足す）。選択中の対象は今までどおり URL（`?target=`）、パネルの配置は
+	 * 利用者ごとの保存（`#lib/dockLayoutStore.ts`、キー `monitor`）で URL には載せない。
+	 * 部品には開閉の帯が無いので、ツリーの表示・非表示と「表示」メニュー（レイアウトを
+	 * 既定に戻す）は中央のツールバーに置く。狭い幅では部品の狭い表示に任せる（ツリーは
+	 * 左端の自動で隠す帯へ。帯のタブで引き出し、Esc・外の押下・選択で戻り、フォーカスは
+	 * 帯のタブへ戻る。#378・#381 の約束の置き換え）。
 	 */
-	import { untrack } from 'svelte';
+	import { onDestroy, tick, untrack } from 'svelte';
 	import { page } from '$app/state';
 	import { afterNavigate, goto } from '$app/navigation';
 	import { toastStore } from '#lib/toast.svelte.js';
@@ -91,7 +101,10 @@
 		probeSessionAfterReconnectFailures,
 		recheckSessionAfterStreamClose
 	} from '#lib/banto/sessionRecheck.js';
-	import { ThreePaneLayout } from '@banto/ui';
+	import { Menu, MenuItem, MenuSeparator } from '@banto/ui';
+	import { createDockState, defaultDockMessages, ThreePaneDock } from '@banto/dock-svelte';
+	import { createDockLayoutStore } from '#lib/dockLayoutStore.js';
+	import { persistThreePaneLayout } from '#lib/dockLayoutPersist.svelte.js';
 	import ConnectionTree from '#lib/components/ConnectionTree.svelte';
 	import type { ConnectionTreeNodeData } from '#lib/components/connectionTreeTypes.js';
 	import { isProviderError } from '@banto/admin-core';
@@ -264,16 +277,78 @@
 	});
 
 	/**
-	 * #378（2026-09-16 オーナー決定）: 狭幅で左ツリーを退避したときの開閉状態
-	 * （`ThreePaneLayout` の `leftDrawerOpen`）。#1179 PR2b から、狭幅の判定は従来どおり
-	 * ビューポート（`mobileNavStore.isNarrow`、サイドバーのオフキャンバスと同じ境界）。
-	 * 部品の既定は枠の幅での判定だが、`narrowOverride` で
-	 * ビューポート基準にしている（2026-11-18 オーナー決定、#1182）。結果を
-	 * `layoutNarrow` へ書き出す。広幅へ戻ると部品が `false` へ戻す。
-	 * タグ登録ページと同じ配線。
+	 * #1253: ドックの枠（`ThreePaneDock`）。`dock` を自分で持ち、`layoutSnapshot()` の変化で
+	 * 配置を保存する（`layoutSnapshot()` を保存する。狭い表示の間は控えた広い配置を返すので、
+	 * 狭い表示の一時の配置は保存しない）。
+	 *
+	 * 狭幅の判定は従来どおりビューポート（`mobileNavStore.isNarrow`、サイドバーの
+	 * オフキャンバスと同じ境界。2026-11-18 オーナー決定、#1182）を `narrowOverride` で渡し、
+	 * 結果を `layoutNarrow` へ書き出す。`treeShown` は広い表示でのツリーの表示・非表示
+	 * （「表示」メニューのチェックと同じ 1 か所の状態、部品の `leftOpen`）。
 	 */
-	let treeOpen = $state(false);
+	const dock = createDockState();
+	const dockLayoutStore = createDockLayoutStore('monitor');
+	onDestroy(() => dockLayoutStore.dispose());
+	let threePane: ReturnType<typeof ThreePaneDock> | undefined = $state();
+	let treeShown = $state(true);
 	let layoutNarrow = $state(false);
+	/** 狭い表示で、ツリーが帯から引き出されているか（#378 の「開いている」）。 */
+	const treeDrawerOpen = $derived(layoutNarrow && dock.flyoutPanel === 'left');
+	let treePaneEl: HTMLDivElement | undefined = $state();
+
+	const dockMessages = {
+		...defaultDockMessages,
+		threePaneLeft: () => '接続とグループ',
+		threePaneCenter: () => 'タグの値',
+		threePaneRight: () => '詳細'
+	};
+
+	/** 「表示」メニューの項目（左のツリー・区切り・レイアウトを既定に戻す）。 */
+	const viewItems = $derived(
+		threePane?.viewMenuItems({ resetLayout: 'レイアウトを既定に戻す' }) ?? []
+	);
+
+	// 配置の保存。最初の 1 回（マウントした時点の配置）は保存の口が基準として受け取るだけ。
+	// `layoutSnapshot()` の読み取りを追跡する（狭い表示の「既定に戻す」・復元で、`dock.layout`
+	// の後に確定する控えた広い配置も拾う。PR #1268 レビュー P2）。
+	// 広い ⇄ 狭いの切り替えの途中（求める表示と出している表示が食い違う間）は保存しない
+	// （狭い表示の一時の木を書かない。PR #1268 再レビュー P2）。
+	persistThreePaneLayout(() => threePane, dockLayoutStore, {
+		wanted: () => mobileNavStore.isNarrow,
+		shown: () => layoutNarrow
+	});
+
+	// サーバーの保存値（利用者ごと）を、枠のマウント後に 1 回だけ読んで当てる。
+	let savedLayoutRequested = false;
+	$effect(() => {
+		const pane = threePane;
+		if (!pane || savedLayoutRequested) return;
+		savedLayoutRequested = true;
+		void dockLayoutStore.loadSaved().then((saved) => {
+			if (saved !== undefined && threePane === pane) void pane.restoreLayout(saved);
+		});
+	});
+
+	/**
+	 * 「表示」メニューの項目を選ぶ。狭い表示でツリーを引き出したときは、フォーカスをツリーへ
+	 * 入れる（帯のタブで開いたときと同じ。Esc で閉じられるように）。メニューが閉じて
+	 * フォーカスをトリガーへ戻した後に移すため、描画を 1 回待つ。狭い表示ではパネルの項目を
+	 * チェックではなく「開く」操作として出す（チェックの項目は選んでもメニューを閉じない。
+	 * 引き出した pane の上にメニューが残らないように）。
+	 */
+	function selectViewItem(item: { id: string; onSelect: () => void }): void {
+		item.onSelect();
+		if (item.id !== 'panel:left' || !layoutNarrow) return;
+		void tick().then(() =>
+			requestAnimationFrame(() => {
+				if (dock.flyoutPanel !== 'left') return;
+				const target =
+					treePaneEl?.querySelector<HTMLElement>('[role="treeitem"][tabindex="0"]') ??
+					treePaneEl?.querySelector<HTMLElement>('[role="tree"]');
+				target?.focus();
+			})
+		);
+	}
 
 	// --- #1179 PR3b: ツリーの選択と URL -----------------------------------
 	//
@@ -375,19 +450,20 @@
 	 * Esc で下の層から閉じることになる。サイドバーは未保存状態を持たない常設
 	 * ナビなので、閉じて安全（`Sidebar.svelte` のリンククリックでも閉じている）。
 	 *
-	 * #1179 PR2b: トグルは `ThreePaneLayout` の帯にあり、押したことはページから
-	 * 拾えないので、**開いた遷移**（`leftDrawerOpen` が `true` になった）で畳む。
-	 * 依存は `treeOpen` だけ（サイドバーの開閉では再実行しない - ツリーを開いた
-	 * あとでサイドバーを開くのは正しい重なりなので、そこで畳んではいけない）。
+	 * #1179 PR2b: トグルは枠の帯にあり、押したことはページから拾えないので、
+	 * **開いた遷移**で畳む（#1253 から、狭い表示でツリーが帯から引き出された =
+	 * `dock.flyoutPanel === 'left'`）。依存はそれだけ（サイドバーの開閉では再実行
+	 * しない - ツリーを開いたあとでサイドバーを開くのは正しい重なりなので、そこで
+	 * 畳んではいけない）。
 	 */
 	$effect(() => {
-		if (!treeOpen) return;
+		if (!treeDrawerOpen) return;
 		untrack(() => {
 			if (mobileNavStore.open) mobileNavStore.closeNav();
 		});
 	});
 
-	/** #378: 閉じていても何で絞られているか分かるよう、枠の帯に出す選択名。 */
+	/** #378: 閉じていても何で絞られているか分かるよう、中央のツールバーに出す選択名。 */
 	const treeSelectionLabel = $derived.by((): string => {
 		if (treeFilter.type === 'connection') {
 			const connectionId = treeFilter.id;
@@ -414,7 +490,8 @@
 		// #378: 狭幅では「選んだ」時点（クリック・Space・Enter）で退避パネルを
 		// 閉じる（タグ登録ページと同じ）。狭幅は `selectionFollowsFocus=false`
 		// なので、上下キーは選択を起こさず、ここへ来るのは選んだときだけ。
-		if (layoutNarrow) treeOpen = false;
+		// #1253: 退避パネルは枠の帯から引き出した pane。戻すとフォーカスは帯のタブへ移る（部品）。
+		if (treeDrawerOpen) dock.closeFlyout();
 	}
 
 	// --- T18-4c: 確認導線のディープリンク受け口 -----------------------------
@@ -573,42 +650,37 @@
 		{/if}
 	</div>
 
-	{#if loading && rows.length === 0}
-		<p class="note">読み込み中…</p>
-	{:else}
-		<!--
-			T18-4a: タグ登録ページと同じ枠（#1179 PR2b から `@banto/ui` の
-			`ThreePaneLayout`。右ペインは使わないので `right` を渡さない = 右のペインも
-			トグルも出ない）+ ConnectionTree + 検索ボックス。左ツリーは接続/グループを
-			選択して絞り込むだけの表示専用（`oncontextmenu` は渡さない - このページに
-			作成系 UI は無い）。
+	<!--
+		T18-4a: タグ登録ページと同じ枠 + ConnectionTree + 検索ボックス。左ツリーは
+		接続/グループを選択して絞り込むだけの表示専用（`oncontextmenu` は渡さない -
+		このページに作成系 UI は無い）。#1253 から枠は `@banto/dock-svelte` の
+		`ThreePaneDock`（右は使わないので `right` を渡さない）。
 
-			#381 レビュー対応6回目: **タグが0件でも枠を出す**
-			（以前は「絞り込む対象が無いので枠は出さない」として空状態を
-			この外に置いていた）。条件マウントだと、ツリーやトグルにフォーカスが
-			ある状態で最後の行が消えたときに**フォーカスの戻り先ごとアンマウント
-			される**（フォーカスが `<body>` に落ちる）。ツリーはタグが0件でも
-			接続・収集グループを出せるので、常時マウントして空状態の案内は中央
-			（下の `rows.length === 0` 分岐）に置く - タグ登録ページが枠を
-			無条件にマウントしているのと同じ形。
+		#381 レビュー対応6回目: **タグが0件でも枠を出す**。条件マウントだと、ツリーや
+		トグルにフォーカスがある状態で最後の行が消えたときに**フォーカスの戻り先ごと
+		アンマウントされる**（フォーカスが `<body>` に落ちる）。#1253 から、最初の
+		読み込み中も枠を出して案内を中央に置く（枠を作り直すと配置の保存・読み直しの
+		基準が崩れるため）。
+	-->
+	<div class="content">
+		<!--
+			#378（2026-09-16 オーナー決定）: 狭幅では左ツリーを退避する。#1253 から退避は
+			部品の狭い表示（左端の自動で隠す帯。タブで引き出し、Esc・外の押下で戻り、
+			フォーカスはタブへ戻る）。狭幅の判定はビューポート基準（`narrowOverride`）。
+			ツリーは引き出すたびに作り直さない（`keepMounted`。展開の状態を保つ）。
 		-->
-		<div class="content">
-			<!--
-				#378（2026-09-16 オーナー決定）: 狭幅では左ツリーをドロワーへ退避する。
-				退避・トグル・Esc・フォーカスの出入りは部品が持つ（冒頭コメントの約束）。
-				狭幅の判定はビューポート基準（`narrowOverride` で上書き）。帯（トグルの隣）には
-				閉じていても何で絞られているかが分かるよう、現在の選択名を出す。
-			-->
-			<ThreePaneLayout
-				narrowOverride={mobileNavStore.isNarrow}
-				bind:leftDrawerOpen={treeOpen}
-				bind:narrow={layoutNarrow}
-				messages={{
-					threePaneLeft: () => '接続とグループ',
-					threePaneResizeLeft: () => '接続とグループの幅'
-				}}
-			>
-				{#snippet left()}
+		<ThreePaneDock
+			bind:this={threePane}
+			{dock}
+			initialLayout={dockLayoutStore.initial}
+			bind:leftOpen={treeShown}
+			bind:narrow={layoutNarrow}
+			narrowOverride={mobileNavStore.isNarrow}
+			keepMounted={(id) => id === 'left'}
+			messages={dockMessages}
+		>
+			{#snippet left()}
+				<div class="tree-pane" bind:this={treePaneEl}>
 					<ConnectionTree
 						{connections}
 						{groups}
@@ -617,87 +689,121 @@
 						selectionFollowsFocus={!layoutNarrow}
 						onselect={handleTreeSelect}
 					/>
-				{/snippet}
-				{#snippet titleContent()}
+				</div>
+			{/snippet}
+			<div class="right-pane">
+				<div class="toolbar">
+					{#if !layoutNarrow}
+						<!-- 広い表示でのツリーの表示・非表示（「表示」メニューのチェックと同じ状態）。
+							狭い表示では左端の帯のタブが開く経路（このボタンは出さない）。 -->
+						<button
+							type="button"
+							class="tool-button"
+							aria-pressed={treeShown}
+							data-testid="monitor-tree-toggle"
+							onclick={() => (treeShown = !treeShown)}>接続とグループ</button
+						>
+					{/if}
 					<span class="tree-selection" data-testid="monitor-tree-selection">
 						{treeSelectionLabel}
 					</span>
-				{/snippet}
-				<div class="right-pane">
-					<div class="toolbar">
-						<input
-							type="search"
-							class="search-box"
-							placeholder="外部名・名前・アドレスで検索"
-							bind:value={searchQuery}
-						/>
-						<span class="count">{filteredRows.length} / {rows.length} 件</span>
-					</div>
-					{#if rows.length === 0}
-						<!--
+					<input
+						type="search"
+						class="search-box"
+						placeholder="外部名・名前・アドレスで検索"
+						bind:value={searchQuery}
+					/>
+					<span class="count">{filteredRows.length} / {rows.length} 件</span>
+					{#if viewItems.length > 0}
+						<Menu label="表示">
+							{#snippet trigger(props)}
+								<button type="button" class="tool-button" data-testid="monitor-view-menu" {...props}
+									>表示</button
+								>
+							{/snippet}
+							{#each viewItems as item (item.id)}
+								{#if item.kind === 'separator'}
+									<MenuSeparator />
+								{:else if item.kind === 'checkbox' && !layoutNarrow}
+									<MenuItem
+										label={item.label}
+										kind="checkbox"
+										checked={item.checked}
+										onSelect={() => selectViewItem(item)}
+									/>
+								{:else}
+									<MenuItem label={item.label} onSelect={() => selectViewItem(item)} />
+								{/if}
+							{/each}
+						</Menu>
+					{/if}
+				</div>
+				{#if loading && rows.length === 0}
+					<p class="note">読み込み中…</p>
+				{:else if rows.length === 0}
+					<!--
 								T18-2d（docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-A「空状態を…
 								不足する前工程と移動ボタンを示す」）: タグが1件も無い（フィルタ
 								の問題ではなく真の空）場合は、前工程（タグ登録）へ案内する。
 								文言・CTA は従来のまま、置き場所だけ右ペインの中へ移した
 								（#381 レビュー対応6回目 - 上の枠のコメント参照）。
 							-->
-						<p class="note">
-							登録されているタグがありません。先に タグの登録画面 からタグを作成してください。
-						</p>
-						<a class="onboarding-cta" href={resolveAppPath('/tags')}>タグの登録画面へ移動</a>
-					{:else if filteredRows.length === 0}
-						<p class="note">条件に一致するタグがありません。</p>
-					{:else}
-						<div class="table-wrap">
-							<table class="values-table">
-								<thead>
-									<tr>
-										<th>外部名</th>
-										<th>接続</th>
-										<th>グループ</th>
-										<th>{columnLabels.value}</th>
-										<th
-											title="未確認 = Hub の起動後に、まだ一度も実機から値を読めていない状態（収集開始後の不良とは別）"
-											>{columnLabels.quality}</th
-										>
-										<th>時刻</th>
+					<p class="note">
+						登録されているタグがありません。先に タグの登録画面 からタグを作成してください。
+					</p>
+					<a class="onboarding-cta" href={resolveAppPath('/tags')}>タグの登録画面へ移動</a>
+				{:else if filteredRows.length === 0}
+					<p class="note">条件に一致するタグがありません。</p>
+				{:else}
+					<div class="table-wrap">
+						<table class="values-table">
+							<thead>
+								<tr>
+									<th>外部名</th>
+									<th>接続</th>
+									<th>グループ</th>
+									<th>{columnLabels.value}</th>
+									<th
+										title="未確認 = Hub の起動後に、まだ一度も実機から値を読めていない状態（収集開始後の不良とは別）"
+										>{columnLabels.quality}</th
+									>
+									<th>時刻</th>
+								</tr>
+							</thead>
+							<tbody>
+								{#each filteredRows as row (row.external_name)}
+									{@const cell = monitorCellDisplay(row, displayMode)}
+									<tr
+										class:flash={flashing[row.external_name]}
+										class:confirm-target={focusSet.has(row.external_name)}
+									>
+										<td class="tag-name">{row.external_name}</td>
+										<td>
+											{row.connection}
+											{#if row.simulation}
+												<span class="sim-badge" title="シミュレーション接続（実機ではありません）"
+													>⚠ SIM</span
+												>
+											{/if}
+										</td>
+										<td>{row.group}</td>
+										<td class="value quality-{cell.qualityClass}">{cell.value}</td>
+										<td class="quality quality-{cell.qualityClass}">{cell.qualityLabel}</td>
+										<td>{formatTime(row.t)}</td>
 									</tr>
-								</thead>
-								<tbody>
-									{#each filteredRows as row (row.external_name)}
-										{@const cell = monitorCellDisplay(row, displayMode)}
-										<tr
-											class:flash={flashing[row.external_name]}
-											class:confirm-target={focusSet.has(row.external_name)}
-										>
-											<td class="tag-name">{row.external_name}</td>
-											<td>
-												{row.connection}
-												{#if row.simulation}
-													<span class="sim-badge" title="シミュレーション接続（実機ではありません）"
-														>⚠ SIM</span
-													>
-												{/if}
-											</td>
-											<td>{row.group}</td>
-											<td class="value quality-{cell.qualityClass}">{cell.value}</td>
-											<td class="quality quality-{cell.qualityClass}">{cell.qualityLabel}</td>
-											<td>{formatTime(row.t)}</td>
-										</tr>
-									{/each}
-								</tbody>
-							</table>
-						</div>
-					{/if}
-				</div>
-			</ThreePaneLayout>
-		</div>
-	{/if}
+								{/each}
+							</tbody>
+						</table>
+					</div>
+				{/if}
+			</div>
+		</ThreePaneDock>
+	</div>
 </div>
 
 <style>
 	/* T18-4a: tags ページ（`(app)/tags/+page.svelte`）と同じ
-	   page/page-header/content/right-pane/toolbar 構成 - 枠（`ThreePaneLayout`）が
+	   page/page-header/content/right-pane/toolbar 構成 - 枠（#1253 から `ThreePaneDock`）が
 	   `height: 100%` を前提にしているため、画面全体を calc(100vh - ...) の
 	   flex column にして `.content` に残り高さ全部を渡す。 */
 	.page {
@@ -825,6 +931,39 @@
 		flex: 0 0 auto;
 		color: var(--banto-text-muted);
 		font-size: 0.75rem;
+	}
+
+	/* #1253: ツリーの表示・非表示と「表示」メニューのボタン（`.resume-button` と同じ見た目）。 */
+	.tool-button {
+		padding: 0.3rem 0.6rem;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
+		background: var(--banto-surface);
+		color: var(--banto-text);
+		font: inherit;
+		font-size: 0.8rem;
+		cursor: pointer;
+	}
+
+	.tool-button[aria-pressed='true'] {
+		background: var(--banto-bg);
+		border-color: var(--banto-primary);
+	}
+
+	/* #378: 何で絞られているか（ツリーを閉じていても見える）。 */
+	.tree-selection {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-size: 0.8rem;
+		font-weight: 600;
+	}
+
+	.tree-pane {
+		height: 100%;
+		min-height: 0;
+		overflow: auto;
 	}
 
 	table {

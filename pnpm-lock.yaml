@@ -47,6 +47,9 @@ importers:
       '@banto/charts':
         specifier: github:tyaro/banto#v7.9.0&path:packages/charts
         version: https://codeload.github.com/tyaro/banto/tar.gz/c017882a654754dfed87bf558a319c96ba136716#path:packages/charts
+      '@banto/dock-svelte':
+        specifier: github:tyaro/banto#v7.9.0&path:packages/dock-svelte
+        version: https://codeload.github.com/tyaro/banto/tar.gz/c017882a654754dfed87bf558a319c96ba136716#path:packages/dock-svelte
       '@banto/forms':
         specifier: github:tyaro/banto#v7.9.0&path:packages/forms
         version: https://codeload.github.com/tyaro/banto/tar.gz/c017882a654754dfed87bf558a319c96ba136716#path:packages/forms
@@ -197,6 +200,10 @@ packages:
 
   '@banto/charts@https://codeload.github.com/tyaro/banto/tar.gz/c017882a654754dfed87bf558a319c96ba136716#path:packages/charts':
     resolution: {path: packages/charts, tarball: https://codeload.github.com/tyaro/banto/tar.gz/c017882a654754dfed87bf558a319c96ba136716}
+    version: 7.9.0
+
+  '@banto/dock-svelte@https://codeload.github.com/tyaro/banto/tar.gz/c017882a654754dfed87bf558a319c96ba136716#path:packages/dock-svelte':
+    resolution: {path: packages/dock-svelte, tarball: https://codeload.github.com/tyaro/banto/tar.gz/c017882a654754dfed87bf558a319c96ba136716}
     version: 7.9.0
 
   '@banto/forms@https://codeload.github.com/tyaro/banto/tar.gz/c017882a654754dfed87bf558a319c96ba136716#path:packages/forms':
@@ -1495,6 +1502,8 @@ snapshots:
   '@banto/admin-core@https://codeload.github.com/tyaro/banto/tar.gz/c017882a654754dfed87bf558a319c96ba136716#path:packages/admin-core': {}
 
   '@banto/charts@https://codeload.github.com/tyaro/banto/tar.gz/c017882a654754dfed87bf558a319c96ba136716#path:packages/charts': {}
+
+  '@banto/dock-svelte@https://codeload.github.com/tyaro/banto/tar.gz/c017882a654754dfed87bf558a319c96ba136716#path:packages/dock-svelte': {}
 
   '@banto/forms@https://codeload.github.com/tyaro/banto/tar.gz/c017882a654754dfed87bf558a319c96ba136716#path:packages/forms': {}
 
