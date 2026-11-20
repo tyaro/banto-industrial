@@ -623,7 +623,8 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		);
 
 		// 帯の既定は、しきい値のある最初のペン（上限 = H 0、上が開いた注意の帯）。
-		const rampPen = trend.getByRole('button', { name: new RegExp(`^${TAG_RAMP}（cnt）`) });
+		// 凡例の名前は単位を含まない（単位は範囲の後に 1 回だけ。#1247）。
+		const rampPen = trend.getByRole('button', { name: new RegExp(`^${TAG_RAMP}\\s*[^（]*cnt`) });
 		const highPen = trend.getByRole('button', { name: new RegExp(`^${TAG_HIGH}`) });
 		await expect(highPen).toHaveAttribute('aria-pressed', 'true');
 		await expect(rampPen).toHaveAttribute('aria-pressed', 'false');
