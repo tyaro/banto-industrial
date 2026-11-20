@@ -14,6 +14,10 @@
  *    出て編集のフォームが見え、入力した値が残っている（値はページの状態。DOM は入れ替わる）。
  * 7. PR #1269 のレビュー: 狭い幅で「表示」メニューから属性をキーボードで開くと、フォーカスが
  *    引き出した pane の中へ入り、Esc で閉じてフォーカスが帯のタブへ戻る。
+ * 8. PR #1269 のレビュー（P2）: 広い幅で属性を帯に折りたたんでから一覧のタグを選ぶと、属性が
+ *    展開されて編集のフォームが見える（元の作りの `editPaneCollapsed = false` と同じ）。
+ * 9. PR #1269 のレビュー（P2）: 属性を自動で隠す帯へ入れてから一覧のタグを選ぶと、引き出す
+ *    （一覧を押すと帯へ戻る）のではなく元の場所へ戻り、一覧を押しても編集のフォームが見えたまま。
  *
  * どのテストも既定の配置で終える（後の spec に残さない）。ファイル名は
  * `banto-hub-smoke.spec.ts` より辞書順で後（`banto-hub-auth.ts` の注記）。前提データは REST で
@@ -358,5 +362,50 @@ test.describe.serial('banto-hub タグ登録のドックの枠 (#1253)', () => {
 			await page.setViewportSize(WIDE);
 		}
 		await expect(attributeToggle()).toHaveAttribute('aria-pressed', 'true');
+	});
+
+	/** 編集を閉じ、検索を空にして既定の配置へ戻す（8・9 の後片付け）。 */
+	async function closeEditorAndReset(): Promise<void> {
+		await editPane().getByRole('button', { name: '閉じる' }).click();
+		await expect(editPane()).toHaveCount(0);
+		await page.getByPlaceholder('名前・アドレスで検索').fill('');
+		await resetLayout();
+		await expect(page.getByRole('button', { name: '属性を帯から展開' })).toHaveCount(0);
+		await expect(page.locator('button[data-dock-band-tab="right"]')).toHaveCount(0);
+		await expect(attributeToggle()).toHaveAttribute('aria-pressed', 'true');
+	}
+
+	test('8. 帯に折りたたんだ属性は、一覧のタグを選ぶと展開して編集のフォームを出す（PR #1269 のレビュー）', async () => {
+		await openTags();
+		await page.getByRole('button', { name: '属性を帯に折りたたむ' }).click();
+		const expand = page.getByRole('button', { name: '属性を帯から展開' });
+		await expect(expand).toBeVisible();
+		await expect(page.getByTestId('tag-attribute-empty')).toBeHidden();
+
+		await openEditor();
+		await expect(expand).toHaveCount(0);
+		await expect(editPane()).toBeVisible();
+		await expect(editPane().getByLabel('単位')).toBeVisible();
+
+		await closeEditorAndReset();
+	});
+
+	test('9. 自動で隠した属性は、一覧のタグを選ぶと元の場所へ戻り、一覧を押しても見えたまま（PR #1269 のレビュー）', async () => {
+		await openTags();
+		await page.getByRole('button', { name: '属性を自動で隠す（ピンを外す）' }).click();
+		const bandTab = page.locator('button[data-dock-band-tab="right"]');
+		await expect(bandTab).toBeVisible();
+		await expect(page.getByTestId('tag-attribute-empty')).toBeHidden();
+
+		await openEditor();
+		await expect(bandTab).toHaveCount(0);
+		await expect(page.locator('[data-dock-flyout="right"]')).toHaveCount(0);
+		await expect(editPane()).toBeVisible();
+		// 引き出しただけなら一覧（外）の押下で帯へ戻る。元の場所へ戻したので見えたまま。
+		await page.getByRole('gridcell', { name: TAG_NAME, exact: true }).click();
+		await expect(editPane().getByLabel('単位')).toBeVisible();
+		await expect(bandTab).toHaveCount(0);
+
+		await closeEditorAndReset();
 	});
 });

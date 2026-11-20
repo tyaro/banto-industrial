@@ -2157,6 +2157,32 @@
 		}
 		return node.children.some((child) => dockedOperable(child, id, node));
 	}
+	/**
+	 * PR #1269 のレビュー（P2）: 右（属性）を**実際に見えて操作できる**形へ戻す（判定は
+	 * `rightPaneOperable` と同じ `paneOperableIn`）。元の作り（`ThreePaneLayout`）が編集を開く・
+	 * 対象を替えるたびに `editPaneCollapsed = false` で展開していたのに合わせる。`rightShown` は
+	 * 畳んだ・自動で隠した・裏のタブでも真なので、`true` を書いても何も起きない。
+	 * - 自動で隠した帯: 引き出す（flyout）のではなく元の場所へ戻す（`dock.restoreAutoHidden`、
+	 *   ピンを留めるのと同じ）。引き出しただけだと、一覧の行を押した（別のタグを選ぶ・式欄へ
+	 *   挿入する）瞬間に外の押下で帯へ戻り、編集中に一覧を触る流れと合わない。
+	 * - 隠した・畳んだ区画・タブの組の裏: 部品の `setVisible`（`DockHost.setPanelVisible` →
+	 *   `showPanel`。区画を展開し、裏のタブは `tab-switch` として聞いて表にする）。
+	 * - 浮かせた窓をタイトルバーへ畳んでいた: `setVisible` は前面へ出すだけなので、展開する。
+	 * 断られた（`refused`・`stale` 等）ら何もしない。狭い表示の間は触らない（編集は Drawer／
+	 * Modal）。展開した配置は保存の口がそのまま保存する（利用者が編集を開いた結果）。
+	 */
+	async function revealRightPane(): Promise<void> {
+		const pane = threePane;
+		if (!pane || layoutNarrow || paneOperableIn(dock.layout, 'right')) return;
+		if (dock.isAutoHidden('right')) {
+			if (dock.flyoutPanel === 'right') dock.closeFlyout();
+			if (!dock.restoreAutoHidden('right')) return;
+		}
+		const outcome = await pane.setVisible('right', true);
+		if (outcome !== 'applied' || threePane !== pane || layoutNarrow) return;
+		if (dock.isCollapsed('right')) dock.setCollapsed('right', false);
+	}
+
 	/** 既定の配置の右（属性）の幅（px）。今までの編集ペインの幅（`drawerWidth` の 480px）。 */
 	const EDIT_PANE_DEFAULT_WIDTH = 480;
 	/** 狭い表示で、ツリーが帯から引き出されているか（#378 の「開いている」）。 */
@@ -2329,9 +2355,10 @@
 		untrack(() => {
 			insertArmed = false;
 			dismissCompletion();
-			// #1253: 右（属性）を隠していたら、編集を開いた・対象が変わったときに出し直す
-			// （部品の `rightOpen` へ書く = `setVisible`）。狭い表示では編集はモーダルなので触らない。
-			if (paneCapableMode && !layoutNarrow) rightShown = true;
+			// #1253: 右（属性）を隠す・畳む・自動で隠す・裏のタブにしていたら、編集を開いた・
+			// 対象が変わったときに見える形へ戻す（`revealRightPane`）。狭い表示では編集は
+			// モーダルなので触らない。
+			if (paneCapableMode && !layoutNarrow) void revealRightPane();
 		});
 	});
 
@@ -2347,7 +2374,7 @@
 	$effect(() => {
 		const narrowNow = layoutNarrow;
 		untrack(() => {
-			if (narrowSeen && !narrowNow && paneCapableMode) rightShown = true;
+			if (narrowSeen && !narrowNow && paneCapableMode) void revealRightPane();
 			narrowSeen = narrowNow;
 		});
 	});
