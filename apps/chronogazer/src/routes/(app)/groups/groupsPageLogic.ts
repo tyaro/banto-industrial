@@ -79,6 +79,38 @@ export interface PenDraft extends PenStyle {
 	/** `hubTag` の出どころ（Hub の接続先名・収集グループ名）。表示だけで、保存には使わない。 */
 	hubSource?: { connection: string; group: string } | null;
 	colorSlot: number | null;
+	/**
+	 * 縦軸の最小・最大の**入力の文字**（編集中だけ持つ。`undefined` = 触っていない = `yMin`・`yMax` の
+	 * 値をそのまま使う）。"-" や "1e" のような途中の文字を黙って `null` にしないため、数として読めない
+	 * 文字は `draftProblems` が保存を止める。
+	 */
+	yMinText?: string;
+	yMaxText?: string;
+}
+
+/** 凡例の名前の上限（code point 数。Rust の `MAX_PEN_LABEL_CHARS` と同じ）。 */
+export const MAX_PEN_LABEL_CHARS = 64;
+/** 単位の上限（code point 数。Rust の `MAX_PEN_UNIT_CHARS` と同じ）。 */
+export const MAX_PEN_UNIT_CHARS = 16;
+
+/** 縦軸の入力の文字を数にする。空 = `null`（既定）、数として読めない = `'invalid'`。 */
+export function parseAxisText(text: string): number | null | 'invalid' {
+	const t = text.trim();
+	if (t === '') return null;
+	const n = Number(t);
+	return Number.isFinite(n) ? n : 'invalid';
+}
+
+/** 縦軸の最小・最大の入力の文字（無ければ値から作る）。 */
+export function axisText(pen: PenDraft, which: 'yMin' | 'yMax'): string {
+	const text = which === 'yMin' ? pen.yMinText : pen.yMaxText;
+	if (text !== undefined) return text;
+	const value = pen[which];
+	return value === null ? '' : String(value);
+}
+
+function codePoints(text: string): number {
+	return Array.from(text).length;
 }
 
 export interface GroupDraft {
@@ -126,18 +158,27 @@ export function penKey(pen: Pick<PenDraft, 'tagId' | 'hubTag'>): string | null {
 }
 
 /** ペンの属性だけを取り出す（保存の本文・未保存の判定・往復で同じ形にする）。 */
-function styleOf(pen: PenStyle): PenStyle {
+function styleOf(pen: PenStyle & { yMinText?: string; yMaxText?: string }): PenStyle {
+	const axisOf = (text: string | undefined, value: number | null | undefined): number | null => {
+		if (text === undefined) return value ?? null;
+		const parsed = parseAxisText(text);
+		return parsed === 'invalid' ? null : parsed;
+	};
+	const trimmed = (text: string | null | undefined): string | null => {
+		const t = (text ?? '').trim();
+		return t === '' ? null : t;
+	};
 	return {
-		label: pen.label ?? null,
-		unit: pen.unit ?? null,
+		label: trimmed(pen.label),
+		unit: trimmed(pen.unit),
 		decimals: pen.decimals ?? null,
 		lineStyle: pen.lineStyle ?? null,
 		lineWidth: pen.lineWidth ?? null,
 		marker: pen.marker ?? null,
 		markerSize: pen.markerSize ?? null,
 		axis: pen.axis ?? null,
-		yMin: pen.yMin ?? null,
-		yMax: pen.yMax ?? null
+		yMin: axisOf(pen.yMinText, pen.yMin),
+		yMax: axisOf(pen.yMaxText, pen.yMax)
 	};
 }
 
@@ -191,7 +232,15 @@ function draftKey(draft: GroupDraft): string {
 		bundle: draft.bundle.trim(),
 		kind: draft.kind,
 		timeWindowSec: draft.kind === 'trend' ? draft.timeWindowSec : null,
-		pens: draft.pens.map((pen) => [penKey(pen), pen.colorSlot, styleOf(pen)]),
+		pens: draft.pens.map((pen) => [
+			penKey(pen),
+			pen.colorSlot,
+			styleOf(pen),
+			// 数として読めない入力の途中は、文字そのものを比べる（値は null に落ちるので）。
+			[pen.yMinText, pen.yMaxText].map((text) =>
+				text !== undefined && parseAxisText(text) === 'invalid' ? text : null
+			)
+		]),
 		// 登録先は `hubTag` のペンがあるときだけ未保存の判定に入る。
 		hubTarget: hasHubPens(draft) ? draft.hubTarget : null
 	});
@@ -208,6 +257,21 @@ export function draftProblems(draft: GroupDraft): string[] {
 	draft.pens.forEach((pen, index) => {
 		if (pen.tagId === null && pen.hubTag === null) {
 			problems.push(`ペン ${index + 1} のタグを選んでください`);
+		}
+		const n = index + 1;
+		const style = styleOf(pen);
+		if (style.label !== null && codePoints(style.label) > MAX_PEN_LABEL_CHARS) {
+			problems.push(`ペン ${n} の凡例の名前は ${MAX_PEN_LABEL_CHARS} 文字までです`);
+		}
+		if (style.unit !== null && codePoints(style.unit) > MAX_PEN_UNIT_CHARS) {
+			problems.push(`ペン ${n} の単位は ${MAX_PEN_UNIT_CHARS} 文字までです`);
+		}
+		const lo = pen.yMinText === undefined ? style.yMin : parseAxisText(pen.yMinText);
+		const hi = pen.yMaxText === undefined ? style.yMax : parseAxisText(pen.yMaxText);
+		if (lo === 'invalid') problems.push(`ペン ${n} の縦軸の最小が数ではありません`);
+		if (hi === 'invalid') problems.push(`ペン ${n} の縦軸の最大が数ではありません`);
+		if (typeof lo === 'number' && typeof hi === 'number' && lo >= hi) {
+			problems.push(`ペン ${n} の縦軸は、最小を最大より小さくしてください`);
 		}
 	});
 	if (hasHubPens(draft)) {
@@ -407,7 +471,8 @@ export interface SortedFieldErrors {
 	other: string[];
 }
 
-const PEN_FIELD = /^pens\[(\d+)\]\.(tagId|colorSlot|hubTag(\..+)?)$/;
+const PEN_FIELD =
+	/^pens\[(\d+)\]\.(tagId|colorSlot|label|unit|decimals|lineStyle|lineWidth|marker|markerSize|axis|yMin|yMax|hubTag(\..+)?)$/;
 const HUB_TAG_GROUP_FIELD = /^hubTagGroup(\..+)?$/;
 
 export function sortFieldErrors(fieldErrors: readonly FieldErrorLike[]): SortedFieldErrors {

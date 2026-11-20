@@ -113,6 +113,8 @@
 		updateDisplayGroup,
 		deleteDisplayGroup,
 		reorderDisplayGroups,
+		DEFAULT_LINE_WIDTH,
+		DEFAULT_MARKER_SIZE,
 		type DisplayGroup,
 		type DisplayKind
 	} from '#lib/banto/displayGroupsAdmin.js';
@@ -129,12 +131,16 @@
 	import {
 		COLOR_SLOTS,
 		KIND_OPTIONS,
+		MAX_PEN_LABEL_CHARS,
+		MAX_PEN_UNIT_CHARS,
+		axisText,
 		MAX_DISPLAY_GROUPS,
 		MAX_BUNDLE_CHARS,
 		MAX_PENS,
 		DEFAULT_HUB_GROUP_NAME,
 		TIME_WINDOW_OPTIONS,
 		appendPens,
+		type PenDraft,
 		colorSlotVar,
 		defaultColorSlot,
 		defaultHubTarget,
@@ -453,6 +459,47 @@
 	function setPenColor(index: number, value: string): void {
 		draft.pens[index].colorSlot = value === '' ? null : Number(value);
 	}
+
+	/** 属性の select 用。空 = 既定（`null`）。 */
+	function setPenText(index: number, key: 'label' | 'unit', value: string): void {
+		draft.pens[index][key] = value;
+	}
+
+	function setPenChoice<K extends 'lineStyle' | 'marker' | 'axis'>(
+		index: number,
+		key: K,
+		value: string
+	): void {
+		draft.pens[index][key] = (value === '' ? null : value) as PenDraft[K];
+	}
+
+	function setPenNumber(
+		index: number,
+		key: 'decimals' | 'lineWidth' | 'markerSize',
+		value: string
+	): void {
+		draft.pens[index][key] = value === '' ? null : Number(value);
+	}
+
+	function setPenAxisText(index: number, key: 'yMinText' | 'yMaxText', value: string): void {
+		draft.pens[index][key] = value;
+	}
+
+	const LINE_STYLE_OPTIONS = [
+		['solid', '実線'],
+		['dashed', '破線'],
+		['dashDot', '一点鎖線'],
+		['dashDotDot', '二点鎖線'],
+		['none', '線なし']
+	] as const;
+	const MARKER_OPTIONS = [
+		['none', 'なし'],
+		['circle', '丸'],
+		['square', '四角'],
+		['triangle', '三角'],
+		['diamond', 'ひし形']
+	] as const;
+	const LINE_WIDTH_VALUES = [1, 1.5, 2, 2.5, 3, 3.5, 4];
 
 	async function save(): Promise<void> {
 		if (busy || selected === null || !draftReady) return;
@@ -1152,6 +1199,132 @@
 										<option value={String(colorSlot)}>色 {colorSlot}</option>
 									{/each}
 								</select>
+							</label>
+						</fieldset>
+						{@const penTag = pen.tagId !== null ? tagsById.get(pen.tagId) : pen.hubTag}
+						{@const noVisibleLine =
+							pen.lineStyle === 'none' && (pen.marker === null || pen.marker === 'none')}
+						<fieldset class="editor" disabled={busy} data-testid="pen-trend-style">
+							<h4 class="sub-heading">トレンドの表示</h4>
+							{#if draft.kind !== 'trend'}
+								<p class="note">保存されますが、効くのはトレンドだけです。</p>
+							{/if}
+							{#if penTag?.dataType === 'bit'}
+								<p class="note">bit のタグは 0〜1 固定で、小数の桁・最小・最大は使いません。</p>
+							{/if}
+							<label class="field">
+								<span>ペン {index + 1} の凡例の名前</span>
+								<input
+									type="text"
+									value={pen.label ?? ''}
+									placeholder={penTag?.name ?? ''}
+									oninput={(e) => setPenText(index, 'label', e.currentTarget.value)}
+								/>
+								<span class="meta">{MAX_PEN_LABEL_CHARS} 文字まで。空はタグの名前。</span>
+							</label>
+							<label class="field">
+								<span>ペン {index + 1} の単位</span>
+								<input
+									type="text"
+									value={pen.unit ?? ''}
+									placeholder={penTag?.unit ?? ''}
+									oninput={(e) => setPenText(index, 'unit', e.currentTarget.value)}
+								/>
+								<span class="meta">{MAX_PEN_UNIT_CHARS} 文字まで。空はタグの単位。</span>
+							</label>
+							<label class="field">
+								<span>ペン {index + 1} の小数の桁</span>
+								<select
+									value={pen.decimals === null ? '' : String(pen.decimals)}
+									onchange={(e) => setPenNumber(index, 'decimals', e.currentTarget.value)}
+								>
+									<option value="">既定（タグの設定）</option>
+									{#each [0, 1, 2, 3, 4, 5, 6] as d (d)}
+										<option value={String(d)}>{d}</option>
+									{/each}
+								</select>
+							</label>
+							<label class="field">
+								<span>ペン {index + 1} の線種</span>
+								<select
+									value={pen.lineStyle ?? ''}
+									onchange={(e) => setPenChoice(index, 'lineStyle', e.currentTarget.value)}
+								>
+									<option value="">既定（実線）</option>
+									{#each LINE_STYLE_OPTIONS as [value, label] (value)}
+										<option {value}>{label}</option>
+									{/each}
+								</select>
+							</label>
+							<label class="field">
+								<span>ペン {index + 1} の線幅</span>
+								<select
+									value={pen.lineWidth === null ? '' : String(pen.lineWidth)}
+									onchange={(e) => setPenNumber(index, 'lineWidth', e.currentTarget.value)}
+								>
+									<option value="">既定（{DEFAULT_LINE_WIDTH} px）</option>
+									{#each LINE_WIDTH_VALUES as w (w)}
+										<option value={String(w)}>{w} px</option>
+									{/each}
+								</select>
+							</label>
+							<label class="field">
+								<span>ペン {index + 1} のマーカー</span>
+								<select
+									value={pen.marker ?? ''}
+									onchange={(e) => setPenChoice(index, 'marker', e.currentTarget.value)}
+								>
+									<option value="">既定（なし）</option>
+									{#each MARKER_OPTIONS as [value, label] (value)}
+										<option {value}>{label}</option>
+									{/each}
+								</select>
+							</label>
+							<label class="field">
+								<span>ペン {index + 1} のマーカーの大きさ</span>
+								<select
+									value={pen.markerSize === null ? '' : String(pen.markerSize)}
+									disabled={pen.marker === null || pen.marker === 'none'}
+									onchange={(e) => setPenNumber(index, 'markerSize', e.currentTarget.value)}
+								>
+									<option value="">既定（{DEFAULT_MARKER_SIZE} px）</option>
+									{#each [2, 3, 4, 5, 6, 7, 8] as m (m)}
+										<option value={String(m)}>{m} px</option>
+									{/each}
+								</select>
+							</label>
+							{#if noVisibleLine}
+								<p class="note">線もマーカーも無いと、線が見えません。</p>
+							{/if}
+							<label class="field">
+								<span>ペン {index + 1} の縦軸</span>
+								<select
+									value={pen.axis ?? ''}
+									onchange={(e) => setPenChoice(index, 'axis', e.currentTarget.value)}
+								>
+									<option value="">既定（左）</option>
+									<option value="left">左</option>
+									<option value="right">右</option>
+								</select>
+							</label>
+							<label class="field">
+								<span>ペン {index + 1} の縦軸の最小</span>
+								<input
+									type="text"
+									inputmode="decimal"
+									value={axisText(pen, 'yMin')}
+									oninput={(e) => setPenAxisText(index, 'yMinText', e.currentTarget.value)}
+								/>
+							</label>
+							<label class="field">
+								<span>ペン {index + 1} の縦軸の最大</span>
+								<input
+									type="text"
+									inputmode="decimal"
+									value={axisText(pen, 'yMax')}
+									oninput={(e) => setPenAxisText(index, 'yMaxText', e.currentTarget.value)}
+								/>
+								<span class="meta">最小・最大が空の側は、タグの工学値レンジ → データの範囲。</span>
 							</label>
 						</fieldset>
 						{#each fieldErrors.penRows[index] ?? [] as message, i (i)}
@@ -1938,6 +2111,16 @@
 		align-items: flex-start;
 		gap: 0.25rem;
 		font-size: 0.85rem;
+	}
+
+	.sub-heading {
+		margin: 0.5rem 0 0;
+		font-size: 0.9rem;
+	}
+
+	.field .meta {
+		color: var(--banto-text-muted);
+		font-size: 0.75rem;
 	}
 
 	.current-tag .meta {

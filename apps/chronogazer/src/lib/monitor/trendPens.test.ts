@@ -23,6 +23,10 @@ describe('ペンの ID と部品のペン', () => {
 				yMin: null,
 				yMax: null,
 				engRange: null,
+				lineStyle: null,
+				lineWidth: null,
+				marker: null,
+				markerSize: null,
 				thresholds: null
 			},
 			{
@@ -36,17 +40,61 @@ describe('ペンの ID と部品のペン', () => {
 				yMin: null,
 				yMax: null,
 				engRange: null,
+				lineStyle: null,
+				lineWidth: null,
+				marker: null,
+				markerSize: null,
 				thresholds: null
 			}
 		]);
 		expect(pens[0]).toEqual({
 			id: trendPenId(0, 1),
-			label: '炉温（℃）',
+			label: '炉温',
 			colorSlot: 3,
 			unit: '℃',
 			decimals: 1
 		});
 		expect(pens[1]).toMatchObject({ id: trendPenId(1, 2), yMin: 0, yMax: 1, decimals: null });
+	});
+
+	it('線種・線幅・マーカーは null でないものだけ渡す（bit にも効く）', () => {
+		const base = {
+			tagId: 1,
+			name: 'x',
+			unit: '℃',
+			decimals: 1,
+			colorSlot: 1,
+			axis: null,
+			yMin: null,
+			yMax: null,
+			engRange: null,
+			lineStyle: null,
+			lineWidth: null,
+			marker: null,
+			markerSize: null,
+			thresholds: null
+		};
+		const [plain, styled, bit] = toTrendPens([
+			{ ...base, isBit: false },
+			{
+				...base,
+				isBit: false,
+				lineStyle: 'dashed',
+				lineWidth: 2.5,
+				marker: 'circle',
+				markerSize: 6
+			},
+			{ ...base, isBit: true, marker: 'square' }
+		]);
+		for (const k of ['lineStyle', 'lineWidth', 'marker', 'markerSize'])
+			expect(k in plain).toBe(false);
+		expect(styled).toMatchObject({
+			lineStyle: 'dashed',
+			lineWidth: 2.5,
+			marker: 'circle',
+			markerSize: 6
+		});
+		expect(bit).toMatchObject({ marker: 'square' });
 	});
 
 	it('縦軸の側・範囲を渡す。bit は 0〜1 固定で、範囲・小数桁は無視し、軸の側だけ効く', () => {
@@ -60,6 +108,10 @@ describe('ペンの ID と部品のペン', () => {
 			yMin: -5,
 			yMax: 50,
 			engRange: null,
+			lineStyle: null,
+			lineWidth: null,
+			marker: null,
+			markerSize: null,
 			thresholds: null
 		};
 		const [num, bit, half, plain] = toTrendPens([
@@ -127,6 +179,10 @@ describe('ペンの ID と部品のペン', () => {
 					yMin: null,
 					yMax: null,
 					engRange: { min: 0, max: 100 },
+					lineStyle: null,
+					lineWidth: null,
+					marker: null,
+					markerSize: null,
 					thresholds: null
 				}
 			]);

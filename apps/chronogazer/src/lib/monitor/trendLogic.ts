@@ -336,6 +336,11 @@ export interface TrendPenInfo {
 	yMax: number | null;
 	/** タグの工学値レンジ（`engLo < engHi` で両方有限のときだけ。縦軸の指定の無い側に使う）。 */
 	engRange: { min: number; max: number } | null;
+	/** ペンの属性の線種・線幅・マーカー（`null` = 既定。効くのはトレンドだけ。bit でも効く）。 */
+	lineStyle: PenStyle['lineStyle'];
+	lineWidth: number | null;
+	marker: PenStyle['marker'];
+	markerSize: number | null;
 	thresholds: ThresholdFields | null;
 }
 
@@ -373,6 +378,10 @@ export function trendPenInfos(
 			yMin: pen.yMin ?? null,
 			yMax: pen.yMax ?? null,
 			engRange: tagEngRange(tag),
+			lineStyle: pen.lineStyle ?? null,
+			lineWidth: pen.lineWidth ?? null,
+			marker: pen.marker ?? null,
+			markerSize: pen.markerSize ?? null,
 			thresholds:
 				tag && hasThresholds(tag)
 					? {
