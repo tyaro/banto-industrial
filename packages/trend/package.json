@@ -22,7 +22,7 @@
     "@banto/charts": "github:tyaro/banto#v7.8.0&path:packages/charts"
   },
   "peerDependencies": {
-    "svelte": "^5.57.3"
+    "svelte": "^5.57.2"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.3.1",
