@@ -428,6 +428,8 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 				lineWidth: null,
 				marker: null,
 				markerSize: null,
+				bitStyle: null,
+				bitBandHeight: null,
 				limits: null
 			},
 			{
@@ -445,6 +447,8 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 				lineWidth: null,
 				marker: null,
 				markerSize: null,
+				bitStyle: null,
+				bitBandHeight: null,
 				limits: null
 			},
 			{
@@ -462,6 +466,8 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 				lineWidth: null,
 				marker: null,
 				markerSize: null,
+				bitStyle: null,
+				bitBandHeight: null,
 				limits: null
 			}
 		]);
@@ -513,7 +519,7 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 		expect(text).not.toContain('全ペン共通');
 	});
 
-	it('bit のタグ: isBit、全ペン bit なら説明文の縦軸は 0 と 1、混在は数値の範囲（#551）', () => {
+	it('bit のタグ: isBit、全ペン bit なら説明文の縦軸は False と True、混在は数値の範囲（#551）', () => {
 		const withBit = [
 			...tags,
 			{ id: 3, name: '運転中', unit: '', decimals: 0, dataType: 'bit', ...NONE },
@@ -529,20 +535,37 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 			[1, 1]
 		];
 		expect(describeOf(60, bits, rows)).toBe(
-			'直近 1 分のトレンド。ペン: 運転中、異常。縦軸は 0 と 1 で、表示中の値は 0〜1。'
+			'直近 1 分のトレンド。ペン: 運転中、異常。縦軸は False と True で、表示中の値は False〜True。'
 		);
 		// 値が 1 種類だけのとき。
-		expect(describeOf(60, bits, [[1, 1]])).toContain('表示中の値は 1。');
+		expect(describeOf(60, bits, [[1, 1]])).toContain('表示中の値は True。');
 
 		// 混在: 数値の範囲で言う。
 		const mixed = trendPenInfos(g(2, 3), withBit);
 		expect(isAllBitTrend(mixed)).toBe(false);
 		const text = describeOf(60, mixed, [[5, 1]]);
-		expect(text).toContain('縦軸はペンごとの自動スケール。表示中の値の範囲: 圧力 5、運転中 1。');
-		expect(text).toContain('bit のペン（運転中）は 0 が False、1 が True。');
+		expect(text).toContain('縦軸はペンごとの自動スケール。表示中の値の範囲: 圧力 5、運転中 True。');
+		expect(text).toContain('bit のペン（運転中）は False か True。');
 
 		// ペンが無いときは全 bit ではない。
 		expect(isAllBitTrend([])).toBe(false);
+	});
+
+	it('ペンの bit の表し（bitStyle・bitBandHeight）を写す。無ければ null', () => {
+		const withBit = [
+			{ id: 3, name: '運転中', unit: '', decimals: 0, dataType: 'bit', ...NONE }
+		] as unknown as Parameters<typeof trendPenInfos>[1];
+		const [styled, plain] = trendPenInfos(
+			{
+				pens: [
+					{ tagId: 3, colorSlot: null, bitStyle: 'band', bitBandHeight: 24 },
+					{ tagId: 3, colorSlot: null }
+				]
+			},
+			withBit
+		);
+		expect(styled).toMatchObject({ bitStyle: 'band', bitBandHeight: 24 });
+		expect(plain).toMatchObject({ bitStyle: null, bitBandHeight: null });
 	});
 
 	it('説明文: 表示範囲の外の値は数えない。追従を止めていれば期間を言う。min・max の包絡も読む', () => {

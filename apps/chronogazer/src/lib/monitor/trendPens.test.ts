@@ -27,6 +27,8 @@ describe('ペンの ID と部品のペン', () => {
 				lineWidth: null,
 				marker: null,
 				markerSize: null,
+				bitStyle: null,
+				bitBandHeight: null,
 				limits: null
 			},
 			{
@@ -44,6 +46,8 @@ describe('ペンの ID と部品のペン', () => {
 				lineWidth: null,
 				marker: null,
 				markerSize: null,
+				bitStyle: null,
+				bitBandHeight: null,
 				limits: null
 			}
 		]);
@@ -72,6 +76,8 @@ describe('ペンの ID と部品のペン', () => {
 			lineWidth: null,
 			marker: null,
 			markerSize: null,
+			bitStyle: null,
+			bitBandHeight: null,
 			limits: null
 		};
 		const [plain, styled, bit] = toTrendPens([
@@ -97,6 +103,35 @@ describe('ペンの ID と部品のペン', () => {
 		expect(bit).toMatchObject({ marker: 'square' });
 	});
 
+	it('bit のペンに bit: true と、null でない bitStyle・bitBandHeight を渡す。bit でないペンには渡さない', () => {
+		const base = {
+			tagId: 1,
+			name: 'x',
+			unit: null,
+			decimals: 0,
+			colorSlot: 1,
+			axis: null,
+			yMin: null,
+			yMax: null,
+			engRange: null,
+			lineStyle: null,
+			lineWidth: null,
+			marker: null,
+			markerSize: null,
+			limits: null
+		};
+		const [plainBit, band, notBit] = toTrendPens([
+			{ ...base, isBit: true, bitStyle: null, bitBandHeight: null },
+			{ ...base, isBit: true, bitStyle: 'band', bitBandHeight: 24 },
+			{ ...base, isBit: false, bitStyle: 'band', bitBandHeight: 24 }
+		]);
+		expect(plainBit).toMatchObject({ bit: true });
+		expect('bitStyle' in plainBit).toBe(false);
+		expect('bitBandHeight' in plainBit).toBe(false);
+		expect(band).toMatchObject({ bit: true, bitStyle: 'band', bitBandHeight: 24 });
+		for (const k of ['bit', 'bitStyle', 'bitBandHeight']) expect(k in notBit).toBe(false);
+	});
+
 	it('縦軸の側・範囲を渡す。bit は 0〜1 固定で、範囲・小数桁は無視し、軸の側だけ効く', () => {
 		const base = {
 			tagId: 1,
@@ -112,6 +147,8 @@ describe('ペンの ID と部品のペン', () => {
 			lineWidth: null,
 			marker: null,
 			markerSize: null,
+			bitStyle: null,
+			bitBandHeight: null,
 			limits: null
 		};
 		const [num, bit, half, plain] = toTrendPens([
@@ -183,6 +220,8 @@ describe('ペンの ID と部品のペン', () => {
 					lineWidth: null,
 					marker: null,
 					markerSize: null,
+					bitStyle: null,
+					bitBandHeight: null,
 					limits: null
 				}
 			]);
@@ -228,6 +267,8 @@ describe('ペンの ID と部品のペン', () => {
 				lineWidth: null,
 				marker: null,
 				markerSize: null,
+				bitStyle: null,
+				bitBandHeight: null,
 				limits: null
 			} as const;
 			const [none, some] = toTrendPens([

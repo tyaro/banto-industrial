@@ -29,7 +29,7 @@
  * 10.（#551、2026-10-09 オーナー決定）bit のタグ（Modbus のコイル 00001、開発用 PLC が
  *    トグルする）は、デジタルで `True` / `False`（0 / 1 ではない）。バー・計器は
  *    「レンジ未設定」にならず 0〜1（目盛 `False` / `True`）。トレンドは共通の部品で、bit の
- *    ペンは縦軸 0〜1 の数値（目盛 `0` / `1`。True / False の表示は後のペンの属性で足す）。
+ *    ペンは縦軸 0〜1 で、目盛・カーソルの値・説明文は `False` / `True` で出る（0 / 1 の数値は出さない）。
  *
  * ## ファイル名（実行順）
  *
@@ -683,7 +683,7 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		await expect.poll(segments, { timeout: 20_000 }).toBeGreaterThan(before);
 	});
 
-	test('8. bit のタグ: デジタルは True / False、トレンドは全ペン bit なら縦軸が 0 と 1（#551）', async () => {
+	test('8. bit のタグ: デジタルは True / False、トレンドは全ペン bit なら縦軸の目盛が False と True（#551）', async () => {
 		await page.goto(`/monitor?group=${groupIds[GROUP_BIT]}`);
 		const bitCell = cell(TAG_BIT);
 		const value = bitCell.locator('.value');
@@ -706,24 +706,23 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		await page.goto(`/monitor?group=${groupIds[GROUP_BIT_TREND]}`);
 		const trend = panel().getByRole('region', { name: `${GROUP_BIT_TREND} のトレンド表示` });
 		await expect(trend).toBeVisible({ timeout: 20_000 });
-		// 縦軸の目盛（左の軸の文字）。bit のペンの縦軸は 0〜1 で、値は数値の 0 / 1
-		// （True / False の表示は後の「ペンの属性」で足す）。
+		// 縦軸の目盛（左の軸の文字）。bit のペンの縦軸は 0〜1 で、目盛は False / True で出る。
 		const yTicks = trend.locator('text.bi-trend__tick[text-anchor="end"]');
 		await expect
 			.poll(async () => (await yTicks.allTextContents()).map((t) => t.trim()), {
 				timeout: 30_000
 			})
-			.toEqual(expect.arrayContaining(['0', '1']));
-		// 目盛は 0〜1 の範囲だけ（True / False の文字は出さない）。
+			.toEqual(expect.arrayContaining(['False', 'True']));
+		// 目盛は False / True だけ（0 / 1 の数値は出さない）。
 		for (const text of await yTicks.allTextContents()) {
-			expect(text.trim()).toMatch(/^(0|1|0\.\d+)$/);
+			expect(text.trim()).toMatch(/^(False|True)$/);
 		}
-		await expect(trend.locator('.sr-only').first()).toContainText('縦軸は 0 と 1 で');
+		await expect(trend.locator('.sr-only').first()).toContainText('縦軸は False と True で');
 	});
 
-	test('9. 全ペン bit のトレンド: 見える値が履歴の 0〜1 の区間だけで現在値が bad でも縦軸は 0 と 1（#554 レビュー）', async () => {
+	test('9. 全ペン bit のトレンド: 見える値が履歴の 0〜1 の区間だけで現在値が bad でも縦軸は False と True（#554 レビュー）', async () => {
 		// 履歴は全区間が「0 も 1 もあった」（最小 0・最大 1）、現在値は bad（値なし）に差し替える。
-		// 縦軸は bit のペンの指定（yMin 0・yMax 1）で必ず 0 と 1 を含む。
+		// 縦軸は bit のペンの指定（yMin 0・yMax 1）で必ず False と True を含む。
 		await page.route('**/api/collect/history*', async (route) => {
 			const url = new URL(route.request().url());
 			const fromMs = Number(url.searchParams.get('fromMs'));
@@ -777,14 +776,14 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 				.poll(async () => (await yTicks.allTextContents()).map((t) => t.trim()), {
 					timeout: 30_000
 				})
-				.toEqual(expect.arrayContaining(['0', '1']));
+				.toEqual(expect.arrayContaining(['False', 'True']));
 			// 線は区間ごとの最小 0〜最大 1 の包絡として描かれている（ハイブリッドの過去の部分は
 			// 履歴の区間そのもの。現在値は bad なのでリングバッファは始まらない）。
 			await expect(trend.locator('.bi-trend__line').first()).toHaveAttribute(
 				'd',
 				/^M[\d.]+,[\d.]+L/
 			);
-			// カーソルを置くと凡例に値が出る（共通の部品。区間の上で「0〜1」と出る）。
+			// カーソルを置くと凡例に値が出る（共通の部品。区間の上で「False〜True」と出る）。
 			// 履歴の点がどの横位置に載るかは窓と格子次第なので、プロット面の上を左から右へ動かして
 			// 値の行を探す。
 			const surface = trend.locator('.bi-trend__plot');
@@ -801,7 +800,7 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 					},
 					{ timeout: 30_000 }
 				)
-				.toEqual(expect.arrayContaining([expect.stringMatching(/^0〜1(\s|$)/)]));
+				.toEqual(expect.arrayContaining([expect.stringMatching(/^False〜True(\s|$)/)]));
 		} finally {
 			await page.unroute('**/api/collect/history*');
 			await page.unroute('**/api/collect/values*');

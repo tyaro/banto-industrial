@@ -313,8 +313,12 @@ export interface TrendPenInfo {
 	unit: string | null;
 	/** 小数桁（タグを読めていなければ `null`）。 */
 	decimals: number | null;
-	/** bit のタグ（縦軸は 0〜1、小数桁は指定せず、値は数値の 0 / 1 のまま）。 */
+	/** bit のタグ（縦軸は 0〜1、小数桁は指定しない。凡例・カーソル・要約・縦軸の目盛りは False / True で出す）。 */
 	isBit: boolean;
+	/** bit の表し（`null` = 段差）。帯になるのは bit で `'band'` のペンだけ（部品が判断する）。 */
+	bitStyle: 'step' | 'band' | null;
+	/** 帯の太さ px（`null` = 部品の既定の 16）。 */
+	bitBandHeight: number | null;
 	colorSlot: number;
 	/** ペンの属性の縦軸の側（`null` = 左）。bit でも効く。 */
 	axis: 'left' | 'right' | null;
@@ -370,6 +374,8 @@ export function trendPenInfos(
 			lineWidth: pen.lineWidth ?? null,
 			marker: pen.marker ?? null,
 			markerSize: pen.markerSize ?? null,
+			bitStyle: pen.bitStyle ?? null,
+			bitBandHeight: pen.bitBandHeight ?? null,
 			limits: resolveLimits(pen, tag, isBit)
 		};
 	});
@@ -377,7 +383,7 @@ export function trendPenInfos(
 
 /**
  * グループの全ペンが bit か（説明文の言い方を替える）。bit の縦軸は 0〜1（小数桁は指定しない）で、値は
- * 数値の 0 / 1 のまま出る（False / True の表示は後の「ペンの属性」で足す）。
+ * False / True で出る（部品が書く。表し方は表示グループのペンの属性で段差か帯か選べる）。
  */
 export function isAllBitTrend(pens: readonly Pick<TrendPenInfo, 'isBit'>[]): boolean {
 	return pens.length > 0 && pens.every((pen) => pen.isBit);
@@ -444,6 +450,7 @@ export function trendDescription(input: {
 	const { view, pens } = input;
 	const parts: string[] = [];
 	const penText = pens.map(penLegendLabel).join('、');
+	const bitText = (v: number): string => (v === 0 ? 'False' : v === 1 ? 'True' : String(v));
 	if (view === null || input.following) {
 		const sec = view === null ? input.windowSec : Math.round((view.endMs - view.startMs) / 1000);
 		parts.push(`直近 ${trendWindowLabel(sec)}のトレンド。ペン: ${penText}。`);
@@ -457,22 +464,22 @@ export function trendDescription(input: {
 	if (found.length === 0) {
 		parts.push('表示できる値はまだありません。');
 	} else if (isAllBitTrend(pens)) {
-		// 全ペンが bit: 縦軸は 0 と 1。
-		const lo = String(Math.min(...found.map((e) => e.min)));
-		const hi = String(Math.max(...found.map((e) => e.max)));
-		parts.push(`縦軸は 0 と 1 で、表示中の値は ${lo === hi ? lo : `${lo}〜${hi}`}。`);
+		// 全ペンが bit: 縦軸は False と True。
+		const lo = bitText(Math.min(...found.map((e) => e.min)));
+		const hi = bitText(Math.max(...found.map((e) => e.max)));
+		parts.push(`縦軸は False と True で、表示中の値は ${lo === hi ? lo : `${lo}〜${hi}`}。`);
 	} else {
 		const ranges = pens.map((pen, i) => {
 			const extent = extents[i];
 			if (extent === null) return `${pen.name} 値なし`;
-			const lo = formatNumber(extent.min, pen.decimals);
-			const hi = formatNumber(extent.max, pen.decimals);
+			const lo = pen.isBit ? bitText(extent.min) : formatNumber(extent.min, pen.decimals);
+			const hi = pen.isBit ? bitText(extent.max) : formatNumber(extent.max, pen.decimals);
 			return `${pen.name} ${lo === hi ? lo : `${lo}〜${hi}`}`;
 		});
 		parts.push(`縦軸はペンごとの自動スケール。表示中の値の範囲: ${ranges.join('、')}。`);
 		const bits = pens.filter((p) => p.isBit);
 		if (bits.length > 0) {
-			parts.push(`bit のペン（${bits.map((p) => p.name).join('、')}）は 0 が False、1 が True。`);
+			parts.push(`bit のペン（${bits.map((p) => p.name).join('、')}）は False か True。`);
 		}
 	}
 	return parts.join('');
