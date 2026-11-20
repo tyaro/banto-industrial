@@ -28,6 +28,20 @@ import {
 } from '#lib/banto/hubRegistration.js';
 import { REVISION_CONFLICT_FIELD } from '#lib/banto/revisionConflict.js';
 import { penColorVar } from '@banto-industrial/trend';
+import {
+	MAX_PEN_LABEL_CHARS,
+	MAX_PEN_UNIT_CHARS,
+	PEN_NUMBER_FIELDS,
+	THRESHOLDS_UNREADABLE,
+	axisText,
+	limitPlaceholder,
+	parseAxisText,
+	penStyleProblems,
+	styleOf,
+	type PenNumberField,
+	type PenNumberTexts,
+	type TagThresholds
+} from '#lib/components/penStyleEditor.js';
 
 /** グループ数の上限（trend-design.md §6。旧 16 → 36）。画面は作成ボタンを止めるだけで、拒否はサーバー。 */
 export const MAX_DISPLAY_GROUPS = 36;
@@ -84,44 +98,21 @@ export interface PenDraft extends PenStyle {
 	 * 触っていない = 欄の値をそのまま使う）。"-" や "1e" のような途中の文字を黙って `null` にしない
 	 * ため、数として読めない文字は `draftProblems` が保存を止める。
 	 */
-	texts?: Partial<Record<PenNumberField, string>>;
+	texts?: PenNumberTexts;
 }
 
-/** 入力の文字で持つペンの数の欄。 */
-export type PenNumberField = 'yMin' | 'yMax' | 'limitHh' | 'limitH' | 'limitL' | 'limitLl';
-const PEN_NUMBER_FIELDS: readonly PenNumberField[] = [
-	'yMin',
-	'yMax',
-	'limitHh',
-	'limitH',
-	'limitL',
-	'limitLl'
-];
-
-/** 凡例の名前の上限（code point 数。Rust の `MAX_PEN_LABEL_CHARS` と同じ）。 */
-export const MAX_PEN_LABEL_CHARS = 64;
-/** 単位の上限（code point 数。Rust の `MAX_PEN_UNIT_CHARS` と同じ）。 */
-export const MAX_PEN_UNIT_CHARS = 16;
-
-/** 縦軸の入力の文字を数にする。空 = `null`（既定）、数として読めない = `'invalid'`。 */
-export function parseAxisText(text: string): number | null | 'invalid' {
-	const t = text.trim();
-	if (t === '') return null;
-	const n = Number(t);
-	return Number.isFinite(n) ? n : 'invalid';
-}
-
-/** 数の欄の入力の文字（無ければ値から作る）。 */
-export function axisText(pen: PenDraft, which: PenNumberField): string {
-	const text = pen.texts?.[which];
-	if (text !== undefined) return text;
-	const value = pen[which];
-	return value === null ? '' : String(value);
-}
-
-function codePoints(text: string): number {
-	return Array.from(text).length;
-}
+// ペンの属性の判断（数の欄の入力の文字・検証・placeholder）は、自由トレンドの画面と共通の
+// `#lib/components/penStyleEditor.ts`（#1207・#1231 PR 8b2b）。ここからも同じ名前で使えるようにする。
+export {
+	MAX_PEN_LABEL_CHARS,
+	MAX_PEN_UNIT_CHARS,
+	THRESHOLDS_UNREADABLE,
+	axisText,
+	limitPlaceholder,
+	parseAxisText,
+	type PenNumberField,
+	type TagThresholds
+};
 
 export interface GroupDraft {
 	name: string;
@@ -165,39 +156,6 @@ export function penKey(pen: Pick<PenDraft, 'tagId' | 'hubTag'>): string | null {
 	if (pen.tagId !== null) return `tag:${pen.tagId}`;
 	if (pen.hubTag !== null) return `hub:${pen.hubTag.externalName}`;
 	return null;
-}
-
-/** ペンの属性だけを取り出す（保存の本文・未保存の判定・往復で同じ形にする）。 */
-function styleOf(pen: PenStyle & Pick<PenDraft, 'texts'>): PenStyle {
-	const axisOf = (which: PenNumberField): number | null => {
-		const text = pen.texts?.[which];
-		if (text === undefined) return pen[which] ?? null;
-		const parsed = parseAxisText(text);
-		return parsed === 'invalid' ? null : parsed;
-	};
-	const trimmed = (text: string | null | undefined): string | null => {
-		const t = (text ?? '').trim();
-		return t === '' ? null : t;
-	};
-	return {
-		label: trimmed(pen.label),
-		unit: trimmed(pen.unit),
-		decimals: pen.decimals ?? null,
-		lineStyle: pen.lineStyle ?? null,
-		lineWidth: pen.lineWidth ?? null,
-		marker: pen.marker ?? null,
-		markerSize: pen.markerSize ?? null,
-		axis: pen.axis ?? null,
-		yMin: axisOf('yMin'),
-		yMax: axisOf('yMax'),
-		limitLines: pen.limitLines ?? null,
-		limitHh: axisOf('limitHh'),
-		limitH: axisOf('limitH'),
-		limitL: axisOf('limitL'),
-		limitLl: axisOf('limitLl'),
-		bitStyle: pen.bitStyle ?? null,
-		bitBandHeight: pen.bitBandHeight ?? null
-	};
 }
 
 export function draftFromGroup(group: DisplayGroup): GroupDraft {
@@ -277,46 +235,7 @@ export function draftProblems(draft: GroupDraft): string[] {
 		if (pen.tagId === null && pen.hubTag === null) {
 			problems.push(`ペン ${index + 1} のタグを選んでください`);
 		}
-		const n = index + 1;
-		const style = styleOf(pen);
-		if (style.label !== null && codePoints(style.label) > MAX_PEN_LABEL_CHARS) {
-			problems.push(`ペン ${n} の凡例の名前は ${MAX_PEN_LABEL_CHARS} 文字までです`);
-		}
-		if (style.unit !== null && codePoints(style.unit) > MAX_PEN_UNIT_CHARS) {
-			problems.push(`ペン ${n} の単位は ${MAX_PEN_UNIT_CHARS} 文字までです`);
-		}
-		const read = (field: PenNumberField): number | null | 'invalid' => {
-			const text = pen.texts?.[field];
-			return text === undefined ? style[field] : parseAxisText(text);
-		};
-		const lo = read('yMin');
-		const hi = read('yMax');
-		if (lo === 'invalid') problems.push(`ペン ${n} の縦軸の最小が数ではありません`);
-		if (hi === 'invalid') problems.push(`ペン ${n} の縦軸の最大が数ではありません`);
-		if (typeof lo === 'number' && typeof hi === 'number' && lo >= hi) {
-			problems.push(`ペン ${n} の縦軸は、最小を最大より小さくしてください`);
-		}
-		// 管理線の上書き（設定したものだけ。LL <= L <= H <= HH。サーバーと同じ）。
-		const limitFields = [
-			['limitLl', 'LL'],
-			['limitL', 'L'],
-			['limitH', 'H'],
-			['limitHh', 'HH']
-		] as const;
-		const set: { label: string; value: number }[] = [];
-		for (const [field, label] of limitFields) {
-			const value = read(field);
-			if (value === 'invalid') problems.push(`ペン ${n} の管理線の ${label} が数ではありません`);
-			else if (value !== null) set.push({ label, value });
-		}
-		for (let i = 1; i < set.length; i += 1) {
-			if (set[i - 1].value > set[i].value) {
-				problems.push(
-					`ペン ${n} の管理線は、LL ≦ L ≦ H ≦ HH の順にしてください（${set[i - 1].label} が ${set[i].label} より大きい）`
-				);
-				break;
-			}
-		}
+		problems.push(...penStyleProblems(pen, index + 1));
 	});
 	if (hasHubPens(draft)) {
 		const blocker = registrationBlocker(
@@ -423,17 +342,6 @@ export function tagsUsedByOtherPens(draft: GroupDraft, index: number | null = nu
 }
 
 /**
- * タグのしきい値（#532: 記録計の側のタグごとの設定。`/api/tag-thresholds` が返す形の
- * 一部。タグ定義の属性ではない）。
- */
-export interface TagThresholds {
-	thresholdLl?: number | null;
-	thresholdL?: number | null;
-	thresholdH?: number | null;
-	thresholdHh?: number | null;
-}
-
-/**
  * しきい値の読み取り専用の表示（LL / L / H / HH の順）。1 つも無ければ
  * 「しきい値なし」。編集は「記録」ページの「しきい値（記録計の設定）」で行う
  * （保存は記録計の側の設定の経路。§3.7.6）。
@@ -451,9 +359,6 @@ export function thresholdSummary(tag: TagThresholds | undefined): string {
 		.map(([label, value]) => `${label} ${value === null || value === undefined ? '—' : value}`)
 		.join(' / ');
 }
-
-/** しきい値を読めなかったときのペンの表示。 */
-export const THRESHOLDS_UNREADABLE = '読み込めませんでした';
 
 /**
  * ペン 1 本のしきい値の表示（純関数、#532）。
@@ -473,28 +378,6 @@ export function penThresholdText(
 	if (tagId === null || !tagKnown) return '—';
 	if (thresholds === null) return thresholdsFailed ? THRESHOLDS_UNREADABLE : '—';
 	return thresholdSummary(thresholds.get(tagId) ?? {});
-}
-
-/**
- * 管理線の入力の placeholder（純関数）。タグ側のしきい値を目安に出す。
- *
- * - タグがまだ無い（未登録の Hub のタグ）→ 「タグの設定なし」
- * - しきい値を読めなかった → 読めなかったことを出す（設定なしに潰さない）
- * - まだ読んでいない → 空
- * - 値があれば「タグ: <値>」、無ければ「タグの設定なし」
- */
-export function limitPlaceholder(
-	tagId: number | null,
-	thresholds: ReadonlyMap<number, TagThresholds> | null,
-	thresholdsFailed: boolean,
-	key: 'thresholdHh' | 'thresholdH' | 'thresholdL' | 'thresholdLl'
-): string {
-	if (tagId === null) return 'タグの設定なし';
-	if (thresholds === null) {
-		return thresholdsFailed ? `タグのしきい値: ${THRESHOLDS_UNREADABLE}` : '';
-	}
-	const value = thresholds.get(tagId)?.[key];
-	return typeof value === 'number' ? `タグ: ${value}` : 'タグの設定なし';
 }
 
 /**

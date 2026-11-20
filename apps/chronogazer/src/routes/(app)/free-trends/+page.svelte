@@ -16,8 +16,15 @@
 	 * 保存（上書き・別の自由トレンドとして保存・版の食い違い）。
 	 * - 下書きは sessionStorage に対象ごと（既存は ID、新規は `new`）。タブを閉じるまで残るので、
 	 *   画面を離れるときの確認は付けない。下書きがあれば、チャートは下書きのペンで描く。
-	 * - ペンの属性の編集欄は 8b2b。保存済みの属性は下書きと保存でそのまま保つ。
 	 * - ペンは登録済みのタグだけ（§9 Q9）。作れるのはアカウントのログインか localDesktop。
+	 *
+	 * 8b2b（#1207・#1231）: ペンの属性の編集欄。ペンの行の「表示の設定」で、表示グループのページと
+	 * 同じ部品（`PenStyleEditor`）を出す。変更は下書きに入り、チャートは下書きのペンで描く。
+	 * - 数の欄（縦軸の最小・最大、管理線の 4 つ）の入力の文字は、この画面の状態にタグ ID をキーに
+	 *   持つ（下書きには数として読めた値だけが入る）。保存・下書きを捨てる・選択の変化・ペンを
+	 *   外したときに捨てる。
+	 * - 数として読めない文字・縦軸の最小 >= 最大・管理線の順序・名前と単位の長さは、表示グループと
+	 *   同じ `penStyleProblems` で保存を止め、そのペンの欄に出す。
 	 */
 	import { onDestroy, onMount, untrack } from 'svelte';
 	import { isProviderError } from '@banto/admin-core';
@@ -42,6 +49,9 @@
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { toastStore } from '#lib/toast.svelte.js';
 	import PenTagPicker from '#lib/components/PenTagPicker.svelte';
+	import PenStyleEditor from '#lib/components/PenStyleEditor.svelte';
+	import type { PenNumberField, PenNumberTexts } from '#lib/components/penStyleEditor.js';
+	import type { PenStyle } from '#lib/banto/displayGroupsAdmin.js';
 	import type { PickerRow } from '#lib/components/penTagPicker.js';
 	import { ValuesPoller } from '#lib/monitor/valuesPoller.svelte.js';
 	import {
@@ -68,6 +78,7 @@
 		afterFreeTrendSave,
 		afterFreeTrendSaveFailure,
 		draftOwner,
+		applyPenNumberText,
 		canCreateFreeTrend,
 		classifySaveFailure,
 		clearDraft,
@@ -79,6 +90,7 @@
 		emptyFreeTrendFieldErrors,
 		loadDraft,
 		movePenAt,
+		penStyleRowProblems,
 		pruneDrafts,
 		remainingPens,
 		removePenAt,
@@ -87,7 +99,9 @@
 		sessionDraftStorage,
 		shouldDiscardSavedDraft,
 		setPenColor,
+		setPenStyle,
 		usedTagKeys,
+		withoutPenTexts,
 		type DraftTarget,
 		type FreeTrendDraft
 	} from '#lib/monitor/freeTrendDraft.js';
@@ -215,6 +229,19 @@
 	let conflict = $state(false);
 	/** `conflict` を立てた対象（「保存されたものを読み込む」が捨てる下書きの持ち主）。 */
 	let conflictFor: DraftTarget | null = null;
+	/** 属性の編集欄を開いているペン（タグ ID。自由トレンドでは同じタグを 2 本にしない）。 */
+	let styleTagId = $state<number | null>(null);
+	/**
+	 * 数の欄（縦軸の最小・最大、管理線の 4 つ）の入力の文字（タグ ID がキー）。sessionStorage の
+	 * 下書きには入れない（数として読めた値だけが下書きに入る）。
+	 */
+	let penTexts = $state<Record<number, PenNumberTexts>>({});
+
+	/** 属性の編集欄の状態を捨てる（保存・下書きを捨てる・選択の変化）。 */
+	function resetPenStyleState(): void {
+		styleTagId = null;
+		penTexts = {};
+	}
 
 	const canEditSelected = $derived(selected?.canEdit === true);
 	/** 下書きを始められるのは、作れる人か、その自由トレンドを変えられる人。 */
@@ -254,6 +281,7 @@
 			picking = false;
 			saveErrors = emptyFreeTrendFieldErrors();
 			conflict = false;
+			resetPenStyleState();
 		});
 	});
 
@@ -290,6 +318,7 @@
 		}
 		saveErrors = emptyFreeTrendFieldErrors();
 		conflict = false;
+		resetPenStyleState();
 	}
 
 	function discardSelectedDraft(): void {
@@ -298,6 +327,7 @@
 		clearDraft(sessionDraftStorage(), owner, selected.id);
 		saveErrors = emptyFreeTrendFieldErrors();
 		conflict = false;
+		resetPenStyleState();
 	}
 
 	function startCreate(): void {
@@ -308,6 +338,7 @@
 		picking = false;
 		saveErrors = emptyFreeTrendFieldErrors();
 		conflict = false;
+		resetPenStyleState();
 		void ensureConnections();
 	}
 
@@ -319,6 +350,7 @@
 		picking = false;
 		saveErrors = emptyFreeTrendFieldErrors();
 		conflict = false;
+		resetPenStyleState();
 		void ensureConnections();
 	}
 
@@ -374,6 +406,36 @@
 		applyEdit(setPenColor(working, index, value === '' ? null : Number(value)));
 	}
 
+	/** ペンを外す。そのペンの入力の文字も捨て、属性の編集欄を開いていれば閉じる。 */
+	function onRemovePen(index: number): void {
+		if (!working) return;
+		const tagId = working.pens[index]?.tagId;
+		applyEdit(removePenAt(working, index));
+		if (tagId === undefined) return;
+		penTexts = withoutPenTexts(penTexts, tagId);
+		if (styleTagId === tagId) styleTagId = null;
+	}
+
+	function togglePenStyle(tagId: number): void {
+		styleTagId = styleTagId === tagId ? null : tagId;
+	}
+
+	function onPenStyleChange(tagId: number, patch: Partial<PenStyle>): void {
+		if (working) applyEdit(setPenStyle(working, tagId, patch));
+	}
+
+	function onPenStyleText(tagId: number, field: PenNumberField, text: string): void {
+		penTexts = { ...penTexts, [tagId]: { ...penTexts[tagId], [field]: text } };
+		if (working) applyEdit(applyPenNumberText(working, tagId, field, text));
+	}
+
+	/** 属性の編集欄を開いているペンの位置（無ければ -1）。 */
+	const styleIndex = $derived(
+		working === null || styleTagId === null
+			? -1
+			: working.pens.findIndex((pen) => pen.tagId === styleTagId)
+	);
+
 	// --- 保存 -------------------------------------------------------------------
 
 	function errorMessage(err: unknown): string {
@@ -395,6 +457,15 @@
 		if (saving || draft === null || startedFor === null) return;
 		if (mode === 'update' && !(startedFor !== 'new' && canEditSelected)) return;
 		if (mode === 'create' && (!canCreate || createBlock !== null)) return;
+		// ペンの属性の誤り（表示グループと同じ検証）は送らずに、そのペンの欄に出す。
+		const penProblems = penStyleRowProblems(draft.pens, penTexts);
+		const firstProblem = draft.pens.findIndex((_, index) => penProblems[index] !== undefined);
+		if (firstProblem >= 0) {
+			saveErrors = { ...emptyFreeTrendFieldErrors(), penRows: penProblems };
+			conflict = false;
+			styleTagId = draft.pens[firstProblem].tagId;
+			return;
+		}
 		saving = true;
 		saveErrors = emptyFreeTrendFieldErrors();
 		conflict = false;
@@ -449,6 +520,8 @@
 					: [...list, saved];
 			}
 			if (next.closeEditor) {
+				// 同じ編集の文脈のときだけ。属性の編集欄の状態も捨てる。
+				resetPenStyleState();
 				closePane();
 				if (next.navigate && parseFreeTrendParam(page.url.searchParams.get('id')) !== saved.id) {
 					void goto(freeTrendHref(saved.id));
@@ -509,6 +582,8 @@
 	// --- タグ情報（単位・小数桁・しきい値・収集周期） ---------------------------
 
 	let tagMeta = $state(INITIAL_TAG_META);
+	/** タグ情報としきい値を 1 度でも読んだか（しきい値の「まだ読んでいない」を分ける）。 */
+	let tagMetaLoaded = $state(false);
 	const tags = $derived(tagsForDisplay(tagMeta));
 	const collectionGroups = $derived(tagMeta.collectionGroups);
 	const tagMetaNoticeLines = $derived(tagMetaNotices(tagMeta));
@@ -516,7 +591,15 @@
 	async function loadTagMeta(): Promise<void> {
 		const { meta, thresholds } = await loadTagMetaResults();
 		tagMeta = applyTagMetaLoad(tagMeta, meta, thresholds);
+		tagMetaLoaded = true;
 	}
+
+	/** 管理線の placeholder に使うしきい値（まだ読んでいない・読めなかった = `null`）。 */
+	const thresholdsByTag = $derived(
+		!tagMetaLoaded || tagMeta.thresholdsError !== null
+			? null
+			: new Map(tagMeta.thresholds.map((row) => [row.tagId, row]))
+	);
 
 	async function reload(): Promise<void> {
 		await Promise.all([reloadList(), loadTagMeta()]);
@@ -1027,18 +1110,48 @@
 												<button
 													type="button"
 													class="secondary"
+													data-testid="free-trend-pen-style"
+													aria-pressed={styleTagId === pen.tagId}
+													onclick={() => togglePenStyle(pen.tagId)}
+													aria-label={`${tagLabel(pen.tagId)} の表示の設定`}
+												>
+													表示の設定
+												</button>
+												<button
+													type="button"
+													class="secondary"
 													data-testid="free-trend-pen-remove"
-													onclick={() => applyEdit(removePenAt(draft, index))}
+													onclick={() => onRemovePen(index)}
 													aria-label={`${tagLabel(pen.tagId)} を外す`}
 												>
 													外す
 												</button>
-												{#each saveErrors.penRows[index] ?? [] as message (message)}
-													<p class="field-error row-error" role="alert">{message}</p>
-												{/each}
+												{#if styleTagId !== pen.tagId}
+													{#each saveErrors.penRows[index] ?? [] as message (message)}
+														<p class="field-error row-error" role="alert">{message}</p>
+													{/each}
+												{/if}
 											</li>
 										{/each}
 									</ol>
+									{#if styleIndex >= 0}
+										{@const stylePen = draft.pens[styleIndex]}
+										<div class="pen-style" data-testid="free-trend-pen-style-pane">
+											<PenStyleEditor
+												index={styleIndex}
+												pen={stylePen}
+												texts={penTexts[stylePen.tagId]}
+												tag={tagMeta.tags.find((tag) => tag.id === stylePen.tagId) ?? null}
+												thresholdTagId={stylePen.tagId}
+												thresholds={thresholdsByTag}
+												thresholdsFailed={tagMeta.thresholdsError !== null}
+												disabled={saving}
+												errors={saveErrors.penRows[styleIndex] ?? []}
+												onchange={(patch) => onPenStyleChange(stylePen.tagId, patch)}
+												ontext={(field, text) => onPenStyleText(stylePen.tagId, field, text)}
+											/>
+										</div>
+									{/if}
 								{/if}
 
 								<div class="actions">
@@ -1288,6 +1401,14 @@
 
 	.row-error {
 		flex: 1 0 100%;
+	}
+
+	.pen-style {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+		padding: 0.5rem 0 0.25rem;
+		border-top: 1px solid var(--banto-border);
 	}
 
 	.actions {

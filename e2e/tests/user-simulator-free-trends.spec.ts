@@ -10,6 +10,8 @@
  * 5. （8b2a）UI で新しく作る（名前・ペン 2 本）→ 保存 → 一覧に出て `?id=` が付く。
  * 6. （8b2a）既存のペンを 1 本外す → 再読み込みしても下書きが残る → 保存で反映され下書きは消える。
  * 7. （8b2a）REST で先に更新してから UI で保存 → 版の食い違いの文言と「保存されたものを読み込む」。
+ * 8. （8b2b）ペンの「表示の設定」で線種・管理線（有効・H の上書き）を変えて保存 → REST で値が入る。
+ *    縦軸の最小に数でない文字を入れると、保存は送られずに止まり、欄に誤りが出る。
  *
  * ## ファイル名（実行順）
  *
@@ -43,6 +45,7 @@ const FT_ONE = `${FREE_TREND_PREFIX}1-${RUN_ID}`;
 const FT_TWO = `${FREE_TREND_PREFIX}2-${RUN_ID}`;
 const FT_NEW = `${FREE_TREND_PREFIX}新規-${RUN_ID}`;
 const FT_EDIT = `${FREE_TREND_PREFIX}編集-${RUN_ID}`;
+const FT_STYLE = `${FREE_TREND_PREFIX}属性-${RUN_ID}`;
 
 interface NamedRow {
 	id: number;
@@ -404,5 +407,74 @@ test.describe.serial('chronogazer 自由トレンドの画面（#1207・#1231 PR
 		await expect(page.getByTestId('free-trend-conflict')).toHaveCount(0);
 		await expect(page.getByTestId('free-trend-name')).toHaveValue(`${FT_EDIT}-REST`);
 		await expect(page.getByTestId('free-trend-draft-badge')).toHaveCount(0);
+	});
+
+	test('8. ペンの表示の設定（線種・管理線）を変えて保存できる。数でない縦軸は保存を止める', async () => {
+		const seeded = await postJson<FreeTrendRow>(page.request, headers, '/api/free-trends', {
+			name: FT_STYLE,
+			timeWindowSec: 600,
+			pens: [{ tagId: tagIds[TAG_RAMP], colorSlot: null }]
+		});
+		trends[FT_STYLE] = seeded;
+
+		await page.goto(`/free-trends?id=${seeded.id}`);
+		await page.getByTestId('free-trend-edit').click();
+		await page.getByTestId('free-trend-pen-style').first().click();
+		const pane = page.getByTestId('free-trend-pen-style-pane');
+		await expect(pane.getByTestId('pen-trend-style')).toBeVisible();
+		const field = (name: string) =>
+			pane
+				.locator('label')
+				.filter({ has: page.locator('span', { hasText: new RegExp(`^ペン 1 の${name}$`) }) });
+
+		await field('線種').locator('select').selectOption('dashed');
+		await pane.getByLabel('ペン 1 の管理線を引く').check();
+		await field('管理線の H').locator('input').fill('42');
+		// 変更は下書きに入る。
+		await expect(page.getByTestId('free-trend-draft-badge')).toBeVisible();
+
+		// 数でない縦軸の最小は、送らずに止めて欄に出す。
+		let sent = false;
+		const onRequest = (req: { url(): string; method(): string }) => {
+			if (req.url().endsWith(`/api/free-trends/${seeded.id}`) && req.method() === 'PUT') {
+				sent = true;
+			}
+		};
+		page.on('request', onRequest);
+		await field('縦軸の最小').locator('input').fill('abc');
+		await page.getByTestId('free-trend-save').click();
+		await expect(pane.locator('.field-error')).toHaveText('ペン 1 の縦軸の最小が数ではありません');
+		page.off('request', onRequest);
+		expect(sent).toBe(false);
+
+		await field('縦軸の最小').locator('input').fill('');
+		const updated = page.waitForResponse(
+			(res) =>
+				res.url().endsWith(`/api/free-trends/${seeded.id}`) && res.request().method() === 'PUT'
+		);
+		await page.getByTestId('free-trend-save').click();
+		expect((await updated).status()).toBe(200);
+		await expect(page.getByTestId('free-trend-draft-badge')).toHaveCount(0);
+
+		const rows = await getList<
+			FreeTrendRow & {
+				pens: {
+					tagId: number;
+					lineStyle: string | null;
+					limitLines: boolean | null;
+					limitH: number | null;
+					yMin: number | null;
+				}[];
+			}
+		>(page.request, headers, '/api/free-trends');
+		const saved = rows.find((row) => row.id === seeded.id);
+		expect(saved?.pens).toHaveLength(1);
+		expect(saved?.pens[0]).toMatchObject({
+			tagId: tagIds[TAG_RAMP],
+			lineStyle: 'dashed',
+			limitLines: true,
+			limitH: 42,
+			yMin: null
+		});
 	});
 });
