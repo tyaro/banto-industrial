@@ -288,10 +288,11 @@ async fn a_config_key_calls_every_tool_and_changes_are_audited_as_mcp() {
     ok!(
         "update_display_group",
         json!({
-            "id": dg_id, "name": "L1b", "kind": "digital", "attributes": {}, "pens": []
+            "id": dg_id, "name": "L1b", "bundle": "B2", "kind": "digital", "attributes": {}, "pens": []
         })
     );
     let got = ok!("get_display_group", json!({ "id": dg_id }));
+    assert_eq!(got["displayGroup"]["bundle"], "B2");
     assert_eq!(got["displayGroup"]["kind"], "digital");
     let reordered = ok!("reorder_display_groups", json!({ "ids": [dg2_id, dg_id] }));
     assert_eq!(reordered["displayGroups"][0]["id"], dg2_id);
@@ -448,7 +449,7 @@ async fn updates_require_every_field_and_a_partial_update_changes_nothing() {
         .call_ok(
             &key,
             "create_display_group",
-            json!({ "name": "L1", "kind": "trend", "pens": [{ "tagId": tag_id }] }),
+            json!({ "name": "L1", "bundle": "B1", "kind": "trend", "pens": [{ "tagId": tag_id }] }),
         )
         .await;
     let dg_id = dg["created"]["id"].as_i64().unwrap();
@@ -504,8 +505,9 @@ async fn updates_require_every_field_and_a_partial_update_changes_nothing() {
         ),
         (
             "update_display_group",
-            json!({ "id": dg_id, "name": "L1", "kind": "trend", "attributes": {}, "pens": [] }),
-            &["id", "name", "kind", "attributes", "pens"],
+            json!({ "id": dg_id, "name": "L1", "bundle": "B1", "kind": "trend", "attributes": {},
+                    "pens": [] }),
+            &["id", "name", "bundle", "kind", "attributes", "pens"],
         ),
         (
             "set_threshold",
@@ -546,6 +548,7 @@ async fn updates_require_every_field_and_a_partial_update_changes_nothing() {
         .call_ok(&key, "get_display_group", json!({ "id": dg_id }))
         .await;
     assert_eq!(got["displayGroup"]["pens"].as_array().unwrap().len(), 1);
+    assert_eq!(got["displayGroup"]["bundle"], "B1");
 
     // 全項目があれば通る（`expectedRevision` は無くてよい）。
     for (tool, args, _) in &full {
@@ -959,7 +962,7 @@ impl ValidArgs {
             }),
             "create_display_group" => json!({ "name": "new-dg", "kind": "gauge" }),
             "update_display_group" => json!({
-                "id": self.dg_id, "name": "dg-renamed", "kind": "digital",
+                "id": self.dg_id, "name": "dg-renamed", "bundle": null, "kind": "digital",
                 "attributes": {}, "pens": []
             }),
             "reorder_display_groups" => json!({ "ids": [self.dg_id] }),

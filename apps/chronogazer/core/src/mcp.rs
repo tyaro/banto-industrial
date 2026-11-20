@@ -229,7 +229,8 @@ const UPDATE_TAG_FIELDS: [&str; 12] = [
     "decimals",
     "enabled",
 ];
-const UPDATE_DISPLAY_GROUP_FIELDS: [&str; 5] = ["id", "name", "kind", "attributes", "pens"];
+const UPDATE_DISPLAY_GROUP_FIELDS: [&str; 6] =
+    ["id", "name", "bundle", "kind", "attributes", "pens"];
 const SET_THRESHOLD_FIELDS: [&str; 5] = [
     "tagId",
     "thresholdLl",
@@ -365,6 +366,7 @@ fn display_group_schema(update: bool) -> Value {
         "type": "object",
         "properties": {
             "name": { "type": "string", "description": "表示グループの名前。" },
+            "bundle": { "type": ["string", "null"], "description": "束の名前（任意、50 文字以内）。同じ名前のグループが 1 つの束になり、監視画面で束 → グループの順に切り替える。null・空は束なし。" },
             "kind": {
                 "type": "string",
                 "enum": ["trend", "digital", "bar", "gauge"],

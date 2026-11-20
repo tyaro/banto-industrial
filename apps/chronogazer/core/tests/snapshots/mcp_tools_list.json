@@ -542,6 +542,13 @@
             "description": "種別ごとの属性（trend の timeWindowSec など）。",
             "type": "object"
           },
+          "bundle": {
+            "description": "束の名前（任意、50 文字以内）。同じ名前のグループが 1 つの束になり、監視画面で束 → グループの順に切り替える。null・空は束なし。",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "hubTagGroup": {
             "additionalProperties": false,
             "description": "未登録の hubTag を登録する先。Hub 接続の既存の収集グループ（collectionGroupId）か新しいグループ（newGroup）のどちらか 1 つ。未登録の hubTag が無ければ使わない。",
@@ -667,6 +674,13 @@
             "description": "種別ごとの属性（trend の timeWindowSec など）。",
             "type": "object"
           },
+          "bundle": {
+            "description": "束の名前（任意、50 文字以内）。同じ名前のグループが 1 つの束になり、監視画面で束 → グループの順に切り替える。null・空は束なし。",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "expectedRevision": {
             "description": "楽観ロック: get_display_group で読んだ revision。省略すると版を確かめない（これだけ省略できる）。",
             "type": "integer"
@@ -782,6 +796,7 @@
         "required": [
           "id",
           "name",
+          "bundle",
           "kind",
           "attributes",
           "pens"
