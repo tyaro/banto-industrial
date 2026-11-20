@@ -8,7 +8,9 @@ import {
 	resolveLineStyle,
 	resolveLineWidth,
 	resolveMarkerKind,
-	resolveMarkerSize
+	resolveMarkerSize,
+	swatchDashArray,
+	swatchWidth
 } from './style';
 
 const x = (v: number) => v;
@@ -49,7 +51,47 @@ describe('dashArray', () => {
 	});
 });
 
+describe('swatchDashArray', () => {
+	const SWATCH_LINE = 30; // 見本の線分（幅 32 − 両端 1px）
+	const len = (d: string, w: number) => d.split(' ').reduce((a, v) => a + Number(v), 0) + w; // 丸い端で伸びる分
+	it('実線・線なしは null', () => {
+		expect(swatchDashArray('solid', 2)).toBeNull();
+		expect(swatchDashArray('none', 2)).toBeNull();
+	});
+	it('線幅 1〜4 の各線種で 1 巡が見本の線分に収まる', () => {
+		for (const style of ['dashed', 'dashDot', 'dashDotDot']) {
+			for (const lw of [1, 2, 3, 4]) {
+				const d = swatchDashArray(style, lw) as string;
+				expect(len(d, swatchWidth(lw))).toBeLessThanOrEqual(SWATCH_LINE);
+			}
+		}
+	});
+	it('一点鎖線と二点鎖線は違うパターン', () => {
+		for (const lw of [1, 2, 3, 4]) {
+			expect(swatchDashArray('dashDot', lw)).not.toBe(swatchDashArray('dashDotDot', lw));
+		}
+	});
+});
+
 describe('markerPoints', () => {
+	const plot = { width: 1000, height: 100 };
+	const sx = (v: number) => v / 100; // 100 秒 → 1000px ではなく 1 ms = 0.01px にするための換算
+	const sy = (v: number) => 100 - v;
+	it('描画域の外の点は間引きに数えず、すぐ後の見える点を残す', () => {
+		// 区間 500 ms = 5px 幅。値 200（外）→ 50（内）。x は 2.5 と 7.5
+		const bins = [bin(0, 200), bin(500, 50)];
+		const p = markerPoints(bins, 500, sx, sy, undefined, 4, plot);
+		expect(p).toEqual([{ x: 7.5, y: 50 }]);
+	});
+	it('範囲を渡さなければ今までと同じ（外の点が先に印を付ける）', () => {
+		const bins = [bin(0, 200), bin(500, 50)];
+		expect(markerPoints(bins, 500, sx, sy, undefined, 4)).toEqual([{ x: 2.5, y: -100 }]);
+	});
+	it('min と max の片方だけ見えるなら見える方を残す', () => {
+		const bins = [bin(0, 50, 200)];
+		const p = markerPoints(bins, 500, sx, sy, undefined, 4, plot);
+		expect(p).toEqual([{ x: 2.5, y: 50 }]);
+	});
 	it('値が 1 つなら 1 点、離れた min/max は 2 点、近ければ中点 1 点', () => {
 		const bins = [bin(0, 10), bin(100, 10, 30), bin(200, 10, 12)];
 		const p = markerPoints(bins, 100, x, y, undefined, 4);

@@ -75,6 +75,8 @@ export {
 	resolveMarkerKind,
 	resolveMarkerSize,
 	dashArray,
+	swatchDashArray,
+	swatchWidth,
 	markerPoints,
 	markerPath,
 	type MarkerPoint

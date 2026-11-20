@@ -147,7 +147,8 @@
 						xScale,
 						linearScale(domains[i], [plotHeight, 0]),
 						{ startMs: eff.startMs, endMs: eff.endMs },
-						size
+						size,
+						{ width: plotWidth, height: plotHeight }
 					);
 					return markerPath(pts, kind, size);
 				})

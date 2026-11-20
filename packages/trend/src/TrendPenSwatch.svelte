@@ -1,14 +1,14 @@
 <!--
   ペンの見本（凡例・表示グループのページ用）。線種・線幅・マーカーが分かる小さな SVG
-  （幅 24px、線 + 中央のマーカー）。計算は `core/style.ts`。線なし・マーカーなしでも幅は保つ。
+  （幅 32px、線 + 中央のマーカー）。計算は `core/style.ts`。線なし・マーカーなしでも幅は保つ。
 -->
 <script lang="ts">
 	import { penColorVar, type TrendPen } from './core/pens';
 	import {
-		dashArray,
+		swatchDashArray,
+		swatchWidth,
 		markerPath,
 		resolveLineStyle,
-		resolveLineWidth,
 		resolveMarkerKind,
 		resolveMarkerSize
 	} from './core/style';
@@ -19,12 +19,12 @@
 		pen: Pick<TrendPen, 'colorSlot' | 'lineStyle' | 'lineWidth' | 'marker' | 'markerSize'>;
 	} = $props();
 
-	const W = 24;
+	const W = 32;
 	const H = 12;
 	const color = $derived(penColorVar(pen.colorSlot));
 	const lineOn = $derived(resolveLineStyle(pen.lineStyle) !== 'none');
-	const width = $derived(resolveLineWidth(pen.lineWidth));
-	const dash = $derived(dashArray(pen.lineStyle, pen.lineWidth));
+	const width = $derived(swatchWidth(pen.lineWidth));
+	const dash = $derived(swatchDashArray(pen.lineStyle, pen.lineWidth));
 	const markerD = $derived(
 		markerPath(
 			[{ x: W / 2, y: H / 2 }],
