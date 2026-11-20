@@ -1,8 +1,8 @@
 //! `GET /api/openapi.json`（#1161 PR6、docs/chronogazer/chronogazer-agent-api-design.md §6）。
 //!
 //! ChronoGazer の REST のうち、**API キーを通すルートの集まり**
-//! （`rest::api_key_routes` が合成する 4 つ: 収集 `collect_router`・表示グループ・
-//! しきい値・レジストリ `tag_registry_router`）だけを utoipa で文書にする。管理系
+//! （`rest::api_key_routes` が合成する 5 つ: 収集 `collect_router`・表示グループ・
+//! 自由トレンド（キーは読むだけ）・しきい値・レジストリ `tag_registry_router`）だけを utoipa で文書にする。管理系
 //! （ユーザー・サーバー設定・HUB 連携 `/api/hub*`・`/api/tags/from-hub`・API キー・
 //! 認証・バックアップ・監査ログ・UI 設定・SSE）はキーを通さない（キーで呼ぶと 403）
 //! ので載せない。`/mcp` は JSON-RPC で OpenAPI の対象外。Swagger UI は載せない
@@ -48,7 +48,7 @@ use super::{
     __path_tags_delete, __path_tags_get, __path_tags_list, __path_tags_update,
     CollectionGroupPayload, PlcConnectionPayload, PlcConnectionResponse, TagPayload,
 };
-use super::{display_groups, tag_thresholds};
+use super::{display_groups, free_trends, tag_thresholds};
 use crate::collect::{
     CollectDailyReport, CollectEventList, CollectEventRow, CollectExport, CollectHistory,
     CollectOutcome, CollectorState, CollectorStateView, ConnectionStatusView, ConnectionView,
@@ -60,6 +60,7 @@ use crate::display_groups::{
     Axis, DisplayAttributes, DisplayGroup, DisplayGroupPayload, DisplayGroupSaveResponse,
     DisplayKind, HubTagGroupPayload, LineStyle, Marker, Pen, PenPayload, ReorderPayload,
 };
+use crate::free_trends::{FreeTrend, FreeTrendPayload, FreeTrendPenPayload};
 use crate::hub_tags::{HubTagRow, NewHubGroup};
 use crate::tag_thresholds::{TagThresholds, TagThresholdsPayload};
 
@@ -179,6 +180,11 @@ impl Modify for SecurityAddon {
         display_groups::update,
         display_groups::delete,
         display_groups::reorder,
+        free_trends::list,
+        free_trends::get_one,
+        free_trends::create,
+        free_trends::update,
+        free_trends::delete,
         tag_thresholds::list,
         tag_thresholds::get_one,
         tag_thresholds::update,
@@ -247,6 +253,9 @@ impl Modify for SecurityAddon {
         DisplayGroupSaveResponse,
         DisplayGroupPayload,
         ReorderPayload,
+        FreeTrend,
+        FreeTrendPayload,
+        FreeTrendPenPayload,
         TagThresholds,
         TagThresholdsPayload,
         banto_tags::Tag,

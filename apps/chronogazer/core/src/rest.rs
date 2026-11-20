@@ -275,6 +275,12 @@ mod display_groups;
 // （`rest/tag_thresholds.rs`）に置く。
 use crate::tag_thresholds::TagThresholdService;
 mod tag_thresholds;
+// #1207・#1231 PR 8a: 自由トレンド。ルーターは子モジュール（`rest/free_trends.rs`）に置き、
+// 権限の表のテストは `rest/free_trends_tests.rs`。
+use crate::free_trends::FreeTrendService;
+mod free_trends;
+#[cfg(test)]
+mod free_trends_tests;
 // #437: 監査の保留の REST の経路（保留・流し込み・状態の口）のテスト。
 #[cfg(test)]
 mod audit_spool_tests;
@@ -2219,6 +2225,13 @@ fn api_key_routes(
             audit.clone(),
             auth.clone(),
         ))
+        // #1207・#1231 PR 8a: 自由トレンドも同じ pool。読み取りのためにキーを通し、書き込みは
+        // ハンドラ（`FreeTrendOps`）がキーを断る。
+        .merge(free_trends::free_trends_router(
+            FreeTrendService::new(display_groups.pool().clone()),
+            audit.clone(),
+            auth.clone(),
+        ))
         .merge(tag_registry_router(
             plc_connections,
             collection_groups,
@@ -2607,6 +2620,24 @@ mod tests {
         sqlx::SqlitePool,
         crate::hub::HubService,
     ) {
+        let (router, admin, editor, viewer, pool, hub, _auth) =
+            router_with_role_tokens_pool_hub_and_auth().await;
+        (router, admin, editor, viewer, pool, hub)
+    }
+
+    /// [`router_with_role_tokens_pool_and_hub`] plus the router's `AuthState`（#1207・#1231
+    /// PR 8a: 自由トレンドの権限の表のテストが、grant のセッション（`localDesktop`・閲覧公開）の
+    /// トークンと、別のアカウントのログインを同じ `AuthState` で作るため。`Clone` は同じ実体）。
+    #[allow(clippy::type_complexity)]
+    pub(super) async fn router_with_role_tokens_pool_hub_and_auth() -> (
+        Router,
+        String,
+        String,
+        String,
+        sqlx::SqlitePool,
+        crate::hub::HubService,
+        AuthState,
+    ) {
         let pool = migrate_memory().await.expect("migrate_memory");
         let (tx, _rx) = broadcast::channel(16);
         let users = UsersService::new(Db::Sqlite(pool.clone()));
@@ -2675,7 +2706,7 @@ mod tests {
                 tags,
                 collect,
                 display_groups,
-                auth,
+                auth.clone(),
                 tx,
                 false,
                 HostAccess::closed(),
@@ -2685,6 +2716,7 @@ mod tests {
             viewer_token,
             pool,
             hub,
+            auth,
         )
     }
 

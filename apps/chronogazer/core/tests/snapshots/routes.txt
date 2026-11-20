@@ -2,6 +2,7 @@ DELETE /api/api-keys/{id}
 DELETE /api/backups/pending-restore
 DELETE /api/collection-groups/{id}
 DELETE /api/display-groups/{id}
+DELETE /api/free-trends/{id}
 DELETE /api/hub
 DELETE /api/plc-connections/{id}
 DELETE /api/tags/{id}
@@ -29,6 +30,8 @@ GET /api/display-groups
 GET /api/display-groups/{id}
 GET /api/drivers
 GET /api/events
+GET /api/free-trends
+GET /api/free-trends/{id}
 GET /api/hub
 GET /api/hub/catalog
 GET /api/hub/subscription
@@ -60,6 +63,7 @@ POST /api/collect/start
 POST /api/collect/stop
 POST /api/collection-groups
 POST /api/display-groups
+POST /api/free-trends
 POST /api/hub/adopt-key
 POST /api/hub/connect
 POST /api/hub/legacy-selection/dismiss
@@ -74,6 +78,7 @@ PUT /api/audit-log/config
 PUT /api/collection-groups/{id}
 PUT /api/display-groups/order
 PUT /api/display-groups/{id}
+PUT /api/free-trends/{id}
 PUT /api/plc-connections/{id}
 PUT /api/settings/auth
 PUT /api/settings/server

@@ -59,6 +59,10 @@ use crate::display_groups::{
     DisplayGroupSaveResponse, DisplayGroupSaved, DisplayGroupService,
     AUDIT_RESOURCE as DISPLAY_GROUPS_RESOURCE,
 };
+use crate::free_trends::{
+    audit_detail as free_trend_audit_detail, FreeTrend, FreeTrendPayload, FreeTrendService,
+    AUDIT_RESOURCE as FREE_TRENDS_RESOURCE,
+};
 use crate::hub::HubService;
 use crate::hub_tags::{registration_audit_detail, HubTagRegistrar};
 use crate::rest::actor::Actor;
@@ -627,6 +631,104 @@ impl CollectOps {
             )
             .await;
         Ok(outcome)
+    }
+}
+
+/// 自由トレンドの操作（REST `/api/free-trends/*`、#1207・#1231 PR 8a）。権限は表示グループと
+/// 違い、作成は viewer 以上のアカウントと `localDesktop`、変更・削除は作った人か editor 以上で、
+/// ログイン不要モード・閲覧公開・API キーは書けない（`crate::free_trends` のモジュール doc
+/// 「権限」）。断ったときは `denied` を監査して `Forbidden`。MCP のツールは無い（§9 Q7）。
+#[derive(Clone)]
+pub(crate) struct FreeTrendOps {
+    pub(crate) free_trends: FreeTrendService,
+    pub(crate) audit: AuditLogService,
+}
+
+impl FreeTrendOps {
+    /// サービスの結果が `Forbidden` なら `denied` を監査する（作った人の確認はサービスの
+    /// トランザクションの中で行うので、拒否はその結果で知る）。
+    async fn denied_on_forbidden<T>(
+        &self,
+        actor: &Actor,
+        via: &Via<'_>,
+        result: Result<T, BantoError>,
+    ) -> Result<T, BantoError> {
+        if matches!(result, Err(BantoError::Forbidden)) {
+            actor
+                .record_denied(&self.audit, via, FREE_TRENDS_RESOURCE)
+                .await;
+        }
+        result
+    }
+
+    /// 作成（REST `POST /api/free-trends`）。
+    pub(crate) async fn create(
+        &self,
+        actor: &Actor,
+        via: &Via<'_>,
+        payload: &FreeTrendPayload,
+    ) -> Result<FreeTrend, BantoError> {
+        let principal = actor.free_trend_actor();
+        let result = self.free_trends.create(&principal, payload).await;
+        let created = self.denied_on_forbidden(actor, via, result).await?;
+        actor
+            .record(
+                &self.audit,
+                via.origin(),
+                "create",
+                FREE_TRENDS_RESOURCE,
+                Some(&created.id.to_string()),
+                Some(free_trend_audit_detail(&created)),
+            )
+            .await;
+        Ok(created)
+    }
+
+    /// 更新（REST `PUT /api/free-trends/{id}`）。
+    pub(crate) async fn update(
+        &self,
+        actor: &Actor,
+        via: &Via<'_>,
+        id: i64,
+        payload: &FreeTrendPayload,
+    ) -> Result<FreeTrend, BantoError> {
+        let principal = actor.free_trend_actor();
+        let result = self.free_trends.update(&principal, id, payload).await;
+        let updated = self.denied_on_forbidden(actor, via, result).await?;
+        actor
+            .record(
+                &self.audit,
+                via.origin(),
+                "update",
+                FREE_TRENDS_RESOURCE,
+                Some(&id.to_string()),
+                Some(free_trend_audit_detail(&updated)),
+            )
+            .await;
+        Ok(updated)
+    }
+
+    /// 削除（REST `DELETE /api/free-trends/{id}`）。
+    pub(crate) async fn delete(
+        &self,
+        actor: &Actor,
+        via: &Via<'_>,
+        id: i64,
+    ) -> Result<(), BantoError> {
+        let principal = actor.free_trend_actor();
+        let result = self.free_trends.delete(&principal, id).await;
+        let deleted = self.denied_on_forbidden(actor, via, result).await?;
+        actor
+            .record(
+                &self.audit,
+                via.origin(),
+                "delete",
+                FREE_TRENDS_RESOURCE,
+                Some(&id.to_string()),
+                Some(json!({ "name": deleted.name })),
+            )
+            .await;
+        Ok(())
     }
 }
 

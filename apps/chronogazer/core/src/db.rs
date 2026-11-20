@@ -388,6 +388,9 @@ mod tests {
             "recorder_tag_settings",
             // #1161 PR4: API キー（0103_api_keys.sql）。
             "api_keys",
+            // #1207・#1231 PR 8a: 自由トレンド（0109_free_trends.sql）。
+            "free_trends",
+            "free_trend_pens",
         ] {
             let exists: Option<String> = sqlx::query_scalar(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -446,7 +449,7 @@ mod tests {
         // #532 の記録計の側のタグごとの設定、#1161 PR4 の API キー）。
         assert_eq!(
             versions,
-            vec![2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103, 104, 105, 106, 107, 108]
+            vec![2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103, 104, 105, 106, 107, 108, 109]
         );
         let has_auth_epoch: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'auth_epoch'",
@@ -528,7 +531,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             versions,
-            vec![2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103, 104, 105, 106, 107, 108]
+            vec![2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103, 104, 105, 106, 107, 108, 109]
         );
         let after: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pragma_table_info('audit_log') WHERE name = 'pending_id'",

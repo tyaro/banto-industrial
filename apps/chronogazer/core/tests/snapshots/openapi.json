@@ -1052,6 +1052,221 @@
         ],
         "type": "object"
       },
+      "FreeTrend": {
+        "properties": {
+          "canEdit": {
+            "type": "boolean"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "createdBy": {
+            "type": "string"
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "pens": {
+            "items": {
+              "$ref": "#/components/schemas/Pen"
+            },
+            "type": "array"
+          },
+          "revision": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "timeWindowSec": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "updatedAt": {
+            "type": "string"
+          },
+          "updatedBy": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "timeWindowSec",
+          "pens",
+          "revision",
+          "createdBy",
+          "createdAt",
+          "updatedBy",
+          "updatedAt",
+          "canEdit"
+        ],
+        "type": "object"
+      },
+      "FreeTrendPayload": {
+        "properties": {
+          "expectedRevision": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "pens": {
+            "items": {
+              "$ref": "#/components/schemas/FreeTrendPenPayload"
+            },
+            "type": "array"
+          },
+          "timeWindowSec": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "FreeTrendPenPayload": {
+        "properties": {
+          "axis": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "bitBandHeight": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "bitStyle": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "colorSlot": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "decimals": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limitH": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "limitHh": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "limitL": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "limitLines": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "limitLl": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "lineStyle": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lineWidth": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "marker": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "markerSize": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tagId": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "unit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "yMax": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "yMin": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "HistoryPoint": {
         "properties": {
           "max": {
@@ -3491,6 +3706,229 @@
         "summary": "ドライバの一覧",
         "tags": [
           "drivers"
+        ]
+      }
+    },
+    "/api/free-trends": {
+      "get": {
+        "description": "自由トレンドの一覧（名前順）。読み取り（`read` キーで足りる）。各件の `canEdit` は、今の主体がその自由トレンドを変えられるか（API キーは常に false）。",
+        "operationId": "free_trends_list",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/FreeTrend"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "自由トレンドの一覧"
+          },
+          "401": {
+            "description": "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ],
+        "summary": "自由トレンドの一覧",
+        "tags": [
+          "free-trends"
+        ]
+      },
+      "post": {
+        "description": "自由トレンドを作る。アカウントのログイン（viewer 以上）とこの PC からの接続（localDesktop）だけが作れる。**API キーでは作れない**（`config` のキーでも 403）。閲覧公開のセッションも 403。ペンは登録済みのタグ（`tagId`）だけ。",
+        "operationId": "free_trends_create",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FreeTrendPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FreeTrend"
+                }
+              }
+            },
+            "description": "作成した自由トレンド"
+          },
+          "401": {
+            "description": "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"
+          },
+          "403": {
+            "description": "API キー、または閲覧公開などのログインなしのセッション"
+          },
+          "422": {
+            "description": "入力の検証エラー（`field_errors` に項目ごとの理由）"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ],
+        "summary": "自由トレンドの作成",
+        "tags": [
+          "free-trends"
+        ]
+      }
+    },
+    "/api/free-trends/{id}": {
+      "delete": {
+        "description": "自由トレンドを削除する。作った人か editor 以上だけ。**API キーでは消せない**（403）。",
+        "operationId": "free_trends_delete",
+        "parameters": [
+          {
+            "description": "対象の id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "削除した"
+          },
+          "401": {
+            "description": "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"
+          },
+          "403": {
+            "description": "作った人でも editor 以上でもない、API キー、またはログインなしのセッション"
+          },
+          "404": {
+            "description": "指定の id が無い"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ],
+        "summary": "自由トレンドの削除",
+        "tags": [
+          "free-trends"
+        ]
+      },
+      "get": {
+        "description": "自由トレンドを 1 件返す。読み取り（`read` キーで足りる）。",
+        "operationId": "free_trends_get",
+        "parameters": [
+          {
+            "description": "対象の id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FreeTrend"
+                }
+              }
+            },
+            "description": "自由トレンド"
+          },
+          "401": {
+            "description": "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"
+          },
+          "404": {
+            "description": "指定の id が無い"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ],
+        "summary": "自由トレンドの取得",
+        "tags": [
+          "free-trends"
+        ]
+      },
+      "put": {
+        "description": "自由トレンドを更新する（全項目を送る。ペンは丸ごと置き換え）。作った人か editor 以上だけ。**API キーでは変えられない**（403）。",
+        "operationId": "free_trends_update",
+        "parameters": [
+          {
+            "description": "対象の id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FreeTrendPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FreeTrend"
+                }
+              }
+            },
+            "description": "更新後の自由トレンド"
+          },
+          "401": {
+            "description": "API キーが無い・誤り・失効・期限切れ、またはログインのセッションが無い"
+          },
+          "403": {
+            "description": "作った人でも editor 以上でもない、API キー、またはログインなしのセッション"
+          },
+          "404": {
+            "description": "指定の id が無い"
+          },
+          "409": {
+            "description": "`expectedRevision` が古い（他で先に更新された。本文は `kind: validation`、`field_errors` の `expectedRevision`）"
+          },
+          "422": {
+            "description": "入力の検証エラー（`field_errors` に項目ごとの理由）"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ],
+        "summary": "自由トレンドの更新",
+        "tags": [
+          "free-trends"
         ]
       }
     },
