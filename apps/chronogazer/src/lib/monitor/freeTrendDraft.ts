@@ -602,12 +602,60 @@ export interface FreeTrendFieldErrors {
 	pens: string[];
 	/** ペンの行ごと（0 始まり）。 */
 	penRows: Record<number, string[]>;
+	/**
+	 * ペンの行ごとの誤りを、タグ ID をキーにして持ち直したもの（`resolvePenRowErrors` が作る）。
+	 * 行番号のままだと、ペンを動かす・外した後に別のペンへ出てしまう。画面はこちらを引く。
+	 */
+	penErrorsByTag: Record<number, string[]>;
 	/** どの欄にも出せないもの。 */
 	other: string[];
 }
 
 export function emptyFreeTrendFieldErrors(): FreeTrendFieldErrors {
-	return { name: [], timeWindowSec: [], pens: [], penRows: {}, other: [] };
+	return { name: [], timeWindowSec: [], pens: [], penRows: {}, penErrorsByTag: {}, other: [] };
+}
+
+/**
+ * 行番号の誤りを、その時点のペンの並びでタグ ID に写す。範囲外の行番号は捨てずに全体の誤り
+ * （`pens`）へ回す。
+ */
+export function penRowErrorsByTag(
+	rows: Record<number, string[]>,
+	pens: readonly { tagId: number }[]
+): { byTag: Record<number, string[]>; orphans: string[] } {
+	const byTag: Record<number, string[]> = {};
+	const orphans: string[] = [];
+	for (const [key, messages] of Object.entries(rows)) {
+		const pen = pens[Number(key)];
+		if (pen) byTag[pen.tagId] = [...(byTag[pen.tagId] ?? []), ...messages];
+		else orphans.push(...messages);
+	}
+	return { byTag, orphans };
+}
+
+/** `penRows` を `penErrorsByTag` に移す（`penRows` は空にする）。誤りを立てた時点のペンの並びで呼ぶ。 */
+export function resolvePenRowErrors(
+	errors: FreeTrendFieldErrors,
+	pens: readonly { tagId: number }[]
+): FreeTrendFieldErrors {
+	const { byTag, orphans } = penRowErrorsByTag(errors.penRows, pens);
+	return {
+		...errors,
+		pens: [...errors.pens, ...orphans],
+		penRows: {},
+		penErrorsByTag: byTag
+	};
+}
+
+/** ペンを外したとき、そのタグ ID の誤りも捨てる。 */
+export function withoutPenErrors(
+	errors: FreeTrendFieldErrors,
+	tagId: number
+): FreeTrendFieldErrors {
+	if (!(tagId in errors.penErrorsByTag)) return errors;
+	const rest = { ...errors.penErrorsByTag };
+	delete rest[tagId];
+	return { ...errors, penErrorsByTag: rest };
 }
 
 /** サーバーの `field_errors` を欄ごとに振り分ける（`pens[i].<項目>`・`name`・`timeWindowSec`・`pens`）。 */

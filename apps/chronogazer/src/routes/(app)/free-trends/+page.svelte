@@ -88,6 +88,8 @@
 		draftToKeep,
 		emptyDraft,
 		emptyFreeTrendFieldErrors,
+		resolvePenRowErrors,
+		withoutPenErrors,
 		loadDraft,
 		movePenAt,
 		penStyleRowProblems,
@@ -413,6 +415,7 @@
 		applyEdit(removePenAt(working, index));
 		if (tagId === undefined) return;
 		penTexts = withoutPenTexts(penTexts, tagId);
+		saveErrors = withoutPenErrors(saveErrors, tagId);
 		if (styleTagId === tagId) styleTagId = null;
 	}
 
@@ -461,7 +464,10 @@
 		const penProblems = penStyleRowProblems(draft.pens, penTexts);
 		const firstProblem = draft.pens.findIndex((_, index) => penProblems[index] !== undefined);
 		if (firstProblem >= 0) {
-			saveErrors = { ...emptyFreeTrendFieldErrors(), penRows: penProblems };
+			saveErrors = resolvePenRowErrors(
+				{ ...emptyFreeTrendFieldErrors(), penRows: penProblems },
+				draft.pens
+			);
 			conflict = false;
 			styleTagId = draft.pens[firstProblem].tagId;
 			return;
@@ -550,7 +556,7 @@
 				// 今の保存内容を読み直して、食い違いの確認に使えるようにする（下書きは残す）。
 				await reloadList();
 			} else if (failure.kind === 'validation') {
-				saveErrors = failure.errors;
+				saveErrors = resolvePenRowErrors(failure.errors, draft.pens);
 				for (const message of failure.errors.other) toastStore.push('error', message);
 			} else {
 				toastStore.push('error', failure.message);
@@ -1127,7 +1133,7 @@
 													外す
 												</button>
 												{#if styleTagId !== pen.tagId}
-													{#each saveErrors.penRows[index] ?? [] as message (message)}
+													{#each saveErrors.penErrorsByTag[pen.tagId] ?? [] as message (message)}
 														<p class="field-error row-error" role="alert">{message}</p>
 													{/each}
 												{/if}
@@ -1146,7 +1152,7 @@
 												thresholds={thresholdsByTag}
 												thresholdsFailed={tagMeta.thresholdsError !== null}
 												disabled={saving}
-												errors={saveErrors.penRows[styleIndex] ?? []}
+												errors={saveErrors.penErrorsByTag[stylePen.tagId] ?? []}
 												onchange={(patch) => onPenStyleChange(stylePen.tagId, patch)}
 												ontext={(field, text) => onPenStyleText(stylePen.tagId, field, text)}
 											/>

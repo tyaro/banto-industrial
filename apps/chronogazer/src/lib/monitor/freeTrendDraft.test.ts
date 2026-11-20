@@ -28,7 +28,11 @@ import {
 	saveDraft,
 	setPenColor,
 	setPenStyle,
+	emptyFreeTrendFieldErrors,
 	sortFreeTrendFieldErrors,
+	penRowErrorsByTag,
+	resolvePenRowErrors,
+	withoutPenErrors,
 	usedTagKeys,
 	withoutPenTexts,
 	type DraftStorage,
@@ -480,6 +484,38 @@ describe('保存の失敗', () => {
 		expect(sorted.pens).toEqual(['p']);
 		expect(sorted.penRows[2]).toEqual(['r2', 'r2b']);
 		expect(sorted.other).toEqual(['o']);
+	});
+	it('行の誤りはタグ ID に写り、並べ替えの後も同じペンに出る', () => {
+		const rows = { 0: ['a の誤り'], 2: ['c の誤り'] };
+		const before = [{ tagId: 10 }, { tagId: 20 }, { tagId: 30 }];
+		const byTag = penRowErrorsByTag(rows, before).byTag;
+		expect(byTag).toEqual({ 10: ['a の誤り'], 30: ['c の誤り'] });
+		// 10 を下へ動かしても、誤りは 10 に付いたまま（20 には出ない）。
+		const moved = [{ tagId: 20 }, { tagId: 10 }, { tagId: 30 }];
+		const errors = resolvePenRowErrors({ ...emptyFreeTrendFieldErrors(), penRows: rows }, before);
+		expect(errors.penRows).toEqual({});
+		expect(errors.penErrorsByTag[10]).toEqual(['a の誤り']);
+		expect(moved.map((p) => errors.penErrorsByTag[p.tagId] ?? [])).toEqual([
+			[],
+			['a の誤り'],
+			['c の誤り']
+		]);
+	});
+	it('範囲外の行番号の誤りは捨てずに全体の誤りへ回す', () => {
+		const errors = resolvePenRowErrors(
+			{ ...emptyFreeTrendFieldErrors(), pens: ['既存'], penRows: { 5: ['はみ出し'] } },
+			[{ tagId: 1 }]
+		);
+		expect(errors.pens).toEqual(['既存', 'はみ出し']);
+		expect(errors.penErrorsByTag).toEqual({});
+	});
+	it('ペンを外すとそのタグ ID の誤りも消える', () => {
+		const errors = resolvePenRowErrors(
+			{ ...emptyFreeTrendFieldErrors(), penRows: { 0: ['x'], 1: ['y'] } },
+			[{ tagId: 1 }, { tagId: 2 }]
+		);
+		expect(withoutPenErrors(errors, 1).penErrorsByTag).toEqual({ 2: ['y'] });
+		expect(withoutPenErrors(errors, 9)).toBe(errors);
 	});
 	it('版の食い違い・検証・その他を分類する', () => {
 		const conflict = {
