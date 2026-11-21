@@ -13,6 +13,7 @@
  * - 管理線と、越えた区間の線の色替えの位置（`core/limits.ts`）。ペンの属性 `limits`
  * - bit のペンの帯（タイムチャート）の置き場と塗り（`core/bitBands.ts`）。ペンの属性
  *   `bit`・`bitStyle`・`bitBandHeight`。bit の値は False / True と出す（`formatBitValue`）。
+ * - 時刻の区間の帯 `timeBands` と時刻の印 `timeMarks` の位置の計算（`core/timeBands.ts`）。
  * - しきい値などの横の帯の位置（`core/bands.ts`）。指定したペンの縦軸で、線の下に描く
  *   （汎用の `{ from, to, colorVar, label }`。管理線に置き換えるときに見直す）。
  * - カーソルの値と、カーソル A・B（置き方・差・時間の差）（`core/cursor.ts`）と、範囲が変わったときの読み直しの段取り
@@ -124,6 +125,20 @@ export {
 	type BitBandLayout,
 	type BitSpan
 } from './core/bitBands';
+export {
+	timeBandLayout,
+	timeMarkLayout,
+	timeSummaryText,
+	TIME_LANE_HEIGHT,
+	TIME_LANE_GAP,
+	TIME_MARK_LABEL_MIN_GAP,
+	TIME_MARK_DEFAULT_COLOR,
+	type TrendTimeBand,
+	type TrendTimeMark,
+	type TimeBandRect,
+	type TimeBandLayout,
+	type TimeMarkLine
+} from './core/timeBands';
 export {
 	SAMPLE_GAP_FACTOR,
 	sampleAt,
