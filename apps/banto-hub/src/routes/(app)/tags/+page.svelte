@@ -68,6 +68,7 @@
 	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
 	import { sharedTreeTarget } from '#lib/treeSelection.svelte.js';
 	import { createTagValueStream } from '#lib/banto/tagValueStream.svelte.js';
+	import { tagIdValueKey } from '#lib/banto/monitorValues.js';
 	import {
 		tagValueCell,
 		tagValueSortKey,
@@ -109,7 +110,7 @@
 	import LogPanel from '#lib/components/LogPanel.svelte';
 	import WatchPanel, { type WatchRowView } from '#lib/components/WatchPanel.svelte';
 	import { createWatchListStore } from '#lib/watchListStore.js';
-	import { WATCH_LIMIT, watchSubscriptionPatterns, type WatchOp } from '#lib/watchList.js';
+	import { WATCH_LIMIT, type WatchOp } from '#lib/watchList.js';
 	import { createLogFeedState } from '#lib/banto/logFeedState.svelte.js';
 	import { isDockPanelOnScreen } from '#lib/dockPanelOnScreen.js';
 	import { persistThreePaneLayout } from '#lib/dockLayoutPersist.svelte.js';
@@ -3468,26 +3469,29 @@
 	// サーバーの保存値が確定する前の操作は口が溜めて、確定した基準に当て直す（写しや空から
 	// 作った一覧でサーバーの一覧を消さない。PR #1282 のレビュー）。
 	// 値は、ツリーの購読（上の `valueStream`）とは別の 2 本目のストリームで、見張っている
-	// タグの収集グループのワイルドカードを購読し、見張っている外部名の値だけを残す
-	// （`watchList.ts::watchSubscriptionPatterns`）。窓が画面に出ている間だけ、かつ購読する
-	// パターンがあるときだけ繋ぐ。
-	const watchStore = createWatchListStore();
+	// タグを**タグ ID で**購読し、値も ID で持つ（2026-11-22 オーナー決定、PR #1282 の再レビュー。
+	// 外部名の形（ドット入りの接続名・グループ名）や、外部名の別のタグへの使い回しに左右され
+	// ない。`tagValueStream.svelte.ts` 冒頭）。窓が画面に出ている間だけ、かつ一覧が空でない
+	// ときだけ繋ぐ。
+	// 読みに失敗したら、口が間隔を延ばしながら確定するまで読み直す（操作を受けたとき・
+	// config_changed のときは待たずに読む）。口の状態が変わるたびに `onChange` で写す。
+	const watchStore = createWatchListStore({ onChange: () => syncWatchState() });
 	onDestroy(() => watchStore.dispose());
 	let watchIds = $state<number[]>(watchStore.list);
 	let watchConfirmed = $state(false);
+	/** 操作がまだ保存されていない（窓に「保存待ち」を出す）。 */
+	let watchUnsaved = $state(false);
+	function syncWatchState(): void {
+		watchIds = watchStore.list;
+		watchConfirmed = watchStore.confirmed;
+		watchUnsaved = watchStore.unsaved;
+	}
 	function applyWatchOp(op: WatchOp): ReturnType<typeof watchStore.apply> {
 		const result = watchStore.apply(op);
-		watchIds = watchStore.list;
+		syncWatchState();
 		return result;
 	}
-	/** サーバーの基準を読む（失敗したら溜めた操作は残り、次の機会にまた読む）。 */
-	function loadWatchList(): void {
-		void watchStore.load().then((confirmed) => {
-			watchIds = watchStore.list;
-			watchConfirmed = confirmed;
-		});
-	}
-	loadWatchList();
+	void watchStore.load();
 	// 消されたタグは、サーバーの基準が確定し、タグ一覧を読んだ後に一覧から落とす（保存し直される）。
 	// 確定する前は落とさない（写しの消えた id を落としても、サーバーの一覧を守れない）。
 	$effect(() => {
@@ -3504,39 +3508,37 @@
 		});
 	});
 	const watchPanelOnScreen = $derived(isDockPanelOnScreen(dock.layout, 'watch', dock.flyoutPanel));
-	const watchPatterns = $derived(
-		watchSubscriptionPatterns(watchedTags, externalNamePrefixByGroupId)
-	);
-	const watchNames = $derived(new Set(watchedTags.map((t) => externalNameForTag(t))));
+	/** 購読するタグ ID（ページの一覧にあるものだけ。一覧に無い ID は行も出さない）。 */
+	const watchSubscribeIds = $derived(watchedTags.map((t) => t.id));
 	const watchStream = createTagValueStream({
 		treeFilter: () => treeFilter,
 		connections: () => connections,
 		groups: () => groups,
-		patterns: () => watchPatterns,
-		acceptNames: () => watchNames,
-		enabled: () => watchPanelOnScreen && watchPatterns.length > 0,
-		// 別の所で消した・改名したタグの最後の値を「良好」のまま残さない: config_changed では、
-		// 編集の保護（一覧の読み直しの保留）とは別に、見張りのストリームだけ購読し直す。
-		// スナップショットは値のマップを置き換えるので、無くなった外部名の値は落ちて「値なし」
-		// になる（一覧の行は、保留が解けて一覧を読み直したときに落ちる）。サーバーの基準を
-		// 読めていなければ、このときに読み直す。
+		ids: () => watchSubscribeIds,
+		enabled: () => watchPanelOnScreen && watchSubscribeIds.length > 0,
+		// 別の所で消したタグの最後の値を「良好」のまま残さない: config_changed では、編集の
+		// 保護（一覧の読み直しの保留）とは別に、見張りのストリームだけ購読し直す。スナップ
+		// ショットは値のマップを置き換えるので、消えた ID の値は落ちて「値なし」になる（一覧の
+		// 行は、保留が解けて一覧を読み直したときに落ちる）。同じ外部名で作り直された別 ID の
+		// タグは ID が違うので、旧 ID の行に値は出ない。
 		onConfigChanged: () => {
 			watchStream.resubscribe();
-			if (!watchConfirmed) loadWatchList();
+			watchStore.retryNow();
 		}
 	});
 	const watchRows = $derived.by((): WatchRowView[] =>
 		watchedTags.map((t) => {
-			const name = externalNameForTag(t);
-			const cell = tagValueCell(watchStream.values, name, t.unit, watchStream.mode);
+			// 値は ID で引く。名前の列はページのタグ一覧の名前（改名は一覧の読み直しで反映）。
+			const key = tagIdValueKey(t.id);
+			const cell = tagValueCell(watchStream.values, key, t.unit, watchStream.mode);
 			return {
 				id: t.id,
-				name,
+				name: externalNameForTag(t),
 				value: cell.value,
 				qualityClass: cell.qualityClass,
 				qualityLabel: cell.qualityLabel,
-				time: tagValueTime(watchStream.values, name, watchStream.mode),
-				flashing: watchStream.isFlashing(name)
+				time: tagValueTime(watchStream.values, key, watchStream.mode),
+				flashing: watchStream.isFlashing(key)
 			};
 		})
 	);
@@ -8331,6 +8333,7 @@
 		onRemove={(id) => applyWatchOp({ kind: 'remove', id })}
 		onClear={() => applyWatchOp({ kind: 'clear' })}
 		onResume={watchStream.resume}
+		unsaved={watchUnsaved}
 	/>
 {/snippet}
 

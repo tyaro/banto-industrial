@@ -24,6 +24,8 @@
 	 * - 表は軽い `<table>`（上限 100 タグ。`LogPanel` と同じ流儀）。名前は完全な外部名。
 	 *   値・品質・時刻の表示はタグ一覧の値の列と同じ（ページが `monitorCellDisplay` を通した結果）。
 	 * - 窓からの書き込みは無い（手動書き込みは段階 2）。
+	 * - サーバーの保存値をまだ読めておらず、操作が保存されていない間は「保存待ち」を出す
+	 *   （`watchListStore.ts` の `unsaved`。読めたら保存して消える。PR #1282 の再レビュー）。
 	 */
 	import type { StreamStatusLine } from '#lib/banto/monitorStreamView.js';
 
@@ -35,9 +37,11 @@
 		onClear: () => void;
 		/** close `1008` で止まった購読の再開。 */
 		onResume: () => void;
+		/** 一覧の変更がまだ保存されていない（サーバーの一覧を読めるまで待っている）。 */
+		unsaved?: boolean;
 	}
 
-	let { rows, status, onRemove, onClear, onResume }: Props = $props();
+	let { rows, status, onRemove, onClear, onResume, unsaved = false }: Props = $props();
 </script>
 
 <div class="watch-panel" data-testid="watch-panel">
@@ -63,6 +67,11 @@
 			onclick={onClear}>すべて外す</button
 		>
 	</div>
+	{#if unsaved}
+		<p class="watch-unsaved" role="status" data-testid="watch-unsaved">
+			保存待ち: サーバーの一覧をまだ読めていません。読めたら保存します。
+		</p>
+	{/if}
 	<div class="watch-table-wrap">
 		{#if rows.length === 0}
 			<p class="watch-empty">
@@ -145,6 +154,11 @@
 		color: var(--banto-text-muted);
 	}
 	.watch-status.warning {
+		color: var(--banto-danger);
+	}
+	.watch-unsaved {
+		flex: 0 0 auto;
+		margin: 0;
 		color: var(--banto-danger);
 	}
 	.watch-table-wrap {

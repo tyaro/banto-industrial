@@ -616,6 +616,22 @@ describe('connectTagStream: #447 のレビュー対応（トークンの消失�
 	});
 });
 
+describe('connectTagStream: タグ ID での購読（#1254、PR #1282 の再レビュー）', () => {
+	it('ids を返せば ids だけを送り、購読し直しでも同じ形で送る', () => {
+		const stream = connectTagStream(
+			{ onData: () => {}, onConfigChanged: () => {}, onHalt: () => {} },
+			() => ({ ids: [3, 1] })
+		);
+		latest().open();
+		const first = JSON.parse(latest().sent[0]);
+		expect(first).toEqual({ op: 'subscribe', id: 1, ids: [3, 1], mode: 'on_change' });
+		stream.resubscribe();
+		const again = JSON.parse(latest().sent.at(-1)!);
+		expect(again).toEqual({ op: 'subscribe', id: 2, ids: [3, 1], mode: 'on_change' });
+		stream.disconnect();
+	});
+});
+
 describe('connectTagStream: 購読 id の照合とスナップショット（#1255）', () => {
 	type Frame = { tag: string; v: number; q: string; t: number };
 	const frame = (id: number, values: Frame[]) => ({

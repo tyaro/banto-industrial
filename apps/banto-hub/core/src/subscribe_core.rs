@@ -9,7 +9,8 @@
 //! 非依存の部分:
 //!
 //! - [`TagPattern`]: `subscribe` の `tags` 文字列(ワイルドカード込み)の
-//!   パースとマッチ判定
+//!   パースとマッチ判定。WS の `ids`(タグ ID の一覧、#1254)は
+//!   [`TagPattern::Ids`] として同じ列に並べる
 //! - [`resolve`]: パターン集合を現在の `TagMap` に照合する(評価の**都度**
 //!   呼ぶ - `config_changed` 相当の再解決を暗黙に行う、モジュール doc
 //!   comment 「ワイルドカードは評価時に TagMap へ照合」参照)
@@ -72,6 +73,15 @@ pub enum TagPattern {
     GroupWildcard { connection: String, group: String },
     /// `*` 単独 - 全タグ。
     All,
+    /// タグ ID の集合(WS の `subscribe` の `ids`、2026-11-22 オーナー決定、#1254)。
+    /// 評価の都度 `TagEntry::ids` のタグ ID(`ids.2`)で照合するので、改名しても
+    /// ID が同じなら同じタグを追い、同じ外部名で作り直された別 ID のタグは
+    /// 選ばない。未知の ID は(ワイルドカードと同じく)0 件マッチなだけで、
+    /// 購読を拒否しない(消されたタグを見張り続けるのは普通に起きるため)。
+    /// 名前の形を解釈しないので、接続名・グループ名に `.` があっても購読できる
+    /// (グループのワイルドカード `{connection}.{group}.*` はちょうど 2 段でしか
+    /// パースできない)。文字列からは作らない(`parse` の対象外)。
+    Ids(HashSet<i64>),
 }
 
 impl TagPattern {
@@ -107,6 +117,7 @@ impl TagPattern {
                 &entry.connection == connection && &entry.group == group
             }
             TagPattern::All => true,
+            TagPattern::Ids(ids) => ids.contains(&entry.ids.2),
         }
     }
 }
@@ -150,6 +161,9 @@ pub type DiffBaseline = HashMap<String, (Option<f64>, Quality, bool)>;
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedValue {
     pub tag: String,
+    /// タグ ID(`TagEntry::ids` の 3 番目)。WS の値に `id` として載る(#1254。
+    /// 画面が外部名の使い回しに惑わされず、ID で値を持つため)。gRPC は載せない。
+    pub id: i64,
     pub v: Option<f64>,
     pub q: Quality,
     pub t: i64,
@@ -236,6 +250,7 @@ pub fn initial_values(
             last.insert(entry.external_name.clone(), (v, q, unverified));
             ResolvedValue {
                 tag: entry.external_name.clone(),
+                id: entry.ids.2,
                 v,
                 q,
                 t,
@@ -288,6 +303,7 @@ pub fn evaluate(
                         .insert(entry.external_name.clone(), (v, q, unverified));
                     changed_values.push(ResolvedValue {
                         tag: entry.external_name.clone(),
+                        id: entry.ids.2,
                         v,
                         q,
                         t,
@@ -315,6 +331,7 @@ pub fn evaluate(
                             read_resolved(entry, current, server_store, now_ms);
                         ResolvedValue {
                             tag: entry.external_name.clone(),
+                            id: entry.ids.2,
                             v,
                             q,
                             t,
@@ -446,5 +463,120 @@ mod unverified_tests {
 
         // 対照: 変化なしなら何も返らない。
         assert!(evaluate(&mut sub, &map, None, &store, 1_500, None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod id_pattern_tests {
+    //! タグ ID での購読([`TagPattern::Ids`]、#1254)。評価の都度 ID で引くので、改名
+    //! しても追い、同じ外部名で作り直された別 ID のタグは選ばない。
+    use super::*;
+    use banto_tags::INTERNAL_TAG_KIND;
+
+    fn entry(connection: &str, group: &str, name: &str, tag_id: i64) -> TagEntry {
+        TagEntry {
+            external_name: format!("{connection}.{group}.{name}"),
+            tag_key: format!("tag:{tag_id}"),
+            ids: (1, 1, tag_id),
+            connection: connection.to_string(),
+            group: group.to_string(),
+            name: name.to_string(),
+            address: String::new(),
+            data_type: "f64".to_string(),
+            unit: None,
+            decimals: 0,
+            period_ms: 1_000,
+            enabled: true,
+            writable: true,
+            tag_kind: INTERNAL_TAG_KIND.to_string(),
+            expression: None,
+            retain: false,
+            simulation: false,
+            push: false,
+        }
+    }
+
+    fn map_of(entries: Vec<TagEntry>) -> TagMap {
+        let mut map = TagMap::default();
+        for e in entries {
+            map.insert_for_test(e);
+        }
+        map
+    }
+
+    fn ids(list: &[i64]) -> Vec<TagPattern> {
+        vec![TagPattern::Ids(list.iter().copied().collect())]
+    }
+
+    fn picked(patterns: &[TagPattern], map: &TagMap) -> Vec<(String, i64)> {
+        let store = ServerTagStore::new();
+        let (values, _) = initial_values(patterns, map, None, &store, 0, None);
+        values.into_iter().map(|v| (v.tag, v.id)).collect()
+    }
+
+    #[test]
+    fn ids_select_only_the_listed_tags_and_carry_the_id() {
+        let map = map_of(vec![entry("c", "g", "a", 1), entry("c", "g", "b", 2)]);
+        assert_eq!(picked(&ids(&[2]), &map), vec![("c.g.b".to_string(), 2)]);
+    }
+
+    #[test]
+    fn unknown_ids_match_nothing_without_failing() {
+        let map = map_of(vec![entry("c", "g", "a", 1)]);
+        assert_eq!(
+            picked(&ids(&[1, 999]), &map),
+            vec![("c.g.a".to_string(), 1)]
+        );
+        assert!(picked(&ids(&[999]), &map).is_empty());
+    }
+
+    #[test]
+    fn ids_work_for_names_with_dots_that_a_group_wildcard_cannot_parse() {
+        let map = map_of(vec![entry("line.1", "fast", "temp", 5)]);
+        assert!(TagPattern::parse("line.1.fast.*").is_err());
+        assert_eq!(
+            picked(&ids(&[5]), &map),
+            vec![("line.1.fast.temp".to_string(), 5)]
+        );
+    }
+
+    #[test]
+    fn a_renamed_tag_is_followed_by_its_id() {
+        let mut sub = Subscription {
+            patterns: ids(&[1]),
+            mode: Mode::OnChange,
+            last: DiffBaseline::new(),
+            next_due_ms: 0,
+        };
+        let store = ServerTagStore::new();
+        let before = map_of(vec![entry("c", "g", "old", 1)]);
+        let first = evaluate(&mut sub, &before, None, &store, 0, None).unwrap();
+        assert_eq!(first[0].tag, "c.g.old");
+        let after = map_of(vec![entry("c", "g", "new", 1)]);
+        let renamed = evaluate(&mut sub, &after, None, &store, 1, None).unwrap();
+        assert_eq!(
+            renamed
+                .iter()
+                .map(|v| (v.tag.as_str(), v.id))
+                .collect::<Vec<_>>(),
+            vec![("c.g.new", 1)]
+        );
+    }
+
+    #[test]
+    fn a_different_id_reusing_the_external_name_is_not_selected() {
+        let mut sub = Subscription {
+            patterns: ids(&[1]),
+            mode: Mode::OnChange,
+            last: DiffBaseline::new(),
+            next_due_ms: 0,
+        };
+        let store = ServerTagStore::new();
+        let before = map_of(vec![entry("c", "g", "a", 1)]);
+        assert!(evaluate(&mut sub, &before, None, &store, 0, None).is_some());
+        // ID 1 を消し、同じ外部名で ID 2 を作り直した。
+        let after = map_of(vec![entry("c", "g", "a", 2)]);
+        assert!(evaluate(&mut sub, &after, None, &store, 1, None).is_none());
+        assert!(picked(&sub.patterns, &after).is_empty());
     }
 }

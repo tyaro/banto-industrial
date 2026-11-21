@@ -12,7 +12,8 @@
  *   確定した基準に当て直すため（端末の写しから作った一覧でサーバーの一覧を消さない。
  *   `watchListStore.ts` 冒頭）。
  * - 消されたタグの id は、サーバーの基準が確定し、タグ一覧を取得した後に `prune` の操作で落とす。
- * - 購読のパターンは見張っているタグの収集グループのワイルドカード（{@link watchSubscriptionPatterns}）。
+ * - 購読はタグ ID で行う（WS の `subscribe` の `ids`、2026-11-22 オーナー決定。
+ *   `tagValueStream.svelte.ts` 冒頭）。外部名の形・使い回しに左右されない。
  */
 
 /** 見張れるタグの上限（2026-11-21 オーナー決定）。 */
@@ -125,34 +126,6 @@ export function applyWatchOps(
 	let list: number[] = [...base];
 	for (const op of ops) list = applyWatchOp(list, op, limit).list;
 	return list;
-}
-
-/**
- * 見張りの購読のパターン: 見張っているタグの属する収集グループのワイルドカード
- * `{接続名}.{グループ名}.*` の重複なしの一覧（見張りの順に初めて出た順）。
- *
- * 外部名の具体名で送らないのは、サーバーが未知の具体名を 1 件でも含む購読を全体ごと
- * `unknown_tag` で拒否し（`core/src/stream.rs`）、ページの一覧と実行中のカタログの差
- * （作ったばかり・別の所で消した）で窓全体が止まるため。ワイルドカードは 0 件でも拒否され
- * ず、タグ名に `*` があっても関係ない。グループの外のタグの値も届くので、受けた値は見張って
- * いる外部名だけを残す（`createTagValueStream` の `accept`）。`prefixByGroupId` に無い
- * グループ（一覧の取得のずれ）のタグは外す（引けるまで値は出ない）。
- */
-export function watchSubscriptionPatterns(
-	tags: readonly { collectionGroupId: number }[],
-	prefixByGroupId: ReadonlyMap<number, string>
-): string[] {
-	const patterns: string[] = [];
-	const seen = new Set<string>();
-	for (const tag of tags) {
-		const prefix = prefixByGroupId.get(tag.collectionGroupId);
-		if (prefix === undefined) continue;
-		const pattern = `${prefix}.*`;
-		if (seen.has(pattern)) continue;
-		seen.add(pattern);
-		patterns.push(pattern);
-	}
-	return patterns;
 }
 
 /** 同じ一覧か（順序も含む）。 */

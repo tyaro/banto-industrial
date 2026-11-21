@@ -1,10 +1,10 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { UiSettingsProvider } from '@banto/admin-core';
 import { MemoryStorage } from './banto/testing/hubHttp';
 
 vi.mock('./banto/setup', () => ({ getUiSettings: () => undefined }));
 
-import { createWatchListStore } from './watchListStore';
+import { RETRY_BASE_MS, RETRY_MAX_MS, createWatchListStore } from './watchListStore';
 import { serializeWatchList } from './watchList';
 
 const LOCAL_KEY = 'banto.watch.v1.account%3A1';
@@ -190,5 +190,153 @@ describe('createWatchListStore', () => {
 		store.apply({ kind: 'add', ids: [1] });
 		expect(store.initial).toEqual([]);
 		expect(setItem).not.toHaveBeenCalled();
+	});
+});
+
+/** 最初の `failures` 回の GET だけ失敗するサーバー（すぐ返る）。 */
+function flakyProvider(initial: string | undefined, failures: number) {
+	const values = new Map<string, string>();
+	if (initial !== undefined) values.set('hub.watch.v1', initial);
+	let left = failures;
+	const set = vi.fn(async (key: string, value: string) => {
+		values.set(key, value);
+	});
+	const get = vi.fn(async (key: string) => {
+		if (left > 0) {
+			left -= 1;
+			throw new Error('offline');
+		}
+		return values.get(key) ?? null;
+	});
+	return { provider: { get, set } as unknown as UiSettingsProvider, values, get, set };
+}
+
+describe('createWatchListStore の読み直し（PR #1282 の再レビュー）', () => {
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it('初回の読みが失敗したら待って読み直し、確定したら溜めた操作を保存する', async () => {
+		vi.useFakeTimers();
+		const server = flakyProvider(serializeWatchList([1]), 1);
+		const onChange = vi.fn();
+		const store = createWatchListStore({
+			provider: server.provider,
+			storage: () => new MemoryStorage(),
+			owner: () => 'account:1',
+			visible: () => true,
+			onChange
+		});
+		// 読み込み中に足す（読み中なので前倒しはしない）。
+		const first = store.load();
+		store.apply({ kind: 'add', ids: [2] });
+		expect(await first).toBe(false);
+		expect(store.unsaved).toBe(true);
+		expect(server.set).not.toHaveBeenCalled();
+		expect(server.get).toHaveBeenCalledTimes(1);
+		await vi.advanceTimersByTimeAsync(RETRY_BASE_MS - 1);
+		expect(server.get).toHaveBeenCalledTimes(1);
+		await vi.advanceTimersByTimeAsync(1);
+		await settle();
+		expect(server.get).toHaveBeenCalledTimes(2);
+		expect(store.confirmed).toBe(true);
+		expect(store.unsaved).toBe(false);
+		expect(store.list).toEqual([1, 2]);
+		expect(server.values.get('hub.watch.v1')).toBe(serializeWatchList([1, 2]));
+		expect(onChange).toHaveBeenCalled();
+		store.dispose();
+	});
+
+	it('確定する前の操作は、再試行の待ちを打ち切ってすぐ読み直す', async () => {
+		vi.useFakeTimers();
+		const server = flakyProvider(serializeWatchList([1]), 1);
+		const store = createWatchListStore({
+			provider: server.provider,
+			storage: () => new MemoryStorage(),
+			owner: () => 'account:1',
+			visible: () => true
+		});
+		expect(await store.load()).toBe(false);
+		expect(server.get).toHaveBeenCalledTimes(1);
+		store.apply({ kind: 'add', ids: [3] });
+		await settle();
+		expect(server.get).toHaveBeenCalledTimes(2);
+		expect(store.confirmed).toBe(true);
+		expect(server.values.get('hub.watch.v1')).toBe(serializeWatchList([1, 3]));
+		// 待っていた再試行は取り消され、もう読まない。
+		await vi.advanceTimersByTimeAsync(RETRY_MAX_MS);
+		expect(server.get).toHaveBeenCalledTimes(2);
+		store.dispose();
+	});
+
+	it('待ちは倍々に延び、上限で止まる', async () => {
+		vi.useFakeTimers();
+		const server = flakyProvider(undefined, 100);
+		const store = createWatchListStore({
+			provider: server.provider,
+			storage: () => new MemoryStorage(),
+			owner: () => 'account:1',
+			visible: () => true
+		});
+		await store.load();
+		const calls = () => server.get.mock.calls.length;
+		await vi.advanceTimersByTimeAsync(2_000);
+		expect(calls()).toBe(2);
+		await vi.advanceTimersByTimeAsync(3_999);
+		expect(calls()).toBe(2);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(calls()).toBe(3);
+		// 8・16・32 秒、その後は 60 秒ごと。
+		await vi.advanceTimersByTimeAsync(8_000 + 16_000 + 32_000);
+		expect(calls()).toBe(6);
+		await vi.advanceTimersByTimeAsync(RETRY_MAX_MS - 1);
+		expect(calls()).toBe(6);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(calls()).toBe(7);
+		store.dispose();
+	});
+
+	it('dispose すると読み直しを止める', async () => {
+		vi.useFakeTimers();
+		const server = flakyProvider(undefined, 100);
+		const store = createWatchListStore({
+			provider: server.provider,
+			storage: () => new MemoryStorage(),
+			owner: () => 'account:1',
+			visible: () => true
+		});
+		await store.load();
+		store.dispose();
+		await vi.advanceTimersByTimeAsync(RETRY_MAX_MS * 3);
+		expect(server.get).toHaveBeenCalledTimes(1);
+	});
+
+	it('隠れている間は読まず、見えたらすぐ読む', async () => {
+		vi.useFakeTimers();
+		const server = flakyProvider(serializeWatchList([1]), 1);
+		let shown = false;
+		let wake: (() => void) | null = null;
+		const store = createWatchListStore({
+			provider: server.provider,
+			storage: () => new MemoryStorage(),
+			owner: () => 'account:1',
+			visible: () => shown,
+			onVisible: (listener) => {
+				wake = listener;
+				return () => {
+					wake = null;
+				};
+			}
+		});
+		await store.load();
+		await vi.advanceTimersByTimeAsync(RETRY_MAX_MS);
+		expect(server.get).toHaveBeenCalledTimes(1);
+		expect(wake).not.toBeNull();
+		shown = true;
+		wake!();
+		await settle();
+		expect(server.get).toHaveBeenCalledTimes(2);
+		expect(store.confirmed).toBe(true);
+		store.dispose();
 	});
 });

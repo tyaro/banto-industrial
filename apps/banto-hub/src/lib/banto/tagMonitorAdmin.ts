@@ -149,9 +149,14 @@ function fromRawCatalog(raw: RawCatalogResponse): CatalogResponse {
 	};
 }
 
-/** `/api/v1/stream` の `op: "data"` の1タグ分（`{ tag, v, q, t }`、未確認のときだけ `unverified: true`）。 */
+/**
+ * `/api/v1/stream` の `op: "data"` の1タグ分（`{ tag, id, v, q, t }`、未確認のときだけ
+ * `unverified: true`）。`id` はタグ ID で、サーバーは常に載せる（2026-11-22、#1254。
+ * 古いサーバーには無いので任意）。
+ */
 export interface StreamValue {
 	tag: string;
+	id?: number;
 	v: number | null;
 	q: string;
 	t: number;
@@ -299,6 +304,31 @@ const RECONNECT_MAX_DELAY_MS = 30000;
  * 間隔より短くして、ログイン直後にすぐ繋がるようにする）。 */
 const TOKEN_WAIT_DELAY_MS = 500;
 
+/**
+ * 購読の範囲（#1254）: パターン（`tags`）とタグ ID（`ids`）。`ids` は改名しても同じ
+ * タグを追い、同じ外部名で作り直された別 ID のタグは選ばず、未知の ID でも購読を
+ * 拒否されない（docs/hub/tag-server-design.md §5.2「タグ ID での購読」）。
+ * 値を見張る窓が `ids` だけで購読する。
+ */
+export interface StreamSubscriptionTarget {
+	tags?: readonly string[];
+	ids?: readonly number[];
+}
+
+/** subscribe のフレーム。配列はパターンだけの購読（今までどおり）。空の欄は送らない。 */
+function subscribeFrame(id: number, target: readonly string[] | StreamSubscriptionTarget): string {
+	const { tags, ids } = Array.isArray(target)
+		? { tags: target as readonly string[], ids: undefined }
+		: (target as StreamSubscriptionTarget);
+	return JSON.stringify({
+		op: 'subscribe',
+		id,
+		...(tags !== undefined && tags.length > 0 ? { tags } : {}),
+		...(ids !== undefined && ids.length > 0 ? { ids } : {}),
+		mode: 'on_change'
+	});
+}
+
 function wsUrl(path: string): string {
 	const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
 	return `${scheme}//${location.host}${path}`;
@@ -312,7 +342,8 @@ function wsUrl(path: string): string {
  * ようにするため（`mode` は引き続き常に `"on_change"`）。`getSubscriptionTags`
  * は呼ぶたびに最新の絞り込み結果を返す関数を渡す想定（`$derived` 相当を
  * クロージャで包んだもの）で、このモジュール自身は絞り込みロジックを
- * 持たない。
+ * 持たない。#1254 から、パターンの配列の代わりに {@link StreamSubscriptionTarget}
+ * （`tags`・`ids`）も返せる（値を見張る窓がタグ ID で購読する）。
  *
  * 戻り値は `{ disconnect, resubscribe, resume }`:
  * - `disconnect()`: ソケットを閉じ、保留中の再接続タイマーを止める
@@ -341,7 +372,7 @@ function wsUrl(path: string): string {
  */
 export function connectTagStream(
 	handlers: TagStreamHandlers,
-	getSubscriptionTags: () => string[]
+	getSubscriptionTags: () => string[] | StreamSubscriptionTarget
 ): { disconnect: () => void; resubscribe: () => void; resume: () => void } {
 	let stopped = false;
 	/**
@@ -459,14 +490,7 @@ export function connectTagStream(
 			reconnectDelayMs = RECONNECT_BASE_DELAY_MS;
 			handlers.onStatusChange?.(true);
 			expectSnapshot = true;
-			socket.send(
-				JSON.stringify({
-					op: 'subscribe',
-					id: subscriptionId,
-					tags: getSubscriptionTags(),
-					mode: 'on_change'
-				})
-			);
+			socket.send(subscribeFrame(subscriptionId, getSubscriptionTags()));
 		};
 
 		socket.onmessage = (event) => {
@@ -584,14 +608,7 @@ export function connectTagStream(
 		ws.send(JSON.stringify({ op: 'unsubscribe', id: subscriptionId }));
 		subscriptionId += 1;
 		expectSnapshot = true;
-		ws.send(
-			JSON.stringify({
-				op: 'subscribe',
-				id: subscriptionId,
-				tags: getSubscriptionTags(),
-				mode: 'on_change'
-			})
-		);
+		ws.send(subscribeFrame(subscriptionId, getSubscriptionTags()));
 	}
 
 	function resume(): void {

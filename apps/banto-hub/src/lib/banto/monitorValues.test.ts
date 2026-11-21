@@ -8,9 +8,10 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
-	keepAcceptedValues,
+	keyValuesById,
 	mergeTagValues,
 	replaceOrMergeTagValues,
+	tagIdValueKey,
 	type RowValue
 } from './monitorValues';
 
@@ -74,28 +75,22 @@ describe('replaceOrMergeTagValues', () => {
 	});
 });
 
-describe('keepAcceptedValues（値を見張る窓、#1254）', () => {
-	const val = (tag: string, v: number) => ({ tag, v, q: 'good', t: v });
+describe('keyValuesById（値を見張る窓、#1254）', () => {
+	const val = (tag: string, id: number | undefined, v: number) => ({ tag, id, v, q: 'good', t: v });
 
-	it('accept の外部名だけを残し、accept が無ければそのまま', () => {
-		const values = [val('a', 1), val('b', 2)];
-		expect(keepAcceptedValues(values, new Set(['a']))).toEqual([val('a', 1)]);
-		expect(keepAcceptedValues(values, undefined)).toBe(values);
+	it('ID のキーに付け替え、id の無い値は捨てる', () => {
+		expect(keyValuesById([val('a', 1, 1), val('b', undefined, 2)])).toEqual([
+			val(tagIdValueKey(1), 1, 1)
+		]);
 	});
 
-	it('見張り外の値はマップに残らず、購読し直しのスナップショットに無い外部名の値は落ちる', () => {
-		const watched = new Set(['a', 'b']);
-		let map = replaceOrMergeTagValues(
-			new Map(),
-			keepAcceptedValues([val('a', 1), val('b', 2), val('x', 9)], watched),
-			true
-		);
-		expect([...map.keys()].sort()).toEqual(['a', 'b']);
-		map = replaceOrMergeTagValues(map, keepAcceptedValues([val('x', 10)], watched), false);
-		expect([...map.keys()].sort()).toEqual(['a', 'b']);
-		// b は別の所で消された: 購読し直しのスナップショットに無い。
-		map = replaceOrMergeTagValues(map, keepAcceptedValues([val('a', 3)], watched), true);
-		expect([...map.keys()]).toEqual(['a']);
-		expect(map.get('a')?.v).toBe(3);
+	it('同じ外部名で作り直された別 ID の値は、旧 ID のキーに入らない', () => {
+		let map = replaceOrMergeTagValues(new Map(), keyValuesById([val('c.g.a', 1, 5)]), true);
+		expect(map.get(tagIdValueKey(1))?.v).toBe(5);
+		// ID 1 を消し、同じ外部名で ID 2 を作り直した（購読し直しのスナップショットには 2 は来ないが、
+		// 来たとしても）旧 ID の行には出ない。
+		map = replaceOrMergeTagValues(map, keyValuesById([val('c.g.a', 2, 9)]), true);
+		expect(map.get(tagIdValueKey(1))).toBeUndefined();
+		expect(map.get(tagIdValueKey(2))?.v).toBe(9);
 	});
 });

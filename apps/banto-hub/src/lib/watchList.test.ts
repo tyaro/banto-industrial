@@ -8,8 +8,7 @@ import {
 	removeFromWatch,
 	sameWatchList,
 	serializeWatchList,
-	watchListKeys,
-	watchSubscriptionPatterns
+	watchListKeys
 } from './watchList';
 
 describe('addToWatch', () => {
@@ -116,26 +115,5 @@ describe('applyWatchOps', () => {
 
 	it('足すときの上限は addToWatch と同じ', () => {
 		expect(applyWatchOps([1, 2], [{ kind: 'add', ids: [3, 4] }], 3)).toEqual([1, 2, 3]);
-	});
-});
-
-describe('watchSubscriptionPatterns', () => {
-	it('収集グループのワイルドカードを重複なしで、引けないグループは外す', () => {
-		const prefixes = new Map([
-			[10, 'plc1.fast'],
-			[11, 'plc1.slow']
-		]);
-		expect(
-			watchSubscriptionPatterns(
-				[
-					{ collectionGroupId: 11 },
-					{ collectionGroupId: 10 },
-					{ collectionGroupId: 11 },
-					{ collectionGroupId: 99 }
-				],
-				prefixes
-			)
-		).toEqual(['plc1.slow.*', 'plc1.fast.*']);
-		expect(watchSubscriptionPatterns([], prefixes)).toEqual([]);
 	});
 });

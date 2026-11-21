@@ -6,17 +6,35 @@
 //!
 //! ```jsonc
 //! // クライアント → サーバー
-//! { "op": "subscribe",   "id": 1, "tags": [...], "mode": "on_change" | "interval",
+//! { "op": "subscribe",   "id": 1, "tags": [...], "ids": [12, 34],
+//!   "mode": "on_change" | "interval",
 //!   "interval_ms": 1000 }          // mode=interval のとき必須
 //! { "op": "unsubscribe", "id": 1 }
 //! { "op": "ping" }
 //!
 //! // サーバー → クライアント
-//! { "op": "data",  "id": 1, "t": <送信時刻ms>, "values": [{ "tag", "v", "q", "t" }] }
+//! { "op": "data",  "id": 1, "t": <送信時刻ms>, "values": [{ "tag", "id", "v", "q", "t" }] }
 //! { "op": "event", "kind": "...", "connection": "...", "t": ... }
 //! { "op": "config_changed", "revision": 42 }
 //! { "op": "error", "id": 1, "code": "unknown_tag" | "invalid_request", "detail": "..." }
 //! ```
+//!
+//! ## タグ ID での購読（`ids`、2026-11-22 オーナー決定、#1254）
+//!
+//! `tags`（パターン）に加えて、任意の `ids`（タグ ID の整数の配列、最大
+//! [`MAX_SUBSCRIBE_IDS`] 件）で購読できる。`tags`・`ids` のどちらか、または両方を
+//! 送る（両方とも空なら `invalid_request`）。両方を送れば和集合。ID は評価の都度
+//! `TagMap` のタグ ID で引く（[`TagPattern::Ids`]）: 改名しても ID が同じなら同じ
+//! タグを追い、消した後に同じ外部名で作り直された別 ID のタグは選ばない。未知の
+//! ID は拒否せず 0 件マッチにするだけ（消されたタグを見張り続けるのは普通に起きる
+//! ので、ワイルドカードと同じ扱い。知らせもしない）。per-tag の read スコープは
+//! 具体名と同じく、スコープ外は 0 件マッチ。名前の形を解釈しないので、接続名・
+//! グループ名に `.` がある既存のデータでも購読できる（グループのワイルドカードは
+//! ちょうど 2 段でしかパースできない）。管理画面の値を見張る窓が使う。
+//!
+//! 値の `id`（タグ ID）は、`ids` で購読したときに限らず**常に**載せる。欄を足す
+//! だけなので既存のクライアントは壊れず、購読の仕方で値の形が変わらない方が
+//! 単純なため。gRPC・MCP・REST の値は変えない。
 //!
 //! ## コネクションのタスク構造
 //!
@@ -190,6 +208,11 @@ const _: () = assert!(REVALIDATE_TIMEOUT.as_nanos() < REVALIDATE_INTERVAL.as_nan
 /// (Policy Violation) - 「このエンドポイントの方針に反する（もう認められて
 /// いない）」。理由は close フレームの理由文（`api_key_revoked` 等）で分ける。
 pub const REVOKED_CLOSE_CODE: u16 = 1008;
+
+/// `subscribe` の `ids` の件数の上限（#1254）。`tags` には上限が無いが、ID の一覧は
+/// 画面の見張り（100 件まで）が使う想定で、桁違いの一覧で評価を重くしないため。
+/// 超えたら `invalid_request`。
+pub const MAX_SUBSCRIBE_IDS: usize = 1_000;
 
 /// 再検証の間隔と 1 回の上限。本番は [`Default`]（15 秒 / 5 秒）。テストは
 /// router に `Extension(StreamRevalidationTiming { .. })` を重ねて短くする
@@ -657,7 +680,12 @@ enum ModeWire {
 #[derive(Debug, Deserialize)]
 struct SubscribeWire {
     id: i64,
+    /// パターン（具体名・ワイルドカード）。`ids` だけで購読するなら省いてよい。
+    #[serde(default)]
     tags: Vec<String>,
+    /// タグ ID（#1254、モジュールの doc comment「タグ ID での購読」）。
+    #[serde(default)]
+    ids: Vec<i64>,
     mode: ModeWire,
     #[serde(default)]
     interval_ms: Option<i64>,
@@ -743,11 +771,20 @@ async fn handle_subscribe(
     close_tx: &mpsc::Sender<CloseFrame>,
     scope: Option<&ApiKeyContext>,
 ) -> bool {
-    if msg.tags.is_empty() {
+    if msg.tags.is_empty() && msg.ids.is_empty() {
         return send_error(
             Some(msg.id),
             "invalid_request",
-            "tags が空です".to_string(),
+            "tags と ids が両方とも空です".to_string(),
+            data_tx,
+            close_tx,
+        );
+    }
+    if msg.ids.len() > MAX_SUBSCRIBE_IDS {
+        return send_error(
+            Some(msg.id),
+            "invalid_request",
+            format!("ids は {MAX_SUBSCRIBE_IDS} 件までです"),
             data_tx,
             close_tx,
         );
@@ -761,7 +798,7 @@ async fn handle_subscribe(
     // 判別させる。T15-3 の `TestOutputControl`/`test_output` opt-in は元々
     // WS には無かった（gRPC 専用の仕組み）ので、この変更で WS 固有の
     // deprecated 概念は増えない。
-    let mut patterns = Vec::with_capacity(msg.tags.len());
+    let mut patterns = Vec::with_capacity(msg.tags.len() + 1);
     for raw in &msg.tags {
         match TagPattern::parse(raw) {
             Ok(pattern) => patterns.push(pattern),
@@ -769,6 +806,11 @@ async fn handle_subscribe(
                 return send_error(Some(msg.id), "invalid_request", detail, data_tx, close_tx)
             }
         }
+    }
+    // ID は存在を確かめない（未知の ID は 0 件マッチ、モジュールの doc comment
+    // 「タグ ID での購読」）。
+    if !msg.ids.is_empty() {
+        patterns.push(TagPattern::Ids(msg.ids.iter().copied().collect()));
     }
 
     let map = manager.tag_map();
@@ -900,6 +942,8 @@ fn evaluate(
 #[derive(Debug, Serialize)]
 struct ValueWire {
     tag: String,
+    /// タグ ID。常に載せる（モジュールの doc comment「タグ ID での購読」）。
+    id: i64,
     v: Option<f64>,
     q: &'static str,
     t: i64,
@@ -915,6 +959,7 @@ impl From<ResolvedValue> for ValueWire {
     fn from(value: ResolvedValue) -> Self {
         ValueWire {
             tag: value.tag,
+            id: value.id,
             v: value.v,
             q: quality_str(value.q),
             t: value.t,
@@ -1121,6 +1166,7 @@ pub(crate) mod tests {
         let wire = |unverified| {
             serde_json::to_value(ValueWire::from(ResolvedValue {
                 tag: "a.b.c".to_string(),
+                id: 7,
                 v: None,
                 q: banto_collect::Quality::Bad,
                 t: 1,
@@ -1130,6 +1176,8 @@ pub(crate) mod tests {
         };
         assert_eq!(wire(true)["unverified"], serde_json::json!(true));
         assert!(wire(false).get("unverified").is_none());
+        // #1254: タグ ID は常に載る。
+        assert_eq!(wire(false)["id"], serde_json::json!(7));
     }
 
     /// 偽の照合が返すもの。
