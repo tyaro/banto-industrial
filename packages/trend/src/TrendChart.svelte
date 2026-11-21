@@ -61,7 +61,13 @@
 		type TrendTimeBand,
 		type TrendTimeMark
 	} from './core/timeBands';
-	import { effectiveClip, samplesInRange, samplesMarkerPoints, samplesPath } from './core/samples';
+	import {
+		effectiveClip,
+		formatObservationTime,
+		samplesInRange,
+		samplesMarkerPoints,
+		samplesPath
+	} from './core/samples';
 	import {
 		axisOwners,
 		axisTickValues,
@@ -781,7 +787,7 @@
 
 {#snippet obsTime(v: CursorValue)}
 	{#if typeof v.tMs === 'number'}<small class="bi-trend__muted">
-			({formatDateTime(v.tMs, true)})</small
+			({formatObservationTime(v.tMs)})</small
 		>{/if}
 {/snippet}
 
