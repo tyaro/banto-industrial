@@ -623,4 +623,61 @@ test.describe.serial('banto-hub タグ登録のドックの枠 (#1253)', () => {
 		}
 		await clearSavedLayout();
 	});
+
+	test('15. サーバーの保存値が外形だけ正しく中身が使えない（部品が既定へ戻す）ときも、低い画面ではログを帯にし、配置を書かない（PR #1270 再レビュー P2）', async () => {
+		const broken = JSON.stringify({ schema: 1, panels: [], layout: {} });
+		for (const target of [
+			{ path: '/tags', setting: DOCK_SETTING, localPrefix: 'banto.dock.v2.tags.' },
+			{
+				path: '/monitor',
+				setting: '/api/ui-settings/hub.dock.v2.monitor',
+				localPrefix: 'banto.dock.v2.monitor.'
+			}
+		]) {
+			const put = await page.request.put(target.setting, {
+				headers: authedHeaders,
+				data: { value: broken }
+			});
+			expect(put.ok(), await put.text()).toBe(true);
+			await page.evaluate((prefix) => {
+				for (const key of Object.keys(localStorage)) {
+					if (key.startsWith(prefix)) localStorage.removeItem(key);
+				}
+			}, target.localPrefix);
+			const puts: string[] = [];
+			const onRequest = (req: Request) => {
+				if (req.url().includes(target.setting) && req.method() === 'PUT')
+					puts.push(req.postData() ?? '');
+			};
+			page.on('request', onRequest);
+			try {
+				const loaded = page.waitForResponse(
+					(r) => r.url().includes(target.setting) && r.request().method() === 'GET'
+				);
+				await page.goto(target.path);
+				await loaded;
+				await page.waitForTimeout(800);
+				await expect(logBandTab()).toBeVisible();
+				await expect(logPanel()).toBeHidden();
+				// 意図しない PUT が無い（送られたなら帯の値）。サーバーの値は壊れたまま残る。
+				for (const body of puts) {
+					expect(logIsBanded((JSON.parse(body) as { value: string }).value)).toBe(true);
+				}
+				expect(puts).toEqual([]);
+			} finally {
+				page.off('request', onRequest);
+			}
+			// 既定の配置（保存値なし）で終える。
+			const clear = await page.request.put(target.setting, {
+				headers: authedHeaders,
+				data: { value: '' }
+			});
+			expect(clear.ok(), await clear.text()).toBe(true);
+			await page.evaluate((prefix) => {
+				for (const key of Object.keys(localStorage)) {
+					if (key.startsWith(prefix)) localStorage.removeItem(key);
+				}
+			}, target.localPrefix);
+		}
+	});
 });

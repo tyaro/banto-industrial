@@ -30,6 +30,8 @@
  * `dockLogBand.svelte.ts`）ための口で、直した配置が基準になり、利用者の変更としては書かない。
  * 直すのに待ちがある（狭い表示で部品の控えを置き換える）ときは、`holding()` が真の間は基準も
  * 変更も取らない。真から偽に変わると effect が走り直し、直した後の配置を基準（または変更）にする。
+ * `rebaseline()` が真なら（サーバーの保存値が使えず部品が既定へ戻し、それを直した後）、その配置を
+ * 送らずに基準へ置き直す（`store.rebase`。利用者の変更ではないので書かない）。
  *
  * コンポーネントの初期化中（`$effect` を張れる所）に呼ぶ。
  */
@@ -56,11 +58,13 @@ export interface BaselineHook {
 	beforeBaseline(): void;
 	/** 直している途中か（反応する値。真の間は保存しない）。 */
 	holding(): boolean;
+	/** 直した後の配置を、送らずに基準へ置き直すか（1 回だけ真）。 */
+	rebaseline?(): boolean;
 }
 
 export function persistThreePaneLayout(
 	pane: () => ThreePaneSnapshotSource | undefined,
-	store: Pick<DockLayoutStore, 'save'>,
+	store: Pick<DockLayoutStore, 'save' | 'rebase'>,
 	narrow?: NarrowDisplay,
 	baseline?: BaselineHook
 ): void {
@@ -78,6 +82,9 @@ export function persistThreePaneLayout(
 		}
 		if (baseline?.holding()) return;
 		const snapshot = current.layoutSnapshot();
-		untrack(() => store.save(snapshot));
+		untrack(() => {
+			if (baseline?.rebaseline?.()) store.rebase(snapshot);
+			else store.save(snapshot);
+		});
 	});
 }

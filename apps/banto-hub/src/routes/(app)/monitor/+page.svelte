@@ -355,8 +355,9 @@
 		savedLayoutRequested = true;
 		void dockLayoutStore.loadSaved().then((saved) => {
 			if (saved === undefined || threePane !== pane) return;
-			logBand.savedRestored();
-			void pane.restoreLayout(saved);
+			// 部品が保存値を採らず既定へ戻したら、その既定にも低い画面の補正を当てて保存しない
+			// （PR #1270 再レビュー P2、`dockLogBand.svelte.ts`）。
+			logBand.restoreSaved(pane, saved);
 		});
 	});
 

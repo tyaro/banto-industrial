@@ -27,6 +27,13 @@
  *   最初から出すので、そのときの既定は部品の標準の幅（1280px）で測ってある。
  * - 「既定に戻す」: 部品の `resetLayout` の後に帯にする（利用者の操作なので、その結果は保存する）。
  *   狭い表示なら上と同じく控えを置き換える。済むまで保存を止め、補正前の配置を書かない。
+ * - サーバーの保存値（`restoreSaved`）: 部品の `restoreLayout` の結果の `status` で、保存値を採った
+ *   （`restored`・`repaired`）か、外形だけ正しく中身が使えずに部品が既定へ戻した（`default`）かを
+ *   分ける（PR #1270 再レビュー P2。例 `{"schema":1,"panels":[],"layout":{}}` は `dockLayout.ts` の
+ *   外形の検証を通るが、部品は開いた既定を当てて `default` を返し、`onRestore` は呼ばない）。
+ *   `default` なら最初の既定と同じ扱い: 低い画面では帯にし、利用者の変更としては書かない
+ *   （復元から補正まで `holding()` で保存を止め、済んだ配置を `rebaseline()` で保存の基準に
+ *   置き直す）。採ったときは今どおり補正しない（利用者の配置に従う）。
  */
 import { createDockState, type DockLayout, type ThreePaneViewMenuItem } from '@banto/dock-svelte';
 
@@ -39,6 +46,14 @@ export const LOG_BAND_MAX_VIEWPORT_HEIGHT = 900;
 
 /** 下のログのパネルの id（両ページの追加パネル）。 */
 export const LOG_PANEL_ID = 'log';
+
+/**
+ * 部品が最初の配置・復元の結果を既定で作ったか（`onRestore` の `fresh`・`default`、
+ * `restoreLayout` の `status` の `default`）。保存値を採った `restored`・`repaired` は偽。
+ */
+export function builtFromDefault(status: string | undefined): boolean {
+	return status === 'fresh' || status === 'default';
+}
 
 /** その高さの画面で、既定の配置のログを帯で始めるか。高さが分からない（0 以下）なら始めない。 */
 export function startsLogInBand(viewportHeight: number): boolean {
@@ -71,8 +86,11 @@ export interface LogBandPane {
 	resetLayout(): Promise<string>;
 	/** 保存の対象（狭い表示の間は控えた広い配置）。 */
 	layoutSnapshot(): { schema: 1; panels: string[]; layout: object };
-	/** 保存値を当てる（狭い表示の間は控えを置き換える）。 */
-	restoreLayout(saved: unknown): Promise<{ outcome: string }>;
+	/**
+	 * 保存値を当てる（狭い表示の間は控えを置き換える）。`status` は部品の `ThreePaneRestoreStatus`
+	 * （`restored`・`repaired`・`default`）。
+	 */
+	restoreLayout(saved: unknown): Promise<{ status?: string; outcome: string }>;
 }
 
 export interface LowScreenLogBandOptions {
@@ -91,8 +109,16 @@ export interface LowScreenLogBand {
 	beforeBaseline(): void;
 	/** 補正（控えの置き換え・既定に戻す）の途中か。真の間は保存しない（反応する値）。 */
 	holding(): boolean;
-	/** サーバーの保存値を当てたときに呼ぶ（以後、途中の補正の結果に手を加えない）。 */
-	savedRestored(): void;
+	/**
+	 * サーバーの保存値を当てる（以後、途中の補正の結果に手を加えない）。部品が既定へ戻した
+	 * （`status: 'default'`）なら、その既定にも低い画面の補正を当て、保存しない（基準に置き直す）。
+	 */
+	restoreSaved(pane: LogBandPane, saved: unknown): void;
+	/**
+	 * 保存を止めていた補正の結果を、利用者の変更ではなく保存の基準として扱うか（1 回だけ真を返す）。
+	 * `persistThreePaneLayout` が `holding()` の明けに読む。
+	 */
+	rebaseline(): boolean;
 	/** 「表示」メニューの項目の「レイアウトを既定に戻す」を、この規則の既定に戻す形へ替える。 */
 	viewItems(items: ThreePaneViewMenuItem[]): ThreePaneViewMenuItem[];
 }
@@ -101,6 +127,10 @@ export interface LowScreenLogBand {
 export function lowScreenLogBand(options: LowScreenLogBandOptions): LowScreenLogBand {
 	const height = options.viewportHeight ?? currentViewportHeight;
 	let startedDefault = false;
+	/** サーバーの保存値を当て始めたか（以後、最初の基準の補正はしない。復元の側が補正する）。 */
+	let savedTaken = false;
+	/** 済んだ補正の配置を、保存の基準に置き直すか（`rebaseline()` で 1 回だけ読む）。 */
+	let rebase = false;
 	/** 途中の補正の数（0 で保存を戻す）。 */
 	let pending = $state(0);
 	/** 最新の補正の世代（サーバーの保存値・新しい「既定に戻す」で古い補正を見送る）。 */
@@ -142,19 +172,32 @@ export function lowScreenLogBand(options: LowScreenLogBandOptions): LowScreenLog
 
 	return {
 		onRestore(status) {
-			startedDefault = status === 'fresh' || status === 'default';
+			startedDefault = builtFromDefault(status);
 		},
 		beforeBaseline() {
 			const pane = options.pane();
-			if (!startedDefault || !pane) return;
+			if (!startedDefault || savedTaken || !pane) return;
 			const gen = ++generation;
 			void held(() => bandIfLow(pane, gen));
 		},
 		holding() {
 			return pending > 0;
 		},
-		savedRestored() {
-			generation += 1;
+		restoreSaved(pane, saved) {
+			savedTaken = true;
+			const gen = ++generation;
+			void held(async () => {
+				const result = await pane.restoreLayout(saved);
+				if (result.outcome !== 'applied' || !builtFromDefault(result.status)) return;
+				if (gen !== generation || options.pane() !== pane) return;
+				await bandIfLow(pane, gen);
+				if (gen === generation) rebase = true;
+			});
+		},
+		rebaseline() {
+			const taken = rebase;
+			rebase = false;
+			return taken;
 		},
 		viewItems(items) {
 			return items.map((item) =>

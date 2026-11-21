@@ -39,6 +39,11 @@ export interface DockLayoutStore {
 	readonly initial: StoredDockLayout | undefined;
 	/** 今の配置を保存する（同じ配置なら何もしない）。 */
 	save(layout: StoredDockLayout): void;
+	/**
+	 * 今の配置を、送らずに比べる基準に置き直す（利用者の変更ではない配置。サーバーの保存値が
+	 * 使えず部品が既定へ戻したときの補正後の配置、`dockLogBand.svelte.ts`）。
+	 */
+	rebase(layout: StoredDockLayout): void;
 	/** サーバーの保存値を読む。当てるべき値があるときだけ返す（上の約束）。 */
 	loadSaved(): Promise<StoredDockLayout | undefined>;
 	/** ページを離れるときに呼ぶ（送信中の応答を捨てる）。 */
@@ -130,6 +135,10 @@ export function createDockLayoutStore(
 			writeLocal(raw);
 			if (loaded) setting.set(layout);
 			else pending = layout;
+		},
+		rebase(layout) {
+			if (disposed) return;
+			lastRaw = serializeDockLayout(layout);
 		},
 		async loadSaved() {
 			const outcome = await setting.load();

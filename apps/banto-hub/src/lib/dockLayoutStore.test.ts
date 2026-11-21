@@ -164,6 +164,24 @@ describe('createDockLayoutStore', () => {
 		expect(server.values.get('hub.dock.v2.monitor')).toBe(serializeDockLayout(layout(0.3)));
 	});
 
+	it('rebase は送らずに基準を置き直す（その後の同じ配置は送らず、違う配置は送る）', async () => {
+		const server = fakeProvider();
+		const store = createDockLayoutStore('monitor', {
+			provider: server.provider,
+			storage: () => new MemoryStorage(),
+			owner: () => 'account:1'
+		});
+		store.save(layout(0.2));
+		await store.loadSaved();
+		store.rebase(layout(0.4));
+		store.save(layout(0.4));
+		await settle();
+		expect(server.set).not.toHaveBeenCalled();
+		store.save(layout(0.5));
+		await settle();
+		expect(server.set).toHaveBeenCalledTimes(1);
+	});
+
 	it('送信に失敗した値は保存済みにせず、次の変更で最新を送り直す', async () => {
 		const server = fakeProvider();
 		const store = createDockLayoutStore('monitor', {

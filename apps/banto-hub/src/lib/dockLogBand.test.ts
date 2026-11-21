@@ -150,3 +150,92 @@ describe('lowScreenLogBand（狭い表示: 控えた広い配置を置き換え�
 		expect(dockedIds(t.kept().autoHidden?.[0]?.node ?? null)).toEqual(['log']);
 	});
 });
+
+describe('lowScreenLogBand.restoreSaved（サーバーの保存値、PR #1270 再レビュー P2）', () => {
+	function setup(options: { status: string; narrow?: boolean; height?: number }) {
+		let kept = defaultLayout(800);
+		const restored: unknown[] = [];
+		let banded = 0;
+		const pane: LogBandPane = {
+			resetLayout: async () => 'applied',
+			layoutSnapshot: () => ({ schema: 1, panels: [], layout: kept }),
+			restoreLayout: async (saved) => {
+				restored.push(saved);
+				// 部品は保存値を採らなければ開いた既定を当てる。
+				kept =
+					options.status === 'default'
+						? defaultLayout(800)
+						: (saved as { layout: DockLayout }).layout;
+				return { status: options.status, outcome: 'applied' };
+			}
+		};
+		const band = lowScreenLogBand({
+			pane: () => pane,
+			dock: {
+				autoHideRegion: () => {
+					if (options.narrow) return false;
+					banded += 1;
+					return true;
+				}
+			},
+			narrow: () => options.narrow ?? false,
+			viewportHeight: () => options.height ?? 720
+		});
+		return { band, pane, restored, banded: () => banded };
+	}
+	const flush = () => new Promise((r) => setTimeout(r, 0));
+
+	it('部品が既定へ戻した（default）なら、低い画面では帯にし、済むまで保存を止め、基準に置き直す', async () => {
+		const t = setup({ status: 'default' });
+		t.band.onRestore('fresh');
+		t.band.beforeBaseline();
+		expect(t.banded()).toBe(1);
+		t.band.restoreSaved(t.pane, { schema: 1, panels: [], layout: {} });
+		expect(t.band.holding()).toBe(true);
+		await flush();
+		expect(t.banded()).toBe(2);
+		expect(t.band.holding()).toBe(false);
+		expect(t.band.rebaseline()).toBe(true);
+		expect(t.band.rebaseline()).toBe(false);
+	});
+
+	it('狭い表示で default なら、控えを帯にした配置で置き換える', async () => {
+		const t = setup({ status: 'default', narrow: true });
+		t.band.restoreSaved(t.pane, { schema: 1, panels: [], layout: {} });
+		await flush();
+		expect(t.restored).toHaveLength(2);
+		const layout = (t.restored[1] as { layout: DockLayout }).layout;
+		expect(dockedIds(layout.autoHidden?.[0]?.node ?? null)).toEqual(['log']);
+		expect(t.band.holding()).toBe(false);
+		expect(t.band.rebaseline()).toBe(true);
+	});
+
+	it('高い画面で default なら帯にしないが、保存もしない（基準に置き直す）', async () => {
+		const t = setup({ status: 'default', height: 1080 });
+		t.band.restoreSaved(t.pane, { schema: 1, panels: [], layout: {} });
+		await flush();
+		expect(t.banded()).toBe(0);
+		expect(t.band.rebaseline()).toBe(true);
+	});
+
+	it('保存値を採った（restored・repaired）なら補正せず、基準にも置き直さない（利用者の配置に従う）', async () => {
+		for (const status of ['restored', 'repaired']) {
+			const t = setup({ status });
+			t.band.restoreSaved(t.pane, { schema: 1, panels: [], layout: defaultLayout(800) });
+			await flush();
+			expect(t.banded()).toBe(0);
+			expect(t.restored).toHaveLength(1);
+			expect(t.band.holding()).toBe(false);
+			expect(t.band.rebaseline()).toBe(false);
+		}
+	});
+
+	it('保存値を当て始めた後の最初の基準では補正しない（復元の側が補正する）', async () => {
+		const t = setup({ status: 'restored' });
+		t.band.onRestore('fresh');
+		t.band.restoreSaved(t.pane, { schema: 1, panels: [], layout: defaultLayout(800) });
+		t.band.beforeBaseline();
+		await flush();
+		expect(t.banded()).toBe(0);
+	});
+});
