@@ -7,6 +7,10 @@
  * `mergeTagValues`（最新値のマップ）・`monitorStreamView`（再接続中・バックプレッシャ
  * （close 1013）・止まっている間の表示）。購読は画面に見えている行ではなく、
  * ツリーで選んだ範囲（2026-11-21 オーナー決定。見えている行だけの購読は段階 3）。
+ * 値を見張る窓（#1254）は同じ部品を別のインスタンスで使い、`patterns`・`enabled` で
+ * 見張っているタグだけを窓が出ている間だけ購読する（ツリーの購読とは別の 2 本目のソケット。
+ * 部品の状態（再接続・バックプレッシャ・強調）がインスタンスごとに独立で、ツリーの範囲を
+ * 一時的に差し替える方式より単純で、片方の切断がもう片方に波及しない）。
  *
  * コンポーネントの初期化の中で 1 回呼ぶ（`$effect` を使う）。ページを離れると接続を閉じる。
  * 値は `external_name`（`{接続}.{グループ}.{タグ}`）をキーに持ち、行の状態は持たない
@@ -42,6 +46,16 @@ export interface TagValueStreamSources {
 	connections: () => PlcConnection[];
 	groups: () => CollectionGroup[];
 	/**
+	 * 購読のパターンを、ツリーの選択ではなくこの関数で決める（値を見張る窓、#1254: 見張って
+	 * いるタグの外部名の完全一致）。空配列は返さない（サーバーが拒否する）。`enabled` と合わせて使う。
+	 */
+	patterns?: () => string[];
+	/**
+	 * 接続しているか（既定は常に true）。false の間は接続を閉じる。見張りの窓は、画面に
+	 * 出ていて一覧が空でない間だけ true にする。
+	 */
+	enabled?: () => boolean;
+	/**
 	 * 設定（タグ・接続・グループ）が別の所で変わったという WS の知らせ（#1255）。
 	 * 一覧を読み直すかは呼び出し側が決める（編集の途中を巻き込まないため）。
 	 */
@@ -65,6 +79,9 @@ export interface TagValueStream {
 }
 
 export function createTagValueStream(sources: TagValueStreamSources): TagValueStream {
+	const patternsNow = (): string[] =>
+		sources.patterns?.() ??
+		subscriptionPatternsFor(sources.treeFilter(), sources.connections(), sources.groups());
 	let values = $state<Map<string, RowValue>>(new Map());
 	let view = $state(initialStreamView());
 	const mode = $derived(cellDisplayMode(view));
@@ -99,6 +116,7 @@ export function createTagValueStream(sources: TagValueStreamSources): TagValueSt
 	}
 
 	$effect(() => {
+		if (!(sources.enabled?.() ?? true)) return;
 		const { disconnect, resubscribe, resume } = connectTagStream(
 			{
 				onData: (incoming, { snapshot }) => {
@@ -139,7 +157,7 @@ export function createTagValueStream(sources: TagValueStreamSources): TagValueSt
 					);
 				}
 			},
-			() => subscriptionPatternsFor(sources.treeFilter(), sources.connections(), sources.groups())
+			() => untrack(patternsNow)
 		);
 		resubscribeSocket = resubscribe;
 		resumeSocket = resume;
@@ -156,13 +174,11 @@ export function createTagValueStream(sources: TagValueStreamSources): TagValueSt
 	// ツリーの選択（または接続・グループの一覧）でパターンが変わったら、既存のソケット上で
 	// 購読し直す（再接続はしない）。一覧を読み終える前は「すべて」（`subscriptionPatternsFor` が
 	// 引けない id を全件に倒す）なので、読み終えたときにも購読し直すよう、対象ではなくパターンを見る。
-	const subscriptionKey = $derived(
-		subscriptionPatternsFor(sources.treeFilter(), sources.connections(), sources.groups()).join(
-			'\n'
-		)
-	);
+	const subscriptionKey = $derived(patternsNow().join('\n'));
 	$effect(() => {
 		void subscriptionKey;
+		// 止めている間（見張りの窓: 一覧が空・窓が出ていない）は、空のパターンを送らない。
+		if (!(sources.enabled?.() ?? true)) return;
 		resubscribeSocket?.();
 		dispatch({ type: 'resubscribed' });
 	});
