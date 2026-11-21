@@ -22,6 +22,12 @@ export interface TrendPen {
 	label: string;
 	/** 色の枠 1〜16（1〜8 は banto の `--banto-chart-N`、9〜16 は `--bi-chart-N`）。 */
 	colorSlot: number;
+	/**
+	 * 色の直接指定（CSS の色）。あれば `colorSlot` より優先して線・マーカー・bit の帯・凡例の見本に使う。
+	 * null・未指定・空白だけは `colorSlot` の枠。SVG の属性に渡すだけで、CSS として正しいかは検証しない
+	 * （利用側の責任）。管理線を越えた区間の色は `TrendLimit.colorVar` のまま。
+	 */
+	color?: string | null;
 	unit?: string | null;
 	/** 小数の桁。未指定は有効数字 6 桁で出す。 */
 	decimals?: number | null;
@@ -157,6 +163,15 @@ export function penColorVar(slot: number): string {
 	const n = Number.isFinite(slot) ? Math.min(MAX_COLOR_SLOTS, Math.max(1, Math.round(slot))) : 1;
 	if (n <= 8) return `var(--banto-chart-${n})`;
 	return `var(--bi-chart-${n}, var(--banto-chart-${((n - 1) % 8) + 1}))`;
+}
+
+/**
+ * ペンの描画色。`color`（前後の空白を除いて空でなければ）を優先し、無ければ `penColorVar(colorSlot)`。
+ * `color` が CSS の色として正しいかは検証しない（利用側の責任）。
+ */
+export function penColor(pen: Pick<TrendPen, 'color' | 'colorSlot'>): string {
+	const c = typeof pen.color === 'string' ? pen.color.trim() : '';
+	return c !== '' ? c : penColorVar(pen.colorSlot);
 }
 
 /** 欠測の表示。 */

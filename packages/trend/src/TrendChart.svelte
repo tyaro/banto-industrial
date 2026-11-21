@@ -7,7 +7,7 @@
   - 操作: Ctrl（mac は Cmd）+ホイールでポインタの時刻を基準に拡大・縮小、Shift+ホイールと
     ドラッグで横のパン。素のホイールはページのスクロールに任せる。キーボードは ← → で
     幅の 10% のパン、+ / - で中央基準の拡大・縮小、Esc でカーソルを消す。
-  - 色はペンの `penColorVar`、文字・線・背景は `--banto-*` のトークンだけ。
+  - 色はペンの `penColor`（`color` があればそれ、無ければ色の枠）、文字・線・背景は `--banto-*` のトークンだけ。
   - 線種・線幅・マーカーはペンの属性（`core/style.ts`）。線は `stroke-width`・`stroke-dasharray`
     （線なしは path を出さない）、マーカーは線の上に 1 本の path（`fill` = ペンの色、stroke なし）。
     凡例の見本は `TrendPenSwatch`（線 + 中央のマーカーの小さな SVG）。
@@ -57,7 +57,7 @@
 		BIT_RANGE_TEXT,
 		formatValue,
 		isBitBand,
-		penColorVar,
+		penColor,
 		resolveYDomain
 	} from './core/pens';
 	import type { TrendPen, YDomain } from './core/pens';
@@ -519,7 +519,7 @@
 								y={bb.y}
 								width={sp.width}
 								height={bb.height}
-								fill={penColorVar(bb.pen.colorSlot)}
+								fill={penColor(bb.pen)}
 								opacity={sp.state === 'true' ? 1 : 0.4}
 							/>
 						{/each}
@@ -557,17 +557,13 @@
 								<path
 									class="bi-trend__line"
 									d={paths[i]}
-									stroke={penColorVar(pen.colorSlot)}
+									stroke={penColor(pen)}
 									stroke-width={resolveLineWidth(pen.lineWidth)}
 									stroke-dasharray={dashArray(pen.lineStyle, pen.lineWidth) ?? undefined}
 								/>
 							{/if}
 							{#if markerPaths[i]}
-								<path
-									class="bi-trend__marker"
-									d={markerPaths[i]}
-									fill={penColorVar(pen.colorSlot)}
-								/>
+								<path class="bi-trend__marker" d={markerPaths[i]} fill={penColor(pen)} />
 							{/if}
 							{#each limitLayouts[i]?.rects ?? [] as r, j (j)}
 								<g clip-path="url(#{uid}-lim-{i}-{j})">

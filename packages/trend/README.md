@@ -77,6 +77,8 @@
 
 ## ペンの線種・線幅・マーカー
 
+`TrendPen.color`（CSS の色の文字列、任意）。あれば `colorSlot` より優先して、線・マーカー・bit の帯・凡例の見本の色になる。null・未指定・空白だけは `colorSlot` の枠。前後の空白は除く。CSS として正しいかは検証しない（利用側の責任）。解決は `penColor`（`core/pens.ts`）。管理線を越えた区間の色は `TrendLimit.colorVar` のまま。注意: 管理線の `colorVar` に `var(--banto-warning)` を使うと `--banto-chart-2` のペンとほぼ同じ橙になり見分けにくい。
+
 `TrendPen` の任意の `lineStyle`（`solid`・`dashed`・`dashDot`・`dashDotDot`・`none`）・`lineWidth`（1〜4 px、既定 1.5）・`marker`（`none`・`circle`・`square`・`triangle`・`diamond`）・`markerSize`（2〜8 px、既定 4）。`null`・未指定は既定、範囲外は丸める。計算は `dashArray`・`markerPoints`・`markerPath`（`core/style.ts`、描画の層から独立）。凡例の見本は `TrendPenSwatch`（`pen` を渡すと線 + 中央のマーカーの小さな SVG になり、表示グループのページでも使える）。
 
 ## 管理線と、越えた区間の色替え

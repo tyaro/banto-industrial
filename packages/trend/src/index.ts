@@ -62,6 +62,7 @@ export {
 	resolveYDomain,
 	axisOwners,
 	penColorVar,
+	penColor,
 	formatValue,
 	formatBitValue,
 	isBitBand,

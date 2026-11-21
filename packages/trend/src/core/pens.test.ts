@@ -7,6 +7,7 @@ import {
 	formatBitValue,
 	formatValue,
 	isBitBand,
+	penColor,
 	penColorVar,
 	resolveYDomain,
 	type Bin,
@@ -150,6 +151,19 @@ describe('penColorVar', () => {
 		expect(penColorVar(99)).toBe('var(--bi-chart-16, var(--banto-chart-8))');
 		expect(penColorVar(NaN)).toBe('var(--banto-chart-1)');
 		expect(penColorVar(2.4)).toBe('var(--banto-chart-2)');
+	});
+});
+
+describe('penColor', () => {
+	it('color があれば colorSlot より優先し、前後の空白は除く', () => {
+		expect(penColor({ color: '#ff0000', colorSlot: 3 })).toBe('#ff0000');
+		expect(penColor({ color: '  rgb(1, 2, 3) ', colorSlot: 3 })).toBe('rgb(1, 2, 3)');
+	});
+	it('null・未指定・空白だけは colorSlot の枠', () => {
+		expect(penColor({ color: null, colorSlot: 3 })).toBe('var(--banto-chart-3)');
+		expect(penColor({ colorSlot: 9 })).toBe(penColorVar(9));
+		expect(penColor({ color: '', colorSlot: 2 })).toBe('var(--banto-chart-2)');
+		expect(penColor({ color: ' 	 ', colorSlot: 2 })).toBe('var(--banto-chart-2)');
 	});
 });
 

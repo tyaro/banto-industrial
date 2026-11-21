@@ -3,7 +3,7 @@
   （幅 32px、線 + 中央のマーカー）。計算は `core/style.ts`。線なし・マーカーなしでも幅は保つ。
 -->
 <script lang="ts">
-	import { isBitBand, penColorVar, type TrendPen } from './core/pens';
+	import { isBitBand, penColor, type TrendPen } from './core/pens';
 	import {
 		swatchDashArray,
 		swatchWidth,
@@ -18,13 +18,20 @@
 	}: {
 		pen: Pick<
 			TrendPen,
-			'colorSlot' | 'lineStyle' | 'lineWidth' | 'marker' | 'markerSize' | 'bit' | 'bitStyle'
+			| 'color'
+			| 'colorSlot'
+			| 'lineStyle'
+			| 'lineWidth'
+			| 'marker'
+			| 'markerSize'
+			| 'bit'
+			| 'bitStyle'
 		>;
 	} = $props();
 
 	const W = 32;
 	const H = 12;
-	const color = $derived(penColorVar(pen.colorSlot));
+	const color = $derived(penColor(pen));
 	const lineOn = $derived(resolveLineStyle(pen.lineStyle) !== 'none');
 	const width = $derived(swatchWidth(pen.lineWidth));
 	const dash = $derived(swatchDashArray(pen.lineStyle, pen.lineWidth));
