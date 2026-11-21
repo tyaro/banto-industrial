@@ -109,10 +109,7 @@ test.describe.serial('banto-hub postgres（DB Source）グループ作成・db �
 	let pgConnectionId: number;
 
 	test.beforeAll(async ({ browser }) => {
-		// #1253: 既定の配置で下のログのパネル（高さの 25%）が開くので、1280×720 ではタグ一覧の
-		// グリッドに行が出ない。グリッドを操作するこの spec は縦を広げる（既定の高さの扱いは
-		// オーナーの判断待ち）。
-		adminPage = await browser.newPage({ viewport: { width: 1280, height: 960 } });
+		adminPage = await browser.newPage();
 		await adminPage.goto('/login');
 		const adminToken = await fetchAuthToken(adminPage.request);
 		await injectAuthToken(adminPage, adminToken);

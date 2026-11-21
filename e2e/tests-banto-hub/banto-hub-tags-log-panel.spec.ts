@@ -11,13 +11,15 @@
  *
  * 管理者でない利用者に操作・書き込みの行が出ないことは、ロックダウン済みの専用サーバーの
  * `banto-hub-user-log-panel-viewer.spec.ts`（試運転中は閲覧者を作っても権限の差が出ない）。
- * 最後は既定の配置へ戻す（後の spec のため）。ファイル名は smoke より後（`t` > `s`）。
+ * 最初に 2 つのページの保存した配置を消し（既定から始める）、最後は既定の配置へ戻す（後の spec のため）。ファイル名は smoke より後（`t` > `s`）。
  */
 import { expect, test, type Page, type Request } from '@playwright/test';
-import { ensureLoggedIn } from './banto-hub-auth';
+import { CSRF_HEADERS, fetchAuthToken, injectAuthToken } from './banto-hub-auth';
 
-const WIDE = { width: 1280, height: 800 };
+/** 高い画面（ログを下に開いて始める。900px 未満の高さでは帯で始まる、2026-11-21 オーナー決定）。 */
+const WIDE = { width: 1920, height: 1080 };
 const MONITOR_SETTING = '/api/ui-settings/hub.dock.v2.monitor';
+const TAGS_SETTING = '/api/ui-settings/hub.dock.v2.tags';
 const FEED_PATH = '/api/log-feed';
 const FAKE_KEY = 'a:999999999';
 /** 読む間隔（5 秒）を 1 回またぐ余裕。 */
@@ -31,6 +33,23 @@ function feedCursor(req: Request): string | null | undefined {
 
 test.describe.serial('banto-hub 下のログのパネル (#1253)', () => {
 	let page: Page;
+	let authedHeaders: Record<string, string>;
+
+	/**
+	 * 2 つのページの保存した配置を消す（部品の既定から始める）。前の spec が低い画面で
+	 * 「既定に戻す」と、ログを帯にした既定が保存されて残る（2026-11-21 オーナー決定）。
+	 */
+	async function clearSavedLayouts(): Promise<void> {
+		for (const setting of [MONITOR_SETTING, TAGS_SETTING]) {
+			const res = await page.request.put(setting, { headers: authedHeaders, data: { value: '' } });
+			expect(res.ok(), await res.text()).toBe(true);
+		}
+		await page.evaluate(() => {
+			for (const key of Object.keys(localStorage)) {
+				if (key.startsWith('banto.dock.v2.')) localStorage.removeItem(key);
+			}
+		});
+	}
 
 	const panel = () => page.getByTestId('log-panel');
 	const rows = (source?: string) =>
@@ -41,7 +60,10 @@ test.describe.serial('banto-hub 下のログのパネル (#1253)', () => {
 	test.beforeAll(async ({ browser }) => {
 		page = await browser.newPage({ viewport: WIDE });
 		await page.goto('/login');
-		await ensureLoggedIn(page);
+		const token = await fetchAuthToken(page.request);
+		await injectAuthToken(page, token);
+		authedHeaders = { ...CSRF_HEADERS, Authorization: `Bearer ${token}` };
+		await clearSavedLayouts();
 	});
 
 	test.afterAll(async () => {

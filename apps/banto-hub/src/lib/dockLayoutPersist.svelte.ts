@@ -25,6 +25,10 @@
  * 切り替えが通れば、その時点の配置を保存する（断られた表示は求める表示ではないので、その間の
  * 変更を見送るのは許す）。
  *
+ * `beforeBaseline` は、最初の保存（保存の口が基準として受け取るだけの 1 回）の直前に 1 回だけ
+ * 呼ぶ。マウントした既定の配置をアプリの規則で直す（低い画面ではログを帯で始める、
+ * `dockLogBand.svelte.ts`）ための口で、直した配置が基準になり、利用者の変更としては書かない。
+ *
  * コンポーネントの初期化中（`$effect` を張れる所）に呼ぶ。
  */
 import { untrack } from 'svelte';
@@ -47,14 +51,20 @@ export interface NarrowDisplay {
 export function persistThreePaneLayout(
 	pane: () => ThreePaneSnapshotSource | undefined,
 	store: Pick<DockLayoutStore, 'save'>,
-	narrow?: NarrowDisplay
+	narrow?: NarrowDisplay,
+	beforeBaseline?: () => void
 ): void {
+	let baselined = false;
 	$effect(() => {
 		const current = pane();
 		if (!current) return;
 		if (narrow) {
 			const wanted = narrow.wanted();
 			if (wanted !== undefined && wanted !== narrow.shown()) return;
+		}
+		if (!baselined) {
+			baselined = true;
+			if (beforeBaseline) untrack(beforeBaseline);
 		}
 		const snapshot = current.layoutSnapshot();
 		untrack(() => store.save(snapshot));

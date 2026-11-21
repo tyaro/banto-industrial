@@ -86,6 +86,7 @@
 	import { createLogFeedState } from '#lib/banto/logFeedState.svelte.js';
 	import { isDockPanelOnScreen } from '#lib/dockPanelOnScreen.js';
 	import { persistThreePaneLayout } from '#lib/dockLayoutPersist.svelte.js';
+	import { lowScreenLogBand } from '#lib/dockLogBand.svelte.js';
 	import { canWriteResources } from '#lib/permissions.js';
 	import ConnectionTree from '#lib/components/ConnectionTree.svelte';
 	import TreeContextMenu from '#lib/components/TreeContextMenu.svelte';
@@ -2215,18 +2216,30 @@
 		threePaneRight: () => ATTRIBUTE_PANE_LABEL
 	};
 
+	// 低い画面では、部品が作った既定の配置（保存値が無い・既定に戻す）でログを下端の帯で
+	// 始める（2026-11-21 オーナー決定、`dockLogBand.svelte.ts`）。
+	const logBand = lowScreenLogBand({
+		pane: () => threePane,
+		dock,
+		narrow: () => layoutNarrow
+	});
 	/** 「表示」メニューの項目（左・右・区切り・レイアウトを既定に戻す）。 */
 	const viewItems = $derived(
-		threePane?.viewMenuItems({ resetLayout: 'レイアウトを既定に戻す' }) ?? []
+		logBand.viewItems(threePane?.viewMenuItems({ resetLayout: 'レイアウトを既定に戻す' }) ?? [])
 	);
 
 	// 配置の保存。最初の 1 回（マウントした時点の配置）は保存の口が基準として受け取るだけ。
 	// 広い ⇄ 狭いの切り替えの途中（求める表示と出している表示が食い違う間）は保存しない
 	// （`persistThreePaneLayout` の doc。PR #1268 のレビューで詰めた形をそのまま使う）。
-	persistThreePaneLayout(() => threePane, dockLayoutStore, {
-		wanted: () => mobileNavStore.isNarrow,
-		shown: () => layoutNarrow
-	});
+	persistThreePaneLayout(
+		() => threePane,
+		dockLayoutStore,
+		{
+			wanted: () => mobileNavStore.isNarrow,
+			shown: () => layoutNarrow
+		},
+		logBand.beforeBaseline
+	);
 
 	// サーバーの保存値（利用者ごと）を、枠のマウント後に 1 回だけ読んで当てる。
 	let savedLayoutRequested = false;
@@ -2235,7 +2248,9 @@
 		if (!pane || savedLayoutRequested) return;
 		savedLayoutRequested = true;
 		void dockLayoutStore.loadSaved().then((saved) => {
-			if (saved !== undefined && threePane === pane) void pane.restoreLayout(saved);
+			if (saved === undefined || threePane !== pane) return;
+			logBand.savedRestored();
+			void pane.restoreLayout(saved);
 		});
 	});
 
@@ -7153,6 +7168,7 @@
 			bind:this={threePane}
 			{dock}
 			initialLayout={dockLayoutStore.initial}
+			onRestore={logBand.onRestore}
 			bind:leftOpen={treeShown}
 			bind:rightOpen={rightShown}
 			bind:narrow={layoutNarrow}

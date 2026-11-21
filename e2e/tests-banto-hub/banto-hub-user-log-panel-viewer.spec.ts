@@ -36,7 +36,8 @@ test.describe
 	let viewerContext: BrowserContext | null = null;
 
 	test.beforeAll(async ({ browser }) => {
-		adminPage = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+		// 高さ 900px 未満の既定ではログが帯で始まる（2026-11-21 オーナー決定）ので、開いて始まる高さ。
+		adminPage = await browser.newPage({ viewport: { width: 1920, height: 1080 } });
 		await adminPage.goto('/login');
 		let token = await fetchAuthToken(adminPage.request);
 		const lockDownRes = await adminPage.request.post('/api/commissioning/lock-down', {
@@ -75,7 +76,7 @@ test.describe
 		});
 		expect(createRes.ok(), await createRes.text()).toBe(true);
 
-		viewerContext = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+		viewerContext = await browser.newContext({ viewport: { width: 1920, height: 1080 } });
 		const viewerPage = await viewerContext.newPage();
 		await viewerPage.goto('/login');
 		const loginRes = await viewerPage.request.post('/api/auth/login', {

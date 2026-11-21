@@ -18,6 +18,10 @@
  *    展開されて編集のフォームが見える（元の作りの `editPaneCollapsed = false` と同じ）。
  * 9. PR #1269 のレビュー（P2）: 属性を自動で隠す帯へ入れてから一覧のタグを選ぶと、引き出す
  *    （一覧を押すと帯へ戻る）のではなく元の場所へ戻り、一覧を押しても編集のフォームが見えたまま。
+ * 10〜12. 2026-11-21 オーナー決定: 低い画面（高さ 900px 未満）では、部品が作った既定の配置
+ *    （保存値が無い・「既定に戻す」）でログを下端の自動で隠す帯で始める。1280×720 では帯で、
+ *    タグ一覧の行が見え、帯のタブから引き出せる。帯で始めた既定は保存しない。1920×1080 では
+ *    下に開く。低い画面の「既定に戻す」も帯。保存値はサーバーの値を空にして消す。
  *
  * どのテストも既定の配置で終える（後の spec に残さない）。ファイル名は
  * `banto-hub-smoke.spec.ts` より辞書順で後（`banto-hub-auth.ts` の注記）。前提データは REST で
@@ -39,6 +43,9 @@ const NARROW = { width: 880, height: 800 };
 /** #1159: 1366×768 を 125% で表示したときの CSS の大きさ。 */
 const SCALED_125 = { width: 1093, height: 614 };
 
+/** 高い画面（ログを下に開いて始める）。 */
+const TALL = { width: 1920, height: 1080 };
+
 const DOCK_SETTING = '/api/ui-settings/hub.dock.v2.tags';
 
 test.describe.serial('banto-hub タグ登録のドックの枠 (#1253)', () => {
@@ -50,6 +57,8 @@ test.describe.serial('banto-hub タグ登録のドックの枠 (#1253)', () => {
 	const attributeToggle = () => page.getByTestId('tag-attribute-toggle');
 	const editPane = () => page.getByRole('complementary', { name: `${TAG_NAME} を編集` });
 	const editDrawer = () => page.getByRole('dialog', { name: `${TAG_NAME} を編集` });
+	const logPanel = () => page.getByTestId('log-panel');
+	const logBandTab = () => page.locator('button[data-dock-band-tab="log"]');
 	const dockSetting = (method: string) =>
 		page.waitForResponse((r) => r.url().includes(DOCK_SETTING) && r.request().method() === method);
 
@@ -63,6 +72,28 @@ test.describe.serial('banto-hub タグ登録のドックの枠 (#1253)', () => {
 	async function resetLayout(): Promise<void> {
 		await page.getByTestId('tag-view-menu').click();
 		await page.getByRole('menuitem', { name: 'レイアウトを既定に戻す' }).click();
+	}
+
+	/** 保存した配置を消す（サーバーの値を空に・localStorage の写しを消す）= 部品の既定から始める。 */
+	async function clearSavedLayout(): Promise<void> {
+		const res = await page.request.put(DOCK_SETTING, {
+			headers: authedHeaders,
+			data: { value: '' }
+		});
+		expect(res.ok(), await res.text()).toBe(true);
+		await page.evaluate(() => {
+			for (const key of Object.keys(localStorage)) {
+				if (key.startsWith('banto.dock.v2.tags.')) localStorage.removeItem(key);
+			}
+		});
+	}
+
+	/** サーバーに保存した配置（空なら `null`）。 */
+	async function savedLayout(): Promise<string | null> {
+		const res = await page.request.get(DOCK_SETTING, { headers: authedHeaders });
+		expect(res.ok()).toBe(true);
+		const body = (await res.json()) as { value: string | null };
+		return body.value === '' ? null : body.value;
 	}
 
 	async function openEditor(): Promise<void> {
@@ -407,5 +438,91 @@ test.describe.serial('banto-hub タグ登録のドックの枠 (#1253)', () => {
 		await expect(bandTab).toHaveCount(0);
 
 		await closeEditorAndReset();
+	});
+
+	test('10. 低い画面（1280×720）の既定ではログを帯で始め、一覧の行が見え、帯のタブから引き出せる（2026-11-21 オーナー決定）', async () => {
+		await clearSavedLayout();
+		const puts: string[] = [];
+		const onRequest = (req: Request) => {
+			if (req.url().includes(DOCK_SETTING) && req.method() === 'PUT')
+				puts.push(req.postData() ?? '');
+		};
+		page.on('request', onRequest);
+		try {
+			await openTags();
+			await expect(logBandTab()).toBeVisible();
+			await expect(logPanel()).toBeHidden();
+			await page.getByPlaceholder('名前・アドレスで検索').fill(TAG_NAME);
+			await expect(page.getByRole('gridcell', { name: TAG_NAME, exact: true })).toBeInViewport();
+
+			// 帯のタブから引き出せる。外の Esc で引っ込む。
+			await logBandTab().click();
+			await expect(logPanel()).toBeVisible();
+			await page.keyboard.press('Escape');
+			await expect(logPanel()).toBeHidden();
+			await expect(logBandTab()).toBeVisible();
+
+			// 帯で始めた既定も、引き出し・引っ込めも、利用者の配置の変更として書かない。
+			await page.waitForTimeout(800);
+			expect(puts).toEqual([]);
+			expect(await savedLayout()).toBeNull();
+		} finally {
+			page.off('request', onRequest);
+		}
+		await page.getByPlaceholder('名前・アドレスで検索').fill('');
+	});
+
+	test('11. 高い画面（1920×1080）の既定ではログを下に開く', async () => {
+		await page.setViewportSize(TALL);
+		try {
+			await clearSavedLayout();
+			await openTags();
+			await expect(logPanel()).toBeVisible();
+			await expect(logBandTab()).toHaveCount(0);
+		} finally {
+			await page.setViewportSize(WIDE);
+		}
+		// 高さが変わっても開いた配置は畳み直さない（利用者の配置と同じ扱い）。
+		await expect(logPanel()).toBeVisible();
+		await clearSavedLayout();
+	});
+
+	test('12. 低い画面の「レイアウトを既定に戻す」もログを帯にし、それを保存する。最後は既定の配置', async () => {
+		await clearSavedLayout();
+		await openTags();
+		await expect(logBandTab()).toBeVisible();
+
+		// ツリーを隠し、ログを下にドッキングし直す（帯のタブで引き出し、ピンで戻す）。
+		const hidden = dockSetting('PUT');
+		await treeToggle().click();
+		await expect(tree()).toBeHidden();
+		expect((await hidden).ok()).toBe(true);
+		await logBandTab().click();
+		await expect(logPanel()).toBeVisible();
+		await page.getByRole('button', { name: 'ログを元の場所に固定（ピンを留める）' }).click();
+		await expect(logBandTab()).toHaveCount(0);
+		await expect(logPanel()).toBeVisible();
+		await expect
+			.poll(async () => (await savedLayout())?.includes('"autoHidden"') ?? false)
+			.toBe(false);
+
+		await resetLayout();
+		await expect(tree()).toBeVisible();
+		await expect(logBandTab()).toBeVisible();
+		await expect(logPanel()).toBeHidden();
+		await expect
+			.poll(async () => {
+				const value = await savedLayout();
+				return value !== null && value.includes('"autoHidden"') && value.includes('"log"');
+			})
+			.toBe(true);
+
+		// 開き直しても帯（保存した既定に従う）。
+		await openTags();
+		await expect(logBandTab()).toBeVisible();
+		await expect(tree()).toBeVisible();
+
+		// 既定の配置（保存値なし）で終える。
+		await clearSavedLayout();
 	});
 });
