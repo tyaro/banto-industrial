@@ -68,6 +68,7 @@
 	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
 	import { sharedTreeTarget } from '#lib/treeSelection.svelte.js';
 	import { createTagValueStream } from '#lib/banto/tagValueStream.svelte.js';
+	import { tagIdValueKey } from '#lib/banto/monitorValues.js';
 	import {
 		tagValueCell,
 		tagValueSortKey,
@@ -107,6 +108,9 @@
 	} from '@banto/dock-svelte';
 	import { createDockLayoutStore } from '#lib/dockLayoutStore.js';
 	import LogPanel from '#lib/components/LogPanel.svelte';
+	import WatchPanel, { type WatchRowView } from '#lib/components/WatchPanel.svelte';
+	import { createWatchListStore } from '#lib/watchListStore.js';
+	import { WATCH_LIMIT, type WatchOp } from '#lib/watchList.js';
 	import { createLogFeedState } from '#lib/banto/logFeedState.svelte.js';
 	import { isDockPanelOnScreen } from '#lib/dockPanelOnScreen.js';
 	import { persistThreePaneLayout } from '#lib/dockLayoutPersist.svelte.js';
@@ -1617,6 +1621,7 @@
 		if (selectedIds.has(t.id)) classes.push('tag-row-selected');
 		// #1255 段階 ③: `?focus=` の確認対象（持続）と、値・品質が変わった直後の一瞬の強調。
 		const externalName = externalNameForTag(t);
+		classes.push(`tag-row-id-${t.id}`); // 行の右クリックで行を特定する（#1254）
 		if (focusSet.has(externalName)) classes.push('confirm-target');
 		if (valueStream.isFlashing(externalName)) classes.push('value-flash');
 		if (insertArmed && insertBlockedReasons.has(t.id)) classes.push('tag-row-insert-blocked');
@@ -2240,8 +2245,11 @@
 	onDestroy(() => logFeed.dispose());
 	const logPanelOnScreen = $derived(isDockPanelOnScreen(dock.layout, 'log', dock.flyoutPanel));
 	$effect(() => logFeed.setVisible(logPanelOnScreen));
+	// 値を見張る窓（#1254）。`initial` は部品の既定（閉じた浮動）。保存値に無い追加パネルは
+	// 部品が閉じた浮動で足すので、配置の保存キーの版は上げない。
 	const dockPanels = [
-		{ id: 'log', title: 'ログ', content: logPanel, initial: { edge: 'bottom' as const } }
+		{ id: 'log', title: 'ログ', content: logPanel, initial: { edge: 'bottom' as const } },
+		{ id: 'watch', title: '見張り', content: watchPanel }
 	];
 
 	const dockMessages = {
@@ -3453,6 +3461,145 @@
 		groups: () => groups,
 		onConfigChanged: () => scheduleConfigChangedReload()
 	});
+
+	// --- #1254: 値を見張る窓（追加パネル `watch`） ---------------------------------
+	//
+	// 見張っているタグの一覧（id の配列）は利用者ごとにサーバーへ保存する（`watchListStore.ts`）。
+	// 一覧の変更はすべて操作（`WatchOp`）として保存の口に渡し、表示は口の `list` を写す。
+	// サーバーの保存値が確定する前の操作は口が溜めて、確定した基準に当て直す（写しや空から
+	// 作った一覧でサーバーの一覧を消さない。PR #1282 のレビュー）。
+	// 値は、ツリーの購読（上の `valueStream`）とは別の 2 本目のストリームで、見張っている
+	// タグを**タグ ID で**購読し、値も ID で持つ（2026-11-22 オーナー決定、PR #1282 の再レビュー。
+	// 外部名の形（ドット入りの接続名・グループ名）や、外部名の別のタグへの使い回しに左右され
+	// ない。`tagValueStream.svelte.ts` 冒頭）。窓が画面に出ている間だけ、かつ一覧が空でない
+	// ときだけ繋ぐ。
+	// 読みに失敗したら、口が間隔を延ばしながら確定するまで読み直す（操作を受けたとき・
+	// config_changed のときは待たずに読む）。口の状態が変わるたびに `onChange` で写す。
+	const watchStore = createWatchListStore({ onChange: () => syncWatchState() });
+	onDestroy(() => watchStore.dispose());
+	let watchIds = $state<number[]>(watchStore.list);
+	let watchConfirmed = $state(false);
+	/** 操作がまだ保存されていない（窓に「保存待ち」を出す）。 */
+	let watchUnsaved = $state(false);
+	function syncWatchState(): void {
+		watchIds = watchStore.list;
+		watchConfirmed = watchStore.confirmed;
+		watchUnsaved = watchStore.unsaved;
+	}
+	function applyWatchOp(op: WatchOp): ReturnType<typeof watchStore.apply> {
+		const result = watchStore.apply(op);
+		syncWatchState();
+		return result;
+	}
+	void watchStore.load();
+	// 消されたタグは、サーバーの基準が確定し、タグ一覧を読んだ後に一覧から落とす（保存し直される）。
+	// 確定する前は落とさない（写しの消えた id を落としても、サーバーの一覧を守れない）。
+	$effect(() => {
+		if (!registryLoaded || !watchConfirmed) return;
+		const existing = new Set(tags.map((t) => t.id));
+		untrack(() => applyWatchOp({ kind: 'prune', existing }));
+	});
+
+	const watchedTags = $derived.by(() => {
+		const byId = new Map(tags.map((t) => [t.id, t]));
+		return watchIds.flatMap((id) => {
+			const tag = byId.get(id);
+			return tag === undefined ? [] : [tag];
+		});
+	});
+	const watchPanelOnScreen = $derived(isDockPanelOnScreen(dock.layout, 'watch', dock.flyoutPanel));
+	/** 購読するタグ ID（ページの一覧にあるものだけ。一覧に無い ID は行も出さない）。 */
+	const watchSubscribeIds = $derived(watchedTags.map((t) => t.id));
+	const watchStream = createTagValueStream({
+		treeFilter: () => treeFilter,
+		connections: () => connections,
+		groups: () => groups,
+		ids: () => watchSubscribeIds,
+		enabled: () => watchPanelOnScreen && watchSubscribeIds.length > 0,
+		// 別の所で消したタグの最後の値を「良好」のまま残さない: config_changed では、編集の
+		// 保護（一覧の読み直しの保留）とは別に、見張りのストリームだけ購読し直す。スナップ
+		// ショットは値のマップを置き換えるので、消えた ID の値は落ちて「値なし」になる（一覧の
+		// 行は、保留が解けて一覧を読み直したときに落ちる）。同じ外部名で作り直された別 ID の
+		// タグは ID が違うので、旧 ID の行に値は出ない。
+		onConfigChanged: () => {
+			watchStream.resubscribe();
+			watchStore.retryNow();
+		}
+	});
+	const watchRows = $derived.by((): WatchRowView[] =>
+		watchedTags.map((t) => {
+			// 値は ID で引く。名前の列はページのタグ一覧の名前（改名は一覧の読み直しで反映）。
+			const key = tagIdValueKey(t.id);
+			const cell = tagValueCell(watchStream.values, key, t.unit, watchStream.mode);
+			return {
+				id: t.id,
+				name: externalNameForTag(t),
+				value: cell.value,
+				qualityClass: cell.qualityClass,
+				qualityLabel: cell.qualityLabel,
+				time: tagValueTime(watchStream.values, key, watchStream.mode),
+				flashing: watchStream.isFlashing(key)
+			};
+		})
+	);
+
+	/** 見張りに足す対象: 選択モードなら選んだ行、そうでなければ属性に出している行。 */
+	const watchAddTargets = $derived.by((): number[] => {
+		if (selectionMode) return [...selectedIds];
+		return drawerMode === 'edit' && selected !== null ? [selected.id] : [];
+	});
+
+	function addWatchTags(ids: number[]): void {
+		if (ids.length === 0) return;
+		const result = applyWatchOp({ kind: 'add', ids });
+		if (result.added > 0 && !dock.isVisible('watch')) dock.show('watch');
+		if (result.overLimit > 0) {
+			toastStore.push(
+				'error',
+				`見張りは ${WATCH_LIMIT} タグまでです。${result.overLimit} 件は足していません。`
+			);
+		} else if (result.added === 0) {
+			toastStore.push('info', '選んだタグはすでに見張りにあります。');
+		}
+	}
+
+	// 行の右クリックのメニュー。`BantoGrid` には行の右クリックの口が無いので、グリッドを包む
+	// 要素で `contextmenu` を受け、行は `rowClass`（`tagRowClass`）に載せた `tag-row-id-<id>`
+	// で特定する（行の DOM に id の属性は無い）。BantoGrid の内部の DOM（`.row`）に頼る回り道で、
+	// 行の右クリックの口を banto に提案した（tyaro/banto#784）。入ったら置き換える。
+	interface WatchRowMenuState {
+		x: number;
+		y: number;
+		ids: number[];
+		triggerEl: HTMLElement | null;
+	}
+	let watchRowMenu: WatchRowMenuState | null = $state(null);
+
+	function handleGridContextMenu(event: MouseEvent): void {
+		const target = event.target;
+		if (!(target instanceof Element)) return;
+		const rowEl = target.closest('.row');
+		if (!rowEl) return;
+		const match = [...rowEl.classList].map((c) => /^tag-row-id-(\d+)$/.exec(c)).find(Boolean);
+		if (!match) return;
+		const id = Number(match[1]);
+		event.preventDefault();
+		// 選択モードで選んだ行の上なら、選んだ行すべて。そうでなければ右クリックした行だけ。
+		const ids = selectionMode && selectedIds.has(id) ? [...selectedIds] : [id];
+		watchRowMenu = {
+			x: event.clientX,
+			y: event.clientY,
+			ids,
+			triggerEl: document.activeElement instanceof HTMLElement ? document.activeElement : null
+		};
+	}
+
+	function closeWatchRowMenu(): void {
+		if (!watchRowMenu) return;
+		const trigger = watchRowMenu.triggerEl;
+		watchRowMenu = null;
+		restoreFocus(trigger, () => undefined);
+	}
 
 	// --- #1255: ほかの所での設定変更（WS の config_changed）の取り込み ------------
 	//
@@ -7432,6 +7579,16 @@
 						</span>
 					{/if}
 					<span class="frame-toolbar-spacer"></span>
+					<button
+						type="button"
+						class="tool-button"
+						data-testid="tag-watch-add"
+						disabled={watchAddTargets.length === 0}
+						title={watchAddTargets.length === 0
+							? '見張りに足すタグを選んでください（属性に出している行、複数選択なら選んだ行）'
+							: '値を見張る窓にタグを足します'}
+						onclick={() => addWatchTags(watchAddTargets)}>見張りに足す</button
+					>
 					{#if !layoutNarrow}
 						<button
 							type="button"
@@ -8070,7 +8227,8 @@
 										{:else if filteredTags.length === 0}
 											<p class="note">条件に一致するタグがありません。</p>
 										{:else}
-											<div class="grid-wrap">
+											<!-- svelte-ignore a11y_no_static_element_interactions -->
+											<div class="grid-wrap" oncontextmenu={handleGridContextMenu}>
 												<!--
 													T18-3e: `@banto/grid-svelte` の `GridState`
 													（`node_modules/@banto/grid-svelte/src/state.svelte.ts`）は
@@ -8167,6 +8325,18 @@
 	<LogPanel feed={logFeed} />
 {/snippet}
 
+<!-- #1254: 値を見張る窓（`ThreePaneDock` の追加パネル `watch`）。 -->
+{#snippet watchPanel()}
+	<WatchPanel
+		rows={watchRows}
+		status={watchStream.status}
+		onRemove={(id) => applyWatchOp({ kind: 'remove', id })}
+		onClear={() => applyWatchOp({ kind: 'clear' })}
+		onResume={watchStream.resume}
+		unsaved={watchUnsaved}
+	/>
+{/snippet}
+
 <!--
 	予約の仮想接続（`calc`/`mem`、`protocol === 'virtual'`）は、編集者でも接続先の
 	設定を読み取り専用にする（右クリックのメニューが再設定・削除を出さないのと同じ。
@@ -8256,6 +8426,24 @@
 			onSelect: () => activateTreeContextMenuAction(action)
 		}))}
 		onClose={closeTreeContextMenu}
+	/>
+{/if}
+
+{#if watchRowMenu}
+	<TreeContextMenu
+		x={watchRowMenu.x}
+		y={watchRowMenu.y}
+		items={[
+			{
+				id: 'watch-add',
+				label:
+					watchRowMenu.ids.length > 1
+						? `見張りに足す（${watchRowMenu.ids.length} 件）`
+						: '見張りに足す',
+				onSelect: () => addWatchTags(watchRowMenu?.ids ?? [])
+			}
+		]}
+		onClose={closeWatchRowMenu}
 	/>
 {/if}
 

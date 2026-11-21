@@ -7,7 +7,13 @@
  * 消した。
  */
 import { describe, expect, it } from 'vitest';
-import { mergeTagValues, replaceOrMergeTagValues, type RowValue } from './monitorValues';
+import {
+	keyValuesById,
+	mergeTagValues,
+	replaceOrMergeTagValues,
+	tagIdValueKey,
+	type RowValue
+} from './monitorValues';
 
 describe('mergeTagValues', () => {
 	it('空マップへ values を畳み込むと外部名をキーにしたマップになる', () => {
@@ -66,5 +72,25 @@ describe('replaceOrMergeTagValues', () => {
 	it('差分はマージする', () => {
 		const next = replaceOrMergeTagValues(cur, [{ tag: 'new', v: 2, q: 'good', t: 2 }], false);
 		expect([...next.keys()].sort()).toEqual(['new', 'old']);
+	});
+});
+
+describe('keyValuesById（値を見張る窓、#1254）', () => {
+	const val = (tag: string, id: number | undefined, v: number) => ({ tag, id, v, q: 'good', t: v });
+
+	it('ID のキーに付け替え、id の無い値は捨てる', () => {
+		expect(keyValuesById([val('a', 1, 1), val('b', undefined, 2)])).toEqual([
+			val(tagIdValueKey(1), 1, 1)
+		]);
+	});
+
+	it('同じ外部名で作り直された別 ID の値は、旧 ID のキーに入らない', () => {
+		let map = replaceOrMergeTagValues(new Map(), keyValuesById([val('c.g.a', 1, 5)]), true);
+		expect(map.get(tagIdValueKey(1))?.v).toBe(5);
+		// ID 1 を消し、同じ外部名で ID 2 を作り直した（購読し直しのスナップショットには 2 は来ないが、
+		// 来たとしても）旧 ID の行には出ない。
+		map = replaceOrMergeTagValues(map, keyValuesById([val('c.g.a', 2, 9)]), true);
+		expect(map.get(tagIdValueKey(1))).toBeUndefined();
+		expect(map.get(tagIdValueKey(2))?.v).toBe(9);
 	});
 });

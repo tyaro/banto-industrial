@@ -98,3 +98,23 @@ export function replaceOrMergeTagValues<V extends { tag: string } & RowValue>(
 ): Map<string, RowValue> {
 	return mergeTagValues(snapshot ? new Map() : current, values);
 }
+
+/**
+ * タグ ID で購読した（WS の `subscribe` の `ids`、#1254）値のマップ・強調のキー。外部名と
+ * 混ざらないよう接頭辞を付ける（`tagValueStream.svelte.ts` の見張りのインスタンスが使い、
+ * 窓の行は `values.get(tagIdValueKey(id))` で引く）。
+ */
+export function tagIdValueKey(id: number): string {
+	return `#id:${id}`;
+}
+
+/**
+ * ID で購読したときに受けた値を、ID のキー（{@link tagIdValueKey}）に付け替える。外部名では
+ * 持たないので、同じ外部名で作り直された別 ID のタグの値が旧 ID の行に出ない。`id` の無い値は
+ * 捨てる（`id` を載せない古いサーバーは、`ids` の購読も受け付けないので届かない）。
+ */
+export function keyValuesById<V extends { tag: string; id?: number }>(values: readonly V[]): V[] {
+	return values.flatMap((value) =>
+		typeof value.id === 'number' ? [{ ...value, tag: tagIdValueKey(value.id) }] : []
+	);
+}

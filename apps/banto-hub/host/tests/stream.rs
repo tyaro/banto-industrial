@@ -880,6 +880,75 @@ async fn subscribing_an_unknown_tag_is_rejected_and_not_subscribed() {
     assert_no_more_data_for(&mut ws, 9).await;
 }
 
+/// #1254（2026-11-22 オーナー決定）: `ids`（タグ ID）で購読できる。未知の ID は拒否
+/// せず 0 件マッチ、値には `id` が載る。`tags`・`ids` が両方とも空、`ids` が上限
+/// 超えは `invalid_request`。改名・外部名の使い回しの追い方は
+/// `banto_hub_core::subscribe_core` の単体テスト（`id_pattern_tests`）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subscribing_by_tag_ids_streams_only_those_tags_and_ignores_unknown_ids() {
+    let app = test_app("ids-subscribe").await;
+    let sim = Simulator::start().await;
+    sim.set_holding_register(0, 100); // 40001
+    sim.set_holding_register(1, 7); // 40002
+
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(conn_input("line1", sim.addr.port()))
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn.id, 100))
+        .await
+        .unwrap();
+    let tags = TagService::new(app.pool.clone());
+    tags.create(tag_input("temp01", group.id, "40001", "i16"))
+        .await
+        .unwrap();
+    let second = tags
+        .create(tag_input("temp02", group.id, "40002", "i16"))
+        .await
+        .unwrap();
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("apply after seeding");
+
+    let mut ws = connect_ws(&app.ws_url("/api/v1/stream"), Some(&app.token))
+        .await
+        .expect("ws handshake should succeed");
+
+    send_json(
+        &mut ws,
+        json!({ "op": "subscribe", "id": 3, "ids": [second.id, 999_999], "mode": "on_change" }),
+    )
+    .await;
+    let snapshot = recv_matching(&mut ws, |m| m["op"] == "data" && m["id"] == 3).await;
+    let values = snapshot["values"].as_array().unwrap();
+    assert_eq!(values.len(), 1, "only the known id: {snapshot}");
+    assert_eq!(values[0]["tag"], "line1.fast.temp02");
+    assert_eq!(values[0]["id"], second.id);
+
+    // 両方とも空は拒否。
+    send_json(
+        &mut ws,
+        json!({ "op": "subscribe", "id": 4, "ids": [], "mode": "on_change" }),
+    )
+    .await;
+    let error = recv_matching(&mut ws, |m| m["op"] == "error" && m["id"] == 4).await;
+    assert_eq!(error["code"], "invalid_request");
+
+    // 上限超えは拒否。
+    let too_many: Vec<i64> = (1..=1_001).collect();
+    send_json(
+        &mut ws,
+        json!({ "op": "subscribe", "id": 5, "ids": too_many, "mode": "on_change" }),
+    )
+    .await;
+    let error = recv_matching(&mut ws, |m| m["op"] == "error" && m["id"] == 5).await;
+    assert_eq!(error["code"], "invalid_request");
+
+    sim.stop();
+}
+
 // ---------------------------------------------------------------------------
 // 5. unsubscribe 後は data が止まる(ping/pong で生存確認)
 // ---------------------------------------------------------------------------
