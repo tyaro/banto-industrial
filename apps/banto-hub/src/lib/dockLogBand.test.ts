@@ -3,7 +3,9 @@ import { threePaneDockLayout, type DockLayout, type DockNode } from '@banto/dock
 import {
 	LOG_BAND_MAX_VIEWPORT_HEIGHT,
 	lowScreenDefaultLayout,
-	startsLogInBand
+	lowScreenLogBand,
+	startsLogInBand,
+	type LogBandPane
 } from './dockLogBand.svelte';
 
 /** 部品の既定の配置（両ページと同じ: 追加パネル `log` を下の外周）。 */
@@ -66,5 +68,85 @@ describe('lowScreenDefaultLayout', () => {
 			floating: []
 		} as DockLayout;
 		expect(lowScreenDefaultLayout(layout, 720)).toBe(layout);
+	});
+});
+
+describe('lowScreenLogBand（狭い表示: 控えた広い配置を置き換える、PR #1270 のレビュー）', () => {
+	function setup(options: { narrow: boolean; height?: number }) {
+		let kept = defaultLayout(800);
+		const restored: unknown[] = [];
+		let finishRestore: (() => void) | null = null;
+		const pane: LogBandPane = {
+			resetLayout: async () => {
+				kept = defaultLayout(800);
+				return 'applied';
+			},
+			layoutSnapshot: () => ({ schema: 1, panels: [], layout: kept }),
+			restoreLayout: (saved) =>
+				new Promise((resolve) => {
+					restored.push(saved);
+					finishRestore = () => {
+						kept = (saved as { layout: DockLayout }).layout;
+						resolve({ outcome: 'applied' });
+					};
+				})
+		};
+		const band = lowScreenLogBand({
+			pane: () => pane,
+			// 狭い表示ではログが木に無い（部品の口は動かせない）。
+			dock: { autoHideRegion: () => !options.narrow },
+			narrow: () => options.narrow,
+			viewportHeight: () => options.height ?? 800
+		});
+		return {
+			band,
+			restored,
+			finish: async () => {
+				finishRestore?.();
+				await new Promise((r) => setTimeout(r, 0));
+			},
+			kept: () => kept
+		};
+	}
+
+	it('狭い表示で既定から始めたら、控えをログを帯にした配置で置き換え、済むまで保存を止める', async () => {
+		const t = setup({ narrow: true });
+		t.band.onRestore('fresh');
+		t.band.beforeBaseline();
+		expect(t.band.holding()).toBe(true);
+		expect(t.restored).toHaveLength(1);
+		const layout = (t.restored[0] as { layout: DockLayout }).layout;
+		expect(dockedIds(layout.autoHidden?.[0]?.node ?? null)).toEqual(['log']);
+		await t.finish();
+		expect(t.band.holding()).toBe(false);
+	});
+
+	it('保存値から始めた・高い画面なら置き換えない', async () => {
+		const saved = setup({ narrow: true });
+		saved.band.onRestore('restored');
+		saved.band.beforeBaseline();
+		expect(saved.restored).toEqual([]);
+		expect(saved.band.holding()).toBe(false);
+		const tall = setup({ narrow: true, height: 1080 });
+		tall.band.onRestore('fresh');
+		tall.band.beforeBaseline();
+		await new Promise((r) => setTimeout(r, 0));
+		expect(tall.restored).toEqual([]);
+		expect(tall.band.holding()).toBe(false);
+	});
+
+	it('狭い表示の「既定に戻す」は、戻した既定を帯にして控えを置き換える（済むまで保存を止める）', async () => {
+		const t = setup({ narrow: true });
+		t.band.onRestore('restored');
+		const reset = t.band
+			.viewItems([{ kind: 'action', id: 'reset-layout', label: '戻す', onSelect: () => {} }])
+			.find((item) => item.kind === 'action');
+		(reset as { onSelect: () => void }).onSelect();
+		expect(t.band.holding()).toBe(true);
+		await new Promise((r) => setTimeout(r, 0));
+		expect(t.restored).toHaveLength(1);
+		await t.finish();
+		expect(t.band.holding()).toBe(false);
+		expect(dockedIds(t.kept().autoHidden?.[0]?.node ?? null)).toEqual(['log']);
 	});
 });

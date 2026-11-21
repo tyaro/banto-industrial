@@ -2238,7 +2238,7 @@
 			wanted: () => mobileNavStore.isNarrow,
 			shown: () => layoutNarrow
 		},
-		logBand.beforeBaseline
+		logBand
 	);
 
 	// サーバーの保存値（利用者ごと）を、枠のマウント後に 1 回だけ読んで当てる。

@@ -22,6 +22,10 @@
  *    （保存値が無い・「既定に戻す」）でログを下端の自動で隠す帯で始める。1280×720 では帯で、
  *    タグ一覧の行が見え、帯のタブから引き出せる。帯で始めた既定は保存しない。1920×1080 では
  *    下に開く。低い画面の「既定に戻す」も帯。保存値はサーバーの値を空にして消す。
+ * 13〜14. PR #1270 のレビュー（P2）: 狭い幅で始めた・狭い幅で既定に戻したときも、低い画面の
+ *    補正は部品が控えた広い配置そのものに当たる。狭い幅（880×800）で既定から始めて幅だけ
+ *    広げると、ログは帯で、配置を書かない（サーバー・localStorage とも）。狭い幅の「既定に戻す」
+ *    は、広い幅へ戻る前に帯の配置を保存する。
  *
  * どのテストも既定の配置で終える（後の spec に残さない）。ファイル名は
  * `banto-hub-smoke.spec.ts` より辞書順で後（`banto-hub-auth.ts` の注記）。前提データは REST で
@@ -47,6 +51,19 @@ const SCALED_125 = { width: 1093, height: 614 };
 const TALL = { width: 1920, height: 1080 };
 
 const DOCK_SETTING = '/api/ui-settings/hub.dock.v2.tags';
+
+/** 狭い幅・低い画面（ログを帯で始める高さ）と、そこから幅だけ広げた大きさ。 */
+const NARROW_LOW = { width: 880, height: 800 };
+const WIDE_LOW = { width: 1280, height: 800 };
+
+/** 保存値（JSON）のログが下端の帯（`autoHidden`）にあるか。 */
+function logIsBanded(raw: string | null): boolean {
+	if (raw === null) return false;
+	const value = JSON.parse(raw) as { layout?: { autoHidden?: { node: unknown }[] } };
+	return (value.layout?.autoHidden ?? []).some((entry) =>
+		JSON.stringify(entry.node).includes('"id":"log"')
+	);
+}
 
 test.describe.serial('banto-hub タグ登録のドックの枠 (#1253)', () => {
 	let page: Page;
@@ -523,6 +540,87 @@ test.describe.serial('banto-hub タグ登録のドックの枠 (#1253)', () => {
 		await expect(tree()).toBeVisible();
 
 		// 既定の配置（保存値なし）で終える。
+		await clearSavedLayout();
+	});
+	const localCopies = () =>
+		page.evaluate(() =>
+			Object.keys(localStorage)
+				.filter((k) => k.startsWith('banto.dock.v2.tags.'))
+				.sort()
+				.map((k) => [k, localStorage.getItem(k)])
+		);
+
+	test('13. 狭い幅（低い画面）で既定から始めて幅だけ広げると、ログは帯で、配置を書かない（PR #1270 のレビュー）', async () => {
+		await clearSavedLayout();
+		const puts: string[] = [];
+		const onRequest = (req: Request) => {
+			if (req.url().includes(DOCK_SETTING) && req.method() === 'PUT')
+				puts.push(req.postData() ?? '');
+		};
+		await page.setViewportSize(NARROW_LOW);
+		page.on('request', onRequest);
+		try {
+			await openTags();
+			await expect(treeToggle()).toHaveCount(0);
+			await page.waitForTimeout(800);
+			await page.setViewportSize(WIDE_LOW);
+			await expect(treeToggle()).toHaveAttribute('aria-pressed', 'true');
+			await expect(logBandTab()).toBeVisible();
+			await expect(logPanel()).toBeHidden();
+			await page.waitForTimeout(800);
+			expect(puts).toEqual([]);
+			expect(await localCopies()).toEqual([]);
+			expect(await savedLayout()).toBeNull();
+		} finally {
+			page.off('request', onRequest);
+			await page.setViewportSize(WIDE);
+		}
+		await clearSavedLayout();
+	});
+
+	test('14. 狭い幅（低い画面）の「既定に戻す」は、広い幅へ戻る前に帯の配置を保存する（PR #1270 のレビュー）', async () => {
+		// 広い幅でログを下にドッキングし直した配置を保存しておく（既定と違う値）。
+		await clearSavedLayout();
+		await page.setViewportSize(WIDE_LOW);
+		try {
+			await openTags();
+			await expect(logBandTab()).toBeVisible();
+			await logBandTab().click();
+			await expect(logPanel()).toBeVisible();
+			const pinned = dockSetting('PUT');
+			await page.getByRole('button', { name: 'ログを元の場所に固定（ピンを留める）' }).click();
+			expect((await pinned).ok()).toBe(true);
+			await expect.poll(async () => logIsBanded(await savedLayout())).toBe(false);
+
+			await page.setViewportSize(NARROW_LOW);
+			await openTags();
+			await expect(treeToggle()).toHaveCount(0);
+			await page.waitForTimeout(800);
+
+			const puts: string[] = [];
+			const onRequest = (req: Request) => {
+				if (req.url().includes(DOCK_SETTING) && req.method() === 'PUT')
+					puts.push(req.postData() ?? '');
+			};
+			page.on('request', onRequest);
+			try {
+				await resetLayout();
+				await expect.poll(() => puts.length).toBeGreaterThan(0);
+				await page.waitForTimeout(800);
+			} finally {
+				page.off('request', onRequest);
+			}
+			// 広い幅へ戻る前に、送った値・localStorage の写し・サーバーの値がどれも帯。
+			for (const body of puts) {
+				expect(logIsBanded((JSON.parse(body) as { value: string }).value)).toBe(true);
+			}
+			const copies = await localCopies();
+			expect(copies).toHaveLength(1);
+			expect(logIsBanded(copies[0][1])).toBe(true);
+			expect(logIsBanded(await savedLayout())).toBe(true);
+		} finally {
+			await page.setViewportSize(WIDE);
+		}
 		await clearSavedLayout();
 	});
 });

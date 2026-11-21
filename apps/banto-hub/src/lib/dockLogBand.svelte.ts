@@ -16,11 +16,18 @@
  * - 最初の既定: 保存の口の「最初の save は基準にするだけ」を守るため、保存の基準を取る直前
  *   （`persistThreePaneLayout` の `beforeBaseline`）に帯にする。帯で始めた既定を利用者の変更と
  *   して書かない。
- * - 狭い表示（部品が追加パネルを隠す）の間はログが木に無いので帯にできない。広い表示へ戻ったとき
- *   部品が既定を測り直すので、そこで帯にする（`pendingWide`）。サーバーの保存値を当てたら取り消す。
+ * - 狭い表示（部品が追加パネルを隠す）の間はログが木に無いので、`dock` では帯にできない。部品が
+ *   控えている広い配置（`layoutSnapshot()`。狭い表示の間はこれが保存の対象）に帯の補正をかけ、
+ *   `restoreLayout(補正後)` で控えを置き換える（部品の README「狭い表示」: 狭い表示の間の
+ *   `restoreLayout` は控えを置き換える）。補正は控えそのものに当たるので、狭 → 広の切り替えの
+ *   時点で新たな変更として起きない（PR #1270 レビュー P2）。置き換えが済むまでは `holding()` が
+ *   真で、保存の口は基準も変更も取らない（基準は補正後の控え）。
+ *   代わりに、部品が控えの既定を広い幅で測り直す（`wideIsDefault`）のは効かなくなり、左右の幅は
+ *   置き換えた時点の枠の幅で測った割合のままになる。両ページは狭い表示を `narrowOverride` で
+ *   最初から出すので、そのときの既定は部品の標準の幅（1280px）で測ってある。
  * - 「既定に戻す」: 部品の `resetLayout` の後に帯にする（利用者の操作なので、その結果は保存する）。
+ *   狭い表示なら上と同じく控えを置き換える。済むまで保存を止め、補正前の配置を書かない。
  */
-import { untrack } from 'svelte';
 import { createDockState, type DockLayout, type ThreePaneViewMenuItem } from '@banto/dock-svelte';
 
 /**
@@ -62,6 +69,10 @@ export function lowScreenDefaultLayout(layout: DockLayout, viewportHeight: numbe
 /** 部品（`ThreePaneDock`）の口のうち、ここで使うもの。 */
 export interface LogBandPane {
 	resetLayout(): Promise<string>;
+	/** 保存の対象（狭い表示の間は控えた広い配置）。 */
+	layoutSnapshot(): { schema: 1; panels: string[]; layout: object };
+	/** 保存値を当てる（狭い表示の間は控えを置き換える）。 */
+	restoreLayout(saved: unknown): Promise<{ outcome: string }>;
 }
 
 export interface LowScreenLogBandOptions {
@@ -78,41 +89,55 @@ export interface LowScreenLogBand {
 	onRestore(status: string): void;
 	/** `persistThreePaneLayout` の `beforeBaseline` に渡す（最初の保存の基準の直前に 1 回）。 */
 	beforeBaseline(): void;
-	/** サーバーの保存値を当てたときに呼ぶ（狭い表示から戻ったときの帯を取り消す）。 */
+	/** 補正（控えの置き換え・既定に戻す）の途中か。真の間は保存しない（反応する値）。 */
+	holding(): boolean;
+	/** サーバーの保存値を当てたときに呼ぶ（以後、途中の補正の結果に手を加えない）。 */
 	savedRestored(): void;
 	/** 「表示」メニューの項目の「レイアウトを既定に戻す」を、この規則の既定に戻す形へ替える。 */
 	viewItems(items: ThreePaneViewMenuItem[]): ThreePaneViewMenuItem[];
 }
 
-/** コンポーネントの初期化中（`$effect` を張れる所）に呼ぶ。 */
+/** コンポーネントの初期化中に呼ぶ。 */
 export function lowScreenLogBand(options: LowScreenLogBandOptions): LowScreenLogBand {
 	const height = options.viewportHeight ?? currentViewportHeight;
 	let startedDefault = false;
-	/** 狭い表示の間に既定を作った: 広い表示へ戻ったら帯にする。 */
-	let pendingWide = false;
+	/** 途中の補正の数（0 で保存を戻す）。 */
+	let pending = $state(0);
+	/** 最新の補正の世代（サーバーの保存値・新しい「既定に戻す」で古い補正を見送る）。 */
+	let generation = 0;
 
-	function bandIfLow(): void {
+	/**
+	 * 低い画面なら、いまの既定のログを帯にする。ドッキングしていれば `dock` で動かし、狭い表示で
+	 * 木に無ければ、控えた広い配置を補正して置き換える（済むまで `holding()`）。
+	 */
+	async function bandIfLow(pane: LogBandPane, gen: number): Promise<void> {
 		if (!startsLogInBand(height())) return;
-		if (!bandLogPanel(options.dock)) pendingWide = true;
+		if (bandLogPanel(options.dock)) return;
+		if (!options.narrow()) return;
+		const kept = pane.layoutSnapshot();
+		const banded = lowScreenDefaultLayout(kept.layout as DockLayout, height());
+		if (banded === kept.layout || gen !== generation || options.pane() !== pane) return;
+		await pane.restoreLayout({ ...kept, layout: banded });
 	}
 
-	$effect(() => {
-		const narrow = options.narrow();
-		if (narrow || !options.pane()) return;
-		untrack(() => {
-			if (!pendingWide) return;
-			pendingWide = false;
-			if (startsLogInBand(height())) bandLogPanel(options.dock);
-		});
-	});
+	async function held(run: () => Promise<void>): Promise<void> {
+		pending += 1;
+		try {
+			await run();
+		} finally {
+			pending -= 1;
+		}
+	}
 
-	async function reset(): Promise<void> {
+	function reset(): void {
 		const pane = options.pane();
 		if (!pane) return;
-		pendingWide = false;
-		const outcome = await pane.resetLayout();
-		if (outcome !== 'applied' || options.pane() !== pane) return;
-		bandIfLow();
+		const gen = ++generation;
+		void held(async () => {
+			const outcome = await pane.resetLayout();
+			if (outcome !== 'applied' || options.pane() !== pane || gen !== generation) return;
+			await bandIfLow(pane, gen);
+		});
 	}
 
 	return {
@@ -120,15 +145,21 @@ export function lowScreenLogBand(options: LowScreenLogBandOptions): LowScreenLog
 			startedDefault = status === 'fresh' || status === 'default';
 		},
 		beforeBaseline() {
-			if (startedDefault) bandIfLow();
+			const pane = options.pane();
+			if (!startedDefault || !pane) return;
+			const gen = ++generation;
+			void held(() => bandIfLow(pane, gen));
+		},
+		holding() {
+			return pending > 0;
 		},
 		savedRestored() {
-			pendingWide = false;
+			generation += 1;
 		},
 		viewItems(items) {
 			return items.map((item) =>
 				item.kind === 'action' && item.id === 'reset-layout'
-					? { ...item, onSelect: () => void reset() }
+					? { ...item, onSelect: () => reset() }
 					: item
 			);
 		}
