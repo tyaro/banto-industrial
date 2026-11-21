@@ -109,7 +109,10 @@ test.describe.serial('banto-hub postgres（DB Source）グループ作成・db �
 	let pgConnectionId: number;
 
 	test.beforeAll(async ({ browser }) => {
-		adminPage = await browser.newPage();
+		// #1253: 既定の配置で下のログのパネル（高さの 25%）が開くので、1280×720 ではタグ一覧の
+		// グリッドに行が出ない。グリッドを操作するこの spec は縦を広げる（既定の高さの扱いは
+		// オーナーの判断待ち）。
+		adminPage = await browser.newPage({ viewport: { width: 1280, height: 960 } });
 		await adminPage.goto('/login');
 		const adminToken = await fetchAuthToken(adminPage.request);
 		await injectAuthToken(adminPage, adminToken);
@@ -242,8 +245,9 @@ test.describe.serial('banto-hub postgres（DB Source）グループ作成・db �
 		await adminPage.getByPlaceholder('名前・アドレスで検索').fill(DB_TAG_NAME);
 		// `role=row`のアクセシブル名計算に依存せず、行内のテキスト内容で
 		// 絞り込む（`.filter({ hasText })`は可視テキストの部分一致で、
-		// アクセシビリティツリーの name 計算の実装差に左右されない）。
-		const row = adminPage.getByRole('row').filter({ hasText: DB_TAG_NAME });
+		// アクセシビリティツリーの name 計算の実装差に左右されない）。#1253 から下のログの
+		// パネルの行（`<tr>`）も同じ名前を含むので、グリッドの中に限る。
+		const row = adminPage.getByRole('grid').getByRole('row').filter({ hasText: DB_TAG_NAME });
 		await expect(row).toBeVisible();
 		await expect(row.getByRole('gridcell', { name: RESULT_COLUMN, exact: true })).toBeVisible();
 		await expect(row.getByRole('gridcell', { name: 'db', exact: true })).toBeVisible();

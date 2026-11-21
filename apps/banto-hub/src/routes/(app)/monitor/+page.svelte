@@ -106,6 +106,9 @@
 	import { createDockLayoutStore } from '#lib/dockLayoutStore.js';
 	import { persistThreePaneLayout } from '#lib/dockLayoutPersist.svelte.js';
 	import ConnectionTree from '#lib/components/ConnectionTree.svelte';
+	import LogPanel from '#lib/components/LogPanel.svelte';
+	import { createLogFeedState } from '#lib/banto/logFeedState.svelte.js';
+	import { isDockPanelOnScreen } from '#lib/dockPanelOnScreen.js';
 	import type { ConnectionTreeNodeData } from '#lib/components/connectionTreeTypes.js';
 	import { isProviderError } from '@banto/admin-core';
 
@@ -295,6 +298,19 @@
 	/** 狭い表示で、ツリーが帯から引き出されているか（#378 の「開いている」）。 */
 	const treeDrawerOpen = $derived(layoutNarrow && dock.flyoutPanel === 'left');
 	let treePaneEl: HTMLDivElement | undefined = $state();
+
+	/**
+	 * #1253: 下のログのパネル（追加パネル `log`、既定は下の外周）。取得と保持はページが持ち
+	 * （パネルは隠すと作り直されることがある）、実際に画面に出ている間だけ読む
+	 * （`isDockPanelOnScreen`。狭い表示では部品が追加パネルを隠すので止まる）。
+	 */
+	const logFeed = createLogFeedState();
+	onDestroy(() => logFeed.dispose());
+	const logPanelOnScreen = $derived(isDockPanelOnScreen(dock.layout, 'log', dock.flyoutPanel));
+	$effect(() => logFeed.setVisible(logPanelOnScreen));
+	const dockPanels = [
+		{ id: 'log', title: 'ログ', content: logPanel, initial: { edge: 'bottom' as const } }
+	];
 
 	const dockMessages = {
 		...defaultDockMessages,
@@ -677,6 +693,7 @@
 			bind:narrow={layoutNarrow}
 			narrowOverride={mobileNavStore.isNarrow}
 			keepMounted={(id) => id === 'left'}
+			panels={dockPanels}
 			messages={dockMessages}
 		>
 			{#snippet left()}
@@ -800,6 +817,10 @@
 		</ThreePaneDock>
 	</div>
 </div>
+
+{#snippet logPanel()}
+	<LogPanel feed={logFeed} />
+{/snippet}
 
 <style>
 	/* T18-4a: tags ページ（`(app)/tags/+page.svelte`）と同じ

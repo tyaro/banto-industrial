@@ -68,7 +68,10 @@ test.describe.serial('banto-hub タグ一括操作 (T18-3b)', () => {
 	const tagIds: number[] = [];
 
 	test.beforeAll(async ({ browser }) => {
-		page = await browser.newPage();
+		// #1253: 既定の配置で下のログのパネル（高さの 25%）が開くので、1280×720 ではタグ一覧の
+		// グリッドに行が出ない。グリッドを操作するこの spec は縦を広げる（既定の高さの扱いは
+		// オーナーの判断待ち）。
+		page = await browser.newPage({ viewport: { width: 1280, height: 960 } });
 		await page.goto('/login');
 
 		const token = await fetchAuthToken(page.request);

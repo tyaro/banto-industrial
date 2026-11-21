@@ -82,6 +82,9 @@
 		type DockNode
 	} from '@banto/dock-svelte';
 	import { createDockLayoutStore } from '#lib/dockLayoutStore.js';
+	import LogPanel from '#lib/components/LogPanel.svelte';
+	import { createLogFeedState } from '#lib/banto/logFeedState.svelte.js';
+	import { isDockPanelOnScreen } from '#lib/dockPanelOnScreen.js';
 	import { persistThreePaneLayout } from '#lib/dockLayoutPersist.svelte.js';
 	import { canWriteResources } from '#lib/permissions.js';
 	import ConnectionTree from '#lib/components/ConnectionTree.svelte';
@@ -2192,6 +2195,18 @@
 	let treeToolbarToggleEl: HTMLButtonElement | undefined = $state();
 	/** 枠の外側（帯のタブをこのページの枠の中から引く）。 */
 	let contentEl: HTMLDivElement | undefined = $state();
+
+	/**
+	 * #1253: 下のログのパネル（追加パネル `log`、既定は下の外周。タグモニタと同じ部品と配線）。
+	 * 取得と保持はページが持ち、実際に画面に出ている間だけ読む（`isDockPanelOnScreen`）。
+	 */
+	const logFeed = createLogFeedState();
+	onDestroy(() => logFeed.dispose());
+	const logPanelOnScreen = $derived(isDockPanelOnScreen(dock.layout, 'log', dock.flyoutPanel));
+	$effect(() => logFeed.setVisible(logPanelOnScreen));
+	const dockPanels = [
+		{ id: 'log', title: 'ログ', content: logPanel, initial: { edge: 'bottom' as const } }
+	];
 
 	const dockMessages = {
 		...defaultDockMessages,
@@ -7145,6 +7160,7 @@
 			rightWidth={EDIT_PANE_DEFAULT_WIDTH}
 			keepMounted={(id) => id === 'left'}
 			persistent={(id) => id === 'right'}
+			panels={dockPanels}
 			messages={dockMessages}
 			right={editPane}
 		>
@@ -7900,6 +7916,11 @@
 	「収集グループを追加」（既存の作成のモーダル）を付ける。グループの公開の
 	トグル（§外部公開）はまだ無い。
 -->
+<!-- #1253: 下のログのパネル（`ThreePaneDock` の追加パネル `log`。タグモニタと同じ部品）。 -->
+{#snippet logPanel()}
+	<LogPanel feed={logFeed} />
+{/snippet}
+
 <!--
 	予約の仮想接続（`calc`/`mem`、`protocol === 'virtual'`）は、編集者でも接続先の
 	設定を読み取り専用にする（右クリックのメニューが再設定・削除を出さないのと同じ。

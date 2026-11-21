@@ -2,7 +2,7 @@
  * #1253（docs/hub/banto-hub-ui-improvement-proposal.md §ドック型の配置）: タグ登録（`/tags`）の
  * 枠を `@banto/dock-svelte` の `ThreePaneDock` へ載せ替えたことの実 DOM 受け入れテスト。
  *
- * 1. 配置（ツリー・属性の表示・非表示）は利用者ごとに保存され（`hub.dock.tags`）、URL には
+ * 1. 配置（ツリー・属性の表示・非表示）は利用者ごとに保存され（`hub.dock.v2.tags`）、URL には
  *    載らず、「表示」メニューの「レイアウトを既定に戻す」で戻せる。
  * 2. 右（属性 = 編集のフォーム）は据え置き（`persistent`）: 隠す・出す・既定に戻す・狭い表示を
  *    行き来しても、未保存の入力が消えず、広い表示では同じ入力欄（DOM）のまま。
@@ -39,7 +39,7 @@ const NARROW = { width: 880, height: 800 };
 /** #1159: 1366×768 を 125% で表示したときの CSS の大きさ。 */
 const SCALED_125 = { width: 1093, height: 614 };
 
-const DOCK_SETTING = '/api/ui-settings/hub.dock.tags';
+const DOCK_SETTING = '/api/ui-settings/hub.dock.v2.tags';
 
 test.describe.serial('banto-hub タグ登録のドックの枠 (#1253)', () => {
 	let page: Page;
@@ -232,7 +232,7 @@ test.describe.serial('banto-hub タグ登録のドックの枠 (#1253)', () => {
 		const localCopies = () =>
 			page.evaluate(() =>
 				Object.keys(localStorage)
-					.filter((k) => k.startsWith('banto.dock.tags.'))
+					.filter((k) => k.startsWith('banto.dock.v2.tags.'))
 					.sort()
 					.map((k) => [k, localStorage.getItem(k)])
 			);

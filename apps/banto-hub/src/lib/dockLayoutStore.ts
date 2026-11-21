@@ -3,11 +3,11 @@
  * `/monitor` と `/tags` が同じ口を使い、ページの名前でキーを分ける。
  *
  * 置き場は `settings.svelte.ts` と同じ二層:
- * - localStorage（`banto.dock.<page>.<持ち主>`）: 写し。最初の描画（`ThreePaneDock` の
+ * - localStorage（`banto.dock.v2.<page>.<持ち主>`）: 写し。最初の描画（`ThreePaneDock` の
  *   `initialLayout`）に使う。書けなくても（容量・無効）黙って続ける。持ち主（今のセッションの
  *   `owner`）は作った時点で決める。分からなければ写しを読まず（既定の配置）書きもしない。
  *   作った後に持ち主が替わっていたら（別のタブで別の利用者がログイン）、写しを書かない。
- * - `UiSettingsProvider`（`hub.dock.<page>`、Hub のサーバー・利用者ごと）: 本体。デスクトップ版は
+ * - `UiSettingsProvider`（`hub.dock.v2.<page>`、Hub のサーバー・利用者ごと）: 本体。デスクトップ版は
  *   起動ごとに origin が変わり localStorage が消えるので、マウント後に読み直して当てる。
  *   送信は `@banto/admin-core` の `createSavedSetting`（即時の形）に任せる: 送っている間は 1 本、
  *   その間の変更は最新だけを続けて送る。**保存済みの印は送信が成功した値だけ**で、失敗したら
