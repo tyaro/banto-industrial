@@ -117,6 +117,7 @@
 - [ ] フィクスチャは `beforeAll` の先頭と `afterAll` の両方で掃除する（banto-hub は `banto-hub-fixture-cleanup.ts` の `cleanupFixtures`）。
 - [ ] **スペックのファイル名は辞書順が実行順**。初回セットアップを行う `*smoke*` より後に来る名前にする（`workers: 1` / `fullyParallel: false`）。`m` は `s` より前に並ぶ: 2026-11-17 の #1164 で `banto-hub-menubar.spec.ts` が smoke より先に初回セットアップを済ませ、smoke が落ちた（spec のコメントは「smoke より後」と書いていた。名前を付けたら `ls` で並びを見る）。
 - [ ] 狭幅の検証は `400x800`（ツリー退避）と `880x800`（ペインが出る狭幅）を使い分ける。
+- [ ] **spec を別のページへ移すと、その spec が残す利用者ごとの保存（ドックの配置など）も移った先のページのものになり、後の spec に効く**。`afterAll` で消す。`/tags` の表の行は `getByRole('row')` だとログのパネルの行にも当たるので `[role="row"].row` で取る（#1255、`/monitor` の吸収で 3 本が CI で落ちた）。
 - [ ] **E2E だけ落ちるときは実装のバグを疑う**（過去 2 回とも実バグだった）。テストを緩めない。
 - [ ] **CI でだけ落ちるフレークは、まず失敗時のアーティファクト（`error-context.md` の DOM・`test-failed-1.png`・trace）で「落ちた瞬間の状態」を見る**。#399 は「共有 page の幅の戻し忘れ」と見立てられていたが、trace のビューポートは 400x800 のままで、実際は**製品のバグ**だった: サイドバーの `visibility` を**開く側でも** 0.2s 遷移させていたため、開いてから最初のアニメーションフレームが進むまで計算値が `hidden` のままになり、Esc の層判定（`escLayering.ts`）がサイドバーを見落とした。遅いランナーでしか踏まず、ローカルのキー入力では 20/20 通る。**開く遷移に `visibility` を載せない**（閉じる側だけ）。再現は「クリック → DOM 反映 → キー」を `page.evaluate` の 1 タスク内で行うと決定的に取れる（テスト 31b）。
 - [ ] **REST の形を変えて E2E を一括で書き換えるときは、spec がどのアプリを叩くかを Playwright の設定（`e2e/*.playwright.config.ts` の `testDir` と起動するサーバー）で確かめる**。`/api/plc-connections` のような同じパスは ChronoGazer にもあり、`e2e/tests-public-viewer/` は ChronoGazer の REST（平らな形のまま）だった。パスの grep だけで対象を決めて書き換え、422 で落ちた（2026-10-24、#813）。

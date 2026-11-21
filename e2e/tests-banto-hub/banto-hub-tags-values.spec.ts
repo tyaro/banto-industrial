@@ -66,7 +66,7 @@ test.describe.serial('banto-hub タグ登録の値の列 (#1255 段階 ②)', ()
 	const subscribeIds: number[] = [];
 
 	function row(): Locator {
-		return page.getByRole('row').filter({ hasText: TAG });
+		return page.locator('[role="row"].row').filter({ hasText: TAG });
 	}
 	function cellOf(field: string): Locator {
 		return row().locator(`[data-cell-field="${field}"]`);

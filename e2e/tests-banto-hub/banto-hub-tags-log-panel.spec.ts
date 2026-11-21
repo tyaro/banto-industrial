@@ -66,6 +66,9 @@ test.describe.serial('banto-hub 下のログのパネル (#1253)', () => {
 	});
 
 	test.afterAll(async () => {
+		// #1255: 3 の隠す・見せ直すは `/tags` の配置に保存を残す（以前は `/monitor` の配置だった）。
+		// 後の spec が部品の既定（低い画面ではログが帯）から始まるよう、保存を消す。
+		await clearSavedLayouts();
 		await page.close();
 	});
 
@@ -186,10 +189,9 @@ test.describe.serial('banto-hub 下のログのパネル (#1253)', () => {
 			page.off('request', onRequest);
 		}
 
-		// 既定に戻す（見せ直した配置が既定と同じなら保存は起きない。後の spec のため）。
-		await page.getByTestId('tag-view-menu').click();
-		await page.getByRole('menuitem', { name: 'レイアウトを既定に戻す' }).click();
-		await expect(panel()).toBeVisible();
-		await expect(page.getByTestId('tag-tree-toggle')).toHaveAttribute('aria-pressed', 'true');
+		// 後の spec のための配置の後始末は `afterAll` の `clearSavedLayouts()` に任せる。
+		// #1255: 以前はここで「表示」→「レイアウトを既定に戻す」を押していたが、`/tags` では
+		// CI だけでその項目の押下が表の見出しに遮られて時間切れになった（手元では再現しない）。
+		// 「既定に戻す」の操作自体は `banto-hub-tags-dock-layout.spec.ts` が試している。
 	});
 });
