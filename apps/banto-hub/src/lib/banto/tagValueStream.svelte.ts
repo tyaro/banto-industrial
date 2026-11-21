@@ -17,7 +17,7 @@ import { untrack } from 'svelte';
 import { connectTagStream } from './tagMonitorAdmin';
 import { subscriptionPatternsFor } from './monitorSubscription';
 import type { MonitorTreeFilter } from './monitorFilter';
-import { mergeTagValues, type RowValue } from './monitorValues';
+import { replaceOrMergeTagValues, type RowValue } from './monitorValues';
 import {
 	cellDisplayMode,
 	initialStreamView,
@@ -70,8 +70,11 @@ export function createTagValueStream(sources: TagValueStreamSources): TagValueSt
 	$effect(() => {
 		const { disconnect, resubscribe, resume } = connectTagStream(
 			{
-				onData: (incoming) => {
-					if (incoming.length > 0) values = mergeTagValues(values, incoming);
+				onData: (incoming, { snapshot }) => {
+					// スナップショットは置き換え（空でも）、差分はマージ。
+					if (snapshot || incoming.length > 0) {
+						values = replaceOrMergeTagValues(values, incoming, snapshot);
+					}
 					dispatch({ type: 'data' });
 				},
 				// 登録の画面は自分で一覧を読み直す（保留中の編集を巻き込まない）。

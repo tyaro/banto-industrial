@@ -62,6 +62,8 @@ test.describe.serial('banto-hub タグ登録の値の列 (#1255 段階 ②)', ()
 	let sockets: WebSocketRoute[] = [];
 	/** 各ソケットが受けた `subscribe` の `tags`（順に）。 */
 	let subscribes: string[][][] = [];
+	/** 各ソケットが最後に送った `subscribe` の `id`（サーバーは `data` にこの id を付ける）。 */
+	const subscribeIds: number[] = [];
 
 	function row(): Locator {
 		return page.getByRole('row').filter({ hasText: TAG });
@@ -73,9 +75,13 @@ test.describe.serial('banto-hub タグ登録の値の列 (#1255 段階 ②)', ()
 		return page.getByTestId('tag-stream-status');
 	}
 
-	function sendValue(index: number, v: number): void {
+	function sendValue(index: number, v: number, id: number = subscribeIds[index]): void {
 		sockets[index].send(
-			JSON.stringify({ op: 'data', values: [{ tag: EXTERNAL, v, q: 'good', t: Date.now() }] })
+			JSON.stringify({
+				op: 'data',
+				id,
+				values: [{ tag: EXTERNAL, v, q: 'good', t: Date.now() }]
+			})
 		);
 	}
 
@@ -127,8 +133,11 @@ test.describe.serial('banto-hub タグ登録の値の列 (#1255 段階 ②)', ()
 			subscribes[index] = [];
 			ws.onMessage((message) => {
 				if (typeof message !== 'string') return;
-				const parsed = JSON.parse(message) as { op?: string; tags?: string[] };
-				if (parsed.op === 'subscribe' && parsed.tags) subscribes[index].push(parsed.tags);
+				const parsed = JSON.parse(message) as { op?: string; id?: number; tags?: string[] };
+				if (parsed.op === 'subscribe' && parsed.tags) {
+					subscribes[index].push(parsed.tags);
+					if (typeof parsed.id === 'number') subscribeIds[index] = parsed.id;
+				}
 			});
 		});
 	});
@@ -174,6 +183,26 @@ test.describe.serial('banto-hub タグ登録の値の列 (#1255 段階 ②)', ()
 		expect(subscribes[0][2]).toEqual(['*']);
 	});
 
+	test('2b. 購読し直した直後の旧 id のフレームは捨て、新 id のスナップショットで置き換わる', async () => {
+		await page.getByRole('tree').getByRole('treeitem', { name: GROUP }).click();
+		await expect.poll(() => subscribes[0]?.length ?? 0).toBe(4);
+		const oldId = subscribeIds[0] - 1;
+		await expect(cellOf('currentValue')).toHaveText(/^--/);
+		// 旧購読のフレーム（送信待ちだったもの）は、値も待機の解除も起こさない。
+		sendValue(0, 99, oldId);
+		await page.waitForTimeout(300);
+		await expect(cellOf('currentValue')).toHaveText(/^--/);
+		await expect(cellOf('currentQuality')).toHaveText('陳腐化');
+		await expect(cellOf('currentTime')).toHaveText(/^--/);
+		// 新 id の空のスナップショット: 古いキャッシュ（43）は残らない。
+		sockets[0].send(JSON.stringify({ op: 'data', id: subscribeIds[0], values: [] }));
+		await expect(cellOf('currentValue')).toHaveText(/^--/);
+		await expect(cellOf('currentTime')).toHaveText(/^--/);
+		// 以降の差分は反映される。
+		sendValue(0, 50);
+		await expect(cellOf('currentValue')).toContainText('50 kPa');
+	});
+
 	test('3. バックプレッシャ切断（1013）はタグモニタと同じ文言。再接続後はスナップショットまで --', async () => {
 		sendValue(0, 44);
 		await expect(cellOf('currentValue')).toContainText('44 kPa');
@@ -181,10 +210,15 @@ test.describe.serial('banto-hub タグ登録の値の列 (#1255 段階 ②)', ()
 		await sockets[0].close({ code: 1013, reason: 'slow consumer' });
 		await expect(status()).toContainText('サーバーが遅い購読者として切断しました（自動再接続中…）');
 		await expect.poll(() => sockets.length).toBe(2);
+		// スナップショットが届くまで、値・品質・時刻の 3 列とも未受信の表示。
 		await expect(cellOf('currentValue')).toHaveText(/^--/);
+		await expect(cellOf('currentQuality')).toHaveText('陳腐化');
+		await expect(cellOf('currentTime')).toHaveText(/^--/);
 		await expect.poll(() => subscribes[1]?.length ?? 0).toBe(1);
 		sendValue(1, 45);
 		await expect(status()).toContainText('接続中（リアルタイム更新中）');
 		await expect(cellOf('currentValue')).toContainText('45 kPa');
+		await expect(cellOf('currentQuality')).toHaveText('良好');
+		await expect(cellOf('currentTime')).not.toHaveText(/^--/);
 	});
 });

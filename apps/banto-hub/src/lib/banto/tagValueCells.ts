@@ -27,9 +27,23 @@ export function tagValueCell(
 	return monitorCellDisplay({ ...entry, unit }, mode);
 }
 
+/** 時刻の並べ替えに使う値（受信前・スナップショット待ちは 0。表示の `--` と同じ）。 */
+export function tagValueTimeSortKey(
+	values: ReadonlyMap<string, RowValue>,
+	externalName: string,
+	mode: CellDisplayMode
+): number {
+	return mode === 'awaitingSnapshot' ? 0 : (values.get(externalName)?.t ?? 0);
+}
+
 /** 時刻の列の表示（受信前は `--`。モニタの `formatTime` と同じ）。 */
-export function tagValueTime(values: ReadonlyMap<string, RowValue>, externalName: string): string {
-	const t = values.get(externalName)?.t ?? 0;
+export function tagValueTime(
+	values: ReadonlyMap<string, RowValue>,
+	externalName: string,
+	mode: CellDisplayMode
+): string {
+	// 再接続の直後（スナップショット待ち）は値・品質と同じく古い受信時刻を出さない。
+	const t = mode === 'awaitingSnapshot' ? 0 : (values.get(externalName)?.t ?? 0);
 	if (!t) return '--';
 	return new Date(t).toLocaleString('ja-JP');
 }
@@ -37,8 +51,10 @@ export function tagValueTime(values: ReadonlyMap<string, RowValue>, externalName
 /** 値の列の並べ替えに使う数値（値が出ない行は `null`）。 */
 export function tagValueSortKey(
 	values: ReadonlyMap<string, RowValue>,
-	externalName: string
+	externalName: string,
+	mode: CellDisplayMode
 ): number | null {
+	if (mode === 'awaitingSnapshot') return null;
 	const entry = values.get(externalName);
 	if (!entry || entry.q !== 'good') return null;
 	return entry.v;

@@ -81,6 +81,8 @@ test.describe
 	let sockets: WebSocketRoute[] = [];
 	/** 各ソケットが最初の `subscribe` を送ったか。 */
 	let subscribed: boolean[] = [];
+	/** 各ソケットが最後に送った `subscribe` の `id`（`data` フレームに付ける）。 */
+	const subscribeIds: number[] = [];
 
 	function row(): Locator {
 		return page.getByRole('row').filter({ hasText: EXTERNAL });
@@ -98,7 +100,11 @@ test.describe
 	async function sendSnapshot(index: number, v: number): Promise<void> {
 		await expect.poll(() => subscribed[index] ?? false).toBe(true);
 		sockets[index].send(
-			JSON.stringify({ op: 'data', values: [{ tag: EXTERNAL, v, q: 'good', t: Date.now() }] })
+			JSON.stringify({
+				op: 'data',
+				id: subscribeIds[index],
+				values: [{ tag: EXTERNAL, v, q: 'good', t: Date.now() }]
+			})
 		);
 	}
 
@@ -171,6 +177,7 @@ test.describe
 			ws.onMessage((message) => {
 				if (typeof message === 'string' && message.includes('"subscribe"')) {
 					subscribed[index] = true;
+					subscribeIds[index] = (JSON.parse(message) as { id: number }).id;
 				}
 			});
 		});

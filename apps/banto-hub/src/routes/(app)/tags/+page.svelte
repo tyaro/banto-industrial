@@ -62,7 +62,12 @@
 	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
 	import { sharedTreeTarget } from '#lib/treeSelection.svelte.js';
 	import { createTagValueStream } from '#lib/banto/tagValueStream.svelte.js';
-	import { tagValueCell, tagValueSortKey, tagValueTime } from '#lib/banto/tagValueCells.js';
+	import {
+		tagValueCell,
+		tagValueSortKey,
+		tagValueTime,
+		tagValueTimeSortKey
+	} from '#lib/banto/tagValueCells.js';
 	import {
 		MISSING_TREE_TARGET_MESSAGE,
 		parseTagsView,
@@ -5704,7 +5709,8 @@
 			{
 				id: 'currentValue',
 				header: '現在値',
-				accessor: (row) => tagValueSortKey(valueStream.values, externalNameForTag(row)),
+				accessor: (row) =>
+					tagValueSortKey(valueStream.values, externalNameForTag(row), valueStream.mode),
 				format: (_v, row) => valueCellText(row),
 				render: valueCell,
 				width: 130,
@@ -5721,8 +5727,10 @@
 			{
 				id: 'currentTime',
 				header: '時刻',
-				accessor: (row) => valueStream.values.get(externalNameForTag(row))?.t ?? 0,
-				format: (_v, row) => tagValueTime(valueStream.values, externalNameForTag(row)),
+				accessor: (row) =>
+					tagValueTimeSortKey(valueStream.values, externalNameForTag(row), valueStream.mode),
+				format: (_v, row) =>
+					tagValueTime(valueStream.values, externalNameForTag(row), valueStream.mode),
 				width: 160
 			},
 			{

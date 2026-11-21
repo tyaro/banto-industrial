@@ -13,6 +13,7 @@ import { describe, expect, it } from 'vitest';
 import {
 	applyTagValues,
 	mergeTagValues,
+	replaceOrMergeTagValues,
 	type RowValue,
 	type ValueBearingRow
 } from './monitorValues';
@@ -119,5 +120,19 @@ describe('applyTagValues', () => {
 		const result = applyTagValues(rows, merged);
 		expect(result[0]).not.toBe(rows[0]);
 		expect(result[0].unverified).toBe(true);
+	});
+});
+
+describe('replaceOrMergeTagValues', () => {
+	const cur = new Map<string, RowValue>([['old', { v: 1, q: 'good', t: 1 }]]);
+	it('スナップショットは置き換える（空なら空）', () => {
+		expect(replaceOrMergeTagValues(cur, [], true).size).toBe(0);
+		const next = replaceOrMergeTagValues(cur, [{ tag: 'new', v: 2, q: 'good', t: 2 }], true);
+		expect([...next.keys()]).toEqual(['new']);
+		expect(cur.size).toBe(1);
+	});
+	it('差分はマージする', () => {
+		const next = replaceOrMergeTagValues(cur, [{ tag: 'new', v: 2, q: 'good', t: 2 }], false);
+		expect([...next.keys()].sort()).toEqual(['new', 'old']);
 	});
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { tagValueCell, tagValueSortKey, tagValueTime } from './tagValueCells';
+import { tagValueCell, tagValueSortKey, tagValueTime, tagValueTimeSortKey } from './tagValueCells';
 import type { RowValue } from './monitorValues';
 
 const values = new Map<string, RowValue>([
@@ -42,11 +42,11 @@ describe('tagValueCell', () => {
 
 describe('tagValueTime', () => {
 	it('受信前は `--`', () => {
-		expect(tagValueTime(values, 'PLC.G.none')).toBe('--');
-		expect(tagValueTime(values, 'PLC.G.new')).toBe('--');
+		expect(tagValueTime(values, 'PLC.G.none', 'live')).toBe('--');
+		expect(tagValueTime(values, 'PLC.G.new', 'live')).toBe('--');
 	});
 	it('受信後は日時の文字列', () => {
-		expect(tagValueTime(values, 'PLC.G.a')).toBe(
+		expect(tagValueTime(values, 'PLC.G.a', 'live')).toBe(
 			new Date(1_700_000_000_000).toLocaleString('ja-JP')
 		);
 	});
@@ -54,8 +54,20 @@ describe('tagValueTime', () => {
 
 describe('tagValueSortKey', () => {
 	it('良好な値だけ数値、それ以外は null', () => {
-		expect(tagValueSortKey(values, 'PLC.G.a')).toBe(12.5);
-		expect(tagValueSortKey(values, 'PLC.G.bad')).toBeNull();
-		expect(tagValueSortKey(values, 'PLC.G.none')).toBeNull();
+		expect(tagValueSortKey(values, 'PLC.G.a', 'live')).toBe(12.5);
+		expect(tagValueSortKey(values, 'PLC.G.bad', 'live')).toBeNull();
+		expect(tagValueSortKey(values, 'PLC.G.none', 'live')).toBeNull();
+	});
+});
+
+describe('スナップショット待ち（値・品質・時刻・並べ替えを同じ未受信の扱いにそろえる）', () => {
+	it('時刻は `--`、並べ替えのキーは未受信と同じ', () => {
+		expect(tagValueTime(values, 'PLC.G.a', 'awaitingSnapshot')).toBe('--');
+		expect(tagValueSortKey(values, 'PLC.G.a', 'awaitingSnapshot')).toBeNull();
+		expect(tagValueTimeSortKey(values, 'PLC.G.a', 'awaitingSnapshot')).toBe(0);
+	});
+	it('止まっている間は最終受信値のまま', () => {
+		expect(tagValueTimeSortKey(values, 'PLC.G.a', 'halted')).toBe(1_700_000_000_000);
+		expect(tagValueSortKey(values, 'PLC.G.a', 'halted')).toBe(12.5);
 	});
 });
