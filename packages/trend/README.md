@@ -85,6 +85,10 @@
 
 `TrendPen.limits`（`{ value, side: 'upper' | 'lower', colorVar, label }[]`、null・空は引かない）。そのペンの縦軸で、描画域の幅いっぱいの細い破線を引き、右端の内側に `label` を添える。`upper` は値より上、`lower` は値より下を「越えた」区間とし、その区間だけペンの線とマーカーを `colorVar` で重ね描きする（並びの後ろが前の上に重なるので、H → HH の順に渡せば HH の色が勝つ）。縦軸の外の線は引かないが、越えた区間には効く。線なし（`lineStyle: 'none'`）のペンは線を重ねず、マーカーだけ。要約（aria）に「管理線 HH 90・H 80」と値を足す。計算は `limitLayout`（`core/limits.ts`、描画の層から独立）。
 
+`TrendSeries.kind`（`'bins' | 'samples'`、未指定は `'bins'` で従来どおり）。`'samples'` は観測点の系列で、`bins` の各要素が観測 1 つ（`tMs` は観測の時刻そのもの、値は `min`。min・max とも null は「記録した欠測」）、`binMs` は記録周期。点を実時刻に置き（区間の中央にずらさない）、マーカーは間引かない（丸めて同じ座標の点だけ省く）。次の観測まで `binMs × 2` を超えて空いたり値が null の観測があると線を切る。bit のペンは前の値を次の観測まで保つ段差。カーソル（固定の A・B と差も）は最も近い有限の観測へ 8px 以内なら吸着して値を出し、離れた所は「—」（`cursorReadout` の `toleranceMs` に 8px 分の ms を渡す）。表示範囲の絞り込みは両側の外の観測を 1 つずつ残して線を端までつなぐが、縦軸の範囲には含めない。計算は `core/samples.ts`。
+
+帯の欠測: bit の帯で、取得範囲 ∩ 表示範囲のうち値のある区間（`'bins'` は有限の値のある区間、`'samples'` は観測から次の観測まで）に覆われていない時刻は「記録なし」として斜線（`--banto-chart-grid`）で描く。記録された OFF（値 0）は覆うので、従来どおり空白のまま。取得範囲の外は何も描かない。計算は `bitMissingSpans`（`core/bitBands.ts`）。
+
 ## bit のペンの帯と True / False
 
 `TrendPen.bit` が真のペンは、値 0 / 1 を `False` / `True`（0.5 以上が True）と出す。カーソルの値は `False`・`True`・区間の中で変わったら `False〜True`、凡例の範囲と要約は `False / True`、縦軸の持ち主が bit のペンなら 0・1 の目盛りが `False`・`True` になる。`formatBitValue`（`core/pens.ts`）。

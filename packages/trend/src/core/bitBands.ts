@@ -19,6 +19,7 @@
 
 import { binEndMs, isOutsideRange } from './geometry';
 import { isBitBand, type Bin, type TrendPen } from './pens';
+import { sampleIntervals } from './samples';
 
 /** 帯の太さの既定・下限・上限（px）と、帯の間（px）。 */
 export const BIT_BAND_DEFAULT = 16;
@@ -90,16 +91,26 @@ export interface BitSpan {
 
 /**
  * 帯の塗りの並び。`range` は有効範囲（取得範囲 ∩ 表示範囲）、`x` は時刻 → px の scale。
- * `bins` は `tMs` の昇順（契約）。
+ * `bins` は `tMs` の昇順（契約）。`kind` が 'samples' なら観測から次の観測までを値で塗る
+ * （`sampleIntervals`。0.5 以上が True、'mixed' は出ない）。
  */
 export function bitSpans(
 	bins: readonly Bin[],
 	binMs: number,
 	x: (tMs: number) => number,
-	range: { startMs: number; endMs: number }
+	range: { startMs: number; endMs: number },
+	kind?: 'bins' | 'samples'
 ): BitSpan[] {
 	const out: { s: number; e: number; state: 'true' | 'mixed' }[] = [];
-	for (let i = 0; i < bins.length; i++) {
+	if (kind === 'samples') {
+		for (const iv of sampleIntervals(bins, binMs, range)) {
+			if (iv.value < 0.5) continue;
+			const prev = out[out.length - 1];
+			if (prev && prev.e >= iv.s) prev.e = Math.max(prev.e, iv.e);
+			else out.push({ s: iv.s, e: iv.e, state: 'true' });
+		}
+	}
+	for (let i = 0; kind !== 'samples' && i < bins.length; i++) {
 		const b = bins[i];
 		const next = bins[i + 1]?.tMs;
 		if (!fin(b.tMs) || isOutsideRange(b.tMs, binMs, next, range.startMs, range.endMs)) continue;
@@ -115,11 +126,62 @@ export function bitSpans(
 		if (prev && prev.state === state && prev.e >= s) prev.e = Math.max(prev.e, e);
 		else out.push({ s, e, state });
 	}
-	const r2 = (v: number) => Math.round(v * 100) / 100;
 	return out
 		.map((o) => {
 			const x0 = x(o.s);
 			return { x: r2(x0), width: r2(x(o.e) - x0), state: o.state };
+		})
+		.filter((o) => Number.isFinite(o.x) && Number.isFinite(o.width) && o.width > 0);
+}
+
+const r2 = (v: number) => Math.round(v * 100) / 100;
+
+/** 帯の欠測 1 つ（px）。 */
+export interface BitMissingSpan {
+	x: number;
+	width: number;
+}
+
+/**
+ * 帯の欠測（「記録なし」）。有効範囲 `range` の中で、値のある区間に覆われていない時刻。
+ * 値のある区間は、'bins' は有限の値を持つ区間（始まりと終わりは有効範囲で切る）、
+ * 'samples' は `sampleIntervals`（記録された OFF = 値 0 も覆う）。OFF の空白とは別に、斜線で描く。
+ * 有効範囲の外は何も返さない。
+ */
+export function bitMissingSpans(
+	bins: readonly Bin[],
+	binMs: number,
+	x: (tMs: number) => number,
+	range: { startMs: number; endMs: number },
+	kind?: 'bins' | 'samples'
+): BitMissingSpan[] {
+	if (!(range.endMs > range.startMs)) return [];
+	const covered: { s: number; e: number }[] = [];
+	if (kind === 'samples') {
+		for (const iv of sampleIntervals(bins, binMs, range)) covered.push({ s: iv.s, e: iv.e });
+	} else {
+		for (let i = 0; i < bins.length; i++) {
+			const b = bins[i];
+			const next = bins[i + 1]?.tMs;
+			if (!fin(b.tMs) || isOutsideRange(b.tMs, binMs, next, range.startMs, range.endMs)) continue;
+			if (!fin(b.min) && !fin(b.max)) continue;
+			const s = Math.max(b.tMs, range.startMs);
+			const e = Math.min(binEndMs(b.tMs, binMs, next), range.endMs);
+			if (e > s) covered.push({ s, e });
+		}
+	}
+	covered.sort((a, b) => a.s - b.s);
+	const gaps: { s: number; e: number }[] = [];
+	let cursor = range.startMs;
+	for (const c of covered) {
+		if (c.s > cursor) gaps.push({ s: cursor, e: c.s });
+		if (c.e > cursor) cursor = c.e;
+	}
+	if (cursor < range.endMs) gaps.push({ s: cursor, e: range.endMs });
+	return gaps
+		.map((g) => {
+			const x0 = x(g.s);
+			return { x: r2(x0), width: r2(x(g.e) - x0) };
 		})
 		.filter((o) => Number.isFinite(o.x) && Number.isFinite(o.width) && o.width > 0);
 }

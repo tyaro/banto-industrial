@@ -118,10 +118,23 @@ export {
 	resolveBitBandHeight,
 	bitBandLayout,
 	bitSpans,
+	bitMissingSpans,
+	type BitMissingSpan,
 	type BitBandSlot,
 	type BitBandLayout,
 	type BitSpan
 } from './core/bitBands';
+export {
+	SAMPLE_GAP_FACTOR,
+	sampleAt,
+	sampleIntervals,
+	sampleValue,
+	samplesForDraw,
+	samplesInRange,
+	samplesMarkerPoints,
+	samplesPath,
+	type SampleInterval
+} from './core/samples';
 export {
 	binAt,
 	cursorDiff,

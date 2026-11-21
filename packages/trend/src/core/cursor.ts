@@ -6,6 +6,7 @@ import type { TrendSeries } from './data';
 import { binEndMs } from './geometry';
 import { formatBitValue, formatValue, MISSING_TEXT, type Bin, type TrendPen } from './pens';
 import type { TimeRange } from './range';
+import { sampleAt } from './samples';
 
 const fin = (v: number | null | undefined): v is number =>
 	typeof v === 'number' && Number.isFinite(v);
@@ -47,17 +48,25 @@ export interface CursorValue {
  * ペンごとのカーソル位置の値。値が 1 つなら `値 単位`、幅があれば `最小〜最大 単位`。
  * 区間の幅はペンごと（`series[id].binMs`）。`tMs` が有効範囲（取得範囲 ∩ 表示範囲）の外、
  * または有効範囲が null なら全ペン「—」。
+ * 'samples' の系列（観測点）は、時刻に最も近い観測（欠測なら「—」）が `toleranceMs`（時刻に直した吸着の幅。TrendChart は
+ * 8px 分を渡す）以内なら吸着してその値、無ければ「—」。`toleranceMs` を渡さない（0）と観測の時刻ぴったりだけ。
  */
 export function cursorReadout(
 	pens: readonly TrendPen[],
 	series: Readonly<Record<string, TrendSeries | undefined>>,
 	tMs: number,
-	effective: TimeRange | null
+	effective: TimeRange | null,
+	toleranceMs = 0
 ): CursorValue[] {
 	const inside = effective !== null && tMs >= effective.startMs && tMs < effective.endMs;
 	return pens.map((pen) => {
 		const s = series[pen.id];
-		const b = inside && s ? binAt(s.bins, s.binMs, tMs) : null;
+		const b =
+			inside && s
+				? s.kind === 'samples'
+					? sampleAt(s.bins, tMs, toleranceMs)
+					: binAt(s.bins, s.binMs, tMs)
+				: null;
 		const min = b ? (fin(b.min) ? b.min : fin(b.max) ? b.max : null) : null;
 		const max = b ? (fin(b.max) ? b.max : min) : null;
 		if (min === null || max === null)
