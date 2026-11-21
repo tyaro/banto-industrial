@@ -75,7 +75,7 @@ banto-hub-tls-trust = { path = "../../../crates/banto-hub-tls-trust" }
 # package は増えない（この crate の依存の行が増えるだけ）。
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39"
-windows-core = "0.62"
+windows-core = "0.100"
 
 # #505 のテスト専用: 窓の CSP（`tauri.conf.json`）が Hub の応答の CSP（banto の
 # `CONTENT_SECURITY_POLICY`）に Tauri の IPC を足しただけか、banto の
