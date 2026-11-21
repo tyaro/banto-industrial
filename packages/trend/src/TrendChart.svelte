@@ -23,6 +23,8 @@
     `{uid}-analog-clip`（アナログの縦の長さまで）で切り、範囲外の値が bit の帯に重ならないようにする。True は濃い塗り、区間の中で変わったものは薄い塗り、帯の左端の
     内側にペンの `label`（帯が 10px 未満に縮んだら出さない。`showLabel`）。縦軸の持ち主が bit のペンなら目盛り（と横の格子）は 0・1 の 2 つだけ（`axisTickValues`）。bit のペンの値は False / True と出す（カーソル・凡例の範囲・要約。縦軸が
     bit のペンのときは 0・1 の目盛りも）。
+  - 時刻の帯（`timeBands`）と印（`timeMarks`、`core/timeBands.ts`）は表示範囲で切って描く。penId 無しの帯は描画域の
+    全高（帯の下の層）、penId 付きは bit の帯の中かアナログの域の上端の列（線の後）。印は縦の破線と上端の名前。
   - 凡例は `onPenSelect` を渡すとペンを選ぶボタンになる（押した印は `selectedPenId`、
     利用側の印は `legendBadge`）。どのペンを選ぶと何が変わるかは利用側が決める。
 -->
@@ -52,6 +54,13 @@
 	} from './core/style';
 	import TrendPenSwatch from './TrendPenSwatch.svelte';
 	import { bitBandLayout, bitMissingSpans, bitSpans } from './core/bitBands';
+	import {
+		timeBandLayout,
+		timeMarkLayout,
+		timeSummaryText,
+		type TrendTimeBand,
+		type TrendTimeMark
+	} from './core/timeBands';
 	import { effectiveClip, samplesInRange, samplesMarkerPoints, samplesPath } from './core/samples';
 	import {
 		axisOwners,
@@ -86,6 +95,10 @@
 		onRangeChange?: (range: TimeRange) => void;
 		/** 横の帯（しきい値など）。`penId` のペンの縦軸で、線の下に描く。 */
 		bands?: TrendBands | null;
+		/** 時刻の区間の帯。`penId` 無しは描画域の全高、あればそのペンの帯・列に描く。 */
+		timeBands?: readonly TrendTimeBand[] | null;
+		/** 時刻の印（縦の破線と名前）。 */
+		timeMarks?: readonly TrendTimeMark[] | null;
 		/** 凡例のペンを押したとき。渡すと凡例の各項目がボタンになる。 */
 		onPenSelect?: (penId: string) => void;
 		/** 凡例で押した印を付けるペン（`onPenSelect` を渡したときだけ使う）。 */
@@ -108,6 +121,8 @@
 		nowMs,
 		onRangeChange,
 		bands = null,
+		timeBands = null,
+		timeMarks = null,
 		onPenSelect,
 		selectedPenId = null,
 		legendLabel = '凡例',
@@ -229,6 +244,12 @@
 			: []
 	);
 	const bandRectList = $derived(valid ? bandLayout(bands, pens, domains, analogHeight) : []);
+	const timeLayout = $derived(
+		valid
+			? timeBandLayout(timeBands, pens, range, plotWidth, bitLayout.bands)
+			: { background: [], bitOverlays: [], lanes: [] }
+	);
+	const timeMarkLines = $derived(valid ? timeMarkLayout(timeMarks, pens, range, plotWidth) : []);
 	// bit の帯: 位置と塗り。
 	const bitBandViews = $derived(
 		valid
@@ -319,7 +340,8 @@
 					(onRangeChange
 						? '左右の矢印キーで移動、+ と - で拡大・縮小、Ctrl+ホイールで拡大・縮小、Shift+ホイールかドラッグで移動。'
 						: '') +
-					'クリックでカーソル A・B を置く（3 回目からは近い方を移す）、Esc でカーソルを消す。'
+					'クリックでカーソル A・B を置く（3 回目からは近い方を移す）、Esc でカーソルを消す。' +
+					timeSummaryText((timeBands ?? []).length, (timeMarks ?? []).length)
 			: '表示範囲が不正です。'
 	);
 
@@ -542,6 +564,16 @@
 				{/if}
 
 				<g clip-path="url(#{uid}-clip)">
+					{#each timeLayout.background as b, i (i)}
+						<rect
+							x={b.x}
+							y="0"
+							width={b.width}
+							height={plotHeight}
+							fill={b.colorVar}
+							fill-opacity="0.15"><title>{b.label}</title></rect
+						>
+					{/each}
 					<g clip-path="url(#{uid}-analog-clip)">
 						{#each bandRectList as b, i (i)}
 							<rect
@@ -584,6 +616,16 @@
 								dominant-baseline="middle">{bb.pen.label}</text
 							>
 						{/if}
+					{/each}
+					{#each timeLayout.bitOverlays as b, i (i)}
+						<rect
+							x={b.x}
+							y={b.y}
+							width={b.width}
+							height={b.height}
+							fill={b.colorVar}
+							fill-opacity="0.35"><title>{b.label}</title></rect
+						>
 					{/each}
 					<g clip-path="url(#{uid}-analog-clip)">
 						{#each limitLayouts as lay, i (pens[i].id)}
@@ -638,6 +680,31 @@
 							{/each}
 						{/each}
 					</g>
+					{#each timeLayout.lanes as b, i (i)}
+						<rect
+							x={b.x}
+							y={b.y}
+							width={b.width}
+							height={b.height}
+							fill={b.colorVar}
+							fill-opacity="0.35"><title>{b.label}</title></rect
+						>
+					{/each}
+					{#each timeMarkLines as m, i (i)}
+						<line
+							x1={m.x}
+							x2={m.x}
+							y1="0"
+							y2={plotHeight}
+							stroke={m.colorVar}
+							stroke-dasharray="3 3"><title>{m.label}</title></line
+						>
+						{#if m.showLabel}
+							<text class="bi-trend__limit-label" x={m.x + 3} y="10" fill={m.colorVar}
+								><title>{m.label}</title>{m.label}</text
+							>
+						{/if}
+					{/each}
 					{#if cursorX !== null}
 						<line class="bi-trend__cursor" x1={cursorX} x2={cursorX} y1="0" y2={plotHeight} />
 					{/if}
