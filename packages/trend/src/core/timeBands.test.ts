@@ -34,7 +34,8 @@ describe('timeBandLayout', () => {
 			[],
 			range,
 			W,
-			[]
+			[],
+			200
 		);
 		expect(l.background.map((r) => [r.x, r.width])).toEqual([
 			[0, 50],
@@ -42,17 +43,26 @@ describe('timeBandLayout', () => {
 		]);
 	});
 	it('幅が 1px 未満は 1px に広げる', () => {
-		const l = timeBandLayout([band(1500, 1503)], [], range, W, []);
+		const l = timeBandLayout([band(1500, 1503)], [], range, W, [], 200);
 		expect(l.background[0].width).toBe(1);
 	});
 	it('帯が null・範囲が不正なら空', () => {
 		const empty = { background: [], bitOverlays: [], lanes: [] };
-		expect(timeBandLayout(null, [], range, W, [])).toEqual(empty);
-		expect(timeBandLayout([band(1100, 1200)], [], { startMs: 5, endMs: 5 }, W, [])).toEqual(empty);
+		expect(timeBandLayout(null, [], range, W, [], 200)).toEqual(empty);
+		expect(timeBandLayout([band(1100, 1200)], [], { startMs: 5, endMs: 5 }, W, [], 200)).toEqual(
+			empty
+		);
 	});
 	it('penId 付きのアナログのペンは上端の列に、帯を持つペンだけを並びの順に積む', () => {
 		const pens = [pen('a'), pen('b'), pen('c')];
-		const l = timeBandLayout([band(1100, 1200, 'c'), band(1300, 1400, 'a')], pens, range, W, []);
+		const l = timeBandLayout(
+			[band(1100, 1200, 'c'), band(1300, 1400, 'a')],
+			pens,
+			range,
+			W,
+			[],
+			200
+		);
 		expect(l.lanes.map((r) => [r.y, r.height, r.x])).toEqual([
 			[5, 4, 10],
 			[0, 4, 30]
@@ -61,14 +71,35 @@ describe('timeBandLayout', () => {
 	it('bit の帯のペンはそのペンの帯の高さの中', () => {
 		const pens = [pen('a'), pen('bit', { bit: true, bitStyle: 'band' })];
 		const slots: BitBandSlot[] = [{ penIndex: 1, y: 70, height: 16, showLabel: true }];
-		const l = timeBandLayout([band(1100, 1200, 'bit')], pens, range, W, slots);
+		const l = timeBandLayout([band(1100, 1200, 'bit')], pens, range, W, slots, 200);
 		expect(l.bitOverlays).toEqual([
 			{ x: 10, width: 10, y: 70, height: 16, colorVar: 'var(--x)', label: 'B' }
 		]);
 		expect(l.lanes).toEqual([]);
 	});
+	it('列が多くてアナログの域の半分を超えるときは縮めて収める', () => {
+		const pens = Array.from({ length: 15 }, (_, i) => pen(`p${i}`));
+		const bands = pens.map((p) => band(1100, 1200, p.id));
+		const l = timeBandLayout(bands, pens, range, W, [], 52);
+		expect(l.lanes).toHaveLength(15);
+		const last = l.lanes[14];
+		expect(last.y + last.height).toBeLessThanOrEqual(26 + 1e-9);
+		expect(l.lanes[0].y).toBe(0);
+	});
+	it('analogHeight が 0 以下なら列は出さない（背景は出す）', () => {
+		const l = timeBandLayout(
+			[band(1100, 1200, 'a'), band(1100, 1200)],
+			[pen('a')],
+			range,
+			W,
+			[],
+			0
+		);
+		expect(l.lanes).toEqual([]);
+		expect(l.background).toHaveLength(1);
+	});
 	it('ペンが居ない penId は出さない', () => {
-		const l = timeBandLayout([band(1100, 1200, 'zz')], [pen('a')], range, W, []);
+		const l = timeBandLayout([band(1100, 1200, 'zz')], [pen('a')], range, W, [], 200);
 		expect(l).toEqual({ background: [], bitOverlays: [], lanes: [] });
 	});
 });

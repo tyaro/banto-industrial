@@ -11,7 +11,8 @@
  * - `penId` 付きの帯: そのペンが bit の帯なら、そのペンの帯の高さの中（`bitOverlays`）。
  *   アナログのペンなら、アナログの域の上端に、ペンごとの細い列（高さ 4px・間 1px）を、
  *   「penId 付きの帯を持つアナログのペン」だけ、ペンの並びの順に上から積む（`lanes`）。
- *   `penId` がペンの組に無い帯は出さない。
+ *   `penId` がペンの組に無い帯は出さない。列の合計がアナログの域の半分を超えるときは、列の高さと
+ *   間を同じ割合で縮めて半分に収める（`analogHeight` が 0 以下・非有限なら列は出さない）。
  * - 印は縦の線（描画域の全高）。表示範囲 `[startMs, endMs)` の外は出さない。色は `colorVar`、
  *   無ければ `penId` のペンの色、どちらも無ければ `--banto-text-muted`。名前は、前に名前を出した
  *   印から 48px 未満なら省く（線と `<title>` は残す）。時刻の順に判定する。
@@ -93,7 +94,8 @@ export function timeBandLayout(
 	pens: readonly TrendPen[],
 	range: RangeLike,
 	plotWidth: number,
-	bitSlots: readonly BitBandSlot[]
+	bitSlots: readonly BitBandSlot[],
+	analogHeight: number
 ): TimeBandLayout {
 	const out: TimeBandLayout = { background: [], bitOverlays: [], lanes: [] };
 	if (!bands || bands.length === 0 || !validRange(range, plotWidth)) return out;
@@ -114,6 +116,10 @@ export function timeBandLayout(
 	for (const p of pens) {
 		if (hasBand.has(p.id) && !isBitBand(p)) laneOf.set(p.id, laneOf.size);
 	}
+	const n = laneOf.size;
+	const rawLanes = n * TIME_LANE_HEIGHT + Math.max(0, n - 1) * TIME_LANE_GAP;
+	const laneBudget = fin(analogHeight) && analogHeight > 0 ? analogHeight * 0.5 : 0;
+	const k = rawLanes > laneBudget ? laneBudget / rawLanes : 1;
 	for (const b of bands) {
 		const c = clip(b);
 		if (!c) continue;
@@ -128,11 +134,12 @@ export function timeBandLayout(
 			const slot = bitSlots.find((s) => s.penIndex === index);
 			if (slot) out.bitOverlays.push({ ...base, y: slot.y, height: slot.height });
 		} else {
+			if (k <= 0) continue;
 			const lane = laneOf.get(b.penId) ?? 0;
 			out.lanes.push({
 				...base,
-				y: lane * (TIME_LANE_HEIGHT + TIME_LANE_GAP),
-				height: TIME_LANE_HEIGHT
+				y: lane * (TIME_LANE_HEIGHT + TIME_LANE_GAP) * k,
+				height: TIME_LANE_HEIGHT * k
 			});
 		}
 	}

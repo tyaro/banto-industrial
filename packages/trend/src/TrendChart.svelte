@@ -252,7 +252,7 @@
 	const bandRectList = $derived(valid ? bandLayout(bands, pens, domains, analogHeight) : []);
 	const timeLayout = $derived(
 		valid
-			? timeBandLayout(timeBands, pens, range, plotWidth, bitLayout.bands)
+			? timeBandLayout(timeBands, pens, range, plotWidth, bitLayout.bands, analogHeight)
 			: { background: [], bitOverlays: [], lanes: [] }
 	);
 	const timeMarkLines = $derived(valid ? timeMarkLayout(timeMarks, pens, range, plotWidth) : []);
