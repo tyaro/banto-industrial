@@ -42,6 +42,15 @@
 	 *   （Esc・外の押下・選択で戻り、フォーカスは帯のタブへ。#378・#381 の約束の置き換え）。
 	 *   編集のフォームは今までどおり狭い幅ではモーダルの `<Drawer>`／`<Modal>` に出す
 	 *   （右は帯に退くが、引き出しても案内だけ）。
+	 *
+	 * #1255（docs/hub/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、統合の段階 ②、
+	 * 2026-11-21 オーナー決定）: タグ一覧の表に読み取り専用の列「現在値」「品質」「時刻」を足した
+	 * （全ロールに出す。`/monitor` の吸収は次の PR）。値はタグモニタと同じ WS 購読
+	 * （`#lib/banto/tagValueStream.svelte.ts`）で、購読の範囲はツリーで選んだ範囲（「すべて」なら
+	 * 全タグ。見えている行だけの購読は段階 3）。行との対応は外部名（`externalNameForTag`）。
+	 * 値は別のマップで持ち、行・選択・保留中の編集は書き換えない。接続の状態（再接続中・
+	 * バックプレッシャ切断・止まっている間）は中央のツールバーに出し、再接続の間は古い値を
+	 * 出さない（`monitorCellDisplay`）。
 	 */
 	import { onDestroy, tick, untrack } from 'svelte';
 	import { page } from '$app/state';
@@ -52,6 +61,13 @@
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
 	import { sharedTreeTarget } from '#lib/treeSelection.svelte.js';
+	import { createTagValueStream } from '#lib/banto/tagValueStream.svelte.js';
+	import {
+		tagValueCell,
+		tagValueSortKey,
+		tagValueTime,
+		tagValueTimeSortKey
+	} from '#lib/banto/tagValueCells.js';
 	import {
 		MISSING_TREE_TARGET_MESSAGE,
 		parseTagsView,
@@ -3406,6 +3422,18 @@
 	let treeFilter: TreeFilter = $state({ type: 'all' });
 	let searchQuery = $state('');
 
+	/**
+	 * #1255 段階 ②: 表の「現在値」「品質」「時刻」の列の値（WS 購読。タグモニタと同じ仕組み、
+	 * `#lib/banto/tagValueStream.svelte.ts`）。購読の範囲はツリーで選んだ範囲（見えている行
+	 * だけの購読ではない）。値は外部名をキーに別のマップで持ち、`tags`・行・選択・保留中の
+	 * 編集は書き換えない。
+	 */
+	const valueStream = createTagValueStream({
+		treeFilter: () => treeFilter,
+		connections: () => connections,
+		groups: () => groups
+	});
+
 	const treeSelectedId = $derived.by((): string => {
 		if (treeFilter.type === 'all') return 'all';
 		if (treeFilter.type === 'connection') return `conn:${treeFilter.id}`;
@@ -5635,6 +5663,15 @@
 	 * （#341、`gridEditAllowed` の doc comment 参照）の両方を満たす間だけ
 	 * 実際に編集できる。
 	 */
+	/** #1255: 1 行の値・品質の表示（タグモニタと同じ `monitorCellDisplay` を通す）。 */
+	function qualityCell(row: Tag) {
+		return tagValueCell(valueStream.values, externalNameForTag(row), row.unit, valueStream.mode);
+	}
+
+	function valueCellText(row: Tag): string {
+		return qualityCell(row).value;
+	}
+
 	const columns = $derived.by((): GridColumn<Tag>[] => {
 		const cellEditable = () => gridEditMode && gridEditAllowed;
 		const base: GridColumn<Tag>[] = [
@@ -5665,6 +5702,36 @@
 						connectionForGroupId(String(row.collectionGroupId))?.protocol
 					),
 				width: 90
+			},
+			// #1255 段階 ②: 現在値・品質・時刻（読み取り専用。`editable` を持たせない -
+			// 上の `hasEditableColumns` の注意）。値は購読のマップから外部名で引く
+			// （`valueStream`。セルの描画が追跡するので列の定義は作り直さない）。
+			{
+				id: 'currentValue',
+				header: '現在値',
+				accessor: (row) =>
+					tagValueSortKey(valueStream.values, externalNameForTag(row), valueStream.mode),
+				format: (_v, row) => valueCellText(row),
+				render: valueCell,
+				width: 130,
+				align: 'right'
+			},
+			{
+				id: 'currentQuality',
+				header: '品質',
+				accessor: (row) => qualityCell(row).qualityLabel,
+				format: (_v, row) => qualityCell(row).qualityLabel,
+				render: qualityCellView,
+				width: 90
+			},
+			{
+				id: 'currentTime',
+				header: '時刻',
+				accessor: (row) =>
+					tagValueTimeSortKey(valueStream.values, externalNameForTag(row), valueStream.mode),
+				format: (_v, row) =>
+					tagValueTime(valueStream.values, externalNameForTag(row), valueStream.mode),
+				width: 160
 			},
 			{
 				id: 'enabled',
@@ -7234,6 +7301,26 @@
 					<span class="tree-selection" data-testid="tag-tree-selection">
 						{treeSelectionLabel}
 					</span>
+					<!--
+						#1255: 値の列の購読の状態（タグモニタと同じ文言。バックプレッシャ切断・
+						止まっている間は色を変える）。
+					-->
+					<span
+						class="stream-status"
+						class:status-warning={valueStream.status.warning}
+						data-testid="tag-stream-status"
+						title={valueStream.status.text}
+					>
+						<span
+							class="ws-dot"
+							class:on={valueStream.status.kind === 'connected'}
+							class:off={valueStream.status.kind !== 'connected'}
+						></span>
+						<span class="stream-status-text">{valueStream.status.text}</span>
+						{#if valueStream.status.resumable}
+							<button type="button" class="tool-button" onclick={valueStream.resume}>再接続</button>
+						{/if}
+					</span>
 					<span class="frame-toolbar-spacer"></span>
 					{#if !layoutNarrow}
 						<button
@@ -7934,6 +8021,28 @@
 	トグル（§外部公開）はまだ無い。
 -->
 <!-- #1253: 下のログのパネル（`ThreePaneDock` の追加パネル `log`。タグモニタと同じ部品）。 -->
+<!--
+	#1255 段階 ②: 表の「現在値」「品質」の列のセル（`columns` の `render`）。色分けと
+	「未確認」・SIM のバッジはタグモニタに合わせる。値は購読のマップを描画の中で読むので、
+	更新で行・選択・保留中の編集を作り直さない。
+-->
+{#snippet valueCell(row: Tag)}
+	{@const cell = qualityCell(row)}
+	<span class="value-cell quality-{cell.qualityClass}" data-testid="tag-value-cell">
+		{cell.value}
+		{#if connectionForGroupId(String(row.collectionGroupId))?.simulation}
+			<span class="sim-badge" title="シミュレーション接続（実機ではありません）">⚠ SIM</span>
+		{/if}
+	</span>
+{/snippet}
+
+{#snippet qualityCellView(row: Tag)}
+	{@const cell = qualityCell(row)}
+	<span class="value-cell quality-{cell.qualityClass}" data-testid="tag-quality-cell"
+		>{cell.qualityLabel}</span
+	>
+{/snippet}
+
 {#snippet logPanel()}
 	<LogPanel feed={logFeed} />
 {/snippet}
@@ -8836,6 +8945,74 @@
 	.tool-button[aria-pressed='true'] {
 		background: var(--banto-bg);
 		border-color: var(--banto-primary);
+	}
+
+	/* #1255: 値の列の購読の状態（タグモニタの状態の行と同じ見た目・文言）。 */
+	.stream-status {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+		min-width: 0;
+		font-size: 0.75rem;
+		color: var(--banto-text-muted);
+	}
+
+	.stream-status.status-warning {
+		color: var(--banto-danger);
+	}
+
+	.stream-status-text {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.ws-dot {
+		flex: 0 0 auto;
+		display: inline-block;
+		width: 0.55rem;
+		height: 0.55rem;
+		border-radius: 50%;
+		background: var(--banto-text-muted);
+	}
+
+	.ws-dot.on {
+		background: var(--banto-primary);
+	}
+
+	.ws-dot.off {
+		background: var(--banto-danger);
+	}
+
+	/* #1255: 現在値・品質の色分け（タグモニタの `.quality-*` と同じ）。 */
+	.value-cell.quality-good {
+		color: var(--banto-text);
+	}
+
+	.value-cell.quality-bad {
+		color: var(--banto-danger);
+		font-weight: 600;
+	}
+
+	.value-cell.quality-stale {
+		color: var(--banto-text-muted);
+	}
+
+	.value-cell.quality-unverified {
+		color: var(--banto-text-muted);
+		font-style: italic;
+	}
+
+	.sim-badge {
+		display: inline-block;
+		margin-left: 0.35rem;
+		padding: 0.05rem 0.35rem;
+		border-radius: var(--banto-radius);
+		border: 1px solid var(--banto-warning);
+		color: var(--banto-warning);
+		font-size: 0.65rem;
+		font-weight: 700;
 	}
 
 	/* #378: 何で絞られているか（ツリーを閉じていても見える）。 */

@@ -31,6 +31,7 @@ vi.mock('@banto/admin-core', () => ({
 }));
 
 import { connectTagStream } from './tagMonitorAdmin';
+import { replaceOrMergeTagValues, type RowValue } from './monitorValues';
 import type { SessionProbeResult } from './streamClose';
 import {
 	cellDisplayMode,
@@ -252,7 +253,7 @@ describe('connectTagStream + streamViewReducer: 停止中の表の表示（#441 
 		const shown = () => monitorCellDisplay(row, cellDisplayMode(view));
 		const snapshot = (v: number) =>
 			latest().onmessage?.({
-				data: JSON.stringify({ op: 'data', values: [{ tag: 'a', v, q: 'good', t: v }] })
+				data: JSON.stringify({ op: 'data', id: 1, values: [{ tag: 'a', v, q: 'good', t: v }] })
 			});
 
 		latest().open();
@@ -611,5 +612,80 @@ describe('connectTagStream: #447 のレビュー対応（トークンの消失�
 		await flush();
 		// 古い login では止めないが、新しい 2 回の失敗は確かめる。
 		expect(probeSession).toHaveBeenCalledTimes(2);
+	});
+});
+
+describe('connectTagStream: 購読 id の照合とスナップショット（#1255）', () => {
+	type Frame = { tag: string; v: number; q: string; t: number };
+	const frame = (id: number, values: Frame[]) => ({
+		data: JSON.stringify({ op: 'data', id, values })
+	});
+	const val = (tag: string, v: number): Frame => ({ tag, v, q: 'good', t: v });
+
+	function startWithValues() {
+		let cache = new Map<string, RowValue>();
+		const infos: boolean[] = [];
+		const stream = connectTagStream(
+			{
+				onData: (values, { snapshot }) => {
+					infos.push(snapshot);
+					cache = replaceOrMergeTagValues(cache, values, snapshot);
+				},
+				onConfigChanged: () => {},
+				onHalt: () => {}
+			},
+			() => ['*']
+		);
+		return { stream, infos, cache: () => cache };
+	}
+
+	it('旧 id のフレームは捨て、新 id の空のスナップショットで置き換え、差分はマージする', () => {
+		const { stream, infos, cache } = startWithValues();
+		latest().open();
+		latest().onmessage?.(frame(1, [val('a', 1)]));
+		expect([...cache().keys()]).toEqual(['a']);
+		expect(infos).toEqual([true]);
+
+		stream.resubscribe(); // id 2
+		// 購読し直した後に届く旧購読（id 1）のフレームは通さない。
+		latest().onmessage?.(frame(1, [val('a', 9)]));
+		expect(infos).toEqual([true]);
+		expect(cache().get('a')?.v).toBe(1);
+
+		// 新 id の空のスナップショットで古い値が消える。
+		latest().onmessage?.(frame(2, []));
+		expect(infos).toEqual([true, true]);
+		expect(cache().size).toBe(0);
+
+		// 以降は差分としてマージ。
+		latest().onmessage?.(frame(2, [val('b', 2)]));
+		latest().onmessage?.(frame(2, [val('c', 3)]));
+		expect(infos).toEqual([true, true, false, false]);
+		expect([...cache().keys()].sort()).toEqual(['b', 'c']);
+	});
+
+	it('id の無いフレームも捨てる', () => {
+		const { infos } = startWithValues();
+		latest().open();
+		latest().onmessage?.({ data: JSON.stringify({ op: 'data', values: [] }) });
+		expect(infos).toEqual([]);
+	});
+
+	it('再接続した新しいソケットの最初の data はスナップショット、旧ソケットのフレームは捨てる', () => {
+		const { infos, cache } = startWithValues();
+		const first = latest();
+		first.open();
+		first.onmessage?.(frame(1, [val('a', 1)]));
+		first.serverClose(1006);
+		vi.advanceTimersByTime(60_000);
+		expect(FakeWebSocket.instances).toHaveLength(2);
+		const second = latest();
+		second.open();
+		// 旧ソケットの遅れて届いたフレーム。
+		first.onmessage?.(frame(1, [val('a', 7)]));
+		expect(infos).toEqual([true]);
+		second.onmessage?.(frame(1, [val('z', 5)]));
+		expect(infos).toEqual([true, true]);
+		expect([...cache().keys()]).toEqual(['z']);
 	});
 });

@@ -91,6 +91,19 @@ export function mergeTagValues<V extends { tag: string } & RowValue>(
 }
 
 /**
+ * 購読の `data` を最新値のマップへ反映する。スナップショット（購読の最初の `data`）は
+ * 現在のマップを**置き換える**（空なら空。スナップショットに入らなくなった古い値を残さない）。
+ * 差分はマージ。既存マップは書き換えない。
+ */
+export function replaceOrMergeTagValues<V extends { tag: string } & RowValue>(
+	current: ReadonlyMap<string, RowValue>,
+	values: readonly V[],
+	snapshot: boolean
+): Map<string, RowValue> {
+	return mergeTagValues(snapshot ? new Map() : current, values);
+}
+
+/**
  * 行配列へ最新値マップを適用する。マップに対応するエントリが無い行は
  * **同一参照のまま**返す（無駄な再レンダリング・`flash` 誤爆を避ける）。
  * 値が既存行と完全一致する場合も同一参照を返す。

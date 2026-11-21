@@ -88,7 +88,11 @@
 	import { monitorViewSearch, parseMonitorFocus } from '#lib/banto/monitorView.js';
 	import { sharedTreeTarget } from '#lib/treeSelection.svelte.js';
 	import { subscriptionPatternsFor } from '#lib/banto/monitorSubscription.js';
-	import { applyTagValues, mergeTagValues, type RowValue } from '#lib/banto/monitorValues.js';
+	import {
+		applyTagValues,
+		replaceOrMergeTagValues,
+		type RowValue
+	} from '#lib/banto/monitorValues.js';
 	import {
 		cellDisplayMode,
 		initialStreamView,
@@ -251,11 +255,19 @@
 	 * この時点で `rows` がまだ空（catalog 未取得）でも値を失わない -
 	 * 後から `reloadCatalog`/`toRow` が同じマップを見て埋める。
 	 */
-	function applyStreamData(values: StreamValue[]): void {
-		if (values.length === 0) return;
-		latestValues = mergeTagValues(latestValues, values);
+	function applyStreamData(values: StreamValue[], snapshot: boolean): void {
+		if (values.length === 0 && !snapshot) return;
+		latestValues = replaceOrMergeTagValues(latestValues, values, snapshot);
 		const existingNames = new Set(rows.map((r) => r.external_name));
-		rows = applyTagValues(rows, latestValues);
+		// スナップショットは置き換え: 載っていない行は値なし（`toRow` の既定と同じ形）にする。
+		const base = snapshot
+			? rows.map((r) =>
+					latestValues.has(r.external_name) || (r.v === null && r.q === 'stale' && r.t === 0)
+						? r
+						: { ...r, v: null, q: 'stale', t: 0, unverified: false }
+				)
+			: rows;
+		rows = applyTagValues(base, latestValues);
 		// フラッシュ表示は「今回のメッセージで届いた」タグに限る（過去分も
 		// 含む latestValues 全体ではなく、あくまで今回の差分に対して一瞬
 		// ハイライトする、という従来どおりの挙動を維持する）。
@@ -555,8 +567,8 @@
 
 		const { disconnect, resubscribe, resume } = connectTagStream(
 			{
-				onData: (values) => {
-					applyStreamData(values);
+				onData: (values, { snapshot }) => {
+					applyStreamData(values, snapshot);
 					// 初期スナップショット（またはそれ以降の on_change）を
 					// 1回でも受けたら stale 強制表示を解除する。
 					dispatchStreamView({ type: 'data' });

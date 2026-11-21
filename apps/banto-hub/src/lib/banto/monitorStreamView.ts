@@ -164,3 +164,53 @@ export function monitorColumnLabels(mode: CellDisplayMode): { value: string; qua
 		? { value: '最終受信値', quality: '品質（受信時）' }
 		: { value: '値', quality: '品質' };
 }
+
+/**
+ * ストリームの状態の行（モニタの `data-testid="monitor-stream-status"` の行と同じ文言）。
+ * #1255 でタグ登録の表にも値の列を足したので、文言の選び方を純関数にして両方で同じにする。
+ *
+ * - `warning`: バックプレッシャ切断・止まっている間（色を変える）。
+ * - `resumable`: close `1008` の `halt`（利用者の操作で再開できる。ボタンを出す）。
+ */
+export interface StreamStatusLine {
+	kind: 'connected' | 'recheckSession' | 'halt' | 'backpressure' | 'reconnecting';
+	text: string;
+	warning: boolean;
+	resumable: boolean;
+}
+
+export function streamStatusLine(view: StreamViewState): StreamStatusLine {
+	if (view.connected) {
+		return {
+			kind: 'connected',
+			text: '接続中（リアルタイム更新中）',
+			warning: false,
+			resumable: false
+		};
+	}
+	if (view.halt?.kind === 'recheckSession') {
+		return {
+			kind: 'recheckSession',
+			text: 'ログイン状態を確認しています…（リアルタイム更新は止まっています）',
+			warning: true,
+			resumable: false
+		};
+	}
+	if (view.halt?.kind === 'halt') {
+		return { kind: 'halt', text: view.halt.message, warning: true, resumable: true };
+	}
+	if (view.backpressure) {
+		return {
+			kind: 'backpressure',
+			text: 'サーバーが遅い購読者として切断しました（自動再接続中…）',
+			warning: true,
+			resumable: false
+		};
+	}
+	return {
+		kind: 'reconnecting',
+		text: '再接続中…（値は最後の受信内容のまま停止しています）',
+		warning: false,
+		resumable: false
+	};
+}

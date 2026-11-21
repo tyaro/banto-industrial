@@ -237,7 +237,12 @@ export async function getCatalog(): Promise<CatalogResponse> {
 // --- WS 購読 -----------------------------------------------------------------
 
 export interface TagStreamHandlers {
-	onData: (values: StreamValue[]) => void;
+	/**
+	 * 現在の購読の `data` フレーム。`snapshot` は、その購読の最初の `data`
+	 * （サーバーは subscribe の直後に必ず 1 回、空でも送る）で `true`。
+	 * 古い購読 id・古いソケットのフレームはここへ来ない（`connectTagStream` が捨てる）。
+	 */
+	onData: (values: StreamValue[], info: { snapshot: boolean }) => void;
 	onConfigChanged: (revision: number) => void;
 	/**
 	 * 接続確立/切断のたびに呼ばれる（画面側が「値が古いかも」を示すため）。
@@ -338,6 +343,8 @@ export function connectTagStream(
 	let timer: ReturnType<typeof setTimeout> | null = null;
 	let reconnectDelayMs = RECONNECT_BASE_DELAY_MS;
 	let subscriptionId = 1;
+	/** 現在の購読の最初の `data`（スナップショット）をまだ受けていない。subscribe を送るたびに立てる。 */
+	let expectSnapshot = true;
 	/** #445: 開く前に閉じた（= 失敗した）再接続が続けて何回あったか。`onopen` で 0 に戻す。 */
 	let consecutiveFailures = 0;
 	/** #445: ログイン状態の確認が飛行中（同じストリームから重ねて起こさない）。 */
@@ -441,6 +448,7 @@ export function connectTagStream(
 			generation += 1;
 			reconnectDelayMs = RECONNECT_BASE_DELAY_MS;
 			handlers.onStatusChange?.(true);
+			expectSnapshot = true;
 			socket.send(
 				JSON.stringify({
 					op: 'subscribe',
@@ -462,8 +470,15 @@ export function connectTagStream(
 			if (typeof msg !== 'object' || msg === null) return;
 			const op = (msg as { op?: unknown }).op;
 			if (op === 'data') {
+				// 旧ソケット・旧購読 id（購読し直した後に届く旧購読のフレーム）は捨てる。
+				if (ws !== socket) return;
+				if ((msg as { id?: unknown }).id !== subscriptionId) return;
 				const values = (msg as { values?: unknown }).values;
-				if (Array.isArray(values)) handlers.onData(values as StreamValue[]);
+				if (Array.isArray(values)) {
+					const snapshot = expectSnapshot;
+					expectSnapshot = false;
+					handlers.onData(values as StreamValue[], { snapshot });
+				}
 			} else if (op === 'config_changed') {
 				const revision = (msg as { revision?: unknown }).revision;
 				if (typeof revision === 'number') handlers.onConfigChanged(revision);
@@ -549,6 +564,7 @@ export function connectTagStream(
 		if (ws === null || ws.readyState !== WebSocket.OPEN) return;
 		ws.send(JSON.stringify({ op: 'unsubscribe', id: subscriptionId }));
 		subscriptionId += 1;
+		expectSnapshot = true;
 		ws.send(
 			JSON.stringify({
 				op: 'subscribe',
