@@ -3443,7 +3443,64 @@
 	const valueStream = createTagValueStream({
 		treeFilter: () => treeFilter,
 		connections: () => connections,
-		groups: () => groups
+		groups: () => groups,
+		onConfigChanged: () => scheduleConfigChangedReload()
+	});
+
+	// --- #1255: ほかの所での設定変更（WS の config_changed）の取り込み ------------
+	//
+	// 消したタグモニタは config_changed で一覧を読み直していた。吸収後も、別のブラウザや
+	// API でタグ・接続が変わったら閲覧者の画面に出す。ただし登録の画面は編集の途中を
+	// 持つので、読み直しで下書きの前提（`groups`・`connections`）を差し替えない:
+	// - 続けて来た知らせ・このページの操作の直後の知らせは 500ms の debounce で 1 回にする。
+	// - 編集の途中でなければ黙って `reload()`。途中なら読み直さず、ツールバーに
+	//   「読み直す」を出す（押すか、途中でなくなった後の黙った読み直しで消す）。
+	// - `reload()` の最中に来た知らせは、debounce の間を置いて予約し直す（終わってから読み直す）。
+	const CONFIG_CHANGED_DEBOUNCE_MS = 500;
+	let configChangedTimer: ReturnType<typeof setTimeout> | null = null;
+	let externalConfigChanged = $state(false);
+
+	/** 読み直すと失われる・前提が変わる編集の途中か（`beforeNavigate` と同じ考え方。安全側）。 */
+	function isEditingInProgress(): boolean {
+		return (
+			drawerMode !== null ||
+			pendingCellEdits.length > 0 ||
+			activeTab === 'settings' ||
+			csvParseResult !== null ||
+			csvRawTable !== null ||
+			bulkAction !== null
+		);
+	}
+
+	async function applyConfigChanged(): Promise<void> {
+		configChangedTimer = null;
+		if (isEditingInProgress()) {
+			externalConfigChanged = true;
+			return;
+		}
+		if (loading) {
+			// `reload()` の最中（このページの操作の後の読み直しなど、どこから呼ばれたものでも）。
+			// 走っている読み直しが知らせより前の内容を読んだかもしれないので、少し後にもう 1 回。
+			scheduleConfigChangedReload();
+			return;
+		}
+		externalConfigChanged = false;
+		await reload();
+	}
+
+	function scheduleConfigChangedReload(): void {
+		if (configChangedTimer !== null) clearTimeout(configChangedTimer);
+		configChangedTimer = setTimeout(() => void applyConfigChanged(), CONFIG_CHANGED_DEBOUNCE_MS);
+	}
+
+	async function reloadAfterExternalChange(): Promise<void> {
+		externalConfigChanged = false;
+		await reload();
+	}
+
+	onDestroy(() => {
+		if (configChangedTimer !== null) clearTimeout(configChangedTimer);
+		configChangedTimer = null;
 	});
 
 	/**
@@ -4324,8 +4381,13 @@
 		}
 		const q = searchQuery.trim().toLowerCase();
 		if (q !== '') {
+			// #1255: 旧タグモニタは外部名で検索できた。ログや SDK に出る完全な外部名
+			// （`接続.グループ.タグ`）を貼っても絞れるようにする。
 			list = list.filter(
-				(t) => t.name.toLowerCase().includes(q) || t.address.toLowerCase().includes(q)
+				(t) =>
+					t.name.toLowerCase().includes(q) ||
+					t.address.toLowerCase().includes(q) ||
+					externalNameForTag(t).toLowerCase().includes(q)
 			);
 		}
 		return list;
@@ -7341,6 +7403,17 @@
 							<button type="button" class="tool-button" onclick={valueStream.resume}>再接続</button>
 						{/if}
 					</span>
+					{#if externalConfigChanged}
+						<span class="stream-status status-warning" data-testid="tag-config-changed">
+							<span class="stream-status-text">ほかの所で設定が変わりました</span>
+							<button
+								type="button"
+								class="tool-button"
+								data-testid="tag-config-changed-reload"
+								onclick={() => void reloadAfterExternalChange()}>読み直す</button
+							>
+						</span>
+					{/if}
 					<span class="frame-toolbar-spacer"></span>
 					{#if !layoutNarrow}
 						<button
@@ -7503,7 +7576,7 @@
 										<input
 											type="search"
 											class="search-box"
-											placeholder="名前・アドレスで検索"
+											placeholder="外部名・名前・アドレスで検索"
 											bind:value={searchQuery}
 										/>
 										<span class="count">{filteredTags.length} / {visibleTags.length} 件</span>
@@ -7866,7 +7939,14 @@
 											CI）の再発防止。 -->
 										<div class="onboarding-banner">
 											<span>タグ一覧で値・品質・時刻を確認できます。</span>
-											<a class="onboarding-cta" href={confirmCtaHref}>確認: 値・品質・時刻を見る</a>
+											<!-- #1255: 同じページの中の遷移なので、前の検索語が残ると新しいタグの行が隠れる。
+											押したときに検索語を消す（遷移は止めない。未保存の確認で取り消される
+											場合も検索語が消えるだけで害は小さいので onclick にした）。 -->
+											<a
+												class="onboarding-cta"
+												href={confirmCtaHref}
+												onclick={() => (searchQuery = '')}>確認: 値・品質・時刻を見る</a
+											>
 											<button
 												type="button"
 												class="secondary"

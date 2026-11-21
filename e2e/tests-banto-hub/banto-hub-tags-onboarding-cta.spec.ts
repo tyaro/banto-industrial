@@ -135,4 +135,70 @@ test.describe.serial('banto-hub 登録後の確認導線 CTA (T18-4c)', () => {
 		// ツリーはそのグループを選択状態にしている。
 		await expect(page.getByRole('treeitem', { selected: true })).toContainText(GROUP_NAME);
 	});
+
+	// #1255: 確認のリンクは同じページの中の遷移なので、検索欄に前の語が残ると新しい名前の行が
+	// 隠れる。押したときに検索語を消す。
+	test('3. 合わない検索語を入れたまま作成して確認を押すと、検索が空になり新しい行が強調される', async () => {
+		const name = `${TAG_NAME}-b`;
+		await page.goto('/tags');
+		await groupNodeByName(page, GROUP_NAME).click();
+		const search = page.getByPlaceholder('名前・アドレスで検索');
+		await search.fill('zzz-no-such-tag');
+		await page.getByRole('button', { name: 'タグを追加' }).click();
+		const drawer = page.getByRole('complementary', { name: '新規作成' });
+		await drawer.getByLabel('名前').fill(name);
+		await drawer.getByLabel('アドレス').fill('40002');
+		await drawer.getByRole('button', { name: '保存して閉じる' }).click();
+		await expect(page.getByText('作成しました')).toBeVisible();
+
+		await page.getByRole('link', { name: CTA_TEXT }).click();
+		await expect(search).toHaveValue('');
+		await expect(page.locator('.row.confirm-target')).toContainText(name);
+	});
+
+	test('4. 旧名の検索語を入れたまま改名して確認を押すと、検索が空になり新しい名前の行が強調される', async () => {
+		const oldName = `${TAG_NAME}-b`;
+		const newName = `${TAG_NAME}-renamed`;
+		await page.goto('/tags');
+		await groupNodeByName(page, GROUP_NAME).click();
+		const search = page.getByPlaceholder('名前・アドレスで検索');
+		await search.fill(oldName);
+		await page.getByRole('gridcell', { name: oldName, exact: true }).click();
+		const drawer = page.getByRole('complementary', { name: `${oldName} を編集` });
+		await expect(drawer).toBeVisible();
+		await drawer.getByLabel('名前').fill(newName);
+		await drawer.getByRole('button', { name: '保存', exact: true }).click();
+		await expect(page.getByText('更新しました')).toBeVisible();
+
+		await page.getByRole('link', { name: CTA_TEXT }).click();
+		await expect(search).toHaveValue('');
+		await expect(page.locator('.row.confirm-target')).toContainText(newName);
+	});
+
+	// #1255: ほかの所（API）で足されたタグが、開いている /tags に config_changed で出る。
+	test('5. 別の経路でタグが足されると、開いている /tags の一覧に行が出る', async () => {
+		const name = `${TAG_NAME}-external`;
+		await page.goto('/tags');
+		await groupNodeByName(page, GROUP_NAME).click();
+		await page.getByPlaceholder('名前・アドレスで検索').fill(name);
+		await expect(page.getByRole('gridcell', { name, exact: true })).toHaveCount(0);
+
+		const res = await page.request.post('/api/tags', {
+			headers: authedHeaders,
+			data: {
+				name,
+				collectionGroupId: groupId,
+				address: '40003',
+				dataType: 'i16',
+				decimals: 0,
+				enabled: true,
+				writable: false,
+				tagKind: 'plc'
+			}
+		});
+		expect(res.ok(), await res.text()).toBe(true);
+		await expect(page.getByRole('gridcell', { name, exact: true })).toBeVisible({
+			timeout: 10_000
+		});
+	});
 });

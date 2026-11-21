@@ -41,6 +41,11 @@ export interface TagValueStreamSources {
 	treeFilter: () => MonitorTreeFilter;
 	connections: () => PlcConnection[];
 	groups: () => CollectionGroup[];
+	/**
+	 * 設定（タグ・接続・グループ）が別の所で変わったという WS の知らせ（#1255）。
+	 * 一覧を読み直すかは呼び出し側が決める（編集の途中を巻き込まないため）。
+	 */
+	onConfigChanged?: () => void;
 }
 
 export interface TagValueStream {
@@ -113,8 +118,9 @@ export function createTagValueStream(sources: TagValueStreamSources): TagValueSt
 					}
 					dispatch({ type: 'data' });
 				},
-				// 登録の画面は自分で一覧を読み直す（保留中の編集を巻き込まない）。
-				onConfigChanged: () => {},
+				// 一覧の読み直しは呼び出し側（登録の画面）が決める。ここで読み直すと、
+				// 作成・編集の途中や保留中の編集を巻き込むため（#1255）。
+				onConfigChanged: () => sources.onConfigChanged?.(),
 				onStatusChange: (connected, closeCode) => {
 					dispatch(connected ? { type: 'connected' } : { type: 'disconnected', code: closeCode });
 				},
