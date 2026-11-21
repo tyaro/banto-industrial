@@ -17,7 +17,7 @@
  *   無ければ `penId` のペンの色、どちらも無ければ `--banto-text-muted`。同じ時刻（`tMs`）の印は 1 本に
  *   まとめる（名前は「・」でつなぐ、色は最初の印の色、件数は `count`）。名前は、前に名前を出した
  *   印から 48px 未満なら省く（線と `<title>` は残す）。時刻の順に判定する。名前は印の右に
- *   左寄せで置くが、印が描画幅の右端から 48px 以内なら印の左に右寄せで置く（`labelSide`。
+ *   左寄せで置くが、印の右の空きが 48px 未満で、左の空きの方が大きければ印の左に右寄せで置く（`labelSide`。
  *   右端で描画域の外に消えないように）。
  */
 
@@ -185,7 +185,9 @@ export function timeMarkLayout(
 				: TIME_MARK_DEFAULT_COLOR;
 		const showLabel = x - lastLabelX >= TIME_MARK_LABEL_MIN_GAP;
 		if (showLabel) lastLabelX = x;
-		const labelSide = x > plotWidth - TIME_MARK_LABEL_MIN_GAP ? 'left' : 'right';
+		const rightRoom = plotWidth - x;
+		const labelSide: TimeMarkLine['labelSide'] =
+			rightRoom < TIME_MARK_LABEL_MIN_GAP && x > rightRoom ? 'left' : 'right';
 		out.push({ x, label: m.label, colorVar, showLabel, labelSide, count: 1 });
 	}
 	return out;

@@ -127,6 +127,13 @@ describe('timeMarkLayout', () => {
 			[99, 'left']
 		]);
 	});
+	it('名前の側: 描画幅が狭くても、左の空きの方が大きければ左端の名前は左に置く', () => {
+		const r = timeMarkLayout([m(1000), m(1975)], [], range, 40);
+		expect(r.map((x) => [x.x, x.labelSide])).toEqual([
+			[0, 'right'],
+			[39, 'left']
+		]);
+	});
 	it('同じ時刻の印は 1 本にまとめ、名前をつなぐ（色は最初）', () => {
 		const r = timeMarkLayout(
 			[
