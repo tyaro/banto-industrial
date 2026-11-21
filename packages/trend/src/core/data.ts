@@ -12,11 +12,18 @@
 import { visibleBins } from './geometry';
 import type { Bin } from './pens';
 import type { TimeRange } from './range';
+import { samplesForDraw } from './samples';
 
 /** ペン 1 本のデータ。`binMs` はその系列の実際の区間の幅（ミリ秒）。 */
 export interface TrendSeries {
 	bins: readonly Bin[];
 	binMs: number;
+	/**
+	 * 系列の種類。未指定は 'bins'（区間の系列）。'samples' は観測点の系列（#1274）で、`bins` の各要素が観測 1 つ
+	 * （`tMs` は観測の時刻そのもの、値は `min`）、`binMs` は記録周期。点を実時刻に置き、間引かず、
+	 * カーソルは近い観測に吸着する（`core/samples.ts`）。
+	 */
+	kind?: 'bins' | 'samples';
 }
 
 /** 取得した範囲と、ペン id → 系列。 */
@@ -36,7 +43,10 @@ export function intersectRange(a: TimeRange, b: TimeRange): TimeRange | null {
 export interface DrawableSeries {
 	/** 取得範囲と表示範囲の重なり。データが無い・重ならないときは null。 */
 	effective: TimeRange | null;
-	/** 有効範囲と重なる区間だけに絞った系列。 */
+	/**
+	 * 有効範囲と重なる区間だけに絞った系列。'samples' は有効範囲の中の観測に、線を端までつなぐための
+	 * 両側の外の観測を 1 つずつ足す（縦軸・空の判定は `samplesInRange` で外を除く）。`kind` は保つ。
+	 */
 	series: Record<string, TrendSeries>;
 }
 
@@ -50,6 +60,14 @@ export function drawableSeries(data: TrendData | null, view: TimeRange): Drawabl
 	const effective = intersectRange(data.range, view);
 	for (const [id, s] of Object.entries(data.series)) {
 		if (!s) continue;
+		if (s.kind === 'samples') {
+			series[id] = {
+				binMs: s.binMs,
+				kind: 'samples',
+				bins: effective ? samplesForDraw(s.bins, effective) : []
+			};
+			continue;
+		}
 		series[id] = {
 			binMs: s.binMs,
 			bins: effective ? visibleBins(s.bins, s.binMs, effective) : []

@@ -36,7 +36,8 @@
 		cursorReadout,
 		formatDuration,
 		placeCursor,
-		type CursorPair
+		type CursorPair,
+		type CursorValue
 	} from './core/cursor';
 	import { drawableSeries, type TrendData } from './core/data';
 	import { envelopePath, hasFiniteValue } from './core/geometry';
@@ -50,7 +51,14 @@
 		resolveMarkerSize
 	} from './core/style';
 	import TrendPenSwatch from './TrendPenSwatch.svelte';
-	import { bitBandLayout, bitSpans } from './core/bitBands';
+	import { bitBandLayout, bitMissingSpans, bitSpans } from './core/bitBands';
+	import {
+		effectiveClip,
+		formatObservationTime,
+		samplesInRange,
+		samplesMarkerPoints,
+		samplesPath
+	} from './core/samples';
 	import {
 		axisOwners,
 		axisTickValues,
@@ -159,8 +167,22 @@
 	// 取得範囲 ∩ 表示範囲と重なる区間だけを、縦軸・空の判定・線・カーソルで共用する。
 	const drawable = $derived(drawableSeries(data, range));
 	const emptyBins: never[] = [];
-	const domains: YDomain[] = $derived(
-		pens.map((p) => resolveYDomain(p, drawable.series[p.id]?.bins ?? emptyBins))
+	// 縦軸・空の判定に使う区間。'samples' は線のために足した範囲の外の観測を除く。
+	const extentBins = $derived(
+		pens.map((p) => {
+			const s = drawable.series[p.id];
+			if (!s) return emptyBins;
+			const eff = drawable.effective;
+			return s.kind === 'samples' ? (eff ? samplesInRange(s.bins, eff) : emptyBins) : s.bins;
+		})
+	);
+	const domains: YDomain[] = $derived(pens.map((p, i) => resolveYDomain(p, extentBins[i])));
+	// 'samples' の線は有効範囲の x の幅で切る（外の観測は補間のために残しているだけ）。
+	const lineClip = $derived(effectiveClip(drawable.effective, xScale, plotWidth));
+	/** カーソルの吸着の幅（'samples' の系列）: 8px を時刻に直した ms。 */
+	const SNAP_PX = 8;
+	const snapMs = $derived(
+		plotWidth > 0 && isValidRange(range) ? ((range.endMs - range.startMs) / plotWidth) * SNAP_PX : 0
 	);
 	const paths = $derived(
 		valid
@@ -168,7 +190,10 @@
 					const s = drawable.series[p.id];
 					const eff = drawable.effective;
 					if (!s || !eff || isBitBand(p)) return '';
-					return envelopePath(s.bins, s.binMs, xScale, linearScale(domains[i], [analogHeight, 0]), {
+					const ys = linearScale(domains[i], [analogHeight, 0]);
+					if (s.kind === 'samples')
+						return samplesPath(s.bins, s.binMs, xScale, ys, { step: !!p.bit });
+					return envelopePath(s.bins, s.binMs, xScale, ys, {
 						startMs: eff.startMs,
 						endMs: eff.endMs
 					});
@@ -184,15 +209,20 @@
 					const eff = drawable.effective;
 					if (kind === 'none' || !s || !eff || isBitBand(p)) return '';
 					const size = resolveMarkerSize(p.markerSize);
-					const pts = markerPoints(
-						s.bins,
-						s.binMs,
-						xScale,
-						linearScale(domains[i], [analogHeight, 0]),
-						{ startMs: eff.startMs, endMs: eff.endMs },
-						size,
-						{ width: plotWidth, height: analogHeight }
-					);
+					const ys = linearScale(domains[i], [analogHeight, 0]);
+					const plot = { width: plotWidth, height: analogHeight };
+					const pts =
+						s.kind === 'samples'
+							? samplesMarkerPoints(s.bins, xScale, ys, eff, size, plot)
+							: markerPoints(
+									s.bins,
+									s.binMs,
+									xScale,
+									ys,
+									{ startMs: eff.startMs, endMs: eff.endMs },
+									size,
+									plot
+								);
 					return markerPath(pts, kind, size);
 				})
 			: []
@@ -214,7 +244,10 @@
 					return {
 						...slot,
 						pen: pens[slot.penIndex],
-						spans: s && eff ? bitSpans(s.bins, s.binMs, xScale, eff) : []
+						spans: s && eff ? bitSpans(s.bins, s.binMs, xScale, eff, s.kind) : [],
+						missing: eff
+							? bitMissingSpans(s?.bins ?? emptyBins, s?.binMs ?? 0, xScale, eff, s?.kind)
+							: []
 					};
 				})
 			: []
@@ -240,18 +273,22 @@
 		return formatValue(v);
 	}
 
-	const hasData = $derived(
-		pens.some((p) => hasFiniteValue(drawable.series[p.id]?.bins ?? emptyBins))
-	);
+	const hasData = $derived(pens.some((_, i) => hasFiniteValue(extentBins[i])));
 	const readout = $derived(
-		cursorMs !== null ? cursorReadout(pens, drawable.series, cursorMs, drawable.effective) : null
+		cursorMs !== null
+			? cursorReadout(pens, drawable.series, cursorMs, drawable.effective, snapMs)
+			: null
 	);
 	const cursorX = $derived(cursorMs !== null && valid ? xScale(cursorMs) : null);
 	const readoutA = $derived(
-		fixed.a !== null ? cursorReadout(pens, drawable.series, fixed.a, drawable.effective) : null
+		fixed.a !== null
+			? cursorReadout(pens, drawable.series, fixed.a, drawable.effective, snapMs)
+			: null
 	);
 	const readoutB = $derived(
-		fixed.b !== null ? cursorReadout(pens, drawable.series, fixed.b, drawable.effective) : null
+		fixed.b !== null
+			? cursorReadout(pens, drawable.series, fixed.b, drawable.effective, snapMs)
+			: null
 	);
 	/** 表示範囲の中にある固定カーソルの x（外は null で線を描かない）。 */
 	function fixedX(t: number | null): number | null {
@@ -450,6 +487,18 @@
 				<clipPath id="{uid}-clip">
 					<rect x="0" y="0" width={plotWidth} height={plotHeight} />
 				</clipPath>
+				<pattern
+					id="{uid}-missing"
+					width="6"
+					height="6"
+					patternUnits="userSpaceOnUse"
+					patternTransform="rotate(45)"
+				>
+					<line class="bi-trend__missing-line" x1="0" y1="0" x2="0" y2="6" />
+				</pattern>
+				<clipPath id="{uid}-eff-clip">
+					<rect x={lineClip?.x ?? 0} y="0" width={lineClip?.width ?? 0} height={plotHeight} />
+				</clipPath>
 				<clipPath id="{uid}-analog-clip">
 					<rect x="0" y="0" width={plotWidth} height={analogHeight} />
 				</clipPath>
@@ -513,6 +562,16 @@
 					</g>
 					{#each bitBandViews as bb (bb.pen.id)}
 						<rect class="bi-trend__bit-bg" x="0" y={bb.y} width={plotWidth} height={bb.height} />
+						{#each bb.missing as ms, j (j)}
+							<rect
+								class="bi-trend__missing"
+								x={ms.x}
+								y={bb.y}
+								width={ms.width}
+								height={bb.height}
+								fill="url(#{uid}-missing)"><title>記録なし</title></rect
+							>
+						{/each}
 						{#each bb.spans as sp, j (j)}
 							<rect
 								x={sp.x}
@@ -557,6 +616,7 @@
 								<path
 									class="bi-trend__line"
 									d={paths[i]}
+									clip-path="url(#{uid}-eff-clip)"
 									stroke={penColor(pen)}
 									stroke-width={resolveLineWidth(pen.lineWidth)}
 									stroke-dasharray={dashArray(pen.lineStyle, pen.lineWidth) ?? undefined}
@@ -571,6 +631,7 @@
 										<path
 											class="bi-trend__line"
 											d={paths[i]}
+											clip-path="url(#{uid}-eff-clip)"
 											stroke={r.colorVar}
 											stroke-width={resolveLineWidth(pen.lineWidth)}
 											stroke-dasharray={dashArray(pen.lineStyle, pen.lineWidth) ?? undefined}
@@ -657,16 +718,26 @@
 	{/if}
 </div>
 
+{#snippet obsTime(v: CursorValue)}
+	{#if typeof v.tMs === 'number'}<small class="bi-trend__muted">
+			({formatObservationTime(v.tMs)})</small
+		>{/if}
+{/snippet}
+
 {#snippet legendBody(pen: TrendPen, i: number)}
 	<TrendPenSwatch {pen} />
 	<span class="bi-trend__legend-label">{pen.label}</span>
 	{#if pen.axis === 'right'}<span class="bi-trend__muted">（右軸）</span>{/if}
 	<span class="bi-trend__muted">{rangeText(pen, domains[i])}</span>
 	{#if readout}
-		<span class="bi-trend__value">{readout[i].text}</span>
+		<span class="bi-trend__value">{readout[i].text}{@render obsTime(readout[i])}</span>
 	{/if}
-	{#if readoutA}<span class="bi-trend__value">A {readoutA[i].text}</span>{/if}
-	{#if readoutB}<span class="bi-trend__value">B {readoutB[i].text}</span>{/if}
+	{#if readoutA}<span class="bi-trend__value"
+			>A {readoutA[i].text}{@render obsTime(readoutA[i])}</span
+		>{/if}
+	{#if readoutB}<span class="bi-trend__value"
+			>B {readoutB[i].text}{@render obsTime(readoutB[i])}</span
+		>{/if}
 	{#if readoutA && readoutB}
 		<span class="bi-trend__value">差 {cursorDiff(pen, readoutA[i], readoutB[i])}</span>
 	{/if}
@@ -733,6 +804,10 @@
 		fill: none;
 		stroke: var(--banto-chart-grid);
 		stroke-width: 1;
+	}
+	.bi-trend__missing-line {
+		stroke: var(--banto-chart-grid);
+		stroke-width: 1.5;
 	}
 	.bi-trend__bit-label {
 		fill: var(--banto-text-muted);
