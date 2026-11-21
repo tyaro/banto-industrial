@@ -7,7 +7,12 @@
  * 消した。
  */
 import { describe, expect, it } from 'vitest';
-import { mergeTagValues, replaceOrMergeTagValues, type RowValue } from './monitorValues';
+import {
+	keepAcceptedValues,
+	mergeTagValues,
+	replaceOrMergeTagValues,
+	type RowValue
+} from './monitorValues';
 
 describe('mergeTagValues', () => {
 	it('空マップへ values を畳み込むと外部名をキーにしたマップになる', () => {
@@ -66,5 +71,31 @@ describe('replaceOrMergeTagValues', () => {
 	it('差分はマージする', () => {
 		const next = replaceOrMergeTagValues(cur, [{ tag: 'new', v: 2, q: 'good', t: 2 }], false);
 		expect([...next.keys()].sort()).toEqual(['new', 'old']);
+	});
+});
+
+describe('keepAcceptedValues（値を見張る窓、#1254）', () => {
+	const val = (tag: string, v: number) => ({ tag, v, q: 'good', t: v });
+
+	it('accept の外部名だけを残し、accept が無ければそのまま', () => {
+		const values = [val('a', 1), val('b', 2)];
+		expect(keepAcceptedValues(values, new Set(['a']))).toEqual([val('a', 1)]);
+		expect(keepAcceptedValues(values, undefined)).toBe(values);
+	});
+
+	it('見張り外の値はマップに残らず、購読し直しのスナップショットに無い外部名の値は落ちる', () => {
+		const watched = new Set(['a', 'b']);
+		let map = replaceOrMergeTagValues(
+			new Map(),
+			keepAcceptedValues([val('a', 1), val('b', 2), val('x', 9)], watched),
+			true
+		);
+		expect([...map.keys()].sort()).toEqual(['a', 'b']);
+		map = replaceOrMergeTagValues(map, keepAcceptedValues([val('x', 10)], watched), false);
+		expect([...map.keys()].sort()).toEqual(['a', 'b']);
+		// b は別の所で消された: 購読し直しのスナップショットに無い。
+		map = replaceOrMergeTagValues(map, keepAcceptedValues([val('a', 3)], watched), true);
+		expect([...map.keys()]).toEqual(['a']);
+		expect(map.get('a')?.v).toBe(3);
 	});
 });

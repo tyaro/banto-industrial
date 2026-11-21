@@ -37,6 +37,7 @@ import {
 	cellDisplayMode,
 	initialStreamView,
 	monitorCellDisplay,
+	streamStatusLine,
 	streamViewReducer,
 	type StreamHalt,
 	type StreamViewEvent
@@ -687,5 +688,83 @@ describe('connectTagStream: 購読 id の照合とスナップショット（#12
 		second.onmessage?.(frame(1, [val('z', 5)]));
 		expect(infos).toEqual([true, true]);
 		expect([...cache().keys()]).toEqual(['z']);
+	});
+});
+
+describe('connectTagStream + streamViewReducer: 購読の拒否（#1254、PR #1282 のレビュー）', () => {
+	const errorFrame = (id: number, code = 'unknown_tag', detail = '未知のタグです: a.b.c') => ({
+		data: JSON.stringify({ op: 'error', id, code, detail })
+	});
+	const dataFrame = (id: number) => ({
+		data: JSON.stringify({ op: 'data', id, values: [{ tag: 'a', v: 1, q: 'good', t: 1 }] })
+	});
+
+	function startWithView() {
+		let view = initialStreamView();
+		const dispatch = (event: StreamViewEvent) => {
+			view = streamViewReducer(view, event);
+		};
+		const onRejected = vi.fn((code: string, detail: string) =>
+			dispatch({ type: 'rejected', code, detail })
+		);
+		const stream = connectTagStream(
+			{
+				onData: () => dispatch({ type: 'data' }),
+				onConfigChanged: () => {},
+				onStatusChange: (connected, code) =>
+					dispatch(connected ? { type: 'connected' } : { type: 'disconnected', code }),
+				onHalt: (action) => dispatch({ type: 'halted', action }),
+				onRejected
+			},
+			() => ['*']
+		);
+		return { stream, onRejected, view: () => view, dispatch };
+	}
+
+	it('今の購読への error で拒否の状態になり、「更新中」と出さない。購読し直しのスナップショットで戻る', () => {
+		const { stream, onRejected, view, dispatch } = startWithView();
+		latest().open();
+		latest().onmessage?.(errorFrame(1));
+		expect(onRejected).toHaveBeenCalledWith('unknown_tag', '未知のタグです: a.b.c');
+		const line = streamStatusLine(view());
+		expect(line.kind).toBe('rejected');
+		expect(line.warning).toBe(true);
+		expect(line.resumable).toBe(true);
+		expect(line.text).toContain('unknown_tag');
+		expect(line.text).toContain('未知のタグです: a.b.c');
+		expect(line.text).not.toContain('更新中');
+		expect(cellDisplayMode(view())).toBe('awaitingSnapshot');
+
+		// 購読し直し（画面の「再接続」・パターンの変化と同じ順）。data が来るまでは拒否のまま。
+		stream.resubscribe();
+		dispatch({ type: 'resubscribed' });
+		expect(streamStatusLine(view()).kind).toBe('rejected');
+		latest().onmessage?.(dataFrame(2));
+		expect(streamStatusLine(view()).kind).toBe('connected');
+		expect(cellDisplayMode(view())).toBe('live');
+	});
+
+	it('古い購読 id・id の無い error は無視する', () => {
+		const { stream, onRejected, view } = startWithView();
+		latest().open();
+		stream.resubscribe(); // id 2
+		latest().onmessage?.(errorFrame(1));
+		latest().onmessage?.({
+			data: JSON.stringify({ op: 'error', code: 'invalid_request', detail: 'x' })
+		});
+		expect(onRejected).not.toHaveBeenCalled();
+		latest().onmessage?.(dataFrame(2));
+		expect(streamStatusLine(view()).kind).toBe('connected');
+	});
+
+	it('旧ソケット宛ての error は無視する', () => {
+		const { onRejected } = startWithView();
+		const first = latest();
+		first.open();
+		first.serverClose(1006);
+		vi.advanceTimersByTime(60_000);
+		latest().open();
+		first.onmessage?.(errorFrame(1));
+		expect(onRejected).not.toHaveBeenCalled();
 	});
 });

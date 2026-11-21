@@ -7,7 +7,12 @@
  * - 一覧はタグの id の配列（順序つき・重複なし・最大 {@link WATCH_LIMIT} 件）。窓は 1 つだけ。
  * - 保存は利用者ごと（サーバーは `hub.watch.v1`、localStorage の写しは持ち主ごと）。ドックの
  *   配置とは別のキーで持つ（配置の版を上げずに済む）。
- * - 消されたタグの id は、タグ一覧を取得したときに {@link pruneMissing} で落とす。
+ * - 一覧の変更は「操作」（{@link WatchOp}: 足す・外す・すべて外す・消えた id の除去）で表し、
+ *   {@link applyWatchOps} で基準の一覧に当てる。サーバーの保存値が確定する前の操作を溜めて、
+ *   確定した基準に当て直すため（端末の写しから作った一覧でサーバーの一覧を消さない。
+ *   `watchListStore.ts` 冒頭）。
+ * - 消されたタグの id は、サーバーの基準が確定し、タグ一覧を取得した後に `prune` の操作で落とす。
+ * - 購読のパターンは見張っているタグの収集グループのワイルドカード（{@link watchSubscriptionPatterns}）。
  */
 
 /** 見張れるタグの上限（2026-11-21 オーナー決定）。 */
@@ -78,6 +83,76 @@ export function removeFromWatch(list: readonly number[], id: number): number[] {
 /** 存在しなくなったタグの id を落とす（残りの順は変えない）。 */
 export function pruneMissing(list: readonly number[], existing: ReadonlySet<number>): number[] {
 	return list.filter((id) => existing.has(id));
+}
+
+/**
+ * 一覧への 1 回の操作。サーバーの基準が確定する前は溜めておき、確定した基準に当て直す
+ * （`watchListStore.ts`）。`prune` の `existing` はその時点のタグ一覧の id。
+ */
+export type WatchOp =
+	| { kind: 'add'; ids: readonly number[] }
+	| { kind: 'remove'; id: number }
+	| { kind: 'clear' }
+	| { kind: 'prune'; existing: ReadonlySet<number> };
+
+/**
+ * 1 つの操作を当てる。足すときの上限・重複の扱いは {@link addToWatch} と同じ。足す以外の
+ * 操作の件数（`added` など）は 0。
+ */
+export function applyWatchOp(
+	list: readonly number[],
+	op: WatchOp,
+	limit: number = WATCH_LIMIT
+): AddResult {
+	switch (op.kind) {
+		case 'add':
+			return addToWatch(list, op.ids, limit);
+		case 'remove':
+			return { list: removeFromWatch(list, op.id), added: 0, duplicates: 0, overLimit: 0 };
+		case 'clear':
+			return { list: [], added: 0, duplicates: 0, overLimit: 0 };
+		case 'prune':
+			return { list: pruneMissing(list, op.existing), added: 0, duplicates: 0, overLimit: 0 };
+	}
+}
+
+/** 操作を順に当てた一覧（基準は書き換えない）。 */
+export function applyWatchOps(
+	base: readonly number[],
+	ops: readonly WatchOp[],
+	limit: number = WATCH_LIMIT
+): number[] {
+	let list: number[] = [...base];
+	for (const op of ops) list = applyWatchOp(list, op, limit).list;
+	return list;
+}
+
+/**
+ * 見張りの購読のパターン: 見張っているタグの属する収集グループのワイルドカード
+ * `{接続名}.{グループ名}.*` の重複なしの一覧（見張りの順に初めて出た順）。
+ *
+ * 外部名の具体名で送らないのは、サーバーが未知の具体名を 1 件でも含む購読を全体ごと
+ * `unknown_tag` で拒否し（`core/src/stream.rs`）、ページの一覧と実行中のカタログの差
+ * （作ったばかり・別の所で消した）で窓全体が止まるため。ワイルドカードは 0 件でも拒否され
+ * ず、タグ名に `*` があっても関係ない。グループの外のタグの値も届くので、受けた値は見張って
+ * いる外部名だけを残す（`createTagValueStream` の `accept`）。`prefixByGroupId` に無い
+ * グループ（一覧の取得のずれ）のタグは外す（引けるまで値は出ない）。
+ */
+export function watchSubscriptionPatterns(
+	tags: readonly { collectionGroupId: number }[],
+	prefixByGroupId: ReadonlyMap<number, string>
+): string[] {
+	const patterns: string[] = [];
+	const seen = new Set<string>();
+	for (const tag of tags) {
+		const prefix = prefixByGroupId.get(tag.collectionGroupId);
+		if (prefix === undefined) continue;
+		const pattern = `${prefix}.*`;
+		if (seen.has(pattern)) continue;
+		seen.add(pattern);
+		patterns.push(pattern);
+	}
+	return patterns;
 }
 
 /** 同じ一覧か（順序も含む）。 */

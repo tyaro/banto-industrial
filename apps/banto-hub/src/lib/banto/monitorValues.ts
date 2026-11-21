@@ -98,3 +98,15 @@ export function replaceOrMergeTagValues<V extends { tag: string } & RowValue>(
 ): Map<string, RowValue> {
 	return mergeTagValues(snapshot ? new Map() : current, values);
 }
+
+/**
+ * 受けた値のうち、`accept` の外部名だけを残す（`accept` が無ければそのまま）。値を見張る窓
+ * （#1254、PR #1282 のレビュー）は収集グループのワイルドカードで購読するので、グループの
+ * 外の値も届く。値のマップ（メモリ）と強調を見張りの分だけにするため、マップへ畳む前に絞る。
+ */
+export function keepAcceptedValues<V extends { tag: string }>(
+	values: readonly V[],
+	accept: ReadonlySet<string> | undefined
+): readonly V[] {
+	return accept === undefined ? values : values.filter((value) => accept.has(value.tag));
+}

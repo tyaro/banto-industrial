@@ -32,32 +32,56 @@ describe('cellDisplayMode', () => {
 		['初期（未接続・最初の値の待ち）', initialStreamView(), 'awaitingSnapshot'],
 		[
 			'接続中・値を受けた',
-			{ connected: true, backpressure: false, awaitingSnapshot: false, halt: null },
+			{ connected: true, backpressure: false, awaitingSnapshot: false, halt: null, rejected: null },
 			'live'
 		],
 		[
 			'接続中・最初の値の待ち',
-			{ connected: true, backpressure: false, awaitingSnapshot: true, halt: null },
+			{ connected: true, backpressure: false, awaitingSnapshot: true, halt: null, rejected: null },
 			'awaitingSnapshot'
 		],
 		[
 			'通常の再接続中（値は受けた後）',
-			{ connected: false, backpressure: false, awaitingSnapshot: false, halt: null },
+			{
+				connected: false,
+				backpressure: false,
+				awaitingSnapshot: false,
+				halt: null,
+				rejected: null
+			},
 			'live'
 		],
 		[
 			'1008 で停止（手動の再開待ち）',
-			{ connected: false, backpressure: false, awaitingSnapshot: false, halt: UNKNOWN_HALT },
+			{
+				connected: false,
+				backpressure: false,
+				awaitingSnapshot: false,
+				halt: UNKNOWN_HALT,
+				rejected: null
+			},
 			'halted'
 		],
 		[
 			'1008 で停止（ログイン状態の確認中）',
-			{ connected: false, backpressure: false, awaitingSnapshot: false, halt: RECHECK },
+			{
+				connected: false,
+				backpressure: false,
+				awaitingSnapshot: false,
+				halt: RECHECK,
+				rejected: null
+			},
 			'halted'
 		],
 		[
 			'1008 で停止・最初の値の待ちでも停止を優先',
-			{ connected: false, backpressure: false, awaitingSnapshot: true, halt: UNKNOWN_HALT },
+			{
+				connected: false,
+				backpressure: false,
+				awaitingSnapshot: true,
+				halt: UNKNOWN_HALT,
+				rejected: null
+			},
 			'halted'
 		]
 	];

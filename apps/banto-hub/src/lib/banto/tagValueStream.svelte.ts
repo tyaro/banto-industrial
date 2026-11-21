@@ -11,6 +11,15 @@
  * 見張っているタグだけを窓が出ている間だけ購読する（ツリーの購読とは別の 2 本目のソケット。
  * 部品の状態（再接続・バックプレッシャ・強調）がインスタンスごとに独立で、ツリーの範囲を
  * 一時的に差し替える方式より単純で、片方の切断がもう片方に波及しない）。
+ * PR #1282 のレビューで、見張りの購読は具体名ではなく収集グループのワイルドカードにした
+ * （`watchList.ts::watchSubscriptionPatterns`。未知の具体名 1 件で購読全体が拒否されるため）。
+ * グループの外の値も届くので、`acceptNames` で見張っている外部名だけを値のマップに残し
+ * （メモリと強調を見張りの分だけにする）、その集合が変わったら購読し直して新しいスナップ
+ * ショットを受ける（足したタグの今の値が、次に変わるまで出ないことが無いように）。
+ * スナップショットは置き換え（`replaceOrMergeTagValues`）なので、購読し直すと、消えた・
+ * 改名されたタグの古い値は落ちる（`resubscribe()`。見張りは config_changed で呼ぶ）。
+ * サーバーが購読を拒否した（`error` フレーム）ら、状態の行は拒否を出す
+ * （`monitorStreamView.ts` の `rejected`。「再接続」で購読し直す）。
  *
  * コンポーネントの初期化の中で 1 回呼ぶ（`$effect` を使う）。ページを離れると接続を閉じる。
  * 値は `external_name`（`{接続}.{グループ}.{タグ}`）をキーに持ち、行の状態は持たない
@@ -21,7 +30,7 @@ import { untrack } from 'svelte';
 import { connectTagStream } from './tagMonitorAdmin';
 import { subscriptionPatternsFor } from './monitorSubscription';
 import type { MonitorTreeFilter } from './monitorFilter';
-import { replaceOrMergeTagValues, type RowValue } from './monitorValues';
+import { keepAcceptedValues, replaceOrMergeTagValues, type RowValue } from './monitorValues';
 import {
 	cellDisplayMode,
 	initialStreamView,
@@ -47,9 +56,16 @@ export interface TagValueStreamSources {
 	groups: () => CollectionGroup[];
 	/**
 	 * 購読のパターンを、ツリーの選択ではなくこの関数で決める（値を見張る窓、#1254: 見張って
-	 * いるタグの外部名の完全一致）。空配列は返さない（サーバーが拒否する）。`enabled` と合わせて使う。
+	 * いるタグの収集グループのワイルドカード）。空配列は返さない（サーバーが拒否する）。
+	 * `enabled` と合わせて使う。
 	 */
 	patterns?: () => string[];
+	/**
+	 * 受けた値のうち、値のマップに残す外部名（既定は全部残す。ツリーの購読）。見張りの窓は
+	 * 見張っている外部名だけにする。集合の中身が変わったら購読し直す（新しいスナップショットで
+	 * 足した外部名の今の値を受けるため）。
+	 */
+	acceptNames?: () => ReadonlySet<string>;
 	/**
 	 * 接続しているか（既定は常に true）。false の間は接続を閉じる。見張りの窓は、画面に
 	 * 出ていて一覧が空でない間だけ true にする。
@@ -74,8 +90,17 @@ export interface TagValueStream {
 	 * `$state` なので、変わった行のセルだけが追跡して描画し直す（列・行の定義は作り直さない）。
 	 */
 	isFlashing: (externalName: string) => boolean;
-	/** close `1008` で止まった購読を、利用者の操作で再開する。 */
+	/**
+	 * 止まった購読を、利用者の操作で再開する（状態の行の「再接続」）。close `1008` なら
+	 * 接続し直し、購読が拒否されている（`rejected`）なら購読し直す。
+	 */
 	resume: () => void;
+	/**
+	 * 今のソケットの上で購読し直す（パターンが同じでも）。次のスナップショットで値の
+	 * マップを置き換えるので、スナップショットに無い外部名の値は落ちる。ソケットが
+	 * 開いていなければ何もしない（次に開いたときの購読がスナップショットを受ける）。
+	 */
+	resubscribe: () => void;
 }
 
 export function createTagValueStream(sources: TagValueStreamSources): TagValueStream {
@@ -119,7 +144,12 @@ export function createTagValueStream(sources: TagValueStreamSources): TagValueSt
 		if (!(sources.enabled?.() ?? true)) return;
 		const { disconnect, resubscribe, resume } = connectTagStream(
 			{
-				onData: (incoming, { snapshot }) => {
+				onData: (received, { snapshot }) => {
+					// 残す外部名は受けるたびに読む（`acceptNames` の doc comment）。
+					const incoming = keepAcceptedValues(
+						received,
+						untrack(() => sources.acceptNames?.())
+					);
 					// スナップショットは置き換え（空でも）、差分はマージ。
 					if (snapshot || incoming.length > 0) {
 						// 差分は、値・品質が前から変わったタグだけ一時的に強調する
@@ -139,6 +169,7 @@ export function createTagValueStream(sources: TagValueStreamSources): TagValueSt
 				// 一覧の読み直しは呼び出し側（登録の画面）が決める。ここで読み直すと、
 				// 作成・編集の途中や保留中の編集を巻き込むため（#1255）。
 				onConfigChanged: () => sources.onConfigChanged?.(),
+				onRejected: (code, detail) => dispatch({ type: 'rejected', code, detail }),
 				onStatusChange: (connected, closeCode) => {
 					dispatch(connected ? { type: 'connected' } : { type: 'disconnected', code: closeCode });
 				},
@@ -174,7 +205,18 @@ export function createTagValueStream(sources: TagValueStreamSources): TagValueSt
 	// ツリーの選択（または接続・グループの一覧）でパターンが変わったら、既存のソケット上で
 	// 購読し直す（再接続はしない）。一覧を読み終える前は「すべて」（`subscriptionPatternsFor` が
 	// 引けない id を全件に倒す）なので、読み終えたときにも購読し直すよう、対象ではなくパターンを見る。
-	const subscriptionKey = $derived(patternsNow().join('\n'));
+	// 見張りは、残す外部名の集合が変わっても購読し直す（`acceptNames` の doc comment）。
+	const subscriptionKey = $derived.by(() => {
+		const names = sources.acceptNames?.();
+		const accept = names === undefined ? '' : [...names].sort().join('\n');
+		return `${patternsNow().join('\n')}\u0000${accept}`;
+	});
+	function resubscribe(): void {
+		if (resubscribeSocket === null) return;
+		resubscribeSocket();
+		dispatch({ type: 'resubscribed' });
+	}
+
 	$effect(() => {
 		void subscriptionKey;
 		// 止めている間（見張りの窓: 一覧が空・窓が出ていない）は、空のパターンを送らない。
@@ -198,8 +240,13 @@ export function createTagValueStream(sources: TagValueStreamSources): TagValueSt
 		},
 		isFlashing: (externalName) => flashing[externalName] === true,
 		resume: () => {
+			if (untrack(() => view.rejected !== null && view.connected)) {
+				resubscribe();
+				return;
+			}
 			dispatch({ type: 'resumed' });
 			resumeSocket?.();
-		}
+		},
+		resubscribe
 	};
 }

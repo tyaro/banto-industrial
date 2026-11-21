@@ -245,6 +245,16 @@ export interface TagStreamHandlers {
 	onData: (values: StreamValue[], info: { snapshot: boolean }) => void;
 	onConfigChanged: (revision: number) => void;
 	/**
+	 * #1254（PR #1282 のレビュー）: 今の購読（今のソケット・今の購読 id）への subscribe を
+	 * サーバーが `error` フレーム（`{ op: "error", id, code, detail }`、`core/src/stream.rs`
+	 * 冒頭）で拒否した。`code` は `unknown_tag`（未知の具体名）・`invalid_request`（パターンの
+	 * 形が不正。接続名・グループ名に `.` や `*` があるとワイルドカードでも起きうる）など。
+	 * 拒否された購読には値が来ない（ソケットは開いたまま）。次の `resubscribe()` か、接続し
+	 * 直したときの subscribe が通れば、その `data` が `onData` へ来る。古い購読 id・古い
+	 * ソケット・id の無い error は呼ばない。
+	 */
+	onRejected?: (code: string, detail: string) => void;
+	/**
 	 * 接続確立/切断のたびに呼ばれる（画面側が「値が古いかも」を示すため）。
 	 * T18-4b: 切断時（`connected: false`）は `CloseEvent.code` を
 	 * `closeCode` として渡す - 画面側がバックプレッシャ切断
@@ -482,12 +492,21 @@ export function connectTagStream(
 			} else if (op === 'config_changed') {
 				const revision = (msg as { revision?: unknown }).revision;
 				if (typeof revision === 'number') handlers.onConfigChanged(revision);
+			} else if (op === 'error') {
+				// 購読の拒否（`onRejected` の doc comment）。ワイルドカードは 0 件でも拒否
+				// されないが、接続名・グループ名に `.`・`*` があるとパターンの形が不正
+				// （`invalid_request`）になりうる。黙って捨てると、値の来ない購読のまま
+				// 「更新中」に見えるので知らせる。旧ソケット・旧購読 id 宛ては捨てる。
+				if (ws !== socket) return;
+				if ((msg as { id?: unknown }).id !== subscriptionId) return;
+				const code = (msg as { code?: unknown }).code;
+				const detail = (msg as { detail?: unknown }).detail;
+				handlers.onRejected?.(
+					typeof code === 'string' ? code : 'unknown',
+					typeof detail === 'string' ? detail : ''
+				);
 			}
-			// "event"/"pong"/"error" は無視 - `getSubscriptionTags()` は常に
-			// `*` かグループワイルドカード（`{connection}.{group}.*`）しか
-			// 返さない（`monitorSubscription.ts` 参照、具体名 `Exact` は
-			// 使わない）ので unknown_tag 等のユーザー向けエラーは発生しない
-			// (subscribe_core.rs: ワイルドカードは0件マッチでもエラーにしない)。
+			// "event"/"pong" は無視。
 		};
 
 		socket.onclose = (ev: CloseEvent) => {

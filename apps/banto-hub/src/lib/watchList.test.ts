@@ -2,12 +2,14 @@ import { describe, expect, it } from 'vitest';
 import {
 	WATCH_LIMIT,
 	addToWatch,
+	applyWatchOps,
 	parseWatchList,
 	pruneMissing,
 	removeFromWatch,
 	sameWatchList,
 	serializeWatchList,
-	watchListKeys
+	watchListKeys,
+	watchSubscriptionPatterns
 } from './watchList';
 
 describe('addToWatch', () => {
@@ -94,5 +96,46 @@ describe('watchListKeys', () => {
 		});
 		expect(watchListKeys(null).local).toBeUndefined();
 		expect(watchListKeys('').local).toBeUndefined();
+	});
+});
+
+describe('applyWatchOps', () => {
+	it('足す・外す・すべて外す・消えた id の除去を順に当て、基準は書き換えない', () => {
+		const base = [1, 2];
+		expect(
+			applyWatchOps(base, [
+				{ kind: 'add', ids: [3, 2] },
+				{ kind: 'remove', id: 1 },
+				{ kind: 'prune', existing: new Set([2, 3, 4]) },
+				{ kind: 'add', ids: [4] }
+			])
+		).toEqual([2, 3, 4]);
+		expect(applyWatchOps(base, [{ kind: 'clear' }, { kind: 'add', ids: [9] }])).toEqual([9]);
+		expect(base).toEqual([1, 2]);
+	});
+
+	it('足すときの上限は addToWatch と同じ', () => {
+		expect(applyWatchOps([1, 2], [{ kind: 'add', ids: [3, 4] }], 3)).toEqual([1, 2, 3]);
+	});
+});
+
+describe('watchSubscriptionPatterns', () => {
+	it('収集グループのワイルドカードを重複なしで、引けないグループは外す', () => {
+		const prefixes = new Map([
+			[10, 'plc1.fast'],
+			[11, 'plc1.slow']
+		]);
+		expect(
+			watchSubscriptionPatterns(
+				[
+					{ collectionGroupId: 11 },
+					{ collectionGroupId: 10 },
+					{ collectionGroupId: 11 },
+					{ collectionGroupId: 99 }
+				],
+				prefixes
+			)
+		).toEqual(['plc1.slow.*', 'plc1.fast.*']);
+		expect(watchSubscriptionPatterns([], prefixes)).toEqual([]);
 	});
 });

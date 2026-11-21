@@ -109,13 +109,7 @@
 	import LogPanel from '#lib/components/LogPanel.svelte';
 	import WatchPanel, { type WatchRowView } from '#lib/components/WatchPanel.svelte';
 	import { createWatchListStore } from '#lib/watchListStore.js';
-	import {
-		WATCH_LIMIT,
-		addToWatch,
-		pruneMissing,
-		removeFromWatch,
-		sameWatchList
-	} from '#lib/watchList.js';
+	import { WATCH_LIMIT, watchSubscriptionPatterns, type WatchOp } from '#lib/watchList.js';
 	import { createLogFeedState } from '#lib/banto/logFeedState.svelte.js';
 	import { isDockPanelOnScreen } from '#lib/dockPanelOnScreen.js';
 	import { persistThreePaneLayout } from '#lib/dockLayoutPersist.svelte.js';
@@ -3470,21 +3464,36 @@
 	// --- #1254: 値を見張る窓（追加パネル `watch`） ---------------------------------
 	//
 	// 見張っているタグの一覧（id の配列）は利用者ごとにサーバーへ保存する（`watchListStore.ts`）。
+	// 一覧の変更はすべて操作（`WatchOp`）として保存の口に渡し、表示は口の `list` を写す。
+	// サーバーの保存値が確定する前の操作は口が溜めて、確定した基準に当て直す（写しや空から
+	// 作った一覧でサーバーの一覧を消さない。PR #1282 のレビュー）。
 	// 値は、ツリーの購読（上の `valueStream`）とは別の 2 本目のストリームで、見張っている
-	// タグの外部名だけを購読する。窓が画面に出ている間だけ、かつ一覧が空でないときだけ繋ぐ。
+	// タグの収集グループのワイルドカードを購読し、見張っている外部名の値だけを残す
+	// （`watchList.ts::watchSubscriptionPatterns`）。窓が画面に出ている間だけ、かつ購読する
+	// パターンがあるときだけ繋ぐ。
 	const watchStore = createWatchListStore();
 	onDestroy(() => watchStore.dispose());
-	let watchIds = $state<number[]>(watchStore.initial);
-	// 最初の 1 回（マウント時の一覧）は保存の口が基準として受け取るだけ。
-	$effect(() => watchStore.save(watchIds));
-	void watchStore.loadSaved().then((saved) => {
-		if (saved !== undefined) watchIds = saved;
-	});
-	// 消されたタグは、タグ一覧を読んだ後に一覧から落とす（保存し直される）。
+	let watchIds = $state<number[]>(watchStore.list);
+	let watchConfirmed = $state(false);
+	function applyWatchOp(op: WatchOp): ReturnType<typeof watchStore.apply> {
+		const result = watchStore.apply(op);
+		watchIds = watchStore.list;
+		return result;
+	}
+	/** サーバーの基準を読む（失敗したら溜めた操作は残り、次の機会にまた読む）。 */
+	function loadWatchList(): void {
+		void watchStore.load().then((confirmed) => {
+			watchIds = watchStore.list;
+			watchConfirmed = confirmed;
+		});
+	}
+	loadWatchList();
+	// 消されたタグは、サーバーの基準が確定し、タグ一覧を読んだ後に一覧から落とす（保存し直される）。
+	// 確定する前は落とさない（写しの消えた id を落としても、サーバーの一覧を守れない）。
 	$effect(() => {
-		if (!registryLoaded) return;
-		const pruned = pruneMissing(watchIds, new Set(tags.map((t) => t.id)));
-		if (!sameWatchList(pruned, watchIds)) watchIds = pruned;
+		if (!registryLoaded || !watchConfirmed) return;
+		const existing = new Set(tags.map((t) => t.id));
+		untrack(() => applyWatchOp({ kind: 'prune', existing }));
 	});
 
 	const watchedTags = $derived.by(() => {
@@ -3495,12 +3504,26 @@
 		});
 	});
 	const watchPanelOnScreen = $derived(isDockPanelOnScreen(dock.layout, 'watch', dock.flyoutPanel));
+	const watchPatterns = $derived(
+		watchSubscriptionPatterns(watchedTags, externalNamePrefixByGroupId)
+	);
+	const watchNames = $derived(new Set(watchedTags.map((t) => externalNameForTag(t))));
 	const watchStream = createTagValueStream({
 		treeFilter: () => treeFilter,
 		connections: () => connections,
 		groups: () => groups,
-		patterns: () => watchedTags.map((t) => externalNameForTag(t)),
-		enabled: () => watchPanelOnScreen && watchedTags.length > 0
+		patterns: () => watchPatterns,
+		acceptNames: () => watchNames,
+		enabled: () => watchPanelOnScreen && watchPatterns.length > 0,
+		// 別の所で消した・改名したタグの最後の値を「良好」のまま残さない: config_changed では、
+		// 編集の保護（一覧の読み直しの保留）とは別に、見張りのストリームだけ購読し直す。
+		// スナップショットは値のマップを置き換えるので、無くなった外部名の値は落ちて「値なし」
+		// になる（一覧の行は、保留が解けて一覧を読み直したときに落ちる）。サーバーの基準を
+		// 読めていなければ、このときに読み直す。
+		onConfigChanged: () => {
+			watchStream.resubscribe();
+			if (!watchConfirmed) loadWatchList();
+		}
 	});
 	const watchRows = $derived.by((): WatchRowView[] =>
 		watchedTags.map((t) => {
@@ -3526,8 +3549,7 @@
 
 	function addWatchTags(ids: number[]): void {
 		if (ids.length === 0) return;
-		const result = addToWatch(watchIds, ids);
-		if (result.added > 0) watchIds = result.list;
+		const result = applyWatchOp({ kind: 'add', ids });
 		if (result.added > 0 && !dock.isVisible('watch')) dock.show('watch');
 		if (result.overLimit > 0) {
 			toastStore.push(
@@ -3541,7 +3563,8 @@
 
 	// 行の右クリックのメニュー。`BantoGrid` には行の右クリックの口が無いので、グリッドを包む
 	// 要素で `contextmenu` を受け、行は `rowClass`（`tagRowClass`）に載せた `tag-row-id-<id>`
-	// で特定する（行の DOM に id の属性は無い）。
+	// で特定する（行の DOM に id の属性は無い）。BantoGrid の内部の DOM（`.row`）に頼る回り道で、
+	// 行の右クリックの口を banto に提案した（tyaro/banto#784）。入ったら置き換える。
 	interface WatchRowMenuState {
 		x: number;
 		y: number;
@@ -8305,8 +8328,8 @@
 	<WatchPanel
 		rows={watchRows}
 		status={watchStream.status}
-		onRemove={(id) => (watchIds = removeFromWatch(watchIds, id))}
-		onClear={() => (watchIds = [])}
+		onRemove={(id) => applyWatchOp({ kind: 'remove', id })}
+		onClear={() => applyWatchOp({ kind: 'clear' })}
 		onResume={watchStream.resume}
 	/>
 {/snippet}
