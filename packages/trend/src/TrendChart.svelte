@@ -36,7 +36,8 @@
 		cursorReadout,
 		formatDuration,
 		placeCursor,
-		type CursorPair
+		type CursorPair,
+		type CursorValue
 	} from './core/cursor';
 	import { drawableSeries, type TrendData } from './core/data';
 	import { envelopePath, hasFiniteValue } from './core/geometry';
@@ -51,7 +52,7 @@
 	} from './core/style';
 	import TrendPenSwatch from './TrendPenSwatch.svelte';
 	import { bitBandLayout, bitMissingSpans, bitSpans } from './core/bitBands';
-	import { samplesInRange, samplesMarkerPoints, samplesPath } from './core/samples';
+	import { effectiveClip, samplesInRange, samplesMarkerPoints, samplesPath } from './core/samples';
 	import {
 		axisOwners,
 		axisTickValues,
@@ -170,6 +171,8 @@
 		})
 	);
 	const domains: YDomain[] = $derived(pens.map((p, i) => resolveYDomain(p, extentBins[i])));
+	// 'samples' の線は有効範囲の x の幅で切る（外の観測は補間のために残しているだけ）。
+	const lineClip = $derived(effectiveClip(drawable.effective, xScale, plotWidth));
 	/** カーソルの吸着の幅（'samples' の系列）: 8px を時刻に直した ms。 */
 	const SNAP_PX = 8;
 	const snapMs = $derived(
@@ -487,6 +490,9 @@
 				>
 					<line class="bi-trend__missing-line" x1="0" y1="0" x2="0" y2="6" />
 				</pattern>
+				<clipPath id="{uid}-eff-clip">
+					<rect x={lineClip?.x ?? 0} y="0" width={lineClip?.width ?? 0} height={plotHeight} />
+				</clipPath>
 				<clipPath id="{uid}-analog-clip">
 					<rect x="0" y="0" width={plotWidth} height={analogHeight} />
 				</clipPath>
@@ -604,6 +610,7 @@
 								<path
 									class="bi-trend__line"
 									d={paths[i]}
+									clip-path="url(#{uid}-eff-clip)"
 									stroke={penColor(pen)}
 									stroke-width={resolveLineWidth(pen.lineWidth)}
 									stroke-dasharray={dashArray(pen.lineStyle, pen.lineWidth) ?? undefined}
@@ -618,6 +625,7 @@
 										<path
 											class="bi-trend__line"
 											d={paths[i]}
+											clip-path="url(#{uid}-eff-clip)"
 											stroke={r.colorVar}
 											stroke-width={resolveLineWidth(pen.lineWidth)}
 											stroke-dasharray={dashArray(pen.lineStyle, pen.lineWidth) ?? undefined}
@@ -704,16 +712,26 @@
 	{/if}
 </div>
 
+{#snippet obsTime(v: CursorValue)}
+	{#if typeof v.tMs === 'number'}<small class="bi-trend__muted">
+			({formatDateTime(v.tMs, true)})</small
+		>{/if}
+{/snippet}
+
 {#snippet legendBody(pen: TrendPen, i: number)}
 	<TrendPenSwatch {pen} />
 	<span class="bi-trend__legend-label">{pen.label}</span>
 	{#if pen.axis === 'right'}<span class="bi-trend__muted">（右軸）</span>{/if}
 	<span class="bi-trend__muted">{rangeText(pen, domains[i])}</span>
 	{#if readout}
-		<span class="bi-trend__value">{readout[i].text}</span>
+		<span class="bi-trend__value">{readout[i].text}{@render obsTime(readout[i])}</span>
 	{/if}
-	{#if readoutA}<span class="bi-trend__value">A {readoutA[i].text}</span>{/if}
-	{#if readoutB}<span class="bi-trend__value">B {readoutB[i].text}</span>{/if}
+	{#if readoutA}<span class="bi-trend__value"
+			>A {readoutA[i].text}{@render obsTime(readoutA[i])}</span
+		>{/if}
+	{#if readoutB}<span class="bi-trend__value"
+			>B {readoutB[i].text}{@render obsTime(readoutB[i])}</span
+		>{/if}
 	{#if readoutA && readoutB}
 		<span class="bi-trend__value">差 {cursorDiff(pen, readoutA[i], readoutB[i])}</span>
 	{/if}

@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { bitMissingSpans, bitSpans } from './bitBands';
-import { cursorReadout } from './cursor';
+import { cursorDiff, cursorReadout } from './cursor';
 import { drawableSeries, type TrendData, type TrendSeries } from './data';
 import type { Bin, TrendPen } from './pens';
 import { resolveYDomain } from './pens';
 import {
+	effectiveClip,
 	sampleAt,
 	sampleIntervals,
 	samplesForDraw,
@@ -199,5 +200,54 @@ describe('bit の帯（samples）と欠測', () => {
 			{ s: 0, e: 1000, value: 1 },
 			{ s: 1000, e: 3000, value: 0 }
 		]);
+	});
+});
+
+describe('指摘の修正（#1276）', () => {
+	const eff = { startMs: 1000, endMs: 2000 };
+	it('カーソルは有効範囲の外の観測に吸着しない（時刻 tMs を返す）', () => {
+		const d = drawableSeries(
+			{
+				range: eff,
+				series: {
+					p: { kind: 'samples', binMs: 1000, bins: [obs(999, 9), obs(1100, 5), obs(2001, 8)] }
+				}
+			},
+			{ startMs: 0, endMs: 3000 }
+		);
+		expect(d.series.p.bins.map((b) => b.tMs)).toEqual([999, 1100, 2001]);
+		// 許容 200 でも 999（範囲の外）ではなく 1100 に吸着する。許容 50 なら範囲の中に候補が無く「—」。
+		const r = cursorReadout([pen], d.series, 1000, d.effective, 200)[0];
+		expect(r.tMs).toBe(1100);
+		const r0 = cursorReadout([pen], d.series, 1000, d.effective, 50)[0];
+		expect(r0.text).toBe('—');
+		expect(r0.tMs).toBeNull();
+		const r2 = cursorReadout([pen], d.series, 1150, d.effective, 200)[0];
+		expect(r2.text).toBe('5.0 V');
+		expect(r2.tMs).toBe(1100);
+	});
+	it('同じ観測は描画と同じ 1 値（min=0,max=1 は 0）。差も観測どうし', () => {
+		const s: TrendSeries = {
+			kind: 'samples',
+			binMs: 1000,
+			bins: [
+				{ tMs: 1100, min: 0, max: 1 },
+				{ tMs: 1600, min: 4, max: 9 }
+			]
+		};
+		const bitPen: TrendPen = { ...pen, bit: true } as TrendPen;
+		const [r] = cursorReadout([bitPen], { p: s }, 1100, eff, 0);
+		expect([r.min, r.max]).toEqual([0, 0]);
+		expect(r.text).not.toContain('〜');
+		const a = cursorReadout([pen], { p: s }, 1100, eff, 0)[0];
+		const b = cursorReadout([pen], { p: s }, 1600, eff, 0)[0];
+		expect(a.text).toBe('0.0 V');
+		expect(cursorDiff(pen, a, b)).toBe('+4.0 V');
+	});
+	it('線の clip は有効範囲の幅（取得 [1000,5000)、表示 [0,6000)）', () => {
+		const x = (t: number) => (t / 6000) * 600;
+		expect(effectiveClip({ startMs: 1000, endMs: 5000 }, x, 600)).toEqual({ x: 100, width: 400 });
+		expect(effectiveClip({ startMs: -1000, endMs: 9000 }, x, 600)).toEqual({ x: 0, width: 600 });
+		expect(effectiveClip(null, x, 600)).toBeNull();
 	});
 });

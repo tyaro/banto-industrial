@@ -8,7 +8,8 @@
  *   `binMs` が正の有限でないときは空きでは切らない。
  * - 線はアナログなら観測点どうしの直線、bit の段差（`step`）は前の値を次の観測まで保つ段差。点は実時刻に置く。
  * - マーカーは実時刻に置き、間引かない。丸めた座標が直前の点とまったく同じ点だけ省く。
- * - カーソルは時刻に最も近い観測に、許容の幅（ms）以内なら吸着する（`sampleAt`）。
+ * - カーソルは時刻に最も近い観測に、許容の幅（ms）以内なら吸着する（`sampleAt`。候補は有効範囲の中の観測だけ）。
+ * - 線は有効範囲の x の幅で切る（`effectiveClip`。外の観測は補間のために残すだけ）。
  * - 範囲の絞り込みは、範囲の中の観測に加えて両側の外の観測を 1 つずつ残す（線を描画域の端までつなぐため。
  *   縦軸・空の判定には外の点を含めない: `samplesInRange`）。
  * - 帯の塗りは観測から次の観測まで（`binMs × 2` と有効範囲の端で打ち切る。最後の観測は `binMs` 分）。
@@ -54,6 +55,22 @@ export function samplesForDraw(bins: readonly Bin[], range: Range): Bin[] {
 /** 有効範囲 `[startMs, endMs)` の中の観測だけ（縦軸・空の判定用）。 */
 export function samplesInRange(bins: readonly Bin[], range: Range): Bin[] {
 	return bins.filter((b) => fin(b.tMs) && b.tMs >= range.startMs && b.tMs < range.endMs);
+}
+
+/**
+ * 'samples' の線・管理線の重ね描きを切る x の幅。有効範囲 `[startMs, endMs)` を x に直し、描画域 `[0, plotWidth]` に収める。
+ * 線のために残した範囲の外の観測が、取得範囲の外に線を引かないようにする。有効範囲が無い・幅が無いときは null。
+ */
+export function effectiveClip(
+	effective: Range | null,
+	x: Scale,
+	plotWidth: number
+): { x: number; width: number } | null {
+	if (!effective) return null;
+	const x0 = Math.max(0, x(effective.startMs));
+	const x1 = Math.min(plotWidth, x(effective.endMs));
+	if (!Number.isFinite(x0) || !Number.isFinite(x1) || x1 <= x0) return null;
+	return { x: x0, width: x1 - x0 };
 }
 
 /** 空きが線を切るほど大きいか。 */

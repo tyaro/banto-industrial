@@ -6,7 +6,7 @@ import type { TrendSeries } from './data';
 import { binEndMs } from './geometry';
 import { formatBitValue, formatValue, MISSING_TEXT, type Bin, type TrendPen } from './pens';
 import type { TimeRange } from './range';
-import { sampleAt } from './samples';
+import { sampleAt, sampleValue, samplesInRange } from './samples';
 
 const fin = (v: number | null | undefined): v is number =>
 	typeof v === 'number' && Number.isFinite(v);
@@ -42,6 +42,8 @@ export interface CursorValue {
 	max: number | null;
 	/** 書式化した値（単位付き）。欠測は「—」。 */
 	text: string;
+	/** 'samples' の系列で吸着した観測の時刻（UTC ms）。'bins' と欠測（「—」）は null。 */
+	tMs?: number | null;
 }
 
 /**
@@ -50,6 +52,8 @@ export interface CursorValue {
  * または有効範囲が null なら全ペン「—」。
  * 'samples' の系列（観測点）は、時刻に最も近い観測（欠測なら「—」）が `toleranceMs`（時刻に直した吸着の幅。TrendChart は
  * 8px 分を渡す）以内なら吸着してその値、無ければ「—」。`toleranceMs` を渡さない（0）と観測の時刻ぴったりだけ。
+ * 吸着の候補は有効範囲 `[startMs, endMs)` の中の観測だけ（線のために残した範囲の外の観測には吸着しない）。
+ * 値は描画と同じ `sampleValue` の 1 値（min = max）。吸着した観測の時刻は `tMs` に入れる。
  */
 export function cursorReadout(
 	pens: readonly TrendPen[],
@@ -61,12 +65,22 @@ export function cursorReadout(
 	const inside = effective !== null && tMs >= effective.startMs && tMs < effective.endMs;
 	return pens.map((pen) => {
 		const s = series[pen.id];
-		const b =
-			inside && s
-				? s.kind === 'samples'
-					? sampleAt(s.bins, tMs, toleranceMs)
-					: binAt(s.bins, s.binMs, tMs)
-				: null;
+		if (inside && s && s.kind === 'samples') {
+			const o = sampleAt(samplesInRange(s.bins, effective), tMs, toleranceMs);
+			const v = o ? sampleValue(o) : null;
+			if (!o || v === null)
+				return { penId: pen.id, min: null, max: null, text: MISSING_TEXT, tMs: null };
+			if (pen.bit) return { penId: pen.id, min: v, max: v, text: formatBitValue(v, v), tMs: o.tMs };
+			const unit = pen.unit ? ` ${pen.unit}` : '';
+			return {
+				penId: pen.id,
+				min: v,
+				max: v,
+				text: `${formatValue(v, pen.decimals)}${unit}`,
+				tMs: o.tMs
+			};
+		}
+		const b = inside && s ? binAt(s.bins, s.binMs, tMs) : null;
 		const min = b ? (fin(b.min) ? b.min : fin(b.max) ? b.max : null) : null;
 		const max = b ? (fin(b.max) ? b.max : min) : null;
 		if (min === null || max === null)
