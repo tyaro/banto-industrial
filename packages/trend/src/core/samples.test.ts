@@ -155,6 +155,17 @@ describe('sampleAt / cursorReadout', () => {
 		expect(sampleAt([obs(999, 3)], 1000, 500, range)).toBeNull();
 		expect(sampleAt([obs(2000, 3)], 1999, 500, range)).toBeNull();
 	});
+	it('range の両端: 範囲の外（startMs 未満・endMs 以上）の隣には吸着しない', () => {
+		const bins = [
+			{ tMs: 999, min: 1, max: 1 },
+			{ tMs: 1100, min: 2, max: 2 },
+			{ tMs: 2000, min: 3, max: 3 }
+		];
+		const range = { startMs: 1000, endMs: 2000 };
+		expect(sampleAt(bins, 800, 1000, range)).toBeNull();
+		expect(sampleAt(bins, 2100, 1000, range)).toBeNull();
+		expect(sampleAt(bins, 1150, 1000, range)?.tMs).toBe(1100);
+	});
 	it('cursorReadout: min・max が違う観測も描画と同じ 1 値（sampleValue）', () => {
 		const eff = { startMs: 0, endMs: 10000 };
 		const w: TrendSeries = {

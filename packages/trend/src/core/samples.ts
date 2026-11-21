@@ -211,8 +211,9 @@ export function sampleAt(
 		}
 	}
 	if (range) {
-		if (left && left.tMs < range.startMs) left = null;
-		if (right && right.tMs >= range.endMs) right = null;
+		const inRange = (b: Bin) => b.tMs >= range.startMs && b.tMs < range.endMs;
+		if (left && !inRange(left)) left = null;
+		if (right && !inRange(right)) right = null;
 	}
 	const dl = left ? tMs - left.tMs : Infinity;
 	const dr = right ? right.tMs - tMs : Infinity;
