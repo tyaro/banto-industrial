@@ -1,7 +1,7 @@
 /**
  * タグ登録の表の値の列（#1255 段階 ②）が使う WS 購読の状態。
  *
- * `/monitor`（`routes/(app)/monitor/+page.svelte`）と同じ仕組みを、`/tags` の中で
+ * タグモニタ（`/monitor`、#1255 段階 ③ で `/tags` に吸収して削除）の仕組みを、`/tags` の中で
  * 使えるように 1 つの部品にまとめたもの: `connectTagStream`（1 本を維持）・
  * `subscriptionPatternsFor`（ツリーで選んだ範囲。「すべて」なら全タグ）・
  * `mergeTagValues`（最新値のマップ）・`monitorStreamView`（再接続中・バックプレッシャ
@@ -34,10 +34,18 @@ import {
 } from './sessionRecheck';
 import type { CollectionGroup, PlcConnection } from './tagRegistryAdmin';
 
+/** 値・品質が変わった行の一時的な強調の長さ（タグモニタの `FLASH_MS` と同じ）。 */
+const FLASH_MS = 700;
+
 export interface TagValueStreamSources {
 	treeFilter: () => MonitorTreeFilter;
 	connections: () => PlcConnection[];
 	groups: () => CollectionGroup[];
+	/**
+	 * 設定（タグ・接続・グループ）が別の所で変わったという WS の知らせ（#1255）。
+	 * 一覧を読み直すかは呼び出し側が決める（編集の途中を巻き込まないため）。
+	 */
+	onConfigChanged?: () => void;
 }
 
 export interface TagValueStream {
@@ -46,6 +54,12 @@ export interface TagValueStream {
 	readonly mode: CellDisplayMode;
 	readonly labels: { value: string; quality: string };
 	readonly status: StreamStatusLine;
+	/**
+	 * 値または品質が直前から変わった直後か（行の一時的な強調用、数百 ms で外れる）。
+	 * スナップショット（接続・購読し直しの直後）では立てない。外部名ごとの小さな
+	 * `$state` なので、変わった行のセルだけが追跡して描画し直す（列・行の定義は作り直さない）。
+	 */
+	isFlashing: (externalName: string) => boolean;
 	/** close `1008` で止まった購読を、利用者の操作で再開する。 */
 	resume: () => void;
 }
@@ -56,6 +70,23 @@ export function createTagValueStream(sources: TagValueStreamSources): TagValueSt
 	const mode = $derived(cellDisplayMode(view));
 	const labels = $derived(monitorColumnLabels(mode));
 	const status = $derived(streamStatusLine(view));
+
+	/** 一時的な強調の最中の外部名 → タイマー。 */
+	const flashTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	const flashing = $state<Record<string, boolean>>({});
+
+	function triggerFlash(externalName: string): void {
+		const running = flashTimers.get(externalName);
+		if (running !== undefined) clearTimeout(running);
+		flashing[externalName] = true;
+		flashTimers.set(
+			externalName,
+			setTimeout(() => {
+				flashTimers.delete(externalName);
+				delete flashing[externalName];
+			}, FLASH_MS)
+		);
+	}
 
 	let resubscribeSocket: (() => void) | null = null;
 	let resumeSocket: (() => void) | null = null;
@@ -73,12 +104,23 @@ export function createTagValueStream(sources: TagValueStreamSources): TagValueSt
 				onData: (incoming, { snapshot }) => {
 					// スナップショットは置き換え（空でも）、差分はマージ。
 					if (snapshot || incoming.length > 0) {
+						// 差分は、値・品質が前から変わったタグだけ一時的に強調する
+						// （スナップショットは置き換えなので光らせない）。
+						if (!snapshot) {
+							for (const value of incoming) {
+								const before = values.get(value.tag);
+								if (!before || before.v !== value.v || before.q !== value.q) {
+									triggerFlash(value.tag);
+								}
+							}
+						}
 						values = replaceOrMergeTagValues(values, incoming, snapshot);
 					}
 					dispatch({ type: 'data' });
 				},
-				// 登録の画面は自分で一覧を読み直す（保留中の編集を巻き込まない）。
-				onConfigChanged: () => {},
+				// 一覧の読み直しは呼び出し側（登録の画面）が決める。ここで読み直すと、
+				// 作成・編集の途中や保留中の編集を巻き込むため（#1255）。
+				onConfigChanged: () => sources.onConfigChanged?.(),
 				onStatusChange: (connected, closeCode) => {
 					dispatch(connected ? { type: 'connected' } : { type: 'disconnected', code: closeCode });
 				},
@@ -105,6 +147,9 @@ export function createTagValueStream(sources: TagValueStreamSources): TagValueSt
 			resubscribeSocket = null;
 			resumeSocket = null;
 			disconnect();
+			for (const timer of flashTimers.values()) clearTimeout(timer);
+			flashTimers.clear();
+			for (const key of Object.keys(flashing)) delete flashing[key];
 		};
 	});
 
@@ -135,6 +180,7 @@ export function createTagValueStream(sources: TagValueStreamSources): TagValueSt
 		get status() {
 			return status;
 		},
+		isFlashing: (externalName) => flashing[externalName] === true,
 		resume: () => {
 			dispatch({ type: 'resumed' });
 			resumeSocket?.();

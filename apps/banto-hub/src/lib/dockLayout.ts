@@ -5,7 +5,7 @@
  * `UiSettingsProvider` への配線を持つ。`navLayout.ts` と `settings.svelte.ts` の分け方と同じ）。
  *
  * - 配置は利用者ごとの保存に任せ、URL には載せない（選択中の対象は今の `?target=` のまま）。
- * - キーはページごと（`/monitor` は `monitor`、`/tags` は `tags`）。localStorage の写しは、さらに
+ * - キーはページごと（`/tags` は `tags`。もとあった `/monitor` の `monitor` は #1255 段階 ③で消え、保存の互換は持たない）。localStorage の写しは、さらに
  *   ログインの利用者ごと（`banto.dock.v2.<page>.<持ち主>`）。同じブラウザで別の利用者が
  *   ログインしたとき、前の利用者の配置を最初の描画に使わない（PR #1268 レビュー）。
  *   持ち主は `@banto/admin-core` の `SessionSnapshot.owner`（`account:<id>`・grant の kind）。

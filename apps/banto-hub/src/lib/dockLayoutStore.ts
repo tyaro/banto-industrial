@@ -1,6 +1,6 @@
 /**
  * ドックの枠の配置を利用者ごとに保存する小さな口（#1253。純粋な読み込みは `dockLayout.ts`）。
- * `/monitor` と `/tags` が同じ口を使い、ページの名前でキーを分ける。
+ * ページの名前でキーを分ける（もとは `/monitor` と `/tags` が使った。#1255 段階 ③で `/monitor` は消えた）。
  *
  * 置き場は `settings.svelte.ts` と同じ二層:
  * - localStorage（`banto.dock.v2.<page>.<持ち主>`）: 写し。最初の描画（`ThreePaneDock` の

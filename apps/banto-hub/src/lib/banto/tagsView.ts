@@ -34,6 +34,8 @@ export interface TagsView {
 
 export const TAGS_VIEW_TARGET_PARAM = 'target';
 export const TAGS_VIEW_TAB_PARAM = 'tab';
+/** 確認対象（T18-4c。external_name のカンマ区切り）。タグ一覧の該当行を持続的に強調する。 */
+export const TAGS_VIEW_FOCUS_PARAM = 'focus';
 
 /**
  * クエリをそのまま読んだ結果（存在の確認の前）。`null` は「値はあるが読めない」。
@@ -47,7 +49,7 @@ export interface ParsedTagsView {
 const TARGET_PATTERN = /^(connection|group):([1-9][0-9]*)$/;
 
 /**
- * #1179 PR3b: `target` だけを読む（タグモニタ `(app)/monitor/+page.svelte` と共有）。
+ * #1179 PR3b: `target` だけを読む。
  * 無ければ「すべて」、値はあるが読めなければ `null`。
  */
 export function parseTreeTarget(params: Pick<URLSearchParams, 'get'>): TreeFilterSelection | null {
@@ -114,7 +116,7 @@ export function resolveTagsView(
 
 /**
  * #1179 PR3b: 対象だけのクエリ（先頭の `?` 付き、「すべて」なら空文字）。
- * タグモニタの URL と、ナビのリンクで対象を引き継ぐときに使う。
+ * ナビのリンクで対象を引き継ぐときに使う。
  */
 export function treeTargetSearch(target: TreeFilterSelection): string {
 	if (target.type === 'all') return '';
@@ -122,11 +124,39 @@ export function treeTargetSearch(target: TreeFilterSelection): string {
 	return `?${TAGS_VIEW_TARGET_PARAM}=${target.type}:${target.id}`;
 }
 
-/** 画面の状態を URL のクエリ（先頭の `?` 付き、既定だけなら空文字）にする。 */
-export function tagsViewSearch(view: TagsView): string {
+/**
+ * `focus` の external_name の一覧（空の要素は捨てる）。`URLSearchParams.get()` が
+ * 1 回デコード済みなので、ここで `decodeURIComponent` は掛けない（二重デコードで
+ * `%` を含む名前が `URIError` になる - T18-4c の注意）。
+ *
+ * #1255 段階 ③: タグモニタ（`/monitor`、削除）の `?focus=` を `/tags` へ移した。
+ */
+export function parseFocus(params: Pick<URLSearchParams, 'get'>): string[] {
+	const raw = params.get(TAGS_VIEW_FOCUS_PARAM);
+	if (!raw) return [];
+	return raw.split(',').filter((name) => name !== '');
+}
+
+/**
+ * 画面の状態を URL のクエリ（先頭の `?` 付き、既定だけなら空文字）にする。
+ * `focus`（確認対象）は対象・タブとは別に持ち、対象やタブを変えても落とさない
+ * （呼び出し側が今の URL から {@link parseFocus} で読んで渡す）。区切りのカンマは
+ * 生のまま、要素の中身だけ `encodeURIComponent` する（`URLSearchParams` は `,` まで
+ * encode するので使わない）。
+ */
+export function tagsViewSearch(view: TagsView, focus: readonly string[] = []): string {
+	const params: string[] = [];
 	const target = treeTargetSearch(view.target);
-	if (target === '') return '';
-	return view.tab === 'settings' ? `${target}&${TAGS_VIEW_TAB_PARAM}=settings` : target;
+	if (target !== '') {
+		params.push(target.slice(1));
+		if (view.tab === 'settings') params.push(`${TAGS_VIEW_TAB_PARAM}=settings`);
+	}
+	if (focus.length > 0) {
+		params.push(
+			`${TAGS_VIEW_FOCUS_PARAM}=${focus.map((name) => encodeURIComponent(name)).join(',')}`
+		);
+	}
+	return params.length === 0 ? '' : `?${params.join('&')}`;
 }
 
 export function sameTreeTarget(a: TreeFilterSelection, b: TreeFilterSelection): boolean {

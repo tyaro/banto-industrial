@@ -1,7 +1,7 @@
 /**
  * タグモニタのストリームの表示状態と、表のセルの表示（#441 のレビュー対応）。
  *
- * モニタ（`routes/(app)/monitor/+page.svelte`）が `connectTagStream` の
+ * タグ登録の表（`routes/(app)/tags/+page.svelte`、`tagValueStream.svelte.ts` 経由。もとはタグモニタ `/monitor`）が `connectTagStream` の
  * コールバックから受けた出来事を {@link streamViewReducer} で状態へ畳み、
  * 表のセルは {@link monitorCellDisplay} で決める。どちらも純関数にして
  * `monitorStreamView.test.ts` で表にして確かめる。
@@ -116,6 +116,9 @@ const QUALITY_LABELS: Readonly<Record<string, string>> = {
 
 /** 未確認 = 起動後にまだ一度も実機から良好値を読めていない（収集開始後の不良と区別する）。 */
 export const UNVERIFIED_LABEL = '未確認';
+/** 「未確認」の説明（品質のセルの `title`）。 */
+export const UNVERIFIED_TITLE =
+	'未確認 = Hub の起動後に、まだ一度も実機から値を読めていない状態（収集開始後の不良とは別）';
 
 export function qualityLabel(q: string): string {
 	return Object.hasOwn(QUALITY_LABELS, q) ? QUALITY_LABELS[q] : q;

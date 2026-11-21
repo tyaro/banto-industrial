@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+	parseFocus,
 	parseTagsView,
 	parseTreeTarget,
 	resolveTagsView,
@@ -151,5 +152,41 @@ describe('parseTreeTarget / resolveTreeTarget / treeTargetSearch（#1179 PR3b）
 		expect(treeTargetSearch({ type: 'all' })).toBe('');
 		expect(treeTargetSearch({ type: 'group', id: 10 })).toBe('?target=group:10');
 		expect(treeTargetSearch({ type: 'connection', id: 2 })).toBe('?target=connection:2');
+	});
+});
+
+describe('tagsViewSearch の focus（#1255 段階 ③、確認対象）', () => {
+	it('「すべて」で focus も無ければ空', () => {
+		expect(tagsViewSearch({ target: { type: 'all' }, tab: 'list' }, [])).toBe('');
+	});
+
+	it('focus は区切りのカンマを生のまま、要素だけ encode する', () => {
+		expect(tagsViewSearch({ target: { type: 'group', id: 5 }, tab: 'list' }, ['a 1', 'b&2'])).toBe(
+			'?target=group:5&focus=a%201,b%262'
+		);
+		expect(tagsViewSearch({ target: { type: 'all' }, tab: 'list' }, ['x'])).toBe('?focus=x');
+	});
+
+	it('タブ・対象と focus は同居する', () => {
+		expect(tagsViewSearch({ target: { type: 'group', id: 5 }, tab: 'settings' }, ['x'])).toBe(
+			'?target=group:5&tab=settings&focus=x'
+		);
+	});
+
+	it('作ったクエリを読み直すと同じ対象・focus に戻る', () => {
+		const focus = ['plc1.g.tag 1', '50%開度'];
+		const params = new URLSearchParams(
+			tagsViewSearch({ target: { type: 'group', id: 7 }, tab: 'list' }, focus)
+		);
+		expect(parseTreeTarget(params)).toEqual({ type: 'group', id: 7 });
+		expect(parseFocus(params)).toEqual(focus);
+	});
+});
+
+describe('parseFocus', () => {
+	it('無い・空なら空配列、空の要素は捨てる', () => {
+		expect(parseFocus(new URLSearchParams(''))).toEqual([]);
+		expect(parseFocus(new URLSearchParams('focus='))).toEqual([]);
+		expect(parseFocus(new URLSearchParams('focus=a,,b'))).toEqual(['a', 'b']);
 	});
 });

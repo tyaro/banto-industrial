@@ -19,22 +19,16 @@ describe('visibleNavItems', () => {
 	it.each(['editor', 'viewer'] as const)('%s には adminOnly の項目を隠す', (role) => {
 		const visible = visibleNavItems({ role });
 		expect(visible.some((item) => item.adminOnly)).toBe(false);
-		expect(paths(visible)).toEqual([
-			'/status',
-			'/tags',
-			'/monitor',
-			'/sink',
-			'/settings/appearance'
-		]);
+		expect(paths(visible)).toEqual(['/status', '/tags', '/sink', '/settings/appearance']);
 	});
 });
 
 describe('navBarEntries', () => {
-	it('admin: 状態 / タグ登録 / タグモニタ / DB Sink / 管理(グループ) / 設定 の並び', () => {
+	it('admin: 状態 / タグ / DB Sink / 管理(グループ) / 設定 の並び', () => {
 		const entries = navBarEntries(visibleNavItems({ role: 'admin' }));
 		expect(
 			entries.map((entry) => (entry.kind === 'item' ? entry.item.label : `[${entry.key}]`))
-		).toEqual(['状態', 'タグ登録', 'タグモニタ', 'DB Sink', `[${ADMIN_GROUP_KEY}]`, '設定']);
+		).toEqual(['状態', 'タグ', 'DB Sink', `[${ADMIN_GROUP_KEY}]`, '設定']);
 		const group = entries.find((entry) => entry.kind === 'group');
 		expect(group?.kind === 'group' && group.items.map((item) => item.label)).toEqual([
 			'APIキー',
@@ -47,19 +41,19 @@ describe('navBarEntries', () => {
 	it('admin 以外にはグループごと出さない', () => {
 		const entries = navBarEntries(visibleNavItems({ role: 'viewer' }));
 		expect(entries.every((entry) => entry.kind === 'item')).toBe(true);
-		expect(entries).toHaveLength(5);
+		expect(entries).toHaveLength(4);
 	});
 
 	it('group を持つ項目は最初のメンバーの位置に集まる（後のメンバーも元の順で）', () => {
 		const items: NavItem[] = [
 			{ path: '/status', label: 'a', icon: '', group: 'g' },
 			{ path: '/tags', label: 'b', icon: '' },
-			{ path: '/monitor', label: 'c', icon: '', group: 'g' }
+			{ path: '/sink', label: 'c', icon: '', group: 'g' }
 		];
 		const entries = navBarEntries(items);
 		expect(entries).toHaveLength(2);
 		expect(entries[0]).toMatchObject({ kind: 'group', key: 'g' });
-		expect(entries[0].kind === 'group' && paths(entries[0].items)).toEqual(['/status', '/monitor']);
+		expect(entries[0].kind === 'group' && paths(entries[0].items)).toEqual(['/status', '/sink']);
 		expect(entries[1]).toMatchObject({ kind: 'item' });
 	});
 
@@ -84,23 +78,20 @@ describe('isNavItemActive', () => {
 		const tags = navItems.find((item) => item.path === '/tags') as NavItem;
 		expect(isNavItemActive(tags, '/tags')).toBe(true);
 		expect(isNavItemActive(tags, '/tags/x')).toBe(true);
-		expect(isNavItemActive(tags, '/monitor')).toBe(false);
+		expect(isNavItemActive(tags, '/status')).toBe(false);
 	});
 });
 
 describe('navItemHref（#1179 PR3b）', () => {
 	const group = { type: 'group', id: 4 } as const;
 
-	it('タグ登録・タグモニタへは共有している対象を ?target= で付ける', () => {
+	it('タグへは共有している対象を ?target= で付ける', () => {
 		expect(navItemHref('/tags', group)).toBe('/tags?target=group:4');
-		expect(navItemHref('/monitor', { type: 'connection', id: 2 })).toBe(
-			'/monitor?target=connection:2'
-		);
+		expect(navItemHref('/tags', { type: 'connection', id: 2 })).toBe('/tags?target=connection:2');
 	});
 
 	it('「すべて」なら何も付けない', () => {
 		expect(navItemHref('/tags', { type: 'all' })).toBe('/tags');
-		expect(navItemHref('/monitor', { type: 'all' })).toBe('/monitor');
 	});
 
 	it('ほかのページへは付けない', () => {

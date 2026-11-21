@@ -25,6 +25,9 @@
 import { expect, test, type Page } from '@playwright/test';
 import { ensureLoggedIn } from './banto-hub-auth';
 
+/** ナビのリンク名（メニューバーは名前だけ、サイドバーは前にアイコンが付く）。 */
+const NAV_TAGS = /^(?:\S+\s+)?タグ$/;
+
 const NARROW_VIEWPORT = { width: 400, height: 800 };
 
 /**
@@ -33,7 +36,7 @@ const NARROW_VIEWPORT = { width: 400, height: 800 };
  * アニメーション（`transition: transform/visibility 0.2s`）の完了は
  * `toBeHidden()` のリトライが待つ。
  */
-async function expectNavHidden(page: Page, locatorName: string): Promise<void> {
+async function expectNavHidden(page: Page, locatorName: RegExp): Promise<void> {
 	await expect(page.getByRole('link', { name: locatorName })).toBeHidden();
 }
 
@@ -53,7 +56,7 @@ test.describe.serial('banto-hub offcanvas sidebar (narrow viewport)', () => {
 	});
 
 	test('1. 初期状態ではサイドバーのナビが画面外に退避している', async () => {
-		await expectNavHidden(page, 'タグ登録');
+		await expectNavHidden(page, NAV_TAGS);
 		// バックドロップも出ていない（開いていないので背景オーバーレイは無い）。
 		await expect(
 			page.getByRole('button', { name: '背景をクリックしてメニューを閉じる' })
@@ -71,7 +74,7 @@ test.describe.serial('banto-hub offcanvas sidebar (narrow viewport)', () => {
 			page.getByRole('button', { name: '背景をクリックしてメニューを閉じる' })
 		).toBeVisible();
 
-		const tagsLink = page.getByRole('link', { name: 'タグ登録' });
+		const tagsLink = page.getByRole('link', { name: NAV_TAGS });
 		await expect(tagsLink).toBeVisible();
 		await expect
 			.poll(async () => {
@@ -82,7 +85,7 @@ test.describe.serial('banto-hub offcanvas sidebar (narrow viewport)', () => {
 	});
 
 	test('3. リンクを押すと遷移してオフキャンバスが閉じる', async () => {
-		await page.getByRole('link', { name: 'タグ登録' }).click();
+		await page.getByRole('link', { name: NAV_TAGS }).click();
 
 		await expect(page).toHaveURL(/\/tags$/);
 		await expect(page.getByRole('heading', { level: 2, name: 'タグ登録' })).toBeVisible();
@@ -90,7 +93,7 @@ test.describe.serial('banto-hub offcanvas sidebar (narrow viewport)', () => {
 		// 遷移により afterNavigate 経由でオフキャンバスが閉じ、☰ は「開く」に
 		// 戻り、ナビは再び画面外へ退避する。
 		await expect(page.getByRole('button', { name: 'メニューを開く' })).toBeVisible();
-		await expectNavHidden(page, 'タグ登録');
+		await expectNavHidden(page, NAV_TAGS);
 	});
 
 	test('4. バックドロップのクリックでもオフキャンバスが閉じる', async () => {
@@ -113,7 +116,7 @@ test.describe.serial('banto-hub offcanvas sidebar (narrow viewport)', () => {
 			.click({ position: { x: NARROW_VIEWPORT.width - 10, y: NARROW_VIEWPORT.height / 2 } });
 
 		await expect(page.getByRole('button', { name: 'メニューを開く' })).toBeVisible();
-		await expectNavHidden(page, 'タグ登録');
+		await expectNavHidden(page, NAV_TAGS);
 		// フォーカスは `<body>` に落とさず、見えている ☰ に戻る（バックドロップが消えても）。
 		await expect(page.getByRole('button', { name: 'メニューを開く' })).toBeFocused();
 	});
@@ -127,6 +130,6 @@ test.describe.serial('banto-hub offcanvas sidebar (narrow viewport)', () => {
 		await page.keyboard.press('Escape');
 
 		await expect(page.getByRole('button', { name: 'メニューを開く' })).toBeVisible();
-		await expectNavHidden(page, 'タグ登録');
+		await expectNavHidden(page, NAV_TAGS);
 	});
 });

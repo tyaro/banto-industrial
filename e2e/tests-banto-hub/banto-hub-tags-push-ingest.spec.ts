@@ -10,7 +10,7 @@
  * 2. 再設定のドロワーに、送り手向けの URL（`/api/v1/ingest/{id}/…`）とスコープ
  *    （`ingest:#{id}`）、受信の状態（まだ送り手が無いので「送り手待ち」）が出る。
  * 3. `ingest:#{id}` のキーで REST の一括送信（`POST /api/v1/ingest/{id}/values`）で
- *    送った値が、モニタのタグ一覧に出る（収集を開始した状態で）。
+ *    送った値が、タグ一覧の「現在値」の列に出る（収集を開始した状態で）。
  * 4. ドロワーの受信の状態が「受信中」になり、送り手（REST・キーの名前）が出る。
  *    キーの値・送った値は状態に出ない（サーバーが出さない。ここでは DOM で確かめる）。
  *
@@ -31,7 +31,6 @@ const PUSH_GROUP = `e2e-push-grp-${RUN_ID}`;
 const PUSH_TAG = `e2e-push-tag-${RUN_ID}`;
 const PUSH_KEY_NAME = `e2e-push-key-${RUN_ID}`;
 const INGEST_KEY = 'line1.temp';
-const EXTERNAL_NAME = `${PUSH_CONN}.${PUSH_GROUP}.${PUSH_TAG}`;
 
 interface ConnectionRow {
 	id: number;
@@ -197,7 +196,7 @@ test.describe.serial('banto-hub 取り込み口 push（R2a-2e）', () => {
 		// #1008: a push source is not described as PLC collection. The stored
 		// tag kind remains plc, as required by the registry/ingest contract.
 		await page.getByPlaceholder('名前・アドレスで検索').fill(PUSH_TAG);
-		const tagRow = page.getByRole('row').filter({ hasText: PUSH_TAG });
+		const tagRow = page.locator('[role="row"].row').filter({ hasText: PUSH_TAG });
 		await expect(tagRow.getByRole('gridcell', { name: 'push', exact: true })).toBeVisible();
 		await tagRow.getByRole('gridcell', { name: PUSH_TAG, exact: true }).click();
 		const tagPane = page.getByRole('complementary', { name: `${PUSH_TAG} を編集` });
@@ -219,7 +218,7 @@ test.describe.serial('banto-hub 取り込み口 push（R2a-2e）', () => {
 		await page.keyboard.press('Escape');
 	});
 
-	test('3. ingest:#{id} のキーで REST で送った値がモニタのタグ一覧に出る', async () => {
+	test('3. ingest:#{id} のキーで REST で送った値がタグ一覧の現在値に出る', async () => {
 		const keyRes = await page.request.post('/api/api-keys', {
 			headers,
 			data: { name: PUSH_KEY_NAME, scopes: [`ingest:#${connectionId}`] }
@@ -231,8 +230,8 @@ test.describe.serial('banto-hub 取り込み口 push（R2a-2e）', () => {
 		expect(startRes.ok(), await startRes.text()).toBe(true);
 		startedCollection = true;
 
-		await page.goto(`/monitor?target=group:${groupId}`);
-		const row = page.locator('tr', { hasText: EXTERNAL_NAME });
+		await page.goto(`/tags?target=group:${groupId}`);
+		const row = page.locator('[role="row"].row').filter({ hasText: PUSH_TAG });
 		await expect(row).toBeVisible();
 		// 開始の直後は計画の反映と WS の購読が追いつくまで待つ。送り直しながら待つ
 		// （受信のタイムアウトは 60 秒なので、1 回届けば十分だが、収集の開始より
@@ -246,8 +245,11 @@ test.describe.serial('banto-hub 取り込み口 push（R2a-2e）', () => {
 			const ack = (await sent.json()) as { accepted: number; collecting: boolean };
 			expect(ack.accepted).toBe(1);
 			expect(ack.collecting).toBe(true);
-			// 外部名に RUN_ID（数字）が入るので、行全体ではなく値の列で見る。
-			await expect(row.locator('td.value')).toHaveText('42', { timeout: 3000 });
+			// 名前に RUN_ID（数字）が入るので、行全体ではなく値の列で見る
+			// （接続がシミュレーションなら値の後ろに SIM の印が付くので先頭だけ見る）。
+			await expect(row.locator('[data-cell-field="currentValue"]')).toHaveText(/^42/, {
+				timeout: 3000
+			});
 		}).toPass({ timeout: 30_000 });
 	});
 

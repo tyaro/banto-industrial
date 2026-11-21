@@ -94,7 +94,7 @@ test.describe.serial('banto-hub 登録後の確認導線 CTA (T18-4c)', () => {
 		await page.close();
 	});
 
-	test('1. UI でタグ登録すると確認 CTA が出て、href が /monitor?target=group:...&focus=... になる', async () => {
+	test('1. UI でタグ登録すると確認 CTA が出て、href が /tags?target=group:...&focus=... になる', async () => {
 		await page.goto('/tags');
 		// T19 S1-c（UX-33）: 「新規登録」はツリーでグループが選択されている
 		// ときしか出ない上、開いた create Drawer は選択中グループへ確定済み
@@ -119,21 +119,159 @@ test.describe.serial('banto-hub 登録後の確認導線 CTA (T18-4c)', () => {
 		await expect(cta).toBeVisible();
 		const href = await cta.getAttribute('href');
 		expect(href).not.toBeNull();
-		// 対象タグのグループへ絞り、対象タグを focus 対象にした /monitor リンク。
-		expect(href!.startsWith(`/monitor?target=group:${groupId}`)).toBe(true);
+		// 対象タグのグループへ絞り、対象タグを focus 対象にした /tags リンク（同じページの中の遷移。#1255 段階 ③）。
+		expect(href!.startsWith(`/tags?target=group:${groupId}`)).toBe(true);
 		expect(href).toContain(`focus=${encodeURIComponent(EXTERNAL_NAME)}`);
 	});
 
-	test('2. CTA クリックで /monitor へ遷移し、ConnectionTree がそのグループに絞られる', async () => {
+	test('2. CTA クリックで focus つきの URL へ替わり、ConnectionTree がそのグループに絞られる', async () => {
 		await page.getByRole('link', { name: CTA_TEXT }).click();
 
-		await expect(page).toHaveURL(new RegExp(`/monitor\\?target=group:${groupId}&focus=`));
+		await expect(page).toHaveURL(new RegExp(`/tags\\?target=group:${groupId}&focus=`));
 		// 登録したタグ行が確認対象（focus ハイライト）として出る。
-		await expect(page.getByText(EXTERNAL_NAME)).toBeVisible();
-		const highlighted = page.locator('tr.confirm-target');
+		const highlighted = page.locator('.row.confirm-target');
 		await expect(highlighted).toHaveCount(1);
-		await expect(highlighted).toContainText(EXTERNAL_NAME);
+		await expect(highlighted).toContainText(TAG_NAME);
 		// ツリーはそのグループを選択状態にしている。
 		await expect(page.getByRole('treeitem', { selected: true })).toContainText(GROUP_NAME);
+	});
+
+	// #1255: 確認のリンクは同じページの中の遷移なので、検索欄に前の語が残ると新しい名前の行が
+	// 隠れる。押したときに検索語を消す。
+	test('3. 合わない検索語を入れたまま作成して確認を押すと、検索が空になり新しい行が強調される', async () => {
+		const name = `${TAG_NAME}-b`;
+		await page.goto('/tags');
+		await groupNodeByName(page, GROUP_NAME).click();
+		const search = page.getByPlaceholder('名前・アドレスで検索');
+		await search.fill('zzz-no-such-tag');
+		await page.getByRole('button', { name: 'タグを追加' }).click();
+		const drawer = page.getByRole('complementary', { name: '新規作成' });
+		await drawer.getByLabel('名前').fill(name);
+		await drawer.getByLabel('アドレス').fill('40002');
+		await drawer.getByRole('button', { name: '保存して閉じる' }).click();
+		await expect(page.getByText('作成しました')).toBeVisible();
+
+		await page.getByRole('link', { name: CTA_TEXT }).click();
+		await expect(search).toHaveValue('');
+		await expect(page.locator('.row.confirm-target')).toContainText(name);
+	});
+
+	test('4. 旧名の検索語を入れたまま改名して確認を押すと、検索が空になり新しい名前の行が強調される', async () => {
+		const oldName = `${TAG_NAME}-b`;
+		const newName = `${TAG_NAME}-renamed`;
+		await page.goto('/tags');
+		await groupNodeByName(page, GROUP_NAME).click();
+		const search = page.getByPlaceholder('名前・アドレスで検索');
+		await search.fill(oldName);
+		await page.getByRole('gridcell', { name: oldName, exact: true }).click();
+		const drawer = page.getByRole('complementary', { name: `${oldName} を編集` });
+		await expect(drawer).toBeVisible();
+		await drawer.getByLabel('名前').fill(newName);
+		await drawer.getByRole('button', { name: '保存', exact: true }).click();
+		await expect(page.getByText('更新しました')).toBeVisible();
+
+		await page.getByRole('link', { name: CTA_TEXT }).click();
+		await expect(search).toHaveValue('');
+		await expect(page.locator('.row.confirm-target')).toContainText(newName);
+	});
+
+	// #1255: ほかの所（API）で足されたタグが、開いている /tags に config_changed で出る。
+	test('5. 別の経路でタグが足されると、開いている /tags の一覧に行が出る', async () => {
+		const name = `${TAG_NAME}-external`;
+		await page.goto('/tags');
+		await groupNodeByName(page, GROUP_NAME).click();
+		await page.getByPlaceholder('名前・アドレスで検索').fill(name);
+		await expect(page.getByRole('gridcell', { name, exact: true })).toHaveCount(0);
+
+		const res = await page.request.post('/api/tags', {
+			headers: authedHeaders,
+			data: {
+				name,
+				collectionGroupId: groupId,
+				address: '40003',
+				dataType: 'i16',
+				decimals: 0,
+				enabled: true,
+				writable: false,
+				tagKind: 'plc'
+			}
+		});
+		expect(res.ok(), await res.text()).toBe(true);
+		await expect(page.getByRole('gridcell', { name, exact: true })).toBeVisible({
+			timeout: 10_000
+		});
+	});
+
+	// #1255: 編集フォームを開いている間に config_changed の読み直しが返っても、結果を当てず「読み直す」の知らせを出す。
+	test('6. 読み直しの応答待ちの間に編集フォームを開くと、一覧は変えず知らせを出し、読み直すで反映される', async () => {
+		const baseName = `${TAG_NAME}-base6`;
+		const addedName = `${TAG_NAME}-added6`;
+		const body = (name: string, address: string) => ({
+			name,
+			collectionGroupId: groupId,
+			address,
+			dataType: 'i16',
+			decimals: 0,
+			enabled: true,
+			writable: false,
+			tagKind: 'plc'
+		});
+		const baseRes = await page.request.post('/api/tags', {
+			headers: authedHeaders,
+			data: body(baseName, '40010')
+		});
+		expect(baseRes.ok(), await baseRes.text()).toBe(true);
+
+		await page.goto('/tags');
+		await groupNodeByName(page, GROUP_NAME).click();
+		await page.getByPlaceholder('名前・アドレスで検索').fill(TAG_NAME);
+		const baseCell = page.getByRole('gridcell', { name: baseName, exact: true });
+		await expect(baseCell).toBeVisible({ timeout: 10_000 });
+
+		let hold = false;
+		let release!: () => void;
+		const released = new Promise<void>((resolve) => (release = resolve));
+		let reachedResolve!: () => void;
+		const reached = new Promise<void>((resolve) => (reachedResolve = resolve));
+		const pattern = '**/api/tags';
+		await page.route(pattern, async (route) => {
+			if (hold && route.request().method() === 'GET') {
+				reachedResolve();
+				await released;
+			}
+			await route.continue();
+		});
+		try {
+			hold = true;
+			const addRes = await page.request.post('/api/tags', {
+				headers: authedHeaders,
+				data: body(addedName, '40011')
+			});
+			expect(addRes.ok(), await addRes.text()).toBe(true);
+			// config_changed → 500ms の debounce → reload() の GET が止まった所に当たる
+			await reached;
+			hold = false;
+
+			await baseCell.click();
+			await expect(page.getByRole('complementary', { name: `${baseName} を編集` })).toBeVisible();
+			release();
+
+			await expect(page.getByTestId('tag-config-changed')).toBeVisible({ timeout: 10_000 });
+			await expect(page.getByRole('complementary', { name: `${baseName} を編集` })).toBeVisible();
+			await expect(page.getByRole('gridcell', { name: addedName, exact: true })).toHaveCount(0);
+
+			await page
+				.getByRole('complementary', { name: `${baseName} を編集` })
+				.getByRole('button', { name: '閉じる' })
+				.click();
+			await page.getByTestId('tag-config-changed-reload').click();
+			await expect(page.getByTestId('tag-config-changed')).toHaveCount(0);
+			await expect(page.getByRole('gridcell', { name: addedName, exact: true })).toBeVisible({
+				timeout: 10_000
+			});
+		} finally {
+			release();
+			await page.unroute(pattern);
+		}
 	});
 });

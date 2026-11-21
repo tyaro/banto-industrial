@@ -8,13 +8,13 @@
  * その専用テスト（`computeOnboardingSteps`/`nextOnboardingStep・
  * isOnboardingComplete`/`connectionAwaitingGroup・groupAwaitingTag`/
  * `collectionGroupsHref・tagsHref` の各 describe ブロック）を削除した。
- * 残す `monitorHref`/プリセット解決系/`resolveRegistrationTarget` の
+ * 残す `tagsFocusHref`/プリセット解決系/`resolveRegistrationTarget` の
  * テストは無改変。
  */
 import { describe, expect, it } from 'vitest';
 import type { CollectionGroup, PlcConnection } from './tagRegistryAdmin';
 import {
-	monitorHref,
+	tagsFocusHref,
 	resolveGroupIdFromTreeSelection,
 	resolvePresetConnectionId,
 	resolvePresetGroupId,
@@ -49,48 +49,48 @@ function group(overrides: Partial<CollectionGroup> = {}): CollectionGroup {
 const CALC = connection({ id: 900, name: 'calc', protocol: 'virtual', simulation: false });
 const MEM = connection({ id: 901, name: 'mem', protocol: 'virtual', simulation: false });
 
-describe('monitorHref', () => {
-	it('何も指定しなければ素の /monitor', () => {
-		expect(monitorHref({})).toBe('/monitor');
+describe('tagsFocusHref', () => {
+	it('何も指定しなければ素の /tags', () => {
+		expect(tagsFocusHref({})).toBe('/tags');
 	});
 
 	it('group のみ指定', () => {
-		expect(monitorHref({ groupId: 5 })).toBe('/monitor?target=group:5');
+		expect(tagsFocusHref({ groupId: 5 })).toBe('/tags?target=group:5');
 	});
 
 	it('connection のみ指定', () => {
-		expect(monitorHref({ connectionId: 3 })).toBe('/monitor?target=connection:3');
+		expect(tagsFocusHref({ connectionId: 3 })).toBe('/tags?target=connection:3');
 	});
 
 	it('group と connection を両方指定した場合は group が優先される', () => {
-		expect(monitorHref({ groupId: 5, connectionId: 3 })).toBe('/monitor?target=group:5');
+		expect(tagsFocusHref({ groupId: 5, connectionId: 3 })).toBe('/tags?target=group:5');
 	});
 
 	it('group と focus の併用', () => {
-		expect(monitorHref({ groupId: 5, focus: ['plc1.group1.tag1'] })).toBe(
-			'/monitor?target=group:5&focus=plc1.group1.tag1'
+		expect(tagsFocusHref({ groupId: 5, focus: ['plc1.group1.tag1'] })).toBe(
+			'/tags?target=group:5&focus=plc1.group1.tag1'
 		);
 	});
 
 	it('connection と focus の併用', () => {
-		expect(monitorHref({ connectionId: 3, focus: ['plc1.group1.tag1'] })).toBe(
-			'/monitor?target=connection:3&focus=plc1.group1.tag1'
+		expect(tagsFocusHref({ connectionId: 3, focus: ['plc1.group1.tag1'] })).toBe(
+			'/tags?target=connection:3&focus=plc1.group1.tag1'
 		);
 	});
 
 	it('focus 複数要素はカンマ区切りで、各要素は encodeURIComponent される', () => {
-		expect(monitorHref({ groupId: 5, focus: ['plc1.group1.tag 1', 'plc1.group1.tag&2'] })).toBe(
-			'/monitor?target=group:5&focus=plc1.group1.tag%201,plc1.group1.tag%262'
+		expect(tagsFocusHref({ groupId: 5, focus: ['plc1.group1.tag 1', 'plc1.group1.tag&2'] })).toBe(
+			'/tags?target=group:5&focus=plc1.group1.tag%201,plc1.group1.tag%262'
 		);
 	});
 
 	it('focus が空配列・未指定なら focus パラメータを付けない', () => {
-		expect(monitorHref({ groupId: 5, focus: [] })).toBe('/monitor?target=group:5');
-		expect(monitorHref({ groupId: 5 })).toBe('/monitor?target=group:5');
+		expect(tagsFocusHref({ groupId: 5, focus: [] })).toBe('/tags?target=group:5');
+		expect(tagsFocusHref({ groupId: 5 })).toBe('/tags?target=group:5');
 	});
 
 	it('focus のみ指定（group/connection 無し）', () => {
-		expect(monitorHref({ focus: ['plc1.group1.tag1'] })).toBe('/monitor?focus=plc1.group1.tag1');
+		expect(tagsFocusHref({ focus: ['plc1.group1.tag1'] })).toBe('/tags?focus=plc1.group1.tag1');
 	});
 });
 

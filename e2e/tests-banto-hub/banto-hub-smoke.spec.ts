@@ -19,6 +19,9 @@
 import { expect, test, type Page } from '@playwright/test';
 import { HUB_ADMIN_DISPLAY_NAME, HUB_ADMIN_PASSWORD, HUB_ADMIN_USERNAME } from './banto-hub-auth';
 
+/** ナビのリンク名（メニューバーは名前だけ、サイドバーは前にアイコンが付く）。 */
+const NAV_TAGS = /^(?:\S+\s+)?タグ$/;
+
 test.describe.serial('banto-hub smoke', () => {
 	let page: Page;
 
@@ -68,7 +71,7 @@ test.describe.serial('banto-hub smoke', () => {
 	});
 
 	test('3. sidebar navigation to タグ登録 renders the tags screen', async () => {
-		await page.getByRole('link', { name: 'タグ登録' }).click();
+		await page.getByRole('link', { name: NAV_TAGS }).click();
 		await expect(page).toHaveURL(/\/tags$/);
 		await expect(page.getByRole('heading', { level: 2, name: 'タグ登録' })).toBeVisible();
 	});

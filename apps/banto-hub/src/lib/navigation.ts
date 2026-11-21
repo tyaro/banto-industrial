@@ -1,6 +1,6 @@
 /**
  * サイドバーナビゲーション定義。relay-wright/chronogazer の navigation.ts
- * と同型だが、項目は banto-hub 独自（状態(/status)・タグ登録・タグモニタ・
+ * と同型だが、項目は banto-hub 独自（状態(/status)・タグ・
  * APIキー(admin限定)・ユーザー管理(admin限定)・監査ログ(admin限定)・
  * 書き込み監査(admin限定、T2-4)・設定）を書き下ろし。
  *
@@ -42,7 +42,7 @@
  * （グループを最初のメンバーの位置に集める）、`isNavItemActive()` を足した。
  * メニューバー（`ShellMenubar.svelte`）とドック（`ShellLauncher.svelte`）が同じ
  * 関数で並べる。admin-template は管理ナビを別の区画（別の `<nav>`）にするが、Hub は
- * 「状態 / タグ登録 / タグモニタ / DB Sink / 管理 ▾ / 設定」の並びにしたいので、
+ * 「状態 / タグ / DB Sink / 管理 ▾ / 設定」の並びにしたいので、
  * `adminOnly` の項目を 1 つの「管理」グループとして**最初の管理項目の位置**に
  * 集める（`group` の指定は要らない）。
  */
@@ -106,8 +106,7 @@ export const NAV_GROUP_LABELS: Record<NavGroupKey, string> = { [ADMIN_GROUP_KEY]
 
 export const navItems: NavItem[] = [
 	{ path: '/status', label: '状態', icon: '📡' },
-	{ path: '/tags', label: 'タグ登録', icon: '🏷️' },
-	{ path: '/monitor', label: 'タグモニタ', icon: '📈' },
+	{ path: '/tags', label: 'タグ', icon: '🏷️' },
 	// S6（docs/hub/banto-hub-external-db-design.md §5.2・§7 row S6）: DB Sink の
 	// sink group 管理画面。`GET /api/sink/groups`はロール不問（閲覧は
 	// viewer も可）・作成/更新/削除は editor 以上（`require_editor`）と
@@ -172,9 +171,10 @@ export function isNavItemActive(item: NavItem, pathname: string): boolean {
 
 /**
  * #1179 PR3b（docs/hub/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、段階 ①）:
- * ツリーの選択を共有するページ。タグ登録（`/tags`）とタグモニタ（`/monitor`）。
+ * ツリーの選択を共有するページ。#1255 段階 ③でタグモニタ（`/monitor`）を `/tags` に
+ * 吸収したので、今は `/tags` だけ（仕組みは、ナビのリンクに最後の対象を付けるために残す）。
  */
-export const TREE_TARGET_SHARING_PATHS: readonly AppPath[] = ['/tags', '/monitor'];
+export const TREE_TARGET_SHARING_PATHS: readonly AppPath[] = ['/tags'];
 
 /**
  * ナビ（メニューバー・ドック・サイドバー・コマンドパレット）のリンクの行き先。

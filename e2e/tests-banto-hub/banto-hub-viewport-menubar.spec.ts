@@ -14,6 +14,9 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
 import { CSRF_HEADERS, ensureLoggedIn, fetchAuthToken, injectAuthToken } from './banto-hub-auth';
 import { cleanupFixtures } from './banto-hub-fixture-cleanup';
 
+/** ナビのリンク名（メニューバーは名前だけ、サイドバーは前にアイコンが付く）。 */
+const NAV_TAGS = /^(?:\S+\s+)?タグ$/;
+
 const WIDE = { width: 1280, height: 800 };
 const NARROW = { width: 800, height: 800 };
 
@@ -129,8 +132,8 @@ test.describe.serial('banto-hub メニューバー キーボードと 900px 境�
 		await page.goto('/status');
 		const nav = mainNav(page);
 		await expect(nav.getByRole('link', { name: '状態' })).toBeVisible();
-		await nav.getByRole('link', { name: 'タグ登録' }).focus();
-		await expect(nav.getByRole('link', { name: 'タグ登録' })).toBeFocused();
+		await nav.getByRole('link', { name: NAV_TAGS }).focus();
+		await expect(nav.getByRole('link', { name: NAV_TAGS })).toBeFocused();
 
 		await page.setViewportSize(NARROW);
 		const hamburger = page.getByRole('button', { name: 'メニューを開く', exact: true });
@@ -149,22 +152,22 @@ test.describe.serial('banto-hub メニューバー キーボードと 900px 境�
 		await expect(
 			page.getByRole('button', { name: 'メニューを閉じる', exact: true })
 		).toHaveAttribute('aria-expanded', 'true');
-		await expect(page.getByRole('link', { name: 'タグ登録' })).toBeVisible();
+		await expect(page.getByRole('link', { name: NAV_TAGS })).toBeVisible();
 		await page.keyboard.press('Escape');
-		await expect(page.getByRole('link', { name: 'タグ登録' })).toBeHidden();
+		await expect(page.getByRole('link', { name: NAV_TAGS })).toBeHidden();
 		await expect(page.getByRole('button', { name: 'メニューを開く', exact: true })).toBeFocused();
 	});
 
 	test('6. ドロワーを開いたまま広げるとドロワーが閉じ、メニューバーが戻る', async () => {
 		await page.getByRole('button', { name: 'メニューを開く', exact: true }).click();
-		await expect(page.getByRole('link', { name: 'タグ登録' })).toBeVisible();
+		await expect(page.getByRole('link', { name: NAV_TAGS })).toBeVisible();
 		await page.setViewportSize(WIDE);
 		const nav = mainNav(page);
 		await expect(nav).toBeVisible();
-		await expect(nav.getByRole('link', { name: 'タグ登録' })).toBeVisible();
+		await expect(nav.getByRole('link', { name: NAV_TAGS })).toBeVisible();
 		// ☰ はもう無く、サイドバーのリンクも出ていない（バーの分だけ）。
 		await expect(page.getByRole('button', { name: /メニューを(開く|閉じる)/ })).toHaveCount(0);
-		await expect(page.getByRole('link', { name: 'タグ登録' })).toHaveCount(1);
+		await expect(page.getByRole('link', { name: NAV_TAGS })).toHaveCount(1);
 		await expect.poll(() => focusKept(page)).toBe(true);
 	});
 });
