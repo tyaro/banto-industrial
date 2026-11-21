@@ -1,6 +1,6 @@
 {
   "name": "@banto-industrial/trend",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "記録計のトレンド（時刻の軸・ペンごとの縦軸・MIN/MAX の包絡）の共通部品。ChronoGazer と temp-scada が使う",
   "license": "MIT",
