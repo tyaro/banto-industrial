@@ -6,15 +6,24 @@
  *
  * - 配置は利用者ごとの保存に任せ、URL には載せない（選択中の対象は今の `?target=` のまま）。
  * - キーはページごと（`/monitor` は `monitor`、`/tags` は `tags`）。localStorage の写しは、さらに
- *   ログインの利用者ごと（`banto.dock.<page>.<持ち主>`）。同じブラウザで別の利用者が
+ *   ログインの利用者ごと（`banto.dock.v2.<page>.<持ち主>`）。同じブラウザで別の利用者が
  *   ログインしたとき、前の利用者の配置を最初の描画に使わない（PR #1268 レビュー）。
  *   持ち主は `@banto/admin-core` の `SessionSnapshot.owner`（`account:<id>`・grant の kind）。
  *   持ち主が分からなければ写しのキーは無い（読まない・書かない）。前のページ名だけのキー
- *   `banto.dock.<page>` は読まない（移行しない）。
+ *   `banto.dock.<page>` も読まない（移行しない）。
+ * - キーには版（`DOCK_LAYOUT_KEY_VERSION`）を入れる（`hub.dock.v2.<page>`・
+ *   `banto.dock.v2.<page>.<持ち主>`）。部品は保存値に無い追加パネルを「閉じた浮動」で足すので、
+ *   下のログのパネル（#1253、追加パネル `log`）を足す前に保存した配置ではログが最初は
+ *   出ない。v2 で保存値を一度捨て、既定の配置（ログを下に開く）から始める（#1268・#1269 は
+ *   未リリースで、破壊的変更は許されている。前の版のキーは読まない・移行しない）。
+ *   これからも、既定で開いておきたいパネルを足すときは版を上げる。
  * - ここでの検証は「自分が書いた形か」だけ（`ThreePaneSavedLayout` の外形: `schema: 1`・
  *   `panels`・`layout`）。中身の検証（知らない id・壊れた木・今のパネルとの照合）は部品の
  *   `reconcileThreePaneLayout` が行うので、ここでは繰り返さない。
  */
+
+/** 保存のキーの版（上の doc。v2 = 下のログのパネルを足した、#1253）。 */
+export const DOCK_LAYOUT_KEY_VERSION = 2;
 
 /** ページの名前（キーの一部）。`UiSettingsProvider` のキーは `[A-Za-z0-9._-]{1,64}`。 */
 const PAGE_PATTERN = /^[a-z0-9-]{1,40}$/;
@@ -39,8 +48,8 @@ export function dockLayoutKeys(page: string, owner: string | null): DockLayoutKe
 	const local =
 		owner === null || owner === ''
 			? undefined
-			: `banto.dock.${page}.${encodeURIComponent(owner).replace(/\./g, '%2E')}`;
-	return { local, setting: `hub.dock.${page}` };
+			: `banto.dock.v${DOCK_LAYOUT_KEY_VERSION}.${page}.${encodeURIComponent(owner).replace(/\./g, '%2E')}`;
+	return { local, setting: `hub.dock.v${DOCK_LAYOUT_KEY_VERSION}.${page}` };
 }
 
 /** 保存する値の外形（`ThreePaneSavedLayout` と同じ。中身は部品が照らす）。 */

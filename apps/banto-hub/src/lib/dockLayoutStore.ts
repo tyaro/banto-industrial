@@ -3,11 +3,11 @@
  * `/monitor` と `/tags` が同じ口を使い、ページの名前でキーを分ける。
  *
  * 置き場は `settings.svelte.ts` と同じ二層:
- * - localStorage（`banto.dock.<page>.<持ち主>`）: 写し。最初の描画（`ThreePaneDock` の
+ * - localStorage（`banto.dock.v2.<page>.<持ち主>`）: 写し。最初の描画（`ThreePaneDock` の
  *   `initialLayout`）に使う。書けなくても（容量・無効）黙って続ける。持ち主（今のセッションの
  *   `owner`）は作った時点で決める。分からなければ写しを読まず（既定の配置）書きもしない。
  *   作った後に持ち主が替わっていたら（別のタブで別の利用者がログイン）、写しを書かない。
- * - `UiSettingsProvider`（`hub.dock.<page>`、Hub のサーバー・利用者ごと）: 本体。デスクトップ版は
+ * - `UiSettingsProvider`（`hub.dock.v2.<page>`、Hub のサーバー・利用者ごと）: 本体。デスクトップ版は
  *   起動ごとに origin が変わり localStorage が消えるので、マウント後に読み直して当てる。
  *   送信は `@banto/admin-core` の `createSavedSetting`（即時の形）に任せる: 送っている間は 1 本、
  *   その間の変更は最新だけを続けて送る。**保存済みの印は送信が成功した値だけ**で、失敗したら
@@ -39,6 +39,11 @@ export interface DockLayoutStore {
 	readonly initial: StoredDockLayout | undefined;
 	/** 今の配置を保存する（同じ配置なら何もしない）。 */
 	save(layout: StoredDockLayout): void;
+	/**
+	 * 今の配置を、送らずに比べる基準に置き直す（利用者の変更ではない配置。サーバーの保存値が
+	 * 使えず部品が既定へ戻したときの補正後の配置、`dockLogBand.svelte.ts`）。
+	 */
+	rebase(layout: StoredDockLayout): void;
 	/** サーバーの保存値を読む。当てるべき値があるときだけ返す（上の約束）。 */
 	loadSaved(): Promise<StoredDockLayout | undefined>;
 	/** ページを離れるときに呼ぶ（送信中の応答を捨てる）。 */
@@ -130,6 +135,10 @@ export function createDockLayoutStore(
 			writeLocal(raw);
 			if (loaded) setting.set(layout);
 			else pending = layout;
+		},
+		rebase(layout) {
+			if (disposed) return;
+			lastRaw = serializeDockLayout(layout);
 		},
 		async loadSaved() {
 			const outcome = await setting.load();

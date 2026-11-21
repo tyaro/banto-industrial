@@ -105,7 +105,11 @@
 	import { createDockState, defaultDockMessages, ThreePaneDock } from '@banto/dock-svelte';
 	import { createDockLayoutStore } from '#lib/dockLayoutStore.js';
 	import { persistThreePaneLayout } from '#lib/dockLayoutPersist.svelte.js';
+	import { lowScreenLogBand } from '#lib/dockLogBand.svelte.js';
 	import ConnectionTree from '#lib/components/ConnectionTree.svelte';
+	import LogPanel from '#lib/components/LogPanel.svelte';
+	import { createLogFeedState } from '#lib/banto/logFeedState.svelte.js';
+	import { isDockPanelOnScreen } from '#lib/dockPanelOnScreen.js';
 	import type { ConnectionTreeNodeData } from '#lib/components/connectionTreeTypes.js';
 	import { isProviderError } from '@banto/admin-core';
 
@@ -296,6 +300,19 @@
 	const treeDrawerOpen = $derived(layoutNarrow && dock.flyoutPanel === 'left');
 	let treePaneEl: HTMLDivElement | undefined = $state();
 
+	/**
+	 * #1253: 下のログのパネル（追加パネル `log`、既定は下の外周）。取得と保持はページが持ち
+	 * （パネルは隠すと作り直されることがある）、実際に画面に出ている間だけ読む
+	 * （`isDockPanelOnScreen`。狭い表示では部品が追加パネルを隠すので止まる）。
+	 */
+	const logFeed = createLogFeedState();
+	onDestroy(() => logFeed.dispose());
+	const logPanelOnScreen = $derived(isDockPanelOnScreen(dock.layout, 'log', dock.flyoutPanel));
+	$effect(() => logFeed.setVisible(logPanelOnScreen));
+	const dockPanels = [
+		{ id: 'log', title: 'ログ', content: logPanel, initial: { edge: 'bottom' as const } }
+	];
+
 	const dockMessages = {
 		...defaultDockMessages,
 		threePaneLeft: () => '接続とグループ',
@@ -303,9 +320,16 @@
 		threePaneRight: () => '詳細'
 	};
 
+	// 低い画面では、部品が作った既定の配置（保存値が無い・既定に戻す）でログを下端の帯で
+	// 始める（2026-11-21 オーナー決定、`dockLogBand.svelte.ts`）。
+	const logBand = lowScreenLogBand({
+		pane: () => threePane,
+		dock,
+		narrow: () => layoutNarrow
+	});
 	/** 「表示」メニューの項目（左のツリー・区切り・レイアウトを既定に戻す）。 */
 	const viewItems = $derived(
-		threePane?.viewMenuItems({ resetLayout: 'レイアウトを既定に戻す' }) ?? []
+		logBand.viewItems(threePane?.viewMenuItems({ resetLayout: 'レイアウトを既定に戻す' }) ?? [])
 	);
 
 	// 配置の保存。最初の 1 回（マウントした時点の配置）は保存の口が基準として受け取るだけ。
@@ -313,10 +337,15 @@
 	// の後に確定する控えた広い配置も拾う。PR #1268 レビュー P2）。
 	// 広い ⇄ 狭いの切り替えの途中（求める表示と出している表示が食い違う間）は保存しない
 	// （狭い表示の一時の木を書かない。PR #1268 再レビュー P2）。
-	persistThreePaneLayout(() => threePane, dockLayoutStore, {
-		wanted: () => mobileNavStore.isNarrow,
-		shown: () => layoutNarrow
-	});
+	persistThreePaneLayout(
+		() => threePane,
+		dockLayoutStore,
+		{
+			wanted: () => mobileNavStore.isNarrow,
+			shown: () => layoutNarrow
+		},
+		logBand
+	);
 
 	// サーバーの保存値（利用者ごと）を、枠のマウント後に 1 回だけ読んで当てる。
 	let savedLayoutRequested = false;
@@ -325,7 +354,10 @@
 		if (!pane || savedLayoutRequested) return;
 		savedLayoutRequested = true;
 		void dockLayoutStore.loadSaved().then((saved) => {
-			if (saved !== undefined && threePane === pane) void pane.restoreLayout(saved);
+			if (saved === undefined || threePane !== pane) return;
+			// 部品が保存値を採らず既定へ戻したら、その既定にも低い画面の補正を当てて保存しない
+			// （PR #1270 再レビュー P2、`dockLogBand.svelte.ts`）。
+			logBand.restoreSaved(pane, saved);
 		});
 	});
 
@@ -673,10 +705,12 @@
 			bind:this={threePane}
 			{dock}
 			initialLayout={dockLayoutStore.initial}
+			onRestore={logBand.onRestore}
 			bind:leftOpen={treeShown}
 			bind:narrow={layoutNarrow}
 			narrowOverride={mobileNavStore.isNarrow}
 			keepMounted={(id) => id === 'left'}
+			panels={dockPanels}
 			messages={dockMessages}
 		>
 			{#snippet left()}
@@ -800,6 +834,10 @@
 		</ThreePaneDock>
 	</div>
 </div>
+
+{#snippet logPanel()}
+	<LogPanel feed={logFeed} />
+{/snippet}
 
 <style>
 	/* T18-4a: tags ページ（`(app)/tags/+page.svelte`）と同じ

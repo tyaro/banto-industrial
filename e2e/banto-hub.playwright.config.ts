@@ -89,7 +89,10 @@ const LOCKED_DOWN_SPECS = [
 	// #445: 切れている間の失効（再接続の拒否を注入し、実サーバーで失効させる）。
 	'**/banto-hub-stream-reconnect-rejected.spec.ts',
 	// banto v1.7.2（tyaro/banto#241）: モニタ以外の画面が SSE の失効の知らせでログイン画面へ移る。
-	'**/banto-hub-user-session-ended.spec.ts'
+	'**/banto-hub-user-session-ended.spec.ts',
+	// #1253: 下のログのパネルの見せる範囲（閲覧者には接続の行だけ）。閲覧者の権限の差は
+	// ロックダウン済みでしか出ない。
+	'**/banto-hub-user-log-panel-viewer.spec.ts'
 ];
 
 // chronogazer の `BANTO_E2E_DB_DIR`/`dbDir` と同じ理由（SqliteConnectOptions::

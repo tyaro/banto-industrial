@@ -19,7 +19,7 @@ function layout(share: number): StoredDockLayout {
 /** サーバーの代役。`get` は手で返せる（読み込みの前後の操作を作るため）。 */
 function fakeProvider(initial?: string) {
 	const values = new Map<string, string>();
-	if (initial !== undefined) values.set('hub.dock.monitor', initial);
+	if (initial !== undefined) values.set('hub.dock.v2.monitor', initial);
 	let gate: Promise<void> | null = null;
 	let failSet = false;
 	const set = vi.fn(async (key: string, value: string) => {
@@ -58,7 +58,7 @@ async function settle(): Promise<void> {
 describe('createDockLayoutStore', () => {
 	it('最初の描画には localStorage の写しを使う（壊れていれば使わない）', () => {
 		const storage = new MemoryStorage();
-		storage.setItem('banto.dock.monitor.account%3A1', serializeDockLayout(layout(0.3)));
+		storage.setItem('banto.dock.v2.monitor.account%3A1', serializeDockLayout(layout(0.3)));
 		const server = fakeProvider();
 		expect(
 			createDockLayoutStore('monitor', {
@@ -67,7 +67,7 @@ describe('createDockLayoutStore', () => {
 				owner: () => 'account:1'
 			}).initial
 		).toEqual(layout(0.3));
-		storage.setItem('banto.dock.monitor.account%3A1', '{broken');
+		storage.setItem('banto.dock.v2.monitor.account%3A1', '{broken');
 		expect(
 			createDockLayoutStore('monitor', {
 				provider: server.provider,
@@ -88,7 +88,7 @@ describe('createDockLayoutStore', () => {
 		store.save(layout(0.2));
 		expect(await store.loadSaved()).toBeUndefined();
 		await settle();
-		expect(storage.getItem('banto.dock.monitor.account%3A1')).toBeNull();
+		expect(storage.getItem('banto.dock.v2.monitor.account%3A1')).toBeNull();
 		expect(server.set).not.toHaveBeenCalled();
 	});
 
@@ -105,7 +105,7 @@ describe('createDockLayoutStore', () => {
 		// 呼び出し側が restoreLayout した結果の save。写しは更新し、サーバーへは送らない。
 		store.save(layout(0.4));
 		await settle();
-		expect(storage.getItem('banto.dock.monitor.account%3A1')).toBe(
+		expect(storage.getItem('banto.dock.v2.monitor.account%3A1')).toBe(
 			serializeDockLayout(layout(0.4))
 		);
 		expect(server.set).not.toHaveBeenCalled();
@@ -136,7 +136,7 @@ describe('createDockLayoutStore', () => {
 		store.save(layout(0.25));
 		store.save(layout(0.3));
 		// 写しは同期で書く。サーバーへは読み終わるまで送らない。
-		expect(storage.getItem('banto.dock.monitor.account%3A1')).toBe(
+		expect(storage.getItem('banto.dock.v2.monitor.account%3A1')).toBe(
 			serializeDockLayout(layout(0.3))
 		);
 		expect(server.set).not.toHaveBeenCalled();
@@ -144,7 +144,7 @@ describe('createDockLayoutStore', () => {
 		expect(await loading).toBeUndefined();
 		await settle();
 		expect(server.set).toHaveBeenCalledTimes(1);
-		expect(server.values.get('hub.dock.monitor')).toBe(serializeDockLayout(layout(0.3)));
+		expect(server.values.get('hub.dock.v2.monitor')).toBe(serializeDockLayout(layout(0.3)));
 	});
 
 	it('読み終えた後の変更は送る。同じ配置は送らない', async () => {
@@ -161,7 +161,25 @@ describe('createDockLayoutStore', () => {
 		store.save(layout(0.3));
 		await settle();
 		expect(server.set).toHaveBeenCalledTimes(1);
-		expect(server.values.get('hub.dock.monitor')).toBe(serializeDockLayout(layout(0.3)));
+		expect(server.values.get('hub.dock.v2.monitor')).toBe(serializeDockLayout(layout(0.3)));
+	});
+
+	it('rebase は送らずに基準を置き直す（その後の同じ配置は送らず、違う配置は送る）', async () => {
+		const server = fakeProvider();
+		const store = createDockLayoutStore('monitor', {
+			provider: server.provider,
+			storage: () => new MemoryStorage(),
+			owner: () => 'account:1'
+		});
+		store.save(layout(0.2));
+		await store.loadSaved();
+		store.rebase(layout(0.4));
+		store.save(layout(0.4));
+		await settle();
+		expect(server.set).not.toHaveBeenCalled();
+		store.save(layout(0.5));
+		await settle();
+		expect(server.set).toHaveBeenCalledTimes(1);
 	});
 
 	it('送信に失敗した値は保存済みにせず、次の変更で最新を送り直す', async () => {
@@ -176,11 +194,11 @@ describe('createDockLayoutStore', () => {
 		server.failWrites(true);
 		store.save(layout(0.3));
 		await settle();
-		expect(server.values.has('hub.dock.monitor')).toBe(false);
+		expect(server.values.has('hub.dock.v2.monitor')).toBe(false);
 		server.failWrites(false);
 		store.save(layout(0.35));
 		await settle();
-		expect(server.values.get('hub.dock.monitor')).toBe(serializeDockLayout(layout(0.35)));
+		expect(server.values.get('hub.dock.v2.monitor')).toBe(serializeDockLayout(layout(0.35)));
 	});
 
 	it('localStorage が書けなくても続ける', async () => {
@@ -200,7 +218,7 @@ describe('createDockLayoutStore', () => {
 		await store.loadSaved();
 		expect(() => store.save(layout(0.3))).not.toThrow();
 		await settle();
-		expect(server.values.get('hub.dock.monitor')).toBe(serializeDockLayout(layout(0.3)));
+		expect(server.values.get('hub.dock.v2.monitor')).toBe(serializeDockLayout(layout(0.3)));
 	});
 
 	it('dispose の後は読み込みの結果を返さず、保存もしない', async () => {
@@ -219,7 +237,7 @@ describe('createDockLayoutStore', () => {
 		expect(await loading).toBeUndefined();
 		store.save(layout(0.3));
 		await settle();
-		expect(storage.getItem('banto.dock.monitor.account%3A1')).toBeNull();
+		expect(storage.getItem('banto.dock.v2.monitor.account%3A1')).toBeNull();
 		expect(server.set).not.toHaveBeenCalled();
 	});
 	it('写しはログインの利用者ごと: A の配置を B の最初の描画に使わない', () => {
@@ -234,7 +252,7 @@ describe('createDockLayoutStore', () => {
 		const a = make('account:1');
 		a.save(layout(0.5));
 		a.save(layout(0.2));
-		expect(storage.getItem('banto.dock.monitor.account%3A1')).toBe(
+		expect(storage.getItem('banto.dock.v2.monitor.account%3A1')).toBe(
 			serializeDockLayout(layout(0.2))
 		);
 		expect(make('account:2').initial).toBeUndefined();
@@ -250,6 +268,21 @@ describe('createDockLayoutStore', () => {
 			owner: () => 'account:1'
 		});
 		expect(store.initial).toBeUndefined();
+	});
+
+	it('前の版のキー（ログのパネルを足す前、#1253）は読まない', async () => {
+		const storage = new MemoryStorage();
+		storage.setItem('banto.dock.monitor.account%3A1', serializeDockLayout(layout(0.3)));
+		const server = fakeProvider();
+		server.values.set('hub.dock.monitor', serializeDockLayout(layout(0.3)));
+		const store = createDockLayoutStore('monitor', {
+			provider: server.provider,
+			storage: () => storage,
+			owner: () => 'account:1'
+		});
+		expect(store.initial).toBeUndefined();
+		store.save(layout(0.2));
+		expect(await store.loadSaved()).toBeUndefined();
 	});
 
 	it('利用者が分からないときは写しを読まず、書きもしない', () => {
@@ -280,7 +313,7 @@ describe('createDockLayoutStore', () => {
 		store.save(layout(0.5));
 		owner = 'account:2';
 		store.save(layout(0.2));
-		expect(storage.getItem('banto.dock.monitor.account%3A1')).toBeNull();
-		expect(storage.getItem('banto.dock.monitor.account%3A2')).toBeNull();
+		expect(storage.getItem('banto.dock.v2.monitor.account%3A1')).toBeNull();
+		expect(storage.getItem('banto.dock.v2.monitor.account%3A2')).toBeNull();
 	});
 });

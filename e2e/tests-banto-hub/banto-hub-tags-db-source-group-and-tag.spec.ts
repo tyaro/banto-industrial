@@ -242,8 +242,9 @@ test.describe.serial('banto-hub postgres（DB Source）グループ作成・db �
 		await adminPage.getByPlaceholder('名前・アドレスで検索').fill(DB_TAG_NAME);
 		// `role=row`のアクセシブル名計算に依存せず、行内のテキスト内容で
 		// 絞り込む（`.filter({ hasText })`は可視テキストの部分一致で、
-		// アクセシビリティツリーの name 計算の実装差に左右されない）。
-		const row = adminPage.getByRole('row').filter({ hasText: DB_TAG_NAME });
+		// アクセシビリティツリーの name 計算の実装差に左右されない）。#1253 から下のログの
+		// パネルの行（`<tr>`）も同じ名前を含むので、グリッドの中に限る。
+		const row = adminPage.getByRole('grid').getByRole('row').filter({ hasText: DB_TAG_NAME });
 		await expect(row).toBeVisible();
 		await expect(row.getByRole('gridcell', { name: RESULT_COLUMN, exact: true })).toBeVisible();
 		await expect(row.getByRole('gridcell', { name: 'db', exact: true })).toBeVisible();

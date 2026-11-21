@@ -10,23 +10,23 @@ const SAVED = {
 describe('dockLayoutKeys', () => {
 	it('ページごとに分け、localStorage の写しはさらに持ち主ごと', () => {
 		expect(dockLayoutKeys('monitor', 'account:1')).toEqual({
-			local: 'banto.dock.monitor.account%3A1',
-			setting: 'hub.dock.monitor'
+			local: 'banto.dock.v2.monitor.account%3A1',
+			setting: 'hub.dock.v2.monitor'
 		});
-		expect(dockLayoutKeys('tags', 'commissioning').local).toBe('banto.dock.tags.commissioning');
-		expect(dockLayoutKeys('tags', 'account:1').setting).toBe('hub.dock.tags');
+		expect(dockLayoutKeys('tags', 'commissioning').local).toBe('banto.dock.v2.tags.commissioning');
+		expect(dockLayoutKeys('tags', 'account:1').setting).toBe('hub.dock.v2.tags');
 	});
 
 	it('持ち主の記号・区切りはエスケープする', () => {
 		expect(dockLayoutKeys('monitor', 'account:a.b/c').local).toBe(
-			'banto.dock.monitor.account%3Aa%2Eb%2Fc'
+			'banto.dock.v2.monitor.account%3Aa%2Eb%2Fc'
 		);
 	});
 
 	it.each([null, ''])('持ち主が %j なら写しのキーは無い', (owner) => {
 		expect(dockLayoutKeys('monitor', owner)).toEqual({
 			local: undefined,
-			setting: 'hub.dock.monitor'
+			setting: 'hub.dock.v2.monitor'
 		});
 	});
 

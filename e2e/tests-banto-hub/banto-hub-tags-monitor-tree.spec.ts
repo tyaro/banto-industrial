@@ -170,7 +170,7 @@ test.describe.serial('banto-hub モニタ Tree/検索 + 確認導線ディープ
 		const savedLayout = () =>
 			page.waitForResponse(
 				(r) =>
-					r.url().includes('/api/ui-settings/hub.dock.monitor') && r.request().method() === 'PUT'
+					r.url().includes('/api/ui-settings/hub.dock.v2.monitor') && r.request().method() === 'PUT'
 			);
 		const tree = page.getByRole('tree');
 		const toggle = page.getByTestId('monitor-tree-toggle');
@@ -209,7 +209,8 @@ test.describe.serial('banto-hub モニタ Tree/検索 + 確認導線ディープ
 		const dockSetting = (method: string) =>
 			page.waitForResponse(
 				(r) =>
-					r.url().includes('/api/ui-settings/hub.dock.monitor') && r.request().method() === method
+					r.url().includes('/api/ui-settings/hub.dock.v2.monitor') &&
+					r.request().method() === method
 			);
 		const tree = page.getByRole('tree');
 		const toggle = page.getByTestId('monitor-tree-toggle');
@@ -253,13 +254,13 @@ test.describe.serial('banto-hub モニタ Tree/検索 + 確認導線ディープ
 		// `narrow` を確定する。その間に保存すると、狭い表示の一時の木が PUT・写しに残る。
 		const puts: string[] = [];
 		const onRequest = (req: Request) => {
-			if (req.url().includes('/api/ui-settings/hub.dock.monitor') && req.method() === 'PUT')
+			if (req.url().includes('/api/ui-settings/hub.dock.v2.monitor') && req.method() === 'PUT')
 				puts.push(req.postData() ?? '');
 		};
 		const localCopies = () =>
 			page.evaluate(() =>
 				Object.keys(localStorage)
-					.filter((k) => k.startsWith('banto.dock.monitor.'))
+					.filter((k) => k.startsWith('banto.dock.v2.monitor.'))
 					.sort()
 					.map((k) => [k, localStorage.getItem(k)])
 			);
@@ -268,7 +269,8 @@ test.describe.serial('banto-hub モニタ Tree/検索 + 確認導線ディープ
 		const wide = page.viewportSize() ?? { width: 1280, height: 720 };
 
 		const loaded = page.waitForResponse(
-			(r) => r.url().includes('/api/ui-settings/hub.dock.monitor') && r.request().method() === 'GET'
+			(r) =>
+				r.url().includes('/api/ui-settings/hub.dock.v2.monitor') && r.request().method() === 'GET'
 		);
 		await page.goto('/monitor');
 		await expect(page.getByText(EXTERNAL_A)).toBeVisible();
