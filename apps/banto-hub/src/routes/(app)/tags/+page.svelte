@@ -784,8 +784,12 @@
 	 * 差し替えない（stale 一覧を維持する） - 一度 `const` の配列に受けて
 	 * から全部揃った時点でまとめて代入することで、途中失敗時に一部だけ
 	 * 更新されて表示が食い違うことも防ぐ。
+	 *
+	 * #1255: `skipApplyIf` が応答の後に真なら、結果を当てずに `false` を返す
+	 * （ほかの所の変更の知らせからの読み直しで、応答を待つ間に編集が始まったとき。
+	 * `groups` を差し替えると URL の正規化が未保存の確認を通らずに対象を移し得る）。
 	 */
-	async function reload(): Promise<void> {
+	async function reload(opts: { skipApplyIf?: () => boolean } = {}): Promise<boolean> {
 		loading = true;
 		try {
 			const [nextGroups, nextConnections, nextTags] = await Promise.all([
@@ -793,6 +797,7 @@
 				listPlcConnections(),
 				listTags()
 			]);
+			if (opts.skipApplyIf?.()) return false;
 			groups = nextGroups;
 			connections = nextConnections;
 			tags = nextTags;
@@ -806,9 +811,11 @@
 				const next = new Set([...selectedIds].filter((id) => existingIds.has(id)));
 				if (next.size !== selectedIds.size) selectedIds = next;
 			}
+			return true;
 		} catch (err) {
 			loadError = errorMessage(err);
 			toastStore.push('error', loadError);
+			return false;
 		} finally {
 			loading = false;
 		}
@@ -3484,8 +3491,14 @@
 			scheduleConfigChangedReload();
 			return;
 		}
-		externalConfigChanged = false;
-		await reload();
+		// 応答を待つ間に編集が始まったら、結果を当てずに「読み直す」の知らせへ戻す
+		// （始める前だけでなく、当てる直前にも確かめる。2026-11-21 オーナーの再レビュー）。
+		let skipped = false;
+		const applied = await reload({
+			skipApplyIf: () => (skipped = isEditingInProgress())
+		});
+		if (applied) externalConfigChanged = false;
+		else if (skipped) externalConfigChanged = true;
 	}
 
 	function scheduleConfigChangedReload(): void {
@@ -3494,6 +3507,10 @@
 	}
 
 	async function reloadAfterExternalChange(): Promise<void> {
+		// 「設定」タブの対象がほかの所で消されていると、読み直しの後の URL の正規化が
+		// 「すべて」へ移してフォームを閉じる（未保存が黙って消える）。読み直す前に、
+		// 対象・タブの切り替えと同じ未保存の確認を通す（取り消したら読み直さない）。
+		if (!requestDiscardSettingsForm()) return;
 		externalConfigChanged = false;
 		await reload();
 	}

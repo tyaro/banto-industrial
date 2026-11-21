@@ -201,4 +201,77 @@ test.describe.serial('banto-hub 登録後の確認導線 CTA (T18-4c)', () => {
 			timeout: 10_000
 		});
 	});
+
+	// #1255: 編集フォームを開いている間に config_changed の読み直しが返っても、結果を当てず「読み直す」の知らせを出す。
+	test('6. 読み直しの応答待ちの間に編集フォームを開くと、一覧は変えず知らせを出し、読み直すで反映される', async () => {
+		const baseName = `${TAG_NAME}-base6`;
+		const addedName = `${TAG_NAME}-added6`;
+		const body = (name: string, address: string) => ({
+			name,
+			collectionGroupId: groupId,
+			address,
+			dataType: 'i16',
+			decimals: 0,
+			enabled: true,
+			writable: false,
+			tagKind: 'plc'
+		});
+		const baseRes = await page.request.post('/api/tags', {
+			headers: authedHeaders,
+			data: body(baseName, '40010')
+		});
+		expect(baseRes.ok(), await baseRes.text()).toBe(true);
+
+		await page.goto('/tags');
+		await groupNodeByName(page, GROUP_NAME).click();
+		await page.getByPlaceholder('名前・アドレスで検索').fill(TAG_NAME);
+		const baseCell = page.getByRole('gridcell', { name: baseName, exact: true });
+		await expect(baseCell).toBeVisible({ timeout: 10_000 });
+
+		let hold = false;
+		let release!: () => void;
+		const released = new Promise<void>((resolve) => (release = resolve));
+		let reachedResolve!: () => void;
+		const reached = new Promise<void>((resolve) => (reachedResolve = resolve));
+		const pattern = '**/api/tags';
+		await page.route(pattern, async (route) => {
+			if (hold && route.request().method() === 'GET') {
+				reachedResolve();
+				await released;
+			}
+			await route.continue();
+		});
+		try {
+			hold = true;
+			const addRes = await page.request.post('/api/tags', {
+				headers: authedHeaders,
+				data: body(addedName, '40011')
+			});
+			expect(addRes.ok(), await addRes.text()).toBe(true);
+			// config_changed → 500ms の debounce → reload() の GET が止まった所に当たる
+			await reached;
+			hold = false;
+
+			await baseCell.click();
+			await expect(page.getByRole('complementary', { name: `${baseName} を編集` })).toBeVisible();
+			release();
+
+			await expect(page.getByTestId('tag-config-changed')).toBeVisible({ timeout: 10_000 });
+			await expect(page.getByRole('complementary', { name: `${baseName} を編集` })).toBeVisible();
+			await expect(page.getByRole('gridcell', { name: addedName, exact: true })).toHaveCount(0);
+
+			await page
+				.getByRole('complementary', { name: `${baseName} を編集` })
+				.getByRole('button', { name: '閉じる' })
+				.click();
+			await page.getByTestId('tag-config-changed-reload').click();
+			await expect(page.getByTestId('tag-config-changed')).toHaveCount(0);
+			await expect(page.getByRole('gridcell', { name: addedName, exact: true })).toBeVisible({
+				timeout: 10_000
+			});
+		} finally {
+			release();
+			await page.unroute(pattern);
+		}
+	});
 });
