@@ -15,7 +15,7 @@
  * ロックダウンでしか失効しないので、ユーザーの失効を SSE は知らせない）。
  *
  * 流れ: 管理者が閲覧者を作る → 閲覧者の別のブラウザコンテキストで
- * `/tags` を開き、SSE が繋がるのを待つ → 管理者が閲覧者のパスワードを
+ * `/status`（WS を持たない画面）を開き、SSE が繋がるのを待つ → 管理者が閲覧者のパスワードを
  * リセットする → banto-server の SSE の再検証（`REVALIDATE_INTERVAL` =
  * 15 秒）がストリームを閉じ、再接続が `401` → controller の確認
  * （`GET /api/auth/identity`、送ったトークンを compare-and-set で消す）→
@@ -74,7 +74,7 @@ test.describe
 		await adminPage.close();
 	});
 
-	test('1. パスワードのリセットで失効したら、開いていたタグ画面はログイン画面へ移り、トークンが消え、SSE は再試行しない', async ({
+	test('1. パスワードのリセットで失効したら、開いていた状態画面はログイン画面へ移り、トークンが消え、SSE は再試行しない', async ({
 		browser
 	}) => {
 		test.setTimeout(ONE_INTERVAL_WITH_MARGIN_MS + QUIET_AFTER_LOGIN_MS + 30_000);
@@ -115,8 +115,9 @@ test.describe
 		expect(login.success && login.token, JSON.stringify(login)).toBeTruthy();
 		await injectAuthToken(viewerPage, login.token as string);
 
-		await viewerPage.goto('/tags');
-		await expect(viewerPage.getByRole('heading', { level: 2, name: 'タグ登録' })).toBeVisible();
+		// 値のストリーム（WS）を持たない画面を開く（#1255 から `/tags` も WS を持つ）。
+		await viewerPage.goto('/status');
+		await expect(viewerPage.getByRole('heading', { level: 2, name: 'サーバー状態' })).toBeVisible();
 		// SSE がこのトークンで繋がった（`200`）。
 		await expect.poll(() => eventStatuses.includes(200), { timeout: 15_000 }).toBe(true);
 

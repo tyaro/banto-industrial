@@ -13,6 +13,7 @@ import {
 	monitorCellDisplay,
 	monitorColumnLabels,
 	RECHECK_FAILED_MESSAGE,
+	streamStatusLine,
 	streamViewReducer,
 	type CellDisplayMode,
 	type StreamViewEvent,
@@ -194,5 +195,48 @@ describe('streamViewReducer', () => {
 	it('購読の変更で最初の値の待ちに戻る', () => {
 		const state = run([{ type: 'connected' }, { type: 'data' }, { type: 'resubscribed' }]);
 		expect(cellDisplayMode(state)).toBe('awaitingSnapshot');
+	});
+});
+
+describe('streamStatusLine（モニタの状態の行と同じ文言）', () => {
+	it('接続中', () => {
+		const line = streamStatusLine(run([{ type: 'connected' }]));
+		expect(line).toMatchObject({ kind: 'connected', warning: false, resumable: false });
+		expect(line.text).toBe('接続中（リアルタイム更新中）');
+	});
+	it('通常の再接続中は警告にしない', () => {
+		const line = streamStatusLine(
+			run([{ type: 'connected' }, { type: 'disconnected', code: 1006 }])
+		);
+		expect(line).toMatchObject({ kind: 'reconnecting', warning: false });
+		expect(line.text).toContain('再接続中');
+	});
+	it('バックプレッシャ切断（1013）は別の文言で警告', () => {
+		const line = streamStatusLine(
+			run([{ type: 'connected' }, { type: 'disconnected', code: 1013 }])
+		);
+		expect(line).toMatchObject({ kind: 'backpressure', warning: true });
+		expect(line.text).toBe('サーバーが遅い購読者として切断しました（自動再接続中…）');
+	});
+	it('止まっている間: halt は再開できる、recheckSession はできない', () => {
+		const halted = run([
+			{ type: 'disconnected', code: 1008 },
+			{ type: 'halted', action: UNKNOWN_HALT }
+		]);
+		expect(streamStatusLine(halted)).toMatchObject({
+			kind: 'halt',
+			text: 'm',
+			warning: true,
+			resumable: true
+		});
+		const rechecking = run([
+			{ type: 'disconnected', code: 1008 },
+			{ type: 'halted', action: RECHECK }
+		]);
+		expect(streamStatusLine(rechecking)).toMatchObject({
+			kind: 'recheckSession',
+			warning: true,
+			resumable: false
+		});
 	});
 });
