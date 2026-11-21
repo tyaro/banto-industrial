@@ -119,6 +119,30 @@ describe('timeMarkLayout', () => {
 			[49, false]
 		]);
 	});
+	it('名前の側: 右端の近くは左、左端・中ほどは右', () => {
+		const r = timeMarkLayout([m(1000), m(1500), m(1990)], [], range, W);
+		expect(r.map((x) => [x.x, x.labelSide])).toEqual([
+			[0, 'right'],
+			[50, 'right'],
+			[99, 'left']
+		]);
+	});
+	it('同じ時刻の印は 1 本にまとめ、名前をつなぐ（色は最初）', () => {
+		const r = timeMarkLayout(
+			[
+				m(1500, { label: 'A', colorVar: 'var(--a)' }),
+				m(1500, { label: 'B', colorVar: 'var(--b)' }),
+				m(1500, { label: 'C' }),
+				m(1600, { label: 'D' })
+			],
+			[],
+			range,
+			W
+		);
+		expect(r).toHaveLength(2);
+		expect(r[0]).toMatchObject({ label: 'A・B・C', colorVar: 'var(--a)', count: 3 });
+		expect(r[1].count).toBe(1);
+	});
 	it('色は colorVar、無ければペンの色、無ければ text-muted', () => {
 		const pens = [pen('a', { color: '#123456' })];
 		const r = timeMarkLayout(

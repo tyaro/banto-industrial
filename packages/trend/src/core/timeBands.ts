@@ -14,8 +14,11 @@
  *   `penId` がペンの組に無い帯は出さない。列の合計がアナログの域の半分を超えるときは、列の高さと
  *   間を同じ割合で縮めて半分に収める（`analogHeight` が 0 以下・非有限なら列は出さない）。
  * - 印は縦の線（描画域の全高）。表示範囲 `[startMs, endMs)` の外は出さない。色は `colorVar`、
- *   無ければ `penId` のペンの色、どちらも無ければ `--banto-text-muted`。名前は、前に名前を出した
- *   印から 48px 未満なら省く（線と `<title>` は残す）。時刻の順に判定する。
+ *   無ければ `penId` のペンの色、どちらも無ければ `--banto-text-muted`。同じ時刻（`tMs`）の印は 1 本に
+ *   まとめる（名前は「・」でつなぐ、色は最初の印の色、件数は `count`）。名前は、前に名前を出した
+ *   印から 48px 未満なら省く（線と `<title>` は残す）。時刻の順に判定する。名前は印の右に
+ *   左寄せで置くが、印が描画幅の右端から 48px 以内なら印の左に右寄せで置く（`labelSide`。
+ *   右端で描画域の外に消えないように）。
  */
 
 import { isBitBand, penColor, type TrendPen } from './pens';
@@ -65,6 +68,10 @@ export interface TimeMarkLine {
 	label: string;
 	colorVar: string;
 	showLabel: boolean;
+	/** 名前を印のどちら側に置くか（右端の近くは 'left'）。 */
+	labelSide: 'right' | 'left';
+	/** まとめた元の印の件数。 */
+	count: number;
 }
 
 export const TIME_LANE_HEIGHT = 4;
@@ -160,7 +167,15 @@ export function timeMarkLayout(
 		.sort((a, b) => a.tMs - b.tMs);
 	const out: TimeMarkLine[] = [];
 	let lastLabelX = -Infinity;
+	let prevT = NaN;
 	for (const m of items) {
+		if (m.tMs === prevT) {
+			const last = out[out.length - 1];
+			last.label = `${last.label}・${m.label}`;
+			last.count += 1;
+			continue;
+		}
+		prevT = m.tMs;
 		const x = ((m.tMs - range.startMs) / span) * plotWidth;
 		const pen = m.penId ? pens.find((p) => p.id === m.penId) : undefined;
 		const colorVar = m.colorVar?.trim()
@@ -170,7 +185,8 @@ export function timeMarkLayout(
 				: TIME_MARK_DEFAULT_COLOR;
 		const showLabel = x - lastLabelX >= TIME_MARK_LABEL_MIN_GAP;
 		if (showLabel) lastLabelX = x;
-		out.push({ x, label: m.label, colorVar, showLabel });
+		const labelSide = x > plotWidth - TIME_MARK_LABEL_MIN_GAP ? 'left' : 'right';
+		out.push({ x, label: m.label, colorVar, showLabel, labelSide, count: 1 });
 	}
 	return out;
 }

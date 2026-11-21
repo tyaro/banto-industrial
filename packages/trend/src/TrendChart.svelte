@@ -706,8 +706,12 @@
 							stroke-dasharray="3 3"><title>{m.label}</title></line
 						>
 						{#if m.showLabel}
-							<text class="bi-trend__limit-label" x={m.x + 3} y="10" fill={m.colorVar}
-								><title>{m.label}</title>{m.label}</text
+							<text
+								class="bi-trend__limit-label"
+								x={m.labelSide === 'left' ? m.x - 3 : m.x + 3}
+								y="10"
+								text-anchor={m.labelSide === 'left' ? 'end' : 'start'}
+								fill={m.colorVar}><title>{m.label}</title>{m.label}</text
 							>
 						{/if}
 					{/each}
