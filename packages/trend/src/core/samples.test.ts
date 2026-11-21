@@ -144,6 +144,28 @@ describe('sampleAt / cursorReadout', () => {
 		expect(sampleAt(s.bins, 3000, 1000)?.tMs).toBe(2000);
 		expect(sampleAt(s.bins, 3000, 500)).toBeNull();
 	});
+	it('range を渡すと、範囲の外の隣には吸着しない', () => {
+		const r = [obs(999, 3), obs(1100, 4), obs(2000, 6)];
+		const range = { startMs: 1000, endMs: 2000 };
+		// 左隣 999 は範囲の外、右隣 2000 は endMs 以後。範囲内は 1100 だけ。
+		expect(sampleAt(r, 1000, 500, range)?.tMs).toBe(1100);
+		expect(sampleAt(r, 1000, 500)?.tMs).toBe(999);
+		expect(sampleAt(r, 1990, 1000, range)?.tMs).toBe(1100);
+		expect(sampleAt(r, 1990, 1000)?.tMs).toBe(2000);
+		expect(sampleAt([obs(999, 3)], 1000, 500, range)).toBeNull();
+		expect(sampleAt([obs(2000, 3)], 1999, 500, range)).toBeNull();
+	});
+	it('cursorReadout: min・max が違う観測も描画と同じ 1 値（sampleValue）', () => {
+		const eff = { startMs: 0, endMs: 10000 };
+		const w: TrendSeries = {
+			kind: 'samples',
+			binMs: 2000,
+			bins: [{ tMs: 1000, min: 0, max: 1 }]
+		};
+		const r = cursorReadout([pen], { p: w }, 1000, eff, 80)[0];
+		expect(r.min).toBe(0);
+		expect(r.max).toBe(0);
+	});
 	it('cursorReadout: 8px 相当の許容の中だけ値を出す', () => {
 		const eff = { startMs: 0, endMs: 10000 };
 		const series = { p: s };

@@ -170,8 +170,17 @@ export function samplesMarkerPoints(
 	return out;
 }
 
-/** `tMs` に最も近い観測（同じ距離なら左）。それが欠測、または距離が `toleranceMs` を超えるなら null。 */
-export function sampleAt(bins: readonly Bin[], tMs: number, toleranceMs: number): Bin | null {
+/**
+ * `tMs` に最も近い観測（同じ距離なら左）。それが欠測、または距離が `toleranceMs` を超えるなら null。
+ * `range` を渡すと候補（左右の隣の観測）を `[startMs, endMs)` の中のものに限る（範囲の外の隣には吸着しない）。
+ * 配列は作らず、二分探索は `bins` に対してそのまま行う。
+ */
+export function sampleAt(
+	bins: readonly Bin[],
+	tMs: number,
+	toleranceMs: number,
+	range?: Range
+): Bin | null {
 	if (!fin(tMs) || !fin(toleranceMs) || toleranceMs < 0 || bins.length === 0) return null;
 	// tMs 以下の最後の観測の添字（無ければ -1）。
 	let lo = 0;
@@ -200,6 +209,10 @@ export function sampleAt(bins: readonly Bin[], tMs: number, toleranceMs: number)
 			right = bins[i];
 			break;
 		}
+	}
+	if (range) {
+		if (left && left.tMs < range.startMs) left = null;
+		if (right && right.tMs >= range.endMs) right = null;
 	}
 	const dl = left ? tMs - left.tMs : Infinity;
 	const dr = right ? right.tMs - tMs : Infinity;

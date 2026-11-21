@@ -6,7 +6,7 @@ import type { TrendSeries } from './data';
 import { binEndMs } from './geometry';
 import { formatBitValue, formatValue, MISSING_TEXT, type Bin, type TrendPen } from './pens';
 import type { TimeRange } from './range';
-import { sampleAt, sampleValue, samplesInRange } from './samples';
+import { sampleAt, sampleValue } from './samples';
 
 const fin = (v: number | null | undefined): v is number =>
 	typeof v === 'number' && Number.isFinite(v);
@@ -66,7 +66,7 @@ export function cursorReadout(
 	return pens.map((pen) => {
 		const s = series[pen.id];
 		if (inside && s && s.kind === 'samples') {
-			const o = sampleAt(samplesInRange(s.bins, effective), tMs, toleranceMs);
+			const o = sampleAt(s.bins, tMs, toleranceMs, effective);
 			const v = o ? sampleValue(o) : null;
 			if (!o || v === null)
 				return { penId: pen.id, min: null, max: null, text: MISSING_TEXT, tMs: null };
