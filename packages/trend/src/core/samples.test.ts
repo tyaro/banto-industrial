@@ -3,17 +3,43 @@ import { bitMissingSpans, bitSpans } from './bitBands';
 import { cursorDiff, cursorReadout } from './cursor';
 import { drawableSeries, type TrendData, type TrendSeries } from './data';
 import type { Bin, TrendPen } from './pens';
-import { resolveYDomain } from './pens';
+import { dataExtent, resolveYDomain } from './pens';
 import {
 	effectiveClip,
 	sampleAt,
 	sampleIntervals,
 	samplesForDraw,
+	formatObservationTime,
 	samplesInRange,
 	samplesMarkerPoints,
 	samplesPath
 } from './samples';
 import { markerPoints } from './style';
+
+describe('samplesInRange の値の正規化・formatObservationTime', () => {
+	it('min と max が違う観測も 1 値に揃え、縦軸が描いていない値で決まらない', () => {
+		const bins: Bin[] = [
+			{ tMs: 1000, min: 1, max: 1_000_000 },
+			{ tMs: 2000, min: 2, max: 1_000_000 },
+			{ tMs: 3000, min: null, max: null }
+		];
+		const inside = samplesInRange(bins, { startMs: 0, endMs: 10000 });
+		expect(inside).toEqual([
+			{ tMs: 1000, min: 1, max: 1 },
+			{ tMs: 2000, min: 2, max: 2 },
+			{ tMs: 3000, min: null, max: null }
+		]);
+		expect(dataExtent(inside)).toEqual([1, 2]);
+	});
+
+	it('秒未満の観測は別の文字列、ミリ秒 0 は秒まで', () => {
+		const t = (ms: number) => new Date(2026, 10, 21, 12, 0, 0, ms).getTime();
+		expect(formatObservationTime(t(100))).toBe('2026/11/21 12:00:00.100');
+		expect(formatObservationTime(t(200))).toBe('2026/11/21 12:00:00.200');
+		expect(formatObservationTime(t(5))).toBe('2026/11/21 12:00:00.005');
+		expect(formatObservationTime(t(0))).toBe('2026/11/21 12:00:00');
+	});
+});
 
 const obs = (tMs: number, v: number | null): Bin => ({ tMs, min: v, max: v });
 const pen: TrendPen = { id: 'p', label: 'P', colorSlot: 1, unit: 'V', decimals: 1 };

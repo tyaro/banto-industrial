@@ -52,9 +52,27 @@ export function samplesForDraw(bins: readonly Bin[], range: Range): Bin[] {
 	return [...(before ? [before] : []), ...out, ...(after ? [after] : [])];
 }
 
-/** 有効範囲 `[startMs, endMs)` の中の観測だけ（縦軸・空の判定用）。 */
+/**
+ * 有効範囲 `[startMs, endMs)` の中の観測だけ（縦軸・空の判定・カーソル用）。
+ * 値は `sampleValue` の 1 値に揃える（`min = max = v`、欠測は両方 null）。縦軸・空の判定・カーソルが描画と同じ値を見る。
+ */
 export function samplesInRange(bins: readonly Bin[], range: Range): Bin[] {
-	return bins.filter((b) => fin(b.tMs) && b.tMs >= range.startMs && b.tMs < range.endMs);
+	return bins
+		.filter((b) => fin(b.tMs) && b.tMs >= range.startMs && b.tMs < range.endMs)
+		.map((b) => {
+			const v = sampleValue(b);
+			return { tMs: b.tMs, min: v, max: v };
+		});
+}
+
+const pad2 = (n: number) => String(n).padStart(2, '0');
+
+/** 凡例の観測の時刻。`YYYY/MM/DD HH:mm:ss`（ローカル時刻）、ミリ秒が 0 でなければ `.mmm` まで。 */
+export function formatObservationTime(tMs: number): string {
+	const d = new Date(tMs);
+	const base = `${d.getFullYear()}/${pad2(d.getMonth() + 1)}/${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+	const ms = d.getMilliseconds();
+	return ms === 0 ? base : `${base}.${String(ms).padStart(3, '0')}`;
 }
 
 /**
