@@ -177,7 +177,7 @@ export interface LogFeedSnapshot {
 	sources: readonly LogSource[];
 	/** 回しているか（見えている）。 */
 	active: boolean;
-	/** 初回から読み直した回数（増えたら、画面が控えた行も捨てる。一時停止中の表示など）。 */
+	/** 初回から読み直した・資格を断られた回数（増えたら、画面が控えた行も捨てる。一時停止中の表示など）。 */
 	epoch: number;
 }
 
@@ -365,6 +365,15 @@ export class LogFeedPoller {
 				break;
 			}
 			case 'unauthorized': {
+				// 古い資格が拒否された（昇格・降格・失効）。取得済みの行は前の資格で読んだ範囲
+				// なので、すぐ捨てる（別の口が失効を確かめて画面を捨てるのを待たない）。
+				// `epoch` を進めて、画面が控えた行（一時停止中の表示）も捨てさせる。見せ直した
+				// ときの 1 回の試しは cursor 無しの初回から読む。
+				this.cursor = null;
+				this.rows = [];
+				this.sources = new Set();
+				this.burst = 0;
+				this.epoch += 1;
 				this.status = 'unauthorized';
 				this.error = null;
 				break;

@@ -132,4 +132,22 @@ describe('createLogFeedState', () => {
 		expect(state.rows).toEqual([]);
 		state.dispose();
 	});
+	it('一時停止中でも、401 を受けたら止めた表示の行を捨てる', async () => {
+		const { state, answers } = setup();
+		answers.push({
+			kind: 'ok',
+			response: { entries: [conn('c:1', 100)], cursor: 'k1', more: false }
+		});
+		state.setVisible(true);
+		await vi.advanceTimersByTimeAsync(0);
+		await flush();
+		state.pause();
+		answers.push({ kind: 'unauthorized' });
+		await vi.advanceTimersByTimeAsync(5000);
+		await flush();
+		expect(state.status).toBe('unauthorized');
+		expect(state.rows).toEqual([]);
+		expect(state.sources).toEqual([]);
+		state.dispose();
+	});
 });

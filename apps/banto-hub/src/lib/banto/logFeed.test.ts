@@ -251,6 +251,33 @@ describe('LogFeedPoller', () => {
 		expect(t.timers.scheduled()).toEqual([0]);
 	});
 
+	it.each([401, 403])(
+		'%s では取得済みの行・種類・位置を捨てて epoch を進め、再試行を予約しない',
+		async (status) => {
+			const t = setup();
+			t.poller.setActive(true);
+			await t.timers.runNext();
+			await t.answer(t.okResponse([op('a:1', 100), write('w:1', 90, 'ok')], 'k1'));
+			expect(t.last().rows).toHaveLength(2);
+			await t.timers.runNext();
+			const epoch = t.last().epoch;
+			const outcome = classifyLogFeedResponse(status, null);
+			expect(outcome.kind).toBe('unauthorized');
+			await t.answer(outcome);
+			expect(t.last().status).toBe('unauthorized');
+			expect(t.last().rows).toEqual([]);
+			expect(t.last().sources).toEqual([]);
+			expect(t.last().epoch).toBe(epoch + 1);
+			expect(t.timers.scheduled()).toEqual([]);
+			// 見せ直したときの 1 回の試しは、cursor 無しの初回から。
+			t.poller.setActive(false);
+			t.poller.setActive(true);
+			expect(t.timers.scheduled()).toEqual([0]);
+			await t.timers.runNext();
+			expect(t.calls[t.calls.length - 1].cursor).toBeNull();
+		}
+	);
+
 	it('失敗は間隔を倍々に延ばして再試行し、成功で戻す', async () => {
 		const t = setup();
 		t.poller.setActive(true);
