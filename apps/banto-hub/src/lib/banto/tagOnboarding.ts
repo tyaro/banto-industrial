@@ -8,10 +8,12 @@
  * `tagRegistryAdmin` からは型だけを取り込み（`import type`）、実行時の
  * 依存は無い。
  *
- * banto v4.0.0（SvelteKit 3、#325）: 例外は `monitorHref()` の遷移先の
- * `/monitor` だけで、アプリ内の遷移先はすべて `../navigation` の
+ * banto v4.0.0（SvelteKit 3、#325）: アプリ内の遷移先はすべて `../navigation` の
  * `resolveAppPath()`（SvelteKit の `resolve()`）を通す方針に揃えた
  * （banto-hub は `base` を使わないので URL は変わらない）。
+ *
+ * #1255 段階 ③: タグモニタ（`/monitor`）は `/tags` に吸収して消した。確認導線は
+ * 同じページ（`/tags?target=…&focus=…`）への遷移になり、{@link tagsFocusHref} が組み立てる。
  *
  * T19 S1-d（docs/hub/banto-hub-t19-design.md UX-44、2026-09-03）: 初回
  * チェックリスト本体（PLC接続作成→収集グループ作成→タグ登録→収集開始→
@@ -24,14 +26,14 @@
  * 作成の経路は撤去していない（ロックダウンに必須 - ユーザー管理画面
  * `/users` が既に admin ロールで到達可能、設計 §2 UX-44 参照）。
  *
- * 残す {@link monitorHref}・プリセット解決系（{@link resolvePresetConnectionId}
+ * 残す {@link tagsFocusHref}・プリセット解決系（{@link resolvePresetConnectionId}
  * 等）・{@link resolveRegistrationTarget} は初回チェックリストとは独立した
  * 機能（登録直後の確認導線 T18-4c、ツリー選択からのフォームプリセット
  * T18-2d/T19 S1-c）なので変更していない。
  */
 import type { CollectionGroup, PlcConnection, TagKind } from './tagRegistryAdmin';
 import { resolveAppPath } from '../navigation';
-import { monitorViewSearch } from './monitorView';
+import { tagsViewSearch } from './tagsView';
 import type { TreeFilterSelection } from './treeFilterPrune';
 
 /** `PlcConnection.protocol === "virtual"`（`calc`/`mem`）かどうか。型だけの
@@ -64,14 +66,13 @@ const MEM_CONNECTION_NAME = 'mem';
  * T18-4c（docs/hub/banto-hub-t18-design.md「T18-4c 確認導線」、
  * docs/hub/banto-hub-desktop-plan.md §9.4 TAG-UX-H「新規／変更タグを『確認対象』
  * として値・品質・時刻へ1クリックで移動できるようにする」）: タグ登録
- * ページの各成功ハンドラから `/monitor` へ渡す遷移先を組み立てる。
+ * ページの各成功ハンドラが出す「確認」リンクの遷移先（`/tags` の確認対象つき）を組み立てる。
  *
  * - `groupId` が指定されていれば `?target=group:{id}`。`groupId` が無く
  *   `connectionId` があれば `?target=connection:{id}`（**group と connection は
- *   同時指定しない・group を優先** - モニタのツリー絞り込みは「すべて／
- *   接続／グループ」のいずれか1つの粒度しか選べないため）。#1179 PR3b で
- *   タグ登録と同じ `target` の形にした（組み立ては `./monitorView` の
- *   `monitorViewSearch`）。
+ *   同時指定しない・group を優先** - ツリー絞り込みは「すべて／
+ *   接続／グループ」のいずれか1つの粒度しか選べないため）。組み立ては
+ *   `./tagsView` の `tagsViewSearch`。
  * - `focus`（対象タグの external_name 配列）が空でなければ `focus=` を
  *   付ける。複数要素はカンマ区切りで連結し、各要素は `encodeURIComponent`
  *   する（`URLSearchParams` は使わない - 呼び出し側で組み立てた「区切りの
@@ -79,9 +80,9 @@ const MEM_CONNECTION_NAME = 'mem';
  *   `URLSearchParams` へ渡すと、`,` まで含めて二重に percent-encode
  *   されてしまう）。target パラメータがあれば `&` で連結する。
  * - `focus` が空配列・未指定なら `focus` パラメータ自体を付けない。
- * - 何も指定が無ければ `/monitor` をそのまま返す。
+ * - 何も指定が無ければ `/tags` をそのまま返す。
  */
-export function monitorHref(opts: {
+export function tagsFocusHref(opts: {
 	groupId?: number | null;
 	connectionId?: number | null;
 	focus?: string[];
@@ -92,7 +93,7 @@ export function monitorHref(opts: {
 			: opts.connectionId !== null && opts.connectionId !== undefined
 				? { type: 'connection', id: opts.connectionId }
 				: { type: 'all' };
-	return `${resolveAppPath('/monitor')}${monitorViewSearch(target, opts.focus ?? [])}`;
+	return `${resolveAppPath('/tags')}${tagsViewSearch({ target, tab: 'list' }, opts.focus ?? [])}`;
 }
 
 // --- 親設定プリセット（ツリー選択・URLクエリ → フォームへの引継ぎ） --------

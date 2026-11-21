@@ -1,7 +1,7 @@
 <script lang="ts">
 	/**
 	 * 下のログのパネル（#1253。docs/hub/banto-hub-ui-improvement-proposal.md §下のログのパネル）。
-	 * `/tags` と `/monitor` のドックの枠（`ThreePaneDock` の追加パネル `log`）に同じ部品を置く。
+	 * `/tags` のドックの枠（`ThreePaneDock` の追加パネル `log`）に置く部品。
 	 *
 	 * - 取得と保持はページが持つ `LogFeedState`（`#lib/banto/logFeedState.svelte.ts`）。この
 	 *   部品は表示と操作（種類の絞り込み・一時停止・消去）だけで、隠すと作り直されてもよい

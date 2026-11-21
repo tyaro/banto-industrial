@@ -1,17 +1,17 @@
 /**
- * #441: 開いていたタグモニタのストリームがセッションの失効で閉じられたら、
+ * #441: 開いていたタグ画面（`/tags`。値の列の購読、#1255 段階 ③で旧タグモニタを吸収）のストリームがセッションの失効で閉じられたら、
  * 画面はログイン画面へ移る（再接続を繰り返さない）。
  *
  * `chromium-locked-down` プロジェクト（`banto-hub.playwright.config.ts`）
  * 専用 - セッションで開くストリーム（`/api/v1/stream`）はロックダウン済みで
  * しか使われない。
  *
- * 流れ: 管理者が閲覧者を作る → 閲覧者の別のブラウザコンテキストでモニタを
- * 開き「接続中」を待つ → 管理者が閲覧者のパスワードをリセットする（閲覧者の
+ * 流れ: 管理者が閲覧者を作る → 閲覧者の別のブラウザコンテキストでタグ画面を
+ * 開き（閲覧者にも値の列の接続状態が出る）「接続中」を待つ → 管理者が閲覧者のパスワードをリセットする（閲覧者の
  * セッションが失効する）→ サーバーの再検証（`stream.rs` の
  * `REVALIDATE_INTERVAL` = 15 秒。短くする手段は無い）が close `1008` +
  * `session_revoked` で閉じる → 画面がルートガードを走らせ直して `/login`
- * へ移る。修正前は通常の切断として再接続を繰り返し、`/monitor` に残る。
+ * へ移る。修正前は通常の切断として再接続を繰り返し、`/tags` に残る。
  *
  * 再接続が起きていないことも見る: 閲覧者のページで開かれた WebSocket は
  * 最初の 1 本だけ。
@@ -97,8 +97,8 @@ test.describe.serial('banto-hub ストリームの失効（ロックダウン済
 		expect(login.success && login.token, JSON.stringify(login)).toBeTruthy();
 		await injectAuthToken(viewerPage, login.token as string);
 
-		await viewerPage.goto('/monitor');
-		await expect(viewerPage.getByTestId('monitor-stream-status')).toContainText('接続中', {
+		await viewerPage.goto('/tags');
+		await expect(viewerPage.getByTestId('tag-stream-status')).toContainText('接続中', {
 			timeout: 15_000
 		});
 		expect(sockets).toHaveLength(1);

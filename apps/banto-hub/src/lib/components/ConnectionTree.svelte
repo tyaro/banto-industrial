@@ -10,7 +10,7 @@
 	 * banto v7.3.0 の `BantoTree` に置き換えて `TreeView.svelte` を消した。
 	 * 置き換えでの対応:
 	 * - 選択はホスト主導（`selection` prop）。このコンポーネントは選択状態を
-	 *   所有しない（tags/monitor ページが `selectedId` を渡し、選択の通知を
+	 *   所有しない（tags ページが `selectedId` を渡し、選択の通知を
 	 *   受けるだけ）のは以前と同じ。
 	 * - 新しいルートの自動展開と開閉状態の保持は `autoExpandNewRoots`。
 	 * - 右クリック・`Shift+F10`・メニューキーは `onContextMenu` に集約される。

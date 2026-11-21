@@ -41,7 +41,7 @@
  * （`canWriteResources('viewer') === false` を前提に、virtual 接続でも
  * 再設定・削除が絶対に含まれないことまで固定している）。
  *
- * `banto-hub-tags-monitor-tree.spec.ts` と同じパターン: 別
+ * `banto-hub-tags-focus-tree.spec.ts` と同じパターン: 別
  * `describe.serial` ブロック、認証・前提データは `page.request` で直接
  * REST を叩いて作る（`simulation: true`、実 PLC 不要）。ファイル名は
  * `smoke` より辞書順で後（`tags-tree-context-menu` > `smoke`）にしてある

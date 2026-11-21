@@ -45,12 +45,18 @@
 	 *
 	 * #1255（docs/hub/banto-hub-ui-improvement-proposal.md §HUB への当てはめ、統合の段階 ②、
 	 * 2026-11-21 オーナー決定）: タグ一覧の表に読み取り専用の列「現在値」「品質」「時刻」を足した
-	 * （全ロールに出す。`/monitor` の吸収は次の PR）。値はタグモニタと同じ WS 購読
+	 * （全ロールに出す）。値はタグモニタと同じ WS 購読
 	 * （`#lib/banto/tagValueStream.svelte.ts`）で、購読の範囲はツリーで選んだ範囲（「すべて」なら
 	 * 全タグ。見えている行だけの購読は段階 3）。行との対応は外部名（`externalNameForTag`）。
 	 * 値は別のマップで持ち、行・選択・保留中の編集は書き換えない。接続の状態（再接続中・
 	 * バックプレッシャ切断・止まっている間）は中央のツールバーに出し、再接続の間は古い値を
 	 * 出さない（`monitorCellDisplay`）。
+	 *
+	 * #1255 段階 ③（2026-11-21）: タグモニタ `/monitor` をこのページに吸収し、ルートごと消した。
+	 * `?focus=`（確認対象、`tagsViewSearch`・`parseFocus`）は該当行を持続的に強調し、値・品質が
+	 * 変わった行は一瞬強調する（`valueStream.isFlashing`）。列の見出しは止まっている間も
+	 * 「現在値」「品質」のまま（`BantoGrid` は列の見出しを作り直すとグリッドごと作り直され、
+	 * 並べ替え・列幅・スクロールを失うため。止まっている旨はツールバーの接続状態が出す）。
 	 */
 	import { onDestroy, tick, untrack } from 'svelte';
 	import { page } from '$app/state';
@@ -68,8 +74,10 @@
 		tagValueTime,
 		tagValueTimeSortKey
 	} from '#lib/banto/tagValueCells.js';
+	import { UNVERIFIED_LABEL, UNVERIFIED_TITLE } from '#lib/banto/monitorStreamView.js';
 	import {
 		MISSING_TREE_TARGET_MESSAGE,
+		parseFocus,
 		parseTagsView,
 		resolveTagsView,
 		sameTagsView,
@@ -247,7 +255,7 @@
 		writableDefaultBlockedReason
 	} from '#lib/banto/writableDefault.js';
 	import {
-		monitorHref,
+		tagsFocusHref,
 		resolveRegistrationTarget,
 		type RegistrationTarget,
 		type TreeSelectionForPreset
@@ -667,8 +675,7 @@
 	/**
 	 * T18-1（TAG-UX-C 6点目、docs/hub/banto-hub-desktop-plan.md §9.4）:
 	 * 初期読込失敗・再読込失敗を通信エラーとして保持する - `tags` は
-	 * 失敗時も直前の内容を残す（stale 維持、`monitor/+page.svelte` の
-	 * `loadError` と同じパターン）。「通信失敗を『タグ0件』と表示しない」
+	 * 失敗時も直前の内容を残す（stale 維持）。「通信失敗を『タグ0件』と表示しない」
 	 * ため、`tags.length === 0` だけでは空とみなさず、この値も併せて見る。
 	 * 成功時にのみ `null` に戻す。
 	 */
@@ -1176,22 +1183,23 @@
 	 * T18-2d の `showMonitorCta`（新規作成専用の真偽値）を一般化し、新規・
 	 * 複製・編集・連続登録・CSV 新規/更新取り込み・一括更新のすべての成功
 	 * 経路で使う「次はここへ」リンク先に置き換えた。`null` はバナー非表示、
-	 * 非 `null` なら `monitorHref()`（`tagOnboarding.ts`）が組み立てた
-	 * `/monitor?...` を指す。`/monitor` は WS 経由の現在値を表示するのみで、
-	 * ここから直接 SIM 値の good/bad は判定しない（T19 S1-d で撤去した初回
-	 * チェックリストが担っていた判定 - 現在この値を使う画面は無い）。
+	 * 非 `null` なら `tagsFocusHref()`（`tagOnboarding.ts`）が組み立てた
+	 * `/tags?target=…&focus=…` を指す（#1255 段階 ③: タグモニタ `/monitor` を吸収した
+	 * ので、同じページの中の遷移。`focus` の行を表で持続的に強調する）。ここから
+	 * 直接 SIM 値の good/bad は判定しない（T19 S1-d で撤去した初回チェックリストが
+	 * 担っていた判定 - 現在この値を使う画面は無い）。
 	 *
 	 * **QueuedWhileRunning（収集稼働中の 202 キュー投入）では設定しない**:
 	 * 各ハンドラは `createTag`/`updateTag`/`createTagsBatch`/`updateTagsBatch`
 	 * の `await` が成功した後（＝ `QueuedWhileRunningError` が投げられず
-	 * catch に落ちなかった場合）にのみ `monitorCtaHref` を代入する。202
+	 * catch に落ちなかった場合）にのみ `confirmCtaHref` を代入する。202
 	 * 応答時は `tagRegistryAdmin.ts::httpRequest` がその `await` 自体を
 	 * `QueuedWhileRunningError` として投げ、各ハンドラの `catch` ブロック
 	 * （汎用エラートーストへ委ねている箇所）に落ちるため、この代入行へは
 	 * 到達しない - 追加の分岐は不要で、既存の try/catch 構造がそのまま
 	 * 「キュー投入時は CTA を出さない」を満たす。
 	 */
-	let monitorCtaHref: string | null = $state(null);
+	let confirmCtaHref: string | null = $state(null);
 
 	/**
 	 * T18-2c（docs/hub/banto-hub-t18-design.md「T18-2c 登録後分岐と親引継ぎ」、
@@ -1258,7 +1266,7 @@
 			}
 			const created = await createTag(toInput(createForm));
 			toastStore.push('success', '作成しました');
-			monitorCtaHref = monitorHref({
+			confirmCtaHref = tagsFocusHref({
 				groupId: created.collectionGroupId,
 				focus: [externalNameForTag(created)]
 			});
@@ -1600,6 +1608,10 @@
 	function tagRowClass(t: Tag): string | undefined {
 		const classes: string[] = [];
 		if (selectedIds.has(t.id)) classes.push('tag-row-selected');
+		// #1255 段階 ③: `?focus=` の確認対象（持続）と、値・品質が変わった直後の一瞬の強調。
+		const externalName = externalNameForTag(t);
+		if (focusSet.has(externalName)) classes.push('confirm-target');
+		if (valueStream.isFlashing(externalName)) classes.push('value-flash');
 		if (insertArmed && insertBlockedReasons.has(t.id)) classes.push('tag-row-insert-blocked');
 		return classes.length > 0 ? classes.join(' ') : undefined;
 	}
@@ -1787,7 +1799,7 @@
 			cellEditValidationResult = result;
 			if (result.ok) {
 				toastStore.push('success', `${result.count}件のセル編集を保存しました`);
-				monitorCtaHref = monitorHref({
+				confirmCtaHref = tagsFocusHref({
 					groupId: soleGroupId(cellEditBatch.rows.map((r) => r.collectionGroupId))
 				});
 				discardGridEdits();
@@ -1818,7 +1830,7 @@
 				expectedRevision: selected.revision
 			});
 			toastStore.push('success', '更新しました');
-			monitorCtaHref = monitorHref({
+			confirmCtaHref = tagsFocusHref({
 				groupId: updated.collectionGroupId,
 				focus: [externalNameForTag(updated)]
 			});
@@ -1993,8 +2005,8 @@
 	/**
 	 * T18-4c: 複数タグの `collectionGroupId` が単一グループに収まっている
 	 * かを判定する。単一ならその ID を返し、空・複数グループへ跨る場合は
-	 * `null`（`monitorHref({ groupId: null, ... })` は `group` パラメータを
-	 * 付けない = 素の `/monitor` への絞り込み無しリンクになる - CSV/一括
+	 * `null`（`tagsFocusHref({ groupId: null, ... })` は `group` パラメータを
+	 * 付けない = 素の `/tags`（絞り込み無し）へのリンクになる - CSV/一括
 	 * 操作のように対象が複数グループへ跨りうる経路の CTA で使う）。
 	 */
 	function soleGroupId(ids: number[]): number | null {
@@ -3434,6 +3446,12 @@
 		groups: () => groups
 	});
 
+	/**
+	 * #1255 段階 ③: `?focus=` で渡された external_name の集合（保存後の「確認」リンク、
+	 * T18-4c）。表の該当行を持続的に強調する（`tagRowClass`）。
+	 */
+	const focusSet = $derived(new Set(parseFocus(page.url.searchParams)));
+
 	const treeSelectedId = $derived.by((): string => {
 		if (treeFilter.type === 'all') return 'all';
 		if (treeFilter.type === 'connection') return `conn:${treeFilter.id}`;
@@ -3533,7 +3551,8 @@
 
 	async function navigateToView(view: TagsView, options: { replace: boolean }): Promise<void> {
 		const url = new URL(page.url.href);
-		url.search = tagsViewSearch(view);
+		// 確認対象（`focus`）は対象・タブを替えても残す（`#lib/banto/tagsView.ts`）。
+		url.search = tagsViewSearch(view, parseFocus(url.searchParams));
 		// 先の `goto` がまだ終わっていない間は `page.url` が古いので、同じに見えても
 		// 省かない（上下キーを続けて押し、元の行へ戻ったときに URL だけが先の行に残る）。
 		if (url.href === page.url.href && viewNavsInFlight === 0) return;
@@ -3568,7 +3587,8 @@
 		const currentConnections = connections;
 		const currentGroups = groups;
 		if (viewNavsInFlight > 0) return;
-		const parsed = parseTagsView(new URLSearchParams(search));
+		const params = new URLSearchParams(search);
+		const parsed = parseTagsView(params);
 		const resolved = resolveTagsView(parsed, currentConnections, currentGroups, { loaded });
 		untrack(() => {
 			if (loaded && !resolved.missingTarget) lastFoundTarget = resolved.view.target;
@@ -3579,7 +3599,7 @@
 				toastStore.push('info', MISSING_TREE_TARGET_MESSAGE);
 			}
 			if (!sameTagsView(currentView(), resolved.view)) applyView(resolved.view);
-			if (loaded && search !== tagsViewSearch(resolved.view)) {
+			if (loaded && search !== tagsViewSearch(resolved.view, parseFocus(params))) {
 				void navigateToView(resolved.view, { replace: true });
 			}
 		});
@@ -4586,7 +4606,7 @@
 				// group 絞りだけ渡す（対象タグ数が多くなりうるため focus は
 				// 省略 - 実装指示どおりの妥協）。フォームをリセットする前に
 				// 読む必要がある。
-				monitorCtaHref = monitorHref({ groupId: Number(continuousForm.collectionGroupId) });
+				confirmCtaHref = tagsFocusHref({ groupId: Number(continuousForm.collectionGroupId) });
 				continuousForm = blankContinuousForm();
 				continuousBaseline = blankContinuousForm();
 				// T19 S1-b（UX-35）: フォームが空へ戻るのに合わせ、touched も
@@ -4864,7 +4884,7 @@
 			structValidationResult = result;
 			if (result.ok) {
 				toastStore.push('success', `構造体タグを${result.count}件登録しました`);
-				monitorCtaHref = monitorHref({ groupId: Number(structForm.collectionGroupId) });
+				confirmCtaHref = tagsFocusHref({ groupId: Number(structForm.collectionGroupId) });
 				structForm = blankStructForm();
 				structBaseline = blankStructForm();
 				invalidateStructValidation();
@@ -5171,9 +5191,9 @@
 				toastStore.push('success', `${result.count}件登録しました`);
 				// T18-4c: 取り込み行が単一グループに収まっていれば group 絞り、
 				// 複数グループに跨る場合は絞り無し（`soleGroupId` が null を
-				// 返す）で `/monitor` へ。`resetCsvImport()` で `csvParseResult`
+				// 返す）でタグ一覧の確認リンクへ。`resetCsvImport()` で `csvParseResult`
 				// が消える前に読む必要がある。
-				monitorCtaHref = monitorHref({
+				confirmCtaHref = tagsFocusHref({
 					groupId: soleGroupId(csvParseResult.rows.map((r) => r.tag.collectionGroupId))
 				});
 				resetCsvImport();
@@ -5227,7 +5247,7 @@
 				// T18-4c: 新規CSVと同じ考え方 - 更新行が単一グループに収まって
 				// いれば group 絞り、複数グループ跨ぎなら絞り無し。
 				// `resetCsvImport()` の前に `csvUpdateClassification` を読む。
-				monitorCtaHref = monitorHref({
+				confirmCtaHref = tagsFocusHref({
 					groupId: soleGroupId(csvUpdateClassification.updateRows.map((r) => r.collectionGroupId))
 				});
 				resetCsvImport();
@@ -5454,10 +5474,10 @@
 				// enable/disable は選択タグ群のグループが単一なら絞り、複数
 				// グループへ跨るなら絞り無し。`closeBulkPanel()`/`selectedIds`
 				// リセットの前に `selectedTags`（選択中の $derived）を読む。
-				monitorCtaHref =
+				confirmCtaHref =
 					bulkAction === 'move' && bulkTargetGroupIdNum !== null
-						? monitorHref({ groupId: bulkTargetGroupIdNum })
-						: monitorHref({ groupId: soleGroupId(selectedTags.map((t) => t.collectionGroupId)) });
+						? tagsFocusHref({ groupId: bulkTargetGroupIdNum })
+						: tagsFocusHref({ groupId: soleGroupId(selectedTags.map((t) => t.collectionGroupId)) });
 				closeBulkPanel();
 				selectedIds = new Set();
 				await reload();
@@ -5620,7 +5640,7 @@
 			bulkOffsetCopyValidationResult = result;
 			if (result.ok) {
 				toastStore.push('success', `オフセットコピーで${result.count}件のタグを複製しました`);
-				monitorCtaHref = monitorHref({
+				confirmCtaHref = tagsFocusHref({
 					groupId: soleGroupId(selectedTags.map((t) => t.collectionGroupId))
 				});
 				selectedIds = new Set();
@@ -7577,7 +7597,7 @@
 									{/if}
 									{#if canWrite && selectedIds.size > 0}
 										<!-- T18-3b: 選択が1件以上のときだけ出す一括操作バー
-											（`monitorCtaHref` バナーと同じ帯パターン）。文言は既存トースト/
+											（`confirmCtaHref` バナーと同じ帯パターン）。文言は既存トースト/
 											ボタン名と部分文字列でも被らないものにしてある（PR #135 の教訓、
 											`handleApplyBulk`/成功トーストのコメント参照）。 -->
 										<div class="onboarding-banner" data-testid="tag-bulk-bar">
@@ -7833,7 +7853,7 @@
 											{/if}
 										</div>
 									{/if}
-									{#if monitorCtaHref}
+									{#if confirmCtaHref}
 										<!-- T18-4c（docs/hub/banto-hub-t18-design.md「T18-4c 確認導線」）: 新規/
 											複製/編集/連続登録/CSV取り込み/一括更新のいずれの成功後にも、
 											サイドバー探索なしでその対象タグの値・品質・時刻へ1クリックで
@@ -7845,12 +7865,12 @@
 											strict mode violation になっていた実測回帰（2026-08-12、PR #135
 											CI）の再発防止。 -->
 										<div class="onboarding-banner">
-											<span>モニタで値・品質・時刻を確認できます。</span>
-											<a class="onboarding-cta" href={monitorCtaHref}>確認: 値・品質・時刻を見る</a>
+											<span>タグ一覧で値・品質・時刻を確認できます。</span>
+											<a class="onboarding-cta" href={confirmCtaHref}>確認: 値・品質・時刻を見る</a>
 											<button
 												type="button"
 												class="secondary"
-												onclick={() => (monitorCtaHref = null)}>閉じる</button
+												onclick={() => (confirmCtaHref = null)}>閉じる</button
 											>
 										</div>
 									{/if}
@@ -8038,7 +8058,10 @@
 
 {#snippet qualityCellView(row: Tag)}
 	{@const cell = qualityCell(row)}
-	<span class="value-cell quality-{cell.qualityClass}" data-testid="tag-quality-cell"
+	<span
+		class="value-cell quality-{cell.qualityClass}"
+		data-testid="tag-quality-cell"
+		title={cell.qualityLabel === UNVERIFIED_LABEL ? UNVERIFIED_TITLE : undefined}
 		>{cell.qualityLabel}</span
 	>
 {/snippet}
@@ -9853,6 +9876,21 @@
 	:global(.row.tag-row-selected) {
 		background: color-mix(in srgb, var(--banto-primary) 14%, transparent);
 		border-left: 3px solid var(--banto-primary);
+	}
+
+	/*
+	 * #1255 段階 ③（タグモニタから移した）: `?focus=` の確認対象の持続的な強調
+	 * （`.tag-row-selected` と同じ配色）と、値・品質が変わった直後の一瞬の強調
+	 * （`value-flash`。数百 ms で外れる）。同時に付いても両立する。
+	 */
+	:global(.row.confirm-target) {
+		background: color-mix(in srgb, var(--banto-primary) 14%, transparent);
+		border-left: 3px solid var(--banto-primary);
+	}
+
+	:global(.row.value-flash) {
+		background: color-mix(in srgb, var(--banto-primary) 22%, transparent);
+		transition: background 0.6s ease-out;
 	}
 
 	/*

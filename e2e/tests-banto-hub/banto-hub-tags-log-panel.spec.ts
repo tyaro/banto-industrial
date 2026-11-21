@@ -1,8 +1,8 @@
 /**
- * #1253: 下のログのパネル（`/monitor`・`/tags` のドックの枠の追加パネル `log`）の実 DOM の
+ * #1253: 下のログのパネル（`/tags` のドックの枠の追加パネル `log`。#1255 段階 ③で `/monitor` を吸収した）の実 DOM の
  * 受け入れテスト（docs/hub/banto-hub-ui-improvement-proposal.md §下のログのパネル）。
  *
- * 1. 両ページの既定の配置にパネルがあり、管理者には操作の監査（このテストのログインなど）の
+ * 1. 既定の配置にパネルがあり、管理者には操作の監査（このテストのログインなど）の
  *    行が出る。種類のトグルで絞れる。
  * 2. 口（`GET /api/log-feed`）が 409（`cursor_expired`）を返したら、表示中の行を捨てて
  *    `cursor` 無しの初回から読み直す（`page.route` で 1 回だけ 409 を返させ、初回の応答に
@@ -11,14 +11,13 @@
  *
  * 管理者でない利用者に操作・書き込みの行が出ないことは、ロックダウン済みの専用サーバーの
  * `banto-hub-user-log-panel-viewer.spec.ts`（試運転中は閲覧者を作っても権限の差が出ない）。
- * 最初に 2 つのページの保存した配置を消し（既定から始める）、最後は既定の配置へ戻す（後の spec のため）。ファイル名は smoke より後（`t` > `s`）。
+ * 最初に `/tags` の保存した配置を消し（既定から始める）、最後は既定の配置へ戻す（後の spec のため）。ファイル名は smoke より後（`t` > `s`）。
  */
 import { expect, test, type Page, type Request } from '@playwright/test';
 import { CSRF_HEADERS, fetchAuthToken, injectAuthToken } from './banto-hub-auth';
 
 /** 高い画面（ログを下に開いて始める。900px 未満の高さでは帯で始まる、2026-11-21 オーナー決定）。 */
 const WIDE = { width: 1920, height: 1080 };
-const MONITOR_SETTING = '/api/ui-settings/hub.dock.v2.monitor';
 const TAGS_SETTING = '/api/ui-settings/hub.dock.v2.tags';
 const FEED_PATH = '/api/log-feed';
 const FAKE_KEY = 'a:999999999';
@@ -36,11 +35,11 @@ test.describe.serial('banto-hub 下のログのパネル (#1253)', () => {
 	let authedHeaders: Record<string, string>;
 
 	/**
-	 * 2 つのページの保存した配置を消す（部品の既定から始める）。前の spec が低い画面で
+	 * 保存した配置を消す（部品の既定から始める）。前の spec が低い画面で
 	 * 「既定に戻す」と、ログを帯にした既定が保存されて残る（2026-11-21 オーナー決定）。
 	 */
 	async function clearSavedLayouts(): Promise<void> {
-		for (const setting of [MONITOR_SETTING, TAGS_SETTING]) {
+		for (const setting of [TAGS_SETTING]) {
 			const res = await page.request.put(setting, { headers: authedHeaders, data: { value: '' } });
 			expect(res.ok(), await res.text()).toBe(true);
 		}
@@ -70,8 +69,9 @@ test.describe.serial('banto-hub 下のログのパネル (#1253)', () => {
 		await page.close();
 	});
 
-	test('1. タグモニタの既定の配置にパネルがあり、管理者には操作の監査の行が出て、種類で絞れる', async () => {
-		await page.goto('/monitor');
+	test('1. 既定の配置にパネルがあり、管理者には操作の監査の行が出て、種類で絞れる', async () => {
+		await page.goto('/tags');
+		await expect(page.getByRole('heading', { level: 2, name: 'タグ登録' })).toBeVisible();
 		await expect(panel()).toBeVisible();
 		await expect(rows('operation').first()).toBeVisible({ timeout: ONE_INTERVAL_MS });
 
@@ -84,14 +84,7 @@ test.describe.serial('banto-hub 下のログのパネル (#1253)', () => {
 		await expect(rows('operation').first()).toBeVisible();
 	});
 
-	test('2. タグ登録の既定の配置にもパネルがあり、行が出る', async () => {
-		await page.goto('/tags');
-		await expect(page.getByRole('heading', { level: 2, name: 'タグ登録' })).toBeVisible();
-		await expect(panel()).toBeVisible();
-		await expect(rows('operation').first()).toBeVisible({ timeout: ONE_INTERVAL_MS });
-	});
-
-	test('3. 409（cursor_expired）では表示中の行を捨て、初回から読み直す', async () => {
+	test('2. 409（cursor_expired）では表示中の行を捨て、初回から読み直す', async () => {
 		test.setTimeout(90_000);
 		const cursors: (string | null)[] = [];
 		let phase: 'first' | 'expire' | 'pass' = 'first';
@@ -133,7 +126,7 @@ test.describe.serial('banto-hub 下のログのパネル (#1253)', () => {
 			return route.continue();
 		});
 		try {
-			await page.goto('/monitor');
+			await page.goto('/tags');
 			const fake = panel().locator(`[data-key="${FAKE_KEY}"]`);
 			await expect(fake).toBeVisible({ timeout: ONE_INTERVAL_MS });
 			await expect(fake).toHaveCount(0, { timeout: ONE_INTERVAL_MS * 2 });
@@ -150,12 +143,12 @@ test.describe.serial('banto-hub 下のログのパネル (#1253)', () => {
 		}
 	});
 
-	test('4. パネルを隠すと読みに行かず、見せ直すと続きから読む。最後は既定の配置へ戻す', async () => {
+	test('3. パネルを隠すと読みに行かず、見せ直すと続きから読む。最後は既定の配置へ戻す', async () => {
 		test.setTimeout(90_000);
 		const loaded = page.waitForResponse(
-			(r) => r.url().includes(MONITOR_SETTING) && r.request().method() === 'GET'
+			(r) => r.url().includes(TAGS_SETTING) && r.request().method() === 'GET'
 		);
-		await page.goto('/monitor');
+		await page.goto('/tags');
 		await loaded;
 		await expect(panel()).toBeVisible();
 		// 1 回は読み終えて、続きの位置を持っている。
@@ -167,11 +160,9 @@ test.describe.serial('banto-hub 下のログのパネル (#1253)', () => {
 			if (cursor !== undefined) requested.push(cursor);
 		};
 		const saved = () =>
-			page.waitForResponse(
-				(r) => r.url().includes(MONITOR_SETTING) && r.request().method() === 'PUT'
-			);
+			page.waitForResponse((r) => r.url().includes(TAGS_SETTING) && r.request().method() === 'PUT');
 		const toggleLog = async () => {
-			await page.getByTestId('monitor-view-menu').click();
+			await page.getByTestId('tag-view-menu').click();
 			await page.getByRole('menuitemcheckbox', { name: 'ログ' }).click();
 			await page.keyboard.press('Escape');
 		};
@@ -196,9 +187,9 @@ test.describe.serial('banto-hub 下のログのパネル (#1253)', () => {
 		}
 
 		// 既定に戻す（見せ直した配置が既定と同じなら保存は起きない。後の spec のため）。
-		await page.getByTestId('monitor-view-menu').click();
+		await page.getByTestId('tag-view-menu').click();
 		await page.getByRole('menuitem', { name: 'レイアウトを既定に戻す' }).click();
 		await expect(panel()).toBeVisible();
-		await expect(page.getByTestId('monitor-tree-toggle')).toHaveAttribute('aria-pressed', 'true');
+		await expect(page.getByTestId('tag-tree-toggle')).toHaveAttribute('aria-pressed', 'true');
 	});
 });

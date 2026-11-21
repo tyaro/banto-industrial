@@ -1,7 +1,8 @@
 /**
- * ライブタグモニタ（`(app)/monitor/+page.svelte`）向けの、WS `data`
- * メッセージの値と catalog 行（`rows`）を結び付ける依存ゼロの純関数群。
- * `monitorFilter.ts`（絞り込み）と同じ「画面側は薄いグルーコードに徹し、
+ * WS `data` メッセージの値を外部名をキーにした最新値のマップへ畳む依存ゼロの純関数群
+ * （タグ登録の表の値の列 `tagValueStream.svelte.ts` が使う。もとはライブタグモニタ
+ * `/monitor` 向けで、#1255 段階 ③ で `/tags` に吸収した。行の突き合わせ
+ * `applyTagValues` はモニタと一緒に消した）。「画面側は薄いグルーコードに徹し、
  * ロジック本体は純関数へ切り出す」方針。
  *
  * **2026-08-31 実機診断で特定した不具合（このファイルが直接の修正）**:
@@ -40,7 +41,7 @@
  * 二度と回復しない（このファイル冒頭の依頼メモの「取りこぼしは致命的」
  * はこの意味）。
  *
- * 修正方針: 「WS から届いた最新値」を `rows` とは独立したキャッシュ
+ * 修正方針（当時。いまは `tagValueStream.svelte.ts` が同じ形で持つ）: 「WS から届いた最新値」を `rows` とは独立したキャッシュ
  * （`external_name` → 値のマップ）として保持し、
  * - WS からの `data` 到着時は、このマップへ畳み込んだ上で `rows` に反映
  *   する（`mergeTagValues` + `applyTagValues`）。
@@ -59,11 +60,6 @@ export interface RowValue {
 	/** 未確認（Hub の起動後に一度も良好値を受けていない）。サーバーは未確認のときだけ送る。 */
 	unverified?: boolean;
 }
-
-/** `applyTagValues` が要求する最小限の行の形。`external_name` をキーに
- * 値を突き合わせ、`RowValue` の3フィールドを持つ。`+page.svelte` の
- * `Row`（`CatalogTagEntry` を拡張）はこれを満たすスーパーセット。 */
-export type ValueBearingRow = RowValue & { external_name: string };
 
 /**
  * WS `data` メッセージの `values` 配列を、外部名をキーにした最新値
@@ -101,34 +97,4 @@ export function replaceOrMergeTagValues<V extends { tag: string } & RowValue>(
 	snapshot: boolean
 ): Map<string, RowValue> {
 	return mergeTagValues(snapshot ? new Map() : current, values);
-}
-
-/**
- * 行配列へ最新値マップを適用する。マップに対応するエントリが無い行は
- * **同一参照のまま**返す（無駄な再レンダリング・`flash` 誤爆を避ける）。
- * 値が既存行と完全一致する場合も同一参照を返す。
- *
- * catalog 再構築時（`reloadCatalog`）・WS `data` 受信時（`applyStreamData`）
- * の両方から呼ばれる共通の突き合わせロジック - これを1箇所に切り出す
- * ことで、「catalog 構築と WS 初期スナップショットのどちらが先でも
- * 最終的に必ず値が反映される」という不変条件を1つの関数の責務として
- * 保証する。
- */
-export function applyTagValues<T extends ValueBearingRow>(
-	rows: readonly T[],
-	values: ReadonlyMap<string, RowValue>
-): T[] {
-	return rows.map((row) => {
-		const update = values.get(row.external_name);
-		if (!update) return row;
-		if (
-			update.v === row.v &&
-			update.q === row.q &&
-			update.t === row.t &&
-			!!update.unverified === !!row.unverified
-		) {
-			return row;
-		}
-		return { ...row, v: update.v, q: update.q, t: update.t, unverified: update.unverified };
-	});
 }

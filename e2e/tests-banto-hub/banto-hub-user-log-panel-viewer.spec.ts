@@ -57,7 +57,7 @@ test.describe
 	});
 
 	test('1. 管理者には操作の監査の行が出る', async () => {
-		await adminPage.goto('/monitor');
+		await adminPage.goto('/tags');
 		const panel = adminPage.getByTestId('log-panel');
 		await expect(panel).toBeVisible();
 		await expect(
@@ -90,7 +90,7 @@ test.describe
 		const feed = viewerPage.waitForResponse(
 			(r) => new URL(r.url()).pathname === FEED_PATH && r.request().method() === 'GET'
 		);
-		await viewerPage.goto('/monitor');
+		await viewerPage.goto('/tags');
 		const response = await feed;
 		expect(response.status()).toBe(200);
 		const body = (await response.json()) as { entries: { source: string }[] };

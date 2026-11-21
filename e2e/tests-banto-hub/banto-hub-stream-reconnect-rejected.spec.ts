@@ -101,9 +101,9 @@ test.describe
 
 	/**
 	 * 閲覧者を作ってログインし、`/api/v1/stream` を差し替えたページで
-	 * モニタを開く（最初の接続は `mock` で開き「接続中」になる）。
+	 * タグ画面を開く（最初の接続は `mock` で開き「接続中」になる）。
 	 */
-	async function openViewerMonitor(browser: Browser) {
+	async function openViewerTags(browser: Browser) {
 		const username = `${USER_PREFIX}${Date.now()}`;
 		const createRes = await adminPage.request.post('/api/users', {
 			headers: adminHeaders,
@@ -155,8 +155,8 @@ test.describe
 		expect(login.success && login.token, JSON.stringify(login)).toBeTruthy();
 		await injectAuthToken(page, login.token as string);
 
-		await page.goto('/monitor');
-		const status = page.getByTestId('monitor-stream-status');
+		await page.goto('/tags');
+		const status = page.getByTestId('tag-stream-status');
 		await expect(status).toContainText('接続中（リアルタイム更新中）');
 		expect(state.attempts).toEqual(['mock']);
 		return { page, state, viewer, status };
@@ -166,7 +166,7 @@ test.describe
 		browser
 	}) => {
 		test.setTimeout(60_000);
-		const { page, state, viewer } = await openViewerMonitor(browser);
+		const { page, state, viewer } = await openViewerTags(browser);
 
 		// ストリームを切る（再接続のハンドシェイクは当面通らない）。
 		state.mode = 'reject';
@@ -201,7 +201,7 @@ test.describe
 		browser
 	}) => {
 		test.setTimeout(60_000);
-		const { page, state, status } = await openViewerMonitor(browser);
+		const { page, state, status } = await openViewerTags(browser);
 		const checksBeforeCut = state.identityChecks.length;
 
 		state.mode = 'reject';
@@ -219,19 +219,19 @@ test.describe
 		// 次の再接続（4 秒後）で戻る。
 		await expect(status).toContainText('接続中（リアルタイム更新中）', { timeout: 10_000 });
 		expect(state.attempts).toEqual(['mock', 'reject', 'reject', 'mock']);
-		await expect(page).toHaveURL(/\/monitor$/);
+		await expect(page).toHaveURL(/\/tags$/);
 
 		await page.waitForTimeout(LONGER_THAN_BACKOFF_MS);
 		expect(state.identityChecks.length - checksBeforeCut).toBe(1);
 		expect(state.attempts).toHaveLength(4);
-		await expect(page).toHaveURL(/\/monitor$/);
+		await expect(page).toHaveURL(/\/tags$/);
 	});
 
 	test('3. 切れている間に保存しているトークンが消えたら（ほかの経路の 401・ほかのタブのログアウト）、待ち続けずにログイン画面へ移る（#447 のレビュー）', async ({
 		browser
 	}) => {
 		test.setTimeout(60_000);
-		const { page, state } = await openViewerMonitor(browser);
+		const { page, state } = await openViewerTags(browser);
 
 		state.mode = 'reject';
 		await state.mocks[0].close({ code: 1001, reason: '' });
@@ -250,7 +250,7 @@ test.describe
 		browser
 	}) => {
 		test.setTimeout(90_000);
-		const { page, state, status } = await openViewerMonitor(browser);
+		const { page, state, status } = await openViewerTags(browser);
 		// 画面を開いた後で照合だけを失敗させる（開くときのガードは通す）。
 		await page.route('**/api/auth/identity', (route) =>
 			route.fulfill({
@@ -270,7 +270,7 @@ test.describe
 				.poll(() => state.identityChecks.length - checksBeforeCut, { timeout: 15_000 })
 				.toBeGreaterThanOrEqual(2);
 			// 画面は保つ: ログイン画面にもエラー画面（503）にも移らず、再接続を続ける。
-			await expect(page).toHaveURL(/\/monitor$/);
+			await expect(page).toHaveURL(/\/tags$/);
 			await expect(page.getByRole('button', { name: '再試行' })).toHaveCount(0);
 			await expect(status).toContainText('再接続中');
 			await expect.poll(() => state.attempts.length, { timeout: 10_000 }).toBeGreaterThanOrEqual(3);
@@ -281,7 +281,7 @@ test.describe
 		// サーバーが戻れば、次の再接続で通常の表示へ戻る（ログインはそのまま）。
 		state.mode = 'mock';
 		await expect(status).toContainText('接続中（リアルタイム更新中）', { timeout: 30_000 });
-		await expect(page).toHaveURL(/\/monitor$/);
+		await expect(page).toHaveURL(/\/tags$/);
 		expect(
 			await page.evaluate((key) => window.sessionStorage.getItem(key), TOKEN_STORAGE_KEY)
 		).not.toBeNull();

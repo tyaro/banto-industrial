@@ -1,8 +1,9 @@
 /**
- * #441 のレビュー対応: モニタ画面を通した結合テスト（close を注入する側）。
+ * #441 のレビュー対応: 値の列を持つタグ画面（`/tags`）を通した結合テスト（close を注入する側）。
+ * #1255 段階 ③でタグモニタ（`/monitor`）を `/tags` に吸収したので、画面は `/tags`。
  *
  * `chromium-locked-down` プロジェクト（`banto-hub.playwright.config.ts`）
- * 専用 - ロックダウン後はモニタがセッションで `/api/v1/stream` を開き、
+ * 専用 - ロックダウン後はタグ画面がセッションで `/api/v1/stream` を開き、
  * ログイン状態の確認（ルートガード）が実際に走る。
  *
  * サーバーに任意の close（未知の理由文の `1008`、今のセッションが有効なままの
@@ -16,9 +17,9 @@
  *
  * 見ること:
  * 1. 未知の理由文の `1008` → 理由と「再接続」ボタンを出し、押すまで接続しない。
- *    止まっている間の表は「最終受信値」「陳腐化（受信時: 良好）」。押したら
+ *    止まっている間の品質は「陳腐化（受信時: 良好）」（列の見出しは替えない）。押したら
  *    新しいスナップショットで通常の表示へ戻る。
- * 2. `session_revoked` → 確認し直して `200 true` → `/monitor` に残り、再開用の
+ * 2. `session_revoked` → 確認し直して `200 true` → `/tags` に残り、再開用の
  *    ソケットを 1 本だけ作り、スナップショットで通常の表示へ戻る。
  * 3. `session_revoked` → 確認し直して `500` / 通信失敗 → 再試行付きのエラー
  *    画面。トークンは残り、ソケットは増えない。
@@ -85,16 +86,16 @@ test.describe
 	const subscribeIds: number[] = [];
 
 	function row(): Locator {
-		return page.getByRole('row').filter({ hasText: EXTERNAL });
+		return page.locator('[role="row"].row').filter({ hasText: TAG });
 	}
 	function valueCell(): Locator {
-		return row().getByRole('cell').nth(3);
+		return row().locator('[data-cell-field="currentValue"]');
 	}
 	function qualityCell(): Locator {
-		return row().getByRole('cell').nth(4);
+		return row().locator('[data-cell-field="currentQuality"]');
 	}
 	function status(): Locator {
-		return page.getByTestId('monitor-stream-status');
+		return page.getByTestId('tag-stream-status');
 	}
 
 	async function sendSnapshot(index: number, v: number): Promise<void> {
@@ -108,16 +109,17 @@ test.describe
 		);
 	}
 
-	/** `/monitor` を開き、差し替えたソケットで良好な値 42 を受けた状態にする。 */
-	async function openMonitorWithGoodValue(): Promise<void> {
+	/** `/tags` を開き、差し替えたソケットで良好な値 42 を受けた状態にする。 */
+	async function openTagsWithGoodValue(): Promise<void> {
 		sockets = [];
 		subscribed = [];
-		await page.goto('/monitor');
+		await page.goto('/tags');
+		await page.getByPlaceholder('名前・アドレスで検索').fill(TAG);
 		await expect(row()).toBeVisible();
 		await expect.poll(() => sockets.length).toBe(1);
 		await sendSnapshot(0, 42);
 		await expect(status()).toContainText('接続中（リアルタイム更新中）');
-		await expect(valueCell()).toHaveText('42');
+		await expect(valueCell()).toHaveText(/^42/);
 		await expect(qualityCell()).toHaveText('良好');
 	}
 
@@ -189,16 +191,15 @@ test.describe
 		await page.close();
 	});
 
-	test('1. 未知の理由文の 1008: 理由と再接続ボタンを出し、押すまで繋がない。止まっている間は最終受信値', async () => {
-		await openMonitorWithGoodValue();
+	test('1. 未知の理由文の 1008: 理由と再接続ボタンを出し、押すまで繋がない。止まっている間は最終受信値の品質に受信時と出す', async () => {
+		await openTagsWithGoodValue();
 
 		await sockets[0].close({ code: 1008, reason: 'e2e_unknown_reason' });
 		await expect(status()).toContainText('e2e_unknown_reason');
 		const resumeButton = status().getByRole('button', { name: '再接続' });
 		await expect(resumeButton).toBeVisible();
 		await expect(status()).not.toContainText('接続中');
-		await expect(page.getByRole('columnheader', { name: '最終受信値' })).toBeVisible();
-		await expect(valueCell()).toHaveText('42');
+		await expect(valueCell()).toHaveText(/^42/);
 		await expect(qualityCell()).toHaveText('陳腐化（受信時: 良好）');
 
 		await page.waitForTimeout(LONGER_THAN_BACKOFF_MS);
@@ -206,25 +207,24 @@ test.describe
 
 		await resumeButton.click();
 		await expect.poll(() => sockets.length).toBe(2);
-		await expect(valueCell()).toHaveText('--');
+		await expect(valueCell()).toHaveText(/^--/);
 		await sendSnapshot(1, 43);
 		await expect(status()).toContainText('接続中（リアルタイム更新中）');
-		await expect(page.getByRole('columnheader', { name: '値', exact: true })).toBeVisible();
-		await expect(valueCell()).toHaveText('43');
+		await expect(valueCell()).toHaveText(/^43/);
 		await expect(qualityCell()).toHaveText('良好');
 		expect(sockets).toHaveLength(2);
 	});
 
-	test('2. session_revoked → 確認し直して 200 true: /monitor に残り、ソケットを 1 本だけ張り直して通常へ戻る', async () => {
-		await openMonitorWithGoodValue();
+	test('2. session_revoked → 確認し直して 200 true: /tags に残り、ソケットを 1 本だけ張り直して通常へ戻る', async () => {
+		await openTagsWithGoodValue();
 
 		await sockets[0].close({ code: 1008, reason: 'session_revoked' });
 		await expect.poll(() => sockets.length).toBe(2);
-		await expect(page).toHaveURL(/\/monitor$/);
-		await expect(valueCell()).toHaveText('--');
+		await expect(page).toHaveURL(/\/tags$/);
+		await expect(valueCell()).toHaveText(/^--/);
 		await sendSnapshot(1, 44);
 		await expect(status()).toContainText('接続中（リアルタイム更新中）');
-		await expect(valueCell()).toHaveText('44');
+		await expect(valueCell()).toHaveText(/^44/);
 		await expect(qualityCell()).toHaveText('良好');
 
 		await page.waitForTimeout(LONGER_THAN_BACKOFF_MS);
@@ -247,7 +247,7 @@ test.describe
 		['通信失敗', (route: Route) => route.abort('failed')]
 	] as const) {
 		test(`3. session_revoked → 確認し直して ${label}: 再試行付きのエラー画面、トークンを保持、ソケットは増えない`, async () => {
-			await openMonitorWithGoodValue();
+			await openTagsWithGoodValue();
 			// 画面を開いた後で照合だけを失敗させる（開くときのガードは通す）。
 			await page.route('**/api/auth/identity', failCheck);
 			try {

@@ -6,8 +6,8 @@
  *    載らず、「表示」メニューの「レイアウトを既定に戻す」で戻せる。
  * 2. 右（属性 = 編集のフォーム）は据え置き（`persistent`）: 隠す・出す・既定に戻す・狭い表示を
  *    行き来しても、未保存の入力が消えず、広い表示では同じ入力欄（DOM）のまま。
- * 3. 狭い幅（900px 以下）での「既定に戻す」も保存される（タグモニタの 6 と同じ型）。
- * 4. 広い幅から狭い幅へ切り替わる途中の一時の配置は保存しない（タグモニタの 7 と同じ型）。
+ * 3. 狭い幅（900px 以下）での「既定に戻す」も保存される。
+ * 4. 広い幅から狭い幅へ切り替わる途中の一時の配置は保存しない。
  * 5. #1159: 1366×768・125%（CSS では 1093×614）で右の属性を含めて「保存」まで届き、狭い幅では
  *    編集がモーダルで届く。畳んだ右も帯のタブから開ける。
  * 6. PR #1269 のレビュー: 広い幅で属性を隠してから狭い幅で編集を始め、広い幅へ戻すと、属性が
@@ -245,7 +245,7 @@ test.describe.serial('banto-hub タグ登録のドックの枠 (#1253)', () => {
 		await page.getByPlaceholder('名前・アドレスで検索').fill('');
 	});
 
-	test('3. 狭い幅での「既定に戻す」も保存される（タグモニタの 6 と同じ型）', async () => {
+	test('3. 狭い幅での「既定に戻す」も保存される', async () => {
 		await openTags();
 		const hidden = dockSetting('PUT');
 		await treeToggle().click();
@@ -271,7 +271,7 @@ test.describe.serial('banto-hub タグ登録のドックの枠 (#1253)', () => {
 		await expect(treeToggle()).toHaveAttribute('aria-pressed', 'true');
 	});
 
-	test('4. 広い幅から狭い幅へ切り替わる途中の一時の配置は保存しない（タグモニタの 7 と同じ型）', async () => {
+	test('4. 広い幅から狭い幅へ切り替わる途中の一時の配置は保存しない', async () => {
 		const puts: string[] = [];
 		const onRequest = (req: Request) => {
 			if (req.url().includes(DOCK_SETTING) && req.method() === 'PUT')
@@ -627,12 +627,7 @@ test.describe.serial('banto-hub タグ登録のドックの枠 (#1253)', () => {
 	test('15. サーバーの保存値が外形だけ正しく中身が使えない（部品が既定へ戻す）ときも、低い画面ではログを帯にし、配置を書かない（PR #1270 再レビュー P2）', async () => {
 		const broken = JSON.stringify({ schema: 1, panels: [], layout: {} });
 		for (const target of [
-			{ path: '/tags', setting: DOCK_SETTING, localPrefix: 'banto.dock.v2.tags.' },
-			{
-				path: '/monitor',
-				setting: '/api/ui-settings/hub.dock.v2.monitor',
-				localPrefix: 'banto.dock.v2.monitor.'
-			}
+			{ path: '/tags', setting: DOCK_SETTING, localPrefix: 'banto.dock.v2.tags.' }
 		]) {
 			const put = await page.request.put(target.setting, {
 				headers: authedHeaders,

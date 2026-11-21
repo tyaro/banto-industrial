@@ -1,6 +1,6 @@
 /**
  * T18-4b（docs/hub/banto-hub-t18-design.md「T18-4b 選択購読と再接続堅牢化」、
- * TAG-UX-H の一部）: ライブタグモニタ（`(app)/monitor/+page.svelte`）の
+ * TAG-UX-H の一部）: ライブタグモニタ（`/monitor`、#1255 段階 ③で `/tags` に吸収）の
  * ツリー選択（`MonitorTreeFilter`、`monitorFilter.ts`）から、WS 購読
  * （`connectTagStream` が送る `subscribe.tags`）に渡すパターン配列を組み立てる
  * 依存ゼロの純関数。T18-4a まではツリー選択は表示絞り込み（`filterMonitorRows`）

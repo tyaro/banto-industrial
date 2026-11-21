@@ -112,7 +112,7 @@ TAG-UX-5（構成パッケージ export/import）は T17 が所有し #119 で�
   `banto-hub-tags-duplicate`（T18-3a 複製）/`banto-hub-tags-bulk`（T18-3b 一括有効化・無効化・グループ移動）/
   `banto-hub-tags-continuous-radix`（T18-3c `X1E→X1F→X20`・`D100.14→D100.15→D101.0`）/
   `banto-hub-tags-csv`（T18-3d CSV 新規/更新・テンプレDL・エクスポート）/
-  `banto-hub-tags-monitor-tree`（T18-4a/4c モニタ Tree/検索・`?group=`/`?focus=` ディープリンク）/
+  `banto-hub-tags-focus-tree`（T18-4a/4c Tree/検索・`?target=`/`?focus=` ディープリンク。もと `banto-hub-tags-monitor-tree`、#1255 段階 ③で `/tags` へ移した）/
   `banto-hub-tags-onboarding-cta`（T18-4c 登録後の確認 CTA）。前提データは REST 直叩き（`simulation:true`、実 PLC 不要）、
   固定名は `RUN_ID` で一意化し、共有 DB を成長させない（後続 spec が仮想化グリッドで自分の行を見失わないよう
   `afterAll` で作成分を掃除する）。全 spec は `banto-hub-smoke` より辞書順で後に置く（先に走ると smoke の初回

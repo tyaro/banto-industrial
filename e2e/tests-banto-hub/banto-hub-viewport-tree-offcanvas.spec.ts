@@ -1,6 +1,6 @@
 /**
  * #378（2026-09-16 オーナー決定、docs/hub/banto-hub-desktop-plan.md §9.4
- * TAG-UX-G）: 狭幅でタグ登録・タグモニタの左ツリーをオフキャンバスへ退避する
+ * TAG-UX-G）: 狭幅でタグ（登録・値の確認。#1255 段階 ③でタグモニタを吸収）の左ツリーをオフキャンバスへ退避する
  * ことの実 DOM 受け入れテスト。
  *
  * このファイルを新設した理由: 400px 幅では固定 280px の左ツリーにグリッドが
@@ -38,7 +38,7 @@
  * セレクタは banto を上げると壊れる」）。バックドロップは部品のスクリム
  * （ポインタ専用・名前なし）になったので、枠の右端の座標をクリックする。
  *
- * #1253: タグ登録の枠も `@banto/dock-svelte` の `ThreePaneDock` へ載せ替えた（タグモニタと
+ * #1253: タグ登録の枠も `@banto/dock-svelte` の `ThreePaneDock` へ載せ替えた（もとはタグモニタと
  * 同じ）。狭い表示ではツリーが左端の自動で隠す帯へ退き、帯のタブ（部品の
  * `data-dock-band-tab="left"`、`aria-expanded` を持つ）で引き出す。引き出した pane は
  * 中央を `inert` にせずスクリムも無い（外の押下・外へのフォーカスの移動で戻る）ので、
@@ -54,6 +54,9 @@
 import { expect, test, type Dialog, type Locator, type Page } from '@playwright/test';
 import { CSRF_HEADERS, fetchAuthToken, groupNodeByName, injectAuthToken } from './banto-hub-auth';
 import { cleanupFixtures } from './banto-hub-fixture-cleanup';
+
+/** ナビのリンク名（メニューバーは名前だけ、サイドバーは前にアイコンが付く）。 */
+const NAV_STATUS = /^(?:\S+\s+)?状態$/;
 
 /** #378 の実測条件そのもの（issue 本文の「400px 幅」）。 */
 const NARROW_VIEWPORT = { width: 400, height: 800 };
@@ -88,7 +91,6 @@ const GROUP_A = 'e2e-tree-oc-group-a';
 const GROUP_B = 'e2e-tree-oc-group-b';
 const TAG_A = 'e2e-tree-oc-tag-a';
 const TAG_B = 'e2e-tree-oc-tag-b';
-const TAG_B_EXTERNAL = `${CONNECTION_NAME}.${GROUP_B}.${TAG_B}`;
 
 /**
  * テスト34 用の別フィクスチャ。ここまでのテストで `TAG_A`/`TAG_B`（削除の検証）と
@@ -781,46 +783,6 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(treePane).toBeHidden();
 	});
 
-	test('21. タグモニタでも 400px でツリーを開いて絞り込める', async () => {
-		await page.goto('/monitor');
-		await expect(page.getByRole('heading', { level: 2, name: 'タグモニタ' })).toBeVisible();
-
-		// #1253: タグモニタの枠は `@banto/dock-svelte` の `ThreePaneDock`。狭い表示では
-		// ツリーが左端の自動で隠す帯へ退き、帯のタブ（`data-dock-band-tab`）が開く経路。
-		const monitorTree = page.getByRole('tree');
-		const monitorBandTab = page.locator('button[data-dock-band-tab="left"]');
-		await expect(monitorTree).toBeHidden();
-		await expect(monitorBandTab).toBeVisible();
-		// 広い表示のトグルは出さない（帯のタブと重ねない）。
-		await expect(page.getByTestId('monitor-tree-toggle')).toHaveCount(0);
-
-		await monitorBandTab.click();
-		await expect(monitorTree).toBeVisible();
-
-		await groupNodeByName(page, GROUP_B).click();
-
-		await expect(monitorTree).toBeHidden();
-		await expect(page.getByTestId('monitor-tree-selection')).toHaveText(GROUP_B);
-		await expect(page.getByRole('cell', { name: TAG_B_EXTERNAL, exact: true })).toBeVisible();
-
-		// #378・#381 の約束: Esc で閉じ、フォーカスは開いた元（帯のタブ）へ戻る。
-		await monitorBandTab.click();
-		await expect(monitorTree).toBeVisible();
-		await page.keyboard.press('Escape');
-		await expect(monitorTree).toBeHidden();
-		await expect(monitorBandTab).toBeFocused();
-
-		// 「表示」メニューからも開け、フォーカスはツリーへ入る（Esc で閉じられる）。
-		await page.getByTestId('monitor-view-menu').click();
-		await page.getByRole('menuitem', { name: '接続とグループ' }).click();
-		await expect(monitorTree).toBeVisible();
-		await expect
-			.poll(() => page.evaluate(() => !!document.activeElement?.closest('[role="tree"]')))
-			.toBe(true);
-		await page.keyboard.press('Escape');
-		await expect(monitorTree).toBeHidden();
-	});
-
 	test('22. モーダルを閉じた直後（outro 中）の Esc でも、次の層が閉じる（#381 レビュー対応12回目）', async () => {
 		// `Drawer`/`Modal` は `open=false` のあと outro（fade/fly）のあいだ DOM に
 		// 残り、矩形も `visibility` も可視のまま。印（`data-layer-inactive`）を
@@ -950,7 +912,7 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		// フォーカスを外してしまうので、判定は DOM 更新の前に行っている）。
 		await page.goto('/tags');
 		await page.getByRole('button', { name: 'メニューを開く' }).click();
-		const navLink = page.getByRole('link', { name: 'タグモニタ' });
+		const navLink = page.getByRole('link', { name: NAV_STATUS });
 		await navLink.focus();
 		await expect(navLink).toBeFocused();
 

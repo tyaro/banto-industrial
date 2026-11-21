@@ -12,6 +12,9 @@
 import { expect, test, type Page } from '@playwright/test';
 import { ensureLoggedIn } from './banto-hub-auth';
 
+/** ナビのリンク名（メニューバーは名前だけ、サイドバーは前にアイコンが付く）。 */
+const NAV_TAGS = /^(?:\S+\s+)?タグ$/;
+
 const collapseBtn = (page: Page) => page.getByRole('button', { name: 'サイドバーを折りたたむ' });
 const openBtn = (page: Page) => page.getByRole('button', { name: 'サイドバーを開く' });
 
@@ -84,13 +87,13 @@ test.describe.serial('banto-hub sidebar toggle placement (#714)', () => {
 		await expect(menuBtn).toBeVisible();
 		await expect(menuBtn).toHaveAttribute('aria-controls', 'app-sidebar');
 		await menuBtn.click();
-		await expect(page.getByRole('link', { name: 'タグ登録' })).toBeVisible();
+		await expect(page.getByRole('link', { name: NAV_TAGS })).toBeVisible();
 		await expect(page.getByRole('button', { name: 'メニューを閉じる', exact: true })).toBeVisible();
 		// ヘッダーの ☰ はバックドロップの下なので、背景の右側をクリックして閉じる。
 		await page
 			.getByRole('button', { name: '背景をクリックしてメニューを閉じる' })
 			.click({ position: { x: 390, y: 400 } });
-		await expect(page.getByRole('link', { name: 'タグ登録' })).toBeHidden();
+		await expect(page.getByRole('link', { name: NAV_TAGS })).toBeHidden();
 		await expect(menuBtn).toBeVisible();
 	});
 
