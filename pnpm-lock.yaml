@@ -66,8 +66,8 @@ importers:
         specifier: github:tyaro/banto#v7.9.0&path:packages/ui
         version: https://codeload.github.com/tyaro/banto/tar.gz/c017882a654754dfed87bf558a319c96ba136716#path:packages/ui
       '@tauri-apps/api':
-        specifier: ^2.12.4
-        version: 2.12.4
+        specifier: ^2.12.5
+        version: 2.12.5
     devDependencies:
       '@sveltejs/adapter-static':
         specifier: ^4.0.1
@@ -130,8 +130,8 @@ importers:
         specifier: github:tyaro/banto#v7.9.0&path:packages/ui
         version: https://codeload.github.com/tyaro/banto/tar.gz/c017882a654754dfed87bf558a319c96ba136716#path:packages/ui
       '@tauri-apps/api':
-        specifier: ^2.12.4
-        version: 2.12.4
+        specifier: ^2.12.5
+        version: 2.12.5
     devDependencies:
       '@sveltejs/adapter-static':
         specifier: ^4.0.1
@@ -587,8 +587,8 @@ packages:
     peerDependencies:
       vite: ^5.2.0 || ^6 || ^7 || ^8
 
-  '@tauri-apps/api@2.12.4':
-    resolution: {integrity: sha512-pVmfis+4zT8H0Qhp3xPZx9Ju7kpzvA6rr/PSJPyuwfvucTQ8sVt61NYU9KMkK703UFlYadFmjKA4HhybOtN0gg==}
+  '@tauri-apps/api@2.12.5':
+    resolution: {integrity: sha512-G9QIMt5fzED+aS4QhVK3w1HWLKpLIwH/MnpCr9z1ugGEHnS2ORmqrLkc0uALOjRK4qXJy+4Yiw8LDl/KicC1Hg==}
 
   '@tauri-apps/cli-darwin-arm64@2.12.4':
     resolution: {integrity: sha512-OxqKSckIkoJ6vX2AjifIJpTasFC0Hbdoo7gEiCmAjauABO3U8m2MRsLWe+QTiBwDx1mIrvgA+rvI7tvDnbnHVg==}
@@ -1799,7 +1799,7 @@ snapshots:
       tailwindcss: 4.3.5
       vite: 8.3.8(jiti@2.7.0)
 
-  '@tauri-apps/api@2.12.4': {}
+  '@tauri-apps/api@2.12.5': {}
 
   '@tauri-apps/cli-darwin-arm64@2.12.4':
     optional: true
