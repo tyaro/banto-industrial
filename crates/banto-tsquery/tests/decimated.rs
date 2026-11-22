@@ -345,3 +345,70 @@ async fn binned_path_covers_the_full_range_contiguously() {
         );
     }
 }
+
+/// #1303: 1 グループ 1999 本（表は ptime ＋ 1999 列 = 2000 列）でも、1 タグの
+/// ビン集約（生データへの素通しではない経路）と統計が成功する。集約 SQL の
+/// 内側が `*` だと結果の列が SQLite の上限 2000 を超えて失敗していた。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn binned_and_stats_work_on_a_full_1999_tag_group() {
+    const N: usize = banto_tstore::MAX_TAGS_PER_GROUP;
+    let dir = TempDir::new("dec-1999");
+    let clock = clock_at(DAY1_START_MS);
+    let tags: Vec<_> = (0..N).map(|i| tag(&format!("t{i}"), None, 1)).collect();
+    let config = store_config(vec![group("g1", 1_000, tags)]);
+    let writer = open_writer(dir.path(), config, clock).await;
+    for row in 0..6i64 {
+        let values: Vec<Option<f64>> = (0..N).map(|i| Some(i as f64 + row as f64)).collect();
+        writer
+            .append("g1", DAY1_START_MS + row * 1_000, &values)
+            .await
+            .unwrap();
+    }
+    writer.close().await.unwrap();
+
+    let query = TsQuery::new(dir.path());
+    let last = format!("t{}", N - 1);
+    // 6 行を 2 ビン（幅 3000ms > 周期 1000ms なので素通しではなく集約）。
+    let result = query
+        .read_decimated(
+            "g1",
+            &tag_keys(&[&last]),
+            DAY1_START_MS,
+            DAY1_START_MS + 5_999,
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.bin_ms, 3_000);
+    assert_eq!(result.bins.len(), 2);
+    let base = (N - 1) as f64;
+    assert_eq!(
+        result.bins[0].tags[0],
+        BinValue::Range {
+            min: base,
+            max: base + 2.0
+        }
+    );
+    assert_eq!(
+        result.bins[1].tags[0],
+        BinValue::Range {
+            min: base + 3.0,
+            max: base + 5.0
+        }
+    );
+
+    // 日報・区間 CSV が使う統計の口。
+    let stats = query
+        .read_binned_stats(
+            "g1",
+            &tag_keys(&[&last]),
+            DAY1_START_MS,
+            DAY1_START_MS + 5_999,
+            3_000,
+        )
+        .await
+        .unwrap();
+    let s0 = stats.bins[0].tags[0].unwrap();
+    assert_eq!((s0.min, s0.max, s0.count), (base, base + 2.0, 3));
+    assert_eq!(s0.avg, base + 1.0);
+}

@@ -324,8 +324,19 @@ fn binned_sql(table_name: &str, present: &[(usize, &str)], with_sum: bool) -> St
             sql.push_str(&format!(", SUM({column})"));
         }
     }
+    // 内側は要求された物理列だけを返す（#1303）。`*` だと 1999 本のグループで
+    // 結果の列が SQLite の上限 2000 を超え、1 タグの集約も失敗する。
+    // 列名は検証済みの c<i> のみ（重複は除く）。
+    let mut inner_cols = String::new();
+    let mut seen: Vec<&str> = Vec::new();
+    for (_, column) in present {
+        if !seen.contains(column) {
+            seen.push(column);
+            inner_cols.push_str(&format!(", {column}"));
+        }
+    }
     sql.push_str(&format!(
-        " FROM (SELECT ptime / ? AS bin_q, ptime % ? AS bin_r, * FROM {table_name} \
+        " FROM (SELECT ptime / ? AS bin_q, ptime % ? AS bin_r{inner_cols} FROM {table_name} \
          WHERE ptime >= ? AND ptime <= ?) GROUP BY bin_idx ORDER BY bin_idx"
     ));
     sql

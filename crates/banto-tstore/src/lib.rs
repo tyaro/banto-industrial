@@ -90,7 +90,7 @@ pub(crate) mod test_support;
 pub mod writer;
 
 pub use clock::{Clock, ManualClock, SystemClock};
-pub use config::{GroupConfig, StoreConfig, TagColumn};
+pub use config::{GroupConfig, StoreConfig, TagColumn, MAX_TAGS_PER_GROUP};
 pub use date::LocalDate;
 pub use error::TstoreError;
 pub use files::{

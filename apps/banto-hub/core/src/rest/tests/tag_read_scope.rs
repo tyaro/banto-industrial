@@ -2107,3 +2107,89 @@ async fn queued_connection_writes_reject_bad_protocol_and_stray_secrets_without_
         "no plaintext secret may stay queued"
     );
 }
+
+/// #1303: 1 つの収集グループは 1999 本まで（banto-tstore の表の列の上限）。登録の口
+/// （単体・一括）で 2000 本目を 422 で断り、グループ名と上限を利用者に返す。
+#[tokio::test]
+async fn tag_registration_rejects_the_2000th_tag_of_a_collection_group() {
+    let env = test_env().await;
+    let (status, conn) = admin_post(
+        &env.router,
+        "/api/plc-connections",
+        &env.admin_token,
+        json!({ "protocol": "modbus-tcp", "name": "line1", "settings": { "host": "127.0.0.1", "port": 15131 } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{conn:?}");
+    let (status, group) = admin_post(
+        &env.router,
+        "/api/collection-groups",
+        &env.admin_token,
+        json!({ "name": "big", "plcConnectionId": conn["id"], "periodMs": 1000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{group:?}");
+
+    let tags: Vec<serde_json::Value> = (0..1999)
+        .map(|i| {
+            json!({
+                "name": format!("t{i}"),
+                "collectionGroupId": group["id"],
+                "address": format!("{}", 40001 + i),
+                "dataType": "i16",
+                "enabled": true,
+            })
+        })
+        .collect();
+    let (status, body) = admin_post(
+        &env.router,
+        "/api/tags/batch",
+        &env.admin_token,
+        json!({ "dryRun": false, "tags": tags }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "1999 tags: {body:?}");
+
+    // 単体の 2000 本目。
+    let (status, body) = admin_post(
+        &env.router,
+        "/api/tags",
+        &env.admin_token,
+        json!({
+            "name": "too-many",
+            "collectionGroupId": group["id"],
+            "address": "45000",
+            "dataType": "i16",
+                "enabled": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    let text = body.to_string();
+    assert!(text.contains("collectionGroupId"), "{text}");
+    assert!(text.contains("1999"), "{text}");
+    assert!(text.contains("big"), "{text}");
+
+    // 一括（1 本でも超えれば全体を断る）。
+    let (status, body) = admin_post(
+        &env.router,
+        "/api/tags/batch",
+        &env.admin_token,
+        json!({
+            "dryRun": false,
+            "tags": [{
+                "name": "too-many",
+                "collectionGroupId": group["id"],
+                "address": "45000",
+                "dataType": "i16",
+                "enabled": true,
+            }]
+        }),
+    )
+    .await;
+    assert!(
+        body.to_string().contains("1999"),
+        "batch must be rejected: {status} {body:?}"
+    );
+    assert_ne!(body["ok"], true, "{body:?}");
+}
