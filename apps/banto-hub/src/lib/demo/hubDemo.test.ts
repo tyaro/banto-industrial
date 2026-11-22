@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DemoSocketConnection } from '@banto-industrial/demo-backend';
 import { HubRegistry, DemoValidationError, DemoRevisionConflictError } from './hubState';
 import { createHubSocketRoute } from './hubStream';
+import { createHubRoutes } from './hubRoutes';
+import { classifyLogFeedResponse } from '#lib/banto/logFeed.js';
 import type { TagInput } from '#lib/banto/tagRegistryAdmin.js';
 
 const NEW_TAG: TagInput = {
@@ -304,6 +306,25 @@ describe('/api/v1/stream の模擬', () => {
 		peer.say({ op: 'ping' });
 		expect(peer.sent.map((m) => m.op)).toEqual(['error', 'error', 'pong']);
 		peer.hangUp();
+	});
+});
+
+describe('/api/log-feed の模擬', () => {
+	it('空のログを返し、画面の分類で ok になる（クエリは受け流す）', async () => {
+		const route = createHubRoutes().find((r) => r.method === 'GET' && r.path === '/api/log-feed')!;
+		expect(route).toBeDefined();
+		const response = await route.handle({
+			method: 'GET',
+			url: new URL('http://demo.test/api/log-feed?cursor=x&limit=50'),
+			params: {},
+			headers: new Headers(),
+			signal: new AbortController().signal,
+			text: async () => '',
+			json: async () => ({}) as never
+		});
+		expect(response.status).toBe(200);
+		const outcome = classifyLogFeedResponse(response.status, await response.json());
+		expect(outcome).toMatchObject({ kind: 'ok', response: { entries: [], more: false } });
 	});
 });
 
