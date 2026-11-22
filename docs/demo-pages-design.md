@@ -1,7 +1,7 @@
 # ブラウザで触れるデモ（GitHub Pages）の設計
 
 作成日: 2026-11-22
-状態: **実装中**（2026-11-23、§6 の 2 を 2a・2b に分けた。2a = 共通パッケージ `packages/demo-backend`・両アプリのデモ用の起動とログイン無し・対象のルートごとの静的な入口・静的な配信の上の E2E（#1308 でマージ済み）。2b-1 = `deploy-demo.yml`・普段の CI の `e2e-demo-pages` ジョブ・implementation-checklist の 1 行（#1309 でマージ済み）。2b-2 = 公開の関門（メニューを対象だけに・対象外の案内・「デモを最初から」・`public-gate.spec.ts`。#1310 でマージ済み）。§6 の 3 = Hub の `/tags` の中身（登録・編集・削除と WebSocket の値。#1311 でマージ済み）。§6 の 4 を 4a・4b に分けた。4a = ChronoGazer の旧 demo モードを消す（本 PR）。4b = ChronoGazer の `/tags` の模擬）。2026-11-22 オーナー決定（目的・範囲・配信の契機・ログイン無し）を記録し、作りの案を置いた。同日、オーナーのレビュー（#1301）で、直に開く・読み直すことの保証（§3.5）と、本物の API に出ないことの制約（§3.1・§3.2）を足した。実装は §6 の順に小さな PR で進める。
+状態: **実装中**（2026-11-23、§6 の 2 を 2a・2b に分けた。2a = 共通パッケージ `packages/demo-backend`・両アプリのデモ用の起動とログイン無し・対象のルートごとの静的な入口・静的な配信の上の E2E（#1308 でマージ済み）。2b-1 = `deploy-demo.yml`・普段の CI の `e2e-demo-pages` ジョブ・implementation-checklist の 1 行（#1309 でマージ済み）。2b-2 = 公開の関門（メニューを対象だけに・対象外の案内・「デモを最初から」・`public-gate.spec.ts`。#1310 でマージ済み）。§6 の 3 = Hub の `/tags` の中身（登録・編集・削除と WebSocket の値。#1311 でマージ済み）。§6 の 4 を 4a・4b に分けた。4a = ChronoGazer の旧 demo モードを消す（#1312）。4b = ChronoGazer の `/tags` の模擬（本 PR））。2026-11-22 オーナー決定（目的・範囲・配信の契機・ログイン無し）を記録し、作りの案を置いた。同日、オーナーのレビュー（#1301）で、直に開く・読み直すことの保証（§3.5）と、本物の API に出ないことの制約（§3.1・§3.2）を足した。実装は §6 の順に小さな PR で進める。
 
 関連: banto の `deploy-demo.yml`（admin-template を InMemory で配信）、temp-scada の `pages.yml`・`docs/guides/demo-pages.md`（模擬値の画面を配信）。
 
@@ -121,8 +121,12 @@ banto・temp-scada と同じく、インストールせずにブラウザで画�
    - WebSocket は `stream.rs` と同じ形: `subscribe`（`tags` のパターン・`ids`）の直後に 1 回のスナップショット、以後は 250ms の評価でグループの周期（下限 500ms）ごとに**変わった値だけ**。登録が変わるたび `config_changed`。値は `packages/demo-backend/src/tagValues.ts` の純関数（単体の試験あり）。文字列のタグは本物と同じく数値の値を持たない（`v: null`）。接続が閉じたらタイマーを止める。
    - E2E: `e2e/tests-demo-pages/hub-tags.spec.ts`（初期のタグ・値が出て変わる・「再接続中…」が出ない・追加・編集・削除・送信 0 件・口の警告 0 件）。
 4. ChronoGazer: 今の demo を置き換え、`/tags` の登録（2026-11-23 に 4a・4b に分けた）。
-   - 4a（本 PR）: 旧 demo モード（`BantoMode` の `'demo'`・InMemory の provider・`providers/demo.ts` の admin/admin・各 `*Admin.ts` の「デモモードでは利用できません」と画面の案内・ログイン画面の admin/admin の案内）を消す。probe の `'none'`（静的ホスト・`vite dev` の 404）も「届かない」と同じ扱いにし、再試行の後に「サーバーに接続できません」を出す（Hub と同じ。バックエンドの無い `vite dev` では画面に入れない）。`VITE_BANTO_DEMO=1` のビルドは今までどおり模擬を入れて `server` で動く。
-   - 4b: `apps/chronogazer/src/lib/demo/` に `/tags` の登録・編集・削除の模擬と E2E。
+   - 4a（#1312）: 旧 demo モード（`BantoMode` の `'demo'`・InMemory の provider・`providers/demo.ts` の admin/admin・各 `*Admin.ts` の「デモモードでは利用できません」と画面の案内・ログイン画面の admin/admin の案内）を消す。probe の `'none'`（静的ホスト・`vite dev` の 404）も「届かない」と同じ扱いにし、再試行の後に「サーバーに接続できません」を出す（Hub と同じ。バックエンドの無い `vite dev` では画面に入れない）。`VITE_BANTO_DEMO=1` のビルドは今までどおり模擬を入れて `server` で動く。
+   - 4b（本 PR）: `/tags` の登録・編集・削除の模擬と E2E。
+     - `apps/chronogazer/src/lib/demo/`: `chronogazerState.ts`（接続 2・グループ 2・タグ 20・しきい値・表示グループ 2 をメモリに持つ登録。必須・名前の重複・参照の存在・周期（`ALLOWED_PERIOD_MS`）・桁数・`expectedRevision`・しきい値の順序だけを検証）、`chronogazerSeed.ts`・`chronogazerDrivers.ts`（初期のデータと、`listDrivers()` に出る SLMP・Modbus/TCP。Hub 経由の接続はドライバではなく「Hub から追加」が作る）、`chronogazerRoutes.ts`（口）、`chronogazerDemo.test.ts`（単体の試験）。ChronoGazer の `Tag` は文字列型を持たず（数値・bit だけ）、収集グループに `defaultWritable` も無い（Hub との違い）。
+     - 拾った口: `GET` の `/api/drivers`・`/api/plc-connections`・`/api/collection-groups`・`/api/tags`・`/api/tag-thresholds`・`/api/tag-thresholds/:tagId`・`/api/config-exclusions`・`/api/display-groups`・`/api/collect/values`（表示グループのペンがあると `/monitor` の起動が現在値を引くので、タグ ID と時刻だけで決まる値を返す）、`POST` の `/api/plc-connections`・`/api/collection-groups`・`/api/tags`、`PUT`・`DELETE` の `/api/tags/:id`・`/api/plc-connections/:id`・`/api/collection-groups/:id`、`PUT` の `/api/tag-thresholds/:tagId`。`/tags` を開いて操作しても警告は 0 件。`/api/tags/from-hub`・`/api/hub*`・表示グループの編集は 501（押して初めて呼ばれる）。`GET /api/collect/history` は `/monitor` を開くだけで（猶予の 2 秒後に）呼ばれるので、系列の無い空の履歴（`state: ready`・`series: []`・`unknownTagIds` に要求のタグ）を返す。本当の履歴の模擬は次の PR（§6 の 5）。
+     - 誤りの形は本物（`banto_tags`・`rest.rs`）に合わせる: 検証は 422 `{ kind: "validation", field_errors }`、使われている接続・グループの削除も 422（`field: "id"`。Hub と違い配下を道連れにせず、残っていれば断る）、`expectedRevision` の不一致は 409 で本文は `kind: validation`（`field: "expectedRevision"`）、無い id は 404 `not_found`。現在値は、タグ・収集グループ・接続のどれかが無効ならキーごと載せない（本物の収集の構成が外す）。表示グループのペンに使われているタグの削除は 422（`field: "displayGroups"`、参照元の名前つき）で断り、何も消さない（本物 `display_groups.rs` の `delete_tag_unless_referenced`。自由トレンドは模擬しない）。
+     - E2E: `e2e/tests-demo-pages/chronogazer-tags.spec.ts`（初期の接続・グループ・タグ、追加・編集・削除と重複の誤りの文言、読み直すと初期に戻る、収集グループの追加とタグが残るグループの削除の拒否、送信 0 件・口の警告 0 件）。
 5. ChronoGazer の `/monitor`: 現在値のポーリングと履歴（トレンド）。
 6. リリースのときに手で回して公開し、README から入口に案内する。
 
