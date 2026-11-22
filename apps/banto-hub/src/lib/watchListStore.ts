@@ -32,11 +32,13 @@
  * 周回（1 本だけ）:
  * 1. その時点の操作の数 `n` を控え、`provider.get` で読む（provider は同じキーの書き込みを
  *    待ってから読む）。
- * 2. サーバーの値と、先頭 `n` 件の操作で足す id のうち、`known` にも `dead` にも無いものを照会し
- *    （上の「消えたかの判定」）、`gone` を `dead` に足す。**上限を当てる前に**削除を確かめる
- *    （最新の GET で初めて見えた削除済みの id が、その回の上限の判定で枠を占めないように）。
- *    読むだけの周回（`n === 0`）は、`known` がまだ無ければ照会しない（後の `setKnownLiveIds` で
- *    確かめる）。
+ * 2. 先頭 `n` 件の操作を、いま分かっている `dead` だけで当てる。**上限で落ちる件数が 0 なら
+ *    照会を待たずに 3 へ進む**（「すべて外す」・外す・枠に収まる追加は、在否の API が無応答でも
+ *    止まらない。消えたと確定した id を落とすのは「ついで」で、急がない。表示のための照会
+ *    （`setKnownLiveIds`）は別に走る）。落ちる件数が 1 以上のときだけ、サーバーの値と操作で足す
+ *    id のうち `known` にも `dead` にも無いものを照会し（上の「消えたかの判定」）、**全体で
+ *    {@link VERIFY_BUDGET_MS} まで**待つ。期限で打ち切った id は不明のまま上限に数える。期限の後に
+ *    届いた結果は `dead` に入れて表示だけ更新し、その周回の結果は変えない。待ってから当て直す。
  * 3. サーバーの値（壊れていれば空）から `dead` を除き、先頭 `n` 件の操作を当てる。`n === 0`
  *    なら当てず書かない（`base` = サーバーの値）。
  * 4. 結果がサーバーの値と違う（壊れた値に操作で中身ができた場合も）なら `provider.set` で書く。
@@ -84,6 +86,8 @@ import {
 export const RETRY_BASE_MS = 2_000;
 /** 待ちの上限。 */
 export const RETRY_MAX_MS = 60_000;
+/** 上限で落ちる操作のときに、在否の照会の全体を待つ期限（打ち切った id は不明のまま進む）。 */
+export const VERIFY_BUDGET_MS = 5_000;
 
 /**
  * 保存の状態（窓の表示に使う）。
@@ -287,6 +291,41 @@ export function createWatchListStore(deps: WatchListStoreDeps = {}): WatchListSt
 		return grew;
 	}
 
+	/**
+	 * 在否の照会を、全体で `ms` までだけ待つ。期限で打ち切って進み、打ち切った id は不明のまま
+	 * （上限に数える）。期限の後に届いた結果は `dead` に入れて表示だけ更新し、その周回の保存の
+	 * 結果は変えない。
+	 */
+	async function verifyWithin(ids: Iterable<number>, ms: number): Promise<void> {
+		const done = verify(ids).then((grew) => {
+			if (grew) notify();
+		});
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const expired = new Promise<void>((resolve) => {
+			timer = setTimeout(resolve, ms);
+		});
+		try {
+			await Promise.race([done, expired]);
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
+	/** サーバーの値から `dead` を除き、操作を順に当てる（上限で落ちた件数も数える）。 */
+	function applyPending(
+		server: readonly number[],
+		pending: readonly WatchOp[]
+	): { list: number[]; overLimit: number } {
+		let applied = withoutIds(server, dead);
+		let overLimit = 0;
+		for (const op of pending) {
+			const result = applyWatchOp(applied, withoutDeadInOp(op, dead));
+			applied = result.list;
+			overLimit += result.overLimit;
+		}
+		return { list: applied, overLimit };
+	}
+
 	function ownerChanged(): boolean {
 		return currentOwner() !== owner;
 	}
@@ -363,24 +402,22 @@ export function createWatchListStore(deps: WatchListStoreDeps = {}): WatchListSt
 		if (ownerChanged()) return fail(null, 'read');
 		const parsed = parseWatchList(raw);
 		const server = parsed ?? [];
-		// 上限を当てる前に、最新の GET の id（と操作で足す id）の削除を確かめる（冒頭の手順 2）。
-		if (n > 0 || known !== null) {
-			const candidates = [...server];
-			for (const op of pending) if (op.kind === 'add') candidates.push(...op.ids);
-			await verify(candidates);
-			if (disposed) return false;
-			if (ownerChanged()) return fail(null, 'read');
-		}
 		let next = server;
 		let overLimit = 0;
 		if (n > 0) {
-			let applied = withoutIds(server, dead);
-			for (const op of pending) {
-				const result = applyWatchOp(applied, withoutDeadInOp(op, dead));
-				applied = result.list;
-				overLimit += result.overLimit;
+			const candidates = [...server];
+			for (const op of pending) if (op.kind === 'add') candidates.push(...op.ids);
+			let applied = applyPending(server, pending);
+			// 上限で落ちる操作があるときだけ、消えたかの確定を待つ（冒頭の手順 2）。落ちないなら
+			// 照会を待たない（「すべて外す」・外す・枠に収まる追加が、照会の無応答に足止めされない）。
+			if (applied.overLimit > 0 && deps.checkTagIds !== undefined) {
+				await verifyWithin(candidates, VERIFY_BUDGET_MS);
+				if (disposed) return false;
+				if (ownerChanged()) return fail(null, 'read');
+				applied = applyPending(server, pending);
 			}
-			next = applied;
+			overLimit = applied.overLimit;
+			next = applied.list;
 			const broken = raw !== null && raw !== '' && parsed === undefined;
 			if (!sameWatchList(next, server) || (broken && next.length > 0)) {
 				try {

@@ -7,6 +7,7 @@ vi.mock('./banto/setup', () => ({ getUiSettings: () => undefined }));
 import {
 	RETRY_BASE_MS,
 	RETRY_MAX_MS,
+	VERIFY_BUDGET_MS,
 	createWatchListStore,
 	type TagPresence,
 	type WatchListChange
@@ -331,24 +332,27 @@ describe('createWatchListStore', () => {
 		await settle();
 		expect(checker.calls).toEqual([[2, 3]]);
 		expect(store.list).toEqual([1, 3]);
-		expect(server.saved()).toBe(serializeWatchList([1, 3]));
-		// 次の周回: 1 は手がかり、2 は dead なので照会しない。3（exists）は覚えないので照会し直す。
+		// 上限で落ちない操作は照会を待たないので、消えた 2 を落とすのは次の保存のついで。
+		expect(server.saved()).toBe(serializeWatchList([1, 2, 3]));
+		// 次の周回: 1 は手がかり、2 は dead。上限で落ちないので、3 も照会し直さない。
 		store.apply({ kind: 'add', ids: [1] });
 		await settle();
-		expect(checker.calls).toEqual([[2, 3], [3]]);
+		expect(server.saved()).toBe(serializeWatchList([1, 3]));
+		expect(checker.calls).toEqual([[2, 3]]);
 		expect(checker.checked()).not.toContain(1);
 		store.dispose();
 	});
 
-	it('6f: 照会の途中で dispose したら結果を当てず、書かない', async () => {
-		const server = fakeProvider(serializeWatchList([1, 2]));
-		const checker = fakeChecker([2]);
+	it('6f: 上限で落ちる操作の照会の途中で dispose したら結果を当てず、書かない', async () => {
+		const server = fakeProvider(serializeWatchList(range(1, 100)));
+		const checker = fakeChecker([101]);
 		const { store, changes } = setup(server, { checkTagIds: checker.check });
 		await store.load();
 		const gate = checker.hold();
-		store.setKnownLiveIds([1]);
-		store.apply({ kind: 'add', ids: [3] });
+		store.setKnownLiveIds(range(1, 100));
+		store.apply({ kind: 'add', ids: [101] });
 		await settle();
+		expect(checker.checked()).toEqual([101]);
 		const seen = changes.length;
 		const listBefore = store.list;
 		store.dispose();
@@ -356,7 +360,7 @@ describe('createWatchListStore', () => {
 		await settle();
 		expect(changes.length).toBe(seen);
 		expect(store.list).toEqual(listBefore);
-		expect(listBefore).toEqual([1, 2, 3]);
+		expect(listBefore).toHaveLength(100);
 		expect(server.set).not.toHaveBeenCalled();
 	});
 
@@ -375,6 +379,70 @@ describe('createWatchListStore', () => {
 		await settle();
 		expect(server.saved()).toBe(serializeWatchList([]));
 		expect(store.list).toEqual([]);
+		store.dispose();
+	});
+
+	/** 解決しない在否の照会。 */
+	function hangingChecker() {
+		return vi.fn(
+			(_ids: readonly number[]) => new Promise<Map<number, TagPresence>>(() => undefined)
+		);
+	}
+
+	it('6i-a: 在否の照会が無応答でも、保存 100 件の「すべて外す」は時計を進めずに保存される', async () => {
+		const server = fakeProvider(serializeWatchList(range(1, 100)));
+		const check = hangingChecker();
+		const { store } = setup(server, { checkTagIds: check });
+		await store.load();
+		store.setKnownLiveIds([]);
+		await settle();
+		expect(check).toHaveBeenCalled();
+		store.apply({ kind: 'clear' });
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([]));
+		expect(store.list).toEqual([]);
+		expect(store.status).toBe('saved');
+		store.dispose();
+	});
+
+	it('6i-b: 在否の照会が無応答でも、枠に収まる追加は時計を進めずに保存される', async () => {
+		const server = fakeProvider(serializeWatchList(range(1, 50)));
+		const check = hangingChecker();
+		const { store } = setup(server, { checkTagIds: check });
+		await store.load();
+		store.apply({ kind: 'add', ids: [200] });
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([...range(1, 50), 200]));
+		store.dispose();
+	});
+
+	it('6i-c: 上限で落ちる追加は期限（5 秒）まで待ち、不明は数えて上限で落ち、保存は変わらない', async () => {
+		const server = fakeProvider(serializeWatchList(range(1, 100)));
+		const check = hangingChecker();
+		const { store, changes } = setup(server, { checkTagIds: check });
+		await store.load();
+		store.apply({ kind: 'add', ids: [101] });
+		await settle();
+		await vi.advanceTimersByTimeAsync(VERIFY_BUDGET_MS - 1);
+		expect(changes.some((c) => c.overLimit > 0)).toBe(false);
+		expect(store.status).toBe('saving');
+		await vi.advanceTimersByTimeAsync(1);
+		await settle();
+		expect(changes.filter((c) => c.overLimit > 0).map((c) => c.overLimit)).toEqual([1]);
+		expect(server.set).not.toHaveBeenCalled();
+		expect(store.list).toEqual(range(1, 100));
+		store.dispose();
+	});
+
+	it('6i-d: 期限の内に gone が返れば、それを除いて足せる', async () => {
+		const server = fakeProvider(serializeWatchList(range(1, 100)));
+		const checker = fakeChecker([100]);
+		const { store, changes } = setup(server, { checkTagIds: checker.check });
+		await store.load();
+		store.apply({ kind: 'add', ids: [101] });
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([...range(1, 99), 101]));
+		expect(changes.every((c) => c.overLimit === 0)).toBe(true);
 		store.dispose();
 	});
 
