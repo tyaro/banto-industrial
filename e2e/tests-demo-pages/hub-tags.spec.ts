@@ -67,22 +67,25 @@ test('Hub /tags: 下のログのパネルの初回の取得が済み、「読み
 }) => {
 	const traffic = recordTraffic(page, new URL(baseURL!).origin);
 	// 取得は、パネルが画面に出てから（`setVisible`）始まる。デモの模擬は `window.fetch` の差し替えで
-	// ネットワークを通らないので、`waitForResponse` は使えない。差し替えの前後を包んで完了を数える。
+	// ネットワークを通らないので、`waitForResponse` は使えない。模擬の fetch を包んで完了を数える。
+	// 模擬が差し替える前の getter は native の fetch をそのまま返す（模擬が `originalFetch` として
+	// 控えるのを native にし、静的な資産の取得が計測を経て模擬へ戻る再帰を作らない。#1316 のレビュー）。
 	await page.addInitScript(() => {
-		const w = window as unknown as { __logFeedDone: number; fetch: typeof fetch };
+		const w = window as unknown as { __logFeedDone: number };
 		w.__logFeedDone = 0;
-		let current = window.fetch.bind(window);
-		const wrapped: typeof fetch = async (input, init) => {
-			const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-			const response = await current(input, init);
-			if (/\/api\/log-feed(\?|$)/.test(url)) w.__logFeedDone += 1;
-			return response;
-		};
+		const native = window.fetch;
+		let current: typeof fetch = native;
 		Object.defineProperty(window, 'fetch', {
 			configurable: true,
-			get: () => wrapped,
+			get: () => current,
 			set: (next: typeof fetch) => {
-				current = next;
+				current = async (input, init) => {
+					const url =
+						typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+					const response = await next(input, init);
+					if (/\/api\/log-feed(\?|$)/.test(url)) w.__logFeedDone += 1;
+					return response;
+				};
 			}
 		});
 	});
@@ -99,6 +102,15 @@ test('Hub /tags: 下のログのパネルの初回の取得が済み、「読み
 	await expect(page.getByTestId('log-status')).toHaveCount(0);
 	await expect(page.getByText('表示する記録はありません。')).toBeVisible();
 	await expect(page.getByText('読み込めません')).toHaveCount(0);
+	// 計測を挟んでも、同じオリジン・ベースパスの静的な資産は模擬を素通りして取れる（再帰しない）。
+	const asset = await page.evaluate(async () => {
+		const src = document.querySelector<HTMLLinkElement>('link[rel="modulepreload"]')?.href;
+		if (!src) return { src: null, status: 0 };
+		const response = await window.fetch(src);
+		return { src, status: response.status };
+	});
+	expect(asset.src).not.toBeNull();
+	expect(asset.status).toBe(200);
 	expect(traffic.unsupported).toEqual([]);
 	expect(traffic.forbidden()).toEqual([]);
 });
