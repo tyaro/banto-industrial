@@ -1,6 +1,6 @@
 // banto v3.0.0（タグ v3.0.0 = f0dcece）の admin-template
 // `apps/admin-template/src/lib/banto/startup.test.ts` からコピー（I2c、banto #286）。
-// chronogazer 固有の差: なし（本文は無改変）。chronogazer 固有のテストは `setup.test.ts`。
+// chronogazer 固有の差: デモのビルドは `server`（下の試験の注記）。chronogazer 固有のテストは `setup.test.ts`。
 /**
  * Startup resolution (Issue #286): Tauri / LAN browser (server-served) /
  * intended demo, plus the transient-failure paths that must NOT become demo.
@@ -40,9 +40,11 @@ describe('resolveStartupTarget', () => {
 		expect(probe).not.toHaveBeenCalled();
 	});
 
-	it('intended demo build: demo without probing, even if a backend would fail', async () => {
+	// chronogazer 固有の差（GitHub Pages のデモ、docs/demo-pages-design.md §3.1）: デモのビルドは
+	// タブの中の模擬のサーバーと話す `server`。
+	it('intended demo build: server (the in-tab mock) without probing, even if a backend would fail', async () => {
 		const { deps, probe } = makeDeps(['unreachable'], { isDemoBuild: () => true });
-		expect(await resolveStartupTarget(deps)).toBe('demo');
+		expect(await resolveStartupTarget(deps)).toBe('server');
 		expect(probe).not.toHaveBeenCalled();
 	});
 

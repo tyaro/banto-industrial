@@ -45,6 +45,9 @@ e2e/playwright-report-public-viewer/
 # e2e/chronogazer-server.playwright.config.ts（サービス接続、#392 B2-2）の出力先
 e2e/test-results-chronogazer-server/
 e2e/playwright-report-chronogazer-server/
+# e2e/demo-pages.playwright.config.ts（GitHub Pages のデモ）の出力先
+e2e/test-results-demo-pages/
+e2e/playwright-report-demo-pages/
 e2e/.cache/
 /test-results/
 

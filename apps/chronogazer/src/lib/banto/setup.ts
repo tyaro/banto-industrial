@@ -130,6 +130,18 @@ let ready = false;
  * (`startupGate.ts`).
  */
 export const bantoReady: Promise<void> = (async () => {
+	// デモ（GitHub Pages、docs/demo-pages-design.md §3.1・§3.2）: 模擬を入れ終えてから、
+	// `server` モードの通常の provider（HTTP）を作る。下の `resolveStartupTarget` はデモの
+	// ビルドでは probe せずに `server` を返す（本物のサーバーへ問い合わせない）。
+	// `import.meta.env.VITE_BANTO_DEMO` はビルドの時点で定数になるので、製品のビルドでは
+	// この分岐と `#lib/demo/` の chunk ごと消える。模擬の import か初期化が失敗したら、
+	// ここで reject して通常の provider を作らない（root layout が止まった画面を出す）。
+	let demoTokenStorageKey: string | undefined;
+	if (import.meta.env.VITE_BANTO_DEMO === '1') {
+		const demo = await import('#lib/demo/index.js');
+		demoTokenStorageKey = (await demo.startDemo()).tokenStorageKey;
+	}
+
 	// Deployment kind is decided explicitly (Tauri / `VITE_BANTO_DEMO` build /
 	// a definitive "no Banto API here" answer); a transient probe failure is
 	// NOT "demo" - it stays on the splash screen with a retry button until the
@@ -163,7 +175,9 @@ export const bantoReady: Promise<void> = (async () => {
 
 	if (target === 'server') {
 		bantoMode = 'server';
-		const authProvider = createHttpAuthProvider();
+		const authProvider = createHttpAuthProvider(
+			demoTokenStorageKey === undefined ? {} : { storageKey: demoTokenStorageKey }
+		);
 		const dataProvider = createHttpDataProvider({ getToken: authProvider.getToken });
 		uiSettings = createHttpUiSettings({ getToken: authProvider.getToken });
 		initBanto({ dataProvider, authProvider, notifier, resources: [] });

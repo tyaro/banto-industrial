@@ -12,7 +12,9 @@
  *   届くようになってから「再接続」すると server になる。以前の
  *   `isEmbeddedServer()` はこの 3 つを全部「サーバー無し」と読んで demo
  *   （メモリ上の空データ）に落ち、二度と戻らなかった。
- * - `VITE_BANTO_DEMO=1` のビルドは probe せずに demo。
+ * - `VITE_BANTO_DEMO=1` のビルド（GitHub Pages のデモ、docs/demo-pages-design.md §3.1）は、
+ *   タブの中の模擬（`#lib/demo/`）を入れ終えてから、probe せずに `server` の provider で起動する。
+ *   トークンはデモ専用のキー。模擬の初期化が失敗したら通常の provider を作らずに reject する。
  * - 同じオリジンが「`/api` は無い」と確定的に答えた（静的ホストの `404`）
  *   ときも demo（admin-template と同じ。`vite dev`/`vite preview` の経路）。
  *
@@ -22,15 +24,28 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { STARTUP_AUTO_RETRIES, STARTUP_RETRY_DELAY_MS } from './startup';
 
-const core = vi.hoisted(() => ({ initBanto: vi.fn(), connectEvents: vi.fn() }));
+const core = vi.hoisted(() => ({
+	initBanto: vi.fn(),
+	connectEvents: vi.fn(),
+	createHttpAuthProvider: vi.fn()
+}));
+// デモの模擬（`#lib/demo/index.js`）。本物は fetch・WebSocket を差し替えるので、ここでは呼ばれた
+// 順と返す値だけを見る。
+const demo = vi.hoisted(() => ({ startDemo: vi.fn() }));
+vi.mock('#lib/demo/index.js', () => ({ startDemo: demo.startDemo }));
 // #392 B2-2: サービスへ navigate した Tauri の窓で invoke を呼ばないことを見る。
 const tauriCore = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: tauriCore.invoke }));
-vi.mock('@banto/admin-core', async (importOriginal) => ({
-	...(await importOriginal<typeof import('@banto/admin-core')>()),
-	initBanto: core.initBanto,
-	connectEvents: core.connectEvents
-}));
+vi.mock('@banto/admin-core', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('@banto/admin-core')>();
+	core.createHttpAuthProvider.mockImplementation(actual.createHttpAuthProvider);
+	return {
+		...actual,
+		initBanto: core.initBanto,
+		connectEvents: core.connectEvents,
+		createHttpAuthProvider: core.createHttpAuthProvider
+	};
+});
 
 const json = (status: number, body: unknown) =>
 	new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
@@ -54,9 +69,13 @@ async function loadSetup() {
 	pendingImport = imports;
 	const [setup, state] = await imports;
 	let settled = false;
-	void setup.bantoReady.then(() => {
-		settled = true;
-	});
+	// 失敗の経路（デモの模擬の初期化の失敗）の reject は各試験が見る。ここでは握りつぶす。
+	void setup.bantoReady.then(
+		() => {
+			settled = true;
+		},
+		() => {}
+	);
 	return { setup, state, settled: () => settled };
 }
 
@@ -89,6 +108,8 @@ beforeEach(() => {
 	vi.useFakeTimers();
 	core.initBanto.mockReset();
 	core.connectEvents.mockReset();
+	core.createHttpAuthProvider.mockClear();
+	demo.startDemo.mockReset();
 	vi.stubGlobal('location', { origin: 'http://lan.test' });
 });
 
@@ -162,18 +183,44 @@ describe('bantoReady: 一時的に届かないときは demo に落ちない（#
 });
 
 describe('bantoReady: demo になる経路', { timeout: 30_000 }, () => {
-	it('VITE_BANTO_DEMO=1 のビルドは probe せずに demo', async () => {
+	it('VITE_BANTO_DEMO=1 のビルドは模擬を入れ終えてから、probe せずに server（デモ専用のトークンのキー）', async () => {
 		vi.stubEnv('VITE_BANTO_DEMO', '1');
 		const fetchMock = vi.fn(async () => json(200, false));
 		vi.stubGlobal('fetch', fetchMock);
+		const order: string[] = [];
+		demo.startDemo.mockImplementation(async () => {
+			order.push('startDemo');
+			return { tokenStorageKey: 'banto-industrial.demo.chronogazer.token' };
+		});
+		core.initBanto.mockImplementation(() => order.push('initBanto'));
 
 		const { setup } = await loadSetup();
 		await setup.bantoReady;
 
-		expect(setup.getBantoMode()).toBe('demo');
+		expect(setup.getBantoMode()).toBe('server');
+		expect(order).toEqual(['startDemo', 'initBanto']);
+		expect(core.createHttpAuthProvider).toHaveBeenCalledWith({
+			storageKey: 'banto-industrial.demo.chronogazer.token'
+		});
+		// probe（`/api/auth/check`）もしない。
 		expect(fetchMock).not.toHaveBeenCalled();
-		expect(core.initBanto).toHaveBeenCalledTimes(1);
+		expect(core.connectEvents).toHaveBeenCalledTimes(1);
+	});
+
+	it('VITE_BANTO_DEMO=1 で模擬の初期化が失敗したら、通常の provider を作らずに reject', async () => {
+		vi.stubEnv('VITE_BANTO_DEMO', '1');
+		const fetchMock = vi.fn(async () => json(200, false));
+		vi.stubGlobal('fetch', fetchMock);
+		demo.startDemo.mockRejectedValue(new Error('demo init failed'));
+
+		const { setup } = await loadSetup();
+		await expect(setup.bantoReady).rejects.toThrow('demo init failed');
+
+		expect(core.createHttpAuthProvider).not.toHaveBeenCalled();
+		expect(core.initBanto).not.toHaveBeenCalled();
 		expect(core.connectEvents).not.toHaveBeenCalled();
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(setup.isBantoReady()).toBe(false);
 	});
 
 	it('静的ホストの 404（「/api は無い」と確定）は demo', async () => {

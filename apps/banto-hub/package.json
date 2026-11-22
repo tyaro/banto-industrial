@@ -12,6 +12,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@banto-industrial/demo-backend": "workspace:*",
     "@banto/admin-core": "github:tyaro/banto#v7.9.0&path:packages/admin-core",
     "@banto/charts": "github:tyaro/banto#v7.9.0&path:packages/charts",
     "@banto/dock-svelte": "github:tyaro/banto#v7.9.0&path:packages/dock-svelte",

@@ -29,6 +29,12 @@
 {:then}
 	{@render children()}
 	<ToastHost store={toastStore} />
+{:catch}
+	<!-- デモ（docs/demo-pages-design.md §3.1）: 模擬を入れられなかったら通常の provider は
+	     作られていない。ここで止まる。製品のビルドは今までどおり何も出さない。 -->
+	{#if import.meta.env.VITE_BANTO_DEMO === '1'}
+		<p class="banto-splash" role="alert">デモを始められませんでした</p>
+	{/if}
 {/await}
 
 <style>

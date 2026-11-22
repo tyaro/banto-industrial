@@ -347,7 +347,7 @@ interface RawIngestStatusEntry {
 }
 
 /** サーバーから受け取る camelCase の生レスポンス形（`AdminStatusResponse`）。 */
-interface RawStatusResponse {
+export interface RawStatusResponse {
 	version: string;
 	revision: number;
 	lastConfigError: string | null;

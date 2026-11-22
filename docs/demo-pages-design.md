@@ -1,7 +1,7 @@
 # ブラウザで触れるデモ（GitHub Pages）の設計
 
 作成日: 2026-11-22
-状態: **設計中（未実装）**。2026-11-22 オーナー決定（目的・範囲・配信の契機・ログイン無し）を記録し、作りの案を置いた。同日、オーナーのレビュー（#1301）で、直に開く・読み直すことの保証（§3.5）と、本物の API に出ないことの制約（§3.1・§3.2）を足した。実装は §6 の順に小さな PR で進める。
+状態: **実装中**（2026-11-22、§6 の 2 の前半 = 共通パッケージ `packages/demo-backend`・両アプリのデモ用の起動とログイン無し・ベースパスの切り替え・対象のルートごとの静的な入口と `404.html`・静的な配信の上の E2E（`pnpm demo:build` → `pnpm e2e:demo-pages`）。`deploy-demo.yml` と普段の CI のジョブは後半の PR）。2026-11-22 オーナー決定（目的・範囲・配信の契機・ログイン無し）を記録し、作りの案を置いた。同日、オーナーのレビュー（#1301）で、直に開く・読み直すことの保証（§3.5）と、本物の API に出ないことの制約（§3.1・§3.2）を足した。実装は §6 の順に小さな PR で進める。
 
 関連: banto の `deploy-demo.yml`（admin-template を InMemory で配信）、temp-scada の `pages.yml`・`docs/guides/demo-pages.md`（模擬値の画面を配信）。
 
@@ -53,6 +53,7 @@ banto・temp-scada と同じく、インストールせずにブラウザで画�
   - 模擬はトークンの中身で何も判断しない（どのトークンでも admin、トークンが無くても admin）。
   - `@banto/admin-core` の `createHttpAuthProvider` は、トークンを必ず localStorage・sessionStorage に書く（選べるのはキーの名前 `storageKey` だけ）。メモリに持つ口を banto に提案した（[tyaro/banto#838](https://github.com/tyaro/banto/issues/838)、v8 の作業に合わせる）。入るまでは、デモ専用のキー（例 `banto-industrial.demo.hub.token`）を使い、起動のたびに消してから始める。既定のキー `banto.auth.token` は読みも書きもしない。
   - テーマなどの保存が要るなら、デモ専用の接頭辞のキーにする（今の範囲では保存しない。§3.3）。
+  - **実装の決定（2026-11-23）**: デモのビルドでは `localStorage`・`sessionStorage` の両方をタブの中のメモリの `Storage` に差し替える（`packages/demo-backend` の `installDemoStorage()`、各アプリの `src/hooks.client.ts` の最上位で、アプリのモジュールの読み込みより前に）。テーマ・ドックの配置・見張りの一覧・トークンなど既存の画面のコードが既定のキーで書いても、オリジンの本物の storage には何も残らず、ほかのデモの値も拾わない。`app.html` の FOUC 対策は JS の前に本物の `banto.theme`・`banto.preset` を**読むだけ**（書かない）なので、そのままにしている。
 
 ### 3.3 模擬のデータと値
 
