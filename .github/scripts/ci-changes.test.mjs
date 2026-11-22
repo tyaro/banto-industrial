@@ -202,7 +202,8 @@ const ALL = {
 	run_rust_db_source: true,
 	run_linux_clippy: true,
 	run_e2e_hub: true,
-	run_e2e_chronogazer: true
+	run_e2e_chronogazer: true,
+	run_e2e_demo_pages: true
 };
 
 const NONE = {
@@ -216,7 +217,8 @@ const NONE = {
 	run_rust_db_source: false,
 	run_linux_clippy: false,
 	run_e2e_hub: false,
-	run_e2e_chronogazer: false
+	run_e2e_chronogazer: false,
+	run_e2e_demo_pages: false
 };
 
 const HUB_RUST =
@@ -261,6 +263,32 @@ const TABLE = [
 		'packages だけ（共通のフロントの部品）は ChronoGazer のフロントだけ',
 		['packages/trend/src/core/range.ts', 'packages/trend/package.json'],
 		{ ...NONE, run_frontend_chronogazer: true }
+	],
+	[
+		'デモの模擬（packages/demo-backend）は両アプリのフロントとデモの E2E（両アプリが import する）',
+		['packages/demo-backend/src/index.ts'],
+		{
+			...NONE,
+			run_frontend_hub: true,
+			run_frontend_chronogazer: true,
+			run_e2e_hub: true,
+			run_e2e_demo_pages: true
+		}
+	],
+	[
+		'アプリの lib/demo（Hub）はそのアプリの画面とデモの E2E',
+		['apps/banto-hub/src/lib/demo/mockFetch.ts'],
+		{ ...NONE, run_frontend_hub: true, run_e2e_hub: true, run_e2e_demo_pages: true }
+	],
+	[
+		'画面だけの変更はデモの E2E を走らせない',
+		['apps/banto-hub/src/routes/(app)/tags/+page.svelte'],
+		{ ...NONE, run_frontend_hub: true, run_e2e_hub: true }
+	],
+	[
+		'デモの E2E だけの変更',
+		['e2e/tests-demo-pages/hub.spec.ts', 'e2e/demo-pages.playwright.config.ts'],
+		{ ...NONE, run_e2e_hub: true, run_e2e_chronogazer: true, run_e2e_demo_pages: true }
 	],
 	[
 		'crates の変更は、そのパッケージと逆依存だけ（banto-tags）',
@@ -577,7 +605,8 @@ const TABLE = [
 			run_frontend_hub: true,
 			run_frontend_chronogazer: true,
 			run_e2e_hub: true,
-			run_e2e_chronogazer: true
+			run_e2e_chronogazer: true,
+			run_e2e_demo_pages: true
 		}
 	],
 	[
@@ -588,7 +617,8 @@ const TABLE = [
 			run_frontend_hub: true,
 			run_frontend_chronogazer: true,
 			run_e2e_hub: true,
-			run_e2e_chronogazer: true
+			run_e2e_chronogazer: true,
+			run_e2e_demo_pages: true
 		}
 	],
 	['.github の変更はフル', ['.github/workflows/ci.yml'], ALL],
@@ -660,7 +690,12 @@ const TABLE = [
 ];
 
 function ALL_BUT_FRONTEND() {
-	return { ...ALL, run_frontend_hub: false, run_frontend_chronogazer: false };
+	return {
+		...ALL,
+		run_frontend_hub: false,
+		run_frontend_chronogazer: false,
+		run_e2e_demo_pages: false
+	};
 }
 
 for (const [name, files, expected] of TABLE) {
@@ -1473,7 +1508,13 @@ test('画面だけの変更（apps/*/src・フロントの設定）は frontend 
 	for (const f of hub) {
 		const r = classify({ event: 'pull_request', files: [f], graph: G });
 		assert.equal(r.areas.frontend_hub, true, f);
-		assert.deepEqual(r.jobs, { ...NONE, run_frontend_hub: true, run_e2e_hub: true }, f);
+		// vite.config.ts はデモの組み立てにも効く。
+		const demo = f.endsWith('vite.config.ts');
+		assert.deepEqual(
+			r.jobs,
+			{ ...NONE, run_frontend_hub: true, run_e2e_hub: true, run_e2e_demo_pages: demo },
+			f
+		);
 		for (const k of RUST_JOBS) assert.equal(r.jobs[k], false, `${f} ${k}`);
 		assert.equal(r.jobs.rust_args, '', f);
 	}
@@ -1489,7 +1530,12 @@ test('画面だけの変更（apps/*/src・フロントの設定）は frontend 
 		assert.equal(r.areas.frontend_chronogazer, true, f);
 		assert.deepEqual(
 			r.jobs,
-			{ ...NONE, run_frontend_chronogazer: true, run_e2e_chronogazer: true },
+			{
+				...NONE,
+				run_frontend_chronogazer: true,
+				run_e2e_chronogazer: true,
+				run_e2e_demo_pages: f.endsWith('vite.config.ts')
+			},
 			f
 		);
 	}

@@ -31,6 +31,10 @@
 //   `include_str!` / `include_bytes!` がパッケージをまたぐ箇所が判定で拾われて
 //   いることはテストで確かめる。
 //
+// ブラウザで触れるデモ（GitHub Pages、docs/demo-pages-design.md §3.6）の組み立てと E2E
+// （`run_e2e_demo_pages`）は、RULES とは独立の `DEMO_PATHS` を変更ファイルの全部に当てて
+// 判定する（既存の領域の分類を変えずに足すため）。フル CI でも走る。
+//
 // 将来 `apps/banto-scada` を足すとき（ci.yml 冒頭のコメントにも同じ手順）:
 //   1. RULES に `^apps/banto-scada/` → `scada`（と E2E を足すなら
 //      `e2e/tests-banto-scada/` 等 → `e2e_scada`）を足す。
@@ -69,7 +73,8 @@ export const AREAS = [
 	'wasm',
 	'hub_sink',
 	'e2e_hub',
-	'e2e_chronogazer'
+	'e2e_chronogazer',
+	'demo_pages'
 ];
 
 /**
@@ -145,6 +150,14 @@ export const RULES = [
 		why: 'chronogazer の画面（Rust は読まない）'
 	},
 	{ re: /^apps\/chronogazer\//, areas: ['chronogazer'], why: 'chronogazer' },
+	// デモの模擬（packages/demo-backend）は Hub・ChronoGazer の両方の画面が import する
+	// （2026-11-23）ので、両方のフロントのジョブで check・test する。ほかの共通部品
+	// （packages/trend）は ChronoGazer だけ。デモ自体の検査は `demo_pages`（下の DEMO_PATHS）。
+	{
+		re: /^packages\/demo-backend\//,
+		areas: ['frontend_hub', 'frontend_packages'],
+		why: 'デモの模擬（Hub・ChronoGazer の両方の画面が使う）'
+	},
 	// 共通のフロントの部品（いまは packages/trend だけ）。使うのは ChronoGazer の画面で、
 	// 将来は temp-scada の画面も使う（別リポジトリなのでここでは見ない。banto-scada を
 	// このリポジトリに足したら、run_frontend_scada もこの area で走らせる）。
@@ -183,6 +196,28 @@ export const RULES = [
 	{ re: /^[^/]+\.md$/, areas: ['docs'], why: 'root の Markdown' },
 	{ re: /^(LICENSE|\.gitignore)$/, areas: ['docs'], why: 'ライセンス・ignore' },
 	{ re: /^\.(claude|cursor)\//, areas: ['docs'], why: 'エージェント向け設定（CI は読まない）' }
+];
+
+/**
+ * ブラウザで触れるデモ（GitHub Pages、docs/demo-pages-design.md §3.6）の組み立てと
+ * E2E（`e2e-demo-pages` ジョブ）を走らせるパス。模擬の経路・組み立て・E2E そのものと、
+ * 組み立てに効く画面の入口・設定。
+ * **RULES とは独立に、変更ファイルの全部に当てる**（RULES は最初に当たった 1 規則だけを
+ * 採るので、画面・E2E の領域に分類されたファイルが同時にここにも当たる必要があるため。
+ * 既存の分類は変えない）。`.github/**`・`scripts/**` はフル CI なのでここに書かなくても
+ * 走る（deploy-demo.yml・build-demo-pages.mjs は念のため明示）。
+ */
+export const DEMO_PATHS = [
+	/^packages\/demo-backend\//,
+	/^apps\/[^/]+\/src\/lib\/demo\//,
+	/^apps\/[^/]+\/src\/hooks\.client\.ts$/,
+	/^apps\/[^/]+\/src\/lib\/banto\/setup\.ts$/,
+	/^apps\/[^/]+\/src\/routes\/\+layout\.svelte$/,
+	/^apps\/[^/]+\/(vite|svelte)\.config\.[cm]?[jt]s$/,
+	/^scripts\/build-demo-pages\.mjs$/,
+	/^e2e\/demo-pages/,
+	/^e2e\/tests-demo-pages\//,
+	/^\.github\/workflows\/deploy-demo\.yml$/
 ];
 
 /**
@@ -370,6 +405,7 @@ export function classifyAreas(files) {
 			: { file, areas: ['full'], why: 'どの規則にも当たらない（安全側でフル CI）' };
 		for (const a of hit.areas) areas[a] = true;
 		matches.push(hit);
+		if (DEMO_PATHS.some((r) => r.test(file))) areas.demo_pages = true;
 	}
 	return { areas, matches };
 }
@@ -481,6 +517,9 @@ export function derive(a, crateAffected = []) {
 			a.frontend_hub ||
 			a.e2e_hub ||
 			hits('run_e2e_hub'),
+		// デモの組み立て + E2E（Rust を使わない）。フル CI、root の依存・設定（frontend_all。
+		// vite・svelte などの版上げで組み立てが壊れうる）、デモの経路に触れたとき。
+		run_e2e_demo_pages: full || a.frontend_all || a.demo_pages,
 		run_e2e_chronogazer:
 			rustWorkspace ||
 			a.frontend_all ||

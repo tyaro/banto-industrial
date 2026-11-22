@@ -1,0 +1,97 @@
+# ブラウザで触れるデモ（GitHub Pages）の配信（docs/demo-pages-design.md §3.5）。
+#
+# - **リリースのたびに手で走らせる**（`workflow_dispatch` だけ。2026-11-22 オーナー決定）。
+#   push・PR・タグでは走らない。`ref` に配信したいブランチ・リリースのタグ名を入れる
+#   （既定は main）。
+# - 何を作るか: `pnpm demo:build`（scripts/build-demo-pages.mjs）が Hub（/tags）と
+#   ChronoGazer（/tags・/monitor）の画面を、通信の境目（fetch・WebSocket）を模擬に
+#   差し替えて静的に書き出す（出力は `target/demo-pages/`）。バックエンドは動かさない。
+# - **配信の前に、組み立てた成果物そのものに対して E2E（`pnpm e2e:demo-pages`）を
+#   ゲートとして走らせる**（fallback の無い静的な配信の上で、対象のルートを直に開く・
+#   読み直す・外への送信が 0 件、を確かめる）。落ちたら配信しない。
+# - 公開先: https://tyaro.github.io/banto-industrial/
+#   （リポジトリの Settings → Pages の Source を「GitHub Actions」にしておく）。
+# - 普段の PR では配信はしない。模擬の経路を変えた PR は ci.yml の e2e-demo-pages
+#   ジョブが同じ組み立てと E2E を回す。
+name: Deploy demo (GitHub Pages)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '配信する ref（ブランチ名・リリースのタグ名。既定は main）'
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+# Pages への配信は同時に 1 本だけ。走っているものは止めない（途中で切ると公開が中途半端になる）。
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build demo pages + E2E gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build demo pages
+        run: pnpm demo:build
+
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      # 組み立てた成果物（target/demo-pages）を静的に配信して確かめる。落ちたら配信しない。
+      - name: E2E gate (demo-pages)
+        run: pnpm e2e:demo-pages
+
+      - name: Upload Playwright report (demo-pages)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report-demo-pages
+          path: e2e/playwright-report-demo-pages/
+          retention-days: 7
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: target/demo-pages
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
