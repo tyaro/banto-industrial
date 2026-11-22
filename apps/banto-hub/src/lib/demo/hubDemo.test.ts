@@ -55,6 +55,23 @@ describe('HubRegistry（模擬の登録）', () => {
 		expect(r.tags).toHaveLength(21);
 	});
 
+	it('更新で comment を省くと保存済みが残り、空文字なら消える', () => {
+		const r = new HubRegistry();
+		const before = r.tags.find((t) => t.comment !== '')!;
+		expect(before).toBeDefined();
+		const { id, revision, ...rest } = before;
+		const { comment, ...withoutComment } = rest;
+		expect(comment).not.toBe('');
+		r.updateTagsBatch([{ ...withoutComment, id, enabled: false }], false);
+		const kept = r.tag(id)!;
+		expect(kept.enabled).toBe(false);
+		expect(kept.comment).toBe(comment);
+		r.updateTag(id, { ...withoutComment, enabled: true });
+		expect(r.tag(id)!.comment).toBe(comment);
+		r.updateTagsBatch([{ ...withoutComment, id, comment: '' }], false);
+		expect(r.tag(id)!.comment).toBe('');
+	});
+
 	it('接続・グループの削除は配下ごと消し、通知する', () => {
 		const r = new HubRegistry();
 		const rev0 = r.revision;

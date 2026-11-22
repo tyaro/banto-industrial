@@ -273,11 +273,12 @@ export class HubRegistry {
 		return errors;
 	}
 
-	#buildTag(id: number, input: TagInput, revision: number): Tag {
+	#buildTag(id: number, input: TagInput, revision: number, current?: Tag): Tag {
 		return {
 			id,
 			name: input.name.trim(),
-			comment: input.comment ?? '',
+			// 更新で省けば保存済みを残す。空文字なら消す（tagRegistryAdmin の約束）。
+			comment: input.comment ?? current?.comment ?? '',
 			collectionGroupId: input.collectionGroupId,
 			address: (input.address ?? '').trim(),
 			dataType: input.dataType,
@@ -315,7 +316,7 @@ export class HubRegistry {
 		}
 		const errors = this.validateTag(input, id);
 		if (errors.length > 0) throw new DemoValidationError(errors);
-		const updated = this.#buildTag(id, input, current.revision + 1);
+		const updated = this.#buildTag(id, input, current.revision + 1, current);
 		this.tags = this.tags.map((t) => (t.id === id ? updated : t));
 		this.#changed();
 		return updated;
@@ -362,7 +363,7 @@ export class HubRegistry {
 			// 名前の一意は、更新を当てた後の状態で下で見る（同じバッチの他の行を含む）。
 			const fieldErrors = this.validateTag(row, row.id, [], false);
 			if (fieldErrors.length > 0) errors.push({ index, id: row.id, fieldErrors });
-			else updates.push(this.#buildTag(row.id, row, current.revision + 1));
+			else updates.push(this.#buildTag(row.id, row, current.revision + 1, current));
 		});
 		if (errors.length === 0) {
 			const after = new Map(this.tags.map((t) => [t.id, t]));
