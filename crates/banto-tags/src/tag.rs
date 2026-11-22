@@ -3837,20 +3837,22 @@ impl TagService {
                 )
             })
             .collect();
-        let mut capacity_conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(banto_storage::storage_error)?;
-        for (index, error) in group_capacity_errors_tx(
-            &mut capacity_conn,
-            &capacity_rows,
-            MAX_COLLECTED_TAGS_PER_GROUP,
-        )
-        .await?
-        .into_iter()
-        .enumerate()
-        {
+        // #1303: 数え終えたら接続を返す（この後の挿入のトランザクションが別の接続を取るので、
+        // 借りたままだと接続 1 本のプールで待ち切れずに失敗する）。
+        let capacity_errors = {
+            let mut capacity_conn = self
+                .pool
+                .acquire()
+                .await
+                .map_err(banto_storage::storage_error)?;
+            group_capacity_errors_tx(
+                &mut capacity_conn,
+                &capacity_rows,
+                MAX_COLLECTED_TAGS_PER_GROUP,
+            )
+            .await?
+        };
+        for (index, error) in capacity_errors.into_iter().enumerate() {
             row_errors[index].extend(error);
         }
 
@@ -4153,6 +4155,26 @@ mod tests {
         assert!(matches!(
             svc.create_batch(two[..1].to_vec(), false).await.unwrap(),
             BatchTagOutcome::Valid { count: 1, .. }
+        ));
+    }
+
+    /// #1303: 接続 1 本のプールで、容量の数えが接続を返してから挿入が始まること。
+    /// 借りたままだと挿入の `begin` が接続を待ち続けて（ここでは 2 秒で）失敗する。
+    #[tokio::test]
+    async fn batch_create_with_a_single_connection_pool_does_not_wait_for_itself() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(2))
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect("sqlite::memory:")
+            .await
+            .expect("single-connection pool");
+        let (svc, group_id) = setup_on(pool).await;
+        let rows = vec![sample_input("One", group_id), sample_input("Two", group_id)];
+        assert!(matches!(
+            svc.create_batch(rows, false).await.expect("batch create"),
+            BatchTagOutcome::Valid { count: 2, .. }
         ));
     }
 
