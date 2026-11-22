@@ -217,9 +217,9 @@ export const DEMO_PATHS = [
 	/^apps\/[^/]+\/src\/routes\/\+layout\.ts$/,
 	/^apps\/[^/]+\/src\/routes\/\+layout\.svelte$/,
 	// 公開の関門（2b-2）: メニュー・対象外の画面の案内・「デモを最初から」・ルートの redirect。
-	/^apps\/[^/]+\/src\/lib\/(navigation|commands)\.ts$/,
+	/^apps\/[^/]+\/src\/lib\/(navigation|commands|navLayout)\.ts$/,
 	/^apps\/[^/]+\/src\/lib\/components\/(Header|Sidebar|ShellLauncher|ShellMenubar|DemoOutOfScope)\.svelte$/,
-	/^apps\/[^/]+\/src\/routes\/\(app\)\/\+layout\.svelte$/,
+	/^apps\/[^/]+\/src\/routes\/\(app\)\/\+layout\.(svelte|ts)$/,
 	/^apps\/[^/]+\/src\/routes\/\+page\.ts$/,
 	/^apps\/[^/]+\/(vite|svelte)\.config\.[cm]?[jt]s$/,
 	/^scripts\/build-demo-pages\.mjs$/,
