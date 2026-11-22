@@ -676,8 +676,9 @@ fn percent_decode(segment: &str) -> Option<String> {
 /// 副作用がどこまで済んだかは分からないので、呼び出し側には「状態を読み直す」ように
 /// 伝え、理由はログに残す。
 ///
-/// banto 自身の書き込みの handler にも同じ穴があるので、共通の口を tyaro/banto#793 で
-/// 提案した。入ったら置き換える。
+/// banto 自身の書き込みの handler にも同じ形の処理（`.await` をまたぐ書き込み → 監査）があり、
+/// 切断で途中で止まる可能性がある（banto 側では再現を確かめていない）ので、共通の口を
+/// tyaro/banto#793 で提案した。入ったら置き換える。
 pub(crate) async fn run_detached<F>(label: &str, work: F) -> Result<F::Output, DetachedTaskFailed>
 where
     F: std::future::Future + Send + 'static,
