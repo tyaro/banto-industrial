@@ -53,6 +53,7 @@ banto・temp-scada と同じく、インストールせずにブラウザで画�
   - 模擬はトークンの中身で何も判断しない（どのトークンでも admin、トークンが無くても admin）。
   - `@banto/admin-core` の `createHttpAuthProvider` は、トークンを必ず localStorage・sessionStorage に書く（選べるのはキーの名前 `storageKey` だけ）。メモリに持つ口を banto に提案した（[tyaro/banto#838](https://github.com/tyaro/banto/issues/838)、v8 の作業に合わせる）。入るまでは、デモ専用のキー（例 `banto-industrial.demo.hub.token`）を使い、起動のたびに消してから始める。既定のキー `banto.auth.token` は読みも書きもしない。
   - テーマなどの保存が要るなら、デモ専用の接頭辞のキーにする（今の範囲では保存しない。§3.3）。
+  - **実装の決定（2026-11-23）**: デモのビルドでは `localStorage`・`sessionStorage` の両方をタブの中のメモリの `Storage` に差し替える（`packages/demo-backend` の `installDemoStorage()`、各アプリの `src/hooks.client.ts` の最上位で、アプリのモジュールの読み込みより前に）。テーマ・ドックの配置・見張りの一覧・トークンなど既存の画面のコードが既定のキーで書いても、オリジンの本物の storage には何も残らず、ほかのデモの値も拾わない。`app.html` の FOUC 対策は JS の前に本物の `banto.theme`・`banto.preset` を**読むだけ**（書かない）なので、そのままにしている。
 
 ### 3.3 模擬のデータと値
 

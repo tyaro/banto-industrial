@@ -17,7 +17,8 @@
  *   閉じる。
  *
  * 状態はメモリだけに持つ（このパッケージは状態を持たず、口ごとの状態は各アプリの
- * `src/lib/demo/` の側）。localStorage・sessionStorage は使わない。口ごとの応答は
+ * `src/lib/demo/` の側）。localStorage・sessionStorage はメモリだけの物に差し替える
+ * （`installDemoStorage()`、各アプリの `src/hooks.client.ts`）。口ごとの応答は
  * 各アプリの `src/lib/demo/` に置き、型は各 `*Admin.ts`・`@banto/admin-core` から取る。
  */
 export {
@@ -58,3 +59,4 @@ export {
 	type DemoRoutes,
 	type InstallDemoBackendOptions
 } from './install';
+export { createMemoryStorage, installDemoStorage, type DemoStorageTarget } from './storage';
