@@ -69,7 +69,7 @@ v0.2.0-alpha.20: 狭幅（≤900px）でタグ登録・タグモニタの左ツ�
 - 追従先は banto **v7.9.0**（Rust クレート・npm `@banto/*` とも）。banto-hub は v0.3.0-alpha.4（pre-release 公開済み）。
 - アプリは banto-hub・banto-hub-sink・chronogazer の 3 つと、共有パッケージ `packages/trend`（タグ `trend-v*`、最新 `trend-v0.2.0`）。crate は 32 個。
 - ChronoGazer は R1 の各画面（監視・ヒストリカル・日報・期間 CSV・表示グループ・自由トレンド）が動く。
-- 機能実装は banto の次のメジャー版まで停止し、CI の見直しをしている（2026-11-22 オーナー決定）。
+- 機能実装は banto の次のメジャー版（v8）まで停止している（2026-11-22 オーナー決定）。
 - 以下で「予定」「未着手」「追従先は v6.x 以前」とあるものは、履歴として読むこと。
 
 - **#661（banto-hub の設定モード ⇔ 運用モード）**: **完了（2026-10-20）**。661-1〜661-5 はマージ済み（#693・#697・#704・#699・#706、決定 #692）、661-6 は docs と実機確認の記録。サービスが起動で profile を締め、STOP で緩める（`relax-only`・終了コード 4・5・見張り）。実機確認の結果と、見つかって直した不具合は [banto-hub-t17-design.md](hub/banto-hub-t17-design.md) §1 の末尾。運用の手順は [banto-hub-operations.md](hub/banto-hub-operations.md) §11。

@@ -17,8 +17,7 @@ R1 の各画面（監視・ヒストリカル・日報・期間 CSV・表示グ�
 が実データで動く。データの源は Hub 経由・SLMP・Modbus の 3 ドライバで、Hub
 なしの単体でも動く。トレンドの設計は
 [../../docs/chronogazer/trend-design.md](../../docs/chronogazer/trend-design.md)、
-経緯と実機で確かめていない点は [../../docs/STATUS.md](../../docs/STATUS.md)
-（ローカルの引き継ぎ）と GitHub の Issue を参照。過去の実施計画は
+経緯と実機で確かめていない点は GitHub の Issue を参照。過去の実施計画は
 [../../docs/archive/r1-plan.md](../../docs/archive/r1-plan.md)。
 
 ## 起動方法
