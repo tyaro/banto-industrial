@@ -3479,7 +3479,7 @@
 	// PR #1282 の 4 回目のレビュー P2、`watchListStore.ts` 冒頭）。同時に 4 本まで。
 	// 上限（100）の最終の判定は口の周回の中だけで、落ちた件数はここ（`onChange`）でだけ知らせる。
 	const watchStore = createWatchListStore({
-		checkTagIds: (ids) => checkIdsConcurrently(ids, getTagPresence),
+		checkTagIds: (ids, onResult) => checkIdsConcurrently(ids, getTagPresence, undefined, onResult),
 		onChange: (change) => {
 			syncWatchState();
 			if (change.overLimit > 0) {

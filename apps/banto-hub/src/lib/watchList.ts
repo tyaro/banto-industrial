@@ -95,22 +95,32 @@ export const TAG_CHECK_CONCURRENCY = 4;
  * id ごとの照会 `checkOne` を、同時に `concurrency` 本までに絞って走らせる（PR #1282 の 4 回目の
  * レビュー P2。消えたかの判定は ID ごとの `GET /api/tags/{id}`、`watchListStore.ts` 冒頭）。
  * 結果には確定した id だけを入れる: `checkOne` が値を返せばその値、reject した id は入れない
- * （不明）。全体は reject しない。
+ * （不明）。全体は reject しない。`onResult` は 1 件ずつ、届いた順に（確定した id だけ）呼ぶ
+ * （全部が終わるのを待たずに結果を使うため。PR #1282 の 5 回目のレビュー P2）。
  */
 export async function checkIdsConcurrently<T>(
 	ids: readonly number[],
 	checkOne: (id: number) => Promise<T>,
-	concurrency: number = TAG_CHECK_CONCURRENCY
+	concurrency: number = TAG_CHECK_CONCURRENCY,
+	onResult?: (id: number, value: T) => void
 ): Promise<Map<number, T>> {
 	const result = new Map<number, T>();
 	let next = 0;
 	async function worker(): Promise<void> {
 		while (next < ids.length) {
 			const id = ids[next++];
+			let value: T;
 			try {
-				result.set(id, await checkOne(id));
+				value = await checkOne(id);
 			} catch {
 				// 不明（結果に入れない）。
+				continue;
+			}
+			result.set(id, value);
+			try {
+				onResult?.(id, value);
+			} catch {
+				// 通知の失敗は照会を止めない。
 			}
 		}
 	}

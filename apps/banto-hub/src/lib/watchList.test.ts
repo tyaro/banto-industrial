@@ -147,6 +147,26 @@ describe('checkIdsConcurrently', () => {
 		]);
 	});
 
+	it('onResult は届いた順に 1 件ずつ呼ぶ。失敗した id は呼ばない', async () => {
+		const order: Array<[number, string]> = [];
+		const delays: Record<number, number> = { 1: 30, 2: 10, 3: 20 };
+		await checkIdsConcurrently(
+			[1, 2, 3, 4],
+			async (id) => {
+				await new Promise((resolve) => setTimeout(resolve, delays[id] ?? 0));
+				if (id === 4) throw new Error('500');
+				return `v${id}`;
+			},
+			4,
+			(id, value) => order.push([id, value])
+		);
+		expect(order).toEqual([
+			[2, 'v2'],
+			[3, 'v3'],
+			[1, 'v1']
+		]);
+	});
+
 	it('空の id では照会しない', async () => {
 		const checkOne = vi.fn(async () => 'exists');
 		expect((await checkIdsConcurrently([], checkOne)).size).toBe(0);

@@ -338,7 +338,9 @@ describe('createWatchListStore', () => {
 		store.apply({ kind: 'add', ids: [1] });
 		await settle();
 		expect(server.saved()).toBe(serializeWatchList([1, 3]));
-		expect(checker.calls).toEqual([[2, 3]]);
+		// 3 は「生きている」と覚えないので周回の後の表示の確かめで照会し直されるが、1（手がかり）と
+		// 消えた 2 は二度と照会しない。
+		expect(checker.checked().filter((id) => id === 2)).toHaveLength(1);
 		expect(checker.checked()).not.toContain(1);
 		store.dispose();
 	});
@@ -684,6 +686,47 @@ describe('createWatchListStore', () => {
 		expect(server.saved()).toBe(serializeWatchList([1, 2]));
 		expect(getItem).not.toHaveBeenCalled();
 		expect(setItem).not.toHaveBeenCalled();
+		store.dispose();
+	});
+
+	it('7: 1 件が直ちに 404、別の 1 件が無応答でも、期限の時点で 404 を除いて足せる（#1282 5 回目 P2）', async () => {
+		const server = fakeProvider(serializeWatchList(range(1, 100)));
+		const A = 1;
+		const B = 2;
+		const C = 200;
+		const check = vi.fn(
+			(ids: readonly number[], onResult?: (id: number, p: TagPresence) => void) => {
+				for (const id of ids) {
+					if (id === B) continue;
+					onResult?.(id, id === A ? 'gone' : 'exists');
+				}
+				return new Promise<Map<number, TagPresence>>(() => undefined);
+			}
+		);
+		const { store, changes } = setup(server, { checkTagIds: check });
+		await store.load();
+		store.apply({ kind: 'add', ids: [C] });
+		await settle();
+		expect(server.set).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(VERIFY_BUDGET_MS);
+		await settle();
+		const expected = [...range(2, 100), C];
+		expect(server.saved()).toBe(serializeWatchList(expected));
+		expect(store.list).toEqual(expected);
+		expect(changes.filter((c) => c.overLimit > 0)).toEqual([]);
+		store.dispose();
+	});
+
+	it('8: 手がかりが先に届き、その後の GET で初めて見えた id も照会され、PUT なしで表示から落ちる', async () => {
+		const server = fakeProvider(serializeWatchList([1]));
+		const checker = fakeChecker([1]);
+		const { store } = setup(server, { checkTagIds: checker.check });
+		store.setKnownLiveIds([2]);
+		await store.load();
+		await settle();
+		expect(checker.checked()).toEqual([1]);
+		expect(store.list).toEqual([]);
+		expect(server.set).not.toHaveBeenCalled();
 		store.dispose();
 	});
 });

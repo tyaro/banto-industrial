@@ -37,12 +37,14 @@
  *    止まらない。消えたと確定した id を落とすのは「ついで」で、急がない。表示のための照会
  *    （`setKnownLiveIds`）は別に走る）。落ちる件数が 1 以上のときだけ、サーバーの値と操作で足す
  *    id のうち `known` にも `dead` にも無いものを照会し（上の「消えたかの判定」）、**全体で
- *    {@link VERIFY_BUDGET_MS} まで**待つ。期限で打ち切った id は不明のまま上限に数える。期限の後に
- *    届いた結果は `dead` に入れて表示だけ更新し、その周回の結果は変えない。待ってから当て直す。
+ *    {@link VERIFY_BUDGET_MS} まで**待つ。期限で打ち切った id は不明のまま上限に数える。結果は 1 件ずつ届き次第
+ *    `dead` に入れる（ほかの id が遅くても、確定した分は期限の判定に使う）。期限（または全件の
+ *    確定）の後に、その時点の `dead` で当て直す。期限の後に届いた結果は表示だけ更新する。
  * 3. サーバーの値（壊れていれば空）から `dead` を除き、先頭 `n` 件の操作を当てる。`n === 0`
  *    なら当てず書かない（`base` = サーバーの値）。
  * 4. 結果がサーバーの値と違う（壊れた値に操作で中身ができた場合も）なら `provider.set` で書く。
- * 5. 成功したら `base` を結果にし、先頭 `n` 件の操作を捨て、写しを書く。周回の間に来た操作が
+ * 5. 成功したら `base` を結果にし、先頭 `n` 件の操作を捨て、写しを書く。`known` があれば、一覧に
+ *    新しく見えた id の表示のための照会を待たずに走らせる（保存はしない）。周回の間に来た操作が
  *    残っていれば、すぐ次の周回。サーバーの値に当てて上限で落ちた件数は `onChange` で渡す
  *    （上限の最終の判定はここだけ。`apply` の手元の判定は仮で、知らせない。操作は成功の
  *    ときだけ捨てるので、同じ操作の上限超えを二度知らせない）。
@@ -151,9 +153,13 @@ export interface WatchListStoreDeps {
 	/**
 	 * id ごとの在否の照会（`GET /api/tags/{id}`、並列の数はページ側で絞る）。結果に入れた id
 	 * だけが確定（`gone` は消えた、`exists` は生きている）で、入れない id は不明（照会の失敗）。
-	 * reject は全件不明として扱う。無ければ照会しない（全部不明）。
+	 * reject は全件不明として扱う。無ければ照会しない（全部不明）。`onResult` は、1 件ずつ届き
+	 * 次第呼ぶ（呼ばなくてもよい。戻り値の Map も同じに扱う）。
 	 */
-	checkTagIds?: (ids: readonly number[]) => Promise<Map<number, TagPresence>>;
+	checkTagIds?: (
+		ids: readonly number[],
+		onResult?: (id: number, presence: TagPresence) => void
+	) => Promise<Map<number, TagPresence>>;
 }
 
 function defaultVisible(): boolean {
@@ -260,35 +266,46 @@ export function createWatchListStore(deps: WatchListStoreDeps = {}): WatchListSt
 	 * （冒頭「消えたかの判定」）。照会中の id は新しく照会せず、その結果を待つ。戻り値は、この
 	 * 呼び出しで `dead` が増えたか。dispose の後は結果を当てない。
 	 */
-	async function verify(ids: Iterable<number>): Promise<boolean> {
+	async function verify(ids: Iterable<number>): Promise<void> {
 		const check = deps.checkTagIds;
-		if (check === undefined) return false;
+		if (check === undefined) return;
 		const targets = [...new Set(ids)].filter((id) => !dead.has(id) && !known?.has(id));
 		const fresh = targets.filter((id) => !inflight.has(id));
 		if (fresh.length > 0) {
-			const batch = Promise.resolve()
-				.then(() => check(fresh))
-				.catch(() => new Map<number, TagPresence>());
+			// 1 件ごとの結果は届き次第 `dead` に入れる（ほかの id の照会が遅くても、先に確定した
+			// 結果は期限の判定に使える。PR #1282 の 5 回目のレビュー P2）。
+			const settlers = new Map<number, (presence: TagPresence | undefined) => void>();
 			for (const id of fresh) {
-				const one = batch.then((result) => result.get(id));
+				const one = new Promise<TagPresence | undefined>((resolve) => {
+					settlers.set(id, resolve);
+				});
 				inflight.set(id, one);
 				void one.finally(() => {
 					if (inflight.get(id) === one) inflight.delete(id);
 				});
 			}
+			const settle = (id: number, presence: TagPresence | undefined): void => {
+				const resolve = settlers.get(id);
+				if (resolve === undefined) return;
+				settlers.delete(id);
+				if (presence === 'gone' && !disposed && !dead.has(id)) {
+					dead.add(id);
+					notify();
+				}
+				resolve(presence);
+			};
+			void Promise.resolve()
+				.then(() => check(fresh, settle))
+				.then(
+					(result) => {
+						for (const id of fresh) settle(id, result.get(id));
+					},
+					() => {
+						for (const id of fresh) settle(id, undefined);
+					}
+				);
 		}
-		const results = await Promise.all(
-			targets.map(async (id) => [id, await inflight.get(id)] as const)
-		);
-		if (disposed) return false;
-		let grew = false;
-		for (const [id, presence] of results) {
-			if (presence === 'gone' && !dead.has(id)) {
-				dead.add(id);
-				grew = true;
-			}
-		}
-		return grew;
+		await Promise.all(targets.map((id) => inflight.get(id)));
 	}
 
 	/**
@@ -297,9 +314,7 @@ export function createWatchListStore(deps: WatchListStoreDeps = {}): WatchListSt
 	 * 結果は変えない。
 	 */
 	async function verifyWithin(ids: Iterable<number>, ms: number): Promise<void> {
-		const done = verify(ids).then((grew) => {
-			if (grew) notify();
-		});
+		const done = verify(ids);
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const expired = new Promise<void>((resolve) => {
 			timer = setTimeout(resolve, ms);
@@ -434,6 +449,9 @@ export function createWatchListStore(deps: WatchListStoreDeps = {}): WatchListSt
 		retryDelay = RETRY_BASE_MS;
 		writeLocal(next);
 		notify(overLimit);
+		// 周回で一覧が替わった後、手がかりがあれば、新しく見えた id の表示のための照会を待たずに
+		// 走らせる（自動の PUT はしない。5 回目のレビュー P3）。
+		if (known !== null) void verify(base);
 		return true;
 	}
 
@@ -462,9 +480,7 @@ export function createWatchListStore(deps: WatchListStoreDeps = {}): WatchListSt
 			if (disposed) return;
 			known = new Set(ids);
 			// 表示の確かめ: 周回とは別に走ってよい（同じ id の照会は `verify` が重ねない）。
-			void verify(list).then((grew) => {
-				if (grew) notify();
-			});
+			void verify(list);
 		},
 		load() {
 			kick();
