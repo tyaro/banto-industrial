@@ -61,6 +61,48 @@ test('Hub /tags: 初期のタグが見え、値が出て変わり、「再接続
 	expect(traffic.unsupported).toEqual([]);
 });
 
+test('Hub /tags: 下のログのパネルの初回の取得が済み、「読み込めません」も警告も出ない', async ({
+	page,
+	baseURL
+}) => {
+	const traffic = recordTraffic(page, new URL(baseURL!).origin);
+	// 取得は、パネルが画面に出てから（`setVisible`）始まる。デモの模擬は `window.fetch` の差し替えで
+	// ネットワークを通らないので、`waitForResponse` は使えない。差し替えの前後を包んで完了を数える。
+	await page.addInitScript(() => {
+		const w = window as unknown as { __logFeedDone: number; fetch: typeof fetch };
+		w.__logFeedDone = 0;
+		let current = window.fetch.bind(window);
+		const wrapped: typeof fetch = async (input, init) => {
+			const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+			const response = await current(input, init);
+			if (/\/api\/log-feed(\?|$)/.test(url)) w.__logFeedDone += 1;
+			return response;
+		};
+		Object.defineProperty(window, 'fetch', {
+			configurable: true,
+			get: () => wrapped,
+			set: (next: typeof fetch) => {
+				current = next;
+			}
+		});
+	});
+	await page.goto(TAGS_URL);
+	await expect(page.getByText(BANNER)).toBeVisible();
+	// 既定の配置では「ログ」は下に畳まれていて、見えるまで取得は始まらない（これが、前の E2E が
+	// 拾えなかった本当の理由）。見出しを押して出す。
+	await page.getByText('ログ', { exact: true }).last().click();
+	await page.waitForFunction(
+		() => (window as unknown as { __logFeedDone: number }).__logFeedDone >= 1
+	);
+
+	// 正常のときは状態の文言（`log-status`）自体が出ない。
+	await expect(page.getByTestId('log-status')).toHaveCount(0);
+	await expect(page.getByText('表示する記録はありません。')).toBeVisible();
+	await expect(page.getByText('読み込めません')).toHaveCount(0);
+	expect(traffic.unsupported).toEqual([]);
+	expect(traffic.forbidden()).toEqual([]);
+});
+
 test('Hub /tags: タグの追加・編集・削除が一覧に反映され、本物へは送らない', async ({
 	page,
 	baseURL

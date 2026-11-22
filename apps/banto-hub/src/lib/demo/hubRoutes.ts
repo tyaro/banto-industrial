@@ -171,6 +171,12 @@ export function createHubRoutes(registry: HubRegistry = new HubRegistry()): Demo
 		{ method: 'GET', path: '/api/commissioning/status', handle: () => json(commissioning) },
 		{ method: 'GET', path: '/api/status', handle: () => json(statusOf(registry)) },
 		{ method: 'GET', path: '/api/tag-catalog', handle: () => json(registry.catalog()) },
+		// 下のログのパネルの取得。デモには記録が無いので空を返す（cursor 等は受け流す）。
+		{
+			method: 'GET',
+			path: '/api/log-feed',
+			handle: () => json({ entries: [], cursor: 'demo', more: false })
+		},
 
 		// --- 接続 ---
 		{ method: 'GET', path: '/api/plc-connections', handle: () => json(registry.connections) },
