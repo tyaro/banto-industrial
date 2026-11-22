@@ -82,7 +82,7 @@ python3.12 -m venv /tmp/banto-hub-opcua-interop-venv
 /tmp/banto-hub-opcua-interop-venv/bin/python interop/opcua/smoke.py target/debug/banto-hub
 ```
 
-検証範囲と未実施の Windows Service / UaExpert 手動確認は
+自動試験の範囲と Windows Service / UaExpert の手動試験の結果は
 [../../docs/testing/banto-hub-opcua-verification.md](../../docs/testing/banto-hub-opcua-verification.md)
 を参照。
 
