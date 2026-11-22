@@ -4,7 +4,8 @@ import {
 	addToWatch,
 	applyWatchOps,
 	parseWatchList,
-	pruneMissing,
+	confirmedDeadIds,
+	withoutIds,
 	removeFromWatch,
 	sameWatchList,
 	serializeWatchList,
@@ -44,13 +45,14 @@ describe('addToWatch', () => {
 	});
 });
 
-describe('removeFromWatch / pruneMissing / sameWatchList', () => {
+describe('removeFromWatch / withoutIds / sameWatchList', () => {
 	it('1 件外す', () => {
 		expect(removeFromWatch([1, 2, 3], 2)).toEqual([1, 3]);
 	});
 
-	it('存在しない id を落とし、順は変えない', () => {
-		expect(pruneMissing([5, 1, 9, 3], new Set([1, 3, 5]))).toEqual([5, 1, 3]);
+	it('与えた id を落とし、順は変えない', () => {
+		expect(withoutIds([5, 1, 9, 3], new Set([9]))).toEqual([5, 1, 3]);
+		expect(withoutIds([5, 1], new Set())).toEqual([5, 1]);
 	});
 
 	it('順序も含めて比べる', () => {
@@ -99,13 +101,12 @@ describe('watchListKeys', () => {
 });
 
 describe('applyWatchOps', () => {
-	it('足す・外す・すべて外す・消えた id の除去を順に当て、基準は書き換えない', () => {
+	it('足す・外す・すべて外すを順に当て、基準は書き換えない', () => {
 		const base = [1, 2];
 		expect(
 			applyWatchOps(base, [
 				{ kind: 'add', ids: [3, 2] },
 				{ kind: 'remove', id: 1 },
-				{ kind: 'prune', existing: new Set([2, 3, 4]) },
 				{ kind: 'add', ids: [4] }
 			])
 		).toEqual([2, 3, 4]);
@@ -115,5 +116,21 @@ describe('applyWatchOps', () => {
 
 	it('足すときの上限は addToWatch と同じ', () => {
 		expect(applyWatchOps([1, 2], [{ kind: 'add', ids: [3, 4] }], 3)).toEqual([1, 2, 3]);
+	});
+});
+
+describe('confirmedDeadIds', () => {
+	it('一覧に無く、一覧の最大の id より小さい id だけが消えた扱い', () => {
+		expect([...confirmedDeadIds([1, 2, 3], [1, 3])]).toEqual([2]);
+	});
+
+	it('一覧の最大より大きい id（別のタブで作ったばかり）は消えた扱いにしない', () => {
+		expect([...confirmedDeadIds([1, 2], [1])]).toEqual([]);
+		expect([...confirmedDeadIds([5, 9], [1, 7])]).toEqual([5]);
+	});
+
+	it('最大と同じ id・一覧にある id・空の一覧では何も消えない', () => {
+		expect([...confirmedDeadIds([7], [1, 7])]).toEqual([]);
+		expect([...confirmedDeadIds([1, 2], [])]).toEqual([]);
 	});
 });

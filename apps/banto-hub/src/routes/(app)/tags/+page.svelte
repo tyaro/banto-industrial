@@ -109,8 +109,8 @@
 	import { createDockLayoutStore } from '#lib/dockLayoutStore.js';
 	import LogPanel from '#lib/components/LogPanel.svelte';
 	import WatchPanel, { type WatchRowView } from '#lib/components/WatchPanel.svelte';
-	import { createWatchListStore } from '#lib/watchListStore.js';
-	import { WATCH_LIMIT, type WatchOp } from '#lib/watchList.js';
+	import { createWatchListStore, type WatchSaveStatus } from '#lib/watchListStore.js';
+	import { WATCH_LIMIT, confirmedDeadIds, type WatchOp } from '#lib/watchList.js';
 	import { createLogFeedState } from '#lib/banto/logFeedState.svelte.js';
 	import { isDockPanelOnScreen } from '#lib/dockPanelOnScreen.js';
 	import { persistThreePaneLayout } from '#lib/dockLayoutPersist.svelte.js';
@@ -3466,25 +3466,31 @@
 	//
 	// 見張っているタグの一覧（id の配列）は利用者ごとにサーバーへ保存する（`watchListStore.ts`）。
 	// 一覧の変更はすべて操作（`WatchOp`）として保存の口に渡し、表示は口の `list` を写す。
-	// サーバーの保存値が確定する前の操作は口が溜めて、確定した基準に当て直す（写しや空から
-	// 作った一覧でサーバーの一覧を消さない。PR #1282 のレビュー）。
+	// 口は「サーバーの値 + まだ確かめられていない操作」を正とし、PUT が成功するまで操作を
+	// 捨てず、周回のたびにサーバーの最新の値へ当て直す（PR #1282 のレビュー、2026-11-22 の
+	// 作り直し）。保存の状態（`status`）は窓に出す（保存中・保存できていません・保存できません）。
 	// 値は、ツリーの購読（上の `valueStream`）とは別の 2 本目のストリームで、見張っている
 	// タグを**タグ ID で**購読し、値も ID で持つ（2026-11-22 オーナー決定、PR #1282 の再レビュー。
 	// 外部名の形（ドット入りの接続名・グループ名）や、外部名の別のタグへの使い回しに左右され
 	// ない。`tagValueStream.svelte.ts` 冒頭）。窓が画面に出ている間だけ、かつ一覧が空でない
 	// ときだけ繋ぐ。
-	// 読みに失敗したら、口が間隔を延ばしながら確定するまで読み直す（操作を受けたとき・
-	// config_changed のときは待たずに読む）。口の状態が変わるたびに `onChange` で写す。
-	const watchStore = createWatchListStore({ onChange: () => syncWatchState() });
+	const watchStore = createWatchListStore({
+		onChange: (change) => {
+			syncWatchState();
+			if (change.overLimit > 0) {
+				toastStore.push(
+					'error',
+					`見張りは ${WATCH_LIMIT} タグまでです。保存の一覧が上限に達していたため、${change.overLimit} 件は足していません。`
+				);
+			}
+		}
+	});
 	onDestroy(() => watchStore.dispose());
 	let watchIds = $state<number[]>(watchStore.list);
-	let watchConfirmed = $state(false);
-	/** 操作がまだ保存されていない（窓に「保存待ち」を出す）。 */
-	let watchUnsaved = $state(false);
+	let watchStatus = $state<WatchSaveStatus>(watchStore.status);
 	function syncWatchState(): void {
 		watchIds = watchStore.list;
-		watchConfirmed = watchStore.confirmed;
-		watchUnsaved = watchStore.unsaved;
+		watchStatus = watchStore.status;
 	}
 	function applyWatchOp(op: WatchOp): ReturnType<typeof watchStore.apply> {
 		const result = watchStore.apply(op);
@@ -3492,12 +3498,19 @@
 		return result;
 	}
 	void watchStore.load();
-	// 消されたタグは、サーバーの基準が確定し、タグ一覧を読んだ後に一覧から落とす（保存し直される）。
-	// 確定する前は落とさない（写しの消えた id を落としても、サーバーの一覧を守れない）。
+	// 消されたタグ（PR #1282 の再レビュー P2-2）: 保存の一覧から自動で消すための PUT はしない。
+	// 「消えたと確かめた」id（同じ 1 回のタグ一覧に無く、その一覧の最大の id より小さい。
+	// `confirmedDeadIds`。タグ ID は再利用されず、`GET /api/tags` は絞り込み・ページ分けの無い
+	// 全件）だけを口に渡し、口は表示から外し、利用者の操作で保存するついでに落とす。
+	// こちらの一覧が古くても（読み直しの保留中など）、別のタブで作ったタグはその一覧の最大より
+	// 大きいので消えた扱いにならない。
+	// 判定の対象は `dead` を除く前の id（`deadCandidates`。除いた後の `watchIds` で判定すると、
+	// 除いた id が次の判定から外れて消えた扱いが解ける）。`watchIds` は読み直しの合図に読む。
 	$effect(() => {
-		if (!registryLoaded || !watchConfirmed) return;
-		const existing = new Set(tags.map((t) => t.id));
-		untrack(() => applyWatchOp({ kind: 'prune', existing }));
+		if (!registryLoaded) return;
+		void watchIds;
+		const tagIds = tags.map((t) => t.id);
+		untrack(() => watchStore.setDeadIds(confirmedDeadIds(watchStore.deadCandidates, tagIds)));
 	});
 
 	const watchedTags = $derived.by(() => {
@@ -8333,7 +8346,8 @@
 		onRemove={(id) => applyWatchOp({ kind: 'remove', id })}
 		onClear={() => applyWatchOp({ kind: 'clear' })}
 		onResume={watchStream.resume}
-		unsaved={watchUnsaved}
+		saveStatus={watchStatus}
+		onRetrySave={() => watchStore.retryNow()}
 	/>
 {/snippet}
 

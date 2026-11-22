@@ -7,11 +7,12 @@
  * - 一覧はタグの id の配列（順序つき・重複なし・最大 {@link WATCH_LIMIT} 件）。窓は 1 つだけ。
  * - 保存は利用者ごと（サーバーは `hub.watch.v1`、localStorage の写しは持ち主ごと）。ドックの
  *   配置とは別のキーで持つ（配置の版を上げずに済む）。
- * - 一覧の変更は「操作」（{@link WatchOp}: 足す・外す・すべて外す・消えた id の除去）で表し、
- *   {@link applyWatchOps} で基準の一覧に当てる。サーバーの保存値が確定する前の操作を溜めて、
- *   確定した基準に当て直すため（端末の写しから作った一覧でサーバーの一覧を消さない。
- *   `watchListStore.ts` 冒頭）。
- * - 消されたタグの id は、サーバーの基準が確定し、タグ一覧を取得した後に `prune` の操作で落とす。
+ * - 一覧の変更は利用者の「操作」（{@link WatchOp}: 足す・外す・すべて外す）で表し、
+ *   {@link applyWatchOps} で基準の一覧に当てる。保存の口は、PUT が成功するまで操作を捨てず、
+ *   周回のたびにサーバーの最新の値へ当て直す（`watchListStore.ts` 冒頭）。
+ * - 消されたタグは操作にしない（PR #1282 の再レビュー P2-2。古いタグ一覧を根拠に、別のタブで
+ *   足した実在のタグを保存から消さないため）。「消えたと確かめた」id（{@link confirmedDeadIds}）
+ *   を口に渡し、表示から外し、利用者の操作で保存するついでにだけ保存の一覧から落とす。
  * - 購読はタグ ID で行う（WS の `subscribe` の `ids`、2026-11-22 オーナー決定。
  *   `tagValueStream.svelte.ts` 冒頭）。外部名の形・使い回しに左右されない。
  */
@@ -81,20 +82,49 @@ export function removeFromWatch(list: readonly number[], id: number): number[] {
 	return list.filter((x) => x !== id);
 }
 
-/** 存在しなくなったタグの id を落とす（残りの順は変えない）。 */
-export function pruneMissing(list: readonly number[], existing: ReadonlySet<number>): number[] {
-	return list.filter((id) => existing.has(id));
+/** 与えた id を落とす（残りの順は変えない）。 */
+export function withoutIds(list: readonly number[], drop: ReadonlySet<number>): number[] {
+	return drop.size === 0 ? [...list] : list.filter((id) => !drop.has(id));
 }
 
 /**
- * 一覧への 1 回の操作。サーバーの基準が確定する前は溜めておき、確定した基準に当て直す
- * （`watchListStore.ts`）。`prune` の `existing` はその時点のタグ一覧の id。
+ * 見張りの一覧のうち「消えたと確かめた」id（PR #1282 の再レビュー P2-2）。
+ *
+ * タグ ID は再利用されない（`crates/banto-tags/migrations/0003_tags.sql` の
+ * `INTEGER PRIMARY KEY AUTOINCREMENT`。表を作り直す `0018` は採番位置を引き継ぐ）。そこで、
+ * **同じ 1 回のタグ一覧**（`tagIds`）の中にその id が無く、かつ id がその一覧の最大の id より
+ * 小さければ、その id のタグはその一覧を取った時点で消えていたと言える。別のタブで作った
+ * ばかりのタグは、こちらの古い一覧の最大より大きいので消えた扱いにならない（読み直しが
+ * 編集の保護で保留中でも安全）。
+ *
+ * 前提: `tagIds` は絞り込み・権限・ページ分けの無い全件（`GET /api/tags` は `ListParams` の
+ * 既定 = LIMIT なし・フィルタなしで全件を返し、閲覧者でも絞らない。`rest/tags.rs` の
+ * `tags_list`）。全件でない一覧を渡してはいけない。
+ */
+export function confirmedDeadIds(
+	watchIds: readonly number[],
+	tagIds: Iterable<number>
+): Set<number> {
+	const have = new Set<number>();
+	let max = -Infinity;
+	for (const id of tagIds) {
+		have.add(id);
+		if (id > max) max = id;
+	}
+	const dead = new Set<number>();
+	for (const id of watchIds) {
+		if (!have.has(id) && id < max) dead.add(id);
+	}
+	return dead;
+}
+
+/**
+ * 利用者の一覧への 1 回の操作。保存の口は PUT が成功するまで溜めておき、周回のたびに
+ * サーバーの値へ当て直す（`watchListStore.ts`）。当て直しても同じ結果になる形だけにする
+ * （足すは重複を足さない、外すは無ければ何もしない）。
  */
 export type WatchOp =
-	| { kind: 'add'; ids: readonly number[] }
-	| { kind: 'remove'; id: number }
-	| { kind: 'clear' }
-	| { kind: 'prune'; existing: ReadonlySet<number> };
+	{ kind: 'add'; ids: readonly number[] } | { kind: 'remove'; id: number } | { kind: 'clear' };
 
 /**
  * 1 つの操作を当てる。足すときの上限・重複の扱いは {@link addToWatch} と同じ。足す以外の
@@ -112,8 +142,6 @@ export function applyWatchOp(
 			return { list: removeFromWatch(list, op.id), added: 0, duplicates: 0, overLimit: 0 };
 		case 'clear':
 			return { list: [], added: 0, duplicates: 0, overLimit: 0 };
-		case 'prune':
-			return { list: pruneMissing(list, op.existing), added: 0, duplicates: 0, overLimit: 0 };
 	}
 }
 

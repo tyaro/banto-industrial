@@ -150,11 +150,16 @@ pub fn interval_floor_ms(patterns: &[TagPattern], map: &TagMap) -> i64 {
         .max(EVAL_TICK_MS)
 }
 
-/// on_change の diff 基準(外部名 → 直近の値/品質/未確認)。単なる型複雑度
+/// on_change の diff 基準(外部名 → 直近のタグ ID/値/品質/未確認)。単なる型複雑度
 /// 回避のエイリアス(clippy::type_complexity)。未確認も入れるのは、評価の
 /// 1 周期の間に未確認の Bad → Good → Bad と動いて値・品質が元に戻ったとき、
 /// 「未確認」のまま送り直されずに残らないようにするため。
-pub type DiffBaseline = HashMap<String, (Option<f64>, Quality, bool)>;
+///
+/// タグ ID も入れる(#1254、PR #1282 の再レビュー P3): キーは外部名のまま
+/// (`TagMap` は外部名ごとに 1 件)だが、外部名が別の ID のタグに移ったとき、
+/// 値・品質・未確認が同じでも新しい ID を知らせる(ID で値を引く購読者が、
+/// 旧 ID のまま新しいタグの値を見落とさないように)。
+pub type DiffBaseline = HashMap<String, (i64, Option<f64>, Quality, bool)>;
 
 /// 1タグの評価済みの値 - transport 非依存の表現。`crate::stream::ValueWire`
 /// (JSON)/gRPC の `TagValue`(proto)へはここから変換する。
@@ -247,7 +252,7 @@ pub fn initial_values(
         .into_iter()
         .map(|entry| {
             let (v, q, t, unverified) = read_resolved(entry, current, server_store, now_ms);
-            last.insert(entry.external_name.clone(), (v, q, unverified));
+            last.insert(entry.external_name.clone(), (entry.ids.2, v, q, unverified));
             ResolvedValue {
                 tag: entry.external_name.clone(),
                 id: entry.ids.2,
@@ -290,9 +295,13 @@ pub fn evaluate(
                 let (v, q, t, unverified) = read_resolved(entry, current, server_store, now_ms);
                 still_present.insert(entry.external_name.clone());
 
+                let id = entry.ids.2;
                 let changed = match sub.last.get(entry.external_name.as_str()) {
-                    Some((prev_v, prev_q, prev_unverified)) => {
-                        *prev_v != v || *prev_q != q || *prev_unverified != unverified
+                    Some((prev_id, prev_v, prev_q, prev_unverified)) => {
+                        *prev_id != id
+                            || *prev_v != v
+                            || *prev_q != q
+                            || *prev_unverified != unverified
                     }
                     // 新規にマッチしたタグ(ワイルドカード購読が構成変更後に
                     // 拾った新タグ等)は初回として必ず1回送る。
@@ -300,10 +309,10 @@ pub fn evaluate(
                 };
                 if changed {
                     sub.last
-                        .insert(entry.external_name.clone(), (v, q, unverified));
+                        .insert(entry.external_name.clone(), (id, v, q, unverified));
                     changed_values.push(ResolvedValue {
                         tag: entry.external_name.clone(),
-                        id: entry.ids.2,
+                        id,
                         v,
                         q,
                         t,
@@ -578,5 +587,81 @@ mod id_pattern_tests {
         let after = map_of(vec![entry("c", "g", "a", 2)]);
         assert!(evaluate(&mut sub, &after, None, &store, 1, None).is_none());
         assert!(picked(&sub.patterns, &after).is_empty());
+    }
+
+    fn name_sub(names: &[&str], mode: Mode) -> Subscription {
+        Subscription {
+            patterns: names
+                .iter()
+                .map(|n| TagPattern::parse(n).unwrap())
+                .collect(),
+            mode,
+            last: DiffBaseline::new(),
+            next_due_ms: 0,
+        }
+    }
+
+    fn sent(values: Option<Vec<ResolvedValue>>) -> Vec<(String, i64)> {
+        values
+            .unwrap_or_default()
+            .into_iter()
+            .map(|v| (v.tag, v.id))
+            .collect()
+    }
+
+    /// P3(PR #1282 の再レビュー): 外部名が別 ID に移り、値・品質・未確認が同じでも、
+    /// 新しい ID で 1 回送る。ID も値も同じなら送らない。
+    #[test]
+    fn on_change_resends_when_the_external_name_moves_to_another_id() {
+        let store = ServerTagStore::new();
+        let mut sub = name_sub(&["c.g.a"], Mode::OnChange);
+        let before = map_of(vec![entry("c", "g", "a", 1)]);
+        let (_, last) = initial_values(&sub.patterns, &before, None, &store, 0, None);
+        sub.last = last;
+        assert!(evaluate(&mut sub, &before, None, &store, 1, None).is_none());
+
+        let after = map_of(vec![entry("c", "g", "a", 2)]);
+        assert_eq!(
+            sent(evaluate(&mut sub, &after, None, &store, 2, None)),
+            vec![("c.g.a".to_string(), 2)]
+        );
+        assert!(evaluate(&mut sub, &after, None, &store, 3, None).is_none());
+    }
+
+    #[test]
+    fn on_change_resends_both_when_two_ids_swap_external_names() {
+        let store = ServerTagStore::new();
+        let mut sub = name_sub(&["c.g.a", "c.g.b"], Mode::OnChange);
+        let before = map_of(vec![entry("c", "g", "a", 1), entry("c", "g", "b", 2)]);
+        let (_, last) = initial_values(&sub.patterns, &before, None, &store, 0, None);
+        sub.last = last;
+        assert!(evaluate(&mut sub, &before, None, &store, 1, None).is_none());
+
+        let swapped = map_of(vec![entry("c", "g", "a", 2), entry("c", "g", "b", 1)]);
+        let mut got = sent(evaluate(&mut sub, &swapped, None, &store, 2, None));
+        got.sort();
+        assert_eq!(
+            got,
+            vec![("c.g.a".to_string(), 2), ("c.g.b".to_string(), 1)]
+        );
+    }
+
+    /// interval は ID の変化に関わらず、発火時刻に全マッチ行を送る(変わらない)。
+    #[test]
+    fn interval_is_unchanged_by_the_id_in_the_baseline() {
+        let store = ServerTagStore::new();
+        let mut sub = name_sub(&["c.g.a"], Mode::Interval { interval_ms: 1_000 });
+        let before = map_of(vec![entry("c", "g", "a", 1)]);
+        assert_eq!(
+            sent(evaluate(&mut sub, &before, None, &store, 0, None)),
+            vec![("c.g.a".to_string(), 1)]
+        );
+        assert!(evaluate(&mut sub, &before, None, &store, 500, None).is_none());
+        let after = map_of(vec![entry("c", "g", "a", 2)]);
+        assert!(evaluate(&mut sub, &after, None, &store, 900, None).is_none());
+        assert_eq!(
+            sent(evaluate(&mut sub, &after, None, &store, 1_000, None)),
+            vec![("c.g.a".to_string(), 2)]
+        );
     }
 }

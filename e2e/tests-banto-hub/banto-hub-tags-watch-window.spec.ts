@@ -6,9 +6,11 @@
  * 2. 再読み込みの後も一覧が残る（利用者ごとにサーバーへ保存。`hub.watch.v1`）。
  * 3. 行の右クリックのメニュー「見張りに足す」で足せる。同じタグを重ねて足さない。
  * 4. 行ごとの「外す」・「すべて外す」で外せ、保存も空になる。
- * 5. 保存値の初回の GET が失敗したら、足した見張りは「保存待ち」になり、読み直しで確定して
- *    保存される（再読み込みの後も残る）。PR #1282 の再レビュー。
- * 6. 見張りはタグ ID で購読し、値も ID で引く（`page.routeWebSocket` で `/api/v1/stream` を
+ * 5. 保存値の初回の GET が失敗しても窓には何も出さず、足した見張りは「保存中」になり、
+ *    読み直しで確定して保存される（再読み込みの後も残る）。PR #1282 の再レビュー。
+ * 6. GET は通り、最初の PUT だけ失敗したら「保存できていません」と「今すぐ再試行」が出て、
+ *    押すと保存される（再読み込みの後も残る）。PR #1282 の再レビュー P2-1。
+ * 7. 見張りはタグ ID で購読し、値も ID で引く（`page.routeWebSocket` で `/api/v1/stream` を
  *    差し替えて値を注入する。`banto-hub-tags-values.spec.ts` と同じ流儀）。同じ外部名の別 ID の
  *    値は行に出ない。
  *
@@ -172,9 +174,9 @@ test.describe.serial('banto-hub 値を見張る窓 (#1254)', () => {
 		await expect.poll(savedWatchIds).toEqual([]);
 	});
 
-	test('5. 保存値の初回の GET が失敗しても、保存待ちを出して読み直し、確定したら保存する', async () => {
-		// 初回の GET だけ失敗させ、2 回目以降の GET は `releaseGet()` まで返さない（保存待ちを
-		// 確かめる間、読み直しが確定しないように）。PUT はそのまま通す。
+	test('5. 保存値の初回の GET が失敗しても、足した見張りは「保存中」を出し、読み直して保存する', async () => {
+		// 初回の GET だけ失敗させ、2 回目以降の GET は `releaseGet()` まで返さない（保存中を
+		// 確かめる間、周回が終わらないように）。PUT はそのまま通す。
 		let gets = 0;
 		let releaseGet: () => void = () => undefined;
 		const released = new Promise<void>((resolve) => {
@@ -196,13 +198,13 @@ test.describe.serial('banto-hub 値を見張る窓 (#1254)', () => {
 		await page.getByTestId('tag-watch-add').click();
 		await expect(panel()).toBeVisible();
 		await expect(watchRows()).toHaveCount(1);
-		await expect(panel().getByTestId('watch-unsaved')).toContainText('保存待ち');
-		// 操作で読み直しが前倒しされた（待っている 2 回目の GET）。まだ保存しない。
+		await expect(panel().getByTestId('watch-save-status')).toContainText('保存中');
+		// 操作で再試行の待ちが打ち切られた（待っている 2 回目の GET）。まだ保存しない。
 		await expect.poll(() => gets).toBeGreaterThanOrEqual(2);
 		expect(await savedWatchIds()).toEqual([]);
 
 		releaseGet();
-		await expect(panel().getByTestId('watch-unsaved')).toHaveCount(0);
+		await expect(panel().getByTestId('watch-save-status')).toHaveCount(0);
 		await expect.poll(savedWatchIds).toEqual([tagIds[0]]);
 
 		await page.unroute('**/api/ui-settings/hub.watch.v1');
@@ -213,7 +215,46 @@ test.describe.serial('banto-hub 値を見張る窓 (#1254)', () => {
 		await expect(watchRows().first()).toContainText(NAME_A);
 	});
 
-	test('6. 見張りはタグ ID で購読し、値を ID で引く（同じ外部名の別 ID の値は出ない）', async () => {
+	test('6. 最初の PUT だけ失敗したら「保存できていません」を出し、再試行で保存する', async () => {
+		// 確かめ終わるまで PUT を失敗させる（口の自動の再送（2 秒後）が先に通らないように）。
+		let puts = 0;
+		let failPut = true;
+		await page.route('**/api/ui-settings/hub.watch.v1', async (route) => {
+			if (route.request().method() !== 'PUT') return route.continue();
+			puts += 1;
+			if (failPut) return route.fulfill({ status: 500, body: 'injected failure' });
+			return route.continue();
+		});
+		await page.getByPlaceholder('名前・アドレスで検索').fill(`e2e-watch-`);
+		await page.getByRole('gridcell', { name: TAG_B, exact: true }).click();
+		await page.getByTestId('tag-watch-add').click();
+		await expect(watchRows()).toHaveCount(2);
+		await expect(panel().getByTestId('watch-save-status')).toContainText('保存できていません');
+		const retry = panel().getByTestId('watch-save-retry');
+		await expect(retry).toHaveText('今すぐ再試行');
+		expect(await savedWatchIds()).toEqual([tagIds[0]]);
+
+		failPut = false;
+		// 押す前に自動の再送が通っていれば、ボタンはもう無い（どちらでも保存される）。
+		await retry.click({ timeout: 2_000 }).catch(() => undefined);
+		await expect(panel().getByTestId('watch-save-status')).toHaveCount(0);
+		await expect.poll(savedWatchIds).toEqual([tagIds[0], tagIds[1]]);
+		expect(puts).toBeGreaterThanOrEqual(2);
+
+		await page.unroute('**/api/ui-settings/hub.watch.v1');
+		await page.reload();
+		await expect(page.getByRole('heading', { level: 2, name: 'タグ登録' })).toBeVisible();
+		if (!(await panel().isVisible())) await openWatchFromViewMenu();
+		await expect(watchRows()).toHaveCount(2);
+		await expect(panel()).toContainText(NAME_B);
+
+		// 次の試験のために B を外す（ふつうに保存される）。
+		await watchRows().filter({ hasText: NAME_B }).getByTestId('watch-remove').click();
+		await expect(watchRows()).toHaveCount(1);
+		await expect.poll(savedWatchIds).toEqual([tagIds[0]]);
+	});
+
+	test('7. 見張りはタグ ID で購読し、値を ID で引く（同じ外部名の別 ID の値は出ない）', async () => {
 		type Subscribe = { op: string; id: number; tags?: string[]; ids?: number[] };
 		let watchSocket: WebSocketRoute | null = null;
 		let watchSubscribe: Subscribe | null = null;
