@@ -14,7 +14,9 @@
 #             ├─ linux-clippy           （条件付き。昇格まわりの 2 crate を ubuntu で）
 #             ├─ driver-api             （条件付き。公開する banto-driver-api・conformance の MSRV・features・semver）
 #             ├─ e2e-chronogazer        （条件付き）
-#             └─ e2e-hub                （条件付き）
+#             ├─ e2e-hub                （条件付き）
+#             └─ e2e-demo-pages         （条件付き。Rust なし。ブラウザで触れるデモを組み立て、静的な配信の上で E2E。
+#                                        デモの経路（模擬・入口・設定）・root の依存に触れたときと、フル CI のとき）
 #   ci-gate（必ず。if: always()）: 上の全ジョブを見て、failure / cancelled、または
 #   「走るべきなのに skipped」があれば fail。条件で skipped になったものは成功扱い。
 #   **ブランチ保護の Required Check は `ci-gate` 1 つに集約する**（ジョブを増減しても
@@ -47,7 +49,11 @@
 #   共有 crate の変更のときだけ（PR）。host のほかの場所を壊した変更は PR では気づかず、main の
 #   push で初めて落ちうる。オーナーが受け入れた（2026-11-22）。
 # - `packages/**`（共通のフロントの部品。いまは packages/trend）は frontend-chronogazer
-#   （その中で部品の check・test も回す）。
+#   （その中で部品の check・test も回す）。`packages/demo-backend`（デモの模擬）は両アプリが
+#   import するので frontend-hub も走る。
+# - e2e-demo-pages（デモの組み立て + E2E）は、ci-changes.mjs の `DEMO_PATHS`（RULES とは独立に
+#   変更ファイルの全部へ当てる）に触れたときと、root の依存・設定（frontend_all）を変えたとき。
+#   ほかの画面だけの変更では走らない。
 #
 # テストは cargo-nextest（`--profile ci`、設定は `.config/nextest.toml`）で走らせる
 # （#ci-speed、2026-10-19。それまでは rust ジョブ 1 本で fmt / clippy / nextest /
@@ -125,6 +131,7 @@ jobs:
       run_linux_clippy: ${{ steps.classify.outputs.run_linux_clippy }}
       run_e2e_hub: ${{ steps.classify.outputs.run_e2e_hub }}
       run_e2e_chronogazer: ${{ steps.classify.outputs.run_e2e_chronogazer }}
+      run_e2e_demo_pages: ${{ steps.classify.outputs.run_e2e_demo_pages }}
     steps:
       # pull_request では checkout は PR のマージコミット（refs/pull/N/merge）。
       # fetch-depth: 2 でその 2 つの親（1 本目 = ベースの先端、2 本目 = PR の先端）
@@ -1459,6 +1466,55 @@ jobs:
           path: e2e/playwright-report-banto-hub/
           retention-days: 7
 
+  # ブラウザで触れるデモ（GitHub Pages）の組み立てと E2E（docs/demo-pages-design.md §3.6）。
+  # 模擬の経路を変えた PR で、組み立て（`pnpm demo:build`）が通り、fallback の無い静的な
+  # 配信の上で直に開く・読み直す・送信 0 件が保てていることを確かめる。配信はしない
+  # （配信は deploy-demo.yml を手で）。Rust は使わない。
+  e2e-demo-pages:
+    name: E2E demo-pages (Playwright)
+    needs: changes
+    if: needs.changes.outputs.run_e2e_demo_pages == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck demo-backend
+        run: pnpm --filter @banto-industrial/demo-backend check
+
+      - name: Unit tests demo-backend
+        run: pnpm --filter @banto-industrial/demo-backend test
+
+      - name: Build demo pages
+        run: pnpm demo:build
+
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run E2E suite (demo-pages)
+        run: pnpm e2e:demo-pages
+
+      - name: Upload Playwright report (demo-pages)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report-demo-pages
+          path: e2e/playwright-report-demo-pages/
+          retention-days: 7
+
   # Required Check 用の最終ゲート（#468）。必ず走り、
   # - changes が success でなければ fail（判定できていない = 何も保証できない）
   # - どのジョブでも failure / cancelled があれば fail
@@ -1481,6 +1537,7 @@ jobs:
       - driver-api
       - e2e-chronogazer
       - e2e-hub
+      - e2e-demo-pages
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -1530,5 +1587,6 @@ jobs:
           check driver-api run_driver_api
           check e2e-chronogazer run_e2e_chronogazer
           check e2e-hub run_e2e_hub
+          check e2e-demo-pages run_e2e_demo_pages
 
           exit "$fail"

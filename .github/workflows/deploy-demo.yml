@@ -1,0 +1,138 @@
+# ブラウザで触れるデモ（GitHub Pages）の配信（docs/demo-pages-design.md §3.5）。
+#
+# - **リリースのたびに手で走らせる**（`workflow_dispatch` だけ。2026-11-22 オーナー決定）。
+#   push・PR・タグでは走らない。`ref` に入れられるのは `main` かリリースのタグ名
+#   （`v*`。例 `v0.3.0-alpha.4`）だけ（既定は main）。ほかのブランチ・ref は断る。
+# - **公開の関門**（2026-11-23 オーナーのレビュー #1309）: 「公開の関門」ステップが、
+#   チェックアウトした版に `e2e/tests-demo-pages/public-gate.spec.ts` が無ければ落とす。
+#   このファイルは 2b-2（共通ナビを対象の画面だけに絞る・ログアウトを隠す／「デモを最初から」
+#   に替える・組み立てた成果物でメニュー操作を確かめる）で足される。後段の E2E ゲートは
+#   対象の ref 自身の試験を走らせるので、「このファイルがある + E2E が通る」ことが
+#   公開の条件が満たされている証拠になる。2b-2 より前の版にはこのファイルが無く、
+#   配信できない（2b-2 が入るまで、このワークフローは必ずここで落ちる。意図どおり）。
+# - 何を作るか: `pnpm demo:build`（scripts/build-demo-pages.mjs）が Hub（/tags）と
+#   ChronoGazer（/tags・/monitor）の画面を、通信の境目（fetch・WebSocket）を模擬に
+#   差し替えて静的に書き出す（出力は `target/demo-pages/`）。バックエンドは動かさない。
+# - **配信の前に、組み立てた成果物そのものに対して E2E（`pnpm e2e:demo-pages`）を
+#   ゲートとして走らせる**（fallback の無い静的な配信の上で、対象のルートを直に開く・
+#   読み直す・外への送信が 0 件、を確かめる）。落ちたら配信しない。
+# - 公開先: https://tyaro.github.io/banto-industrial/
+#   （リポジトリの Settings → Pages の Source を「GitHub Actions」にしておく）。
+# - 普段の PR では配信はしない。模擬の経路を変えた PR は ci.yml の e2e-demo-pages
+#   ジョブが同じ組み立てと E2E を回す。
+name: Deploy demo (GitHub Pages)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '配信する ref（main かリリースのタグ名 v*。既定は main）'
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+env:
+  # 2b-2 で足す公開の関門の試験。チェックアウトした版に無ければ配信しない。
+  DEMO_PUBLIC_GATE_SPEC: e2e/tests-demo-pages/public-gate.spec.ts
+
+# Pages への配信は同時に 1 本だけ。走っているものは止めない（途中で切ると公開が中途半端になる）。
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build demo pages + E2E gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      # `inputs.ref` は env 経由で受け、run の中へ直に展開しない。main かリリースのタグ
+      # （v で始まる）だけを許し、完全修飾の ref にしてブランチがタグを装えないようにする。
+      - name: Validate ref
+        id: ref
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          if [[ "$INPUT_REF" == "main" ]]; then
+            echo "checkout_ref=refs/heads/main" >> "$GITHUB_OUTPUT"
+          elif [[ "$INPUT_REF" =~ ^v[0-9][0-9A-Za-z.+-]*$ ]]; then
+            echo "checkout_ref=refs/tags/$INPUT_REF" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::ref は main かリリースのタグ（v*）だけ配信できます: $INPUT_REF"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.ref.outputs.checkout_ref }}
+
+      # 公開の関門。2b-2 の試験（public-gate.spec.ts）が無い版は配信しない。
+      - name: 公開の関門
+        run: |
+          if [[ ! -f "$DEMO_PUBLIC_GATE_SPEC" ]]; then
+            echo "::error::$DEMO_PUBLIC_GATE_SPEC が無い版は配信できません（公開の条件を満たす 2b-2 より前の版）"
+            exit 1
+          fi
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck demo-backend
+        run: pnpm --filter @banto-industrial/demo-backend check
+
+      - name: Unit tests demo-backend
+        run: pnpm --filter @banto-industrial/demo-backend test
+
+      - name: Build demo pages
+        run: pnpm demo:build
+
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      # 組み立てた成果物（target/demo-pages）を静的に配信して確かめる。落ちたら配信しない。
+      - name: E2E gate (demo-pages)
+        run: pnpm e2e:demo-pages
+
+      - name: Upload Playwright report (demo-pages)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report-demo-pages
+          path: e2e/playwright-report-demo-pages/
+          retention-days: 7
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: target/demo-pages
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
