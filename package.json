@@ -32,13 +32,13 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@playwright/test": "^1.65.0",
-    "eslint": "^10.14.0",
+    "@playwright/test": "^1.65.1",
+    "eslint": "^10.15.0",
     "eslint-config-prettier": "^10.1.8",
     "eslint-plugin-svelte": "^3.24.1",
     "globals": "^17.14.0",
     "prettier": "^3.10.0",
-    "prettier-plugin-svelte": "^4.1.1",
+    "prettier-plugin-svelte": "^4.2.0",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.72.2"
   }
