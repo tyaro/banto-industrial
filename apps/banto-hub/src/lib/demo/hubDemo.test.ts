@@ -54,6 +54,57 @@ describe('HubRegistry（模擬の登録）', () => {
 		expect(r.createTagsBatch([NEW_TAG], false).ok).toBe(true);
 		expect(r.tags).toHaveLength(21);
 	});
+
+	it('接続・グループの削除は配下ごと消し、通知する', () => {
+		const r = new HubRegistry();
+		const rev0 = r.revision;
+		const g1 = r.groups[0];
+		const inGroup = r.tags.filter((t) => t.collectionGroupId === g1.id).length;
+		expect(inGroup).toBeGreaterThan(0);
+		expect(r.deleteGroup(g1.id)).toEqual({ deletedTags: inGroup });
+		expect(r.groups.some((g) => g.id === g1.id)).toBe(false);
+		expect(r.tags.some((t) => t.collectionGroupId === g1.id)).toBe(false);
+		expect(r.revision).toBe(rev0 + 1);
+		const conn = r.connections[0];
+		const groupIds = r.groups.filter((g) => g.plcConnectionId === conn.id).map((g) => g.id);
+		const result = r.deleteConnection(conn.id);
+		expect(result.deletedGroups).toBe(groupIds.length);
+		expect(r.groups.some((g) => g.plcConnectionId === conn.id)).toBe(false);
+		expect(r.tags.some((t) => groupIds.includes(t.collectionGroupId))).toBe(false);
+		expect(r.revision).toBe(rev0 + 2);
+	});
+
+	it('一括更新の名前の一意は、更新後の状態（同じバッチの他の行を含む）で見る', () => {
+		const r = new HubRegistry();
+		const empty = r.createGroup({
+			name: 'empty',
+			plcConnectionId: r.connections[0].id,
+			periodMs: 1000,
+			enabled: true,
+			defaultWritable: false
+		});
+		const a = r.tags.find((t) => t.collectionGroupId === r.groups[0].id)!;
+		const b = r.createTag({ ...NEW_TAG, name: a.name, collectionGroupId: r.groups[1].id });
+		const toInput = (t: typeof a, groupId: number) =>
+			({ ...t, collectionGroupId: groupId }) as unknown as TagInput & { id: number };
+		const rows = [toInput(a, empty.id), toInput(b, empty.id)];
+		const before = r.tags.map((t) => t.collectionGroupId);
+		for (const dryRun of [true, false]) {
+			const res = r.updateTagsBatch(rows, dryRun);
+			expect(res.ok).toBe(false);
+			expect(res.errors.map((e) => e.index)).toEqual([0, 1]);
+		}
+		expect(r.tags.map((t) => t.collectionGroupId)).toEqual(before);
+		// 片方だけ移すのは通る。
+		expect(r.updateTagsBatch([rows[0]], false).ok).toBe(true);
+		// 名前を入れ替える一括は、元の状態では重複でも結果は一意なので通る。
+		const x = r.tags.find((t) => t.collectionGroupId === r.groups[1].id && t.id !== b.id)!;
+		const swap = [
+			{ ...toInput(b, b.collectionGroupId), name: x.name },
+			{ ...toInput(x, x.collectionGroupId), name: b.name }
+		];
+		expect(r.updateTagsBatch(swap, false).ok).toBe(true);
+	});
 });
 
 /** 模擬の WebSocket の相手（画面）の代わり。 */

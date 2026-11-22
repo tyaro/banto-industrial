@@ -150,13 +150,16 @@ export class HubRegistry {
 		return updated;
 	}
 
-	deleteConnection(id: number): void {
+	/** 配下のグループ・タグごと消す（本物の `cascade_delete_tx`。応答は 204 で、件数は監査にだけ載る）。 */
+	deleteConnection(id: number): { deletedGroups: number; deletedTags: number } {
 		if (!this.connection(id)) throw new DemoNotFoundError('plc-connections', id);
-		if (this.groups.some((g) => g.plcConnectionId === id)) {
-			throw new DemoConflictError('この接続にはまだ収集グループがあります');
-		}
+		const groupIds = new Set(this.groups.filter((g) => g.plcConnectionId === id).map((g) => g.id));
+		const deletedTags = this.tags.filter((t) => groupIds.has(t.collectionGroupId)).length;
+		this.tags = this.tags.filter((t) => !groupIds.has(t.collectionGroupId));
+		this.groups = this.groups.filter((g) => !groupIds.has(g.id));
 		this.connections = this.connections.filter((c) => c.id !== id);
 		this.#changed();
+		return { deletedGroups: groupIds.size, deletedTags };
 	}
 
 	// --- 収集グループ -----------------------------------------------------
@@ -216,19 +219,25 @@ export class HubRegistry {
 		return updated;
 	}
 
-	deleteGroup(id: number): void {
+	/** 属するタグごと消す（本物の `cascade_delete_tx`。応答は 204 で、件数は監査にだけ載る）。 */
+	deleteGroup(id: number): { deletedTags: number } {
 		if (!this.group(id)) throw new DemoNotFoundError('collection-groups', id);
-		if (this.tags.some((t) => t.collectionGroupId === id)) {
-			throw new DemoConflictError('このグループにはまだタグがあります');
-		}
+		const deletedTags = this.tags.filter((t) => t.collectionGroupId === id).length;
+		this.tags = this.tags.filter((t) => t.collectionGroupId !== id);
 		this.groups = this.groups.filter((g) => g.id !== id);
 		this.#changed();
+		return { deletedTags };
 	}
 
 	// --- タグ -----------------------------------------------------------
 
 	/** 1 本のタグの入力の検証。`pending` は同じ一括の中の、まだ登録していない名前。 */
-	validateTag(input: TagInput, selfId: number | null, pending: Tag[] = []): FieldError[] {
+	validateTag(
+		input: TagInput,
+		selfId: number | null,
+		pending: Tag[] = [],
+		checkNameDup = true
+	): FieldError[] {
 		const errors: FieldError[] = [];
 		const name = (input.name ?? '').trim();
 		if (name === '') errors.push({ field: 'name', message: '名前は必須です' });
@@ -238,6 +247,7 @@ export class HubRegistry {
 		const group = this.group(input.collectionGroupId);
 		if (!group) errors.push({ field: 'collectionGroupId', message: 'グループが見つかりません' });
 		else if (
+			checkNameDup &&
 			name !== '' &&
 			[...this.tags, ...pending].some(
 				(t) => t.name === name && t.collectionGroupId === group.id && t.id !== selfId
@@ -349,10 +359,30 @@ export class HubRegistry {
 				});
 				return;
 			}
-			const fieldErrors = this.validateTag(row, row.id);
+			// 名前の一意は、更新を当てた後の状態で下で見る（同じバッチの他の行を含む）。
+			const fieldErrors = this.validateTag(row, row.id, [], false);
 			if (fieldErrors.length > 0) errors.push({ index, id: row.id, fieldErrors });
 			else updates.push(this.#buildTag(row.id, row, current.revision + 1));
 		});
+		if (errors.length === 0) {
+			const after = new Map(this.tags.map((t) => [t.id, t]));
+			for (const u of updates) after.set(u.id, u);
+			const counts = new Map<string, number>();
+			for (const t of after.values()) {
+				const key = `${t.collectionGroupId}|${t.name}`;
+				counts.set(key, (counts.get(key) ?? 0) + 1);
+			}
+			rows.forEach((row, index) => {
+				const u = after.get(row.id)!;
+				if ((counts.get(`${u.collectionGroupId}|${u.name}`) ?? 0) > 1) {
+					errors.push({
+						index,
+						id: row.id,
+						fieldErrors: [{ field: 'name', message: '同じグループに同じ名前のタグがあります' }]
+					});
+				}
+			});
+		}
 		if (errors.length > 0 || dryRun) {
 			return { ok: errors.length === 0, dryRun, count: rows.length, errors };
 		}

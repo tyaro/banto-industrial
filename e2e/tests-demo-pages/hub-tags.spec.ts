@@ -7,6 +7,8 @@
 import { expect, test, type Page } from '@playwright/test';
 import { BANNER, recordTraffic, SITE } from './helpers';
 
+test.use({ viewport: { width: 1280, height: 720 } });
+
 /** 削除の取り消しの猶予（`deferredDeleteCore.ts` の `UNDO_WINDOW_MS`）。 */
 const UNDO_WINDOW_MS = 6000;
 const TAGS_URL = `${SITE}/hub/tags`;
@@ -69,6 +71,9 @@ test('Hub /tags: タグの追加・編集・削除が一覧に反映され、本
 	await create.getByRole('button', { name: '保存して閉じる' }).click();
 	await expect(page.getByText('作成しました')).toBeVisible();
 	await expect(create).toBeHidden();
+	// 画面の高さによっては追加した行が表示範囲（仮想化）の外なので、検索で絞ってから確かめる。
+	const search = page.getByPlaceholder('外部名・名前・アドレスで検索');
+	await search.fill('demo_added');
 	const added = page.getByRole('gridcell', { name: 'demo_added', exact: true });
 	await expect(added).toBeVisible();
 	// 追加したタグにも値が出る（`config_changed` で catalog を引き直し、購読に入る）。
@@ -96,6 +101,7 @@ test('Hub /tags: タグの追加・編集・削除が一覧に反映され、本
 	// 読み直すと初期のデータに戻る（保存しない）。
 	await page.reload();
 	await groupNode(page, 'pump').click();
+	await expect(page.getByPlaceholder('外部名・名前・アドレスで検索')).toHaveValue('');
 	await expect(page.getByRole('gridcell', { name: 'pump_flow', exact: true })).toBeVisible();
 
 	await page.waitForTimeout(1000);
