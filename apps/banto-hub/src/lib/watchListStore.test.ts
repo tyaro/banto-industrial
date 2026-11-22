@@ -8,9 +8,10 @@ import {
 	RETRY_BASE_MS,
 	RETRY_MAX_MS,
 	createWatchListStore,
+	type TagPresence,
 	type WatchListChange
 } from './watchListStore';
-import { WATCH_LIMIT, confirmedDeadIds, serializeWatchList } from './watchList';
+import { WATCH_LIMIT, serializeWatchList } from './watchList';
 
 const KEY = 'hub.watch.v1';
 const LOCAL_KEY = 'banto.watch.v1.account%3A1';
@@ -50,7 +51,43 @@ function authError(kind: 'unauthorized' | 'forbidden' = 'unauthorized'): Error {
 }
 
 async function settle(): Promise<void> {
-	for (let i = 0; i < 20; i++) await Promise.resolve();
+	for (let i = 0; i < 60; i++) await Promise.resolve();
+}
+
+/**
+ * `GET /api/tags/{id}` の代わり。`gone` の id は消えた、`failing` の id は照会の失敗（結果に
+ * 入れない = 不明）、それ以外は生きている。`hold()` で次の照会を `release()` まで返さない。
+ */
+function fakeChecker(gone: Iterable<number> = [], failing: Iterable<number> = []) {
+	const goneSet = new Set(gone);
+	const failSet = new Set(failing);
+	const calls: number[][] = [];
+	let gate: Promise<void> | null = null;
+	const check = vi.fn(async (ids: readonly number[]) => {
+		calls.push([...ids]);
+		if (gate !== null) await gate;
+		const result = new Map<number, TagPresence>();
+		for (const id of ids) {
+			if (failSet.has(id)) continue;
+			result.set(id, goneSet.has(id) ? 'gone' : 'exists');
+		}
+		return result;
+	});
+	function hold(): { release: () => void } {
+		let open: () => void = () => undefined;
+		gate = new Promise<void>((resolve) => {
+			open = () => {
+				gate = null;
+				resolve();
+			};
+		});
+		return { release: () => open() };
+	}
+	return { check, calls, hold, checked: () => calls.flat() };
+}
+
+function range(from: number, to: number): number[] {
+	return Array.from({ length: to - from + 1 }, (_, i) => from + i);
 }
 
 function setup(
@@ -152,11 +189,14 @@ describe('createWatchListStore', () => {
 		store.dispose();
 	});
 
-	it('4: タグ一覧 [1]・サーバー [1,2] なら 2 は消えた扱いにならず保存に残る', async () => {
+	it('4: タグ一覧 [1]・サーバー [1,2] で、照会で 2 が生きていれば保存に残る', async () => {
 		const server = fakeProvider(serializeWatchList([1, 2]));
-		const { store } = setup(server);
+		const checker = fakeChecker();
+		const { store } = setup(server, { checkTagIds: checker.check });
 		await store.load();
-		store.setDeadIds(confirmedDeadIds(store.list, [1]));
+		store.setKnownLiveIds([1]);
+		await settle();
+		expect(checker.checked()).toEqual([2]);
 		expect(store.list).toEqual([1, 2]);
 		store.apply({ kind: 'add', ids: [5] });
 		await settle();
@@ -164,15 +204,14 @@ describe('createWatchListStore', () => {
 		store.dispose();
 	});
 
-	it('5: タグ一覧 [1,3]・保存 [1,2,3] なら 2 は dead。操作なしでは PUT せず、次の足すで落ちる', async () => {
+	it('5: タグ一覧 [1,3]・保存 [1,2,3] で 2 が 404 なら dead。操作なしでは PUT せず、次の足すで落ちる', async () => {
 		const server = fakeProvider(serializeWatchList([1, 2, 3]));
-		const { store } = setup(server);
+		const checker = fakeChecker([2]);
+		const { store } = setup(server, { checkTagIds: checker.check });
 		await store.load();
-		store.setDeadIds(confirmedDeadIds(store.list, [1, 3]));
-		expect(store.list).toEqual([1, 3]);
-		// ページは除く前の id で判定し直す（除いた後の list で判定すると 2 が戻る）。
-		expect([...confirmedDeadIds(store.deadCandidates, [1, 3])]).toEqual([2]);
+		store.setKnownLiveIds([1, 3]);
 		await settle();
+		expect(store.list).toEqual([1, 3]);
 		expect(server.set).not.toHaveBeenCalled();
 		store.apply({ kind: 'add', ids: [4] });
 		await settle();
@@ -181,15 +220,137 @@ describe('createWatchListStore', () => {
 		store.dispose();
 	});
 
-	it('6: タグ一覧の最大より大きい消えた id は残る', async () => {
-		const server = fakeProvider(serializeWatchList([1, 3, 9]));
-		const { store } = setup(server);
+	it('6a: 見張り [2..101] で最大の 101 を消しても、照会で dead になり 1 を足せる', async () => {
+		const server = fakeProvider(serializeWatchList(range(2, 101)));
+		const checker = fakeChecker([101]);
+		const { store, changes } = setup(server, { checkTagIds: checker.check });
 		await store.load();
-		store.setDeadIds(confirmedDeadIds(store.list, [1, 3]));
-		expect(store.list).toEqual([1, 3, 9]);
-		store.apply({ kind: 'remove', id: 1 });
+		store.setKnownLiveIds(range(1, 100));
 		await settle();
-		expect(server.saved()).toBe(serializeWatchList([3, 9]));
+		expect(checker.checked()).toEqual([101]);
+		expect(store.list).toEqual(range(2, 100));
+		const result = store.apply({ kind: 'add', ids: [1] });
+		expect(result.added).toBe(1);
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([...range(2, 100), 1]));
+		expect(store.list).toEqual([...range(2, 100), 1]);
+		expect(changes.every((c) => c.overLimit === 0)).toBe(true);
+		store.dispose();
+	});
+
+	it('6b: 見張り [2..101] を全部消したら、表示 0 件で上限に数えず足せる', async () => {
+		const server = fakeProvider(serializeWatchList(range(2, 101)));
+		const checker = fakeChecker(range(2, 101));
+		const { store } = setup(server, { checkTagIds: checker.check });
+		await store.load();
+		store.setKnownLiveIds([1]);
+		await settle();
+		expect(store.list).toEqual([]);
+		store.apply({ kind: 'add', ids: [1] });
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([1]));
+		expect(store.list).toEqual([1]);
+		// 消えた id は周回でも照会し直さない。
+		expect(checker.checked().filter((id) => id === 50)).toEqual([50]);
+		store.dispose();
+	});
+
+	it('6c: 最新の GET で初めて見えた削除済みの id は、上限を当てる前に照会して除く', async () => {
+		const server = fakeProvider(serializeWatchList(range(1, 99)));
+		const checker = fakeChecker([150]);
+		const { store, changes } = setup(server, { checkTagIds: checker.check });
+		await store.load();
+		store.setKnownLiveIds([...range(1, 99), 200]);
+		await settle();
+		// 別のタブが 150 を足し、その後 150 は消された（こちらのタグ一覧には無い）。
+		server.values.set(KEY, serializeWatchList([...range(1, 99), 150]));
+		const result = store.apply({ kind: 'add', ids: [200] });
+		expect(result.overLimit).toBe(0);
+		await settle();
+		expect(checker.checked()).toEqual([150]);
+		expect(server.saved()).toBe(serializeWatchList([...range(1, 99), 200]));
+		expect(store.list).toEqual([...range(1, 99), 200]);
+		expect(changes.every((c) => c.overLimit === 0)).toBe(true);
+		store.dispose();
+	});
+
+	it('6d: 照会に失敗した id は残り、上限に数え、外すと保存から消える', async () => {
+		const server = fakeProvider(serializeWatchList([...range(1, 99), 500]));
+		const checker = fakeChecker([], [500]);
+		const { store, changes } = setup(server, { checkTagIds: checker.check });
+		await store.load();
+		store.setKnownLiveIds([...range(1, 99), 600]);
+		await settle();
+		expect(store.list).toEqual([...range(1, 99), 500]);
+		store.apply({ kind: 'add', ids: [600] });
+		await settle();
+		expect(changes.filter((c) => c.overLimit > 0).map((c) => c.overLimit)).toEqual([1]);
+		expect(store.list).toEqual([...range(1, 99), 500]);
+		expect(server.set).not.toHaveBeenCalled();
+		store.apply({ kind: 'remove', id: 500 });
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList(range(1, 99)));
+		store.apply({ kind: 'add', ids: [600] });
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([...range(1, 99), 600]));
+		store.dispose();
+	});
+
+	it('6e: 手がかりにある id は照会せず、照会中の id は重ねず、消えた id は二度と照会しない', async () => {
+		const server = fakeProvider(serializeWatchList([1, 2, 3]));
+		const checker = fakeChecker([2]);
+		const { store } = setup(server, { checkTagIds: checker.check });
+		await store.load();
+		const gate = checker.hold();
+		store.setKnownLiveIds([1]);
+		// 表示の確かめの照会中に周回が走っても、同じ id は重ねて照会しない（3 は足す操作にも入る）。
+		store.apply({ kind: 'add', ids: [3, 3] });
+		await settle();
+		gate.release();
+		await settle();
+		expect(checker.calls).toEqual([[2, 3]]);
+		expect(store.list).toEqual([1, 3]);
+		expect(server.saved()).toBe(serializeWatchList([1, 3]));
+		// 次の周回: 1 は手がかり、2 は dead なので照会しない。3（exists）は覚えないので照会し直す。
+		store.apply({ kind: 'add', ids: [1] });
+		await settle();
+		expect(checker.calls).toEqual([[2, 3], [3]]);
+		expect(checker.checked()).not.toContain(1);
+		store.dispose();
+	});
+
+	it('6f: 照会の途中で dispose したら結果を当てず、書かない', async () => {
+		const server = fakeProvider(serializeWatchList([1, 2]));
+		const checker = fakeChecker([2]);
+		const { store, changes } = setup(server, { checkTagIds: checker.check });
+		await store.load();
+		const gate = checker.hold();
+		store.setKnownLiveIds([1]);
+		store.apply({ kind: 'add', ids: [3] });
+		await settle();
+		const seen = changes.length;
+		const listBefore = store.list;
+		store.dispose();
+		gate.release();
+		await settle();
+		expect(changes.length).toBe(seen);
+		expect(store.list).toEqual(listBefore);
+		expect(listBefore).toEqual([1, 2, 3]);
+		expect(server.set).not.toHaveBeenCalled();
+	});
+
+	it('6g: 「すべて外す」は、確かめられない項目だけのときも保存を空にする', async () => {
+		const server = fakeProvider(serializeWatchList([7, 8]));
+		const checker = fakeChecker([], [7, 8]);
+		const { store } = setup(server, { checkTagIds: checker.check });
+		await store.load();
+		store.setKnownLiveIds([]);
+		await settle();
+		expect(store.list).toEqual([7, 8]);
+		store.apply({ kind: 'clear' });
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([]));
+		expect(store.list).toEqual([]);
 		store.dispose();
 	});
 
@@ -359,15 +520,19 @@ describe('createWatchListStore', () => {
 		store.dispose();
 	});
 
-	it('12b: 足した時点で知らせた上限超えは、もう一度は知らせない', async () => {
+	it('12b: 足した時点の上限超えは仮で知らせず、周回で 1 回だけ知らせる', async () => {
 		const full = Array.from({ length: WATCH_LIMIT }, (_, i) => 1000 + i);
 		const server = fakeProvider(serializeWatchList(full));
 		const { store, changes } = setup(server);
 		await store.load();
+		const before = changes.length;
 		const result = store.apply({ kind: 'add', ids: [1] });
 		expect(result.overLimit).toBe(1);
+		expect(changes.slice(before).every((c) => c.overLimit === 0)).toBe(true);
 		await settle();
-		expect(changes.every((c) => c.overLimit === 0)).toBe(true);
+		store.retryNow();
+		await settle();
+		expect(changes.filter((c) => c.overLimit > 0).map((c) => c.overLimit)).toEqual([1]);
 		store.dispose();
 	});
 

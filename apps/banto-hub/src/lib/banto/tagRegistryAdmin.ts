@@ -950,6 +950,30 @@ export async function updateTag(id: number, input: TagInput): Promise<Tag> {
 	});
 }
 
+/** {@link getTagPresence} が 404（`not_found`）を受けた印。 */
+class TagGoneError extends Error {}
+
+/**
+ * #1254（PR #1282 の 4 回目のレビュー P2）: タグがまだあるかを `GET /api/tags/{id}` で確かめる。
+ * タグ ID は再利用されない（AUTOINCREMENT）ので、404（`not_found`）なら消えたと確定してよい
+ * （`'gone'`）。200 は `'exists'`。それ以外の失敗（通信・権限・5xx）は reject（不明）。
+ */
+export async function getTagPresence(id: number): Promise<'exists' | 'gone'> {
+	try {
+		await httpRequest<Tag>(`/api/tags/${id}`, {
+			method: 'GET',
+			mapErrorBody: (body, status) => {
+				const kind = (body as { kind?: unknown } | null)?.kind;
+				return status === 404 && kind === 'not_found' ? new TagGoneError() : undefined;
+			}
+		});
+		return 'exists';
+	} catch (error) {
+		if (error instanceof TagGoneError) return 'gone';
+		throw error;
+	}
+}
+
 export async function deleteTag(id: number): Promise<void> {
 	await httpRequest<void>(`/api/tags/${id}`, { method: 'DELETE', expectNoContent: true });
 }

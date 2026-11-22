@@ -1,10 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
 	WATCH_LIMIT,
 	addToWatch,
 	applyWatchOps,
 	parseWatchList,
-	confirmedDeadIds,
+	checkIdsConcurrently,
 	withoutIds,
 	removeFromWatch,
 	sameWatchList,
@@ -119,18 +119,36 @@ describe('applyWatchOps', () => {
 	});
 });
 
-describe('confirmedDeadIds', () => {
-	it('一覧に無く、一覧の最大の id より小さい id だけが消えた扱い', () => {
-		expect([...confirmedDeadIds([1, 2, 3], [1, 3])]).toEqual([2]);
+describe('checkIdsConcurrently', () => {
+	it('同時に走るのは concurrency 本まで。reject した id は結果に入れない', async () => {
+		let running = 0;
+		let peak = 0;
+		const result = await checkIdsConcurrently(
+			[1, 2, 3, 4, 5, 6, 7],
+			async (id) => {
+				running++;
+				peak = Math.max(peak, running);
+				await new Promise((resolve) => setTimeout(resolve, 0));
+				running--;
+				if (id === 3) throw new Error('500');
+				return id % 2 === 0 ? 'gone' : 'exists';
+			},
+			2
+		);
+		expect(peak).toBe(2);
+		expect([...result.entries()].sort((a, b) => a[0] - b[0])).toEqual([
+			[1, 'exists'],
+			[2, 'gone'],
+			[4, 'gone'],
+			[5, 'exists'],
+			[6, 'gone'],
+			[7, 'exists']
+		]);
 	});
 
-	it('一覧の最大より大きい id（別のタブで作ったばかり）は消えた扱いにしない', () => {
-		expect([...confirmedDeadIds([1, 2], [1])]).toEqual([]);
-		expect([...confirmedDeadIds([5, 9], [1, 7])]).toEqual([5]);
-	});
-
-	it('最大と同じ id・一覧にある id・空の一覧では何も消えない', () => {
-		expect([...confirmedDeadIds([7], [1, 7])]).toEqual([]);
-		expect([...confirmedDeadIds([1, 2], [])]).toEqual([]);
+	it('空の id では照会しない', async () => {
+		const checkOne = vi.fn(async () => 'exists');
+		expect((await checkIdsConcurrently([], checkOne)).size).toBe(0);
+		expect(checkOne).not.toHaveBeenCalled();
 	});
 });

@@ -1,7 +1,19 @@
 <script module lang="ts">
-	/** 窓の 1 行（ページが外部名・値の表示・強調を組み立てて渡す）。 */
-	export interface WatchRowView {
+	/**
+	 * 窓の 1 行（ページが外部名・値の表示・強調を組み立てて渡す）。`unverified` は、保存の一覧に
+	 * あるがタグ一覧に無く、消えたとも確かめられていない id（照会の失敗・照会の前・一覧の
+	 * 読み直しの保留中）。名前は「確かめられないタグ（#id）」、値の列は空で、「外す」だけ出す。
+	 */
+	export type WatchRowView = WatchTagRowView | WatchUnverifiedRowView;
+
+	export interface WatchUnverifiedRowView {
 		id: number;
+		unverified: true;
+	}
+
+	export interface WatchTagRowView {
+		id: number;
+		unverified?: false;
 		/** 完全な外部名（`{接続}.{グループ}.{タグ}`）。 */
 		name: string;
 		value: string;
@@ -28,6 +40,9 @@
 	 *   作り直し）を出す: `saving` は「保存中」、`retrying` は「保存できていません。再試行します」と
 	 *   「今すぐ再試行」、`blocked` は「保存できません（ログインし直してください）」。`loading`・
 	 *   `saved` は出さない。保存が成功する前にページを離れた変更は失われるので、隠さず出す。
+	 * - 確かめられない保存の項目（`unverified` の行、PR #1282 の 4 回目のレビュー P2）も行として
+	 *   出し、件数に含める。上限 100 の枠を占めるので、見えないまま外せない状態にしない
+	 *   （「すべて外す」も、この行だけのときに押せる）。
 	 */
 	import type { StreamStatusLine } from '#lib/banto/monitorStreamView.js';
 	import type { WatchSaveStatus } from '#lib/watchListStore.js';
@@ -115,25 +130,45 @@
 				</thead>
 				<tbody>
 					{#each rows as row (row.id)}
-						<tr class:flash={row.flashing} data-testid="watch-row" data-tag-id={row.id}>
-							<td class="name">{row.name}</td>
-							<td class="nowrap value quality-{row.qualityClass}" data-testid="watch-value"
-								>{row.value}</td
-							>
-							<td class="nowrap quality-{row.qualityClass}" data-testid="watch-quality"
-								>{row.qualityLabel}</td
-							>
-							<td class="nowrap">{row.time}</td>
-							<td class="nowrap">
-								<button
-									type="button"
-									class="tool-button"
-									data-testid="watch-remove"
-									aria-label="{row.name} を見張りから外す"
-									onclick={() => onRemove(row.id)}>外す</button
+						{#if row.unverified}
+							<tr class="unverified" data-testid="watch-row-unverified" data-tag-id={row.id}>
+								<td class="name" title="タグ一覧に無く、消えたかを確かめられていません"
+									>確かめられないタグ（#{row.id}）</td
 								>
-							</td>
-						</tr>
+								<td></td>
+								<td></td>
+								<td></td>
+								<td class="nowrap">
+									<button
+										type="button"
+										class="tool-button"
+										data-testid="watch-remove"
+										aria-label="確かめられないタグ（#{row.id}）を見張りから外す"
+										onclick={() => onRemove(row.id)}>外す</button
+									>
+								</td>
+							</tr>
+						{:else}
+							<tr class:flash={row.flashing} data-testid="watch-row" data-tag-id={row.id}>
+								<td class="name">{row.name}</td>
+								<td class="nowrap value quality-{row.qualityClass}" data-testid="watch-value"
+									>{row.value}</td
+								>
+								<td class="nowrap quality-{row.qualityClass}" data-testid="watch-quality"
+									>{row.qualityLabel}</td
+								>
+								<td class="nowrap">{row.time}</td>
+								<td class="nowrap">
+									<button
+										type="button"
+										class="tool-button"
+										data-testid="watch-remove"
+										aria-label="{row.name} を見張りから外す"
+										onclick={() => onRemove(row.id)}>外す</button
+									>
+								</td>
+							</tr>
+						{/if}
 					{/each}
 				</tbody>
 			</table>
@@ -234,6 +269,10 @@
 		color: var(--banto-text-muted);
 	}
 	.quality-unverified {
+		color: var(--banto-text-muted);
+		font-style: italic;
+	}
+	tr.unverified .name {
 		color: var(--banto-text-muted);
 		font-style: italic;
 	}

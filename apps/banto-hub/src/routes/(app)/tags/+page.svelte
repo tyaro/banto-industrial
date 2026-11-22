@@ -110,7 +110,7 @@
 	import LogPanel from '#lib/components/LogPanel.svelte';
 	import WatchPanel, { type WatchRowView } from '#lib/components/WatchPanel.svelte';
 	import { createWatchListStore, type WatchSaveStatus } from '#lib/watchListStore.js';
-	import { WATCH_LIMIT, confirmedDeadIds, type WatchOp } from '#lib/watchList.js';
+	import { WATCH_LIMIT, checkIdsConcurrently, type WatchOp } from '#lib/watchList.js';
 	import { createLogFeedState } from '#lib/banto/logFeedState.svelte.js';
 	import { isDockPanelOnScreen } from '#lib/dockPanelOnScreen.js';
 	import { persistThreePaneLayout } from '#lib/dockLayoutPersist.svelte.js';
@@ -126,6 +126,7 @@
 		createTag,
 		updateTag,
 		deleteTag,
+		getTagPresence,
 		listCollectionGroups,
 		listPlcConnections,
 		listDrivers,
@@ -3474,13 +3475,17 @@
 	// 外部名の形（ドット入りの接続名・グループ名）や、外部名の別のタグへの使い回しに左右され
 	// ない。`tagValueStream.svelte.ts` 冒頭）。窓が画面に出ている間だけ、かつ一覧が空でない
 	// ときだけ繋ぐ。
+	// 消えたかは ID ごとの `GET /api/tags/{id}` の 404 で確かめる（ID は再利用されない。
+	// PR #1282 の 4 回目のレビュー P2、`watchListStore.ts` 冒頭）。同時に 4 本まで。
+	// 上限（100）の最終の判定は口の周回の中だけで、落ちた件数はここ（`onChange`）でだけ知らせる。
 	const watchStore = createWatchListStore({
+		checkTagIds: (ids) => checkIdsConcurrently(ids, getTagPresence),
 		onChange: (change) => {
 			syncWatchState();
 			if (change.overLimit > 0) {
 				toastStore.push(
 					'error',
-					`見張りは ${WATCH_LIMIT} タグまでです。保存の一覧が上限に達していたため、${change.overLimit} 件は足していません。`
+					`見張りは ${WATCH_LIMIT} タグまでです。${change.overLimit} 件は足していません。`
 				);
 			}
 		}
@@ -3498,28 +3503,24 @@
 		return result;
 	}
 	void watchStore.load();
-	// 消されたタグ（PR #1282 の再レビュー P2-2）: 保存の一覧から自動で消すための PUT はしない。
-	// 「消えたと確かめた」id（同じ 1 回のタグ一覧に無く、その一覧の最大の id より小さい。
-	// `confirmedDeadIds`。タグ ID は再利用されず、`GET /api/tags` は絞り込み・ページ分けの無い
-	// 全件）だけを口に渡し、口は表示から外し、利用者の操作で保存するついでに落とす。
-	// こちらの一覧が古くても（読み直しの保留中など）、別のタブで作ったタグはその一覧の最大より
-	// 大きいので消えた扱いにならない。
-	// 判定の対象は `dead` を除く前の id（`deadCandidates`。除いた後の `watchIds` で判定すると、
-	// 除いた id が次の判定から外れて消えた扱いが解ける）。`watchIds` は読み直しの合図に読む。
+	// 消されたタグ（PR #1282 の再レビュー P2-2・4 回目のレビュー P2）: 保存の一覧から自動で
+	// 消すための PUT はしない。ページの全件のタグ一覧の id は「生きている」の手がかりとして口に
+	// 渡すだけ（`setKnownLiveIds`。一覧に無いことは「消えた」の根拠にしない）。口は一覧に無い id
+	// だけを照会し、404 の id を表示から外す。照会の失敗・照会の前・読み直しの保留中で一覧に
+	// まだ無い id は「確かめられないタグ」の行として出し、外せるようにする（`watchRows`）。
 	$effect(() => {
 		if (!registryLoaded) return;
-		void watchIds;
 		const tagIds = tags.map((t) => t.id);
-		untrack(() => watchStore.setDeadIds(confirmedDeadIds(watchStore.deadCandidates, tagIds)));
+		untrack(() => watchStore.setKnownLiveIds(tagIds));
 	});
 
-	const watchedTags = $derived.by(() => {
-		const byId = new Map(tags.map((t) => [t.id, t]));
-		return watchIds.flatMap((id) => {
-			const tag = byId.get(id);
+	const watchTagById = $derived(new Map(tags.map((t) => [t.id, t])));
+	const watchedTags = $derived.by(() =>
+		watchIds.flatMap((id) => {
+			const tag = watchTagById.get(id);
 			return tag === undefined ? [] : [tag];
-		});
-	});
+		})
+	);
 	const watchPanelOnScreen = $derived(isDockPanelOnScreen(dock.layout, 'watch', dock.flyoutPanel));
 	/** 購読するタグ ID（ページの一覧にあるものだけ。一覧に無い ID は行も出さない）。 */
 	const watchSubscribeIds = $derived(watchedTags.map((t) => t.id));
@@ -3539,8 +3540,13 @@
 			watchStore.retryNow();
 		}
 	});
-	const watchRows = $derived.by((): WatchRowView[] =>
-		watchedTags.map((t) => {
+	const watchRows = $derived.by((): WatchRowView[] => {
+		// タグ一覧を読む前は、全部が「確かめられない」に見えるので出さない。
+		if (!registryLoaded) return [];
+		return watchIds.map((id): WatchRowView => {
+			const t = watchTagById.get(id);
+			// タグ一覧に無い id: 確かめられない保存の項目（値は出さない。「外す」で外せる）。
+			if (t === undefined) return { id, unverified: true };
 			// 値は ID で引く。名前の列はページのタグ一覧の名前（改名は一覧の読み直しで反映）。
 			const key = tagIdValueKey(t.id);
 			const cell = tagValueCell(watchStream.values, key, t.unit, watchStream.mode);
@@ -3553,8 +3559,8 @@
 				time: tagValueTime(watchStream.values, key, watchStream.mode),
 				flashing: watchStream.isFlashing(key)
 			};
-		})
-	);
+		});
+	});
 
 	/** 見張りに足す対象: 選択モードなら選んだ行、そうでなければ属性に出している行。 */
 	const watchAddTargets = $derived.by((): number[] => {
@@ -3565,13 +3571,9 @@
 	function addWatchTags(ids: number[]): void {
 		if (ids.length === 0) return;
 		const result = applyWatchOp({ kind: 'add', ids });
-		if (result.added > 0 && !dock.isVisible('watch')) dock.show('watch');
-		if (result.overLimit > 0) {
-			toastStore.push(
-				'error',
-				`見張りは ${WATCH_LIMIT} タグまでです。${result.overLimit} 件は足していません。`
-			);
-		} else if (result.added === 0) {
+		// 上限の判定はここでは仮（口の周回で確かめた後に `onChange` で知らせる）。
+		if ((result.added > 0 || result.overLimit > 0) && !dock.isVisible('watch')) dock.show('watch');
+		if (result.added === 0 && result.overLimit === 0) {
 			toastStore.push('info', '選んだタグはすでに見張りにあります。');
 		}
 	}

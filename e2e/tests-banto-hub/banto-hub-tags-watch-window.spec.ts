@@ -13,6 +13,9 @@
  * 7. 見張りはタグ ID で購読し、値も ID で引く（`page.routeWebSocket` で `/api/v1/stream` を
  *    差し替えて値を注入する。`banto-hub-tags-values.spec.ts` と同じ流儀）。同じ外部名の別 ID の
  *    値は行に出ない。
+ * 8. 消したタグは ID ごとの照会（`GET /api/tags/{id}` の 404）で窓から消え、上限の枠を空ける
+ *    （PR #1282 の 4 回目のレビュー P2）。照会に失敗したタグは「確かめられないタグ（#id）」の
+ *    行で出て、行の「外す」・「すべて外す」で外せる（その行だけのときも押せる）。
  *
  * 最初に保存した見張りの一覧と配置を消し、最後も消す（後の spec のため）。
  */
@@ -36,6 +39,8 @@ test.describe.serial('banto-hub 値を見張る窓 (#1254)', () => {
 	let connectionId: number;
 	let groupId: number;
 	const tagIds: number[] = [];
+	/** 試験の中で作って消すタグ（消し損ねたときに afterAll で消す）。 */
+	const extraTagIds: number[] = [];
 
 	const panel = () => page.getByTestId('watch-panel');
 	const watchRows = () => panel().getByTestId('watch-row');
@@ -60,6 +65,27 @@ test.describe.serial('banto-hub 値を見張る窓 (#1254)', () => {
 		const body = (await res.json()) as { value?: string | null };
 		if (!body.value) return [];
 		return (JSON.parse(body.value) as { tags: number[] }).tags;
+	}
+
+	async function createTag(name: string, address: string): Promise<number> {
+		const res = await page.request.post('/api/tags', {
+			headers: authedHeaders,
+			data: {
+				name,
+				collectionGroupId: groupId,
+				address,
+				dataType: 'i16',
+				unit: null,
+				decimals: 0,
+				enabled: true,
+				writable: false,
+				tagKind: 'plc'
+			}
+		});
+		expect(res.ok(), await res.text()).toBe(true);
+		const id = ((await res.json()) as { id: number }).id;
+		extraTagIds.push(id);
+		return id;
 	}
 
 	async function openWatchFromViewMenu(): Promise<void> {
@@ -120,7 +146,7 @@ test.describe.serial('banto-hub 値を見張る窓 (#1254)', () => {
 	test.afterAll(async () => {
 		await page.unrouteAll({ behavior: 'ignoreErrors' });
 		await clearSaved();
-		for (const id of tagIds)
+		for (const id of [...tagIds, ...extraTagIds])
 			await page.request.delete(`/api/tags/${id}`, { headers: authedHeaders });
 		await page.request.delete(`/api/collection-groups/${groupId}`, { headers: authedHeaders });
 		await page.request.delete(`/api/plc-connections/${connectionId}`, { headers: authedHeaders });
@@ -295,5 +321,88 @@ test.describe.serial('banto-hub 値を見張る窓 (#1254)', () => {
 		await expect(value).toContainText('43');
 		// 名前の列はページのタグ一覧の名前。
 		await expect(watchRows().first()).toContainText(NAME_A);
+	});
+
+	test('8. 消したタグは照会（404）で窓から消え、枠を空ける。照会に失敗したタグは「確かめられない」行で外せる', async () => {
+		// 見張りの購読は 7 の `routeWebSocket` の差し替えのまま（config_changed は来ないので、
+		// ページのタグ一覧は再読み込みで読み直す）。
+		const [idC, idD] = [
+			await createTag(`e2e-watch-c-${RUN_ID}`, '40003'),
+			await createTag(`e2e-watch-d-${RUN_ID}`, '40004')
+		];
+		await page.reload();
+		await expect(page.getByRole('heading', { level: 2, name: 'タグ登録' })).toBeVisible();
+		if (!(await panel().isVisible())) await openWatchFromViewMenu();
+		await page.getByPlaceholder('名前・アドレスで検索').fill(`e2e-watch-`);
+		await page.getByRole('gridcell', { name: `e2e-watch-c-${RUN_ID}`, exact: true }).click({
+			button: 'right'
+		});
+		await page.getByRole('menuitem', { name: '見張りに足す' }).click();
+		await expect(watchRows()).toHaveCount(2);
+		await expect.poll(savedWatchIds).toEqual([tagIds[0], idC]);
+
+		// C を消す（別のタブを模して API で）。ID は再利用されないので、404 は消えた確定。
+		const deleted = await page.request.delete(`/api/tags/${idC}`, { headers: authedHeaders });
+		expect(deleted.ok()).toBe(true);
+		const gone = await page.request.get(`/api/tags/${idC}`, { headers: authedHeaders });
+		expect(gone.status()).toBe(404);
+		expect(((await gone.json()) as { kind?: string }).kind).toBe('not_found');
+
+		await page.reload();
+		await expect(page.getByRole('heading', { level: 2, name: 'タグ登録' })).toBeVisible();
+		if (!(await panel().isVisible())) await openWatchFromViewMenu();
+		await expect(watchRows()).toHaveCount(1);
+		await expect(panel().getByTestId('watch-row-unverified')).toHaveCount(0);
+		await expect(panel().getByTestId('watch-count')).toHaveText('1 件');
+		// もう 1 つ足せる。保存のついでに消えた C が落ちる。
+		await page.getByPlaceholder('名前・アドレスで検索').fill(`e2e-watch-`);
+		await page.getByRole('gridcell', { name: `e2e-watch-d-${RUN_ID}`, exact: true }).click({
+			button: 'right'
+		});
+		await page.getByRole('menuitem', { name: '見張りに足す' }).click();
+		await expect(watchRows()).toHaveCount(2);
+		await expect(panel().getByTestId('watch-count')).toHaveText('2 件');
+		await expect.poll(savedWatchIds).toEqual([tagIds[0], idD]);
+
+		// D を消し、D の照会を 500 にする: 消えたと確かめられないので「確かめられない」行で出す。
+		expect((await page.request.delete(`/api/tags/${idD}`, { headers: authedHeaders })).ok()).toBe(
+			true
+		);
+		const checkD = new RegExp(`/api/tags/${idD}$`);
+		await page.route(checkD, (route) =>
+			route.request().method() === 'GET'
+				? route.fulfill({ status: 500, body: 'injected failure' })
+				: route.continue()
+		);
+		await page.reload();
+		await expect(page.getByRole('heading', { level: 2, name: 'タグ登録' })).toBeVisible();
+		if (!(await panel().isVisible())) await openWatchFromViewMenu();
+		const unverified = panel().getByTestId('watch-row-unverified');
+		await expect(unverified).toHaveCount(1);
+		await expect(unverified).toContainText(`確かめられないタグ（#${idD}）`);
+		await expect(watchRows()).toHaveCount(1);
+		await expect(panel().getByTestId('watch-count')).toHaveText('2 件');
+		await unverified.getByTestId('watch-remove').click();
+		await expect(unverified).toHaveCount(0);
+		await expect.poll(savedWatchIds).toEqual([tagIds[0]]);
+
+		// 確かめられない項目だけのときも「すべて外す」を押せ、保存が空になる。
+		const put = await page.request.put(WATCH_SETTING, {
+			headers: authedHeaders,
+			data: { value: JSON.stringify({ schema: 1, tags: [idD] }) }
+		});
+		expect(put.ok(), await put.text()).toBe(true);
+		await page.reload();
+		await expect(page.getByRole('heading', { level: 2, name: 'タグ登録' })).toBeVisible();
+		if (!(await panel().isVisible())) await openWatchFromViewMenu();
+		await expect(unverified).toHaveCount(1);
+		await expect(watchRows()).toHaveCount(0);
+		await expect(panel().getByTestId('watch-count')).toHaveText('1 件');
+		await expect(panel().getByTestId('watch-clear')).toBeEnabled();
+		await panel().getByTestId('watch-clear').click();
+		await expect(unverified).toHaveCount(0);
+		await expect(panel()).toContainText('見張っているタグはありません');
+		await expect.poll(savedWatchIds).toEqual([]);
+		await page.unroute(checkD);
 	});
 });

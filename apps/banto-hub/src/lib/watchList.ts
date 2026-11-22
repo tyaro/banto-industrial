@@ -11,8 +11,9 @@
  *   {@link applyWatchOps} で基準の一覧に当てる。保存の口は、PUT が成功するまで操作を捨てず、
  *   周回のたびにサーバーの最新の値へ当て直す（`watchListStore.ts` 冒頭）。
  * - 消されたタグは操作にしない（PR #1282 の再レビュー P2-2。古いタグ一覧を根拠に、別のタブで
- *   足した実在のタグを保存から消さないため）。「消えたと確かめた」id（{@link confirmedDeadIds}）
- *   を口に渡し、表示から外し、利用者の操作で保存するついでにだけ保存の一覧から落とす。
+ *   足した実在のタグを保存から消さないため）。消えたかは ID ごとの照会（`GET /api/tags/{id}` の
+ *   404。ID は再利用されない）で確かめ、口は表示から外し、利用者の操作で保存するついでにだけ
+ *   保存の一覧から落とす（4 回目のレビュー P2、`watchListStore.ts` 冒頭）。
  * - 購読はタグ ID で行う（WS の `subscribe` の `ids`、2026-11-22 オーナー決定。
  *   `tagValueStream.svelte.ts` 冒頭）。外部名の形・使い回しに左右されない。
  */
@@ -87,35 +88,35 @@ export function withoutIds(list: readonly number[], drop: ReadonlySet<number>): 
 	return drop.size === 0 ? [...list] : list.filter((id) => !drop.has(id));
 }
 
+/** id ごとの在否の照会を同時に走らせる数（{@link checkIdsConcurrently} の既定）。 */
+export const TAG_CHECK_CONCURRENCY = 4;
+
 /**
- * 見張りの一覧のうち「消えたと確かめた」id（PR #1282 の再レビュー P2-2）。
- *
- * タグ ID は再利用されない（`crates/banto-tags/migrations/0003_tags.sql` の
- * `INTEGER PRIMARY KEY AUTOINCREMENT`。表を作り直す `0018` は採番位置を引き継ぐ）。そこで、
- * **同じ 1 回のタグ一覧**（`tagIds`）の中にその id が無く、かつ id がその一覧の最大の id より
- * 小さければ、その id のタグはその一覧を取った時点で消えていたと言える。別のタブで作った
- * ばかりのタグは、こちらの古い一覧の最大より大きいので消えた扱いにならない（読み直しが
- * 編集の保護で保留中でも安全）。
- *
- * 前提: `tagIds` は絞り込み・権限・ページ分けの無い全件（`GET /api/tags` は `ListParams` の
- * 既定 = LIMIT なし・フィルタなしで全件を返し、閲覧者でも絞らない。`rest/tags.rs` の
- * `tags_list`）。全件でない一覧を渡してはいけない。
+ * id ごとの照会 `checkOne` を、同時に `concurrency` 本までに絞って走らせる（PR #1282 の 4 回目の
+ * レビュー P2。消えたかの判定は ID ごとの `GET /api/tags/{id}`、`watchListStore.ts` 冒頭）。
+ * 結果には確定した id だけを入れる: `checkOne` が値を返せばその値、reject した id は入れない
+ * （不明）。全体は reject しない。
  */
-export function confirmedDeadIds(
-	watchIds: readonly number[],
-	tagIds: Iterable<number>
-): Set<number> {
-	const have = new Set<number>();
-	let max = -Infinity;
-	for (const id of tagIds) {
-		have.add(id);
-		if (id > max) max = id;
+export async function checkIdsConcurrently<T>(
+	ids: readonly number[],
+	checkOne: (id: number) => Promise<T>,
+	concurrency: number = TAG_CHECK_CONCURRENCY
+): Promise<Map<number, T>> {
+	const result = new Map<number, T>();
+	let next = 0;
+	async function worker(): Promise<void> {
+		while (next < ids.length) {
+			const id = ids[next++];
+			try {
+				result.set(id, await checkOne(id));
+			} catch {
+				// 不明（結果に入れない）。
+			}
+		}
 	}
-	const dead = new Set<number>();
-	for (const id of watchIds) {
-		if (!have.has(id) && id < max) dead.add(id);
-	}
-	return dead;
+	const workers = Math.max(1, Math.min(concurrency, ids.length));
+	await Promise.all(Array.from({ length: workers }, () => worker()));
+	return result;
 }
 
 /**
