@@ -220,6 +220,16 @@ pub(crate) async fn create_schema(
     Ok(())
 }
 
+/// ファイルに表が 1 つも無い（`sqlite_master` が空）か。`create_schema` が途中で失敗して
+/// 残った空のファイル（4096 バイト）の判定に使う（#1304）。`tstore_meta` が無くても他の表が
+/// あるなら（banto-tstore のファイルではない）`false`。
+pub(crate) async fn is_empty_database(pool: &SqlitePool) -> Result<bool, TstoreError> {
+    Ok(sqlx::query("SELECT name FROM sqlite_master LIMIT 1")
+        .fetch_optional(pool)
+        .await?
+        .is_none())
+}
+
 /// Read a file's `tstore_meta`/`tstore_groups`/`tstore_columns` back into a
 /// [`FileMeta`]. Returns [`TstoreError::Uninitialized`] if `tstore_meta`
 /// itself does not exist (no `banto-tstore` schema at all yet - see that

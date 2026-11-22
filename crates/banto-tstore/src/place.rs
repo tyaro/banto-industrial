@@ -218,6 +218,35 @@ impl DataPlace {
 }
 
 impl DataPlace {
+    /// `name` の本体と付随（`-wal`・`-shm`・`-journal`）を消す（無いものは飛ばす）。
+    /// 書き手が作ったばかりでスキーマを作れなかったファイルの後始末用（#1304）。呼ぶ前に
+    /// [`WritableFile::close`] で pool を閉じ終え、握りを離しておくこと（Managed の削除は
+    /// 握りの共有違反で失敗する）。順序は保持期間の削除と同じ（本体を最後）。Managed は
+    /// [`ManagedDir::remove`]、Path は `std::fs::remove_file`。
+    pub(crate) fn remove_data_file_set(&self, name: &str) -> Result<(), TstoreError> {
+        for suffix in [WAL_SUFFIX, SHM_SUFFIX, JOURNAL_SUFFIX, ""] {
+            let target = format!("{name}{suffix}");
+            match self {
+                DataPlace::Path(path) => match std::fs::remove_file(path.join(&target)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                },
+                DataPlace::Managed { dir, .. } => {
+                    dir.remove(&target).map_err(|error| {
+                        TstoreError::Storage(format!(
+                            "空のデータファイルを消せません（{}）: {error}",
+                            dir.final_path().join(&target).display()
+                        ))
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl DataPlace {
     /// 読み取り専用で開く（#623 PR7。[`crate::reader::TsReader::open_in`]・banto-tsquery の読み手）。
     /// `name` は [`DataPlace::list_data_files`] が返した名前（ファイル名の 1 要素）。
     ///

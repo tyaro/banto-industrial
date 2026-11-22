@@ -844,6 +844,35 @@ async fn resolve_file(
             let file = place.open_writable(&name).await?;
             let file_meta = match schema::read_file_meta(&file.pool).await {
                 Ok(meta) => meta,
+                Err(TstoreError::Uninitialized(reason)) => {
+                    // #1304: 表が 1 つも無い空のファイルは、前回 `create_schema` が失敗して
+                    // 残った物（書き手は place の握りで 1 つだけなので、書き手が空のファイルを
+                    // 見るのは書き込み途中ではなく残骸）。同じ連番でスキーマを作り直す。
+                    // 別の表があるのに `tstore_meta` が無いファイルは、今までどおり誤りにする。
+                    match schema::is_empty_database(&file.pool).await {
+                        Ok(true) => {
+                            return create_in(
+                                place,
+                                file,
+                                &name,
+                                existing.seq,
+                                config,
+                                config_hash,
+                                date,
+                                created_at_ms,
+                            )
+                            .await;
+                        }
+                        Ok(false) => {
+                            file.close().await;
+                            return Err(TstoreError::Uninitialized(reason));
+                        }
+                        Err(err) => {
+                            file.close().await;
+                            return Err(err);
+                        }
+                    }
+                }
                 Err(err) => {
                     file.close().await;
                     return Err(err);
@@ -858,16 +887,48 @@ async fn resolve_file(
         None => 1,
     };
 
-    let file = place
-        .open_writable(&schema::data_file_name(date, seq))
-        .await?;
-    if let Err(err) =
-        schema::create_schema(&file.pool, config, config_hash, date, created_at_ms).await
-    {
-        file.close().await;
-        return Err(err);
+    let name = schema::data_file_name(date, seq);
+    let file = place.open_writable(&name).await?;
+    create_in(
+        place,
+        file,
+        &name,
+        seq,
+        config,
+        config_hash,
+        date,
+        created_at_ms,
+    )
+    .await
+}
+
+/// 開いた（表の無い）`file` にスキーマを作る。失敗したら pool を閉じ終えて握りを離してから
+/// ファイルと `-wal`・`-shm` を消し、元の誤りを返す（#1304。表の無いファイルを残すと、次の
+/// open が `Uninitialized` で止まり、その日は収集を再開できなかった）。消せなかったときは元の誤りを返したまま、消せなかったことを stderr に残す。
+#[allow(clippy::too_many_arguments)]
+async fn create_in(
+    place: &DataPlace,
+    file: WritableFile,
+    name: &str,
+    seq: u32,
+    config: &StoreConfig,
+    config_hash: &str,
+    date: LocalDate,
+    created_at_ms: i64,
+) -> Result<(WritableFile, u32), TstoreError> {
+    match schema::create_schema(&file.pool, config, config_hash, date, created_at_ms).await {
+        Ok(()) => Ok((file, seq)),
+        Err(err) => {
+            file.close().await;
+            if let Err(remove_err) = place.remove_data_file_set(name) {
+                // 元の誤りを返すので、消せなかったことはここで残す。
+                eprintln!(
+                    "banto-tstore: スキーマを作れなかった空のデータファイル {name} を消せませんでした（#1304）: {remove_err}"
+                );
+            }
+            Err(err)
+        }
     }
-    Ok((file, seq))
 }
 
 #[cfg(test)]
@@ -1430,6 +1491,105 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, TstoreError::Config(_)));
+    }
+
+    // --- #1304: 空のファイルの残骸 ----------------------------------------
+
+    fn wide_config(tags: usize) -> StoreConfig {
+        StoreConfig {
+            groups: vec![GroupConfig {
+                key: "wide".to_string(),
+                name: "Wide".to_string(),
+                period_ms: 1_000,
+                tags: (0..tags).map(|i| tag(&format!("t{i}"), None, 0)).collect(),
+            }],
+        }
+    }
+
+    fn data_dir_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_create_schema_leaves_no_file_behind() {
+        // 1 グループ 2000 タグ（ptime を足して 2001 列）は SQLite の列数の上限で
+        // create_schema が失敗する（#1304 の実際の筋書き）。
+        let dir = TempDir::new("create-schema-fails");
+        let clock = clock_at(DAY1_START_MS);
+        let err = TsWriter::open(dir.path(), wide_config(2000), clock.clone()).await;
+        assert!(err.is_err(), "列数の上限で open は失敗する");
+        assert_eq!(
+            data_dir_names(dir.path()),
+            Vec::<String>::new(),
+            "本体も -wal・-shm も残らない"
+        );
+
+        // その後タグを減らした設定で open できる。
+        let writer = TsWriter::open(dir.path(), wide_config(10), clock)
+            .await
+            .expect("タグを減らせば open できる");
+        writer.close().await.unwrap();
+        let files = list_data_files(dir.path()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].seq, 1, "失敗した分の連番は使われない");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_creates_the_schema_in_an_existing_empty_file() {
+        let dir = TempDir::new("empty-file-leftover");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let date = LocalDate::from_epoch_ms(DAY1_START_MS, OFFSET_MS);
+        let name = schema::data_file_name(date, 1);
+        // 表の無い空の SQLite ファイル（前回の失敗の残骸）を作る。
+        let pool = schema::connect_writable(&dir.path().join(&name))
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let clock = clock_at(DAY1_START_MS);
+        let writer = TsWriter::open(dir.path(), two_group_config(), clock)
+            .await
+            .expect("空のファイルがあっても open できる");
+        writer
+            .append("g1", DAY1_START_MS, &[Some(1.0), None])
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        let files = list_data_files(dir.path()).unwrap();
+        assert_eq!(files.len(), 1, "同じ連番のファイルを使う");
+        assert_eq!(files[0].seq, 1);
+        let reader = TsReader::open(&files[0].path).await.unwrap();
+        let samples = reader
+            .read_range("g1", DAY1_START_MS, DAY1_START_MS + 1_000)
+            .await
+            .unwrap();
+        assert_eq!(samples.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_still_rejects_a_file_with_other_tables_but_no_tstore_meta() {
+        let dir = TempDir::new("foreign-file");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let date = LocalDate::from_epoch_ms(DAY1_START_MS, OFFSET_MS);
+        let pool = schema::connect_writable(&dir.path().join(schema::data_file_name(date, 1)))
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE other (x INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let err = TsWriter::open(dir.path(), two_group_config(), clock_at(DAY1_START_MS))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TstoreError::Uninitialized(_)));
     }
 
     // --- crash / WAL-recovery on reopen (H7 ②, docs/improvement-plan.md) --
