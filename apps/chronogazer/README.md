@@ -11,24 +11,15 @@ banto テンプレート（Tauri + SvelteKit）由来。SvelteKit 3・TypeScript
 （`svelte.config.js` は無い）。ナビ・設定カテゴリの表の `path` は `AppPath`（存在しないルートは型エラー）、
 URL にするときは `resolveAppPath()`（`src/lib/navigation.ts`）を通す。
 
-## 現状（R1-A 段階）
+## 現状
 
-**アプリ骨格のみ実装済み**で、記録計としての中核機能（収集・トレンド表示）
-はまだ動かない。
-
-- 動くもの: ログイン、設定画面（テーマ・認証・バックアップ等、banto
-  テンプレート由来の機能）、LANモード（`banto-serve`）/ Tauri デスクトップ
-  の両起動経路
-- 動かないもの: 監視・ヒストリカル・イベントの各画面は実データ無しの
-  プレースホルダ表示（`src/routes/(app)/monitor`・`historical`・`events`
-  それぞれの `+page.svelte` に「R1-A: プレースホルダ」と明記）。I系クレート
-  （banto-tags/banto-plc/banto-tstore/banto-collect/banto-tsquery）は
-  `core/Cargo.toml` に依存としては追加済みだが、**まだ REST/Tauri
-  コマンドのどこにも配線されていない**（同ファイルの依存コメント参照）。
-  収集ランタイム統合は R1-C、実データでの監視画面は R1-D で入る予定
-
-今後の実施計画（R1-B 設定CRUD → R1-C 収集ランタイム統合 → R1-D 監視画面）は
-[../../docs/archive/r1-plan.md](../../docs/archive/r1-plan.md) を参照。
+R1 の各画面（監視・ヒストリカル・日報・期間 CSV・表示グループ・自由トレンド）
+が実データで動く。データの源は Hub 経由・SLMP・Modbus の 3 ドライバで、Hub
+なしの単体でも動く。トレンドの設計は
+[../../docs/chronogazer/trend-design.md](../../docs/chronogazer/trend-design.md)、
+経緯と実機で確かめていない点は [../../docs/STATUS.md](../../docs/STATUS.md)
+（ローカルの引き継ぎ）と GitHub の Issue を参照。過去の実施計画は
+[../../docs/archive/r1-plan.md](../../docs/archive/r1-plan.md)。
 
 ## 起動方法
 
