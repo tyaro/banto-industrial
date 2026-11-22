@@ -1,7 +1,11 @@
 name: Installer delete-pending (disposable Windows)
 
+# リリース（タグの push: v* / trend-v*）と手動の実行（workflow_dispatch）では、
+# 変更パスの絞り込みをせず全部走らせる（2026-11-22 オーナー決定）。
 on:
   workflow_dispatch:
+  push:
+    tags: ['v*', 'trend-v*']
   pull_request:
     paths:
       - '.github/workflows/installer-delete-pending.yml'
