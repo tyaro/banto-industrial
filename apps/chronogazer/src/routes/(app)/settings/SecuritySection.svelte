@@ -222,9 +222,9 @@
 			</div>
 
 			<div class="save-row">
-				<button type="button" onclick={saveLocalGrant} disabled={applyingLocalGrant}
-					>保存して適用</button
-				>
+				<button type="button" onclick={saveLocalGrant} disabled={applyingLocalGrant}>
+					保存して適用
+				</button>
 				{#if localGrantDirty}
 					<button
 						type="button"
@@ -241,10 +241,10 @@
 			</div>
 		{:else}
 			<p class="status">
-				現在の設定: <strong
-					>{localGrantOptions.find((option) => option.value === authSettingsStore.value?.localGrant)
-						?.label ?? '—'}</strong
-				>
+				現在の設定: <strong>
+					{localGrantOptions.find((option) => option.value === authSettingsStore.value?.localGrant)
+						?.label ?? '—'}
+				</strong>
 			</p>
 			<p class="note">この設定は、サービスを動かしている PC から開いた画面でだけ変更できます。</p>
 		{/if}
@@ -260,8 +260,9 @@
 		{/if}
 
 		<p class="status">
-			ログイン不要モード: <strong>{authSettingsStore.value?.disabled ? '有効' : '無効'}</strong
-			>（デスクトップアプリの画面だけに効く設定で、ここからは変更できません）
+			ログイン不要モード: <strong>
+				{authSettingsStore.value?.disabled ? '有効' : '無効'}
+			</strong>（デスクトップアプリの画面だけに効く設定で、ここからは変更できません）
 		</p>
 	</section>
 {/if}
@@ -302,11 +303,11 @@
 
 		{#if authSettingsStore.value}
 			<p class="status">
-				状態: <strong
-					>{authSettingsStore.value.disabled
+				状態: <strong>
+					{authSettingsStore.value.disabled
 						? '有効（ログイン画面なし）'
-						: '無効（通常のログインが必要）'}</strong
-				>
+						: '無効（通常のログインが必要）'}
+				</strong>
 			</p>
 		{/if}
 

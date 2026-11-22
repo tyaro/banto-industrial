@@ -318,8 +318,9 @@
 								<td
 									class="mark"
 									class:unregistered={row.kind === 'unregistered' && state.kind === 'addable'}
-									>{mark}</td
 								>
+									{mark}
+								</td>
 								<td class="act-col">
 									<button
 										type="button"

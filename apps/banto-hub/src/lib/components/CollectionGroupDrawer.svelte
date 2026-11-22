@@ -578,8 +578,9 @@
 					placeholder="SELECT id, temperature, running FROM sensors"
 					aria-invalid={errors.querySql ? 'true' : undefined}
 					aria-describedby={errors.querySql ? 'group-query-sql-err' : undefined}></textarea>
-				{#if errors.querySql}<span class="err" id="group-query-sql-err">{errors.querySql}</span
-					>{/if}
+				{#if errors.querySql}<span class="err" id="group-query-sql-err">
+						{errors.querySql}
+					</span>{/if}
 			</label>
 			<span class="hint wide">
 				読み取り専用の DB ユーザーで実行してください。先頭 1 行のみ採用。

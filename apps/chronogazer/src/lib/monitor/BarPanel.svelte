@@ -69,9 +69,9 @@
 				<div class="meter" aria-hidden="true">
 					<div class="scale">
 						{#each pen.ticks as tick (tick.value)}
-							<span class="tick" style:bottom={pct(tick.position)}
-								>{scaleText(pen, tick.value)}</span
-							>
+							<span class="tick" style:bottom={pct(tick.position)}>
+								{scaleText(pen, tick.value)}
+							</span>
 						{/each}
 					</div>
 					<div class="track">
@@ -89,9 +89,9 @@
 					</div>
 					<div class="mark-labels">
 						{#each pen.markGroups as mark (mark.label)}
-							<span class="mark-label" data-tone={mark.tone} style:bottom={pct(mark.position)}
-								>{mark.label}</span
-							>
+							<span class="mark-label" data-tone={mark.tone} style:bottom={pct(mark.position)}>
+								{mark.label}
+							</span>
 						{/each}
 					</div>
 				</div>

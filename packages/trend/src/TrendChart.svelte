@@ -544,17 +544,23 @@
 						y1="0"
 						y2={plotHeight}
 					/>
-					<text class="bi-trend__tick" x={xScale(t.tMs)} y={plotHeight + 16} text-anchor="middle"
-						>{t.label}</text
-					>
+					<text class="bi-trend__tick" x={xScale(t.tMs)} y={plotHeight + 16} text-anchor="middle">
+						{t.label}
+					</text>
 				{/each}
 				<rect class="bi-trend__frame" x="0" y="0" width={plotWidth} height={plotHeight} />
 
 				{#if owners.left !== null}
 					{#each leftTicks as t (t.v)}
-						<text class="bi-trend__tick" x="-6" y={t.y} text-anchor="end" dominant-baseline="middle"
-							>{tickText(owners.left, t.v)}</text
+						<text
+							class="bi-trend__tick"
+							x="-6"
+							y={t.y}
+							text-anchor="end"
+							dominant-baseline="middle"
 						>
+							{tickText(owners.left, t.v)}
+						</text>
 					{/each}
 				{/if}
 				{#if owners.right !== null}
@@ -564,8 +570,10 @@
 							x={plotWidth + 6}
 							y={t.y}
 							text-anchor="start"
-							dominant-baseline="middle">{tickText(owners.right, t.v)}</text
+							dominant-baseline="middle"
 						>
+							{tickText(owners.right, t.v)}
+						</text>
 					{/each}
 				{/if}
 
@@ -577,8 +585,10 @@
 							width={b.width}
 							height={plotHeight}
 							fill={b.colorVar}
-							fill-opacity="0.15"><title>{b.label}</title></rect
+							fill-opacity="0.15"
 						>
+							<title>{b.label}</title>
+						</rect>
 					{/each}
 					<g clip-path="url(#{uid}-analog-clip)">
 						{#each bandRectList as b, i (i)}
@@ -588,8 +598,10 @@
 								y={b.y}
 								width={plotWidth}
 								height={b.height}
-								fill={b.colorVar}><title>{b.label}</title></rect
+								fill={b.colorVar}
 							>
+								<title>{b.label}</title>
+							</rect>
 						{/each}
 					</g>
 					{#each bitBandViews as bb (bb.pen.id)}
@@ -601,8 +613,10 @@
 								y={bb.y}
 								width={ms.width}
 								height={bb.height}
-								fill="url(#{uid}-missing)"><title>記録なし</title></rect
+								fill="url(#{uid}-missing)"
 							>
+								<title>記録なし</title>
+							</rect>
 						{/each}
 						{#each bb.spans as sp, j (j)}
 							<rect
@@ -619,8 +633,10 @@
 								class="bi-trend__bit-label"
 								x="4"
 								y={bb.y + bb.height / 2}
-								dominant-baseline="middle">{bb.pen.label}</text
+								dominant-baseline="middle"
 							>
+								{bb.pen.label}
+							</text>
 						{/if}
 					{/each}
 					{#each timeLayout.bitOverlays as b, i (i)}
@@ -630,8 +646,10 @@
 							width={b.width}
 							height={b.height}
 							fill={b.colorVar}
-							fill-opacity="0.35"><title>{b.label}</title></rect
+							fill-opacity="0.35"
 						>
+							<title>{b.label}</title>
+						</rect>
 					{/each}
 					<g clip-path="url(#{uid}-analog-clip)">
 						{#each limitLayouts as lay, i (pens[i].id)}
@@ -642,15 +660,19 @@
 									x2={plotWidth}
 									y1={l.y}
 									y2={l.y}
-									stroke={l.colorVar}><title>{l.label}</title></line
+									stroke={l.colorVar}
 								>
+									<title>{l.label}</title>
+								</line>
 								<text
 									class="bi-trend__limit-label"
 									x={plotWidth - 4}
 									y={limitLabelY(l.y)}
 									text-anchor="end"
-									fill={l.colorVar}>{l.label}</text
+									fill={l.colorVar}
 								>
+									{l.label}
+								</text>
 							{/each}
 						{/each}
 						{#each pens as pen, i (pen.id)}
@@ -693,8 +715,10 @@
 							width={b.width}
 							height={b.height}
 							fill={b.colorVar}
-							fill-opacity="0.35"><title>{b.label}</title></rect
+							fill-opacity="0.35"
 						>
+							<title>{b.label}</title>
+						</rect>
 					{/each}
 					{#each timeMarkLines as m, i (i)}
 						<line
@@ -703,16 +727,20 @@
 							y1="0"
 							y2={plotHeight}
 							stroke={m.colorVar}
-							stroke-dasharray="3 3"><title>{m.label}</title></line
+							stroke-dasharray="3 3"
 						>
+							<title>{m.label}</title>
+						</line>
 						{#if m.showLabel}
 							<text
 								class="bi-trend__limit-label"
 								x={m.labelSide === 'left' ? m.x - 3 : m.x + 3}
 								y="10"
 								text-anchor={m.labelSide === 'left' ? 'end' : 'start'}
-								fill={m.colorVar}><title>{m.label}</title>{m.label}</text
+								fill={m.colorVar}
 							>
+								<title>{m.label}</title>{m.label}
+							</text>
 						{/if}
 					{/each}
 					{#if cursorX !== null}
@@ -732,8 +760,10 @@
 								class="bi-trend__fixed-name"
 								x={c.x > plotWidth - 14 ? c.x - 3 : c.x + 3}
 								text-anchor={c.x > plotWidth - 14 ? 'end' : 'start'}
-								y="10">{c.name}</text
+								y="10"
 							>
+								{c.name}
+							</text>
 						{/if}
 					{/each}
 				</g>
@@ -744,8 +774,10 @@
 						x={plotWidth / 2}
 						y={plotHeight / 2}
 						text-anchor="middle"
-						dominant-baseline="middle">{loading ? '読み込み中…' : emptyMessage}</text
+						dominant-baseline="middle"
 					>
+						{loading ? '読み込み中…' : emptyMessage}
+					</text>
 				{/if}
 			</g>
 		</svg>
@@ -791,8 +823,8 @@
 
 {#snippet obsTime(v: CursorValue)}
 	{#if typeof v.tMs === 'number'}<small class="bi-trend__muted">
-			({formatObservationTime(v.tMs)})</small
-		>{/if}
+			({formatObservationTime(v.tMs)})
+		</small>{/if}
 {/snippet}
 
 {#snippet legendBody(pen: TrendPen, i: number)}
@@ -803,12 +835,12 @@
 	{#if readout}
 		<span class="bi-trend__value">{readout[i].text}{@render obsTime(readout[i])}</span>
 	{/if}
-	{#if readoutA}<span class="bi-trend__value"
-			>A {readoutA[i].text}{@render obsTime(readoutA[i])}</span
-		>{/if}
-	{#if readoutB}<span class="bi-trend__value"
-			>B {readoutB[i].text}{@render obsTime(readoutB[i])}</span
-		>{/if}
+	{#if readoutA}<span class="bi-trend__value">
+			A {readoutA[i].text}{@render obsTime(readoutA[i])}
+		</span>{/if}
+	{#if readoutB}<span class="bi-trend__value">
+			B {readoutB[i].text}{@render obsTime(readoutB[i])}
+		</span>{/if}
 	{#if readoutA && readoutB}
 		<span class="bi-trend__value">差 {cursorDiff(pen, readoutA[i], readoutB[i])}</span>
 	{/if}

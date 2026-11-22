@@ -1217,10 +1217,10 @@
 			placeholder={String(DEFAULT_STALE_TIMEOUT_MS)}
 			disabled={readOnly}
 		/>
-		<span class="hint"
-			>送り手からの最後の通信からこの時間が過ぎると、この接続のタグは Bad になります（空欄は既定の
-			10,000 ms、1,000〜3,600,000）。</span
-		>
+		<span class="hint">
+			送り手からの最後の通信からこの時間が過ぎると、この接続のタグは Bad になります（空欄は既定の
+			10,000 ms、1,000〜3,600,000）。
+		</span>
 		{#if errors.staleTimeoutMs}<span class="err">{errors.staleTimeoutMs}</span>{/if}
 	</label>
 	<label class="field checkbox wide">
@@ -1249,9 +1249,9 @@
 					<label class="field">
 						クエリの名前
 						<input type="text" bind:value={query.name} disabled={readOnly} />
-						{#if errors[bridgeQueryErrorKey(index, 'name')]}<span class="err"
-								>{errors[bridgeQueryErrorKey(index, 'name')]}</span
-							>{/if}
+						{#if errors[bridgeQueryErrorKey(index, 'name')]}<span class="err">
+								{errors[bridgeQueryErrorKey(index, 'name')]}
+							</span>{/if}
 					</label>
 					<label class="field">
 						周期
@@ -1268,9 +1268,9 @@
 							bind:value={query.sql}
 							placeholder="SELECT temp, run FROM line1_now"
 							disabled={readOnly}></textarea>
-						{#if errors[bridgeQueryErrorKey(index, 'sql')]}<span class="err"
-								>{errors[bridgeQueryErrorKey(index, 'sql')]}</span
-							>{/if}
+						{#if errors[bridgeQueryErrorKey(index, 'sql')]}<span class="err">
+								{errors[bridgeQueryErrorKey(index, 'sql')]}
+							</span>{/if}
 					</label>
 					<label class="field">
 						列とキーの対応（1 行に 1 つ「列名=キー」）
@@ -1279,19 +1279,19 @@
 							bind:value={query.columnsText}
 							placeholder="temp=line1.temp&#10;run=line1.run"
 							disabled={readOnly}></textarea>
-						{#if errors[bridgeQueryErrorKey(index, 'columns')]}<span class="err"
-								>{errors[bridgeQueryErrorKey(index, 'columns')]}</span
-							>{/if}
+						{#if errors[bridgeQueryErrorKey(index, 'columns')]}<span class="err">
+								{errors[bridgeQueryErrorKey(index, 'columns')]}
+							</span>{/if}
 					</label>
 					{#if queryLoad}
-						<span class="hint"
-							>このクエリ: {queryLoad.items} 件・1 周期 {queryLoad.messagesPerCycle} メッセージ</span
-						>
+						<span class="hint">
+							このクエリ: {queryLoad.items} 件・1 周期 {queryLoad.messagesPerCycle} メッセージ
+						</span>
 					{/if}
 					{#if !readOnly}
-						<button type="button" class="secondary" onclick={() => removeBridgeQuery(index)}
-							>このクエリを外す</button
-						>
+						<button type="button" class="secondary" onclick={() => removeBridgeQuery(index)}>
+							このクエリを外す
+						</button>
 					{/if}
 				</fieldset>
 			{/each}
@@ -1373,9 +1373,9 @@
 			{/if}
 		{:else}
 			<p>
-				<span class="state-chip {ingestLinkClass(ingestStatus)}" data-testid="ingest-link"
-					>{ingestLinkLabel(ingestStatus)}</span
-				>
+				<span class="state-chip {ingestLinkClass(ingestStatus)}" data-testid="ingest-link">
+					{ingestLinkLabel(ingestStatus)}
+				</span>
 				{#if ingestStatus.link !== 'live' && ingestStatus.link_detail}
 					<span class="hint">{ingestStatus.link_detail}</span>
 				{/if}
@@ -1459,9 +1459,9 @@
 			{#if testState.result.ok}
 				<span class="test-result ok">接続成功（応答 {testState.result.elapsedMs}ms）</span>
 			{:else}
-				<span class="test-result error"
-					>{testState.result.error?.message ?? '接続に失敗しました'}</span
-				>
+				<span class="test-result error">
+					{testState.result.error?.message ?? '接続に失敗しました'}
+				</span>
 			{/if}
 		{/if}
 	</div>
@@ -1514,9 +1514,9 @@
 					</details>
 				</div>
 			{:else if rangeDiagnostic}
-				<span class="test-result"
-					>{rangeDiagnostic.reason ?? 'この接続では診断を利用できません'}</span
-				>
+				<span class="test-result">
+					{rangeDiagnostic.reason ?? 'この接続では診断を利用できません'}
+				</span>
 			{/if}
 		</section>
 	{/if}
@@ -1543,11 +1543,11 @@
 			<span class="test-result testing">テスト中…</span>
 		{:else if dbTestState.result}
 			{#if dbTestState.result.ok}
-				<span class="test-result ok"
-					>接続成功{dbTestState.result.serverVersion
+				<span class="test-result ok">
+					接続成功{dbTestState.result.serverVersion
 						? `（${dbTestState.result.serverVersion}）`
-						: ''}</span
-				>
+						: ''}
+				</span>
 			{:else}
 				<span class="test-result error">{dbTestState.result.error ?? '接続に失敗しました'}</span>
 			{/if}
@@ -1648,8 +1648,10 @@
 					type="button"
 					class="secondary"
 					onclick={goBack}
-					disabled={saving || dbTestState.testing}>戻る</button
+					disabled={saving || dbTestState.testing}
 				>
+					戻る
+				</button>
 			{/if}
 			{#if step === 1}
 				<button type="button" onclick={goNext} disabled={!canAdvanceFromStep1}>次へ</button>

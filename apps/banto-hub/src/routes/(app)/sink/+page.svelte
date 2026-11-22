@@ -147,12 +147,13 @@
 	<section>
 		<h2>DB Sink</h2>
 		<p class="note">
-			ここで設定した内容は即時に反映されます（保留中の変更キューには載りません）。サイドカー （<code
-				>banto-hub-sink</code
-			>）はこの変更を <code>config_refresh_secs</code>（既定30秒）以内に
+			ここで設定した内容は即時に反映されます（保留中の変更キューには載りません）。サイドカー （<code>
+				banto-hub-sink
+			</code>）はこの変更を <code>config_refresh_secs</code>（既定30秒）以内に
 			取り込みます。サイドカー自体の起動・停止は
-			<a href={`${resolveAppPath('/status')}#collection-control`}>状態画面</a
-			>の「サービス一覧」から行えます。
+			<a href={`${resolveAppPath('/status')}#collection-control`}>
+				状態画面
+			</a>の「サービス一覧」から行えます。
 		</p>
 
 		{#if loading && sinkGroups.length === 0}

@@ -1232,9 +1232,13 @@
 							{:else if groups === null}
 								<p class="load-error" role="alert">
 									表示グループの一覧を読み込めませんでした（{groupsError}）。登録が0件という意味ではありません。
-									<button type="button" onclick={() => void reloadGroups()} disabled={groupsLoading}
-										>再試行</button
+									<button
+										type="button"
+										onclick={() => void reloadGroups()}
+										disabled={groupsLoading}
 									>
+										再試行
+									</button>
 								</p>
 							{:else}
 								{#if groupsError !== null}
@@ -1243,8 +1247,10 @@
 										<button
 											type="button"
 											onclick={() => void reloadGroups()}
-											disabled={groupsLoading}>再試行</button
+											disabled={groupsLoading}
 										>
+											再試行
+										</button>
 									</p>
 								{/if}
 								{#if groups.length === 0}
@@ -1264,9 +1270,9 @@
 													{#if group.bundle !== null}
 														<span class="group-bundle" title="束">{group.bundle}</span>
 													{/if}
-													<span class="group-meta"
-														>{kindLabel(group.kind)}・ペン {group.pens.length} 本</span
-													>
+													<span class="group-meta">
+														{kindLabel(group.kind)}・ペン {group.pens.length} 本
+													</span>
 												</button>
 												{#if canWrite}
 													<button
@@ -1638,9 +1644,9 @@
 														<option value={bundle}></option>
 													{/each}
 												</datalist>
-												<span class="note" id="group-bundle-note"
-													>同じ名前の束を付けたグループは、監視画面で 1 つの束にまとまります。</span
-												>
+												<span class="note" id="group-bundle-note">
+													同じ名前の束を付けたグループは、監視画面で 1 つの束にまとまります。
+												</span>
 												{#each fieldErrors.bundle as message, i (i)}
 													<span class="field-error">{message}</span>
 												{/each}

@@ -79,8 +79,10 @@
 				class="watch-status"
 				class:warning={status.warning}
 				data-testid="watch-status"
-				title={status.text}>{status.text}</span
+				title={status.text}
 			>
+				{status.text}
+			</span>
 			{#if status.resumable}
 				<button type="button" class="tool-button" onclick={onResume}>再接続</button>
 			{/if}
@@ -92,8 +94,10 @@
 			class="tool-button"
 			data-testid="watch-clear"
 			disabled={rows.length === 0}
-			onclick={onClear}>すべて外す</button
+			onclick={onClear}
 		>
+			すべて外す
+		</button>
 	</div>
 	{#if saveStatus === 'saving'}
 		<p class="watch-save" role="status" data-testid="watch-save-status">保存中…</p>
@@ -104,8 +108,10 @@
 				type="button"
 				class="tool-button"
 				data-testid="watch-save-retry"
-				onclick={() => onRetrySave?.()}>今すぐ再試行</button
+				onclick={() => onRetrySave?.()}
 			>
+				今すぐ再試行
+			</button>
 		</p>
 	{:else if saveStatus === 'blocked'}
 		<p class="watch-save warning" role="status" data-testid="watch-save-status">
@@ -132,9 +138,9 @@
 					{#each rows as row (row.id)}
 						{#if row.unverified}
 							<tr class="unverified" data-testid="watch-row-unverified" data-tag-id={row.id}>
-								<td class="name" title="タグ一覧に無く、消えたかを確かめられていません"
-									>確かめられないタグ（#{row.id}）</td
-								>
+								<td class="name" title="タグ一覧に無く、消えたかを確かめられていません">
+									確かめられないタグ（#{row.id}）
+								</td>
 								<td></td>
 								<td></td>
 								<td></td>
@@ -144,19 +150,21 @@
 										class="tool-button"
 										data-testid="watch-remove"
 										aria-label="確かめられないタグ（#{row.id}）を見張りから外す"
-										onclick={() => onRemove(row.id)}>外す</button
+										onclick={() => onRemove(row.id)}
 									>
+										外す
+									</button>
 								</td>
 							</tr>
 						{:else}
 							<tr class:flash={row.flashing} data-testid="watch-row" data-tag-id={row.id}>
 								<td class="name">{row.name}</td>
-								<td class="nowrap value quality-{row.qualityClass}" data-testid="watch-value"
-									>{row.value}</td
-								>
-								<td class="nowrap quality-{row.qualityClass}" data-testid="watch-quality"
-									>{row.qualityLabel}</td
-								>
+								<td class="nowrap value quality-{row.qualityClass}" data-testid="watch-value">
+									{row.value}
+								</td>
+								<td class="nowrap quality-{row.qualityClass}" data-testid="watch-quality">
+									{row.qualityLabel}
+								</td>
 								<td class="nowrap">{row.time}</td>
 								<td class="nowrap">
 									<button
@@ -164,8 +172,10 @@
 										class="tool-button"
 										data-testid="watch-remove"
 										aria-label="{row.name} を見張りから外す"
-										onclick={() => onRemove(row.id)}>外す</button
+										onclick={() => onRemove(row.id)}
 									>
+										外す
+									</button>
 								</td>
 							</tr>
 						{/if}

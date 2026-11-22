@@ -426,16 +426,16 @@
 					{#if outcome?.state === 'unavailable'}
 						<p class="note warn no-print" role="alert">
 							{DAILY_REPORT_UNAVAILABLE_MESSAGE}
-							<button type="button" class="secondary" onclick={() => (retryToken += 1)}
-								>再試行</button
-							>
+							<button type="button" class="secondary" onclick={() => (retryToken += 1)}>
+								再試行
+							</button>
 						</p>
 					{:else if outcome?.state === 'error'}
 						<p class="note warn no-print" role="alert">
 							{outcome.message}
-							<button type="button" class="secondary" onclick={() => (retryToken += 1)}
-								>再試行</button
-							>
+							<button type="button" class="secondary" onclick={() => (retryToken += 1)}>
+								再試行
+							</button>
 						</p>
 					{/if}
 					{#if loading}

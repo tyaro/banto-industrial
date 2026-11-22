@@ -175,19 +175,20 @@
 					{#each rows as row (row.id)}
 						<tr class:alert-row={isAlertResult(row.result)} onclick={() => selectRow(row)}>
 							<td>{formatSqliteUtc(row.ts)}</td>
-							<td
-								>{row.apiKeyNameSnapshot}{#if row.apiKeyPrefixSnapshot}
-									<small class="key-prefix">{row.apiKeyPrefixSnapshot}</small
-									>{/if}{#if row.operatorClaim}
-									<small class="claim">申告: {row.operatorClaim}</small>{/if}</td
-							>
+							<td>
+								{row.apiKeyNameSnapshot}{#if row.apiKeyPrefixSnapshot}
+									<small class="key-prefix">
+										{row.apiKeyPrefixSnapshot}
+									</small>{/if}{#if row.operatorClaim}
+									<small class="claim">申告: {row.operatorClaim}</small>{/if}
+							</td>
 							<td class="tag-name">{row.externalNameSnapshot}</td>
 							<td class="value">{row.valueRequested ?? row.valueRequestedText ?? '-'}</td>
 							<td>{actionLabel(row.action)}</td>
-							<td class:alert={isAlertResult(row.result)}
-								>{resultLabel(row.result)}{#if rejectionReason(row)}
-									<small class="key-prefix">{rejectionReason(row)}</small>{/if}</td
-							>
+							<td class:alert={isAlertResult(row.result)}>
+								{resultLabel(row.result)}{#if rejectionReason(row)}
+									<small class="key-prefix">{rejectionReason(row)}</small>{/if}
+							</td>
 						</tr>
 					{/each}
 				</tbody>
@@ -214,9 +215,9 @@
 				<dt>操作者（申告）</dt>
 				<dd class="wrap">
 					{selected.operatorClaim ?? '—'}
-					<small class="claim-note"
-						>呼出側の申告で、Hub は確かめていません。認証の根拠は API キーです。</small
-					>
+					<small class="claim-note">
+						呼出側の申告で、Hub は確かめていません。認証の根拠は API キーです。
+					</small>
 				</dd>
 				<dt>相関 ID</dt>
 				<dd class="wrap">{selected.correlationId ?? '—'}</dd>

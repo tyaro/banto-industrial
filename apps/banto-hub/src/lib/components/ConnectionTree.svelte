@@ -260,8 +260,10 @@
 					? 'PostgreSQL 接続（DB Source、S1）'
 					: connection.simulation && !isVirtualConnection(connection)
 						? 'シミュレーション接続（実機ではありません）'
-						: undefined}>{connectionBadge(connection)}</span
+						: undefined}
 			>
+				{connectionBadge(connection)}
+			</span>
 		{/if}
 	{:else if node.data?.kind === 'group'}
 		<span class="icon" aria-hidden="true">⏱</span>

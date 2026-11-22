@@ -242,13 +242,13 @@
 								<td>{STATE_LABEL[keyState]}</td>
 								<td>
 									{#if key.revokedAt === null}
-										<button type="button" class="danger" onclick={() => handleRevoke(key)}
-											>失効</button
-										>
+										<button type="button" class="danger" onclick={() => handleRevoke(key)}>
+											失効
+										</button>
 									{:else}
-										<button type="button" class="danger" onclick={() => handleDelete(key)}
-											>削除</button
-										>
+										<button type="button" class="danger" onclick={() => handleDelete(key)}>
+											削除
+										</button>
 									{/if}
 								</td>
 							</tr>
