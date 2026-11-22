@@ -1,266 +1,92 @@
 # banto-industrial
 
-工場・現場系アプリのための再利用資産層。
-[banto](https://github.com/tyaro/banto)（汎用管理画面テンプレート）の上に、
-ドメイン寄りの共通資産（タグレジストリ・PLC通信・時系列収集/読み出し）と
-それを使う製品アプリ（記録計ほか）を蓄積する。
+[banto](https://github.com/tyaro/banto)（UI・認証・保存などの共通基盤）の上に、
+工場・現場向けの共通資産とアプリを置くリポジトリ。Rust の workspace と
+SvelteKit / Tauri のフロントで構成する。
 
-- 計画: [docs/plan.md](docs/plan.md)（I系 = 資産クレート、R系 = 記録計 **ChronoGazer**、
-  W系 = 自動書き込みアプリ **relay-wright**、T系 = タグサーバー **banto-hub**）
-- ChronoGazer（記録計）要件定義: [docs/chronogazer/recorder-requirements.md](docs/chronogazer/recorder-requirements.md)
-- banto 側のスコープ整理: banto リポジトリの docs/template-scope.md
+- docs 全体の地図・現状・各文書の「正」: [docs/README.md](docs/README.md)
+- 全体計画: [docs/plan.md](docs/plan.md)
+- タグサーバー banto-hub の設計: [docs/hub/tag-server-design.md](docs/hub/tag-server-design.md)
 
-## 構成
+## アプリ・パッケージ
 
-```
-crates/
-  banto-tags/        I1: タグレジストリ（PLC接続/収集グループ/タグの定義・型・スケーリング）実装済み
-  banto-plc/         I2/I2a: PLC通信（読み取り専用。trait + Modbus TCP + MELSEC MC/SLMP）実装済み
-  banto-tstore/      I3a: 時系列ストレージ（日次ファイル+スキーマ凍結の自己記述的SQLite）実装済み
-  banto-collect/     I3b: 収集エンジン（PLC定期読み出し→banto-tstore書き込み、現在値・イベント供給）実装済み
-  banto-tsquery/     I4: 期間クエリ + サーバ側 min/max 間引き（read_range/read_decimated/aggregate/catalog）実装済み
-  banto-plc-write/   I5: PLC書き込み（SLMP一括書き込み。読み取り側と分離した専用trait）実装済み
-  banto-broker/      I6: PLC アクセスブローカー（接続毎1タスク・read/write 単一セッション・再接続バックオフ）実装済み
-  banto-expr/        T6-1: 演算タグの式評価エンジン（tokio/レジストリ非依存、依存は thiserror のみ）実装済み
-apps/
-  chronogazer/       R系: デジタル記録計 ChronoGazer（Tauri + LAN、banto テンプレート由来）
-  banto-hub/         T系: タグサーバー banto-hub（Tauriなしのヘッドレス axum、REST/WS/MQTT/gRPC でタグ空間を外部公開。T18-6 まで実装済み・試運転モード/ロックダウン対応、残は実機/soak 系のみ）
-```
+| 場所                                           | 役目                                                                                                                                                                                               |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [apps/banto-hub](apps/banto-hub/README.md)     | FA-Server 型のタグサーバー。PLC（Modbus TCP / MELSEC SLMP）から収集し、REST / WebSocket / MQTT / gRPC / MCP と OPC UA（任意で有効・読み取り専用）で公開する。ヘッドレスの単一 exe で管理 UI も配信 |
+| apps/banto-hub-sink                            | banto-hub のタグを購読し、値を外部の PostgreSQL へまとめて書き込む別プロセスのサイドカー（`banto-hub-sink.exe`。設定ファイルで動き、Windows サービスとして登録できる）                             |
+| [apps/chronogazer](apps/chronogazer/README.md) | 記録計。監視・ヒストリカル・日報・期間 CSV・表示グループ・自由トレンド。Hub 経由・SLMP・Modbus の 3 ドライバで単体でも動く                                                                         |
+| [packages/trend](packages/trend/README.md)     | トレンドのチャートの部品（`@banto-industrial/trend`）。ChronoGazer と temp-scada が使う。タグ `trend-v*` で配る                                                                                    |
 
-W系（条件付きPLC自動書き込みアプリ **relay-wright**）は 2026-09-24 に
-main から外し、タグ `archive/relay-wright-2026-09-24` に退避した（構想の
-練り直し、オーナー決定。docs/plan.md §4b 参照）。
+## クレート（crates/）
 
-### `banto-tags`（I1）
+各 crate の設計意図は `src/lib.rs` 先頭のモジュールドキュメント（`//!`）に書いてある。
 
-3層のエンティティモデル（`PlcConnection` → `CollectionGroup` → `Tag`）+
-CRUD/一覧サービス + スケーリング純関数（`scale_raw`/`unscale`）。
-マイグレーションはクレート内 `migrations/` に同梱し、消費側が
-`banto_tags::migrate(&pool)` を起動時に呼んで適用する
-（`apps/admin-template/core/src/db.rs` の方式を踏襲）。
-詳細は [crates/banto-tags/src/lib.rs](crates/banto-tags/src/lib.rs) の
-モジュールドキュメントを参照。
+**タグと収集・時系列**
 
-### `banto-plc`（I2 / I2a）
+- `banto-tags`: タグのレジストリ（タグ・収集グループ・表示グループ）
+- `banto-collect`: 収集エンジン（PLC 接続ごとに周期で読み、時系列へ書く）
+- `banto-tstore`: 時系列ストレージ
+- `banto-tsquery`: 時系列の期間クエリ（ヒストリカル・CSV・日報の元）
+- `banto-expr`: 演算タグの式の評価
+- `banto-db-source`: 外部 DB（PostgreSQL）を Source にする共有部品
 
-読み取り専用・一括読み出しの PLC 通信クライアント。プロトコル差し替えの
-境界は [`PlcClient`](crates/banto-plc/src/client.rs) trait（`dyn` 互換に
-手書き - I3 が `Box<dyn PlcClient>` で複数 PLC を並行保持する前提）。
-同 trait の実装が2本ある:
+**PLC とドライバ**
 
-- **Modbus TCP**（MBAP の組み立て・解釈は
-  [`modbus`](crates/banto-plc/src/modbus/mod.rs)、I2。R2b-3c から通信は
-  `banto-driver-modbus` の Frame 型ドライバ + `banto-driver-engine`）:
-  外部 `modbus` クレート不使用の自前実装。デバッグ容易性を優先して先行実装
-  （docs/plan.md I2）
-- **MELSEC MC/SLMP**（[`SlmpClient`](crates/banto-plc/src/slmp/mod.rs)、I2a）:
-  本命ターゲット。フレーミングは承認済み外部クレート `slmp`（MIT）を
-  ラップし、この crate 側は「何を読むか」（プランニング）と「どう失敗した
-  か」（エラー翻訳）だけを持つ。Modbus 側と方針が異なる理由は
-  `slmp/mod.rs` のモジュールドキュメント
+- `banto-plc`: PLC 通信の共通部分（アドレス・読み取り計画・デコード・シミュレータ）
+- `banto-plc-address`: アドレスがどの領域か・書き込めるかの判定
+- `banto-plc-write`: PLC への書き込みクライアント（読み取りだけの利用側と分けた crate）
+- `banto-register-codec`: 16 ビットレジスタ列の数値デコード
+- `banto-broker`: PLC への接続を CPU ごとに 1 本に束ねるブローカー
+- `banto-driver-api`: ドライバの境界（型とトレイトのみ）
+- `banto-driver-engine`: フレーム型ドライバを期限つきの Session で動かす実行系
+- `banto-driver-slmp` / `banto-driver-modbus`: SLMP・Modbus TCP のドライバ
+- `banto-driver-wasm`: Wasmtime の Component Model で動くドライバ（署名つき書き込みは別の経路）
+- `banto-drivers`: ホストがエンジンへ渡すドライバの組
+- `banto-driver-conformance`: Hub なしでドライバを検査する道具
+- `banto-rtsp`: RTSP の基礎型（映像の入口。アプリ層の外に置く）
 
-- アドレス表記（`crates/banto-plc/src/address.rs`）: `Address` は2表記の
-  sum type。計装の参照番号方式（`0/1/3/4` + 4or5桁、`40001` → 保持レジスタ
-  offset 0）と MELSEC デバイス方式（`D100`/`M50`/`X1A`、デバイス毎に
-  10進/16進が決まる - `slmp/address.rs`）をそれぞれ純関数でパース。
-  どちらを使うかは `PlcConnection.protocol` が決め、テキストからの推測は
-  しない（2表記は重複しないので、プロトコル設定ミスは個別タグの Bad として
-  露出する）
-- 要求プランニング（`planning.rs` / `slmp/planning.rs`）: 近接タグを1回の
-  要求へ結合（間隙許容・プロトコル毎の上限で分割）、応答→各タグへの逆写像
-  まで純関数で設計。256タグ/100ms 収集の実現可否はここが握る
-- デコード（`crates/banto-plc/src/decode.rs`）: i16/u16/i32/u32/f32 +
-  i64/u64/f64（2026-09-08 追加、issue #325。Modbus 接続配下のタグのみ
-  登録可、4レジスタ占有）+ 32bit/64bit ワード順。両プロトコルで共用するが
-  既定値が異なる（Modbus=HighLow / SLMP=LowHigh - MELSEC は下位ワードが先）
-- シミュレータ（`simulator` feature、`modbus/simulator.rs` /
-  `slmp/simulator.rs`）: in-process テストダブル。SLMP 側は実バイト列で
-  4E バイナリフレームを話す（ラップ先クレートの内部を通すため）。I3 の
-  結合テストや R4 の72hソークでも再利用予定
-- 性能スモーク実測（ループバック、256タグ・1000回平均）: Modbus は
-  3往復/回で約0.4ms/回、SLMP は1往復/回。いずれも 100ms/周期目標に対し
-  十分な余裕（実PLC相手の実測はI3で再検証）
+**Hub との接続・公開**
 
-詳細は [crates/banto-plc/src/lib.rs](crates/banto-plc/src/lib.rs) の
-モジュールドキュメントを参照。
+- `banto-tagclient`: Hub を読む（と単一タグを書く）クライアント
+- `banto-hub-bootstrap`: 設定なしで Hub に接続するための API キー取得の部品
+- `banto-hub-tls-trust`: Hub の loopback TLS の置き場を、書き込みせずに検証する
+- `banto-hub-squat-harness`: ポートの横取りでも資格情報が漏れないことの試験用の道具
+- `banto-api-keys`: 機械クライアント向け API キー（発行・失効・照合）の共有部分
+- `banto-mcp`: MCP サーバーの骨組み
 
-### `banto-tstore`（I3a）
+**デスクトップ・サービス**
 
-時系列データの保存層。**日次ファイル + スキーマ凍結**方式
-（2026-07-12 決定、docs/chronogazer/recorder-requirements.md §8）:
-データファイル（SQLite、`YYYYMMDD-NNN.sqlite3`）は作成時にスキーマが
-確定し以後変更しない。収集グループ/タグの構成が変わっても既存ファイルは
-`ALTER` せず、新しい連番ファイルへローテーションする。`banto-tags`/
-`banto-plc` と異なり **タグレジストリ（I1）に一切依存しない** - 各
-ファイルは `tstore_meta`/`tstore_groups`/`tstore_columns` テーブルを
-同梱する自己記述的な構造で、後続の I4（クエリ層）はレジストリ DB へ
-接続しなくてもファイル単体を解釈できる。
+- `banto-desktop-tray`: トレイ常駐アプリの窓と終了まわり
+- `banto-instance-lock`: 同じデータを開くプロセスを 1 つにする排他
+- `banto-exit-once`: 終了の後始末をプロセスで 1 回だけ走らせる
+- `banto-service-control`: Windows の SCM の状態取得と start / stop / 自動開始
+- `banto-service-elev`: 昇格ヘルパーが使う Win32 の部品
 
-- [`config::StoreConfig`](crates/banto-tstore/src/config.rs): ファイル
-  生成に使う構成スナップショット（I3b がタグレジストリの行から組み立てる）
-- [`writer::TsWriter`](crates/banto-tstore/src/writer.rs): 追記 +
-  バッファリング（既定 1秒/500行、`WriterOptions` で調整可）+
-  ローカル深夜0時での自動ローテーション（[`clock::Clock`](crates/banto-tstore/src/clock.rs)
-  trait 経由でテスト注入可能）
-- [`reader::TsReader`](crates/banto-tstore/src/reader.rs): 1ファイル
-  単位の最小限の読み出し（範囲クエリ・間引きは I4 の仕事）
-- [`files`](crates/banto-tstore/src/files.rs): `list_data_files`/
-  `prune_files`（保持期限超過ファイルの自動削除、当日は対象外）
-- ローカル暦日変換（[`date::LocalDate`](crates/banto-tstore/src/date.rs)）は
-  Howard Hinnant の暦日アルゴリズムを純整数演算で実装し、追加の日付
-  クレートに依存しない。OS のローカル UTC オフセット取得のみ `time`
-  クレートを使用（Windows 専用製品という前提での判断 - `Cargo.toml`
-  参照）
+**安全と秘密**
 
-詳細は [crates/banto-tstore/src/lib.rs](crates/banto-tstore/src/lib.rs) の
-モジュールドキュメントを参照。
+- `banto-safe-root`: 利用者が触れうるフォルダの木を、サービスが辿らずに扱う
+- `banto-secret-store`: 秘密を DPAPI で守ったファイルとして保存する
 
-### `banto-collect`（I3b）
+## banto の参照
 
-収集エンジン。I1/I2/I3a を束ねる初のクレート: タグレジストリから
-**有効な構成のスナップショット**（[`build_config`](crates/banto-collect/src/config.rs)
-→ `CollectorConfig`）を組み立て、PLC 接続毎に1タスクを起動して
-グループ周期で一括読み出し → スケーリング適用 → `banto-tstore` へ追記する。
-UI と独立に 24/365 自走し（recorder-requirements.md §4）、停止指示
-（`Collector::stop`、writer flush 保証付き）まで回り続ける。
+banto の部品は npm（`github:tyaro/banto#<タグ>&path:packages/...`）と cargo
+（`git`・`tag`）の両方を git タグで参照する。上げるときは両方を同じタグに揃える。
+実際の版は `package.json`・`Cargo.toml` を正とする（例: `v7.9.0`）。
+banto に必要なものが見つかったら、industrial 側で回り道を作らず banto に Issue で提案する。
 
-- **並行構造**: 接続毎に1タスクがソケットを専有（`Box<dyn PlcClient>`、
-  プロトコル分岐は factory 関数に隔離）。グループ周期の多重化はタスク内の
-  最小デッドライン方式で、発火後の次回は常に「今 + 周期」— 追い付き連射を
-  しない（取りこぼしは gap として記録されるのが記録計として正しい）
-- **断絶時挙動**: PLC 断でも周期ティックは止めず**全NULL行を記録し続け**、
-  接続は別サブタスクで指数バックオフ（1s→2s→…上限30s、成功でリセット）
-  再接続。`plc_disconnected`/`plc_reconnected` イベント発行
-- **現在値キャッシュ**（[`CurrentValuesHandle`](crates/banto-collect/src/current.rs)）:
-  タグ毎の最新値 + 品質。Good/Bad は格納、**Stale は読み出し時判定**
-  （最終更新から周期×2.5超）— R1 のデジタル/バー/計器・ヘルス表示が消費
-- **イベント2系統**（[`EventSink`](crates/banto-collect/src/event.rs)）:
-  `tokio::broadcast` によるライブ配信 + `collect_events` テーブルへの永続化
-  （収集開始/停止・PLC断/復旧・しきい値 entered/cleared。しきい値は
-  スケーリング後の値の状態変化エッジのみ — ACK等のアラーム管理は非スコープ §7）
-- テストは `banto-plc` の `simulator` feature を再利用（結合11件 +
-  100ms×3グループのミニソーク + `#[ignore]` の60秒版 = 将来の72hソークの雛形）
+## 開発の始め方
 
-詳細は [crates/banto-collect/src/lib.rs](crates/banto-collect/src/lib.rs) の
-モジュールドキュメントを参照。
+各アプリの README と [e2e/README.md](e2e/README.md) を参照。ルートで使う主なもの:
 
-### `banto-tsquery`（I4）
+- `pnpm format:check`: prettier の検査（Markdown・TS・Svelte を編集したら `pnpm exec prettier --write` を先にかける）
+- `pnpm lint`: eslint
+- `pnpm check`: 各パッケージの型検査
+- `pnpm test`: 各パッケージの試験
 
-時系列クエリ層。`banto-tstore`（I3a）のデータディレクトリを、タグレジストリ
-（I1）に接続せず自己記述的メタデータだけで読む点は banto-tstore と同じ設計。
-4つのクエリを提供する `TsQuery`:
+## relay-wright
 
-- `read_range`: 生データ範囲取得（CSV出力向け）。行数上限（既定10万行）を
-  超えるとエラーで `read_decimated` の利用を促す
-- `read_decimated`: サーバ側 **min/maxエンベロープ間引き**（トレンド用）。
-  各ビンは平均ではなく実際の min/max を返す — 瞬間スパイクを潰さない設計
-  （記録計の存在意義）。間引きはファイル毎に SQLite の `GROUP BY` で実行し、
-  Rust側は複数ファイルの結果を時刻順マージするのみ（大範囲でも生データ行を
-  Rust側に吸い上げない）。ビン幅はグループの `period_ms`（ファイル間で
-  異なる場合は最大値）未満に細かくならないようクランプし、クランプが効いて
-  なお実データ点数が少ない場合はビン境界に丸めず実サンプル時刻をそのまま
-  返す最適化（ズームイン時の階段状表示を回避）付き
-- `aggregate`: 期間集計（日報用）。タグ毎 min/max/avg/count（NULL除外）
-- `catalog`: 利用可能なグループ/タグ/データ期間の一覧（UIの期間選択初期化用）
-
-**欠測（gap）は隠さない**: ビン内の有効サンプル数が0のタグ、またはビンに
-行が1つも無い区間（収集停止等）は `BinValue::Gap` として明示的に返す
-（フロントが線を切れるように）。ファイルを跨ぐ範囲（日次ローテーション、
-タグ構成変更による強制ローテーション）では `tag_key` でマッチし、
-あるファイルに存在しないタグは gap になる。
-
-`TsReader`（I3a）の `SqlitePool` は非公開のため、`read_decimated`/
-`aggregate`/`catalog` はカスタム集計SQLを実行できない - この crate は
-対象ファイルを自前で読み取り専用オープンし、`tstore_groups`/
-`tstore_columns` を直接読む（`read_range` のみ `TsReader::read_range` に
-委譲 - カスタムSQL不要なため）。テーブル名/列名はメタテーブルから読み戻した
-値を SQL識別子として使う前に形式検証する防御的実装（`plan.rs`）。
-
-詳細は [crates/banto-tsquery/src/lib.rs](crates/banto-tsquery/src/lib.rs) の
-モジュールドキュメントを参照。
-
-### `banto-plc-write`（I5）
-
-PLC **書き込み**クライアント。`banto-plc`（読み取り）とは**別クレート・
-別 trait**（[`PlcWriteClient`](crates/banto-plc-write/src/client.rs)）に
-分離してあり、読み取り専用の消費者（ChronoGazer、banto-collect）は
-書き込み API を一切リンクしない — 書き込めるのは意図してこの crate を
-依存に加えたアプリ（relay-wright）だけ。SLMP 一括書き込み
-（`slmp/planning.rs` で read 側と対称の要求結合）、`TagValue` → レジスタ/
-ビット列エンコード（read 側 `decode` の逆写像、32bit/64bit ワード順対応）、
-read/write 両対応のシミュレータ拡張を持つ。`Address`/`DataType`/
-`SlmpConfig` 等の語彙は `banto-plc` から再利用し、依存は
-banto-plc-write → banto-plc の一方向のみ。
-
-詳細は [crates/banto-plc-write/src/lib.rs](crates/banto-plc-write/src/lib.rs) の
-モジュールドキュメントを参照。
-
-### `apps/chronogazer`（R系）
-
-デジタル記録計 **ChronoGazer**（Tauri + LAN、banto テンプレート由来、
-docs/plan.md §4）。PLC通信 + タグデータ保存 + リアルタイム/ヒストリカル/
-ハイブリッドトレンド + 計器表示を1台に統合し、既設PLC + 現場PCでチャネル数
-自由という価格・柔軟性の優位を狙う。
-
-**現状は R1-A 段階（アプリ骨格のみ）**: ログイン・設定画面と、LANモード
-（`banto-serve`）/ Tauri デスクトップの両起動経路は動く。I系クレート
-（banto-tags/banto-plc/banto-tstore/banto-collect/banto-tsquery）は
-依存には追加済みだが、**まだ REST/Tauri コマンドのどこにも配線されていない**
-（`apps/chronogazer/core/Cargo.toml` の依存コメント参照）。監視・
-ヒストリカル・イベントの各画面は実データ無しのプレースホルダ表示のまま。
-実施計画は [docs/archive/r1-plan.md](docs/archive/r1-plan.md)（Phase R1-A〜R1-D）、要件定義は
-[docs/chronogazer/recorder-requirements.md](docs/chronogazer/recorder-requirements.md)を参照。詳細は
-[apps/chronogazer/README.md](apps/chronogazer/README.md)。
-
-### `apps/relay-wright`（W系、2026-09-24 に main から退避）
-
-条件付き PLC 自動書き込みアプリ（Tauri + banto テンプレート由来、
-docs/plan.md §4b）。タグレジストリの読み取り値を条件に、設定ルールに
-従って別の PLC デバイスへ値を自動書き込みする構想だった。アーミング
-（再起動で必ず disarmed に戻る）・dry-run・レート制限ブレーカ（トリップで
-自動ディスアーム）・log-before-write・書き込みループのサイクル検出という
-安全機構をエンジンに持つ設計だったが、**2026-09-17 に凍結、2026-09-24 に
-main から外してタグ `archive/relay-wright-2026-09-24` に退避した**（構想の
-練り直し、オーナー決定）。復元は
-`git checkout archive/relay-wright-2026-09-24 -- apps/relay-wright ...` で
-できる。詳細は docs/plan.md §4b、退避直前の内容は同タグの
-`apps/relay-wright/README.md` を参照。
-
-banto のパッケージ/クレートの消費は **両方とも git タグ参照**
-（2026-07-12 決定。GitHub 組織名 banto が取得不能だったため
-レジストリ発行は棚上げ。banto の docs/publishing.md 参照）。
-両者は別マニフェスト（`package.json`/`Cargo.toml`）で独立に追従できるが、
-**上げるときは揃えて上げる運用**とする（2026-09-01、Issue #220 — npm 側
-だけ v1.2.0 に取り残されていたのを是正した教訓）。2026-09-14 時点で両者とも
-`v1.6.0`（実際の値は各 `package.json`/`Cargo.toml` を正とする）:
-
-```sh
-pnpm add "github:tyaro/banto#v1.6.0&path:packages/admin-core"
-```
-
-```toml
-banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v1.6.0" }
-```
-
-### `apps/banto-hub`（T系）
-
-FA-Server 型の独立タグサーバー **banto-hub**（Tauri を使わないヘッドレスの
-単一 exe、axum + SQLite。docs/hub/tag-server-design.md §3.1）。I系クレート
-（タグレジストリ・PLC通信・収集エンジン・時系列ストレージ）を束ね、
-タグ空間（= banto-collect の現在値キャッシュ）を **REST / WebSocket /
-MQTT publish / gRPC** の4経路で外部（MES・クラウド・自作画面等）へ公開する。
-書き込みは per-tag opt-in（既定不可）+ API キースコープ + 監査 +
-レート制限ブレーカ付きのパススルーのみ（条件付き自動書き込みは
-banto-hub のスコープ外 - relay-wright が構想していた領域で、同アプリは
-2026-09-24 に main から退避済み）。演算タグ・内部タグの一元実装、稼働中の
-タグ定義変更（オンライン動的変更）にも対応する。
-
-実装状況は **T0〜T18-6 実装済み**（試運転モード・ロックダウン、収集の開始/停止 UI、
-タグ名一意性の収集グループ内一意への緩和を含む。2026-08-31 時点）。残るは
-T18-5c/d・T5-5（Windows 実機往復・72h soak 実行 + 実機最終サインオフ）等の
-実機依存項目のみ。詳細設計は [docs/hub/tag-server-design.md](docs/hub/tag-server-design.md)、運用手順は
-[docs/hub/banto-hub-operations.md](docs/hub/banto-hub-operations.md)、起動方法は
-[apps/banto-hub/README.md](apps/banto-hub/README.md) を参照。
+PLC への自動書き込みアプリ `apps/relay-wright` は 2026-09-24 に main から外し、
+タグ `archive/relay-wright-2026-09-24` に退避した（[docs/plan.md](docs/plan.md) §4b）。
 
 ## ライセンス
 
@@ -270,14 +96,12 @@ T18-5c/d・T5-5（Windows 実機往復・72h soak 実行 + 実機最終サイン
 商用のシステム構築（導入支援・カスタム開発・保守）は tyaro が有償で
 提供する。
 
-### relay-wright（PLC自動書き込み）に関する安全上の注意
+### PLC への書き込みに関する安全上の注意
 
-`apps/relay-wright` は 2026-09-24 に main から外し、タグ
-`archive/relay-wright-2026-09-24` に退避した（構想の練り直し、オーナー
-決定）。稼働中は設定されたルールに基づき **稼働中のPLCへ自動的に値を
-書き込む**アプリケーションだったため、退避タグから復元して使う場合も、
-設定ミスや不具合が意図しない機器動作を引き起こしうる点、MIT ライセンス
-により**無保証（AS IS）**で提供される点は変わらない。安全な導入（実機
-投入前の検証・アーミング/インターロック/非常停止の確保・適用法令の遵守）
-は利用者の責任で行うこと。詳細は退避タグの
-`apps/relay-wright/README.md` を参照。
+banto-hub は REST・gRPC・MCP から **稼働中の PLC へ値を書き込める**。書き込みには
+タグごとの許可（`writable`）と監査記録が要り、受付全体のトグル（`write_enabled`）もあるが、
+設定ミスや不具合が意図しない機器動作を引き起こしうる。なお受付トグルと新規の収集
+グループの書き込み許可の既定は「有効」である（2026-09-09 の #340 で変更。
+[docs/hub/banto-hub-mcp-reference.md](docs/hub/banto-hub-mcp-reference.md)）。
+MIT ライセンスにより**無保証（AS IS）**で提供される。安全な導入（実機投入前の検証・
+インターロック/非常停止の確保・適用法令の遵守）は利用者の責任で行うこと。
