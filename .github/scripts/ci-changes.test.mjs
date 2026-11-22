@@ -1046,25 +1046,49 @@ test('WASM crate の変更は Hub host を選び、固定ゲストの ignored �
 	assert.equal(jobs.run_rust, true);
 	assert.ok(jobs.rust_args.includes('-p banto-hub-host'));
 	const workflow = readFileSync(new URL('../workflows/ci.yml', import.meta.url), 'utf8');
-	const start = workflow.indexOf('      - name: test (WASM Hub components)');
-	const end = workflow.indexOf('\n  rust-test:\n', start);
-	assert.ok(start > 0 && end > start, 'rust-wasm に WASM 接続試験がない');
-	// #ci-speed（2026-10-28）: 別ジョブ rust-wasm に切り出した。条件はジョブ側（run_wasm）。
 	const jobStart = workflow.indexOf('\n  rust-wasm:\n');
-	assert.ok(jobStart > 0 && jobStart < start, 'rust-wasm ジョブがない');
+	const jobEnd = workflow.indexOf('\n  rust-test:\n', jobStart);
+	assert.ok(jobStart > 0 && jobEnd > jobStart, 'rust-wasm ジョブがない');
+	const job = workflow.slice(jobStart, jobEnd);
+	// #ci-speed（2026-10-28）: 別ジョブ rust-wasm に切り出した。条件はジョブ側（run_wasm）。
 	assert.ok(
-		workflow.slice(jobStart, start).includes("if: needs.changes.outputs.run_wasm == 'true'"),
+		job.includes("if: needs.changes.outputs.run_wasm == 'true'"),
 		'rust-wasm のジョブ条件が run_wasm でない'
 	);
-	const step = workflow.slice(start, end);
-	assert.match(step, /5233d55a4d1c278c473e9c44df608c1423c1a629/);
+	// ステップの範囲（名前で切り出す）。ゲストの照合・ビルドと nextest の実行は別ステップ。
+	const stepRange = (/** @type {string} */ name, /** @type {string | null} */ next) => {
+		const s = job.indexOf(`      - name: ${name}\n`);
+		assert.ok(s > 0, `ステップがない: ${name}`);
+		const e = next === null ? job.length : job.indexOf(`      - name: ${next}\n`, s);
+		assert.ok(e > s, `ステップの終わりがない: ${name}`);
+		return job.slice(s, e);
+	};
+	const build = stepRange('Build and verify WASM guests', 'Save WASM guest components');
+	const test = stepRange('test (WASM Hub components)', null);
+	const jobEnv = job.slice(0, job.indexOf('    steps:\n'));
+	// ピンの SHA は job の env に 1 回だけ書き、ビルドのステップはそれを参照する。
+	const pins = {
+		WIT_MAIN: '3b7f0f6120af689fdd7a807cff7837657242c6b2',
+		MODBUS_BASE: '5233d55a4d1c278c473e9c44df608c1423c1a629'
+	};
+	for (const [name, sha] of Object.entries(pins)) {
+		assert.ok(
+			jobEnv.includes(`      WASM_GUEST_PIN_${name}: '${sha}'\n`),
+			`job env のピン: ${name}`
+		);
+		assert.ok(build.includes(`$env:WASM_GUEST_PIN_${name}`), `ビルドが env を使わない: ${name}`);
+		assert.ok(!build.includes(sha), `ビルドのステップに SHA の直書き: ${name}`);
+		assert.ok(!test.includes(sha), `テストのステップに SHA の直書き: ${name}`);
+	}
+	assert.equal(jobEnv.match(/^ {6}WASM_GUEST_PIN_\w+: '[0-9a-f]{40}'$/gm)?.length, 13);
 	// #902: 固定の driver.wit は guest main と同じか、古い WIT のときだけ差し替える。
-	assert.match(step, /\$canonicalSha = '3b7f0f6120af689fdd7a807cff7837657242c6b2'/);
-	assert.match(step, /\$legacyDriverWit = '313a79ed545a366c938c9bc2d8f86f7c3ca0141e'/);
-	assert.match(step, /function Enter-GuestPin/);
-	assert.match(step, /Enter-GuestPin \$sha 'canonical guest'/);
+	assert.match(build, /\$canonicalSha = \$env:WASM_GUEST_PIN_WIT_MAIN\n/);
+	assert.match(build, /\$sha = \$env:WASM_GUEST_PIN_MODBUS_BASE\n/);
+	assert.match(build, /\$legacyDriverWit = '313a79ed545a366c938c9bc2d8f86f7c3ca0141e'/);
+	assert.match(build, /function Enter-GuestPin/);
+	assert.match(build, /Enter-GuestPin \$sha 'canonical guest'/);
 	for (const label of ['read WIT mismatch', 'WIT swap failed', 'swapped WIT mismatch']) {
-		assert.ok(step.includes(label), `pin guard missing: ${label}`);
+		assert.ok(build.includes(label), `pin guard missing: ${label}`);
 	}
 	for (const revision of [
 		'${canonicalSha}:wit/driver.wit',
@@ -1072,7 +1096,7 @@ test('WASM crate の変更は Hub host を選び、固定ゲストの ignored �
 		'${sha}:component/manifest.json',
 		'HEAD:crates/banto-driver-wasm/tests/manifest.json'
 	]) {
-		assert.ok(step.includes(revision), `blob reference missing: ${revision}`);
+		assert.ok(build.includes(revision), `blob reference missing: ${revision}`);
 	}
 	for (const label of [
 		'canonical WIT blob lookup failed',
@@ -1080,24 +1104,31 @@ test('WASM crate の変更は Hub host を選び、固定ゲストの ignored �
 		'canonical manifest blob lookup failed',
 		'host manifest blob lookup failed'
 	]) {
-		assert.ok(step.includes(label), `Git error guard missing: ${label}`);
+		assert.ok(build.includes(label), `Git error guard missing: ${label}`);
 	}
-	assert.doesNotMatch(step, /Get-FileHash/);
-	assert.match(step, /canonical manifest and host manifest differ/);
-	assert.match(step, /cargo \+1\.98\.1 build/);
-	assert.match(step, /\$wasmToolsVersion = wasm-tools --version/);
-	assert.ok(step.includes("$wasmToolsVersion -notmatch '^wasm-tools 1\\.262\\.0"));
-	assert.match(step, /wasm-tools version mismatch/);
+	assert.doesNotMatch(build, /Get-FileHash/);
+	assert.match(build, /canonical WIT and host WIT differ/);
+	assert.match(build, /canonical manifest and host manifest differ/);
+	// ゲストの toolchain は env の 1.98.1 を使い、ビルドは cargo +<toolchain> build。
+	assert.ok(jobEnv.includes("      WASM_GUEST_TOOLCHAIN: '1.98.1'\n"));
+	assert.match(build, /cargo "\+\$\(\$env:WASM_GUEST_TOOLCHAIN\)" build/);
+	assert.match(build, /\$wasmToolsVersion = wasm-tools --version/);
+	assert.ok(build.includes("'^wasm-tools ' + [regex]::Escape($env:WASM_TOOLS_VERSION)"));
+	assert.match(build, /wasm-tools version mismatch/);
 	// テストは rust-test-build の nextest archive を走らせる（ここではビルドしない）。
-	assert.doesNotMatch(step, /cargo \+1\.98\.1 test/);
-	assert.ok(step.includes('--run-ignored $RunIgnored'));
-	assert.ok(step.includes("[string]$RunIgnored = 'only'"));
-	assert.match(step, /--no-tests=fail/);
+	assert.doesNotMatch(test, /cargo "?\+/);
+	assert.doesNotMatch(test, /cargo build|cargo test/);
+	assert.ok(test.includes('--run-ignored $RunIgnored'));
+	assert.ok(test.includes("[string]$RunIgnored = 'only'"));
+	assert.match(test, /--no-tests=fail/);
+	// 件数の検査（Invoke-ArchivedTestGroup にまとめた形）。
+	assert.ok(test.includes("$hubConn = 'banto-hub-host::t12_connection_test'"));
 	assert.match(
-		step,
-		/-Expected 1 -Filter 'binary_id\(banto-hub-host::t12_connection_test\) & test\(=/
+		test,
+		/Binary = \$hubConn; Name = 'wasm_fc3_connection_test_direct_reuse_and_changed_settings'; Expected = 1 \}/
 	);
-	assert.match(step, /-Expected 3 -Filter 'binary_id\(banto-driver-wasm::component\)'/);
+	assert.match(test, /Binary = 'banto-driver-wasm::component'; Expected = 3 \}/);
+	assert.match(test, /did not run as expected/);
 });
 
 // 過去の実例（実グラフで引く）。今までの判定は 3 つとも workspace 全体だった。
@@ -1275,26 +1306,92 @@ test('escapeRegExp は正規表現の特別な文字をすべて文字どおり�
 
 test('WASM FC3 の wasm-tools は固定版の検証済みバイナリを fallback なしで使う', () => {
 	const workflow = readFileSync(new URL('../workflows/ci.yml', import.meta.url), 'utf8');
-	const installStart = workflow.indexOf(
-		'      - name: Install wasm-tools 1.262.0 (verified binary)'
-	);
-	const testStart = workflow.indexOf('      - name: test (WASM Hub components)');
-	assert.ok(installStart !== -1 && testStart > installStart);
-	const install = workflow.slice(installStart, testStart);
+	const jobStart = workflow.indexOf('\n  rust-wasm:\n');
+	const jobEnd = workflow.indexOf('\n  rust-test:\n', jobStart);
+	assert.ok(jobStart !== -1 && jobEnd > jobStart);
+	const job = workflow.slice(jobStart, jobEnd);
+	const installStart = job.indexOf('      - name: Install wasm-tools (verified binary)\n');
+	const keyStart = job.indexOf('      - name: Compute WASM guest cache key\n');
+	const buildStart = job.indexOf('      - name: Build and verify WASM guests\n');
+	const testStart = job.indexOf('      - name: test (WASM Hub components)\n');
+	assert.ok(installStart !== -1 && keyStart > installStart && buildStart > keyStart);
+	assert.ok(testStart > buildStart);
+	// 版は job の env に 1 回だけ。install はそれを参照する。
+	const jobEnv = job.slice(0, job.indexOf('    steps:\n'));
+	assert.ok(jobEnv.includes("      WASM_TOOLS_VERSION: '1.262.0'\n"));
+	const install = job.slice(installStart, keyStart);
+	assert.ok(!install.match(/wasm-tools@\d/));
 	assert.ok(install.includes('        uses: taiki-e/install-action@v2\n'));
-	assert.ok(install.includes('          tool: wasm-tools@1.262.0\n'));
+	assert.ok(install.includes('          tool: wasm-tools@${{ env.WASM_TOOLS_VERSION }}\n'));
 	assert.ok(install.includes('          checksum: true\n'));
 	assert.ok(install.includes('          fallback: none\n'));
 	// #ci-speed（2026-10-28）: 条件はステップの `if:` からジョブ rust-wasm の `run_wasm` に移した。
-	assert.ok(!install.includes('if: needs.changes.outputs.rust_args'));
-	assert.ok(!workflow.slice(testStart, testStart + 200).includes('if: needs.changes'));
-	const jobStart = workflow.indexOf('\n  rust-wasm:\n');
-	assert.ok(jobStart !== -1 && jobStart < installStart);
-	assert.ok(
-		workflow.slice(jobStart, installStart).includes("if: needs.changes.outputs.run_wasm == 'true'")
-	);
-	assert.match(workflow.slice(testStart), /wasm-tools --version/);
+	assert.ok(!install.includes('if: '));
+	assert.ok(!job.slice(testStart, testStart + 200).includes('if: needs.changes'));
+	assert.ok(job.includes("if: needs.changes.outputs.run_wasm == 'true'"));
+	// 版の照合はビルドのステップ（キャッシュに当たっても毎回走る）。
+	assert.match(job.slice(buildStart, testStart), /wasm-tools --version/);
 	assert.doesNotMatch(workflow, /cargo \+1\.98\.1 install wasm-tools/);
+	assert.doesNotMatch(workflow, /wasm-tools@1\.262\.0/);
+});
+
+test('WASM ゲストのキャッシュは main だけが保存し、当たっても照合と validate を毎回走らせる', () => {
+	const workflow = readFileSync(new URL('../workflows/ci.yml', import.meta.url), 'utf8');
+	const jobStart = workflow.indexOf('\n  rust-wasm:\n');
+	const jobEnd = workflow.indexOf('\n  rust-test:\n', jobStart);
+	const job = workflow.slice(jobStart, jobEnd);
+	const at = (/** @type {string} */ name) => {
+		const i = job.indexOf(`      - name: ${name}\n`);
+		assert.ok(i > 0, `ステップがない: ${name}`);
+		return i;
+	};
+	const keyStart = at('Compute WASM guest cache key');
+	const restoreStart = at('Restore WASM guest components');
+	const buildStart = at('Build and verify WASM guests');
+	const saveStart = at('Save WASM guest components');
+	const testStart = at('test (WASM Hub components)');
+	assert.ok(keyStart < restoreStart && restoreStart < buildStart);
+	assert.ok(buildStart < saveStart && saveStart < testStart);
+	const key = job.slice(keyStart, restoreStart);
+	const restore = job.slice(restoreStart, buildStart);
+	const build = job.slice(buildStart, saveStart);
+	const save = job.slice(saveStart, testStart);
+	// キー: ピンを名前で全部拾い、数を検査し、fixture をハッシュする。
+	assert.ok(key.includes("-like 'WASM_GUEST_PIN_*'"));
+	assert.ok(key.includes('hashFiles('));
+	assert.match(key, /\$pins\.Count -ne 13/);
+	// restore は完全一致のキーだけ（restore-keys で古いキャッシュを拾わない）。
+	assert.ok(restore.includes('uses: actions/cache/restore@'));
+	assert.ok(restore.includes('key: ${{ steps.guest-key.outputs.key }}'));
+	assert.ok(!restore.includes('restore-keys'));
+	// save は main だけ。
+	assert.ok(save.includes('uses: actions/cache/save@'));
+	assert.ok(save.includes("github.ref == 'refs/heads/main'"));
+	assert.ok(!save.includes('restore-keys'));
+	// キャッシュに当たっても、照合と validate は条件の外で毎回走る。
+	assert.ok(!build.includes('if: '), 'ビルドのステップが条件付きになっている');
+	for (const guard of [
+		'wasm-tools validate $File',
+		'wasm-tools component targets $Wit $File --world $world',
+		'git -C $guest checkout --quiet --force --detach $pin',
+		'canonical WIT and host WIT differ',
+		'canonical manifest and host manifest differ',
+		'wasm-tools version mismatch'
+	]) {
+		assert.ok(build.includes(guard), `毎回走らせる検査がない: ${guard}`);
+	}
+	// cache-hit を見るのは省略してよいもの（cargo build・component new）だけ。validate は見ない。
+	const testFn = build.slice(
+		build.indexOf('function Test-GuestComponent'),
+		build.indexOf('# Guest main:')
+	);
+	assert.ok(testFn.includes('wasm-tools validate') && !testFn.includes('$guestsCached'));
+	const buildFn = build.slice(
+		build.indexOf('function Build-GuestComponent'),
+		build.indexOf('function Test-GuestComponent')
+	);
+	assert.ok(buildFn.includes('if ($guestsCached)'));
+	assert.ok(buildFn.includes('wasm-tools component new'));
 });
 
 test('run_wasm: workspace 全体か、-p に banto-hub-host が入るときだけ true', () => {
