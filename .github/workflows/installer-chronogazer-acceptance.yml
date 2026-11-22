@@ -13,8 +13,12 @@ name: Installer ChronoGazer acceptance (disposable Windows, real setup + real SC
 # 対象外: 上の問い以外の可視 UI（WebView2 の後始末、`_?=` なしの可視のアンインストール）・サービス停止の RUNNING 拒否と追加待ち中に STOPPED になる道・`File` の書込み途中の失敗・
 # 消し残り（RequireChronoGazerExesDeleted）・実 collector・#392 B3-5。
 
+# リリース（タグの push: v* / trend-v*）と手動の実行（workflow_dispatch）では、
+# 変更パスの絞り込みをせず全部走らせる（2026-11-22 オーナー決定）。
 on:
   workflow_dispatch:
+  push:
+    tags: ['v*', 'trend-v*']
   pull_request:
     paths:
       - '.github/workflows/installer-chronogazer-acceptance.yml'
@@ -25,8 +29,11 @@ on:
 permissions:
   contents: read
 
+# タグの push と手動の実行は run_id で独立した group にする。ref で束ねると、同じ ref の別の実行に
+# 取り消されたり、待機中の run が 1 本だけの仕様で次の run に置き換えられたりする(2026-11-22 レビュー)。
+# PR・branch の push は今まで通り ref で束ねる。
 concurrency:
-  group: installer-chronogazer-acceptance-${{ github.ref }}
+  group: installer-chronogazer-acceptance-${{ (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && github.run_id || github.ref }}
   # Allow in-flight cleanup to finish rather than cancel it for a new head.
   cancel-in-progress: false
 

@@ -220,7 +220,7 @@ const NONE = {
 };
 
 const HUB_RUST =
-	'-p banto-driver-wasm -p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink -p banto-tagclient';
+	'-p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink -p banto-tagclient';
 const CHRONO_RUST = '-p chronogazer -p chronogazer-core -p chronogazer-elev';
 
 /** [名前, 変更ファイル, 期待するジョブ] */
@@ -230,16 +230,7 @@ const TABLE = [
 	[
 		'hub だけ（frontend）',
 		['apps/banto-hub/src/routes/+page.svelte'],
-		{
-			...NONE,
-			run_frontend_hub: true,
-			run_rust: true,
-			rust_args: HUB_RUST,
-			run_wasm: true,
-			run_linux_clippy: true,
-			run_rust_db_source: true,
-			run_e2e_hub: true
-		}
+		{ ...NONE, run_frontend_hub: true, run_e2e_hub: true }
 	],
 	[
 		'hub だけ（core）',
@@ -249,7 +240,6 @@ const TABLE = [
 			run_frontend_hub: true,
 			run_rust: true,
 			rust_args: HUB_RUST,
-			run_wasm: true,
 			run_linux_clippy: true,
 			run_rust_db_source: true,
 			run_e2e_hub: true
@@ -279,7 +269,6 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args: [
-				'-p banto-driver-wasm',
 				'-p banto-hub-core',
 				'-p banto-hub-host',
 				'-p banto-hub-shell',
@@ -289,7 +278,6 @@ const TABLE = [
 				'-p chronogazer-core',
 				'-p chronogazer-elev'
 			].join(' '),
-			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
@@ -303,7 +291,6 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args: [
-				'-p banto-driver-wasm',
 				'-p banto-hub-core',
 				'-p banto-hub-host',
 				'-p banto-hub-shell',
@@ -313,7 +300,6 @@ const TABLE = [
 				'-p chronogazer-core',
 				'-p chronogazer-elev'
 			].join(' '),
-			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
@@ -327,7 +313,6 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args: [
-				'-p banto-driver-wasm',
 				'-p banto-hub-core',
 				'-p banto-hub-host',
 				'-p banto-hub-shell',
@@ -337,7 +322,6 @@ const TABLE = [
 				'-p chronogazer-core',
 				'-p chronogazer-elev'
 			].join(' '),
-			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
@@ -352,13 +336,11 @@ const TABLE = [
 			run_rust: true,
 			rust_args: [
 				'-p banto-db-source',
-				'-p banto-driver-wasm',
 				'-p banto-hub-core',
 				'-p banto-hub-host',
 				'-p banto-hub-shell',
 				'-p banto-hub-sink'
 			].join(' '),
-			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true
@@ -371,7 +353,6 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args: [
-				'-p banto-driver-wasm',
 				'-p banto-hub-core',
 				'-p banto-hub-host',
 				'-p banto-hub-shell',
@@ -382,7 +363,6 @@ const TABLE = [
 				'-p chronogazer-core',
 				'-p chronogazer-elev'
 			].join(' '),
-			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
@@ -396,7 +376,6 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args: [
-				'-p banto-driver-wasm',
 				'-p banto-hub-core',
 				'-p banto-hub-host',
 				'-p banto-hub-shell',
@@ -408,7 +387,6 @@ const TABLE = [
 				'-p chronogazer-core',
 				'-p chronogazer-elev'
 			].join(' '),
-			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
@@ -422,7 +400,6 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args: [
-				'-p banto-driver-wasm',
 				'-p banto-hub-bootstrap',
 				'-p banto-hub-core',
 				'-p banto-hub-host',
@@ -434,7 +411,6 @@ const TABLE = [
 				'-p chronogazer-core',
 				'-p chronogazer-elev'
 			].join(' '),
-			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
@@ -546,7 +522,6 @@ const TABLE = [
 			run_frontend_hub: true,
 			run_rust: true,
 			rust_args: [
-				'-p banto-driver-wasm',
 				'-p banto-hub-core',
 				'-p banto-hub-host',
 				'-p banto-hub-shell',
@@ -557,7 +532,6 @@ const TABLE = [
 				'-p chronogazer-core',
 				'-p chronogazer-elev'
 			].join(' '),
-			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
@@ -672,21 +646,6 @@ const TABLE = [
 			...NONE,
 			run_frontend_hub: true,
 			run_frontend_chronogazer: true,
-			run_rust: true,
-			rust_args: [
-				'-p banto-driver-wasm',
-				'-p banto-hub-core',
-				'-p banto-hub-host',
-				'-p banto-hub-shell',
-				'-p banto-hub-sink',
-				'-p banto-tagclient',
-				'-p chronogazer',
-				'-p chronogazer-core',
-				'-p chronogazer-elev'
-			].join(' '),
-			run_wasm: true,
-			run_rust_db_source: true,
-			run_linux_clippy: true,
 			run_e2e_hub: true,
 			run_e2e_chronogazer: true
 		}
@@ -1394,24 +1353,193 @@ test('WASM ゲストのキャッシュは main だけが保存し、当たって
 	assert.ok(buildFn.includes('wasm-tools component new'));
 });
 
-test('run_wasm: workspace 全体か、-p に banto-hub-host が入るときだけ true', () => {
-	const only = (/** @type {string[]} */ pkgs) => derive({}, pkgs);
-	// banto-hub-host を含まない -p
-	assert.equal(only(['banto-plc']).run_wasm, false);
-	assert.equal(only(['banto-hub-shell', 'banto-hub-sink']).run_wasm, false);
-	assert.equal(only([]).run_wasm, false);
-	// banto-hub-host を含む -p
-	const hit = only(['banto-plc', 'banto-hub-host']);
-	assert.equal(hit.run_wasm, true);
-	assert.match(hit.rust_args, /(^| )-p banto-hub-host( |$)/);
-	// rust-wasm は archive のテストを走らせるので、banto-driver-wasm のテストも archive に
-	// 入れる。ほかのジョブの判定（driver-api など）には混ぜない。
-	assert.match(hit.rust_args, /(^| )-p banto-driver-wasm( |$)/);
-	assert.equal(hit.run_driver_api, only(['banto-plc', 'banto-hub-host']).run_driver_api);
-	assert.equal(only(['banto-hub-host']).run_driver_api, false);
-	assert.doesNotMatch(only(['banto-plc']).rust_args, /banto-driver-wasm/);
-	assert.equal(derive({ full: true }).rust_args, '--workspace');
-	// workspace 全体
+// --- run_wasm（2026-11-22 オーナー決定）: WASM に関係する変更のときだけ。
+// 以前は `-p banto-hub-host` が入る変更ならすべて走り、host のほかの場所でも約 17 分かかった。
+
+const pr = (/** @type {string[]} */ files) =>
+	classify({ event: 'pull_request', files, graph: G }).jobs;
+
+test('run_wasm: workspace 全体・WASM に関わる host・banto-driver-wasm / banto-drivers に届く crate だけ true', () => {
+	// host のほかの場所（WASM と関係ない）は Rust 系は走るが rust-wasm は走らない。
+	for (const f of [
+		'apps/banto-hub/host/src/lib.rs',
+		'apps/banto-hub/host/tests/grpc.rs',
+		'apps/banto-hub/host/tests/integration.rs',
+		'apps/banto-hub/core/src/stream.rs',
+		'apps/banto-hub/src-tauri/src/lib.rs'
+	]) {
+		const j = pr([f]);
+		assert.equal(j.run_rust, true, f);
+		assert.equal(j.run_wasm, false, f);
+		assert.doesNotMatch(j.rust_args, /banto-driver-wasm/, f);
+		assert.match(j.rust_args, /(^| )-p banto-hub-host( |$)/, f);
+	}
+	// WASM に関わる host のソース・rust-wasm が走らせる試験・共通の補助・host の Cargo.toml。
+	for (const f of [
+		'apps/banto-hub/host/src/bin/banto_hub/wasm_plugins.rs',
+		'apps/banto-hub/host/src/bin/banto-hub.rs',
+		'apps/banto-hub/host/src/bin/banto_hub/win_service.rs',
+		'apps/banto-hub/host/tests/t12_connection_test.rs',
+		'apps/banto-hub/host/tests/t12_slmp_wasm/mod.rs',
+		'apps/banto-hub/host/tests/t12_modbus_wasm_join/mod.rs',
+		'apps/banto-hub/host/tests/t12_wasm_all_simulation/mod.rs',
+		'apps/banto-hub/host/tests/t12_device_address/mod.rs',
+		'apps/banto-hub/host/tests/slmp_wasm_live_q_range_write.rs',
+		'apps/banto-hub/host/tests/modbus_wasm_live_917.rs',
+		'apps/banto-hub/host/tests/common/mod.rs',
+		'apps/banto-hub/host/Cargo.toml'
+	]) {
+		const j = pr([f]);
+		assert.equal(j.run_wasm, true, f);
+		// rust-wasm は archive を使うので、両方のパッケージが -p に入る。
+		assert.match(j.rust_args, /(^| )-p banto-driver-wasm( |$)/, f);
+		assert.match(j.rust_args, /(^| )-p banto-hub-host( |$)/, f);
+	}
+	// 共有 crate: banto-driver-wasm 自身・それに依存される側（banto-driver-api）・banto-drivers。
+	for (const f of [
+		'crates/banto-driver-wasm/src/lib.rs',
+		'crates/banto-driver-wasm/tests/manifest.json',
+		'crates/banto-driver-api/src/lib.rs',
+		'crates/banto-drivers/src/lib.rs'
+	]) {
+		const j = pr([f]);
+		assert.equal(j.run_wasm, true, f);
+		assert.match(j.rust_args, /(^| )-p banto-driver-wasm( |$)/, f);
+		assert.match(j.rust_args, /(^| )-p banto-hub-host( |$)/, f);
+	}
+	// WASM に届かない共有 crate は走らない（banto-tags は banto-drivers の通常の依存なので
+	// 届く。下の「実グラフ: run_wasm」で確かめる）。
+	for (const f of ['crates/banto-instance-lock/src/lib.rs', 'crates/banto-rtsp/src/lib.rs']) {
+		assert.equal(pr([f]).run_wasm, false, f);
+	}
+	// workspace 全体（Cargo.lock・toolchain・.github）は常に走る。
+	for (const f of ['Cargo.lock', 'rust-toolchain.toml', '.github/workflows/ci.yml']) {
+		assert.equal(pr([f]).run_wasm, true, f);
+	}
 	assert.equal(derive({ full: true }).run_wasm, true);
 	assert.equal(derive({ rust_all: true }).run_wasm, true);
+	assert.equal(derive({ wasm: true }).run_wasm, true);
+	assert.equal(derive({}, ['banto-plc', 'banto-hub-host']).run_wasm, false);
+	// ほかのジョブの判定（driver-api など）には混ぜない。
+	assert.equal(pr(['apps/banto-hub/host/src/bin/banto_hub/wasm_plugins.rs']).run_driver_api, false);
+});
+
+test('実グラフ: run_wasm は banto-drivers・banto-driver-wasm に届く crate（banto-tags など）で true、届かない crate で false', () => {
+	const g = real();
+	const run = (/** @type {string} */ f) =>
+		classify({ event: 'pull_request', files: [f], graph: g }).jobs.run_wasm;
+	// banto-drivers の通常の依存（banto-tags・banto-driver-engine など）の変更は届く。
+	for (const c of ['banto-tags', 'banto-plc-address', 'banto-driver-engine', 'banto-drivers']) {
+		assert.equal(run(`crates/${c}/src/lib.rs`), true, c);
+	}
+	// banto-drivers・banto-driver-wasm のどちらにも届かない crate は false。
+	for (const c of ['banto-rtsp', 'banto-instance-lock', 'banto-tstore']) {
+		assert.equal(run(`crates/${c}/src/lib.rs`), false, c);
+	}
+});
+
+test('run_wasm: main への push は常に true（PR で省いた分は push で検証する）', () => {
+	for (const f of [
+		'apps/banto-hub/host/src/lib.rs',
+		'docs/plan.md',
+		'apps/banto-hub/src/app.css'
+	]) {
+		const r = classify({ event: 'push', files: [f], graph: G });
+		assert.equal(r.jobs.run_wasm, true, f);
+		assert.equal(r.jobs.rust_args, '--workspace', f);
+	}
+});
+
+// --- 画面だけの変更は Rust 系のジョブを走らせない（2026-11-22 オーナー決定）
+
+const RUST_JOBS = [
+	'run_rust',
+	'run_wasm',
+	'run_driver_api',
+	'run_rust_db_source',
+	'run_linux_clippy'
+];
+
+test('画面だけの変更（apps/*/src・フロントの設定）は frontend と E2E だけで、Rust 系は走らない', () => {
+	const hub = [
+		'apps/banto-hub/src/routes/tags/+page.svelte',
+		'apps/banto-hub/src/lib/banto/foo.ts',
+		'apps/banto-hub/src/app.css',
+		'apps/banto-hub/package.json',
+		'apps/banto-hub/vite.config.ts',
+		'apps/banto-hub/vitest.config.ts',
+		'apps/banto-hub/tsconfig.json'
+	];
+	for (const f of hub) {
+		const r = classify({ event: 'pull_request', files: [f], graph: G });
+		assert.equal(r.areas.frontend_hub, true, f);
+		assert.deepEqual(r.jobs, { ...NONE, run_frontend_hub: true, run_e2e_hub: true }, f);
+		for (const k of RUST_JOBS) assert.equal(r.jobs[k], false, `${f} ${k}`);
+		assert.equal(r.jobs.rust_args, '', f);
+	}
+	const chrono = [
+		'apps/chronogazer/src/routes/+page.svelte',
+		'apps/chronogazer/src/lib/foo.ts',
+		'apps/chronogazer/package.json',
+		'apps/chronogazer/vite.config.ts',
+		'apps/chronogazer/tsconfig.json'
+	];
+	for (const f of chrono) {
+		const r = classify({ event: 'pull_request', files: [f], graph: G });
+		assert.equal(r.areas.frontend_chronogazer, true, f);
+		assert.deepEqual(
+			r.jobs,
+			{ ...NONE, run_frontend_chronogazer: true, run_e2e_chronogazer: true },
+			f
+		);
+	}
+});
+
+test('Rust が読むものは画面扱いにしない（static・src-tauri・core・host・installer・fixtures）', () => {
+	for (const f of [
+		'apps/chronogazer/static/x.html',
+		'apps/chronogazer/static/legacy-db.html',
+		'apps/chronogazer/src-tauri/tauri.conf.json',
+		'apps/chronogazer/core/src/lib.rs',
+		'apps/chronogazer/installer/src/main.rs',
+		'apps/banto-hub/static/favicon.svg',
+		'apps/banto-hub/src-tauri/tauri.conf.json',
+		'apps/banto-hub/installer/src/main.rs',
+		// banto-hub-core の bridge_load_fixtures.rs が読む。
+		'apps/banto-hub/src/lib/banto/bridgeLoad.fixtures.json'
+	]) {
+		const r = classify({ event: 'pull_request', files: [f], graph: G });
+		assert.equal(r.jobs.run_rust, true, f);
+		assert.equal(r.areas.frontend_hub || r.areas.frontend_chronogazer, false, f);
+	}
+	// fixtures は Rust（banto-hub-core）と画面の vitest の両方。
+	const j = pr(['apps/banto-hub/src/lib/banto/bridgeLoad.fixtures.json']);
+	assert.equal(j.run_frontend_hub, true);
+	assert.match(j.rust_args, /(^| )-p banto-hub-core( |$)/);
+	// 画面 + Rust は和集合（Rust 側が勝つ）。
+	const mix = pr(['apps/banto-hub/src/app.css', 'apps/banto-hub/core/src/stream.rs']);
+	assert.equal(mix.run_rust, true);
+	assert.equal(mix.run_frontend_hub, true);
+});
+
+test('Rust は apps/*/src（画面）を include_str! 等で読まない（RULES の例外以外）', (t) => {
+	// 追跡している .rs を走査し、画面（apps/banto-hub/src・apps/chronogazer/src）を指す
+	// include_str! / include_bytes! / include! が無いことを確かめる。
+	// env!("CARGO_MANIFEST_DIR") 経由の読み方（bridge_load_fixtures.rs）は走査できないので、
+	// RULES の例外に手で書いてある。
+	const files = execFileSync('git', ['ls-files', '*.rs'], { cwd: REPO_ROOT, encoding: 'utf8' })
+		.split('\n')
+		.filter(Boolean);
+	/** @type {string[]} */
+	const found = [];
+	for (const f of files) {
+		const text = readFileSync(new URL(`../../${f}`, import.meta.url), 'utf8');
+		for (const m of text.matchAll(/include_(?:str|bytes)!\(\s*"([^"]+)"|include!\(\s*"([^"]+)"/g)) {
+			const lit = m[1] ?? m[2];
+			const target = posix.normalize(posix.join(posix.dirname(f), lit));
+			if (/^apps\/(banto-hub|chronogazer)\/src\//.test(target)) found.push(`${f} -> ${target}`);
+		}
+	}
+	t.diagnostic(`include 系で画面を読む箇所: ${found.length}`);
+	assert.deepEqual(found, []);
 });

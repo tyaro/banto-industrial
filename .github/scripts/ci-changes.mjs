@@ -64,6 +64,9 @@ export const AREAS = [
 	'frontend_packages',
 	'hub',
 	'chronogazer',
+	'frontend_hub',
+	'frontend_chronogazer',
+	'wasm',
 	'hub_sink',
 	'e2e_hub',
 	'e2e_chronogazer'
@@ -106,7 +109,41 @@ export const RULES = [
 
 	// --- アプリ単位（banto-hub-sink を banto-hub より先に書く）
 	{ re: /^apps\/banto-hub-sink\//, areas: ['hub_sink'], why: 'banto-hub-sink' },
+	// 画面だけの変更（SvelteKit のソース・フロントの設定）は Rust 系のジョブを走らせない
+	// （2026-11-22 オーナー決定）。走るのは frontend-<app> と e2e-<app> だけ。
+	// **Rust が読むものは外さない**: `static/`（chronogazer の src-tauri が include_str!）・
+	// `src-tauri/`・`core/`・`host/`・`installer/` は下の `hub` / `chronogazer` のまま。
+	// `apps/*/src/` と下の設定ファイルを Rust が読んでいないことは grep で確かめた
+	// （include_str! / include_bytes! / include! / env!("CARGO_MANIFEST_DIR") /
+	// rust-embed の folder（`../build`）/ tauri.conf.json の frontendDist。
+	// 例外は次の fixtures 1 つだけ）。**Rust が `apps/*/src/` を読む箇所を足すときは、
+	// この例外に足す。**
+	{
+		// banto-hub-core の bridge_load_fixtures.rs が読む（Rust の試験の入力）。
+		re: /^apps\/banto-hub\/src\/lib\/banto\/bridgeLoad\.fixtures\.json$/,
+		areas: ['hub'],
+		why: 'Rust の試験が読む fixtures（画面の vitest と banto-hub-core の両方）'
+	},
+	// WASM Hub components（ci.yml の rust-wasm ジョブ）に関わる host のソース・試験
+	// （2026-11-22 オーナー決定）。`banto_driver_wasm` を使うファイルと、rust-wasm が
+	// nextest で走らせる試験（t12_*・*wasm*・共通の tests/common）。
+	// rust-wasm の試験の名前（ci.yml の `-E`）を足したら、ここも合わせる。
+	{
+		re: /^apps\/banto-hub\/host\/(Cargo\.toml$|src\/bin\/(banto-hub\.rs$|banto_hub\/(wasm_plugins|win_service)\.rs$)|tests\/(common\/|t12_|[a-z0-9_]*wasm[a-z0-9_]*\.rs$))/,
+		areas: ['hub', 'wasm'],
+		why: 'banto-hub（WASM Hub components の host・試験）'
+	},
+	{
+		re: /^apps\/banto-hub\/(src\/|package\.json$|(svelte|vite|vitest)\.config\.[cm]?[jt]s$|tsconfig(\..+)?\.json$)/,
+		areas: ['frontend_hub'],
+		why: 'banto-hub の画面（Rust は読まない）'
+	},
 	{ re: /^apps\/banto-hub\//, areas: ['hub'], why: 'banto-hub' },
+	{
+		re: /^apps\/chronogazer\/(src\/|package\.json$|(svelte|vite|vitest)\.config\.[cm]?[jt]s$|tsconfig(\..+)?\.json$)/,
+		areas: ['frontend_chronogazer'],
+		why: 'chronogazer の画面（Rust は読まない）'
+	},
 	{ re: /^apps\/chronogazer\//, areas: ['chronogazer'], why: 'chronogazer' },
 	// 共通のフロントの部品（いまは packages/trend だけ）。使うのは ChronoGazer の画面で、
 	// 将来は temp-scada の画面も使う（別リポジトリなのでここでは見ない。banto-scada を
@@ -390,22 +427,40 @@ export function derive(a, crateAffected = []) {
 	}
 	const hits = (/** @type {keyof typeof JOB_PACKAGES} */ job) =>
 		JOB_PACKAGES[job].some((p) => packages.has(p));
-	// WASM Hub components（ci.yml の rust-wasm ジョブ）は、workspace 全体か、
-	// -p に banto-hub-host が入るときだけ。rust_args と同じ値から決める。
-	const runWasm = rustWorkspace || packages.has('banto-hub-host');
+	// WASM Hub components（ci.yml の rust-wasm ジョブ）を走らせるのは、
+	// - workspace 全体（push・`.github/`・Cargo.lock・toolchain など。push は classify() が
+	//   必ず full にするので、main では常に走る）、
+	// - WASM に関わる host のソース・試験の変更（RULES の `wasm`）、
+	// - 共有 crate の変更が依存グラフで banto-driver-wasm に届くとき、
+	// だけ（2026-11-22 オーナー決定。それまでは `-p banto-hub-host` が入る変更ならすべて
+	// 走り、host のほかの場所の変更でも約 17 分かかっていた）。host の WASM と関係ない
+	// 場所を壊した変更は PR では rust-wasm が走らず、main の push で初めて落ちうる。
+	// オーナーはそれを受け入れた。
+	// 「届く」は banto-driver-wasm 自身か、それを host の registry に組み込む banto-drivers
+	// のどちらかが入ること（banto-drivers の変更は banto-driver-wasm には届かないが、
+	// WASM ドライバの組み込みを壊しうるので足す。ドライバ crate の変更も banto-drivers 経由で届く）。
+	const runWasm =
+		rustWorkspace ||
+		a.wasm ||
+		crateAffected.includes('banto-driver-wasm') ||
+		crateAffected.includes('banto-drivers');
 	// rust-wasm は rust-test-build の nextest archive のテストを走らせる（自前でビルド
-	// しない）。banto-driver-wasm のテスト（--test component・--lib など）も archive に
-	// 入るよう、-p に banto-hub-host が入るときは banto-driver-wasm も足す。
-	// ほかのジョブの判定（hits）には混ぜない。
+	// しない）。banto-driver-wasm と banto-hub-host のテストが archive に入るよう、
+	// -p に両方を足す（WASM に関わる変更が host の外の crate だけのとき、host は
+	// 依存グラフで入るとは限らない）。ほかのジョブの判定（hits）には混ぜない。
 	const argPackages = new Set(packages);
-	if (runWasm && !rustWorkspace) argPackages.add('banto-driver-wasm');
+	if (runWasm && !rustWorkspace) {
+		argPackages.add('banto-driver-wasm');
+		argPackages.add('banto-hub-host');
+	}
 	const runRust = rustWorkspace || packages.size > 0;
 	return {
 		// 判定したら必ず走る（repo 全体の ESLint + Prettier。docs の整形もここ）。
 		run_lint_format: true,
-		run_frontend_hub: full || a.frontend_all || a.hub,
+		run_frontend_hub: full || a.frontend_all || a.hub || a.frontend_hub,
 		// packages/*（共通の部品）は、それを使う ChronoGazer のフロントのジョブで check・test する。
-		run_frontend_chronogazer: full || a.frontend_all || a.chronogazer || a.frontend_packages,
+		run_frontend_chronogazer:
+			full || a.frontend_all || a.chronogazer || a.frontend_chronogazer || a.frontend_packages,
 		run_rust: runRust,
 		rust_args: !runRust
 			? ''
@@ -419,11 +474,18 @@ export function derive(a, crateAffected = []) {
 		run_driver_api: rustWorkspace || hits('run_driver_api'),
 		run_rust_db_source: rustWorkspace || a.hub || a.hub_sink || hits('run_rust_db_source'),
 		run_linux_clippy: rustWorkspace || hits('run_linux_clippy'),
-		run_e2e_hub: rustWorkspace || a.frontend_all || a.hub || a.e2e_hub || hits('run_e2e_hub'),
+		run_e2e_hub:
+			rustWorkspace ||
+			a.frontend_all ||
+			a.hub ||
+			a.frontend_hub ||
+			a.e2e_hub ||
+			hits('run_e2e_hub'),
 		run_e2e_chronogazer:
 			rustWorkspace ||
 			a.frontend_all ||
 			a.chronogazer ||
+			a.frontend_chronogazer ||
 			a.e2e_chronogazer ||
 			hits('run_e2e_chronogazer')
 	};

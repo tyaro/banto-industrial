@@ -20,16 +20,23 @@
 # は保持している。
 name: Supply Chain
 
+# リリース（タグの push: v* / trend-v*）と手動の実行（workflow_dispatch）では、
+# 変更パスの絞り込みをせず全部走らせる（2026-11-22 オーナー決定）。
 on:
   push:
     branches: [main]
+    tags: ['v*', 'trend-v*']
   pull_request:
+  workflow_dispatch:
 
-# ci.yml と同じ流儀(ワークフロー名 + ref でグループ化し、新しい push/PR
-# 更新が来たら実行中の古いジョブをキャンセルする)。
+# ci.yml と同じ流儀(ワークフロー名 + ref でグループ化し、PR の更新が来たら
+# 実行中の古いジョブをキャンセルする。main・タグ・手動の実行は取り消さない)。
+# タグの push と手動の実行は run_id で独立した group にする。ref で束ねると、同じ ref の別の実行に
+# 取り消されたり、待機中の run が 1 本だけの仕様で次の run に置き換えられたりする(2026-11-22 レビュー)。
+# PR・branch の push は今まで通り ref で束ねる。
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # advisories だけ独立ジョブにする。理由: advisory DB の新着(既存の

@@ -7,7 +7,8 @@
 #             ├─ rust                   （条件付き。fmt / clippy。対象は workspace 全体か -p に絞る）
 #             ├─ rust-test-build        （条件付き。テストを 1 回だけビルドして nextest archive にし、doctest も回す。対象は rust と同じ）
 #             │    ├─ rust-test         （rust-test-build の後。アーカイブを 3 台にシャーディングして実行）
-#             │    └─ rust-wasm         （条件付き。WASM Hub components の ignored テスト。workspace 全体か -p banto-hub-host を含むとき。
+#             │    └─ rust-wasm         （条件付き。WASM Hub components の ignored テスト。workspace 全体・WASM に関わる host のソース/試験・
+#             │                           banto-driver-wasm / banto-drivers に届く crate の変更のとき。main への push は常に走る（2026-11-22）。
 #             │                           rust-test-build の後で、アーカイブを再利用しテストはビルドしない。ゲストの wasm だけビルドする）
 #             ├─ rust-db-source         （条件付き。PostgreSQL）
 #             ├─ linux-clippy           （条件付き。昇格まわりの 2 crate を ubuntu で）
@@ -36,6 +37,15 @@
 # - root の Cargo.toml / Cargo.lock・toolchain・proto・.cargo・.config は Rust workspace
 #   全体 + 両アプリの E2E。root の package.json / pnpm-lock.yaml / lint・format・TS
 #   設定は全 frontend + 両 E2E。
+# - 画面だけの変更（`apps/banto-hub/src/**`・`apps/chronogazer/src/**` と、アプリ直下の
+#   package.json・vite/vitest/svelte の設定・tsconfig）は、frontend-<app> と e2e-<app> だけ走らせ、
+#   Rust 系のジョブ（rust・rust-test-build・rust-test・rust-wasm・rust-db-source・linux-clippy・
+#   driver-api）は走らせない（2026-11-22 オーナー決定）。Rust が読む `static/`・`src-tauri/`・
+#   `core/`・`host/`・`installer/` と、Rust の試験が読む `bridgeLoad.fixtures.json` は今までどおり。
+# - rust-wasm は、host の WASM に関わるソース/試験（`wasm_plugins.rs`・`banto-hub.rs`・`win_service.rs`・tests/t12_*・*wasm*・
+#   tests/common・host の Cargo.toml）と、依存グラフで banto-driver-wasm / banto-drivers に届く
+#   共有 crate の変更のときだけ（PR）。host のほかの場所を壊した変更は PR では気づかず、main の
+#   push で初めて落ちうる。オーナーが受け入れた（2026-11-22）。
 # - `packages/**`（共通のフロントの部品。いまは packages/trend）は frontend-chronogazer
 #   （その中で部品の check・test も回す）。
 #
@@ -69,16 +79,23 @@
 #   Required Check は ci-gate のままなので、保護の設定は変えなくてよい。
 name: CI
 
+# リリース（タグの push: v* / trend-v*）と手動の実行（workflow_dispatch）では、
+# 変更パスの絞り込みをせず全部走らせる（2026-11-22 オーナー決定）。
 on:
   push:
     branches: [main]
+    tags: ['v*', 'trend-v*']
   pull_request:
+  workflow_dispatch:
 
 # #ci-speed（2026-10-19）: 取り消すのは PR の古い実行だけ。main の実行は最後まで走らせる。
 # main を取り消すとジョブ末尾の rust-cache 保存に届かず、main のキャッシュが
 # 作り直されないまま全 PR がキャッシュ無しでビルドする（run 39319407775 で実際に起きた）。
+# タグの push と手動の実行は run_id で独立した group にする。ref で束ねると、同じ ref の別の実行に
+# 取り消されたり、待機中の run が 1 本だけの仕様で次の run に置き換えられたりする(2026-11-22 レビュー)。
+# PR・branch の push は今まで通り ref で束ねる。
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && github.run_id || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
