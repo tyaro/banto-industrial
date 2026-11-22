@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import {
 	classify,
 	classifyAreas,
+	DEMO_PATHS,
 	derive,
 	escapeRegExp,
 	graphFromMetadata,
@@ -279,6 +280,36 @@ const TABLE = [
 		'アプリの lib/demo（Hub）はそのアプリの画面とデモの E2E',
 		['apps/banto-hub/src/lib/demo/mockFetch.ts'],
 		{ ...NONE, run_frontend_hub: true, run_e2e_hub: true, run_e2e_demo_pages: true }
+	],
+	[
+		'デモの組み立てに効く: Hub の package.json',
+		['apps/banto-hub/package.json'],
+		{ ...NONE, run_frontend_hub: true, run_e2e_hub: true, run_e2e_demo_pages: true }
+	],
+	[
+		'デモの組み立てに効く: ChronoGazer の package.json',
+		['apps/chronogazer/package.json'],
+		{ ...NONE, run_frontend_chronogazer: true, run_e2e_chronogazer: true, run_e2e_demo_pages: true }
+	],
+	[
+		'デモの組み立てに効く: Hub の app.html',
+		['apps/banto-hub/src/app.html'],
+		{ ...NONE, run_frontend_hub: true, run_e2e_hub: true, run_e2e_demo_pages: true }
+	],
+	[
+		'デモの組み立てに効く: ChronoGazer の routes/+layout.ts',
+		['apps/chronogazer/src/routes/+layout.ts'],
+		{ ...NONE, run_frontend_chronogazer: true, run_e2e_chronogazer: true, run_e2e_demo_pages: true }
+	],
+	[
+		'デモの組み立てに効く: ChronoGazer の lib/banto/startup.ts',
+		['apps/chronogazer/src/lib/banto/startup.ts'],
+		{ ...NONE, run_frontend_chronogazer: true, run_e2e_chronogazer: true, run_e2e_demo_pages: true }
+	],
+	[
+		'デモの組み立てに効く: ChronoGazer の lib/banto/environment.ts',
+		['apps/chronogazer/src/lib/banto/environment.ts'],
+		{ ...NONE, run_frontend_chronogazer: true, run_e2e_chronogazer: true, run_e2e_demo_pages: true }
 	],
 	[
 		'画面だけの変更はデモの E2E を走らせない',
@@ -1508,8 +1539,8 @@ test('画面だけの変更（apps/*/src・フロントの設定）は frontend 
 	for (const f of hub) {
 		const r = classify({ event: 'pull_request', files: [f], graph: G });
 		assert.equal(r.areas.frontend_hub, true, f);
-		// vite.config.ts はデモの組み立てにも効く。
-		const demo = f.endsWith('vite.config.ts');
+		// vite.config.ts・package.json などはデモの組み立てにも効く（DEMO_PATHS）。
+		const demo = DEMO_PATHS.some((re) => re.test(f));
 		assert.deepEqual(
 			r.jobs,
 			{ ...NONE, run_frontend_hub: true, run_e2e_hub: true, run_e2e_demo_pages: demo },
@@ -1534,7 +1565,7 @@ test('画面だけの変更（apps/*/src・フロントの設定）は frontend 
 				...NONE,
 				run_frontend_chronogazer: true,
 				run_e2e_chronogazer: true,
-				run_e2e_demo_pages: f.endsWith('vite.config.ts')
+				run_e2e_demo_pages: DEMO_PATHS.some((re) => re.test(f))
 			},
 			f
 		);

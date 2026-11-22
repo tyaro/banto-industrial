@@ -1492,6 +1492,12 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Typecheck demo-backend
+        run: pnpm --filter @banto-industrial/demo-backend check
+
+      - name: Unit tests demo-backend
+        run: pnpm --filter @banto-industrial/demo-backend test
+
       - name: Build demo pages
         run: pnpm demo:build
 

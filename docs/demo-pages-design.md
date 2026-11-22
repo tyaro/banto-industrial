@@ -75,6 +75,7 @@ banto・temp-scada と同じく、インストールせずにブラウザで画�
 - ワークフロー `deploy-demo.yml` を足す。契機は `workflow_dispatch` だけで、入力に配信する ref（既定は main。リリースのときはタグ名）を取る。
 - 2 つのアプリを同じサイトの `/banto-industrial/hub/` と `/banto-industrial/chronogazer/` に置き、`/banto-industrial/` に入口のページを置く。ベースパスは `paths.base` を環境変数（`BASE_PATH`）で切り替え、未設定（Tauri・LAN 配信）なら今と同じビルドにする。
 - サードパーティの Action は ci.yml の方針どおりコミットの SHA で固定する。
+- 配信は main か `v*` のタグだけを受け付け、`e2e/tests-demo-pages/public-gate.spec.ts`（2b-2 で足す公開の関門の試験）が無い ref は断る（2026-11-23 オーナーのレビュー #1309）。
 
 **対象の URL を直に開く・読み直すことも、配信物で保証する**（2026-11-22 オーナーのレビュー）。両アプリは SPA の fallback（`index.html`）で作っているが、GitHub Pages は無いパスをサブディレクトリの `index.html` へ回さない。無いパスにはサイトの最上位の `404.html` を返すだけ（[GitHub Pages の 404 の仕様](https://docs.github.com/en/pages/getting-started-with-github-pages/creating-a-custom-404-page-for-your-github-pages-site)）。
 
