@@ -190,6 +190,29 @@ describe('connectTagStream: close 1008 で再接続しない（#441）', () => {
 		expect(FakeWebSocket.instances).toHaveLength(1);
 	});
 
+	it('disconnect() した古いソケットの遅れた close は、新しい接続の状態を上書きしない', () => {
+		const a = start();
+		const socketA = latest();
+		socketA.open();
+		a.stream.disconnect();
+		a.onStatusChange.mockClear();
+
+		const b = start();
+		const socketB = latest();
+		socketB.open();
+		expect(b.onStatusChange).toHaveBeenLastCalledWith(true);
+
+		// 古い接続 A の close が、B の open の後に届く。
+		socketA.serverClose(1006);
+		expect(a.onStatusChange).not.toHaveBeenCalled();
+		expect(b.onStatusChange).toHaveBeenCalledTimes(1);
+		expect(b.onStatusChange).toHaveBeenLastCalledWith(true);
+
+		// A の再接続は予約されない（B のソケットだけ）。
+		vi.advanceTimersByTime(WELL_PAST_BACKOFF_MS);
+		expect(FakeWebSocket.instances).toHaveLength(2);
+	});
+
 	it('止まっていないときの resume() は何もしない', () => {
 		const { stream } = start();
 		latest().open();

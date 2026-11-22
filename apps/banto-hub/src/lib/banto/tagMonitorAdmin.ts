@@ -494,6 +494,7 @@ export function connectTagStream(
 		};
 
 		socket.onmessage = (event) => {
+			if (stopped) return;
 			if (typeof event.data !== 'string') return;
 			let msg: unknown;
 			try {
@@ -535,8 +536,10 @@ export function connectTagStream(
 
 		socket.onclose = (ev: CloseEvent) => {
 			if (ws === socket) ws = null;
-			handlers.onStatusChange?.(false, ev.code);
+			// disconnect() の後は、古いソケットの遅れた close で新しい接続の状態を
+			// 上書きしない（知らせも再接続の予約もしない）。
 			if (stopped) return;
+			handlers.onStatusChange?.(false, ev.code);
 			// #441: 資格情報が使えないと確認された close（`1008`）は再接続
 			// しない - 失効したセッションでは再接続が認証で拒否され続ける
 			// だけで、利用者に理由も伝わらない。判断は `streamClose.ts`。

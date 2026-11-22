@@ -140,9 +140,12 @@ export function createTagValueStream(sources: TagValueStreamSources): TagValueSt
 
 	$effect(() => {
 		if (!(sources.enabled?.() ?? true)) return;
+		// 片付けた接続の遅れた知らせで、表示の状態・値を変えないための印。
+		let alive = true;
 		const { disconnect, resubscribe, resume } = connectTagStream(
 			{
 				onData: (received, { snapshot }) => {
+					if (!alive) return;
 					// ID で購読したインスタンスは ID をキーにする（外部名の使い回しに惑わされない）。
 					const incoming = byId ? keyValuesById(received) : received;
 					// スナップショットは置き換え（空でも）、差分はマージ。
@@ -163,21 +166,29 @@ export function createTagValueStream(sources: TagValueStreamSources): TagValueSt
 				},
 				// 一覧の読み直しは呼び出し側（登録の画面）が決める。ここで読み直すと、
 				// 作成・編集の途中や保留中の編集を巻き込むため（#1255）。
-				onConfigChanged: () => sources.onConfigChanged?.(),
-				onRejected: (code, detail) => dispatch({ type: 'rejected', code, detail }),
+				onConfigChanged: () => {
+					if (alive) sources.onConfigChanged?.();
+				},
+				onRejected: (code, detail) => {
+					if (alive) dispatch({ type: 'rejected', code, detail });
+				},
 				onStatusChange: (connected, closeCode) => {
+					if (!alive) return;
 					dispatch(connected ? { type: 'connected' } : { type: 'disconnected', code: closeCode });
 				},
 				probeSession: probeSessionAfterReconnectFailures,
 				onHalt: (action) => {
+					if (!alive) return;
 					dispatch({ type: 'halted', action });
 					if (action.kind !== 'recheckSession') return;
 					recheckSessionAfterStreamClose().then(
 						() => {
+							if (!alive) return;
 							dispatch({ type: 'resumed' });
 							resume();
 						},
 						() => {
+							if (!alive) return;
 							dispatch({ type: 'recheckFailed', reason: action.reason });
 						}
 					);
@@ -188,6 +199,7 @@ export function createTagValueStream(sources: TagValueStreamSources): TagValueSt
 		resubscribeSocket = resubscribe;
 		resumeSocket = resume;
 		return () => {
+			alive = false;
 			resubscribeSocket = null;
 			resumeSocket = null;
 			disconnect();
