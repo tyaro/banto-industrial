@@ -12,6 +12,8 @@ import { resolve } from '$app/paths';
 import { installDemoBackend, mountDemoBanner } from '@banto-industrial/demo-backend';
 import { createBantoRoutes, resetDemoToken } from './bantoRoutes';
 import { createHubRoutes } from './hubRoutes';
+import { HubRegistry } from './hubState';
+import { createHubSocketRoute } from './hubStream';
 
 /** デモ専用のトークンのキー（既定の `banto.auth.token` は使わない、設計 §3.2）。 */
 export const DEMO_TOKEN_STORAGE_KEY = 'banto-industrial.demo.hub.token';
@@ -32,8 +34,13 @@ export async function startDemo(): Promise<DemoStart> {
 	if (new URLSearchParams(location.search).has(DEMO_FAIL_INIT_PARAM)) {
 		throw new Error('demo: 模擬の初期化を失敗させました（試験の口）');
 	}
+	// 登録の状態は 1 つ（口と WebSocket が同じ物を見る。読み直すと初期のデータに戻る）。
+	const registry = new HubRegistry();
 	installDemoBackend(
-		{ http: [...createBantoRoutes(), ...createHubRoutes()] },
+		{
+			http: [...createBantoRoutes(), ...createHubRoutes(registry)],
+			sockets: [createHubSocketRoute(registry)]
+		},
 		{
 			// SvelteKit 3 は `base` を出さないので、根の解決（`<base>/`）から取る。
 			basePath: resolve('/'),

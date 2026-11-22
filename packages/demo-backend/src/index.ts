@@ -60,3 +60,12 @@ export {
 	type InstallDemoBackendOptions
 } from './install';
 export { createMemoryStorage, installDemoStorage, type DemoStorageTarget } from './storage';
+export {
+	DEMO_MIN_PERIOD_MS,
+	demoHash01,
+	demoSampleTime,
+	demoTagValue,
+	demoValueIsNumeric,
+	effectivePeriodMs,
+	type DemoTagValueInput
+} from './tagValues';
