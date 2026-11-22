@@ -338,6 +338,22 @@ describe('HubRegistry.offsetAddress（模擬のアドレス移動）', () => {
 		});
 	});
 
+	it('文字列は stringLength（ワード数）そのままの幅で動かし、parseAddress は wordCount を返す', () => {
+		const r = new HubRegistry();
+		const id = slmp().id;
+		expect(
+			r.offsetAddress(
+				item({ connectionId: id, address: 'D200', dataType: 'string', stringLength: 8, n: 1 })
+			)
+		).toMatchObject({ ok: true, canonical: 'D208', wordCount: 8 });
+		expect(
+			r.parseAddress(id, { tagKind: 'plc', address: 'D200', dataType: 'string', stringLength: 8 })
+		).toMatchObject({ ok: true, wordCount: 8 });
+		expect(
+			r.parseAddress(id, { tagKind: 'plc', address: 'D200', dataType: 'string', stringLength: 0 })
+		).toMatchObject({ ok: true, wordCount: null });
+	});
+
 	it('Modbus の桁を保つ・範囲外・解析できない・接続なしは行ごとの誤り', () => {
 		const r = new HubRegistry();
 		expect(

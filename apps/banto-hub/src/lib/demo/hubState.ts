@@ -461,7 +461,12 @@ export class HubRegistry {
 	/** アドレスの解析（最小限の規則: 形が合うかだけ。細かい範囲の検証は再現しない）。 */
 	parseAddress(
 		connectionId: number,
-		item: { tagKind: string; address: string; dataType: string }
+		item: {
+			tagKind: string;
+			address: string;
+			dataType: string;
+			stringLength?: number | null;
+		}
 	): ParsedAddress {
 		const address = (item.address ?? '').trim();
 		if (address === '') return { ok: false, message: 'アドレスを入力してください' };
@@ -482,7 +487,11 @@ export class HubRegistry {
 			: ['i64', 'u64', 'f64'].includes(item.dataType)
 				? 4
 				: item.dataType === 'string'
-					? null
+					? Number.isInteger(item.stringLength) &&
+						(item.stringLength as number) >= 1 &&
+						(item.stringLength as number) <= 128
+						? (item.stringLength as number)
+						: null
 					: 1;
 		if (connection.protocol === 'modbus-tcp') {
 			const m = /^([0134])(\d{4,5})$/.exec(address);
@@ -532,13 +541,12 @@ export class HubRegistry {
 		const base = this.parseAddress(item.connectionId, {
 			tagKind,
 			address: item.address,
-			dataType: item.dataType
+			dataType: item.dataType,
+			stringLength: item.stringLength
 		});
 		if (!base.ok || tagKind !== 'plc') return base;
 		const perPoint =
-			item.dataType === 'string'
-				? Math.max(1, Math.ceil((item.stringLength ?? 2) / 2))
-				: (base.wordCount ?? 1);
+			item.dataType === 'string' ? Math.max(1, item.stringLength ?? 1) : (base.wordCount ?? 1);
 		const step = item.unit === 'points' ? item.n * perPoint : item.n;
 		const address = item.address.trim();
 		const digits = /^([A-Za-z]{1,2})(\d+)$/.exec(address) ?? /^([0134])(\d{4,5})$/.exec(address);
@@ -555,7 +563,8 @@ export class HubRegistry {
 		return this.parseAddress(item.connectionId, {
 			tagKind,
 			address: moved,
-			dataType: item.dataType
+			dataType: item.dataType,
+			stringLength: item.stringLength
 		});
 	}
 }
