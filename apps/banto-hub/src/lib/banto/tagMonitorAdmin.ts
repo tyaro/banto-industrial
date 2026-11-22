@@ -149,9 +149,14 @@ function fromRawCatalog(raw: RawCatalogResponse): CatalogResponse {
 	};
 }
 
-/** `/api/v1/stream` の `op: "data"` の1タグ分（`{ tag, v, q, t }`、未確認のときだけ `unverified: true`）。 */
+/**
+ * `/api/v1/stream` の `op: "data"` の1タグ分（`{ tag, id, v, q, t }`、未確認のときだけ
+ * `unverified: true`）。`id` はタグ ID で、サーバーは常に載せる（2026-11-22、#1254。
+ * 古いサーバーには無いので任意）。
+ */
 export interface StreamValue {
 	tag: string;
+	id?: number;
 	v: number | null;
 	q: string;
 	t: number;
@@ -245,6 +250,16 @@ export interface TagStreamHandlers {
 	onData: (values: StreamValue[], info: { snapshot: boolean }) => void;
 	onConfigChanged: (revision: number) => void;
 	/**
+	 * #1254（PR #1282 のレビュー）: 今の購読（今のソケット・今の購読 id）への subscribe を
+	 * サーバーが `error` フレーム（`{ op: "error", id, code, detail }`、`core/src/stream.rs`
+	 * 冒頭）で拒否した。`code` は `unknown_tag`（未知の具体名）・`invalid_request`（パターンの
+	 * 形が不正。接続名・グループ名に `.` や `*` があるとワイルドカードでも起きうる）など。
+	 * 拒否された購読には値が来ない（ソケットは開いたまま）。次の `resubscribe()` か、接続し
+	 * 直したときの subscribe が通れば、その `data` が `onData` へ来る。古い購読 id・古い
+	 * ソケット・id の無い error は呼ばない。
+	 */
+	onRejected?: (code: string, detail: string) => void;
+	/**
 	 * 接続確立/切断のたびに呼ばれる（画面側が「値が古いかも」を示すため）。
 	 * T18-4b: 切断時（`connected: false`）は `CloseEvent.code` を
 	 * `closeCode` として渡す - 画面側がバックプレッシャ切断
@@ -289,6 +304,31 @@ const RECONNECT_MAX_DELAY_MS = 30000;
  * 間隔より短くして、ログイン直後にすぐ繋がるようにする）。 */
 const TOKEN_WAIT_DELAY_MS = 500;
 
+/**
+ * 購読の範囲（#1254）: パターン（`tags`）とタグ ID（`ids`）。`ids` は改名しても同じ
+ * タグを追い、同じ外部名で作り直された別 ID のタグは選ばず、未知の ID でも購読を
+ * 拒否されない（docs/hub/tag-server-design.md §5.2「タグ ID での購読」）。
+ * 値を見張る窓が `ids` だけで購読する。
+ */
+export interface StreamSubscriptionTarget {
+	tags?: readonly string[];
+	ids?: readonly number[];
+}
+
+/** subscribe のフレーム。配列はパターンだけの購読（今までどおり）。空の欄は送らない。 */
+function subscribeFrame(id: number, target: readonly string[] | StreamSubscriptionTarget): string {
+	const { tags, ids } = Array.isArray(target)
+		? { tags: target as readonly string[], ids: undefined }
+		: (target as StreamSubscriptionTarget);
+	return JSON.stringify({
+		op: 'subscribe',
+		id,
+		...(tags !== undefined && tags.length > 0 ? { tags } : {}),
+		...(ids !== undefined && ids.length > 0 ? { ids } : {}),
+		mode: 'on_change'
+	});
+}
+
 function wsUrl(path: string): string {
 	const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
 	return `${scheme}//${location.host}${path}`;
@@ -302,7 +342,8 @@ function wsUrl(path: string): string {
  * ようにするため（`mode` は引き続き常に `"on_change"`）。`getSubscriptionTags`
  * は呼ぶたびに最新の絞り込み結果を返す関数を渡す想定（`$derived` 相当を
  * クロージャで包んだもの）で、このモジュール自身は絞り込みロジックを
- * 持たない。
+ * 持たない。#1254 から、パターンの配列の代わりに {@link StreamSubscriptionTarget}
+ * （`tags`・`ids`）も返せる（値を見張る窓がタグ ID で購読する）。
  *
  * 戻り値は `{ disconnect, resubscribe, resume }`:
  * - `disconnect()`: ソケットを閉じ、保留中の再接続タイマーを止める
@@ -331,7 +372,7 @@ function wsUrl(path: string): string {
  */
 export function connectTagStream(
 	handlers: TagStreamHandlers,
-	getSubscriptionTags: () => string[]
+	getSubscriptionTags: () => string[] | StreamSubscriptionTarget
 ): { disconnect: () => void; resubscribe: () => void; resume: () => void } {
 	let stopped = false;
 	/**
@@ -449,17 +490,11 @@ export function connectTagStream(
 			reconnectDelayMs = RECONNECT_BASE_DELAY_MS;
 			handlers.onStatusChange?.(true);
 			expectSnapshot = true;
-			socket.send(
-				JSON.stringify({
-					op: 'subscribe',
-					id: subscriptionId,
-					tags: getSubscriptionTags(),
-					mode: 'on_change'
-				})
-			);
+			socket.send(subscribeFrame(subscriptionId, getSubscriptionTags()));
 		};
 
 		socket.onmessage = (event) => {
+			if (stopped) return;
 			if (typeof event.data !== 'string') return;
 			let msg: unknown;
 			try {
@@ -482,18 +517,29 @@ export function connectTagStream(
 			} else if (op === 'config_changed') {
 				const revision = (msg as { revision?: unknown }).revision;
 				if (typeof revision === 'number') handlers.onConfigChanged(revision);
+			} else if (op === 'error') {
+				// 購読の拒否（`onRejected` の doc comment）。ワイルドカードは 0 件でも拒否
+				// されないが、接続名・グループ名に `.`・`*` があるとパターンの形が不正
+				// （`invalid_request`）になりうる。黙って捨てると、値の来ない購読のまま
+				// 「更新中」に見えるので知らせる。旧ソケット・旧購読 id 宛ては捨てる。
+				if (ws !== socket) return;
+				if ((msg as { id?: unknown }).id !== subscriptionId) return;
+				const code = (msg as { code?: unknown }).code;
+				const detail = (msg as { detail?: unknown }).detail;
+				handlers.onRejected?.(
+					typeof code === 'string' ? code : 'unknown',
+					typeof detail === 'string' ? detail : ''
+				);
 			}
-			// "event"/"pong"/"error" は無視 - `getSubscriptionTags()` は常に
-			// `*` かグループワイルドカード（`{connection}.{group}.*`）しか
-			// 返さない（`monitorSubscription.ts` 参照、具体名 `Exact` は
-			// 使わない）ので unknown_tag 等のユーザー向けエラーは発生しない
-			// (subscribe_core.rs: ワイルドカードは0件マッチでもエラーにしない)。
+			// "event"/"pong" は無視。
 		};
 
 		socket.onclose = (ev: CloseEvent) => {
 			if (ws === socket) ws = null;
-			handlers.onStatusChange?.(false, ev.code);
+			// disconnect() の後は、古いソケットの遅れた close で新しい接続の状態を
+			// 上書きしない（知らせも再接続の予約もしない）。
 			if (stopped) return;
+			handlers.onStatusChange?.(false, ev.code);
 			// #441: 資格情報が使えないと確認された close（`1008`）は再接続
 			// しない - 失効したセッションでは再接続が認証で拒否され続ける
 			// だけで、利用者に理由も伝わらない。判断は `streamClose.ts`。
@@ -565,14 +611,7 @@ export function connectTagStream(
 		ws.send(JSON.stringify({ op: 'unsubscribe', id: subscriptionId }));
 		subscriptionId += 1;
 		expectSnapshot = true;
-		ws.send(
-			JSON.stringify({
-				op: 'subscribe',
-				id: subscriptionId,
-				tags: getSubscriptionTags(),
-				mode: 'on_change'
-			})
-		);
+		ws.send(subscribeFrame(subscriptionId, getSubscriptionTags()));
 	}
 
 	function resume(): void {

@@ -19,6 +19,13 @@
  * `row.v` / `q` / `t` は書き換えず、表示だけを変える（再開してスナップ
  * ショットが届けば通常の表示へ戻る）。通常の再接続中（`1006` など）の表示は
  * 従来どおり（状態の行が「値は最後の受信内容のまま停止しています」と出す）。
+ *
+ * 購読の拒否（#1254、PR #1282 のレビュー）: サーバーが subscribe を `error` フレームで
+ * 拒否した（`connectTagStream` の `onRejected`）ら `rejected` に code と detail を持つ。
+ * ソケットは開いたままでも値は来ないので、状態の行は「更新中」と出さず警告にし、セルは
+ * 最初の値の待ちと同じ `--`（陳腐化）にする。次の購読（購読し直し・接続し直し）の `data`
+ * を受けたら解く（拒否されたままの間は、接続し直しても `data` が来ないので解けない）。
+ * 状態の行の「再接続」ボタン（`resumable`）で購読し直せる。
  */
 import type { StreamCloseAction } from './streamClose';
 
@@ -33,6 +40,14 @@ export interface StreamViewState {
 	awaitingSnapshot: boolean;
 	/** close `1008` で止まっている理由。止まっていなければ `null`。 */
 	halt: StreamHalt | null;
+	/** 今の購読がサーバーに拒否された（`error` フレーム）。拒否されていなければ `null`。 */
+	rejected: StreamRejection | null;
+}
+
+/** 購読の拒否（`{ op: "error", code, detail }`）。 */
+export interface StreamRejection {
+	code: string;
+	detail: string;
 }
 
 export type StreamViewEvent =
@@ -41,6 +56,8 @@ export type StreamViewEvent =
 	| { type: 'data' }
 	| { type: 'resubscribed' }
 	| { type: 'halted'; action: StreamHalt }
+	/** 今の購読への subscribe がサーバーに拒否された。 */
+	| { type: 'rejected'; code: string; detail: string }
 	/** 手動の再開、またはログイン状態の確認で有効と分かって再開した。 */
 	| { type: 'resumed' }
 	/** ログイン状態の確認そのものが失敗した（`refreshAll()` の reject）。 */
@@ -51,7 +68,13 @@ export const RECHECK_FAILED_MESSAGE =
 	'ログイン状態を確認できなかったため、リアルタイム更新を止めています。';
 
 export function initialStreamView(): StreamViewState {
-	return { connected: false, backpressure: false, awaitingSnapshot: true, halt: null };
+	return {
+		connected: false,
+		backpressure: false,
+		awaitingSnapshot: true,
+		halt: null,
+		rejected: null
+	};
 }
 
 export function streamViewReducer(state: StreamViewState, event: StreamViewEvent): StreamViewState {
@@ -65,11 +88,17 @@ export function streamViewReducer(state: StreamViewState, event: StreamViewEvent
 				backpressure: event.code === 1013 ? true : state.backpressure
 			};
 		case 'data':
-			return { ...state, awaitingSnapshot: false };
+			return { ...state, awaitingSnapshot: false, rejected: null };
 		case 'resubscribed':
 			return { ...state, awaitingSnapshot: true };
 		case 'halted':
 			return { ...state, halt: event.action };
+		case 'rejected':
+			return {
+				...state,
+				awaitingSnapshot: true,
+				rejected: { code: event.code, detail: event.detail }
+			};
 		case 'resumed':
 			// 次のスナップショットまでは今の値として見せない（再開の直後に
 			// 「良好」の古い値へ戻らないように）。
@@ -173,16 +202,26 @@ export function monitorColumnLabels(mode: CellDisplayMode): { value: string; qua
  * #1255 でタグ登録の表にも値の列を足したので、文言の選び方を純関数にして両方で同じにする。
  *
  * - `warning`: バックプレッシャ切断・止まっている間（色を変える）。
- * - `resumable`: close `1008` の `halt`（利用者の操作で再開できる。ボタンを出す）。
+ * - `resumable`: close `1008` の `halt`、または購読の拒否（`rejected`。押すと購読し直す）。
+ *   利用者の操作で再開できる。ボタンを出す。
  */
 export interface StreamStatusLine {
-	kind: 'connected' | 'recheckSession' | 'halt' | 'backpressure' | 'reconnecting';
+	kind: 'connected' | 'rejected' | 'recheckSession' | 'halt' | 'backpressure' | 'reconnecting';
 	text: string;
 	warning: boolean;
 	resumable: boolean;
 }
 
 export function streamStatusLine(view: StreamViewState): StreamStatusLine {
+	if (view.connected && view.rejected !== null) {
+		const { code, detail } = view.rejected;
+		return {
+			kind: 'rejected',
+			text: `サーバーが購読を拒否しました（${code}${detail === '' ? '' : `: ${detail}`}）。リアルタイム更新は止まっています`,
+			warning: true,
+			resumable: true
+		};
+	}
 	if (view.connected) {
 		return {
 			kind: 'connected',

@@ -1,0 +1,732 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { UiSettingsProvider } from '@banto/admin-core';
+import { MemoryStorage } from './banto/testing/hubHttp';
+
+vi.mock('./banto/setup', () => ({ getUiSettings: () => undefined }));
+
+import {
+	RETRY_BASE_MS,
+	RETRY_MAX_MS,
+	VERIFY_BUDGET_MS,
+	createWatchListStore,
+	type TagPresence,
+	type WatchListChange
+} from './watchListStore';
+import { WATCH_LIMIT, serializeWatchList } from './watchList';
+
+const KEY = 'hub.watch.v1';
+const LOCAL_KEY = 'banto.watch.v1.account%3A1';
+
+/** サーバーの代わり。既定は即答。場面ごとに `get`・`set` の振る舞いを `mock...Once` で替える。 */
+function fakeProvider(initial?: string) {
+	const values = new Map<string, string>();
+	if (initial !== undefined) values.set(KEY, initial);
+	const get = vi.fn(async (key: string): Promise<string | null> => values.get(key) ?? null);
+	const set = vi.fn(async (key: string, value: string): Promise<void> => {
+		values.set(key, value);
+	});
+	const provider = { get, set } as unknown as UiSettingsProvider;
+	/** 次の GET を `release()` まで返さない。 */
+	function deferNextGet(): { release: () => void } {
+		let release: () => void = () => undefined;
+		get.mockImplementationOnce(
+			(key: string) =>
+				new Promise<string | null>((resolve) => {
+					release = () => resolve(values.get(key) ?? null);
+				})
+		);
+		return { release: () => release() };
+	}
+	return {
+		provider,
+		values,
+		get,
+		set,
+		deferNextGet,
+		saved: () => values.get(KEY)
+	};
+}
+
+function authError(kind: 'unauthorized' | 'forbidden' = 'unauthorized'): Error {
+	return Object.assign(new Error(kind), { body: { kind } });
+}
+
+async function settle(): Promise<void> {
+	for (let i = 0; i < 60; i++) await Promise.resolve();
+}
+
+/**
+ * `GET /api/tags/{id}` の代わり。`gone` の id は消えた、`failing` の id は照会の失敗（結果に
+ * 入れない = 不明）、それ以外は生きている。`hold()` で次の照会を `release()` まで返さない。
+ */
+function fakeChecker(gone: Iterable<number> = [], failing: Iterable<number> = []) {
+	const goneSet = new Set(gone);
+	const failSet = new Set(failing);
+	const calls: number[][] = [];
+	let gate: Promise<void> | null = null;
+	const check = vi.fn(async (ids: readonly number[]) => {
+		calls.push([...ids]);
+		if (gate !== null) await gate;
+		const result = new Map<number, TagPresence>();
+		for (const id of ids) {
+			if (failSet.has(id)) continue;
+			result.set(id, goneSet.has(id) ? 'gone' : 'exists');
+		}
+		return result;
+	});
+	function hold(): { release: () => void } {
+		let open: () => void = () => undefined;
+		gate = new Promise<void>((resolve) => {
+			open = () => {
+				gate = null;
+				resolve();
+			};
+		});
+		return { release: () => open() };
+	}
+	return { check, calls, hold, checked: () => calls.flat() };
+}
+
+function range(from: number, to: number): number[] {
+	return Array.from({ length: to - from + 1 }, (_, i) => from + i);
+}
+
+function setup(
+	server: ReturnType<typeof fakeProvider>,
+	extra: Partial<Parameters<typeof createWatchListStore>[0]> = {}
+) {
+	const storage = new MemoryStorage();
+	const changes: WatchListChange[] = [];
+	const store = createWatchListStore({
+		provider: server.provider,
+		storage: () => storage,
+		owner: () => 'account:1',
+		onChange: (change) => changes.push(change),
+		...extra
+	});
+	return { store, storage, changes };
+}
+
+beforeEach(() => {
+	vi.useFakeTimers();
+});
+
+afterEach(() => {
+	vi.useRealTimers();
+});
+
+describe('createWatchListStore', () => {
+	it('最初の描画には写しを使い、読めたらサーバーの値を一覧にして送り返さない', async () => {
+		const server = fakeProvider(serializeWatchList([7, 8]));
+		const storage = new MemoryStorage();
+		storage.setItem(LOCAL_KEY, serializeWatchList([4, 5]));
+		const store = createWatchListStore({
+			provider: server.provider,
+			storage: () => storage,
+			owner: () => 'account:1'
+		});
+		expect(store.initial).toEqual([4, 5]);
+		expect(store.list).toEqual([4, 5]);
+		expect(store.status).toBe('loading');
+		await store.load();
+		expect(store.list).toEqual([7, 8]);
+		expect(store.status).toBe('saved');
+		expect(server.set).not.toHaveBeenCalled();
+		expect(storage.getItem(LOCAL_KEY)).toBe(serializeWatchList([7, 8]));
+		store.dispose();
+	});
+
+	it('1: GET が通り PUT が失敗したら、操作を残して retrying。再送で saved、次の読み込みでも残る', async () => {
+		const server = fakeProvider(serializeWatchList([1]));
+		const { store } = setup(server);
+		await store.load();
+		server.set.mockRejectedValueOnce(new Error('offline'));
+		store.apply({ kind: 'add', ids: [2] });
+		expect(store.status).toBe('saving');
+		await settle();
+		expect(store.status).toBe('retrying');
+		expect(store.list).toEqual([1, 2]);
+		expect(server.saved()).toBe(serializeWatchList([1]));
+		await vi.advanceTimersByTimeAsync(RETRY_BASE_MS);
+		expect(store.status).toBe('saved');
+		expect(server.saved()).toBe(serializeWatchList([1, 2]));
+		store.dispose();
+
+		const next = setup(server);
+		await next.store.load();
+		expect(next.store.list).toEqual([1, 2]);
+		next.store.dispose();
+	});
+
+	it('2: PUT は届いたが応答が失敗したら、次の周回は PUT なしで saved', async () => {
+		const server = fakeProvider(serializeWatchList([1]));
+		const { store } = setup(server);
+		await store.load();
+		server.set.mockImplementationOnce(async (key: string, value: string) => {
+			server.values.set(key, value);
+			throw new Error('response lost');
+		});
+		store.apply({ kind: 'add', ids: [2] });
+		await settle();
+		expect(store.status).toBe('retrying');
+		await vi.advanceTimersByTimeAsync(RETRY_BASE_MS);
+		expect(store.status).toBe('saved');
+		expect(server.set).toHaveBeenCalledTimes(1);
+		expect(store.list).toEqual([1, 2]);
+		store.dispose();
+	});
+
+	it('3: 別のタブが足した分は消さない（サーバー [1,2]、表示 [1] で 3 を足すと [1,2,3]）', async () => {
+		const server = fakeProvider(serializeWatchList([1]));
+		const { store } = setup(server);
+		await store.load();
+		server.values.set(KEY, serializeWatchList([1, 2]));
+		expect(store.list).toEqual([1]);
+		store.apply({ kind: 'add', ids: [3] });
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([1, 2, 3]));
+		expect(store.list).toEqual([1, 2, 3]);
+		expect(store.status).toBe('saved');
+		store.dispose();
+	});
+
+	it('4: タグ一覧 [1]・サーバー [1,2] で、照会で 2 が生きていれば保存に残る', async () => {
+		const server = fakeProvider(serializeWatchList([1, 2]));
+		const checker = fakeChecker();
+		const { store } = setup(server, { checkTagIds: checker.check });
+		await store.load();
+		store.setKnownLiveIds([1]);
+		await settle();
+		expect(checker.checked()).toEqual([2]);
+		expect(store.list).toEqual([1, 2]);
+		store.apply({ kind: 'add', ids: [5] });
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([1, 2, 5]));
+		store.dispose();
+	});
+
+	it('5: タグ一覧 [1,3]・保存 [1,2,3] で 2 が 404 なら dead。操作なしでは PUT せず、次の足すで落ちる', async () => {
+		const server = fakeProvider(serializeWatchList([1, 2, 3]));
+		const checker = fakeChecker([2]);
+		const { store } = setup(server, { checkTagIds: checker.check });
+		await store.load();
+		store.setKnownLiveIds([1, 3]);
+		await settle();
+		expect(store.list).toEqual([1, 3]);
+		expect(server.set).not.toHaveBeenCalled();
+		store.apply({ kind: 'add', ids: [4] });
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([1, 3, 4]));
+		expect(store.list).toEqual([1, 3, 4]);
+		store.dispose();
+	});
+
+	it('6a: 見張り [2..101] で最大の 101 を消しても、照会で dead になり 1 を足せる', async () => {
+		const server = fakeProvider(serializeWatchList(range(2, 101)));
+		const checker = fakeChecker([101]);
+		const { store, changes } = setup(server, { checkTagIds: checker.check });
+		await store.load();
+		store.setKnownLiveIds(range(1, 100));
+		await settle();
+		expect(checker.checked()).toEqual([101]);
+		expect(store.list).toEqual(range(2, 100));
+		const result = store.apply({ kind: 'add', ids: [1] });
+		expect(result.added).toBe(1);
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([...range(2, 100), 1]));
+		expect(store.list).toEqual([...range(2, 100), 1]);
+		expect(changes.every((c) => c.overLimit === 0)).toBe(true);
+		store.dispose();
+	});
+
+	it('6b: 見張り [2..101] を全部消したら、表示 0 件で上限に数えず足せる', async () => {
+		const server = fakeProvider(serializeWatchList(range(2, 101)));
+		const checker = fakeChecker(range(2, 101));
+		const { store } = setup(server, { checkTagIds: checker.check });
+		await store.load();
+		store.setKnownLiveIds([1]);
+		await settle();
+		expect(store.list).toEqual([]);
+		store.apply({ kind: 'add', ids: [1] });
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([1]));
+		expect(store.list).toEqual([1]);
+		// 消えた id は周回でも照会し直さない。
+		expect(checker.checked().filter((id) => id === 50)).toEqual([50]);
+		store.dispose();
+	});
+
+	it('6c: 最新の GET で初めて見えた削除済みの id は、上限を当てる前に照会して除く', async () => {
+		const server = fakeProvider(serializeWatchList(range(1, 99)));
+		const checker = fakeChecker([150]);
+		const { store, changes } = setup(server, { checkTagIds: checker.check });
+		await store.load();
+		store.setKnownLiveIds([...range(1, 99), 200]);
+		await settle();
+		// 別のタブが 150 を足し、その後 150 は消された（こちらのタグ一覧には無い）。
+		server.values.set(KEY, serializeWatchList([...range(1, 99), 150]));
+		const result = store.apply({ kind: 'add', ids: [200] });
+		expect(result.overLimit).toBe(0);
+		await settle();
+		expect(checker.checked()).toEqual([150]);
+		expect(server.saved()).toBe(serializeWatchList([...range(1, 99), 200]));
+		expect(store.list).toEqual([...range(1, 99), 200]);
+		expect(changes.every((c) => c.overLimit === 0)).toBe(true);
+		store.dispose();
+	});
+
+	it('6d: 照会に失敗した id は残り、上限に数え、外すと保存から消える', async () => {
+		const server = fakeProvider(serializeWatchList([...range(1, 99), 500]));
+		const checker = fakeChecker([], [500]);
+		const { store, changes } = setup(server, { checkTagIds: checker.check });
+		await store.load();
+		store.setKnownLiveIds([...range(1, 99), 600]);
+		await settle();
+		expect(store.list).toEqual([...range(1, 99), 500]);
+		store.apply({ kind: 'add', ids: [600] });
+		await settle();
+		expect(changes.filter((c) => c.overLimit > 0).map((c) => c.overLimit)).toEqual([1]);
+		expect(store.list).toEqual([...range(1, 99), 500]);
+		expect(server.set).not.toHaveBeenCalled();
+		store.apply({ kind: 'remove', id: 500 });
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList(range(1, 99)));
+		store.apply({ kind: 'add', ids: [600] });
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([...range(1, 99), 600]));
+		store.dispose();
+	});
+
+	it('6d2: 溜めた足す操作の消えた id は当て直しでも除き、残りの追加は上限で落ちない', async () => {
+		const server = fakeProvider(serializeWatchList(range(1, 99)));
+		const checker = fakeChecker([101]);
+		const { store, changes } = setup(server, { checkTagIds: checker.check });
+		await store.load();
+		const gate = server.deferNextGet();
+		store.apply({ kind: 'add', ids: [101, 102] });
+		await settle();
+		// GET を待つ間に 101 が別の画面で消され、照会が gone を返す。
+		store.setKnownLiveIds(range(1, 99));
+		await settle();
+		expect(store.list).toEqual([...range(1, 99), 102]);
+		gate.release();
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([...range(1, 99), 102]));
+		expect(store.list).toHaveLength(100);
+		expect(store.list).toEqual([...range(1, 99), 102]);
+		expect(changes.every((c) => c.overLimit === 0)).toBe(true);
+		store.dispose();
+	});
+
+	it('6e: 手がかりにある id は照会せず、照会中の id は重ねず、消えた id は二度と照会しない', async () => {
+		const server = fakeProvider(serializeWatchList([1, 2, 3]));
+		const checker = fakeChecker([2]);
+		const { store } = setup(server, { checkTagIds: checker.check });
+		await store.load();
+		const gate = checker.hold();
+		store.setKnownLiveIds([1]);
+		// 表示の確かめの照会中に周回が走っても、同じ id は重ねて照会しない（3 は足す操作にも入る）。
+		store.apply({ kind: 'add', ids: [3, 3] });
+		await settle();
+		gate.release();
+		await settle();
+		expect(checker.calls).toEqual([[2, 3]]);
+		expect(store.list).toEqual([1, 3]);
+		// 上限で落ちない操作は照会を待たないので、消えた 2 を落とすのは次の保存のついで。
+		expect(server.saved()).toBe(serializeWatchList([1, 2, 3]));
+		// 次の周回: 1 は手がかり、2 は dead。上限で落ちないので、3 も照会し直さない。
+		store.apply({ kind: 'add', ids: [1] });
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([1, 3]));
+		// 3 は「生きている」と覚えないので周回の後の表示の確かめで照会し直されるが、1（手がかり）と
+		// 消えた 2 は二度と照会しない。
+		expect(checker.checked().filter((id) => id === 2)).toHaveLength(1);
+		expect(checker.checked()).not.toContain(1);
+		store.dispose();
+	});
+
+	it('6f: 上限で落ちる操作の照会の途中で dispose したら結果を当てず、書かない', async () => {
+		const server = fakeProvider(serializeWatchList(range(1, 100)));
+		const checker = fakeChecker([101]);
+		const { store, changes } = setup(server, { checkTagIds: checker.check });
+		await store.load();
+		const gate = checker.hold();
+		store.setKnownLiveIds(range(1, 100));
+		store.apply({ kind: 'add', ids: [101] });
+		await settle();
+		expect(checker.checked()).toEqual([101]);
+		const seen = changes.length;
+		const listBefore = store.list;
+		store.dispose();
+		gate.release();
+		await settle();
+		expect(changes.length).toBe(seen);
+		expect(store.list).toEqual(listBefore);
+		expect(listBefore).toHaveLength(100);
+		expect(server.set).not.toHaveBeenCalled();
+	});
+
+	it('6h: 照会が期限で reject しても（不明）周回は進み、「すべて外す」が保存される（#1282 P2）', async () => {
+		const server = fakeProvider(serializeWatchList([7, 8]));
+		const timedOut = vi.fn(async (_ids: readonly number[]) => {
+			throw new Error('presence check timed out');
+		});
+		const { store } = setup(server, { checkTagIds: timedOut });
+		await store.load();
+		store.setKnownLiveIds([]);
+		await settle();
+		expect(timedOut).toHaveBeenCalled();
+		expect(store.list).toEqual([7, 8]);
+		store.apply({ kind: 'clear' });
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([]));
+		expect(store.list).toEqual([]);
+		store.dispose();
+	});
+
+	/** 解決しない在否の照会。 */
+	function hangingChecker() {
+		return vi.fn(
+			(_ids: readonly number[]) => new Promise<Map<number, TagPresence>>(() => undefined)
+		);
+	}
+
+	it('6i-a: 在否の照会が無応答でも、保存 100 件の「すべて外す」は時計を進めずに保存される', async () => {
+		const server = fakeProvider(serializeWatchList(range(1, 100)));
+		const check = hangingChecker();
+		const { store } = setup(server, { checkTagIds: check });
+		await store.load();
+		store.setKnownLiveIds([]);
+		await settle();
+		expect(check).toHaveBeenCalled();
+		store.apply({ kind: 'clear' });
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([]));
+		expect(store.list).toEqual([]);
+		expect(store.status).toBe('saved');
+		store.dispose();
+	});
+
+	it('6i-b: 在否の照会が無応答でも、枠に収まる追加は時計を進めずに保存される', async () => {
+		const server = fakeProvider(serializeWatchList(range(1, 50)));
+		const check = hangingChecker();
+		const { store } = setup(server, { checkTagIds: check });
+		await store.load();
+		store.apply({ kind: 'add', ids: [200] });
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([...range(1, 50), 200]));
+		store.dispose();
+	});
+
+	it('6i-c: 上限で落ちる追加は期限（5 秒）まで待ち、不明は数えて上限で落ち、保存は変わらない', async () => {
+		const server = fakeProvider(serializeWatchList(range(1, 100)));
+		const check = hangingChecker();
+		const { store, changes } = setup(server, { checkTagIds: check });
+		await store.load();
+		store.apply({ kind: 'add', ids: [101] });
+		await settle();
+		await vi.advanceTimersByTimeAsync(VERIFY_BUDGET_MS - 1);
+		expect(changes.some((c) => c.overLimit > 0)).toBe(false);
+		expect(store.status).toBe('saving');
+		await vi.advanceTimersByTimeAsync(1);
+		await settle();
+		expect(changes.filter((c) => c.overLimit > 0).map((c) => c.overLimit)).toEqual([1]);
+		expect(server.set).not.toHaveBeenCalled();
+		expect(store.list).toEqual(range(1, 100));
+		store.dispose();
+	});
+
+	it('6i-d: 期限の内に gone が返れば、それを除いて足せる', async () => {
+		const server = fakeProvider(serializeWatchList(range(1, 100)));
+		const checker = fakeChecker([100]);
+		const { store, changes } = setup(server, { checkTagIds: checker.check });
+		await store.load();
+		store.apply({ kind: 'add', ids: [101] });
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([...range(1, 99), 101]));
+		expect(changes.every((c) => c.overLimit === 0)).toBe(true);
+		store.dispose();
+	});
+
+	it('6g: 「すべて外す」は、確かめられない項目だけのときも保存を空にする', async () => {
+		const server = fakeProvider(serializeWatchList([7, 8]));
+		const checker = fakeChecker([], [7, 8]);
+		const { store } = setup(server, { checkTagIds: checker.check });
+		await store.load();
+		store.setKnownLiveIds([]);
+		await settle();
+		expect(store.list).toEqual([7, 8]);
+		store.apply({ kind: 'clear' });
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([]));
+		expect(store.list).toEqual([]);
+		store.dispose();
+	});
+
+	it('7: 周回中に来た操作は、その周回の成功で消えず、次の周回で送られる', async () => {
+		const server = fakeProvider();
+		const { store } = setup(server);
+		await store.load();
+		const gate = server.deferNextGet();
+		store.apply({ kind: 'add', ids: [1] });
+		await settle();
+		store.apply({ kind: 'add', ids: [2] });
+		expect(store.list).toEqual([1, 2]);
+		gate.release();
+		await settle();
+		expect(server.set).toHaveBeenCalledTimes(2);
+		expect(server.set.mock.calls[0][1]).toBe(serializeWatchList([1]));
+		expect(server.set.mock.calls[1][1]).toBe(serializeWatchList([1, 2]));
+		expect(store.status).toBe('saved');
+		expect(store.list).toEqual([1, 2]);
+		store.dispose();
+	});
+
+	it('8: GET の失敗が続けば待ちは倍々で上限まで、隠れている間は止まり、retryNow と新しい操作で打ち切る', async () => {
+		const server = fakeProvider();
+		server.get.mockRejectedValue(new Error('offline'));
+		let shown = true;
+		let wake: (() => void) | null = null;
+		const { store } = setup(server, {
+			visible: () => shown,
+			onVisible: (listener) => {
+				wake = listener;
+				return () => {
+					wake = null;
+				};
+			}
+		});
+		await store.load();
+		expect(server.get).toHaveBeenCalledTimes(1);
+		// 読めず操作も無い間は表示しない（裏で読み直す）。
+		expect(store.status).toBe('loading');
+		store.apply({ kind: 'add', ids: [1] });
+		await settle();
+		expect(server.get).toHaveBeenCalledTimes(2);
+		expect(store.status).toBe('retrying');
+		// 待ちは 2 回目の失敗で 4 秒（1 回目の 2 秒の待ちは新しい操作で打ち切った）。
+		await vi.advanceTimersByTimeAsync(RETRY_BASE_MS * 2 - 1);
+		expect(server.get).toHaveBeenCalledTimes(2);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(server.get).toHaveBeenCalledTimes(3);
+		await vi.advanceTimersByTimeAsync(RETRY_BASE_MS * 4);
+		expect(server.get).toHaveBeenCalledTimes(4);
+		store.retryNow();
+		await settle();
+		expect(server.get).toHaveBeenCalledTimes(5);
+		store.apply({ kind: 'add', ids: [2] });
+		await settle();
+		expect(server.get).toHaveBeenCalledTimes(6);
+		// 上限で止まる。
+		await vi.advanceTimersByTimeAsync(RETRY_MAX_MS * 10);
+		const calls = server.get.mock.calls.length;
+		await vi.advanceTimersByTimeAsync(RETRY_MAX_MS - 1);
+		expect(server.get.mock.calls.length).toBe(calls);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(server.get.mock.calls.length).toBe(calls + 1);
+		// 隠れている間は読まない。見えたらすぐ読む。
+		shown = false;
+		await vi.advanceTimersByTimeAsync(RETRY_MAX_MS * 3);
+		expect(server.get.mock.calls.length).toBe(calls + 1);
+		expect(wake).not.toBeNull();
+		server.get.mockReset();
+		server.get.mockImplementation(async () => server.values.get(KEY) ?? null);
+		shown = true;
+		wake!();
+		await settle();
+		expect(server.get).toHaveBeenCalledTimes(1);
+		expect(store.status).toBe('saved');
+		expect(server.saved()).toBe(serializeWatchList([1, 2]));
+		store.dispose();
+	});
+
+	it('9a: unauthorized は blocked で、再送せず写しも書かない', async () => {
+		const server = fakeProvider();
+		const { store, storage } = setup(server);
+		await store.load();
+		storage.setItem(LOCAL_KEY, serializeWatchList([]));
+		server.set.mockRejectedValueOnce(authError());
+		store.apply({ kind: 'add', ids: [1] });
+		await settle();
+		expect(store.status).toBe('blocked');
+		await vi.advanceTimersByTimeAsync(RETRY_MAX_MS * 3);
+		store.retryNow();
+		await settle();
+		expect(server.set).toHaveBeenCalledTimes(1);
+		expect(storage.getItem(LOCAL_KEY)).toBe(serializeWatchList([]));
+		store.dispose();
+	});
+
+	it('9b: forbidden の読みも blocked', async () => {
+		const server = fakeProvider();
+		server.get.mockRejectedValueOnce(authError('forbidden'));
+		const { store } = setup(server);
+		await store.load();
+		expect(store.status).toBe('blocked');
+		await vi.advanceTimersByTimeAsync(RETRY_MAX_MS * 3);
+		expect(server.get).toHaveBeenCalledTimes(1);
+		store.dispose();
+	});
+
+	it('9c: 持ち主が替わったら blocked で、書かず写しも書かない', async () => {
+		const server = fakeProvider(serializeWatchList([1]));
+		let owner = 'account:1';
+		const { store, storage } = setup(server, { owner: () => owner });
+		await store.load();
+		expect(storage.getItem(LOCAL_KEY)).toBe(serializeWatchList([1]));
+		owner = 'account:2';
+		store.apply({ kind: 'add', ids: [2] });
+		await settle();
+		expect(store.status).toBe('blocked');
+		expect(server.set).not.toHaveBeenCalled();
+		expect(storage.getItem(LOCAL_KEY)).toBe(serializeWatchList([1]));
+		await vi.advanceTimersByTimeAsync(RETRY_MAX_MS * 3);
+		expect(server.get).toHaveBeenCalledTimes(2);
+		store.dispose();
+	});
+
+	it('10: dispose の後は周回の結果を当てず、知らせない', async () => {
+		const server = fakeProvider(serializeWatchList([1]));
+		const gate = server.deferNextGet();
+		const { store, changes } = setup(server);
+		void store.load();
+		store.apply({ kind: 'add', ids: [2] });
+		const seen = changes.length;
+		store.dispose();
+		gate.release();
+		await settle();
+		await vi.advanceTimersByTimeAsync(RETRY_MAX_MS);
+		expect(changes.length).toBe(seen);
+		expect(server.set).not.toHaveBeenCalled();
+		expect(store.status).toBe('saving');
+	});
+
+	it('11: 壊れた保存値は、操作が無ければ書かず、操作を足すと上書きする', async () => {
+		const server = fakeProvider('{broken');
+		const { store } = setup(server);
+		await store.load();
+		expect(store.list).toEqual([]);
+		expect(store.status).toBe('saved');
+		expect(server.set).not.toHaveBeenCalled();
+		store.apply({ kind: 'add', ids: [1] });
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([1]));
+		store.dispose();
+	});
+
+	it('12: サーバーの値に当てて上限で落ちた件数を知らせる', async () => {
+		const server = fakeProvider();
+		const { store, changes } = setup(server);
+		await store.load();
+		const full = Array.from({ length: WATCH_LIMIT }, (_, i) => 1000 + i);
+		server.values.set(KEY, serializeWatchList(full));
+		const result = store.apply({ kind: 'add', ids: [1, 2] });
+		expect(result.overLimit).toBe(0);
+		await settle();
+		expect(changes.some((c) => c.overLimit === 2)).toBe(true);
+		expect(store.list).toEqual(full);
+		expect(server.set).not.toHaveBeenCalled();
+		store.dispose();
+	});
+
+	it('12b: 足した時点の上限超えは仮で知らせず、周回で 1 回だけ知らせる', async () => {
+		const full = Array.from({ length: WATCH_LIMIT }, (_, i) => 1000 + i);
+		const server = fakeProvider(serializeWatchList(full));
+		const { store, changes } = setup(server);
+		await store.load();
+		const before = changes.length;
+		const result = store.apply({ kind: 'add', ids: [1] });
+		expect(result.overLimit).toBe(1);
+		expect(changes.slice(before).every((c) => c.overLimit === 0)).toBe(true);
+		await settle();
+		store.retryNow();
+		await settle();
+		expect(changes.filter((c) => c.overLimit > 0).map((c) => c.overLimit)).toEqual([1]);
+		store.dispose();
+	});
+
+	it('13: 一度も読めていない間の表示は写しに操作を当てたもの。写しは成功の後だけ書く', async () => {
+		const server = fakeProvider(serializeWatchList([7]));
+		const gate = server.deferNextGet();
+		const storage = new MemoryStorage();
+		storage.setItem(LOCAL_KEY, serializeWatchList([4, 5]));
+		const store = createWatchListStore({
+			provider: server.provider,
+			storage: () => storage,
+			owner: () => 'account:1'
+		});
+		void store.load();
+		store.apply({ kind: 'add', ids: [6] });
+		expect(store.list).toEqual([4, 5, 6]);
+		expect(store.status).toBe('saving');
+		expect(storage.getItem(LOCAL_KEY)).toBe(serializeWatchList([4, 5]));
+		gate.release();
+		await settle();
+		// 読むだけの周回（操作の数 0）の後に、足すの周回でサーバーの値に当てる。
+		expect(store.list).toEqual([7, 6]);
+		expect(server.saved()).toBe(serializeWatchList([7, 6]));
+		expect(storage.getItem(LOCAL_KEY)).toBe(serializeWatchList([7, 6]));
+		expect(store.status).toBe('saved');
+		store.dispose();
+	});
+
+	it('持ち主が分からなければ写しを読まず書かない', async () => {
+		const server = fakeProvider(serializeWatchList([1]));
+		const storage = new MemoryStorage();
+		const getItem = vi.spyOn(storage, 'getItem');
+		const setItem = vi.spyOn(storage, 'setItem');
+		const store = createWatchListStore({
+			provider: server.provider,
+			storage: () => storage,
+			owner: () => null
+		});
+		await store.load();
+		store.apply({ kind: 'add', ids: [2] });
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([1, 2]));
+		expect(getItem).not.toHaveBeenCalled();
+		expect(setItem).not.toHaveBeenCalled();
+		store.dispose();
+	});
+
+	it('7: 1 件が直ちに 404、別の 1 件が無応答でも、期限の時点で 404 を除いて足せる（#1282 5 回目 P2）', async () => {
+		const server = fakeProvider(serializeWatchList(range(1, 100)));
+		const A = 1;
+		const B = 2;
+		const C = 200;
+		const check = vi.fn(
+			(ids: readonly number[], onResult?: (id: number, p: TagPresence) => void) => {
+				for (const id of ids) {
+					if (id === B) continue;
+					onResult?.(id, id === A ? 'gone' : 'exists');
+				}
+				return new Promise<Map<number, TagPresence>>(() => undefined);
+			}
+		);
+		const { store, changes } = setup(server, { checkTagIds: check });
+		await store.load();
+		store.apply({ kind: 'add', ids: [C] });
+		await settle();
+		expect(server.set).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(VERIFY_BUDGET_MS);
+		await settle();
+		const expected = [...range(2, 100), C];
+		expect(server.saved()).toBe(serializeWatchList(expected));
+		expect(store.list).toEqual(expected);
+		expect(changes.filter((c) => c.overLimit > 0)).toEqual([]);
+		store.dispose();
+	});
+
+	it('8: 手がかりが先に届き、その後の GET で初めて見えた id も照会され、PUT なしで表示から落ちる', async () => {
+		const server = fakeProvider(serializeWatchList([1]));
+		const checker = fakeChecker([1]);
+		const { store } = setup(server, { checkTagIds: checker.check });
+		store.setKnownLiveIds([2]);
+		await store.load();
+		await settle();
+		expect(checker.checked()).toEqual([1]);
+		expect(store.list).toEqual([]);
+		expect(server.set).not.toHaveBeenCalled();
+		store.dispose();
+	});
+});
