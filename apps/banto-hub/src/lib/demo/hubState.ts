@@ -510,4 +510,52 @@ export class HubRegistry {
 			wordCount
 		};
 	}
+
+	/**
+	 * アドレスを動かす（`POST /api/tags/offset-addresses` の模擬）。`points` は型のワード数 × `n`、
+	 * `words` は `n` ワード。動かした後は `parseAddress` で解析し直す（本物と同じ「動かして再検証」）。
+	 * 末尾の数字は十進で扱う（`parseAddress` と同じ最小の規則）。接続が無い・範囲外・解析できない行は
+	 * その行だけ `ok: false`。
+	 */
+	offsetAddress(item: {
+		connectionId: number;
+		tagKind?: string;
+		address: string;
+		dataType: string;
+		stringLength?: number | null;
+		n: number;
+		unit: 'points' | 'words';
+	}): ParsedAddress {
+		const tagKind = item.tagKind ?? 'plc';
+		const connection = this.connection(item.connectionId);
+		if (!connection) return { ok: false, message: `接続 ${item.connectionId} が見つかりません` };
+		const base = this.parseAddress(item.connectionId, {
+			tagKind,
+			address: item.address,
+			dataType: item.dataType
+		});
+		if (!base.ok || tagKind !== 'plc') return base;
+		const perPoint =
+			item.dataType === 'string'
+				? Math.max(1, Math.ceil((item.stringLength ?? 2) / 2))
+				: (base.wordCount ?? 1);
+		const step = item.unit === 'points' ? item.n * perPoint : item.n;
+		const address = item.address.trim();
+		const digits = /^([A-Za-z]{1,2})(\d+)$/.exec(address) ?? /^([0134])(\d{4,5})$/.exec(address);
+		if (!digits) return { ok: false, message: 'アドレスを動かせません' };
+		const next = Number(digits[2]) + step;
+		if (
+			!Number.isSafeInteger(next) ||
+			next < 0 ||
+			(connection.protocol === 'modbus-tcp' && next < 1)
+		) {
+			return { ok: false, message: 'アドレスの範囲外です' };
+		}
+		const moved = `${digits[1]}${String(next).padStart(digits[2].length, '0')}`;
+		return this.parseAddress(item.connectionId, {
+			tagKind,
+			address: moved,
+			dataType: item.dataType
+		});
+	}
 }

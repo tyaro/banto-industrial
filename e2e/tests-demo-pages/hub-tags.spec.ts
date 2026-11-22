@@ -131,3 +131,33 @@ test('Hub /tags: タグの追加・編集・削除が一覧に反映され、本
 	expect(traffic.forbidden()).toEqual([]);
 	expect(traffic.unsupported).toEqual([]);
 });
+
+test('Hub /tags: 連続登録（アドレスの計算 `offset-addresses` の模擬）で数本のタグが作れる', async ({
+	page,
+	baseURL
+}) => {
+	const traffic = recordTraffic(page, new URL(baseURL!).origin);
+	await page.goto(TAGS_URL);
+	await groupNode(page, 'pump').click();
+	await page.getByRole('button', { name: '連続登録' }).click();
+	const pane = page.getByRole('complementary', { name: '連続登録' });
+	await expect(pane).toBeVisible();
+	await page.getByLabel('開始アドレス').fill('40200');
+	await page.getByLabel('名前パターン').fill('demo_cont{n}');
+	await page.getByLabel('開始番号').fill('1');
+	await page.getByLabel('点数').fill('3');
+	await expect(page.getByRole('heading', { level: 4, name: 'プレビュー（3件）' })).toBeVisible();
+	const previewRows = page.locator('.preview-table tbody tr');
+	await expect(previewRows).toHaveCount(3);
+	await expect(previewRows.nth(2)).toContainText('demo_cont3');
+	await expect(previewRows.nth(2)).toContainText('40202');
+	await pane.getByRole('button', { name: '検証', exact: true }).click();
+	await pane.getByRole('button', { name: '登録', exact: true }).click();
+	// 画面の高さによっては追加した行が表示範囲（仮想化）の外なので、検索で絞ってから確かめる。
+	await page.getByPlaceholder('外部名・名前・アドレスで検索').fill('demo_cont');
+	for (const name of ['demo_cont1', 'demo_cont2', 'demo_cont3']) {
+		await expect(page.getByRole('gridcell', { name, exact: true })).toBeVisible();
+	}
+	expect(traffic.forbidden()).toEqual([]);
+	expect(traffic.unsupported).toEqual([]);
+});

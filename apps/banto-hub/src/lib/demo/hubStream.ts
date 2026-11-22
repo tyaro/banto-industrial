@@ -96,10 +96,12 @@ function evaluate(
 		const last = sub.sent.get(tag.id);
 		if (!tag.enabled || !group.enabled || !connection.enabled) {
 			// 本物（`effective_current_view`）は無効のタグを `v: null`・`q: bad` で返す。
-			// 値を送ったことがあるものだけ、1 回送って消す（`t` は直近のまま）。
-			if (last && last.q === 'good') {
-				sub.sent.set(tag.id, { t: last.t, v: null, q: 'bad' });
-				values.push({ tag: externalName, id: tag.id, v: null, q: 'bad', t: last.t });
+			// スナップショットでは無効のタグも載せる（`t` は値のキャッシュが無ければ now）。
+			// 差分では値を送ったことがあるものだけ 1 回送って、以後は再送しない。
+			if (snapshot || (last && last.q === 'good')) {
+				const t = last ? last.t : nowMs;
+				sub.sent.set(tag.id, { t, v: null, q: 'bad' });
+				values.push({ tag: externalName, id: tag.id, v: null, q: 'bad', t });
 			}
 			continue;
 		}

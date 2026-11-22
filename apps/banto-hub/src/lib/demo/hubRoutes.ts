@@ -262,6 +262,16 @@ export function createHubRoutes(registry: HubRegistry = new HubRegistry()): Demo
 		},
 		{
 			method: 'POST',
+			path: '/api/tags/offset-addresses',
+			handle: guarded(async (req) => {
+				const body = await req.json<{
+					items: Parameters<HubRegistry['offsetAddress']>[0][];
+				}>();
+				return json({ items: body.items.map((item) => registry.offsetAddress(item)) });
+			})
+		},
+		{
+			method: 'POST',
 			path: '/api/tags/batch',
 			handle: guarded(async (req) => {
 				const body = await req.json<{ tags: TagInput[]; dryRun: boolean }>();

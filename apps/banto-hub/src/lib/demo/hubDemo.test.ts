@@ -59,7 +59,7 @@ describe('HubRegistry（模擬の登録）', () => {
 		const r = new HubRegistry();
 		const before = r.tags.find((t) => t.comment !== '')!;
 		expect(before).toBeDefined();
-		const { id, revision, ...rest } = before;
+		const { id, revision: _revision, ...rest } = before;
 		const { comment, ...withoutComment } = rest;
 		expect(comment).not.toBe('');
 		r.updateTagsBatch([{ ...withoutComment, id, enabled: false }], false);
@@ -281,6 +281,21 @@ describe('/api/v1/stream の模擬', () => {
 		peer.hangUp();
 	});
 
+	it('購読直後のスナップショットは無効のタグも v: null・q: bad で載せる', () => {
+		const registry = new HubRegistry();
+		const tag = registry.tags[0];
+		registry.updateTag(tag.id, { ...tag, enabled: false } as unknown as TagInput);
+		const now = 1_700_000_000_000;
+		const peer = fakeConnection();
+		createHubSocketRoute(registry, () => now).connect(peer.connection);
+		peer.say({ op: 'subscribe', id: 1, ids: [tag.id], mode: 'on_change' });
+		const first = peer.sent[0] as { values: { id: number; v: unknown; q: string; t: number }[] };
+		expect(first.values).toEqual([
+			expect.objectContaining({ id: tag.id, v: null, q: 'bad', t: now })
+		]);
+		peer.hangUp();
+	});
+
 	it('形の悪い購読は error、ping は pong', () => {
 		const peer = fakeConnection();
 		createHubSocketRoute(new HubRegistry()).connect(peer.connection);
@@ -289,5 +304,54 @@ describe('/api/v1/stream の模擬', () => {
 		peer.say({ op: 'ping' });
 		expect(peer.sent.map((m) => m.op)).toEqual(['error', 'error', 'pong']);
 		peer.hangUp();
+	});
+});
+
+describe('HubRegistry.offsetAddress（模擬のアドレス移動）', () => {
+	const item = (o: Record<string, unknown>) =>
+		({
+			connectionId: 1,
+			address: 'D100',
+			dataType: 'u16',
+			n: 1,
+			unit: 'points',
+			...o
+		}) as Parameters<HubRegistry['offsetAddress']>[0];
+	const slmp = () => new HubRegistry().connections.find((c) => c.protocol !== 'modbus-tcp')!;
+	const modbus = () => new HubRegistry().connections.find((c) => c.protocol === 'modbus-tcp')!;
+
+	it('points は型のワード数ぶん・words は n ワード動かす', () => {
+		const r = new HubRegistry();
+		const id = slmp().id;
+		expect(r.offsetAddress(item({ connectionId: id, n: 3 }))).toMatchObject({
+			ok: true,
+			canonical: 'D103'
+		});
+		expect(r.offsetAddress(item({ connectionId: id, dataType: 'f32', n: 3 }))).toMatchObject({
+			ok: true,
+			canonical: 'D106'
+		});
+		expect(
+			r.offsetAddress(item({ connectionId: id, dataType: 'f32', n: 3, unit: 'words' }))
+		).toMatchObject({
+			canonical: 'D103'
+		});
+	});
+
+	it('Modbus の桁を保つ・範囲外・解析できない・接続なしは行ごとの誤り', () => {
+		const r = new HubRegistry();
+		expect(
+			r.offsetAddress(item({ connectionId: modbus().id, address: '40001', n: 10 }))
+		).toMatchObject({ ok: true, canonical: '40011' });
+		expect(r.offsetAddress(item({ connectionId: slmp().id, n: -500 }))).toMatchObject({
+			ok: false
+		});
+		expect(r.offsetAddress(item({ connectionId: slmp().id, address: 'zzz' }))).toMatchObject({
+			ok: false
+		});
+		expect(r.offsetAddress(item({ connectionId: 9999 }))).toEqual({
+			ok: false,
+			message: '接続 9999 が見つかりません'
+		});
 	});
 });
