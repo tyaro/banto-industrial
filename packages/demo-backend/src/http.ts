@@ -1,7 +1,9 @@
 /**
  * 差し替えの `fetch`（設計 §3.1）。`/api/` は模擬の口が答え、口が無ければ 501。
- * 元の `fetch` を呼ぶのは同じオリジンでベースパスの下の静的な資産だけで、ほかの宛先は
- * `TypeError` で失敗させる（本物の `fetch` のネットワークの失敗と同じ形）。
+ * 元の `fetch` を呼ぶのは同じオリジンでベースパスの下の静的な資産の `GET`・`HEAD` だけで、
+ * ほかの宛先・メソッドは `TypeError` で失敗させる（本物の `fetch` のネットワークの失敗と
+ * 同じ形）。渡すのは判定に使った絶対の URL の `Request` で（相対のまま渡すと、ブラウザが
+ * 文書を基準に解決し直して別の宛先へ送りうる）、リダイレクトは追わない（`redirect: 'error'`）。
  */
 import { classify, matchPath, type PathPattern } from './routing';
 
@@ -107,7 +109,20 @@ export function createDemoFetch(options: DemoFetchOptions): typeof fetch {
 	const demoFetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
 		const url = resolveInput(input, baseUrl);
 		const destination = classify(url, options.origin, options.basePath);
-		if (destination === 'static') return options.originalFetch(input, init);
+		if (destination === 'static') {
+			// 判定した URL のまま（`Request` の入力は `input.url` のまま）、リダイレクトは追わず渡す。
+			const staticRequest = new Request(isRequest(input) ? input : url.href, {
+				...init,
+				redirect: 'error'
+			});
+			const staticMethod = staticRequest.method.toUpperCase();
+			if (staticMethod !== 'GET' && staticMethod !== 'HEAD') {
+				throw new TypeError(
+					`demo: ${staticMethod} ${url.pathname} は送りません（静的な資産は GET・HEAD だけ）`
+				);
+			}
+			return options.originalFetch(staticRequest);
+		}
 		if (destination === 'blocked') {
 			throw new TypeError(`demo: ${url.origin}${url.pathname} へは送りません（模擬の外）`);
 		}

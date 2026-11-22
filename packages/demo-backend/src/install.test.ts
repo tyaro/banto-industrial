@@ -142,6 +142,48 @@ describe('fetch', () => {
 		expect(original).toHaveBeenCalledTimes(2);
 	});
 
+	it('静的な資産には判定した絶対の URL の Request を、リダイレクトを追わず GET・HEAD だけ渡す', async () => {
+		const { target, original } = setup({ http: [] });
+		const sent = () => (original.mock.calls as unknown[][]).map((c) => c[0] as Request);
+		// (a) 相対パスは判定した絶対の URL で渡る。
+		await target.fetch('_app/x.js');
+		await target.fetch('./x.css');
+		expect(sent().map((r) => r.url)).toEqual([
+			`${ORIGIN}${BASE}/_app/x.js`,
+			`${ORIGIN}${BASE}/x.css`
+		]);
+		// (c) init が follow を指定しても error。
+		await target.fetch('_app/y.js', { redirect: 'follow' });
+		expect(sent().every((r) => r.redirect === 'error')).toBe(true);
+		// (b) GET・HEAD 以外は失敗し、元の fetch を呼ばない。
+		const before = original.mock.calls.length;
+		await expect(target.fetch('_app/x.js', { method: 'POST', body: 'a' })).rejects.toBeInstanceOf(
+			TypeError
+		);
+		await expect(target.fetch('_app/x.js', { method: 'put' })).rejects.toBeInstanceOf(TypeError);
+		expect(original.mock.calls.length).toBe(before);
+		await target.fetch('_app/x.js', { method: 'HEAD' });
+		expect(sent().at(-1)?.method).toBe('HEAD');
+		// (d) Request で呼んでも同じ。
+		original.mockClear();
+		const abort = new AbortController();
+		await target.fetch(
+			new Request(`${ORIGIN}${BASE}/z.js`, {
+				redirect: 'follow',
+				headers: { 'x-a': '1' },
+				signal: abort.signal
+			})
+		);
+		const r = sent()[0];
+		expect(r.url).toBe(`${ORIGIN}${BASE}/z.js`);
+		expect(r.redirect).toBe('error');
+		expect(r.headers.get('x-a')).toBe('1');
+		await expect(
+			target.fetch(new Request(`${ORIGIN}${BASE}/z.js`, { method: 'POST', body: 'a' }))
+		).rejects.toBeInstanceOf(TypeError);
+		expect(original).toHaveBeenCalledTimes(1);
+	});
+
 	it('別のオリジン・ベースパスの外・拡張子の無いパスは失敗し、元の fetch を呼ばない', async () => {
 		const { target, original } = setup({ http: [] });
 		for (const url of [
