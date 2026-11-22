@@ -1,7 +1,7 @@
 # ブラウザで触れるデモ（GitHub Pages）の設計
 
 作成日: 2026-11-22
-状態: **設計中（未実装）**。2026-11-22 オーナー決定（目的・範囲・配信の契機・ログイン無し）を記録し、作りの案を置いた。実装は §6 の順に小さな PR で進める。
+状態: **設計中（未実装）**。2026-11-22 オーナー決定（目的・範囲・配信の契機・ログイン無し）を記録し、作りの案を置いた。同日、オーナーのレビュー（#1301）で、直に開く・読み直すことの保証（§3.5）と、本物の API に出ないことの制約（§3.1・§3.2）を足した。実装は §6 の順に小さな PR で進める。
 
 関連: banto の `deploy-demo.yml`（admin-template を InMemory で配信）、temp-scada の `pages.yml`・`docs/guides/demo-pages.md`（模擬値の画面を配信）。
 
@@ -33,6 +33,13 @@ banto・temp-scada と同じく、インストールせずにブラウザで画�
 - パスが `/api/...` の直書きでも、ネットワークに出る前に横取りするのでベースパスと関係なく動く。
 - 模擬のコードは `import.meta.env.VITE_BANTO_DEMO === '1'` のときだけ動的に import する。製品のビルドには入らない（実装の PR でバンドルに含まれないことを確かめる）。
 
+**本物の API に出ないことは実装の制約にする**（2026-11-22 オーナーのレビュー）。観測で確かめるだけにしない。
+
+- 振り分けは「模擬に無い口は本物へ流す」にしない。`/api/` で始まるもの（同じオリジンでも別のオリジンでも）は、模擬に無ければ 501（§3.4）を返し、元の `fetch` を呼ばない。元の `fetch` へ渡すのは、ベースパスの下の静的な資産（JS・CSS・画像・フォント）だけ。それ以外の宛先は失敗で返す。
+- 差し替えた `WebSocket`・`EventSource` は本物の接続を一度も開かない。模擬に無いパスは、開いた直後に閉じる。
+- 起動の順は「模擬を入れ終える → 通常の provider（HTTP 認証・UI 設定・イベント）を作る」。模擬の import か初期化が失敗したら、通常の provider を起動せず、デモを始められない旨の画面を出して止まる（`setup.ts` を呼ばない）。
+- デモのビルドでは、Tauri・本物のサーバーを探す処理（ChronoGazer の `probeBackend` など）も模擬に答えさせ、実際のサーバーへの問い合わせを残さない。
+
 置き場所は、振り分けと値の生成の共通部分を `packages/` に新しいパッケージ（仮に `@banto-industrial/demo-backend`）として置き、口ごとの応答は `apps/<app>/src/lib/demo/` に置く。
 
 ### 3.2 ログイン無しで入る
@@ -42,6 +49,10 @@ banto・temp-scada と同じく、インストールせずにブラウザで画�
 - Hub の通常の「ログイン無し」は試運転の grant（`grants.commissioning`）なので、そのまま使うと試運転の表示やロックダウンの操作が画面に出る。デモでは使わず、ログイン済みの利用者として始める。トークンの置き方（起動の前に保存しておくか、grant の応答で渡すか）は、画面に試運転の表示が出ない方を実装の PR で選ぶ。
 - ChronoGazer は `localDesktop` の grant でもよいが、Hub と揃えてログイン済みの admin にする。
 - ChronoGazer の今の demo（InMemory・admin/admin のログイン・全部断る）は、この作りで置き換えて消す（互換は考えない）。
+- **模擬の利用者・認証はメモリだけに持つ**（2026-11-22 オーナーのレビュー）。Pages は `tyaro.github.io` のオリジンを banto・temp-scada のデモと共有するので、ほかのデモの設定やセッションを拾わない・残さない。
+  - 模擬はトークンの中身で何も判断しない（どのトークンでも admin、トークンが無くても admin）。
+  - `@banto/admin-core` の `createHttpAuthProvider` は、トークンを必ず localStorage・sessionStorage に書く（選べるのはキーの名前 `storageKey` だけ）。メモリに持つ口を banto に提案した（[tyaro/banto#838](https://github.com/tyaro/banto/issues/838)、v8 の作業に合わせる）。入るまでは、デモ専用のキー（例 `banto-industrial.demo.hub.token`）を使い、起動のたびに消してから始める。既定のキー `banto.auth.token` は読みも書きもしない。
+  - テーマなどの保存が要るなら、デモ専用の接頭辞のキーにする（今の範囲では保存しない。§3.3）。
 
 ### 3.3 模擬のデータと値
 
@@ -63,7 +74,15 @@ banto・temp-scada と同じく、インストールせずにブラウザで画�
 - ワークフロー `deploy-demo.yml` を足す。契機は `workflow_dispatch` だけで、入力に配信する ref（既定は main。リリースのときはタグ名）を取る。
 - 2 つのアプリを同じサイトの `/banto-industrial/hub/` と `/banto-industrial/chronogazer/` に置き、`/banto-industrial/` に入口のページを置く。ベースパスは `paths.base` を環境変数（`BASE_PATH`）で切り替え、未設定（Tauri・LAN 配信）なら今と同じビルドにする。
 - サードパーティの Action は ci.yml の方針どおりコミットの SHA で固定する。
-- 配信の前に、デモのビルドで両アプリが開き、対象の画面に値が出るかを Playwright で 1 本だけ確かめる。
+
+**対象の URL を直に開く・読み直すことも、配信物で保証する**（2026-11-22 オーナーのレビュー）。両アプリは SPA の fallback（`index.html`）で作っているが、GitHub Pages は無いパスをサブディレクトリの `index.html` へ回さない。無いパスにはサイトの最上位の `404.html` を返すだけ（[GitHub Pages の 404 の仕様](https://docs.github.com/en/pages/getting-started-with-github-pages/creating-a-custom-404-page-for-your-github-pages-site)）。
+
+- 対象のルートごとに静的な入口を作る。組み立ての後に fallback の `index.html` を `hub/tags/index.html`・`chronogazer/tags/index.html`・`chronogazer/monitor/index.html`（と各アプリの最上位・入口）へ写す。写した先でも資産を読めるよう、デモのビルドでは資産のパスを絶対パス（`paths.relative: false`）にする。
+- Pages は `/hub/tags` を `/hub/tags/` へ転送する。SvelteKit の `trailingSlash` と行き来して転送が止まらない、ということが無いかを確かめ、要るならデモのビルドだけ `trailingSlash: 'always'` にする。
+- サイトの最上位の `404.html` は、入口へのリンクを出すだけにする（対象外のパスを SPA として開かない）。
+- **確かめ方**: 開発サーバーではなく、組み立てた Pages の成果物を、fallback の無い静的なサーバーで配って確かめる。Hub の `/tags`、ChronoGazer の `/tags`・`/monitor` を、それぞれ直に開き、読み直す。
+
+**本物の API への送信が 0 件であることを試験で確かめる**（§3.1 の制約の検査）。同じ静的な配信の上で Playwright を走らせ、ページの全部の要求と WebSocket を記録する。起動・タグの追加・値の購読・履歴の表示・対象外の操作のそれぞれで、`/api` への本物の要求・WebSocket の接続・ほかのオリジンへの要求が 0 件であること、対象の画面に値が出ることを確かめる。配信の前にこれを通す。
 
 ### 3.6 壊れていることに気づく仕組み
 
@@ -71,6 +90,7 @@ banto・temp-scada と同じく、インストールせずにブラウザで画�
 
 - 模擬のコードは各アプリの `src/` と `packages/` に置くので、今の frontend のジョブ（`svelte-check`・lint・単体の試験）にそのまま入る。
 - 振り分けと値の生成には単体の試験を書く。
+- **模擬の経路を変えた PR では、普段の CI でデモを組み立てて確かめる**（配信はしない）。対象は `packages/demo-backend/**`・`apps/*/src/lib/demo/**`、起動の配線（各アプリの `setup.ts`・ルートの layout）、`vite.config.ts`、`deploy-demo.yml`。これらが変わったら、デモのビルドと §3.5 の静的な配信の上の試験（直に開く・読み直す・送信 0 件）を走らせる。それ以外の PR では走らせない。
 - API の口を変えた PR は、模擬の応答も同じ PR で直す（implementation-checklist に 1 行足す）。
 
 ## 4. 決めないこと・後で決めること
@@ -82,12 +102,12 @@ banto・temp-scada と同じく、インストールせずにブラウザで画�
 ## 5. 危ういところ
 
 - 模擬が本物の応答とずれる。対策は §3.6 と、応答の型を各 `*Admin.ts` の型から取ること（模擬の側で型を書き直さない）。
-- `fetch` の差し替えが、banto の部品の内部の通信（あれば）を取りこぼす。実装の PR で、デモのビルドのネットワークの記録に `/api` への本物の送信が 0 件であることを確かめる。
+- `fetch` の差し替えが、banto の部品の内部の通信（あれば）を取りこぼす。§3.1 で「模擬に無いものは本物へ流さない」を制約にし、§3.5 の送信 0 件の試験で確かめる。
 
 ## 6. 進め方（PR の分け方）
 
 1. この設計書（本 PR）。
-2. 土台: 共通パッケージ（振り分け・値の生成と単体の試験）、両アプリのデモ用の起動とログイン無し、ベースパスの切り替え、`deploy-demo.yml` と入口のページ。画面は開くが中身は空でよい。
+2. 土台: 共通パッケージ（振り分け・値の生成と単体の試験）、両アプリのデモ用の起動とログイン無し、ベースパスの切り替え、対象のルートごとの静的な入口と `404.html`、`deploy-demo.yml` と入口のページ、§3.6 の普段の CI のジョブ。画面は開くが中身は空でよい。**受け入れの条件**: 組み立てた成果物を静的に配って、対象の 3 つの URL を直に開き・読み直して画面が出ること。起動の間の本物の API への送信が 0 件であること。模擬の初期化を失敗させたら、通常の provider が起動しないこと。
 3. Hub の `/tags`: 登録・編集・削除と WebSocket の値。
 4. ChronoGazer: 今の demo を置き換え、`/tags` の登録。
 5. ChronoGazer の `/monitor`: 現在値のポーリングと履歴（トレンド）。
