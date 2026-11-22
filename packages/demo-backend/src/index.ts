@@ -69,3 +69,14 @@ export {
 	effectivePeriodMs,
 	type DemoTagValueInput
 } from './tagValues';
+export {
+	DEMO_HISTORY_MAX_BINS,
+	DEMO_HISTORY_MAX_POINTS,
+	DEMO_HISTORY_MAX_TAGS,
+	DEMO_HISTORY_MAX_WINDOW_MS,
+	demoTagHistory,
+	validateDemoHistoryRequest,
+	type DemoHistoryFieldError,
+	type DemoHistoryPoint,
+	type DemoHistoryTag
+} from './tagHistory';

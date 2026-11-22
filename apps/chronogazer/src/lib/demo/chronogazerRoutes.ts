@@ -7,22 +7,30 @@
  * どの口が要るかは、デモのビルドで `/tags` を開き、模擬の「口がありません」の警告から
  * 拾った（2026-11-22・2026-11-23）。応答の型は各 `*Admin.ts` から取る（模擬の側で書き直さない）。
  * `/api/tags/from-hub`・`/api/hub*`・表示グループの編集は、今のデモの対象外で 501
- * （押して初めて呼ばれる）。履歴は `/monitor` を開くだけで呼ばれるので空で返す（本当の模擬は次の PR）。現在値（`/api/collect/values`）は
+ * （押して初めて呼ばれる）。履歴（`/api/collect/history`）と現在値（`/api/collect/values`）は
  * `/monitor` を開いたときの起動で呼ばれるので模擬する。
  */
 import {
 	demoSampleTime,
+	demoTagHistory,
 	demoTagValue,
 	json,
 	noContent,
 	type DemoHttpRoute,
-	type DemoRequest
+	type DemoRequest,
+	validateDemoHistoryRequest
 } from '@banto-industrial/demo-backend';
-import type { CollectHistory, Readout, ValuesResponse } from '#lib/banto/collectAdmin.js';
+import type {
+	CollectHistory,
+	HistorySeries,
+	Readout,
+	ValuesResponse
+} from '#lib/banto/collectAdmin.js';
 import type {
 	CollectionGroupInput,
 	ExclusionView,
 	PlcConnectionInput,
+	Tag,
 	TagInput
 } from '#lib/banto/tagRegistryAdmin.js';
 import type { TagThresholdsInput } from '#lib/banto/tagThresholdsAdmin.js';
@@ -53,6 +61,14 @@ function guarded(handle: (req: DemoRequest) => Response | Promise<Response>) {
 	};
 }
 
+/** 収集の対象か（タグ・収集グループ・PLC 接続の全部が有効）。 */
+function isCollected(registry: ChronoGazerRegistry, tag: Tag): boolean {
+	if (!tag.enabled) return false;
+	const group = registry.group(tag.collectionGroupId);
+	if (!group?.enabled) return false;
+	return !!registry.connections.find((c) => c.id === group.plcConnectionId)?.enabled;
+}
+
 /**
  * `GET /api/collect/values` の模擬: 収集の対象になるタグの現在値（タグ ID と時刻だけで決まる純関数）。
  * 本物は、タグ自身・収集グループ・PLC 接続のどれかが無効なら収集の構成に入れない
@@ -61,10 +77,8 @@ function guarded(handle: (req: DemoRequest) => Response | Promise<Response>) {
 function valuesOf(registry: ChronoGazerRegistry, nowMs: number): ValuesResponse {
 	const data: Extract<ValuesResponse, { state: 'ready' }>['data'] = {};
 	for (const tag of registry.tags) {
-		if (!tag.enabled) continue;
+		if (!isCollected(registry, tag)) continue;
 		const group = registry.group(tag.collectionGroupId);
-		if (!group?.enabled) continue;
-		if (!registry.connections.find((c) => c.id === group.plcConnectionId)?.enabled) continue;
 		const sampleMs = demoSampleTime(nowMs, group?.periodMs);
 		data[`tag:${tag.id}`] = {
 			value: demoTagValue({ id: tag.id, dataType: tag.dataType, periodMs: group?.periodMs }, nowMs),
@@ -76,27 +90,58 @@ function valuesOf(registry: ChronoGazerRegistry, nowMs: number): ValuesResponse 
 	return { state: 'ready', data, serverNowMs: nowMs };
 }
 
-/**
- * 系列の無い履歴。`tagIds` のうちレジストリに居ないタグだけを `unknownTagIds` に並べる（本物と同じ意味。
- * 重複は除く）。居るタグは系列が無いだけで、無いタグとは扱わない。
- */
-function emptyHistory(
-	registry: ChronoGazerRegistry,
-	query: URLSearchParams
-): Readout<CollectHistory> {
+/** 要求のタグ ID（重複は除く。数でないものは落とす）。 */
+function requestedTagIds(query: URLSearchParams): number[] {
 	const ids = (query.get('tagIds') ?? '')
 		.split(',')
-		.map((s) => Number(s))
-		.filter((n) => Number.isInteger(n) && !registry.tag(n));
-	return {
-		state: 'ready',
-		data: {
-			fromMs: Number(query.get('fromMs') ?? 0),
-			toMs: Number(query.get('toMs') ?? 0),
-			series: [],
-			unknownTagIds: [...new Set(ids)]
+		.filter((s) => s.trim() !== '')
+		.map((s) => Number(s));
+	return [...new Set(ids)];
+}
+
+/**
+ * `GET /api/collect/history` の模擬（本物は `core/src/collect/history.rs`）。検証は本物と同じ 422、
+ * 居ないタグは `unknownTagIds`（本物は「レジストリに居ない」だけ。無効なタグは系列に出て、欠測の点になる）。
+ * 値はタグ ID と時刻だけで決まる純関数（`packages/demo-backend/src/tagHistory.ts`）。
+ */
+function historyOf(
+	registry: ChronoGazerRegistry,
+	query: URLSearchParams,
+	nowMs: number
+): Readout<CollectHistory> {
+	const ids = requestedTagIds(query);
+	const fromMs = Number(query.get('fromMs'));
+	const toMs = Number(query.get('toMs'));
+	const bins = Number(query.get('bins'));
+	const errors = validateDemoHistoryRequest(ids, fromMs, toMs, bins);
+	if (errors.length > 0) throw new DemoValidationError(errors);
+
+	const series: HistorySeries[] = [];
+	const unknownTagIds: number[] = [];
+	for (const id of ids) {
+		const tag = registry.tag(id);
+		if (!tag) {
+			unknownTagIds.push(id);
+			continue;
 		}
-	};
+		const group = registry.group(tag.collectionGroupId);
+		const { binMs, points } = demoTagHistory(
+			{
+				id: tag.id,
+				dataType: tag.dataType,
+				decimals: tag.decimals,
+				periodMs: group?.periodMs,
+				collected: isCollected(registry, tag)
+			},
+			fromMs,
+			toMs,
+			bins,
+			nowMs
+		);
+		// `simulation` は常に false（本物はシミュレーション接続の値を記録せず null にするが、デモは模擬の値を出す）。
+		series.push({ tagId: id, simulation: false, binMs, points });
+	}
+	return { state: 'ready', data: { fromMs, toMs, series, unknownTagIds } };
 }
 
 function idOf(req: DemoRequest): number {
@@ -117,16 +162,15 @@ export function createChronoGazerRoutes(
 			path: '/api/collect/values',
 			handle: () => json(valuesOf(registry, Date.now()))
 		},
-		// 履歴の本当の模擬は次の PR。`/monitor` が最初のグループで読むので、系列の無い空の履歴を返す
-		// （本物の `core/src/rest.rs` の collect_history の試験と同じ形。要求の期間はそのまま返す）。
+		// `/monitor` が最初のグループで読む。
 		{
 			method: 'GET',
 			path: '/api/collect/history',
-			handle: (req) => {
+			handle: guarded((req) => {
 				// E2E が「模擬の履歴の応答を実際に返した」ことを待つ印（デモのビルドにだけある模擬のコード）。
 				console.debug('demo: 履歴を返しました');
-				return json(emptyHistory(registry, req.url.searchParams));
-			}
+				return json(historyOf(registry, req.url.searchParams, Date.now()));
+			})
 		},
 
 		// --- 接続 ---

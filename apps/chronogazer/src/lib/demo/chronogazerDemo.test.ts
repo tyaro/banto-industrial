@@ -214,18 +214,60 @@ describe('createChronoGazerRoutes（口）', () => {
 		expect(await keys()).toHaveLength(base);
 	});
 
-	it('GET /api/collect/history は系列の無い空の履歴を返し、居ないタグだけを unknownTagIds に並べる', async () => {
+	it('GET /api/collect/history は系列を返し、居ないタグだけを unknownTagIds に並べる', async () => {
 		const routes = createChronoGazerRoutes();
+		const now = Date.now();
 		const res = await call(
 			routes,
 			'GET',
-			'/api/collect/history?tagIds=1%2C1%2C9999%2C9999&fromMs=1000&toMs=61000&bins=60'
+			`/api/collect/history?tagIds=1%2C1%2C9999%2C9999&fromMs=${now - 60_000}&toMs=${now}&bins=60`
 		);
 		expect(res.status).toBe(200);
-		expect(await res.json()).toEqual({
-			state: 'ready',
-			data: { fromMs: 1000, toMs: 61000, series: [], unknownTagIds: [9999] }
-		});
+		const body = await res.json();
+		expect(body.state).toBe('ready');
+		expect(body.data.unknownTagIds).toEqual([9999]);
+		expect(body.data.series).toHaveLength(1);
+		const s = body.data.series[0];
+		expect(s.tagId).toBe(1);
+		expect(s.points.length).toBeGreaterThan(0);
+		expect(s.points.length).toBeLessThanOrEqual(60);
+		for (const p of s.points) expect(p.min).toBeLessThanOrEqual(p.max);
+	});
+
+	it('GET /api/collect/history の検証の誤りは 422 validation（本物と同じ上限）', async () => {
+		const routes = createChronoGazerRoutes();
+		const now = Date.now();
+		const fields = async (qs: string) => {
+			const res = await call(routes, 'GET', `/api/collect/history?${qs}`);
+			expect(res.status).toBe(422);
+			const body = await res.json();
+			expect(body.kind).toBe('validation');
+			return body.field_errors.map((e: { field: string }) => e.field);
+		};
+		expect(await fields(`tagIds=&fromMs=${now - 1000}&toMs=${now}&bins=10`)).toEqual(['tagIds']);
+		expect(await fields(`tagIds=1&fromMs=${now}&toMs=${now - 1000}&bins=10`)).toEqual(['toMs']);
+		expect(await fields(`tagIds=1&fromMs=0&toMs=${32 * 86_400_000}&bins=10`)).toEqual(['toMs']);
+		expect(await fields(`tagIds=1&fromMs=${now - 1000}&toMs=${now}&bins=0`)).toEqual(['bins']);
+		expect(await fields(`tagIds=1&fromMs=${now - 1000}&toMs=${now}&bins=2001`)).toEqual(['bins']);
+		const many = Array.from({ length: 17 }, (_, i) => i + 1).join(',');
+		expect(await fields(`tagIds=${many}&fromMs=${now - 1000}&toMs=${now}&bins=10`)).toEqual([
+			'tagIds'
+		]);
+	});
+
+	it('GET /api/collect/history: 無効なタグは系列に出て、点は欠測（null）', async () => {
+		const routes = createChronoGazerRoutes();
+		const tag = (await (await call(routes, 'GET', '/api/tags')).json())[0];
+		await call(routes, 'PUT', `/api/tags/${tag.id}`, { ...tag, enabled: false });
+		const now = Date.now();
+		const res = await call(
+			routes,
+			'GET',
+			`/api/collect/history?tagIds=${tag.id}&fromMs=${now - 10_000}&toMs=${now}&bins=5`
+		);
+		const body = await res.json();
+		expect(body.data.unknownTagIds).toEqual([]);
+		expect(body.data.series[0].points.every((p: { min: null }) => p.min === null)).toBe(true);
 	});
 
 	it('DELETE /api/tags/:id は使用中のタグを 422 displayGroups で断る', async () => {
