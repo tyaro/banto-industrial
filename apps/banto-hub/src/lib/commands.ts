@@ -6,7 +6,7 @@
 import { goto } from '$app/navigation';
 import type { PaletteCommand } from '@banto/admin-core';
 import { hubLogout } from './banto/hubLogout';
-import { navItemHref, navItems, resolveAppPath } from './navigation';
+import { DEMO_NAV_PATHS, IS_DEMO_BUILD, navItemHref, navItems, resolveAppPath } from './navigation';
 import { sharedTreeTarget } from './treeSelection.svelte';
 import { settings } from './settings.svelte';
 import { sessionStore } from './session.svelte';
@@ -15,7 +15,11 @@ import { toastStore } from './toast.svelte';
 import { exportConfigPackageToDownload } from './banto/configPackageAdmin';
 
 function navigationCommands(): PaletteCommand[] {
-	return navItems.map((item) => ({
+	// デモのビルドは対象画面だけ（`DEMO_NAV_PATHS`、メニューと同じ）。
+	const items = IS_DEMO_BUILD
+		? navItems.filter((item) => DEMO_NAV_PATHS.includes(item.path))
+		: navItems;
+	return items.map((item) => ({
 		id: `nav.${item.path}`,
 		title: item.label,
 		group: 'ナビゲーション',
@@ -76,7 +80,8 @@ function sessionCommands(): PaletteCommand[] {
 			title: 'ログアウト',
 			group: 'セッション',
 			keywords: ['logout', 'sign out'],
-			visible: () => !sessionStore.authDisabled,
+			// デモのビルドにログアウトは無い（ヘッダーの「デモを最初から」へ置き換える）。
+			visible: () => !IS_DEMO_BUILD && !sessionStore.authDisabled,
 			run: async () => {
 				// banto v2.0.0 (#260): same as Header.svelte's logout.
 				await hubLogout(() => goto(resolveAppPath('/login')));
@@ -102,7 +107,8 @@ function configCommands(): PaletteCommand[] {
 			title: '構成パッケージをダウンロード',
 			group: CONFIG_GROUP,
 			keywords: ['export', 'エクスポート', 'バックアップ', 'ダウンロード'],
-			visible: () => isAdmin(sessionStore.role),
+			// デモのビルドは設定画面（対象外）へ行く口を出さない。
+			visible: () => !IS_DEMO_BUILD && isAdmin(sessionStore.role),
 			run: async () => {
 				try {
 					await exportConfigPackageToDownload();
@@ -118,7 +124,7 @@ function configCommands(): PaletteCommand[] {
 			title: '構成パッケージを取り込む…',
 			group: CONFIG_GROUP,
 			keywords: ['import', 'インポート', '復元', '読み込み', 'リストア'],
-			visible: () => isAdmin(sessionStore.role),
+			visible: () => !IS_DEMO_BUILD && isAdmin(sessionStore.role),
 			run: () => {
 				// #359 段階2: 構成パッケージのセクションは data カテゴリへ移設。
 				void goto(`${resolveAppPath('/settings/data')}#config-package`);

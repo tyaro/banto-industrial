@@ -312,6 +312,66 @@ const TABLE = [
 		{ ...NONE, run_frontend_chronogazer: true, run_e2e_chronogazer: true, run_e2e_demo_pages: true }
 	],
 	[
+		'公開の関門に効く: Hub の lib/navigation.ts',
+		['apps/banto-hub/src/lib/navigation.ts'],
+		{ ...NONE, run_frontend_hub: true, run_e2e_hub: true, run_e2e_demo_pages: true }
+	],
+	[
+		'公開の関門に効く: ChronoGazer の lib/navigation.ts',
+		['apps/chronogazer/src/lib/navigation.ts'],
+		{ ...NONE, run_frontend_chronogazer: true, run_e2e_chronogazer: true, run_e2e_demo_pages: true }
+	],
+	[
+		'公開の関門に効く: Hub の routes/(app)/+layout.ts',
+		['apps/banto-hub/src/routes/(app)/+layout.ts'],
+		{ ...NONE, run_frontend_hub: true, run_e2e_hub: true, run_e2e_demo_pages: true }
+	],
+	[
+		'公開の関門に効く: ChronoGazer の routes/(app)/+layout.ts',
+		['apps/chronogazer/src/routes/(app)/+layout.ts'],
+		{ ...NONE, run_frontend_chronogazer: true, run_e2e_chronogazer: true, run_e2e_demo_pages: true }
+	],
+	[
+		'公開の関門に効く: Hub の lib/navLayout.ts',
+		['apps/banto-hub/src/lib/navLayout.ts'],
+		{ ...NONE, run_frontend_hub: true, run_e2e_hub: true, run_e2e_demo_pages: true }
+	],
+	[
+		'公開の関門に効く: ChronoGazer の lib/navLayout.ts',
+		['apps/chronogazer/src/lib/navLayout.ts'],
+		{ ...NONE, run_frontend_chronogazer: true, run_e2e_chronogazer: true, run_e2e_demo_pages: true }
+	],
+	[
+		'公開の関門に効く: Hub の lib/commands.ts',
+		['apps/banto-hub/src/lib/commands.ts'],
+		{ ...NONE, run_frontend_hub: true, run_e2e_hub: true, run_e2e_demo_pages: true }
+	],
+	[
+		'公開の関門に効く: ChronoGazer の lib/components/Header.svelte',
+		['apps/chronogazer/src/lib/components/Header.svelte'],
+		{ ...NONE, run_frontend_chronogazer: true, run_e2e_chronogazer: true, run_e2e_demo_pages: true }
+	],
+	[
+		'公開の関門に効く: Hub の lib/components/DemoOutOfScope.svelte',
+		['apps/banto-hub/src/lib/components/DemoOutOfScope.svelte'],
+		{ ...NONE, run_frontend_hub: true, run_e2e_hub: true, run_e2e_demo_pages: true }
+	],
+	[
+		'公開の関門に効く: Hub の routes/(app)/+layout.svelte',
+		['apps/banto-hub/src/routes/(app)/+layout.svelte'],
+		{ ...NONE, run_frontend_hub: true, run_e2e_hub: true, run_e2e_demo_pages: true }
+	],
+	[
+		'公開の関門に効く: ChronoGazer の routes/(app)/+layout.svelte',
+		['apps/chronogazer/src/routes/(app)/+layout.svelte'],
+		{ ...NONE, run_frontend_chronogazer: true, run_e2e_chronogazer: true, run_e2e_demo_pages: true }
+	],
+	[
+		'公開の関門に効く: Hub の routes/+page.ts',
+		['apps/banto-hub/src/routes/+page.ts'],
+		{ ...NONE, run_frontend_hub: true, run_e2e_hub: true, run_e2e_demo_pages: true }
+	],
+	[
 		'画面だけの変更はデモの E2E を走らせない',
 		['apps/banto-hub/src/routes/(app)/tags/+page.svelte'],
 		{ ...NONE, run_frontend_hub: true, run_e2e_hub: true }

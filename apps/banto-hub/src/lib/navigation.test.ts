@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+	DEMO_NAV_PATHS,
+	isDemoTargetPath,
 	ADMIN_GROUP_KEY,
 	isNavItemActive,
 	navBarEntries,
@@ -96,5 +98,30 @@ describe('navItemHref（#1179 PR3b）', () => {
 
 	it('ほかのページへは付けない', () => {
 		expect(navItemHref('/status', group)).toBe('/status');
+	});
+});
+
+describe('デモのビルド（docs/demo-pages-design.md §3.4）', () => {
+	it('visibleNavItems は役割によらず対象画面だけを見せる', () => {
+		expect(paths(visibleNavItems({ role: 'admin' }, true))).toEqual(['/tags']);
+		expect(paths(visibleNavItems({ role: 'viewer' }, true))).toEqual(['/tags']);
+	});
+
+	it('製品のビルド（demo=false）の見え方は変えない', () => {
+		expect(paths(visibleNavItems({ role: 'admin' }, false))).toEqual(paths(navItems));
+	});
+
+	it('DEMO_NAV_PATHS は navItems の項目だけ', () => {
+		for (const path of DEMO_NAV_PATHS) expect(paths(navItems)).toContain(path);
+	});
+
+	it('isDemoTargetPath は対象画面（末尾の / と配下を含む）だけ true', () => {
+		const target = DEMO_NAV_PATHS[0];
+		expect(isDemoTargetPath(target)).toBe(true);
+		expect(isDemoTargetPath(`${target}/`)).toBe(true);
+		expect(isDemoTargetPath(`${target}/x`)).toBe(true);
+		expect(isDemoTargetPath(`${target}s`)).toBe(false);
+		expect(isDemoTargetPath('/users')).toBe(false);
+		expect(isDemoTargetPath('/settings/appearance')).toBe(false);
 	});
 });

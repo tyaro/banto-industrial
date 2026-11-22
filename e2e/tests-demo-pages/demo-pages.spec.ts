@@ -11,7 +11,8 @@
  *    「デモを始められませんでした」で止まり、通常の provider が動かないこと（模擬を入れる
  *    前に失敗させるので、provider が動けば本物の `/api` への要求が見える）。
  */
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test } from '@playwright/test';
+import { BANNER, recordTraffic, SITE } from './helpers';
 
 /** 本物の storage に置いておく、ほかのデモ・製品が残した値（画面が拾ってはならない）。 */
 const FOREIGN_KEYS = {
@@ -21,44 +22,11 @@ const FOREIGN_KEYS = {
 	'banto.navLayout': 'top'
 };
 
-const SITE = '/banto-industrial';
-const BANNER = 'デモ版 — 機器にはつながりません。読み直すと元に戻ります';
-
 const TARGETS = [
 	{ name: 'Hub /tags', path: `${SITE}/hub/tags`, heading: 'タグ登録' },
 	{ name: 'ChronoGazer /tags', path: `${SITE}/chronogazer/tags`, heading: '記録' },
 	{ name: 'ChronoGazer /monitor', path: `${SITE}/chronogazer/monitor`, heading: '監視' }
 ] as const;
-
-/** ページの全部の要求と WebSocket を記録する。 */
-function recordTraffic(page: Page, origin: string) {
-	const requests: string[] = [];
-	const sockets: string[] = [];
-	const documents: string[] = [];
-	page.on('request', (request) => {
-		requests.push(request.url());
-		if (request.resourceType() === 'document') documents.push(request.url());
-	});
-	page.on('websocket', (ws) => sockets.push(ws.url()));
-	const unsupported: string[] = [];
-	page.on('console', (message) => {
-		if (message.text().startsWith('demo: 模擬に口がありません')) unsupported.push(message.text());
-	});
-	return {
-		documents,
-		/** 模擬に口が無く 501 を返した `/api`（`src/lib/demo/` の警告）。 */
-		unsupported,
-		/** 本物の `/api`・ほかのオリジン・WebSocket（あってはならないもの）。 */
-		forbidden(): string[] {
-			const bad = requests.filter((raw) => {
-				const url = new URL(raw);
-				if (url.protocol === 'data:' || url.protocol === 'blob:') return false;
-				return url.origin !== origin || url.pathname === '/api' || url.pathname.includes('/api/');
-			});
-			return [...bad, ...sockets.map((s) => `WebSocket ${s}`)];
-		}
-	};
-}
 
 for (const target of TARGETS) {
 	test(`${target.name}: 直に開く・読み直すと画面が出て、本物の API へは送らない`, async ({

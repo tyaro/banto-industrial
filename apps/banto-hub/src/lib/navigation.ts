@@ -104,6 +104,26 @@ export const ADMIN_GROUP_KEY: NavGroupKey = 'admin';
 /** グループの表示名（メニューバーのドロップダウンのボタン）。 */
 export const NAV_GROUP_LABELS: Record<NavGroupKey, string> = { [ADMIN_GROUP_KEY]: '管理' };
 
+/**
+ * デモ（GitHub Pages、docs/demo-pages-design.md §3.4・2026-11-23 決定）の対象画面。
+ * デモのビルド（`VITE_BANTO_DEMO=1`）ではメニューに**この画面だけ**を出し、対象外の画面へ
+ * アプリの中から着いた場合は `DemoOutOfScope.svelte` の案内を出す（直に開く・読み直すは
+ * 静的な配信の 404）。ビルドの時点で定数なので、製品のビルドでは分岐ごと消える。
+ */
+export const DEMO_NAV_PATHS: readonly AppPath[] = ['/tags'];
+
+/** このビルドがデモか（ビルド時の定数）。純粋関数には引数で渡す（試験で切り替えられる）。 */
+export const IS_DEMO_BUILD: boolean = import.meta.env.VITE_BANTO_DEMO === '1';
+
+/** `pathname`（base 付きの URL の path）がデモの対象画面か。末尾の `/` は区別しない。 */
+export function isDemoTargetPath(pathname: string): boolean {
+	const trimmed = pathname.length > 1 ? pathname.replace(/\/+$/, '') : pathname;
+	return DEMO_NAV_PATHS.some((path) => {
+		const match = resolveAppPath(path);
+		return trimmed === match || trimmed.startsWith(match + '/');
+	});
+}
+
 export const navItems: NavItem[] = [
 	{ path: '/status', label: '状態', icon: '📡' },
 	{ path: '/tags', label: 'タグ', icon: '🏷️' },
@@ -125,8 +145,11 @@ export const navItems: NavItem[] = [
  * セッションに見せるナビ項目（navItems の順のまま）。管理限定の項目は無効化せず
  * 隠す（RBAC、画面側のガードと同じ。`Sidebar.svelte` と同じ規則）。純粋関数。
  */
-export function visibleNavItems(session: { role: Role }): NavItem[] {
-	return navItems.filter((item) => !item.adminOnly || isAdmin(session.role));
+export function visibleNavItems(session: { role: Role }, demo: boolean = IS_DEMO_BUILD): NavItem[] {
+	return navItems.filter(
+		(item) =>
+			(!item.adminOnly || isAdmin(session.role)) && (!demo || DEMO_NAV_PATHS.includes(item.path))
+	);
 }
 
 /** グループ化したバーの 1 スロット: 単独の項目、または最初のメンバーの位置に集めたグループ。 */
