@@ -62,6 +62,8 @@ import {
 	listTagsPaged,
 	listTagGroupCounts,
 	parseTagAddresses,
+	getTagPresence,
+	TAG_PRESENCE_TIMEOUT_MS,
 	isQueuedWhileRunningError,
 	QueuedWhileRunningError,
 	type PlcConnection,
@@ -137,6 +139,35 @@ const queuedBody = {
 
 afterEach(() => {
 	vi.unstubAllGlobals();
+});
+
+describe('getTagPresence の期限（#1282 P2）', () => {
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it('返らない照会は期限（5 秒）で中断され、reject（不明）になる', async () => {
+		vi.useFakeTimers();
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(
+				(_path: string, init?: RequestInit) =>
+					new Promise((_resolve, reject) => {
+						init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted')));
+					})
+			)
+		);
+		let outcome: 'pending' | 'rejected' | 'resolved' = 'pending';
+		const promise = getTagPresence(7).then(
+			() => (outcome = 'resolved'),
+			() => (outcome = 'rejected')
+		);
+		await vi.advanceTimersByTimeAsync(TAG_PRESENCE_TIMEOUT_MS - 1);
+		expect(outcome).toBe('pending');
+		await vi.advanceTimersByTimeAsync(1);
+		await promise;
+		expect(outcome).toBe('rejected');
+	});
 });
 
 describe('httpRequest の 202 (queued while running) 処理', () => {

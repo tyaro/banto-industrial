@@ -560,6 +560,8 @@ interface HttpInit {
 	 * 通常の `ErrorBody`/`other` フォールバックに委ねる。
 	 */
 	mapErrorBody?: (body: unknown, status: number) => Error | undefined;
+	/** 中断の口。中断で `fetch` が投げたら、通信の失敗（`NETWORK_ERROR_MESSAGE`）と同じ扱い。 */
+	signal?: AbortSignal;
 }
 
 async function httpRequest<T>(path: string, init: HttpInit): Promise<T> {
@@ -593,7 +595,8 @@ async function httpRequest<T>(path: string, init: HttpInit): Promise<T> {
 		response = await fetch(path, {
 			method: init.method,
 			headers,
-			body: hasBody ? JSON.stringify(init.body) : undefined
+			body: hasBody ? JSON.stringify(init.body) : undefined,
+			...(init.signal ? { signal: init.signal } : {})
 		});
 	} catch {
 		throw new ProviderError({ kind: 'other', message: NETWORK_ERROR_MESSAGE });
@@ -950,6 +953,9 @@ export async function updateTag(id: number, input: TagInput): Promise<Tag> {
 	});
 }
 
+/** {@link getTagPresence} の 1 件ごとの期限（ミリ秒）。 */
+export const TAG_PRESENCE_TIMEOUT_MS = 5000;
+
 /** {@link getTagPresence} が 404（`not_found`）を受けた印。 */
 class TagGoneError extends Error {}
 
@@ -957,11 +963,18 @@ class TagGoneError extends Error {}
  * #1254（PR #1282 の 4 回目のレビュー P2）: タグがまだあるかを `GET /api/tags/{id}` で確かめる。
  * タグ ID は再利用されない（AUTOINCREMENT）ので、404（`not_found`）なら消えたと確定してよい
  * （`'gone'`）。200 は `'exists'`。それ以外の失敗（通信・権限・5xx）は reject（不明）。
+ *
+ * 期限（{@link TAG_PRESENCE_TIMEOUT_MS}）を付けて呼ぶ。返らない照会 1 件で、見張りの一覧の保存の
+ * 周回（`watchListStore.verify`）が止まり、外す・すべて外すも保存されなくなるため。期限切れは
+ * 通信の失敗と同じく reject（不明）になり、その項目は確かめられないまま残って周回は進む。
  */
 export async function getTagPresence(id: number): Promise<'exists' | 'gone'> {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), TAG_PRESENCE_TIMEOUT_MS);
 	try {
 		await httpRequest<Tag>(`/api/tags/${id}`, {
 			method: 'GET',
+			signal: controller.signal,
 			mapErrorBody: (body, status) => {
 				const kind = (body as { kind?: unknown } | null)?.kind;
 				return status === 404 && kind === 'not_found' ? new TagGoneError() : undefined;
@@ -971,6 +984,8 @@ export async function getTagPresence(id: number): Promise<'exists' | 'gone'> {
 	} catch (error) {
 		if (error instanceof TagGoneError) return 'gone';
 		throw error;
+	} finally {
+		clearTimeout(timer);
 	}
 }
 

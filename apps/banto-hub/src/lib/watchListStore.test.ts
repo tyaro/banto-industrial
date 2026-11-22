@@ -360,6 +360,24 @@ describe('createWatchListStore', () => {
 		expect(server.set).not.toHaveBeenCalled();
 	});
 
+	it('6h: 照会が期限で reject しても（不明）周回は進み、「すべて外す」が保存される（#1282 P2）', async () => {
+		const server = fakeProvider(serializeWatchList([7, 8]));
+		const timedOut = vi.fn(async (_ids: readonly number[]) => {
+			throw new Error('presence check timed out');
+		});
+		const { store } = setup(server, { checkTagIds: timedOut });
+		await store.load();
+		store.setKnownLiveIds([]);
+		await settle();
+		expect(timedOut).toHaveBeenCalled();
+		expect(store.list).toEqual([7, 8]);
+		store.apply({ kind: 'clear' });
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([]));
+		expect(store.list).toEqual([]);
+		store.dispose();
+	});
+
 	it('6g: 「すべて外す」は、確かめられない項目だけのときも保存を空にする', async () => {
 		const server = fakeProvider(serializeWatchList([7, 8]));
 		const checker = fakeChecker([], [7, 8]);
