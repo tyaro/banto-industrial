@@ -437,6 +437,27 @@ jobs:
     if: needs.changes.outputs.run_wasm == 'true'
     runs-on: windows-latest
     timeout-minutes: 45
+    env:
+      # rust-wasm のゲストのビルドとキャッシュキーの元。ピン・toolchain・wasm-tools・cargo の
+      # 引数は、ここだけに書く（キーは WASM_GUEST_PIN_* を名前で全部拾ってハッシュする）。
+      # ピンを足したら、キー計算の「13 本」の検査の数も合わせる。
+      WASM_GUEST_REPO: https://github.com/tyaro/banto-driver-wasm.git
+      WASM_GUEST_TOOLCHAIN: '1.98.1'
+      WASM_TOOLS_VERSION: '1.262.0'
+      WASM_GUEST_CARGO_ARGS: '--target wasm32-unknown-unknown --locked'
+      WASM_GUEST_PIN_WIT_MAIN: '3b7f0f6120af689fdd7a807cff7837657242c6b2'
+      WASM_GUEST_PIN_MODBUS_BASE: '5233d55a4d1c278c473e9c44df608c1423c1a629'
+      WASM_GUEST_PIN_SLMP_READ: '3df89fdb0ed16b08897076495ab7cb29ac2c1b77'
+      WASM_GUEST_PIN_SLMP_WRITE: 'fdb161520019b81a22bc2fec2bc9bf3d837f5bd3'
+      WASM_GUEST_PIN_SLMP_RANGE_WRITE: 'c95e7f84e0a3b275298901882a9f6b2512c4f41a'
+      WASM_GUEST_PIN_Q_TEST_WRITE: '33171bbb990859c5a46df44cfafc233e58ba5317'
+      WASM_GUEST_PIN_SLMP_NORMAL_WRITE: 'ce6513a127d956ca00508f8d47480567c73e4a49'
+      WASM_GUEST_PIN_SLMP_COMMON_DW: '532e0ba1f0b91a67422e33dac72e9edbb7c3fe0e'
+      WASM_GUEST_PIN_SLMP_DIAGNOSTIC: 'f20766041ed75de1f6102c01dc94151d48785d5e'
+      WASM_GUEST_PIN_SLMP_NEW: '5281578d79fb2055a7af86c96691d15bf95dab65'
+      WASM_GUEST_PIN_MODBUS_NUMERIC: '9ffa939ffc3551325551b28e4993ec62b8ddc34d'
+      WASM_GUEST_PIN_FC4_W: '290648da33895a707abcaaafeb23bd0f05d5b828'
+      WASM_GUEST_PIN_MODBUS_JOIN: 'f6c8781bab6f85a6c866e4d552039b547c4390ac'
     steps:
       - uses: actions/checkout@v7
       - uses: taiki-e/install-action@v2
@@ -456,51 +477,107 @@ jobs:
           foreach ($f in @('target/nextest/binaries-metadata.json', 'target/nextest/cargo-metadata.json')) {
             if (-not (Test-Path $f)) { throw "nextest archive metadata missing: $f" }
           }
-      - name: Install wasm-tools 1.262.0 (verified binary)
+      - name: Install wasm-tools (verified binary)
         uses: taiki-e/install-action@v2
         with:
-          tool: wasm-tools@1.262.0
+          tool: wasm-tools@${{ env.WASM_TOOLS_VERSION }}
           checksum: true
           fallback: none
-      # Canonical guest source is a public, separate repository. This test is
-      # ignored in the normal nextest archive because that archive has no guest
-      # artifact; run it explicitly here after building the pinned component.
-      - name: test (WASM Hub components)
+      # ゲストの成果物（component 化した後の .wasm）のキャッシュ。
+      # キーは「成果物を決めるもの」を全部ハッシュする: ゲストのリポジトリ URL・13 本のピン
+      # （job env の WASM_GUEST_PIN_* を名前で全部拾う。足し忘れは 13 本の数の検査で落ちる）・
+      # ゲストの toolchain・wasm-tools の版・cargo の引数・fixture（device-address）の中身と
+      # それが読む WIT・OS とアーキテクチャ。ビルドの手順の形（debug、どの crate をどの名前で
+      # component 化するか）を変えたら、下の接頭辞 `wasm-guests-v1-` を上げる。
+      # ピンの SHA・WIT の突き合わせ・manifest の突き合わせ・`wasm-tools validate` と
+      # `component targets` は、キャッシュに当たっても毎回走らせる（ホストの WIT は PR で
+      # 変わるのでキーに頼らない）。キャッシュが省くのは rustup の導入・cargo build・
+      # `wasm-tools component new` だけ。
+      - name: Compute WASM guest cache key
+        id: guest-key
         shell: pwsh
+        env:
+          FIXTURE_HASH: ${{ hashFiles('crates/banto-driver-wasm/tests/fixtures/device-address/**', 'crates/banto-driver-wasm/wit/**', '.cargo/config.toml') }}
         run: |
           $ErrorActionPreference = 'Stop'
-          # テストは rust-test-build の nextest archive（前のステップで展開済み）から
-          # 走らせる。ここではホスト側をビルドしない。--no-tests=fail で一致 0 件を
-          # 失敗にし、nextest の Summary 行の「N tests run: N passed」で件数を確かめる
-          # （旧 `test result: ok. N passed` の検査と同じ強さ）。-Expected 0 は 1 件以上。
-          # -RunIgnored は既定 only（旧 `-- --ignored` と同じ）。default は旧の無指定。
-          $binariesMetadata = 'target/nextest/binaries-metadata.json'
-          $cargoMetadata = 'target/nextest/cargo-metadata.json'
-          function Invoke-ArchivedTest([string]$Label, [int]$Expected, [string]$Filter, [string]$RunIgnored = 'only', [string]$Log) {
-            if (-not $Log) { $Log = Join-Path $env:RUNNER_TEMP ('nextest-' + [guid]::NewGuid() + '.txt') }
-            Write-Host "nextest filterset: $Filter"
-            cargo-nextest nextest run --binaries-metadata $binariesMetadata --cargo-metadata $cargoMetadata --workspace-remap . --run-ignored $RunIgnored --no-tests=fail --no-fail-fast --color never -E $Filter 2>&1 | Tee-Object -FilePath $Log
-            if ($LASTEXITCODE -ne 0) { throw "$Label failed" }
-            $summary = Select-String -Path $Log -Pattern '^\s*Summary \[[^\]]*\]\s+(\d+) tests? run: (\d+) passed' | Select-Object -Last 1
-            if (-not $summary) { throw "${Label}: nextest summary not found" }
-            $run = [int]$summary.Matches[0].Groups[1].Value
-            $passed = [int]$summary.Matches[0].Groups[2].Value
-            if ($run -lt 1 -or $passed -ne $run -or ($Expected -gt 0 -and $run -ne $Expected)) {
-              throw "$Label did not run as expected (expected: $Expected, run: $run, passed: $passed)"
+          if (-not $env:FIXTURE_HASH) { throw 'fixture hash is empty' }
+          $parts = [System.Collections.Generic.List[string]]::new()
+          foreach ($name in @('WASM_GUEST_REPO', 'WASM_GUEST_TOOLCHAIN', 'WASM_TOOLS_VERSION', 'WASM_GUEST_CARGO_ARGS')) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if (-not $value) { throw "$name is empty" }
+            $parts.Add("$name=$value")
+          }
+          $pins = @(Get-ChildItem env: | Where-Object { $_.Name -like 'WASM_GUEST_PIN_*' } | Sort-Object Name)
+          if ($pins.Count -ne 13) { throw "expected 13 guest pins in the job env, found $($pins.Count)" }
+          foreach ($pin in $pins) {
+            if ($pin.Value -notmatch '^[0-9a-f]{40}$') { throw "$($pin.Name) is not a full SHA" }
+            $parts.Add("$($pin.Name)=$($pin.Value)")
+          }
+          $parts.Add("fixture=$($env:FIXTURE_HASH)")
+          $parts.Add("os=$($env:RUNNER_OS)-$($env:RUNNER_ARCH)")
+          $text = $parts -join "`n"
+          Write-Host $text
+          $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
+          $hash = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::HashData($bytes)).Replace('-', '').ToLowerInvariant()
+          $key = "wasm-guests-v1-$($env:RUNNER_OS)-$($env:RUNNER_ARCH)-$hash"
+          Write-Host "cache key: $key"
+          "key=$key" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+      - name: Restore WASM guest components
+        id: guest-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}\wasm-guests
+          key: ${{ steps.guest-key.outputs.key }}
+      # Canonical guest source is a public, separate repository. Pin 検査と
+      # ゲストのビルド・component 化・検証をここでまとめて行い、テストは次のステップで
+      # 走らせる（成果物は RUNNER_TEMP\wasm-guests、manifest は RUNNER_TEMP\wasm-guest-manifests）。
+      - name: Build and verify WASM guests
+        shell: pwsh
+        env:
+          GUESTS_CACHED: ${{ steps.guest-cache.outputs.cache-hit }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $guestsCached = $env:GUESTS_CACHED -eq 'true'
+          Write-Host "guest component cache hit: $guestsCached"
+          $out = Join-Path $env:RUNNER_TEMP 'wasm-guests'
+          $manifests = Join-Path $env:RUNNER_TEMP 'wasm-guest-manifests'
+          New-Item -ItemType Directory -Force $out, $manifests | Out-Null
+          $cargoArgs = $env:WASM_GUEST_CARGO_ARGS -split ' '
+          # キャッシュに当たったら、cargo build と `wasm-tools component new` を飛ばして
+          # 成果物があることだけ確かめる（validate と targets は呼び出し側が毎回通す）。
+          function Build-GuestComponent([string]$Label, [string]$ManifestDir, [string]$Module, [string]$Out) {
+            if ($guestsCached) {
+              if (-not (Test-Path -LiteralPath $Out -PathType Leaf) -or (Get-Item -LiteralPath $Out).Length -eq 0) {
+                throw "$Label cached component is missing or empty: $Out"
+              }
+              return
+            }
+            cargo "+$($env:WASM_GUEST_TOOLCHAIN)" build --manifest-path (Join-Path $ManifestDir 'Cargo.toml') @cargoArgs
+            if ($LASTEXITCODE -ne 0) { throw "$Label build failed" }
+            $moduleFile = Join-Path $ManifestDir "target/wasm32-unknown-unknown/debug/$Module.wasm"
+            wasm-tools component new $moduleFile -o $Out
+            if ($LASTEXITCODE -ne 0) { throw "$Label component creation failed" }
+          }
+          function Test-GuestComponent([string]$Label, [string]$File, [string]$Wit, [string[]]$Worlds) {
+            wasm-tools validate $File
+            if ($LASTEXITCODE -ne 0) { throw "$Label component validation failed" }
+            foreach ($world in $Worlds) {
+              wasm-tools component targets $Wit $File --world $world
+              if ($LASTEXITCODE -ne 0) { throw "$Label component world mismatch ($world)" }
             }
           }
           # Guest main: its wit/driver.wit is the host WIT (#902 added
           # item-error.verification-failed in guest #47).
-          $canonicalSha = '3b7f0f6120af689fdd7a807cff7837657242c6b2'
+          $canonicalSha = $env:WASM_GUEST_PIN_WIT_MAIN
           # Regression pins below predate #47. Their driver.wit (this blob)
           # lacks that one item-error case, and Wasmtime's component type
           # check needs the exact variant cases, so they are built with the
           # guest main driver.wit swapped in. That blob pair differs only in
           # the item-error line; each pin's code and other WIT files are kept.
           $legacyDriverWit = '313a79ed545a366c938c9bc2d8f86f7c3ca0141e'
-          $sha = '5233d55a4d1c278c473e9c44df608c1423c1a629'
+          $sha = $env:WASM_GUEST_PIN_MODBUS_BASE
           $guest = Join-Path $env:RUNNER_TEMP 'banto-driver-wasm'
-          git clone --quiet https://github.com/tyaro/banto-driver-wasm.git $guest
+          git clone --quiet $env:WASM_GUEST_REPO $guest
           if ($LASTEXITCODE -ne 0) { throw 'canonical guest clone failed' }
           # Compare committed blobs: Windows may check out either worktree with CRLF.
           $canonicalWit = git -C $guest rev-parse --verify "${canonicalSha}:wit/driver.wit"
@@ -530,65 +607,42 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'host manifest blob lookup failed' }
           if ($canonicalManifest -ne $hostManifest) { throw 'canonical manifest and host manifest differ' }
           # ゲストのビルドだけに使う（ホスト側は archive を走らせるのでビルドしない）。
-          rustup toolchain install 1.98.1 --profile minimal
-          if ($LASTEXITCODE -ne 0) { throw 'Rust 1.98.1 installation failed' }
-          rustup target add wasm32-unknown-unknown --toolchain 1.98.1
-          if ($LASTEXITCODE -ne 0) { throw 'wasm32 target installation failed' }
+          # キャッシュに当たったときは cargo を使わないので、導入も省く。
+          if (-not $guestsCached) {
+            rustup toolchain install $env:WASM_GUEST_TOOLCHAIN --profile minimal
+            if ($LASTEXITCODE -ne 0) { throw "Rust $($env:WASM_GUEST_TOOLCHAIN) installation failed" }
+            rustup target add wasm32-unknown-unknown --toolchain $env:WASM_GUEST_TOOLCHAIN
+            if ($LASTEXITCODE -ne 0) { throw 'wasm32 target installation failed' }
+          }
           $wasmToolsVersion = wasm-tools --version
           Write-Host "wasm-tools version: $wasmToolsVersion"
-          if ($LASTEXITCODE -ne 0 -or $wasmToolsVersion -notmatch '^wasm-tools 1\.262\.0(?: \([0-9a-f]{9} \d{4}-\d{2}-\d{2}\))?$') {
+          $wasmToolsPattern = '^wasm-tools ' + [regex]::Escape($env:WASM_TOOLS_VERSION) + '(?: \([0-9a-f]{9} \d{4}-\d{2}-\d{2}\))?$'
+          if ($LASTEXITCODE -ne 0 -or $wasmToolsVersion -notmatch $wasmToolsPattern) {
             throw 'wasm-tools version mismatch'
           }
-          cargo +1.98.1 build --manifest-path (Join-Path $guest 'component/Cargo.toml') --target wasm32-unknown-unknown --locked
-          if ($LASTEXITCODE -ne 0) { throw 'canonical guest build failed' }
-          $module = Join-Path $guest 'component/target/wasm32-unknown-unknown/debug/banto_modbus_tcp_component.wasm'
-          $env:BANTO_COMPONENT_WASM = Join-Path $env:RUNNER_TEMP 'banto-modbus-tcp-component.wasm'
-          wasm-tools component new $module -o $env:BANTO_COMPONENT_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'component creation failed' }
-          wasm-tools validate $env:BANTO_COMPONENT_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'component validation failed' }
-          wasm-tools component targets (Join-Path $guest 'wit/driver.wit') $env:BANTO_COMPONENT_WASM --world driver
-          if ($LASTEXITCODE -ne 0) { throw 'component world mismatch' }
-          $testLog = Join-Path $env:RUNNER_TEMP 'wasm-hub-test.txt'
-          Invoke-ArchivedTest -Label 'WASM Hub connection test' -Expected 1 -Filter 'binary_id(banto-hub-host::t12_connection_test) & test(=wasm_fc3_connection_test_direct_reuse_and_changed_settings)' -Log $testLog
+          $driverWit = 'crates/banto-driver-wasm/wit/driver.wit'
+          $witDir = 'crates/banto-driver-wasm/wit'
+          $modbusModule = 'banto_modbus_tcp_component'
+          $slmpModule = 'banto_slmp_read_component'
+          $modbusDir = Join-Path $guest 'component'
+          $slmpDir = Join-Path $guest 'slmp-component'
+          # Modbus base pin: canonical guest.
+          $canonicalWasm = Join-Path $out 'banto-modbus-tcp-component.wasm'
+          Build-GuestComponent 'canonical guest' $modbusDir $modbusModule $canonicalWasm
+          Test-GuestComponent 'canonical' $canonicalWasm (Join-Path $guest 'wit/driver.wit') @('driver')
           $fixture = 'crates/banto-driver-wasm/tests/fixtures/device-address'
-          cargo +1.98.1 build --manifest-path (Join-Path $fixture 'Cargo.toml') --target wasm32-unknown-unknown --locked
-          if ($LASTEXITCODE -ne 0) { throw 'device-address test guest build failed' }
-          $deviceModule = Join-Path $fixture 'target/wasm32-unknown-unknown/debug/banto_device_address_test_component.wasm'
-          $env:BANTO_DEVICE_COMPONENT_WASM = Join-Path $env:RUNNER_TEMP 'device-address-component.wasm'
-          wasm-tools component new $deviceModule -o $env:BANTO_DEVICE_COMPONENT_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'device-address component creation failed' }
-          wasm-tools validate $env:BANTO_DEVICE_COMPONENT_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'device-address component validation failed' }
-          wasm-tools component targets 'crates/banto-driver-wasm/wit/driver.wit' $env:BANTO_DEVICE_COMPONENT_WASM --world driver
-          if ($LASTEXITCODE -ne 0) { throw 'device-address component world mismatch' }
-          $startupTestLog = Join-Path $env:RUNNER_TEMP 'wasm-signed-startup-test.txt'
-          Invoke-ArchivedTest -Label 'signed startup registration test' -Expected 1 -Filter 'binary_id(banto-hub-host::bin/banto-hub) & test(=wasm_plugins::tests::real_component_registers_on_restart_and_rejects_tampering)' -Log $startupTestLog
-          $deviceTestLog = Join-Path $env:RUNNER_TEMP 'wasm-device-address-test.txt'
-          Invoke-ArchivedTest -Label 'device-address Hub test' -Expected 1 -Filter 'binary_id(banto-hub-host::t12_connection_test) & test(=device_address_test::saves_collects_reads_now_and_reuses_broker)' -Log $deviceTestLog
-          $componentTestLog = Join-Path $env:RUNNER_TEMP 'wasm-component-test.txt'
-          Invoke-ArchivedTest -Label 'WASM component adapter tests' -Expected 3 -Filter 'binary_id(banto-driver-wasm::component)' -Log $componentTestLog
-          $epochTestLog = Join-Path $env:RUNNER_TEMP 'wasm-epoch-test.txt'
-          Invoke-ArchivedTest -Label 'WASM component epoch test' -Expected 1 -Filter 'binary_id(banto-driver-wasm) & test(=runtime::tests::real_component_export_expires_at_epoch_deadline)' -Log $epochTestLog
+          $deviceWasm = Join-Path $out 'device-address-component.wasm'
+          Build-GuestComponent 'device-address test guest' $fixture 'banto_device_address_test_component' $deviceWasm
+          Test-GuestComponent 'device-address' $deviceWasm $driverWit @('driver')
           # The SLMP guest is reviewed separately. Pin it, and keep this Hub
           # acceptance test on the existing WIT and test-only registry path.
-          $slmpSha = '3df89fdb0ed16b08897076495ab7cb29ac2c1b77'
-          Enter-GuestPin $slmpSha 'SLMP guest'
-          cargo +1.98.1 build --manifest-path (Join-Path $guest 'slmp-component/Cargo.toml') --target wasm32-unknown-unknown --locked
-          if ($LASTEXITCODE -ne 0) { throw 'SLMP guest build failed' }
-          $slmpModule = Join-Path $guest 'slmp-component/target/wasm32-unknown-unknown/debug/banto_slmp_read_component.wasm'
-          $env:BANTO_SLMP_COMPONENT_WASM = Join-Path $env:RUNNER_TEMP 'slmp-read-component.wasm'
-          wasm-tools component new $slmpModule -o $env:BANTO_SLMP_COMPONENT_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'SLMP component creation failed' }
-          wasm-tools validate $env:BANTO_SLMP_COMPONENT_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'SLMP component validation failed' }
-          wasm-tools component targets 'crates/banto-driver-wasm/wit/driver.wit' $env:BANTO_SLMP_COMPONENT_WASM --world driver
-          if ($LASTEXITCODE -ne 0) { throw 'SLMP component world mismatch' }
-          $slmpTestLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-hub-test.txt'
-          Invoke-ArchivedTest -Label 'SLMP WASM Hub tests' -Expected 16 -Filter 'binary_id(banto-hub-host::t12_connection_test) & test(~slmp_wasm_test::) - test(~slmp_wasm_test::r_eight_numeric_kinds_collect_and_serve_rest) - test(~slmp_wasm_test::r_w_eight_numeric_kinds_collect_and_serve_rest)' -Log $slmpTestLog
+          Enter-GuestPin $env:WASM_GUEST_PIN_SLMP_READ 'SLMP guest'
+          $slmpReadWasm = Join-Path $out 'slmp-read-component.wasm'
+          Build-GuestComponent 'SLMP guest' $slmpDir $slmpModule $slmpReadWasm
+          Test-GuestComponent 'SLMP' $slmpReadWasm $driverWit @('driver')
           # The optional write world is accepted only by the controlled test
           # loader. Keep the read-only guest pinned above for regression tests.
-          $slmpWriteSha = 'fdb161520019b81a22bc2fec2bc9bf3d837f5bd3'
+          $slmpWriteSha = $env:WASM_GUEST_PIN_SLMP_WRITE
           Enter-GuestPin $slmpWriteSha 'SLMP write guest'
           $hostWriteWit = git rev-parse --verify 'HEAD:crates/banto-driver-wasm/wit/write-v1.wit'
           if ($LASTEXITCODE -ne 0) { throw 'host SLMP write WIT is missing' }
@@ -596,110 +650,59 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $slmpWriteWit -ne $hostWriteWit) {
             throw 'SLMP write guest WIT mismatch'
           }
-          cargo +1.98.1 build --manifest-path (Join-Path $guest 'slmp-component/Cargo.toml') --target wasm32-unknown-unknown --locked
-          if ($LASTEXITCODE -ne 0) { throw 'SLMP write guest build failed' }
-          $slmpWriteModule = Join-Path $guest 'slmp-component/target/wasm32-unknown-unknown/debug/banto_slmp_read_component.wasm'
-          $env:BANTO_SLMP_WRITE_COMPONENT_WASM = Join-Path $env:RUNNER_TEMP 'slmp-write-component.wasm'
-          wasm-tools component new $slmpWriteModule -o $env:BANTO_SLMP_WRITE_COMPONENT_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'SLMP write component creation failed' }
-          wasm-tools validate $env:BANTO_SLMP_WRITE_COMPONENT_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'SLMP write component validation failed' }
-          wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_WRITE_COMPONENT_WASM --world driver-with-write-v1
-          if ($LASTEXITCODE -ne 0) { throw 'SLMP write component world mismatch' }
+          $slmpWriteWasm = Join-Path $out 'slmp-write-component.wasm'
+          Build-GuestComponent 'SLMP write guest' $slmpDir $slmpModule $slmpWriteWasm
+          Test-GuestComponent 'SLMP write' $slmpWriteWasm $witDir @('driver-with-write-v1')
           # The range-write guest is pinned separately. Keep the earlier
           # write-v1 component above for single-word compatibility tests.
-          $slmpRangeWriteSha = 'c95e7f84e0a3b275298901882a9f6b2512c4f41a'
+          $slmpRangeWriteSha = $env:WASM_GUEST_PIN_SLMP_RANGE_WRITE
           Enter-GuestPin $slmpRangeWriteSha 'SLMP range-write guest'
           $slmpRangeWriteWit = git -C $guest rev-parse --verify "${slmpRangeWriteSha}:wit/write-v1.wit"
           if ($LASTEXITCODE -ne 0 -or $slmpRangeWriteWit -ne $hostWriteWit) {
             throw 'SLMP range-write guest WIT mismatch'
           }
-          cargo +1.98.1 build --manifest-path (Join-Path $guest 'slmp-component/Cargo.toml') --target wasm32-unknown-unknown --locked
-          if ($LASTEXITCODE -ne 0) { throw 'SLMP range-write guest build failed' }
-          $slmpRangeWriteModule = Join-Path $guest 'slmp-component/target/wasm32-unknown-unknown/debug/banto_slmp_read_component.wasm'
-          $env:BANTO_SLMP_RANGE_WRITE_COMPONENT_WASM = Join-Path $env:RUNNER_TEMP 'slmp-range-write-component.wasm'
-          wasm-tools component new $slmpRangeWriteModule -o $env:BANTO_SLMP_RANGE_WRITE_COMPONENT_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'SLMP range-write component creation failed' }
-          wasm-tools validate $env:BANTO_SLMP_RANGE_WRITE_COMPONENT_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'SLMP range-write component validation failed' }
-          wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_RANGE_WRITE_COMPONENT_WASM --world driver-with-write-v1
-          if ($LASTEXITCODE -ne 0) { throw 'SLMP range-write component world mismatch' }
-          $slmpWriteTestLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-write-hub-test.txt'
-          Invoke-ArchivedTest -Label 'SLMP WASM controlled write Hub tests' -Expected 13 -Filter 'binary_id(banto-hub-host::t12_connection_test) & test(~slmp_wasm_write_test::)' -Log $slmpWriteTestLog
+          $slmpRangeWriteWasm = Join-Path $out 'slmp-range-write-component.wasm'
+          Build-GuestComponent 'SLMP range-write guest' $slmpDir $slmpModule $slmpRangeWriteWasm
+          Test-GuestComponent 'SLMP range-write' $slmpRangeWriteWasm $witDir @('driver-with-write-v1')
           # Q25PRH write remains a separate, default-disabled test fixture.
           # Pin the separately published guest and exercise settings persistence and broker
           # routing with a mock Q endpoint. Never run the ignored live Q test.
-          $qTestWriteSha = '33171bbb990859c5a46df44cfafc233e58ba5317'
+          $qTestWriteSha = $env:WASM_GUEST_PIN_Q_TEST_WRITE
           Enter-GuestPin $qTestWriteSha 'Q25PRH test-write guest'
           $qTestWriteWit = git -C $guest rev-parse --verify "${qTestWriteSha}:wit/write-v1.wit"
           if ($LASTEXITCODE -ne 0 -or $qTestWriteWit -ne $hostWriteWit) {
             throw 'Q25PRH test-write guest WIT mismatch'
           }
-          cargo +1.98.1 build --manifest-path (Join-Path $guest 'slmp-component/Cargo.toml') --target wasm32-unknown-unknown --locked
-          if ($LASTEXITCODE -ne 0) { throw 'Q25PRH test-write guest build failed' }
-          $qTestModule = Join-Path $guest 'slmp-component/target/wasm32-unknown-unknown/debug/banto_slmp_read_component.wasm'
-          $env:BANTO_SLMP_Q_WRITE_COMPONENT_WASM = Join-Path $env:RUNNER_TEMP 'slmp-q25prh-test-write-component.wasm'
-          wasm-tools component new $qTestModule -o $env:BANTO_SLMP_Q_WRITE_COMPONENT_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'Q25PRH test-write component creation failed' }
-          wasm-tools validate $env:BANTO_SLMP_Q_WRITE_COMPONENT_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'Q25PRH test-write component validation failed' }
-          wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_Q_WRITE_COMPONENT_WASM --world driver-with-write-v1
-          if ($LASTEXITCODE -ne 0) { throw 'Q25PRH test-write component world mismatch' }
-          $qTestLog = Join-Path $env:RUNNER_TEMP 'wasm-q25prh-test-write-hub-test.txt'
-          Invoke-ArchivedTest -Label 'Q25PRH test-write Hub tests' -Expected 4 -Filter 'binary_id(banto-hub-host::t12_connection_test) & test(~slmp_wasm_q_write_test::)' -Log $qTestLog
-          $qGuardLog = Join-Path $env:RUNNER_TEMP 'wasm-q25prh-test-write-guard-test.txt'
-          Invoke-ArchivedTest -Label 'Q25PRH test-write guard tests' -Expected 2 -Filter 'binary_id(banto-hub-host::slmp_wasm_live_q_range_write)' -RunIgnored default -Log $qGuardLog
+          $qTestWasm = Join-Path $out 'slmp-q25prh-test-write-component.wasm'
+          Build-GuestComponent 'Q25PRH test-write guest' $slmpDir $slmpModule $qTestWasm
+          Test-GuestComponent 'Q25PRH test-write' $qTestWasm $witDir @('driver-with-write-v1')
           # Normal Q/R D/u16 writes use a separately selected, signed plugin.
           # This job exercises only loopback PLCs and temporary TestApp state;
           # its ignored live-PLC fixtures are not selected.
-          $normalWriteSha = 'ce6513a127d956ca00508f8d47480567c73e4a49'
+          $normalWriteSha = $env:WASM_GUEST_PIN_SLMP_NORMAL_WRITE
           Enter-GuestPin $normalWriteSha 'normal SLMP write guest'
           $normalWriteWit = git -C $guest rev-parse --verify "${normalWriteSha}:wit/write-v1.wit"
           if ($LASTEXITCODE -ne 0 -or $normalWriteWit -ne $hostWriteWit) {
             throw 'normal SLMP write guest WIT mismatch'
           }
-          cargo +1.98.1 build --manifest-path (Join-Path $guest 'slmp-component/Cargo.toml') --target wasm32-unknown-unknown --locked
-          if ($LASTEXITCODE -ne 0) { throw 'normal SLMP write guest build failed' }
-          $normalWriteModule = Join-Path $guest 'slmp-component/target/wasm32-unknown-unknown/debug/banto_slmp_read_component.wasm'
-          $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM = Join-Path $env:RUNNER_TEMP 'slmp-normal-write-component.wasm'
-          wasm-tools component new $normalWriteModule -o $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'normal SLMP write component creation failed' }
-          wasm-tools validate $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'normal SLMP write component validation failed' }
-          wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM --world driver-with-write-v1
-          if ($LASTEXITCODE -ne 0) { throw 'normal SLMP write component world mismatch' }
-          $normalWriteLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-normal-write-hub-test.txt'
-          Invoke-ArchivedTest -Label 'normal SLMP write Hub tests' -Expected 6 -Filter 'binary_id(banto-hub-host::t12_connection_test) & test(~slmp_wasm_operational_write_test::) - test(~new_guest_) - test(~bit_bool_values_and_device_error_survive_the_host_read_boundary) - test(~saved_bit_tags_keep_values_and_quality_after_collection) - test(~explicit_w_range_uses_the_same_q_and_r_gate_without_broadening_d) - test(~diagnostic_guest_uses_existing_connection_and_preserves_read) - test(~saved_tags_are_diagnosed_through_the_authenticated_rest_and_broker_path) - test(~high_low_word_order_is_preserved_through_host_and_guest) - test(~typed_words_are_one_complete_frame_and_bad_items_send_nothing) - test(~standard_q_and_r_bit_areas_use_bool_and_one_frame_per_allowed_run) - test(~malformed_allowlist_notation_is_rejected_and_sends_no_write_frame) - test(~w_write_with_unknown_ack_or_plc_error_never_succeeds_or_replays)' -Log $normalWriteLog
+          $normalWriteWasm = Join-Path $out 'slmp-normal-write-component.wasm'
+          Build-GuestComponent 'normal SLMP write guest' $slmpDir $slmpModule $normalWriteWasm
+          Test-GuestComponent 'normal SLMP write' $normalWriteWasm $witDir @('driver-with-write-v1')
           # The merged common D/W guest also advertises bit reads. Keep the
           # earlier D-only guest regression above, then build this revision
           # independently instead of relying on a developer's local component.
-          $commonDwSha = '532e0ba1f0b91a67422e33dac72e9edbb7c3fe0e'
+          $commonDwSha = $env:WASM_GUEST_PIN_SLMP_COMMON_DW
           Enter-GuestPin $commonDwSha 'common D/W SLMP guest'
           $commonDwWriteWit = git -C $guest rev-parse --verify "${commonDwSha}:wit/write-v1.wit"
           if ($LASTEXITCODE -ne 0 -or $commonDwWriteWit -ne $hostWriteWit) {
             throw 'common D/W SLMP guest write WIT mismatch'
           }
-          cargo +1.98.1 build --manifest-path (Join-Path $guest 'slmp-component/Cargo.toml') --target wasm32-unknown-unknown --locked
-          if ($LASTEXITCODE -ne 0) { throw 'common D/W SLMP guest build failed' }
-          $commonDwModule = Join-Path $guest 'slmp-component/target/wasm32-unknown-unknown/debug/banto_slmp_read_component.wasm'
-          $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM = Join-Path $env:RUNNER_TEMP 'slmp-common-dw-component.wasm'
-          wasm-tools component new $commonDwModule -o $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'common D/W SLMP component creation failed' }
-          wasm-tools validate $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'common D/W SLMP component validation failed' }
-          wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM --world driver-with-write-v1
-          if ($LASTEXITCODE -ne 0) { throw 'common D/W SLMP component world mismatch' }
-          $commonDwLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-common-dw-hub-test.txt'
-          Invoke-ArchivedTest -Label 'common D/W SLMP Hub tests' -Expected 11 -Filter 'binary_id(banto-hub-host::t12_connection_test) & test(~slmp_wasm_operational_write_test::) - test(~new_guest_) - test(~diagnostic_guest_uses_existing_connection_and_preserves_read) - test(~saved_tags_are_diagnosed_through_the_authenticated_rest_and_broker_path) - test(~high_low_word_order_is_preserved_through_host_and_guest) - test(~typed_words_are_one_complete_frame_and_bad_items_send_nothing) - test(~standard_q_and_r_bit_areas_use_bool_and_one_frame_per_allowed_run)' -Log $commonDwLog
-          $env:BANTO_SLMP_LEGACY_COMPONENT_WASM = $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM
-          $env:BANTO_STAGE2_SLMP_WASM = $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM
-          $env:BANTO_LOCAL_W_WASM = $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM
-          foreach ($numericTest in @('r_eight_numeric_kinds_collect_and_serve_rest', 'r_w_eight_numeric_kinds_collect_and_serve_rest')) {
-            Invoke-ArchivedTest -Label "common D/W SLMP numeric regression: $numericTest" -Expected 0 -Filter "binary_id(banto-hub-host::t12_connection_test) & test(~slmp_wasm_test::$numericTest)"
-          }
+          $commonDwWasm = Join-Path $out 'slmp-common-dw-component.wasm'
+          Build-GuestComponent 'common D/W SLMP guest' $slmpDir $slmpModule $commonDwWasm
+          Test-GuestComponent 'common D/W SLMP' $commonDwWasm $witDir @('driver-with-write-v1')
           # Optional diagnostics use a new world. The existing read/write
           # worlds and their pinned regression guests above remain unchanged.
-          $diagnosticSha = 'f20766041ed75de1f6102c01dc94151d48785d5e'
+          $diagnosticSha = $env:WASM_GUEST_PIN_SLMP_DIAGNOSTIC
           Enter-GuestPin $diagnosticSha 'diagnostic SLMP guest'
           foreach ($wit in @('write-v1.wit', 'diagnostics-v1.wit')) {
             $guestBlob = git -C $guest rev-parse --verify "${diagnosticSha}:wit/$wit"
@@ -708,20 +711,9 @@ jobs:
               throw "diagnostic SLMP $wit mismatch"
             }
           }
-          cargo +1.98.1 build --manifest-path (Join-Path $guest 'slmp-component/Cargo.toml') --target wasm32-unknown-unknown --locked
-          if ($LASTEXITCODE -ne 0) { throw 'diagnostic SLMP guest build failed' }
-          $diagnosticModule = Join-Path $guest 'slmp-component/target/wasm32-unknown-unknown/debug/banto_slmp_read_component.wasm'
-          $env:BANTO_SLMP_DIAGNOSTICS_COMPONENT_WASM = Join-Path $env:RUNNER_TEMP 'slmp-diagnostics-component.wasm'
-          wasm-tools component new $diagnosticModule -o $env:BANTO_SLMP_DIAGNOSTICS_COMPONENT_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'diagnostic SLMP component creation failed' }
-          wasm-tools validate $env:BANTO_SLMP_DIAGNOSTICS_COMPONENT_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'diagnostic SLMP component validation failed' }
-          wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_DIAGNOSTICS_COMPONENT_WASM --world driver-with-write-and-diagnostics-v1
-          if ($LASTEXITCODE -ne 0) { throw 'diagnostic SLMP world mismatch' }
-          Invoke-ArchivedTest -Label 'optional diagnostics world compatibility' -Expected 0 -Filter 'binary_id(banto-driver-wasm::diagnostics_v1)'
-          $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM = $env:BANTO_SLMP_DIAGNOSTICS_COMPONENT_WASM
-          $diagnosticLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-diagnostics-hub-test.txt'
-          Invoke-ArchivedTest -Label 'diagnostic SLMP Hub tests' -Expected 16 -Filter 'binary_id(banto-hub-host::t12_connection_test) & test(~slmp_wasm_operational_write_test::) - test(~new_guest_)' -Log $diagnosticLog
+          $diagnosticWasm = Join-Path $out 'slmp-diagnostics-component.wasm'
+          Build-GuestComponent 'diagnostic SLMP guest' $slmpDir $slmpModule $diagnosticWasm
+          Test-GuestComponent 'diagnostic SLMP' $diagnosticWasm $witDir @('driver-with-write-and-diagnostics-v1')
           # Keep the earlier diagnostic and read/write guests above for
           # compatibility. Build guest main (SLMP code as of #61, WIT as of #47)
           # separately for Hub acceptance. Its own pin: $canonicalSha stays at #47.
@@ -764,7 +756,7 @@ jobs:
           # SD210-SD216 (BIN) or SD210-SD213 (BCD), writing nothing (SM213 OFF
           # is rejected); the Hub binds driver-with-clock-read-v1 and offers it
           # whatever the loader.
-          $newSlmpSha = '5281578d79fb2055a7af86c96691d15bf95dab65'
+          $newSlmpSha = $env:WASM_GUEST_PIN_SLMP_NEW
           Enter-GuestPin $newSlmpSha 'new SLMP guest'
           foreach ($wit in @('write-v1.wit', 'diagnostics-v1.wit', 'clock-v1.wit', 'clock-read-v1.wit')) {
             $guestBlob = git -C $guest rev-parse --verify "${newSlmpSha}:wit/$wit"
@@ -782,136 +774,34 @@ jobs:
               -not ($slmpManifest.transports -contains 'tcp') -or -not ($slmpManifest.transports -contains 'udp')) {
             throw 'SLMP Hub fixture manifest mismatch'
           }
-          cargo +1.98.1 build --manifest-path (Join-Path $guest 'slmp-component/Cargo.toml') --target wasm32-unknown-unknown --locked
-          if ($LASTEXITCODE -ne 0) { throw 'new SLMP guest build failed' }
-          $newSlmpModule = Join-Path $guest 'slmp-component/target/wasm32-unknown-unknown/debug/banto_slmp_read_component.wasm'
-          $env:BANTO_SLMP_NEW_COMPONENT_WASM = Join-Path $env:RUNNER_TEMP 'slmp-44-component.wasm'
-          wasm-tools component new $newSlmpModule -o $env:BANTO_SLMP_NEW_COMPONENT_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'new SLMP component creation failed' }
-          wasm-tools validate $env:BANTO_SLMP_NEW_COMPONENT_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'new SLMP component validation failed' }
-          wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_NEW_COMPONENT_WASM --world driver-with-write-and-diagnostics-v1
-          if ($LASTEXITCODE -ne 0) { throw 'new SLMP component world mismatch' }
-          wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_NEW_COMPONENT_WASM --world driver-with-write-diagnostics-and-clock-v1
-          if ($LASTEXITCODE -ne 0) { throw 'new SLMP component clock world mismatch' }
-          wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_NEW_COMPONENT_WASM --world driver-with-clock-v1
-          if ($LASTEXITCODE -ne 0) { throw 'new SLMP component small clock world mismatch' }
-          wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_NEW_COMPONENT_WASM --world driver-with-write-diagnostics-clock-and-clock-read-v1
-          if ($LASTEXITCODE -ne 0) { throw 'new SLMP component clock read world mismatch' }
-          wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_NEW_COMPONENT_WASM --world driver-with-clock-read-v1
-          if ($LASTEXITCODE -ne 0) { throw 'new SLMP component small clock read world mismatch' }
-          $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM = $env:BANTO_SLMP_NEW_COMPONENT_WASM
-          $env:BANTO_SLMP_DIAGNOSTICS_COMPONENT_WASM = $env:BANTO_SLMP_NEW_COMPONENT_WASM
-          # Component-level word-bit RMW: a confirm-read mismatch is
-          # verification-failed for that item only (#906).
-          $wordBitLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-word-bit-test.txt'
-          Invoke-ArchivedTest -Label 'SLMP word-bit component test' -Expected 1 -Filter 'binary_id(banto-driver-wasm::slmp_word_bit_write)' -Log $wordBitLog
-          # Component-level E4 (UDP over a loopback peer, 4E and 3E) and C1
-          # (D/W string bytes and the one-1401 write) for the same guest.
-          $slmpUdpStringLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-udp-string-test.txt'
-          Invoke-ArchivedTest -Label 'SLMP UDP/string component tests' -Expected 4 -Filter 'binary_id(banto-driver-wasm::slmp_udp_strings)' -Log $slmpUdpStringLog
-          # Component-level G1 (U\G reads on Q and R, byte-exact frames, one
-          # request per tag, per-item Unsupported, end codes, no writes).
-          $slmpUnitBufferLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-unit-buffer-test.txt'
-          Invoke-ArchivedTest -Label 'SLMP U\G component tests' -Expected 6 -Filter 'binary_id(banto-driver-wasm::slmp_unit_buffer)' -Log $slmpUnitBufferLog
-          # Component-level G2a (QnPH, QnUDPV, MELSEC-L, Q12PRH recognized by the
-          # exact 0101 pair; mismatched pairs stay Unknown).
-          $slmpG2aLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-g2a-models-test.txt'
-          Invoke-ArchivedTest -Label 'SLMP G2a component tests' -Expected 5 -Filter 'binary_id(banto-driver-wasm::slmp_g2a_models)' -Log $slmpG2aLog
-          # Component-level G2b (iQ-R process, SIL2 process, safety CPU and MX-R
-          # recognized by the exact 0101 pair; S only on the process CPU).
-          $slmpG2bLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-g2b-models-test.txt'
-          Invoke-ArchivedTest -Label 'SLMP G2b component tests' -Expected 4 -Filter 'binary_id(banto-driver-wasm::slmp_g2b_models)' -Log $slmpG2bLog
-          # Component-level G2c (FX5 recognized by code table plus FX5 name on
-          # 3E own station; R<n> read-only and FX5 only; X/Y/ZR/U\G per-item
-          # Unsupported; 4E or another station is Unknown; D/M writes only).
-          $slmpG2cLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-g2c-models-test.txt'
-          Invoke-ArchivedTest -Label 'SLMP G2c component tests' -Expected 7 -Filter 'binary_id(banto-driver-wasm::slmp_g2c_models)' -Log $slmpG2cLog
-          # Component-level G3 (labels read by one 041C byte for byte incl. a
-          # UTF-16 non-ASCII name, per-item type mismatch, 041C check + 141B
-          # write, Hub label gate sends nothing, standard Q sends no label).
-          $slmpG3Log = Join-Path $env:RUNNER_TEMP 'wasm-slmp-g3-labels-test.txt'
-          Invoke-ArchivedTest -Label 'SLMP G3 component tests' -Expected 6 -Filter 'binary_id(banto-driver-wasm::slmp_g3_labels)' -Log $slmpG3Log
-          # Component-level H (clock-v1 on iQ-R over 4E and 3E: the four exact
-          # requests, SM210/SM211 outcomes, end code, guest gate, standard Q
-          # and the read-only loader send nothing, a short response is fatal).
-          $slmpHLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-h-clock-test.txt'
-          Invoke-ArchivedTest -Label 'SLMP H component tests' -Expected 6 -Filter 'binary_id(banto-driver-wasm::slmp_h_clock)' -Log $slmpHLog
-          # Component-level H3 (clock-read-v1 on iQ-R and standard Q over 4E
-          # and 3E: the two exact requests, BIN and BCD, SM213 OFF / SM210 ON
-          # rejected, verification-failed, end codes, Q25PRH and FX5 send
-          # nothing, a short response is fatal, the read-only loader offers
-          # the read but not the clock set).
-          $slmpH3Log = Join-Path $env:RUNNER_TEMP 'wasm-slmp-h3-clock-read-test.txt'
-          Invoke-ArchivedTest -Label 'SLMP H3 component tests' -Expected 8 -Filter 'binary_id(banto-driver-wasm::slmp_h3_clock_read)' -Log $slmpH3Log
-          $newSlmpLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-44-hub-test.txt'
-          Invoke-ArchivedTest -Label 'new SLMP Hub acceptance tests' -Expected 57 -Filter 'binary_id(banto-hub-host::t12_connection_test) & test(~slmp_wasm_operational_write_test::)' -Log $newSlmpLog
-          # H2 (Hub clock sync, #1053): the scheduler, manual REST, the two
-          # gates, each result's audit and the timeout without a resend,
-          # through the operational loader and a loopback SLMP peer.
-          # H3 (Hub clock read): GET /clock on R and Q, the 5 s reuse, SM213
-          # OFF, the read-only loader and the reads before/after a clock sync
-          # in its audit (5 more tests in the same module).
-          $clockSyncLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-h2-clock-sync-hub-test.txt'
-          Invoke-ArchivedTest -Label 'H2 clock sync Hub acceptance tests' -Expected 11 -Filter 'binary_id(banto-hub-host::t12_connection_test) & test(~slmp_wasm_clock_test::)' -Log $clockSyncLog
+          $newSlmpWasm = Join-Path $out 'slmp-44-component.wasm'
+          Build-GuestComponent 'new SLMP guest' $slmpDir $slmpModule $newSlmpWasm
+          Test-GuestComponent 'new SLMP' $newSlmpWasm $witDir @(
+            'driver-with-write-and-diagnostics-v1',
+            'driver-with-write-diagnostics-and-clock-v1',
+            'driver-with-clock-v1',
+            'driver-with-write-diagnostics-clock-and-clock-read-v1',
+            'driver-with-clock-read-v1')
           # Stage-2 numeric reads use the separately reviewed guest revision.
           # Keep the older guest revisions above for read and write regressions.
-          $numericSha = '9ffa939ffc3551325551b28e4993ec62b8ddc34d'
-          Enter-GuestPin $numericSha 'numeric guest'
-          $env:BANTO_STAGE2_MODBUS_MANIFEST = Join-Path $guest 'component/manifest.json'
-          cargo +1.98.1 build --manifest-path (Join-Path $guest 'component/Cargo.toml') --target wasm32-unknown-unknown --locked
-          if ($LASTEXITCODE -ne 0) { throw 'numeric Modbus guest build failed' }
-          $numericModbusModule = Join-Path $guest 'component/target/wasm32-unknown-unknown/debug/banto_modbus_tcp_component.wasm'
-          $env:BANTO_STAGE2_MODBUS_WASM = Join-Path $env:RUNNER_TEMP 'numeric-modbus-component.wasm'
-          wasm-tools component new $numericModbusModule -o $env:BANTO_STAGE2_MODBUS_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'numeric Modbus component creation failed' }
-          wasm-tools validate $env:BANTO_STAGE2_MODBUS_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'numeric Modbus component validation failed' }
-          wasm-tools component targets 'crates/banto-driver-wasm/wit/driver.wit' $env:BANTO_STAGE2_MODBUS_WASM --world driver
-          if ($LASTEXITCODE -ne 0) { throw 'numeric Modbus component world mismatch' }
-          cargo +1.98.1 build --manifest-path (Join-Path $guest 'slmp-component/Cargo.toml') --target wasm32-unknown-unknown --locked
-          if ($LASTEXITCODE -ne 0) { throw 'numeric SLMP guest build failed' }
-          $numericSlmpModule = Join-Path $guest 'slmp-component/target/wasm32-unknown-unknown/debug/banto_slmp_read_component.wasm'
-          $env:BANTO_STAGE2_SLMP_WASM = Join-Path $env:RUNNER_TEMP 'numeric-slmp-component.wasm'
-          wasm-tools component new $numericSlmpModule -o $env:BANTO_STAGE2_SLMP_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'numeric SLMP component creation failed' }
-          wasm-tools validate $env:BANTO_STAGE2_SLMP_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'numeric SLMP component validation failed' }
-          wasm-tools component targets 'crates/banto-driver-wasm/wit/driver.wit' $env:BANTO_STAGE2_SLMP_WASM --world driver
-          if ($LASTEXITCODE -ne 0) { throw 'numeric SLMP component world mismatch' }
-          $numericTestLog = Join-Path $env:RUNNER_TEMP 'wasm-numeric-stage2-test.txt'
-          Invoke-ArchivedTest -Label 'WASM numeric stage-2 host tests' -Expected 6 -Filter 'binary_id(banto-driver-wasm::numeric_stage2) - test(~local_fc4_eight_kinds_use_input_registers_without_write_capability) - test(~local_r_w_eight_kinds_use_hex_addresses_without_write_capability)' -Log $numericTestLog
-          $numericHubLog = Join-Path $env:RUNNER_TEMP 'wasm-numeric-stage2-hub-test.txt'
-          Invoke-ArchivedTest -Label 'WASM numeric stage-2 Hub tests' -Expected 2 -Filter 'binary_id(banto-hub-host::t12_connection_test) & test(~eight_numeric_kinds_collect_and_serve_rest) - test(~wasm_fc4_eight_numeric_kinds_collect_and_serve_rest) - test(~slmp_wasm_test::r_w_eight_numeric_kinds_collect_and_serve_rest)' -Log $numericHubLog
+          Enter-GuestPin $env:WASM_GUEST_PIN_MODBUS_NUMERIC 'numeric guest'
+          Copy-Item -LiteralPath (Join-Path $guest 'component/manifest.json') -Destination (Join-Path $manifests 'numeric-modbus-manifest.json')
+          $numericModbusWasm = Join-Path $out 'numeric-modbus-component.wasm'
+          Build-GuestComponent 'numeric Modbus guest' $modbusDir $modbusModule $numericModbusWasm
+          Test-GuestComponent 'numeric Modbus' $numericModbusWasm $driverWit @('driver')
+          $numericSlmpWasm = Join-Path $out 'numeric-slmp-component.wasm'
+          Build-GuestComponent 'numeric SLMP guest' $slmpDir $slmpModule $numericSlmpWasm
+          Test-GuestComponent 'numeric SLMP' $numericSlmpWasm $driverWit @('driver')
           # FC4 and SLMP W use a separately reviewed read-only guest revision.
           # Keep the stage-2 and write revisions above pinned for regressions.
-          $fc4WSha = '290648da33895a707abcaaafeb23bd0f05d5b828'
-          Enter-GuestPin $fc4WSha 'FC4/W guest'
-          $env:BANTO_LOCAL_FC4_MANIFEST = Join-Path $guest 'component/manifest.json'
-          cargo +1.98.1 build --manifest-path (Join-Path $guest 'component/Cargo.toml') --target wasm32-unknown-unknown --locked
-          if ($LASTEXITCODE -ne 0) { throw 'FC4 Modbus guest build failed' }
-          $fc4Module = Join-Path $guest 'component/target/wasm32-unknown-unknown/debug/banto_modbus_tcp_component.wasm'
-          $env:BANTO_LOCAL_FC4_WASM = Join-Path $env:RUNNER_TEMP 'fc4-modbus-component.wasm'
-          wasm-tools component new $fc4Module -o $env:BANTO_LOCAL_FC4_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'FC4 Modbus component creation failed' }
-          wasm-tools validate $env:BANTO_LOCAL_FC4_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'FC4 Modbus component validation failed' }
-          wasm-tools component targets 'crates/banto-driver-wasm/wit/driver.wit' $env:BANTO_LOCAL_FC4_WASM --world driver
-          if ($LASTEXITCODE -ne 0) { throw 'FC4 Modbus component world mismatch' }
-          cargo +1.98.1 build --manifest-path (Join-Path $guest 'slmp-component/Cargo.toml') --target wasm32-unknown-unknown --locked
-          if ($LASTEXITCODE -ne 0) { throw 'SLMP W guest build failed' }
-          $wModule = Join-Path $guest 'slmp-component/target/wasm32-unknown-unknown/debug/banto_slmp_read_component.wasm'
-          $env:BANTO_LOCAL_W_WASM = Join-Path $env:RUNNER_TEMP 'slmp-w-component.wasm'
-          wasm-tools component new $wModule -o $env:BANTO_LOCAL_W_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'SLMP W component creation failed' }
-          wasm-tools validate $env:BANTO_LOCAL_W_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'SLMP W component validation failed' }
-          wasm-tools component targets 'crates/banto-driver-wasm/wit/driver.wit' $env:BANTO_LOCAL_W_WASM --world driver
-          if ($LASTEXITCODE -ne 0) { throw 'SLMP W component world mismatch' }
-          $fc4WHostLog = Join-Path $env:RUNNER_TEMP 'wasm-fc4-w-host-test.txt'
-          Invoke-ArchivedTest -Label 'FC4/W host tests' -Expected 2 -Filter 'binary_id(banto-driver-wasm::numeric_stage2) & test(~local_)' -Log $fc4WHostLog
-          $fc4WHubLog = Join-Path $env:RUNNER_TEMP 'wasm-fc4-w-hub-test.txt'
-          Invoke-ArchivedTest -Label 'FC4/W Hub tests' -Expected 2 -Filter 'binary_id(banto-hub-host::t12_connection_test) & test(~eight_numeric_kinds_collect_and_serve_rest) - test(~wasm_fc3_eight_numeric_kinds_collect_and_serve_rest) - test(~slmp_wasm_test::r_eight_numeric_kinds_collect_and_serve_rest)' -Log $fc4WHubLog
+          Enter-GuestPin $env:WASM_GUEST_PIN_FC4_W 'FC4/W guest'
+          Copy-Item -LiteralPath (Join-Path $guest 'component/manifest.json') -Destination (Join-Path $manifests 'fc4-modbus-manifest.json')
+          $fc4Wasm = Join-Path $out 'fc4-modbus-component.wasm'
+          Build-GuestComponent 'FC4 Modbus guest' $modbusDir $modbusModule $fc4Wasm
+          Test-GuestComponent 'FC4 Modbus' $fc4Wasm $driverWit @('driver')
+          $slmpWWasm = Join-Path $out 'slmp-w-component.wasm'
+          Build-GuestComponent 'SLMP W guest' $slmpDir $slmpModule $slmpWWasm
+          Test-GuestComponent 'SLMP W' $slmpWWasm $driverWit @('driver')
           # Modbus FC1/2/3/4 and gated FC5/6/15/16/22 join uses the exact reviewed
           # guest package manifest and the optional write world (guest main:
           # Modbus code as of #58 (A1 coil/discrete probe, B1 register_bit_write,
@@ -919,29 +809,226 @@ jobs:
           # 3xxxxx/4xxxxx strings of 1-123 words, high byte first per register,
           # one holding string written as one FC16; manifest 0.9.0);
           # its WIT is still the #47 one, so Enter-GuestPin keeps the WIT checkout).
-          $modbusJoinSha = 'f6c8781bab6f85a6c866e4d552039b547c4390ac'
+          $modbusJoinSha = $env:WASM_GUEST_PIN_MODBUS_JOIN
           Enter-GuestPin $modbusJoinSha 'Modbus join guest'
           $modbusWriteWit = git -C $guest rev-parse --verify "${modbusJoinSha}:wit/write-v1.wit"
           if ($LASTEXITCODE -ne 0 -or $modbusWriteWit -ne $hostWriteWit) { throw 'Modbus join write WIT mismatch' }
-          $env:BANTO_MODBUS_MANIFEST = Join-Path $guest 'component/manifest.json'
-          cargo +1.98.1 build --manifest-path (Join-Path $guest 'component/Cargo.toml') --target wasm32-unknown-unknown --locked
-          if ($LASTEXITCODE -ne 0) { throw 'Modbus join guest build failed' }
-          $modbusJoinModule = Join-Path $guest 'component/target/wasm32-unknown-unknown/debug/banto_modbus_tcp_component.wasm'
-          $env:BANTO_MODBUS_COMPONENT_WASM = Join-Path $env:RUNNER_TEMP 'modbus-join-component.wasm'
-          wasm-tools component new $modbusJoinModule -o $env:BANTO_MODBUS_COMPONENT_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'Modbus join component creation failed' }
-          wasm-tools validate $env:BANTO_MODBUS_COMPONENT_WASM
-          if ($LASTEXITCODE -ne 0) { throw 'Modbus join component validation failed' }
-          wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_MODBUS_COMPONENT_WASM --world driver-with-write-v1
-          if ($LASTEXITCODE -ne 0) { throw 'Modbus join write world mismatch' }
-          $modbusJoinLog = Join-Path $env:RUNNER_TEMP 'wasm-modbus-join-test.txt'
-          Invoke-ArchivedTest -Label 'Modbus join adapter tests' -Expected 11 -Filter 'binary_id(banto-driver-wasm::modbus_join)' -Log $modbusJoinLog
-          $modbusHubLog = Join-Path $env:RUNNER_TEMP 'wasm-modbus-hub-join-test.txt'
-          Invoke-ArchivedTest -Label 'Modbus Hub join tests' -Expected 10 -Filter 'binary_id(banto-hub-host::t12_connection_test) & test(~modbus_wasm_join_test::)' -Log $modbusHubLog
+          Copy-Item -LiteralPath (Join-Path $guest 'component/manifest.json') -Destination (Join-Path $manifests 'modbus-join-manifest.json')
+          $modbusJoinWasm = Join-Path $out 'modbus-join-component.wasm'
+          Build-GuestComponent 'Modbus join guest' $modbusDir $modbusModule $modbusJoinWasm
+          Test-GuestComponent 'Modbus join' $modbusJoinWasm $witDir @('driver-with-write-v1')
+          # 成果物がちょうど 15 個そろっていること（キャッシュに入るのもこの 15 個）。
+          $built = @(Get-ChildItem -LiteralPath $out -File)
+          if ($built.Count -ne 15) { throw "expected 15 guest components, found $($built.Count)" }
+      # main だけが保存する（repo の rust-cache と同じ方針）。PR の実行は main の
+      # キャッシュを読めるが、PR の ref に閉じた保存は他の PR から見えず、main の
+      # 保存だけが全員に配られる。PR で保存しても同じ内容の別コピーが増えるだけなので省く。
+      # 上のビルド・検証が成功したときだけ（暗黙の success()）保存する。
+      - name: Save WASM guest components
+        if: github.ref == 'refs/heads/main' && steps.guest-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}\wasm-guests
+          key: ${{ steps.guest-key.outputs.key }}
+      - name: test (WASM Hub components)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # テストは rust-test-build の nextest archive（前のステップで展開済み）から
+          # 走らせる。ここではホスト側をビルドしない。--no-tests=fail で一致 0 件を
+          # 失敗にし、nextest の Summary 行の「N tests run: N passed」で件数を確かめる
+          # （旧 `test result: ok. N passed` の検査と同じ強さ）。-Expected 0 は 1 件以上。
+          # -RunIgnored は既定 only（旧 `-- --ignored` と同じ）。default は旧の無指定。
+          # nextest の起動は 1 回ごとに全バイナリの一覧を作り直すので、環境変数と引数が
+          # 同じ試験は Invoke-ArchivedTestGroup で 1 回にまとめる。まとめた中の各部分は、
+          # PASS の行をバイナリ・試験名で数え、部分ごとの件数と「合計が全 PASS と一致」
+          # （どの部分にも属さない試験が走らない）も確かめる。
+          # 環境変数が違うもの（ゲストの .wasm の差し替え）や --run-ignored が違うものは、
+          # 別々の起動のままにしてある。環境変数は元のステップと同じ順序・同じ値で設定する。
+          $binariesMetadata = 'target/nextest/binaries-metadata.json'
+          $cargoMetadata = 'target/nextest/cargo-metadata.json'
+          $guestDir = Join-Path $env:RUNNER_TEMP 'wasm-guests'
+          $manifestDir = Join-Path $env:RUNNER_TEMP 'wasm-guest-manifests'
+          function Get-GuestFile([string]$Dir, [string]$Name) {
+            $p = Join-Path $Dir $Name
+            if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw "guest file is missing: $p" }
+            return $p
+          }
+          function Invoke-ArchivedTest([string]$Label, [int]$Expected, [string]$Filter, [string]$RunIgnored = 'only', [string]$Log) {
+            if (-not $Log) { $Log = Join-Path $env:RUNNER_TEMP ('nextest-' + [guid]::NewGuid() + '.txt') }
+            Write-Host "nextest filterset: $Filter"
+            cargo-nextest nextest run --binaries-metadata $binariesMetadata --cargo-metadata $cargoMetadata --workspace-remap . --run-ignored $RunIgnored --no-tests=fail --no-fail-fast --color never -E $Filter 2>&1 | Tee-Object -FilePath $Log
+            if ($LASTEXITCODE -ne 0) { throw "$Label failed" }
+            $summary = Select-String -Path $Log -Pattern '^\s*Summary \[[^\]]*\]\s+(\d+) tests? run: (\d+) passed' | Select-Object -Last 1
+            if (-not $summary) { throw "${Label}: nextest summary not found" }
+            $run = [int]$summary.Matches[0].Groups[1].Value
+            $passed = [int]$summary.Matches[0].Groups[2].Value
+            if ($run -lt 1 -or $passed -ne $run -or ($Expected -gt 0 -and $run -ne $Expected)) {
+              throw "$Label did not run as expected (expected: $Expected, run: $run, passed: $passed)"
+            }
+          }
+          # 部分 = @{ Id; Binary; Name（完全一致）; Like（部分一致のどれか）; Not（部分一致で除く）; Expected（0 は 1 件以上） }
+          function New-PartFilter($Part) {
+            $f = "binary_id($($Part.Binary))"
+            if ($Part.Name) { $f += " & test(=$($Part.Name))" }
+            if ($Part.Like) { $f += ' & (' + ((@($Part.Like) | ForEach-Object { "test(~$_)" }) -join ' | ') + ')' }
+            foreach ($n in @($Part.Not)) { if ($n) { $f += " - test(~$n)" } }
+            return $f
+          }
+          function Test-PartMatch($Passed, $Part) {
+            if ($Passed.Binary -ne $Part.Binary) { return $false }
+            if ($Part.Name -and $Passed.Name -ne $Part.Name) { return $false }
+            if ($Part.Like -and -not (@($Part.Like) | Where-Object { $Passed.Name.Contains($_) })) { return $false }
+            foreach ($n in @($Part.Not)) { if ($n -and $Passed.Name.Contains($n)) { return $false } }
+            return $true
+          }
+          function Invoke-ArchivedTestGroup([string]$Label, [object[]]$Parts) {
+            $filter = (@($Parts | ForEach-Object { '(' + (New-PartFilter $_) + ')' })) -join ' | '
+            $expected = 0
+            $open = $false
+            foreach ($p in $Parts) { if ($p.Expected -gt 0) { $expected += $p.Expected } else { $open = $true } }
+            if ($open) { $expected = 0 }
+            $log = Join-Path $env:RUNNER_TEMP ('nextest-group-' + [guid]::NewGuid() + '.txt')
+            Invoke-ArchivedTest -Label $Label -Expected $expected -Filter $filter -Log $log
+            $passLines = @(Get-Content -LiteralPath $log | ForEach-Object {
+              # LEAK は合格だがハンドルを残した試験（nextest は passed に数える）。
+              if ($_ -match '^\s*(?:PASS|LEAK)\s+\[[^\]]*\]\s+(?:\(\s*\d+/\s*\d+\)\s+)?(\S+)\s+(\S+)\s*$') {
+                [pscustomobject]@{ Binary = $Matches[1]; Name = $Matches[2] }
+              }
+            })
+            $accounted = 0
+            foreach ($p in $Parts) {
+              $n = @($passLines | Where-Object { Test-PartMatch $_ $p }).Count
+              if ($p.Expected -gt 0 -and $n -ne $p.Expected) { throw "${Label}: part '$($p.Id)' expected $($p.Expected), passed $n" }
+              if ($p.Expected -le 0 -and $n -lt 1) { throw "${Label}: part '$($p.Id)' ran no test" }
+              $accounted += $n
+            }
+            if ($accounted -ne $passLines.Count) {
+              throw "${Label}: $($passLines.Count) tests passed but the parts account for $accounted"
+            }
+          }
+          $hubConn = 'banto-hub-host::t12_connection_test'
+          # 1 回目: canonical guest の接続試験・署名付き起動・device-address・adapter・epoch。
+          # device-address の .wasm の環境変数は、元は接続試験の後に設定していた。それを
+          # 読むのは device-address の試験と banto-hub の起動の試験だけなので、接続試験の
+          # 起動にも付けて、5 件を 1 回で走らせる。
+          $env:BANTO_COMPONENT_WASM = Get-GuestFile $guestDir 'banto-modbus-tcp-component.wasm'
+          $env:BANTO_DEVICE_COMPONENT_WASM = Get-GuestFile $guestDir 'device-address-component.wasm'
+          Invoke-ArchivedTestGroup -Label 'WASM Hub connection, signed startup, device-address and component tests' -Parts @(
+            @{ Id = 'WASM Hub connection test'; Binary = $hubConn; Name = 'wasm_fc3_connection_test_direct_reuse_and_changed_settings'; Expected = 1 },
+            @{ Id = 'signed startup registration test'; Binary = 'banto-hub-host::bin/banto-hub'; Name = 'wasm_plugins::tests::real_component_registers_on_restart_and_rejects_tampering'; Expected = 1 },
+            @{ Id = 'device-address Hub test'; Binary = $hubConn; Name = 'device_address_test::saves_collects_reads_now_and_reuses_broker'; Expected = 1 },
+            @{ Id = 'WASM component adapter tests'; Binary = 'banto-driver-wasm::component'; Expected = 3 },
+            @{ Id = 'WASM component epoch test'; Binary = 'banto-driver-wasm'; Name = 'runtime::tests::real_component_export_expires_at_epoch_deadline'; Expected = 1 }
+          )
+          $env:BANTO_SLMP_COMPONENT_WASM = Get-GuestFile $guestDir 'slmp-read-component.wasm'
+          $slmpTestLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-hub-test.txt'
+          Invoke-ArchivedTest -Label 'SLMP WASM Hub tests' -Expected 16 -Filter 'binary_id(banto-hub-host::t12_connection_test) & test(~slmp_wasm_test::) - test(~slmp_wasm_test::r_eight_numeric_kinds_collect_and_serve_rest) - test(~slmp_wasm_test::r_w_eight_numeric_kinds_collect_and_serve_rest)' -Log $slmpTestLog
+          $env:BANTO_SLMP_WRITE_COMPONENT_WASM = Get-GuestFile $guestDir 'slmp-write-component.wasm'
+          $env:BANTO_SLMP_RANGE_WRITE_COMPONENT_WASM = Get-GuestFile $guestDir 'slmp-range-write-component.wasm'
+          $slmpWriteTestLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-write-hub-test.txt'
+          Invoke-ArchivedTest -Label 'SLMP WASM controlled write Hub tests' -Expected 13 -Filter 'binary_id(banto-hub-host::t12_connection_test) & test(~slmp_wasm_write_test::)' -Log $slmpWriteTestLog
+          $env:BANTO_SLMP_Q_WRITE_COMPONENT_WASM = Get-GuestFile $guestDir 'slmp-q25prh-test-write-component.wasm'
+          $qTestLog = Join-Path $env:RUNNER_TEMP 'wasm-q25prh-test-write-hub-test.txt'
+          Invoke-ArchivedTest -Label 'Q25PRH test-write Hub tests' -Expected 4 -Filter 'binary_id(banto-hub-host::t12_connection_test) & test(~slmp_wasm_q_write_test::)' -Log $qTestLog
+          $qGuardLog = Join-Path $env:RUNNER_TEMP 'wasm-q25prh-test-write-guard-test.txt'
+          Invoke-ArchivedTest -Label 'Q25PRH test-write guard tests' -Expected 2 -Filter 'binary_id(banto-hub-host::slmp_wasm_live_q_range_write)' -RunIgnored default -Log $qGuardLog
+          $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM = Get-GuestFile $guestDir 'slmp-normal-write-component.wasm'
+          $normalWriteLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-normal-write-hub-test.txt'
+          Invoke-ArchivedTest -Label 'normal SLMP write Hub tests' -Expected 6 -Filter 'binary_id(banto-hub-host::t12_connection_test) & test(~slmp_wasm_operational_write_test::) - test(~new_guest_) - test(~bit_bool_values_and_device_error_survive_the_host_read_boundary) - test(~saved_bit_tags_keep_values_and_quality_after_collection) - test(~explicit_w_range_uses_the_same_q_and_r_gate_without_broadening_d) - test(~diagnostic_guest_uses_existing_connection_and_preserves_read) - test(~saved_tags_are_diagnosed_through_the_authenticated_rest_and_broker_path) - test(~high_low_word_order_is_preserved_through_host_and_guest) - test(~typed_words_are_one_complete_frame_and_bad_items_send_nothing) - test(~standard_q_and_r_bit_areas_use_bool_and_one_frame_per_allowed_run) - test(~malformed_allowlist_notation_is_rejected_and_sends_no_write_frame) - test(~w_write_with_unknown_ack_or_plc_error_never_succeeds_or_replays)' -Log $normalWriteLog
+          $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM = Get-GuestFile $guestDir 'slmp-common-dw-component.wasm'
+          $commonDwLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-common-dw-hub-test.txt'
+          Invoke-ArchivedTest -Label 'common D/W SLMP Hub tests' -Expected 11 -Filter 'binary_id(banto-hub-host::t12_connection_test) & test(~slmp_wasm_operational_write_test::) - test(~new_guest_) - test(~diagnostic_guest_uses_existing_connection_and_preserves_read) - test(~saved_tags_are_diagnosed_through_the_authenticated_rest_and_broker_path) - test(~high_low_word_order_is_preserved_through_host_and_guest) - test(~typed_words_are_one_complete_frame_and_bad_items_send_nothing) - test(~standard_q_and_r_bit_areas_use_bool_and_one_frame_per_allowed_run)' -Log $commonDwLog
+          $env:BANTO_SLMP_LEGACY_COMPONENT_WASM = $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM
+          $env:BANTO_STAGE2_SLMP_WASM = $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM
+          $env:BANTO_LOCAL_W_WASM = $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM
+          # 数値 2 種の回帰（元は 2 回の起動）。環境変数は同じなので 1 回にまとめる。
+          Invoke-ArchivedTestGroup -Label 'common D/W SLMP numeric regression' -Parts @(
+            @{ Id = 'r_eight_numeric_kinds_collect_and_serve_rest'; Binary = $hubConn; Like = @('slmp_wasm_test::r_eight_numeric_kinds_collect_and_serve_rest'); Expected = 0 },
+            @{ Id = 'r_w_eight_numeric_kinds_collect_and_serve_rest'; Binary = $hubConn; Like = @('slmp_wasm_test::r_w_eight_numeric_kinds_collect_and_serve_rest'); Expected = 0 }
+          )
+          $env:BANTO_SLMP_DIAGNOSTICS_COMPONENT_WASM = Get-GuestFile $guestDir 'slmp-diagnostics-component.wasm'
+          Invoke-ArchivedTest -Label 'optional diagnostics world compatibility' -Expected 0 -Filter 'binary_id(banto-driver-wasm::diagnostics_v1)'
+          $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM = $env:BANTO_SLMP_DIAGNOSTICS_COMPONENT_WASM
+          $diagnosticLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-diagnostics-hub-test.txt'
+          Invoke-ArchivedTest -Label 'diagnostic SLMP Hub tests' -Expected 16 -Filter 'binary_id(banto-hub-host::t12_connection_test) & test(~slmp_wasm_operational_write_test::) - test(~new_guest_)' -Log $diagnosticLog
+          # 新しい SLMP ゲスト（#43〜#78）: component 単位の試験 9 本と Hub の受け入れ・時計同期を
+          # 同じ環境変数で 1 回にまとめる。
+          $env:BANTO_SLMP_NEW_COMPONENT_WASM = Get-GuestFile $guestDir 'slmp-44-component.wasm'
+          $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM = $env:BANTO_SLMP_NEW_COMPONENT_WASM
+          $env:BANTO_SLMP_DIAGNOSTICS_COMPONENT_WASM = $env:BANTO_SLMP_NEW_COMPONENT_WASM
+          # Component-level word-bit RMW: a confirm-read mismatch is
+          # verification-failed for that item only (#906).
+          # Component-level E4 (UDP over a loopback peer, 4E and 3E) and C1
+          # (D/W string bytes and the one-1401 write) for the same guest.
+          # Component-level G1 (U\G reads on Q and R, byte-exact frames, one
+          # request per tag, per-item Unsupported, end codes, no writes).
+          # Component-level G2a (QnPH, QnUDPV, MELSEC-L, Q12PRH recognized by the
+          # exact 0101 pair; mismatched pairs stay Unknown).
+          # Component-level G2b (iQ-R process, SIL2 process, safety CPU and MX-R
+          # recognized by the exact 0101 pair; S only on the process CPU).
+          # Component-level G2c (FX5 recognized by code table plus FX5 name on
+          # 3E own station; R<n> read-only and FX5 only; X/Y/ZR/U\G per-item
+          # Unsupported; 4E or another station is Unknown; D/M writes only).
+          # Component-level G3 (labels read by one 041C byte for byte incl. a
+          # UTF-16 non-ASCII name, per-item type mismatch, 041C check + 141B
+          # write, Hub label gate sends nothing, standard Q sends no label).
+          # Component-level H (clock-v1 on iQ-R over 4E and 3E: the four exact
+          # requests, SM210/SM211 outcomes, end code, guest gate, standard Q
+          # and the read-only loader send nothing, a short response is fatal).
+          # Component-level H3 (clock-read-v1 on iQ-R and standard Q over 4E
+          # and 3E: the two exact requests, BIN and BCD, SM213 OFF / SM210 ON
+          # rejected, verification-failed, end codes, Q25PRH and FX5 send
+          # nothing, a short response is fatal, the read-only loader offers
+          # the read but not the clock set).
+          # H2 (Hub clock sync, #1053): the scheduler, manual REST, the two
+          # gates, each result's audit and the timeout without a resend,
+          # through the operational loader and a loopback SLMP peer.
+          # H3 (Hub clock read): GET /clock on R and Q, the 5 s reuse, SM213
+          # OFF, the read-only loader and the reads before/after a clock sync
+          # in its audit (5 more tests in the same module).
+          Invoke-ArchivedTestGroup -Label 'new SLMP guest component and Hub tests' -Parts @(
+            @{ Id = 'SLMP word-bit component test'; Binary = 'banto-driver-wasm::slmp_word_bit_write'; Expected = 1 },
+            @{ Id = 'SLMP UDP/string component tests'; Binary = 'banto-driver-wasm::slmp_udp_strings'; Expected = 4 },
+            @{ Id = 'SLMP U\G component tests'; Binary = 'banto-driver-wasm::slmp_unit_buffer'; Expected = 6 },
+            @{ Id = 'SLMP G2a component tests'; Binary = 'banto-driver-wasm::slmp_g2a_models'; Expected = 5 },
+            @{ Id = 'SLMP G2b component tests'; Binary = 'banto-driver-wasm::slmp_g2b_models'; Expected = 4 },
+            @{ Id = 'SLMP G2c component tests'; Binary = 'banto-driver-wasm::slmp_g2c_models'; Expected = 7 },
+            @{ Id = 'SLMP G3 component tests'; Binary = 'banto-driver-wasm::slmp_g3_labels'; Expected = 6 },
+            @{ Id = 'SLMP H component tests'; Binary = 'banto-driver-wasm::slmp_h_clock'; Expected = 6 },
+            @{ Id = 'SLMP H3 component tests'; Binary = 'banto-driver-wasm::slmp_h3_clock_read'; Expected = 8 },
+            @{ Id = 'new SLMP Hub acceptance tests'; Binary = $hubConn; Like = @('slmp_wasm_operational_write_test::'); Expected = 57 },
+            @{ Id = 'H2 clock sync Hub acceptance tests'; Binary = $hubConn; Like = @('slmp_wasm_clock_test::'); Expected = 11 }
+          )
+          # Stage-2 numeric reads use the separately reviewed guest revision.
+          # Keep the older guest revisions above for read and write regressions.
+          $env:BANTO_STAGE2_MODBUS_MANIFEST = Get-GuestFile $manifestDir 'numeric-modbus-manifest.json'
+          $env:BANTO_STAGE2_MODBUS_WASM = Get-GuestFile $guestDir 'numeric-modbus-component.wasm'
+          $env:BANTO_STAGE2_SLMP_WASM = Get-GuestFile $guestDir 'numeric-slmp-component.wasm'
+          Invoke-ArchivedTestGroup -Label 'WASM numeric stage-2 host and Hub tests' -Parts @(
+            @{ Id = 'WASM numeric stage-2 host tests'; Binary = 'banto-driver-wasm::numeric_stage2'; Not = @('local_fc4_eight_kinds_use_input_registers_without_write_capability', 'local_r_w_eight_kinds_use_hex_addresses_without_write_capability'); Expected = 6 },
+            @{ Id = 'WASM numeric stage-2 Hub tests'; Binary = $hubConn; Like = @('eight_numeric_kinds_collect_and_serve_rest'); Not = @('wasm_fc4_eight_numeric_kinds_collect_and_serve_rest', 'slmp_wasm_test::r_w_eight_numeric_kinds_collect_and_serve_rest'); Expected = 2 }
+          )
+          # FC4 and SLMP W use a separately reviewed read-only guest revision.
+          # Keep the stage-2 and write revisions above pinned for regressions.
+          $env:BANTO_LOCAL_FC4_MANIFEST = Get-GuestFile $manifestDir 'fc4-modbus-manifest.json'
+          $env:BANTO_LOCAL_FC4_WASM = Get-GuestFile $guestDir 'fc4-modbus-component.wasm'
+          $env:BANTO_LOCAL_W_WASM = Get-GuestFile $guestDir 'slmp-w-component.wasm'
+          Invoke-ArchivedTestGroup -Label 'FC4/W host and Hub tests' -Parts @(
+            @{ Id = 'FC4/W host tests'; Binary = 'banto-driver-wasm::numeric_stage2'; Like = @('local_'); Expected = 2 },
+            @{ Id = 'FC4/W Hub tests'; Binary = $hubConn; Like = @('eight_numeric_kinds_collect_and_serve_rest'); Not = @('wasm_fc3_eight_numeric_kinds_collect_and_serve_rest', 'slmp_wasm_test::r_eight_numeric_kinds_collect_and_serve_rest'); Expected = 2 }
+          )
+          # Modbus FC1/2/3/4 and gated FC5/6/15/16/22 join uses the exact reviewed
+          # guest package manifest and the optional write world.
           # #695: WASM の接続はシミュレーションのとき実ホストへ一度も接続・送信しない
-          # （t12_wasm_all_simulation。同じ Modbus component を使う）。
-          $wasmAllSimLog = Join-Path $env:RUNNER_TEMP 'wasm-all-simulation-test.txt'
-          Invoke-ArchivedTest -Label 'WASM all-simulation Hub tests' -Expected 4 -Filter 'binary_id(banto-hub-host::t12_connection_test) & test(~wasm_all_simulation_test::)' -Log $wasmAllSimLog
+          # （t12_wasm_all_simulation。同じ Modbus component を使う）。同じ環境変数なので 1 回にまとめる。
+          $env:BANTO_MODBUS_MANIFEST = Get-GuestFile $manifestDir 'modbus-join-manifest.json'
+          $env:BANTO_MODBUS_COMPONENT_WASM = Get-GuestFile $guestDir 'modbus-join-component.wasm'
+          Invoke-ArchivedTestGroup -Label 'Modbus join adapter, Hub join and all-simulation tests' -Parts @(
+            @{ Id = 'Modbus join adapter tests'; Binary = 'banto-driver-wasm::modbus_join'; Expected = 11 },
+            @{ Id = 'Modbus Hub join tests'; Binary = $hubConn; Like = @('modbus_wasm_join_test::'); Expected = 10 },
+            @{ Id = 'WASM all-simulation Hub tests'; Binary = $hubConn; Like = @('wasm_all_simulation_test::'); Expected = 4 }
+          )
 
   # #ci-speed（2026-10-19）: `rust-test-build` のアーカイブを 3 台にシャーディングして
   # 走らせる。ビルドはしない（Rust ツールチェーンも rust-cache も使わない）。
