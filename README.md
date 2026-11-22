@@ -8,6 +8,15 @@ SvelteKit / Tauri のフロントで構成する。
 - 全体計画: [docs/plan.md](docs/plan.md)
 - タグサーバー banto-hub の設計: [docs/hub/tag-server-design.md](docs/hub/tag-server-design.md)
 
+## ブラウザで触れるデモ
+
+インストールせずに画面を触れるデモを GitHub Pages に置いている:
+<https://tyaro.github.io/banto-industrial/>
+
+- 触れる画面は、Hub の `/tags`（タグの登録とモニタ）と、ChronoGazer の `/tags`（タグの登録）・`/monitor`（トレンド）だけ。ほかの画面はメニューに出さない。
+- ログインは無い。サーバー・PLC には繋がず、通信を模擬に差し替えた値で動く（外への送信は無い）。変更はブラウザのメモリにだけ残り、読み直すと初めの状態に戻る。
+- 配信はリリースのときに手で回す（`deploy-demo.yml`）ので、main の最新とは限らない。作りは [docs/demo-pages-design.md](docs/demo-pages-design.md)。
+
 ## アプリ・パッケージ
 
 | 場所                                           | 役目                                                                                                                                                                                               |
