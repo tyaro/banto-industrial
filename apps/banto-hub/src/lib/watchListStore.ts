@@ -74,6 +74,7 @@ import {
 	sameWatchList,
 	serializeWatchList,
 	watchListKeys,
+	withoutDeadInOp,
 	withoutIds,
 	type AddResult,
 	type WatchOp
@@ -240,7 +241,7 @@ export function createWatchListStore(deps: WatchListStoreDeps = {}): WatchListSt
 
 	function computeList(): number[] {
 		let next = withoutIds(base ?? initial, dead);
-		for (const op of ops) next = applyWatchOp(next, op).list;
+		for (const op of ops) next = applyWatchOp(next, withoutDeadInOp(op, dead)).list;
 		return next;
 	}
 
@@ -375,7 +376,7 @@ export function createWatchListStore(deps: WatchListStoreDeps = {}): WatchListSt
 		if (n > 0) {
 			let applied = withoutIds(server, dead);
 			for (const op of pending) {
-				const result = applyWatchOp(applied, op);
+				const result = applyWatchOp(applied, withoutDeadInOp(op, dead));
 				applied = result.list;
 				overLimit += result.overLimit;
 			}
@@ -412,7 +413,7 @@ export function createWatchListStore(deps: WatchListStoreDeps = {}): WatchListSt
 		apply(op) {
 			if (disposed) return { list, added: 0, duplicates: 0, overLimit: 0 };
 			// 手元の上限の判定は仮（操作は捨てない）。最終の判定は周回の中（冒頭の手順 5）。
-			const result = applyWatchOp(list, op);
+			const result = applyWatchOp(list, withoutDeadInOp(op, dead));
 			// 操作の無い間の失敗（読み直しの失敗）を、新しい操作の「保存できていません」にしない。
 			if (ops.length === 0 && lastError !== 'auth') lastError = null;
 			ops.push(op);

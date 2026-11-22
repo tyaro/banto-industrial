@@ -296,6 +296,27 @@ describe('createWatchListStore', () => {
 		store.dispose();
 	});
 
+	it('6d2: 溜めた足す操作の消えた id は当て直しでも除き、残りの追加は上限で落ちない', async () => {
+		const server = fakeProvider(serializeWatchList(range(1, 99)));
+		const checker = fakeChecker([101]);
+		const { store, changes } = setup(server, { checkTagIds: checker.check });
+		await store.load();
+		const gate = server.deferNextGet();
+		store.apply({ kind: 'add', ids: [101, 102] });
+		await settle();
+		// GET を待つ間に 101 が別の画面で消され、照会が gone を返す。
+		store.setKnownLiveIds(range(1, 99));
+		await settle();
+		expect(store.list).toEqual([...range(1, 99), 102]);
+		gate.release();
+		await settle();
+		expect(server.saved()).toBe(serializeWatchList([...range(1, 99), 102]));
+		expect(store.list).toHaveLength(100);
+		expect(store.list).toEqual([...range(1, 99), 102]);
+		expect(changes.every((c) => c.overLimit === 0)).toBe(true);
+		store.dispose();
+	});
+
 	it('6e: 手がかりにある id は照会せず、照会中の id は重ねず、消えた id は二度と照会しない', async () => {
 		const server = fakeProvider(serializeWatchList([1, 2, 3]));
 		const checker = fakeChecker([2]);

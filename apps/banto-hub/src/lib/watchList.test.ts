@@ -6,6 +6,7 @@ import {
 	parseWatchList,
 	checkIdsConcurrently,
 	withoutIds,
+	withoutDeadInOp,
 	removeFromWatch,
 	sameWatchList,
 	serializeWatchList,
@@ -150,5 +151,23 @@ describe('checkIdsConcurrently', () => {
 		const checkOne = vi.fn(async () => 'exists');
 		expect((await checkIdsConcurrently([], checkOne)).size).toBe(0);
 		expect(checkOne).not.toHaveBeenCalled();
+	});
+});
+
+describe('withoutDeadInOp', () => {
+	it('足す操作の ids から dead だけを除き、不明の id は残す', () => {
+		expect(withoutDeadInOp({ kind: 'add', ids: [1, 2, 3] }, new Set([2]))).toEqual({
+			kind: 'add',
+			ids: [1, 3]
+		});
+	});
+
+	it('dead が空なら同じ操作、足す以外はそのまま', () => {
+		const add = { kind: 'add', ids: [1] } as const;
+		expect(withoutDeadInOp(add, new Set())).toBe(add);
+		const remove = { kind: 'remove', id: 2 } as const;
+		expect(withoutDeadInOp(remove, new Set([2]))).toBe(remove);
+		const clear = { kind: 'clear' } as const;
+		expect(withoutDeadInOp(clear, new Set([2]))).toBe(clear);
 	});
 });

@@ -146,6 +146,15 @@ export function applyWatchOp(
 	}
 }
 
+/**
+ * 足す操作の `ids` から、消えたと確定した id（`dead`）だけを除く。確かめられない（不明の）
+ * id は `dead` に入らないので残る。足す以外の操作はそのまま返す。
+ */
+export function withoutDeadInOp(op: WatchOp, dead: ReadonlySet<number>): WatchOp {
+	if (op.kind !== 'add' || dead.size === 0) return op;
+	return { kind: 'add', ids: op.ids.filter((id) => !dead.has(id)) };
+}
+
 /** 操作を順に当てた一覧（基準は書き換えない）。 */
 export function applyWatchOps(
 	base: readonly number[],
