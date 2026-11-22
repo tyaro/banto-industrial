@@ -10,12 +10,12 @@ SvelteKit / Tauri のフロントで構成する。
 
 ## アプリ・パッケージ
 
-| 場所                                           | 役目                                                                                                                                                                   |
-| ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [apps/banto-hub](apps/banto-hub/README.md)     | FA-Server 型のタグサーバー。PLC（Modbus TCP / MELSEC SLMP）から収集し、REST / WebSocket / MQTT / gRPC / MCP で公開する。ヘッドレスの単一 exe で管理 UI も配信          |
-| apps/banto-hub-sink                            | banto-hub のタグを購読し、値を外部の PostgreSQL へまとめて書き込む別プロセスのサイドカー（`banto-hub-sink.exe`。設定ファイルで動き、Windows サービスとして登録できる） |
-| [apps/chronogazer](apps/chronogazer/README.md) | 記録計。監視・ヒストリカル・日報・期間 CSV・表示グループ・自由トレンド。Hub 経由・SLMP・Modbus の 3 ドライバで単体でも動く                                             |
-| [packages/trend](packages/trend/README.md)     | トレンドのチャートの部品（`@banto-industrial/trend`）。ChronoGazer と temp-scada が使う。タグ `trend-v*` で配る                                                        |
+| 場所                                           | 役目                                                                                                                                                                                               |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [apps/banto-hub](apps/banto-hub/README.md)     | FA-Server 型のタグサーバー。PLC（Modbus TCP / MELSEC SLMP）から収集し、REST / WebSocket / MQTT / gRPC / MCP と OPC UA（任意で有効・読み取り専用）で公開する。ヘッドレスの単一 exe で管理 UI も配信 |
+| apps/banto-hub-sink                            | banto-hub のタグを購読し、値を外部の PostgreSQL へまとめて書き込む別プロセスのサイドカー（`banto-hub-sink.exe`。設定ファイルで動き、Windows サービスとして登録できる）                             |
+| [apps/chronogazer](apps/chronogazer/README.md) | 記録計。監視・ヒストリカル・日報・期間 CSV・表示グループ・自由トレンド。Hub 経由・SLMP・Modbus の 3 ドライバで単体でも動く                                                                         |
+| [packages/trend](packages/trend/README.md)     | トレンドのチャートの部品（`@banto-industrial/trend`）。ChronoGazer と temp-scada が使う。タグ `trend-v*` で配る                                                                                    |
 
 ## クレート（crates/）
 
