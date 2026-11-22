@@ -81,7 +81,7 @@ function valuesOf(registry: ChronoGazerRegistry, nowMs: number): ValuesResponse 
 		const group = registry.group(tag.collectionGroupId);
 		const sampleMs = demoSampleTime(nowMs, group?.periodMs);
 		data[`tag:${tag.id}`] = {
-			value: demoTagValue({ id: tag.id, dataType: tag.dataType, periodMs: group?.periodMs }, nowMs),
+			value: demoTagValue(valueInputOf(registry, tag), nowMs),
 			ptimeMs: sampleMs,
 			quality: 'good',
 			lastGoodMs: sampleMs
@@ -90,13 +90,59 @@ function valuesOf(registry: ChronoGazerRegistry, nowMs: number): ValuesResponse 
 	return { state: 'ready', data, serverNowMs: nowMs };
 }
 
-/** 要求のタグ ID（重複は除く。数でないものは落とす）。 */
-function requestedTagIds(query: URLSearchParams): number[] {
-	const ids = (query.get('tagIds') ?? '')
-		.split(',')
-		.filter((s) => s.trim() !== '')
-		.map((s) => Number(s));
-	return [...new Set(ids)];
+/** タグ ID の文字列を整数にする（本物の `parse_tag_ids`: 空の要素・整数でない要素は `tagIds` の誤り）。 */
+function parseTagIds(raw: string): number[] {
+	const trimmed = raw.trim();
+	if (trimmed === '') return [];
+	const ids = trimmed.split(',').map((part) => part.trim());
+	if (ids.some((part) => !/^[+-]?\d+$/.test(part))) {
+		throw new DemoValidationError([
+			{ field: 'tagIds', message: 'タグ ID はカンマ区切りの整数で指定してください' }
+		]);
+	}
+	return [...new Set(ids.map(Number))];
+}
+
+/**
+ * 履歴のクエリを読む。欠けた `fromMs`・`toMs`・`bins` は 3 つまとめて「必須です」（本物の
+ * `history_request_from_query`）。整数でない値は、本物は axum の 400 だが、模擬は同じ項目の 422 で断る。
+ */
+function parseHistoryQuery(query: URLSearchParams): {
+	ids: number[];
+	fromMs: number;
+	toMs: number;
+	bins: number;
+} {
+	const missing = ['fromMs', 'toMs', 'bins'].filter((f) => !query.has(f));
+	if (missing.length > 0) {
+		throw new DemoValidationError(missing.map((field) => ({ field, message: '必須です' })));
+	}
+	const integer = (field: string, min: number): number => {
+		const raw = (query.get(field) ?? '').trim();
+		const n = Number(raw);
+		if (!/^[+-]?\d+$/.test(raw) || !Number.isSafeInteger(n) || n < min) {
+			throw new DemoValidationError([{ field, message: '整数で指定してください' }]);
+		}
+		return n;
+	};
+	const ids = parseTagIds(query.get('tagIds') ?? '');
+	return {
+		ids,
+		fromMs: integer('fromMs', Number.MIN_SAFE_INTEGER),
+		toMs: integer('toMs', Number.MIN_SAFE_INTEGER),
+		bins: integer('bins', 0)
+	};
+}
+
+/** タグとグループから値の関数の入力を作る（現在値・履歴の両方がこれを使い、同じ時刻なら同じ値になる）。 */
+function valueInputOf(registry: ChronoGazerRegistry, tag: Tag) {
+	const group = registry.group(tag.collectionGroupId);
+	return {
+		id: tag.id,
+		dataType: tag.dataType,
+		decimals: tag.decimals,
+		periodMs: group?.periodMs
+	};
 }
 
 /**
@@ -109,10 +155,7 @@ function historyOf(
 	query: URLSearchParams,
 	nowMs: number
 ): Readout<CollectHistory> {
-	const ids = requestedTagIds(query);
-	const fromMs = Number(query.get('fromMs'));
-	const toMs = Number(query.get('toMs'));
-	const bins = Number(query.get('bins'));
+	const { ids, fromMs, toMs, bins } = parseHistoryQuery(query);
 	const errors = validateDemoHistoryRequest(ids, fromMs, toMs, bins);
 	if (errors.length > 0) throw new DemoValidationError(errors);
 
@@ -124,15 +167,8 @@ function historyOf(
 			unknownTagIds.push(id);
 			continue;
 		}
-		const group = registry.group(tag.collectionGroupId);
 		const { binMs, points } = demoTagHistory(
-			{
-				id: tag.id,
-				dataType: tag.dataType,
-				decimals: tag.decimals,
-				periodMs: group?.periodMs,
-				collected: isCollected(registry, tag)
-			},
+			{ ...valueInputOf(registry, tag), collected: isCollected(registry, tag) },
 			fromMs,
 			toMs,
 			bins,
@@ -160,16 +196,25 @@ export function createChronoGazerRoutes(
 		{
 			method: 'GET',
 			path: '/api/collect/values',
-			handle: () => json(valuesOf(registry, Date.now()))
+			handle: () => {
+				const values = valuesOf(registry, Date.now());
+				// E2E が「現在値のポーリングに模擬が応えた」回数を数える印（履歴とは別に確かめる）。
+				console.debug('demo: 現在値を返しました');
+				return json(values);
+			}
 		},
 		// `/monitor` が最初のグループで読む。
 		{
 			method: 'GET',
 			path: '/api/collect/history',
 			handle: guarded((req) => {
-				// E2E が「模擬の履歴の応答を実際に返した」ことを待つ印（デモのビルドにだけある模擬のコード）。
-				console.debug('demo: 履歴を返しました');
-				return json(historyOf(registry, req.url.searchParams, Date.now()));
+				const history = historyOf(registry, req.url.searchParams, Date.now());
+				// E2E が「模擬の履歴の応答を返した」ことと、中身が空でないことを確かめる印
+				// （デモのビルドにだけある模擬のコード。応答を作った後に出す）。
+				const data = history.state === 'ready' ? history.data : undefined;
+				const points = data?.series.reduce((n, s) => n + s.points.length, 0) ?? 0;
+				console.debug(`demo: 履歴を返しました（系列 ${data?.series.length ?? 0}・点 ${points}）`);
+				return json(history);
 			})
 		},
 

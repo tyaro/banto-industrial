@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { matchPath, type DemoHttpRoute, type DemoRequest } from '@banto-industrial/demo-backend';
 import type { TagInput } from '#lib/banto/tagRegistryAdmin.js';
 import { ChronoGazerRegistry, DemoNotFoundError, DemoValidationError } from './chronogazerState';
@@ -150,6 +150,8 @@ describe('ChronoGazerRegistry（模擬の登録）', () => {
 });
 
 describe('createChronoGazerRoutes（口）', () => {
+	afterEach(() => vi.useRealTimers());
+
 	function call(routes: DemoHttpRoute[], method: string, fullPath: string, body?: unknown) {
 		const url = new URL(fullPath, 'http://demo.local');
 		const path = url.pathname;
@@ -268,6 +270,63 @@ describe('createChronoGazerRoutes（口）', () => {
 		const body = await res.json();
 		expect(body.data.unknownTagIds).toEqual([]);
 		expect(body.data.series[0].points.every((p: { min: null }) => p.min === null)).toBe(true);
+	});
+
+	it('同じ時刻の現在値と履歴の 1 点は同じ値（decimals も同じに丸める）', async () => {
+		const routes = createChronoGazerRoutes();
+		// press_position（ID 2・f32・1 桁・500ms 周期）。500ms の標本の時刻ちょうどに合わせる。
+		const t = 1_800_000_000_000;
+		vi.useFakeTimers();
+		vi.setSystemTime(t + 1);
+		const values = await (await call(routes, 'GET', '/api/collect/values')).json();
+		// 幅 1 標本の区間: binMs = ceil((toMs - fromMs + 1) / bins) = 1。
+		const history = await (
+			await call(routes, 'GET', `/api/collect/history?tagIds=2&fromMs=${t}&toMs=${t + 1}&bins=2`)
+		).json();
+		const point = history.data.series[0].points[0];
+		expect(history.data.series[0].binMs).toBe(1);
+		expect(point.tMs).toBe(t);
+		expect(point.min).toBe(point.max);
+		expect(values.data['tag:2'].ptimeMs).toBe(t);
+		expect(point.min).toBe(values.data['tag:2'].value);
+	});
+
+	it('GET /api/collect/history: tagIds・欠けた値・整数でない値は本物と同じ項目の 422 で、NaN を出さない', async () => {
+		const routes = createChronoGazerRoutes();
+		const now = Date.now();
+		const win = `fromMs=${now - 1000}&toMs=${now}&bins=10`;
+		const errors = async (qs: string) => {
+			const res = await call(routes, 'GET', `/api/collect/history?${qs}`);
+			expect(res.status).toBe(422);
+			return (await res.json()).field_errors as { field: string; message: string }[];
+		};
+		for (const ids of ['1,a', '1,,2', '1.5', 'abc']) {
+			expect(await errors(`tagIds=${ids}&${win}`)).toEqual([
+				{ field: 'tagIds', message: 'タグ ID はカンマ区切りの整数で指定してください' }
+			]);
+		}
+		// 欠けた fromMs・toMs・bins は 3 つまとめて「必須です」（tagIds の検証より先）。
+		expect(await errors('tagIds=abc')).toEqual([
+			{ field: 'fromMs', message: '必須です' },
+			{ field: 'toMs', message: '必須です' },
+			{ field: 'bins', message: '必須です' }
+		]);
+		expect((await errors(`tagIds=1&fromMs=${now - 1000}&toMs=${now}`)).map((e) => e.field)).toEqual(
+			['bins']
+		);
+		for (const bad of [
+			'fromMs=x&toMs=1&bins=1',
+			'fromMs=0&toMs=&bins=1',
+			'fromMs=0&toMs=1&bins=-1'
+		]) {
+			expect((await errors(`tagIds=1&${bad}`)).length).toBe(1);
+		}
+		// 空白つき・重複は通り、unknownTagIds に NaN（JSON の null）は出ない。
+		const ok = await (
+			await call(routes, 'GET', `/api/collect/history?tagIds=1%2C+2%2C1%2C9999&${win}`)
+		).json();
+		expect(ok.data.series.map((x: { tagId: number }) => x.tagId)).toEqual([1, 2]);
+		expect(ok.data.unknownTagIds).toEqual([9999]);
 	});
 
 	it('DELETE /api/tags/:id は使用中のタグを 422 displayGroups で断る', async () => {
