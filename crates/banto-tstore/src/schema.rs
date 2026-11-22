@@ -114,18 +114,46 @@ pub(crate) async fn connect_readonly(path: &Path) -> Result<SqlitePool, TstoreEr
     Ok(SqlitePoolOptions::new().connect_with(options).await?)
 }
 
+/// [`create_schema`] の結果（#1304）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SchemaInit {
+    /// 空のファイルにスキーマを作った。
+    Created,
+    /// 書き込みのロックを取った時点で表が既にあった（別の初期化が先に済ませた、または
+    /// banto-tstore のファイルではない）。ファイルには何も書かずにロールバックした。呼び出し側は
+    /// [`read_file_meta`] を読み直して判断する。
+    AlreadyInitialized,
+}
+
 /// Create every table (`tstore_meta`/`tstore_groups`/`tstore_columns` +
 /// one `samples_<n>` per group) and populate the two metadata tables, all in
 /// one transaction - `config` must already have passed [`StoreConfig::validate`]
 /// (this crate's two callers, both in `writer.rs`, always validate first).
+///
+/// #1304: 空のファイルにだけ作る。`BEGIN IMMEDIATE` で書き込みのロックを先に取り（WAL でも
+/// 書き手は 1 つだけになる。待ちは接続の busy_timeout）、同じトランザクションの中で
+/// `sqlite_master` が空かを見る。空でなければ何も変えずにロールバックし
+/// [`SchemaInit::AlreadyInitialized`] を返す。空の判定と作成の間に別の初期化が割り込めないので、
+/// 既にあるファイル（使われている収集ファイル・他の表のあるファイル）を書き換えない。作成が
+/// 途中で失敗したとき（列数の上限など）もロールバックで表は残らず、ファイルは空のまま残るので、
+/// 次の open が同じ口で作り直せる（失敗した分を名前で消すことはしない）。
 pub(crate) async fn create_schema(
     pool: &SqlitePool,
     config: &StoreConfig,
     config_hash: &str,
     date: LocalDate,
     created_at_ms: i64,
-) -> Result<(), TstoreError> {
-    let mut tx = pool.begin().await?;
+) -> Result<SchemaInit, TstoreError> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+
+    let has_any_object = sqlx::query("SELECT name FROM sqlite_master LIMIT 1")
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+    if has_any_object {
+        tx.rollback().await?;
+        return Ok(SchemaInit::AlreadyInitialized);
+    }
 
     sqlx::query("CREATE TABLE tstore_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         .execute(&mut *tx)
@@ -217,17 +245,7 @@ pub(crate) async fn create_schema(
     }
 
     tx.commit().await?;
-    Ok(())
-}
-
-/// ファイルに表が 1 つも無い（`sqlite_master` が空）か。`create_schema` が途中で失敗して
-/// 残った空のファイル（4096 バイト）の判定に使う（#1304）。`tstore_meta` が無くても他の表が
-/// あるなら（banto-tstore のファイルではない）`false`。
-pub(crate) async fn is_empty_database(pool: &SqlitePool) -> Result<bool, TstoreError> {
-    Ok(sqlx::query("SELECT name FROM sqlite_master LIMIT 1")
-        .fetch_optional(pool)
-        .await?
-        .is_none())
+    Ok(SchemaInit::Created)
 }
 
 /// Read a file's `tstore_meta`/`tstore_groups`/`tstore_columns` back into a
