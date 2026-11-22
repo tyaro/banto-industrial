@@ -125,6 +125,12 @@ pub(crate) enum SchemaInit {
     AlreadyInitialized,
 }
 
+/// 試験だけの差し込み: 先頭のグループのキーがこの値のとき、`create_schema` は 3 つの表を作った後で
+/// 誤りを返す（作成の途中の失敗からの回復を、設定の検証に依らずに試すため）。キーで判定するので
+/// 並列に走る試験どうしで干渉しない。製品のビルドには入らない。
+#[cfg(test)]
+pub(crate) const TEST_FAIL_CREATE_KEY: &str = "__fail_create_schema__";
+
 /// Create every table (`tstore_meta`/`tstore_groups`/`tstore_columns` +
 /// one `samples_<n>` per group) and populate the two metadata tables, all in
 /// one transaction - `config` must already have passed [`StoreConfig::validate`]
@@ -183,6 +189,17 @@ pub(crate) async fn create_schema(
     )
     .execute(&mut *tx)
     .await?;
+
+    #[cfg(test)]
+    if config
+        .groups
+        .first()
+        .is_some_and(|g| g.key == TEST_FAIL_CREATE_KEY)
+    {
+        return Err(TstoreError::Storage(
+            "injected create_schema failure".to_string(),
+        ));
+    }
 
     for meta_row in [
         ("format_version", FORMAT_VERSION.to_string()),

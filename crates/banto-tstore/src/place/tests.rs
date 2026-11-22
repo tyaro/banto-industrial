@@ -675,6 +675,13 @@ fn wide_config(tags: usize) -> StoreConfig {
     }
 }
 
+/// `create_schema` が 3 つの表を作った後で失敗する設定（試験だけの差し込み）。
+fn failing_config() -> StoreConfig {
+    let mut config = wide_config(10);
+    config.groups[0].key = crate::schema::TEST_FAIL_CREATE_KEY.to_string();
+    config
+}
+
 /// 本体と `-wal` のバイト列、`-wal`・`-shm` の有無（`-shm` の中身は接続でも変わるので有無だけ）。
 fn file_set_snapshot(dir: &Path, name: &str) -> (Vec<u8>, Option<Vec<u8>>, bool) {
     let body = std::fs::read(dir.join(name)).unwrap();
@@ -698,12 +705,12 @@ async fn create_schema_does_not_touch_a_held_file_in_use() {
         writer.flush().await.unwrap();
         let before = file_set_snapshot(&held.data_path, &day1_name());
 
-        // 書き手が開いたままのファイルを、別の口から握って作成を当てる（列数の上限で失敗する
+        // 書き手が開いたままのファイルを、別の口から握って作成を当てる（作成で失敗する
         // 設定でも、表があるので試みずに戻る）。
         let other = place.open_writable(&day1_name()).await.unwrap();
         let outcome = crate::schema::create_schema(
             &other.pool,
-            &wide_config(2000),
+            &failing_config(),
             "other-hash",
             LocalDate::from_epoch_ms(DAY1_START_MS, OFFSET_MS),
             DAY1_START_MS,
@@ -753,12 +760,12 @@ async fn a_failed_create_leaves_an_empty_held_file_the_next_open_initializes() {
         let held = held(mode);
         let err = TsWriter::open_in(
             held.place(),
-            wide_config(2000),
+            failing_config(),
             clock_at(DAY1_START_MS),
             WriterOptions::default(),
         )
         .await;
-        assert!(err.is_err(), "{mode:?}: 列数の上限で open は失敗する");
+        assert!(err.is_err(), "{mode:?}: 作成の途中の失敗で open は失敗する");
         assert!(held.names().contains(&day1_name()), "{mode:?}");
 
         // 表の無いファイルは、次の open が同じ連番で作り直す。

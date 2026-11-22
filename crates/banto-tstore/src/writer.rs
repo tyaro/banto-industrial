@@ -1495,6 +1495,13 @@ mod tests {
         }
     }
 
+    /// `create_schema` が 3 つの表を作った後で失敗する設定（試験だけの差し込み）。
+    fn failing_config() -> StoreConfig {
+        let mut config = wide_config(10);
+        config.groups[0].key = schema::TEST_FAIL_CREATE_KEY.to_string();
+        config
+    }
+
     fn data_dir_names(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
@@ -1506,13 +1513,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failed_create_schema_leaves_an_empty_file_the_next_open_initializes() {
-        // 1 グループ 2000 タグ（ptime を足して 2001 列）は SQLite の列数の上限で
-        // create_schema が失敗する（#1304 の実際の筋書き）。トランザクションが戻るので、
-        // ファイルは表の無いまま残る（名前で消すことはしない）。
+        // create_schema が表を作った途中で失敗する（#1304 の筋書き。試験だけの差し込み）。
+        // トランザクションが戻るので、ファイルは表の無いまま残る（名前で消すことはしない）。
         let dir = TempDir::new("create-schema-fails");
         let clock = clock_at(DAY1_START_MS);
-        let err = TsWriter::open(dir.path(), wide_config(2000), clock.clone()).await;
-        assert!(err.is_err(), "列数の上限で open は失敗する");
+        let err = TsWriter::open(dir.path(), failing_config(), clock.clone()).await;
+        assert!(err.is_err(), "作成の途中の失敗で open は失敗する");
         let date = LocalDate::from_epoch_ms(DAY1_START_MS, OFFSET_MS);
         let name = schema::data_file_name(date, 1);
         assert!(
@@ -1532,10 +1538,10 @@ mod tests {
         );
         pool.close().await;
 
-        // その後タグを減らした設定で open すると、同じ連番で作れる。
+        // 失敗の原因が無い設定で open すると、同じ連番で作れる。
         let writer = TsWriter::open(dir.path(), wide_config(10), clock)
             .await
-            .expect("タグを減らせば open できる");
+            .expect("原因が無ければ open できる");
         writer.close().await.unwrap();
         let files = list_data_files(dir.path()).unwrap();
         assert_eq!(files.len(), 1);
@@ -1554,7 +1560,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_schema_does_not_touch_a_file_in_use() {
         // #1304: 別の書き手が使っている初期化済みのファイルに作成の口が当たっても、
-        // 何も書かずに AlreadyInitialized を返す（列数の上限で失敗する設定でも試みない）。
+        // 何も書かずに AlreadyInitialized を返す（作成で失敗する設定でも試みない）。
         let dir = TempDir::new("in-use");
         let writer = TsWriter::open(dir.path(), two_group_config(), clock_at(DAY1_START_MS))
             .await
@@ -1575,7 +1581,7 @@ mod tests {
         let meta_before = schema::read_file_meta(&other.pool).await.unwrap();
         let outcome = schema::create_schema(
             &other.pool,
-            &wide_config(2000),
+            &failing_config(),
             "other-hash",
             date,
             DAY1_START_MS,
