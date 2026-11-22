@@ -51,6 +51,8 @@
 
 - [ ] **同じ作業ツリーで 2 つの実装エージェントを同時に走らせない**。片方の `git checkout` がもう片方のブランチを奪い、コミットが `main` に載る事故が起きた（2026-09-17）。`isolation: "worktree"` を使うか、順番に流す。
 
+- [ ] **別の worktree のエージェントと `CARGO_TARGET_DIR` を共有しない**。同じ crate 名を 2 つのブランチで作ると、片方で足した公開の定数が「見つからない」（E0425）になった（古い成果物が残る。#1307、2026-11-22）。共有したら、疑わしいときは触った crate のソースを `touch` して作り直す。
+
 - [ ] **ブランチを最初に切らせる**（`git checkout main && git pull --ff-only origin main` → `git switch -c ...` → `git status -sb` で確認）。main を汚させない。
 - [ ] **入れ子のサブエージェント禁止**と明記（Agent ツールを呼ばせない）。
 - [ ] **`.claude/worktrees` に入らない**と明記（メイン checkout で作業させる）。
