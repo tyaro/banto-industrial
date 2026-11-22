@@ -281,9 +281,9 @@
 						新しいパスワード（8文字以上）
 						<input type="password" bind:value={resetPassword} autocomplete="new-password" />
 					</label>
-					<button type="button" onclick={saveReset} disabled={resetting}
-						>パスワードをリセット</button
-					>
+					<button type="button" onclick={saveReset} disabled={resetting}>
+						パスワードをリセット
+					</button>
 				</div>
 			</section>
 		{/if}

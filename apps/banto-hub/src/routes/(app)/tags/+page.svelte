@@ -6140,12 +6140,9 @@
 					}}
 				>
 					{#each TAG_KIND_OPTIONS as opt (opt.value)}
-						<option value={opt.value}
-							>{tagKindOptionLabel(
-								opt,
-								connectionForGroupId(form.collectionGroupId)?.protocol
-							)}</option
-						>
+						<option value={opt.value}>
+							{tagKindOptionLabel(opt, connectionForGroupId(form.collectionGroupId)?.protocol)}
+						</option>
 					{/each}
 				</select>
 			{/if}
@@ -6170,13 +6167,13 @@
 				{/each}
 			</select>
 			{#if form.tagKind === 'computed'}
-				<span class="hint" id="tag-group-hint"
-					>{CALC_CONNECTION_NAME} 接続配下のグループのみ選択できます。</span
-				>
+				<span class="hint" id="tag-group-hint">
+					{CALC_CONNECTION_NAME} 接続配下のグループのみ選択できます。
+				</span>
 			{:else if form.tagKind === 'internal'}
-				<span class="hint" id="tag-group-hint"
-					>{MEM_CONNECTION_NAME} 接続配下のグループのみ選択できます。</span
-				>
+				<span class="hint" id="tag-group-hint">
+					{MEM_CONNECTION_NAME} 接続配下のグループのみ選択できます。
+				</span>
 			{:else if form.tagKind === DB_TAG_KIND}
 				<!--
 					S3: db タグは postgres（DB Source）接続配下のグループのみ
@@ -6190,15 +6187,15 @@
 					SIM かをここで先出しする（保存前の確認領域とは別に、選択
 					直後にも分かるようにする）。
 				-->
-				<span class="hint" id="tag-group-hint"
-					>接続: {connectionForGroupId(form.collectionGroupId)?.name}（{confirmEnvironmentLabel(
+				<span class="hint" id="tag-group-hint">
+					接続: {connectionForGroupId(form.collectionGroupId)?.name}（{confirmEnvironmentLabel(
 						form
-					)}）</span
-				>
+					)}）
+				</span>
 			{/if}
-			{#if errors.collectionGroupId}<span class="err" id="tag-group-err"
-					>{errors.collectionGroupId}</span
-				>{/if}
+			{#if errors.collectionGroupId}<span class="err" id="tag-group-err">
+					{errors.collectionGroupId}
+				</span>{/if}
 		</label>
 		<label class="field">
 			名前<span class="required">*</span>
@@ -6296,19 +6293,18 @@
 					)}
 				/>
 				{#if addressHelp.driverHelp !== ''}
-					<span class="hint driver-help" id="tag-address-driver-help">{addressHelp.driverHelp}</span
-					>
+					<span class="hint driver-help" id="tag-address-driver-help">
+						{addressHelp.driverHelp}
+					</span>
 				{/if}
-				<span class="hint" id="tag-address-hint"
-					>{addressHelp.deviceHint}{#if addressHelp.occupancyHint !== ''}
-						{addressHelp.occupancyHint}{/if}</span
-				>
+				<span class="hint" id="tag-address-hint">
+					{addressHelp.deviceHint}{#if addressHelp.occupancyHint !== ''}
+						{addressHelp.occupancyHint}{/if}
+				</span>
 				{#if addressHelp.examples.length > 0}
-					<span class="hint" id="tag-address-examples"
-						>例: {addressHelp.examples
-							.map((e) => `${e.address}（${e.description}）`)
-							.join('、')}</span
-					>
+					<span class="hint" id="tag-address-examples">
+						例: {addressHelp.examples.map((e) => `${e.address}（${e.description}）`).join('、')}
+					</span>
 				{/if}
 				{#if addressHelp.bitHint !== ''}
 					<span class="hint" id="tag-address-bit-hint">{addressHelp.bitHint}</span>
@@ -6320,8 +6316,10 @@
 						class:address-preflight-ok={addressPreflight.result?.ok === true}
 						class:address-preflight-error={addressPreflight.result?.ok === false}
 						id="tag-address-preflight"
-						aria-live="polite">{preflightMessage}</span
+						aria-live="polite"
 					>
+						{preflightMessage}
+					</span>
 				{/if}
 				{#if errors.address}<span class="err" id="tag-address-err">{errors.address}</span>{/if}
 			</div>
@@ -6384,8 +6382,10 @@
 						class:address-preflight-ok={addressPreflight.result?.ok === true}
 						class:address-preflight-error={addressPreflight.result?.ok === false}
 						id="tag-address-preflight"
-						aria-live="polite">{preflightMessage}</span
+						aria-live="polite"
 					>
+						{preflightMessage}
+					</span>
 				{/if}
 				{#if errors.address}<span class="err" id="tag-address-err">{errors.address}</span>{/if}
 				<div class="db-column-candidates">
@@ -6452,9 +6452,9 @@
 				flex column のままなので見た目は変わらない。
 			-->
 			<div class="field wide">
-				<label id="tag-expression-label" for="tag-expression"
-					>式（expression）<span class="required">*</span></label
-				>
+				<label id="tag-expression-label" for="tag-expression">
+					式（expression）<span class="required">*</span>
+				</label>
 				<!--
 					#342 段階A: textarea の下にミラー要素（同じフォント・パディング・
 					折り返し）を重ね、`pos`（バイト = 文字オフセット、
@@ -6494,9 +6494,9 @@
 					aria-controls={COMPLETION_LISTBOX_ID}
 				>
 					<div class="expr-mirror" aria-hidden="true">
-						{#if errPos !== null}{form.expression.slice(0, errPos)}<span class="expr-error-char"
-								>{form.expression.slice(errPos, errPos + 1) || ' '}</span
-							>{form.expression.slice(errPos + 1)}{:else}{form.expression}{/if}
+						{#if errPos !== null}{form.expression.slice(0, errPos)}<span class="expr-error-char">
+								{form.expression.slice(errPos, errPos + 1) || ' '}
+							</span>{form.expression.slice(errPos + 1)}{:else}{form.expression}{/if}
 					</div>
 					<textarea
 						id="tag-expression"
@@ -6566,12 +6566,12 @@
 						</span>
 					</div>
 				{/if}
-				<span class="hint" id="tag-expression-hint"
-					>四則・比較・論理・if(c,a,b)・min/max/abs/round/clamp/bit(tag,n)。参照する外部名は他タグ
+				<span class="hint" id="tag-expression-hint">
+					四則・比較・論理・if(c,a,b)・min/max/abs/round/clamp/bit(tag,n)。参照する外部名は他タグ
 					（plc/computed/internal）の完全名。保存前に自動でチェックされます。Ctrl+Space または
 					Ctrl+.（ドットの入力・2文字以上の入力でも自動）で、接続 → 収集グループ → タグ
-					の順に補完できます。</span
-				>
+					の順に補完できます。
+				</span>
 				{#if errors.expression}
 					<!--
 						issue #342 からの意図的な変更（PR 本文にも記載）: issue は
@@ -6681,12 +6681,12 @@
 						errors.stringLength && 'tag-string-length-err'
 					)}
 				/>
-				<span class="hint" id="tag-string-length-hint"
-					>{MIN_STRING_LENGTH}〜{MAX_STRING_LENGTH} word（1 word = 2バイト）。</span
-				>
-				{#if errors.stringLength}<span class="err" id="tag-string-length-err"
-						>{errors.stringLength}</span
-					>{/if}
+				<span class="hint" id="tag-string-length-hint">
+					{MIN_STRING_LENGTH}〜{MAX_STRING_LENGTH} word（1 word = 2バイト）。
+				</span>
+				{#if errors.stringLength}<span class="err" id="tag-string-length-err">
+						{errors.stringLength}
+					</span>{/if}
 			</label>
 			<label class="field">
 				文字コード
@@ -7251,9 +7251,9 @@
 			>
 				このタグを複製
 			</button>
-			<button type="button" class="danger" onclick={handleDelete} disabled={isDrawerBusy()}
-				>削除</button
-			>
+			<button type="button" class="danger" onclick={handleDelete} disabled={isDrawerBusy()}>
+				削除
+			</button>
 		</div>
 	</form>
 {/snippet}
@@ -7276,9 +7276,10 @@
 			名前パターン（<code>{'{n}'}</code>が連番に置き換わります。例:
 			<code>temp{'{n}'}</code> + 開始1 + 3点 → temp1, temp2,
 			temp3）・開始アドレス・点数・共通設定から連続タグを一括生成します。アドレスの増分はデータ型から自動決定（i16/u16
-			等のワード型は+1、i32/u32/f32 は+2、i64/u64/f64 は+4、string は文字列長分）。<code>.N</code
-			>（ビット位置）付きのアドレス（ワード内のビット指定。書き方はドライバによる）はワード内 bit
-			連番になります（bit15 の次は次ワードの
+			等のワード型は+1、i32/u32/f32 は+2、i64/u64/f64 は+4、string は文字列長分）。<code>
+				.N
+			</code>（ビット位置）付きのアドレス（ワード内のビット指定。書き方はドライバによる）はワード内
+			bit 連番になります（bit15 の次は次ワードの
 			bit0）。桁上がりなどアドレスの進み方はドライバのアドレス規則に従います。
 		</p>
 		{#if continuousForm.collectionGroupId !== ''}
@@ -7344,9 +7345,9 @@
 					<span class="hint">{addrHelp.deviceHint}</span>
 				{/if}
 				{#if addrHelp.examples.length > 0}
-					<span class="hint"
-						>例: {addrHelp.examples.map((e) => `${e.address}（${e.description}）`).join('、')}</span
-					>
+					<span class="hint">
+						例: {addrHelp.examples.map((e) => `${e.address}（${e.description}）`).join('、')}
+					</span>
 				{/if}
 			</label>
 			<label class="field">
@@ -7399,18 +7400,20 @@
 			{/if}
 
 			<div class="actions">
-				<button type="button" onclick={handleValidateContinuous} disabled={isDrawerBusy()}
-					>検証</button
-				>
+				<button type="button" onclick={handleValidateContinuous} disabled={isDrawerBusy()}>
+					検証
+				</button>
 				<button
 					type="button"
 					onclick={handleApplyContinuous}
-					disabled={!continuousValidatedFresh || isDrawerBusy()}>登録</button
+					disabled={!continuousValidatedFresh || isDrawerBusy()}
 				>
+					登録
+				</button>
 				{#if !continuousValidatedFresh}
-					<span class="hint"
-						>先に「検証」を実行してください（フォームを変更すると再検証が必要）。</span
-					>
+					<span class="hint">
+						先に「検証」を実行してください（フォームを変更すると再検証が必要）。
+					</span>
 				{/if}
 			</div>
 		{/if}
@@ -7556,8 +7559,10 @@
 							aria-pressed={treeShown}
 							data-testid="tag-tree-toggle"
 							bind:this={treeToolbarToggleEl}
-							onclick={() => (treeShown = !treeShown)}>{TREE_PANE_LABEL}</button
+							onclick={() => (treeShown = !treeShown)}
 						>
+							{TREE_PANE_LABEL}
+						</button>
 					{/if}
 					<span class="tree-selection" data-testid="tag-tree-selection">
 						{treeSelectionLabel}
@@ -7589,8 +7594,10 @@
 								type="button"
 								class="tool-button"
 								data-testid="tag-config-changed-reload"
-								onclick={() => void reloadAfterExternalChange()}>読み直す</button
+								onclick={() => void reloadAfterExternalChange()}
 							>
+								読み直す
+							</button>
 						</span>
 					{/if}
 					<span class="frame-toolbar-spacer"></span>
@@ -7602,23 +7609,27 @@
 						title={watchAddTargets.length === 0
 							? '見張りに足すタグを選んでください（属性に出している行、複数選択なら選んだ行）'
 							: '値を見張る窓にタグを足します'}
-						onclick={() => addWatchTags(watchAddTargets)}>見張りに足す</button
+						onclick={() => addWatchTags(watchAddTargets)}
 					>
+						見張りに足す
+					</button>
 					{#if !layoutNarrow}
 						<button
 							type="button"
 							class="tool-button"
 							aria-pressed={rightShown}
 							data-testid="tag-attribute-toggle"
-							onclick={() => (rightShown = !rightShown)}>{ATTRIBUTE_PANE_LABEL}</button
+							onclick={() => (rightShown = !rightShown)}
 						>
+							{ATTRIBUTE_PANE_LABEL}
+						</button>
 					{/if}
 					{#if viewItems.length > 0}
 						<Menu label="表示">
 							{#snippet trigger(props)}
-								<button type="button" class="tool-button" data-testid="tag-view-menu" {...props}
-									>表示</button
-								>
+								<button type="button" class="tool-button" data-testid="tag-view-menu" {...props}>
+									表示
+								</button>
 							{/snippet}
 							{#each viewItems as item (item.id)}
 								{#if item.kind === 'separator'}
@@ -7759,9 +7770,9 @@
 												選択行（{selectedIds.size}件）
 											</option>
 										</select>
-										<button type="button" class="secondary" onclick={handleExportCsv}
-											>CSVエクスポート</button
-										>
+										<button type="button" class="secondary" onclick={handleExportCsv}>
+											CSVエクスポート
+										</button>
 										<input
 											type="search"
 											class="search-box"
@@ -7845,15 +7856,19 @@
 													type="button"
 													data-testid="tag-cell-edit-apply"
 													disabled={!cellEditValidatedFresh || cellEditApplying}
-													onclick={handleApplyGridEdits}>この内容で保存を適用</button
+													onclick={handleApplyGridEdits}
 												>
+													この内容で保存を適用
+												</button>
 												<button
 													type="button"
 													class="secondary"
 													data-testid="tag-cell-edit-cancel-confirm"
 													onclick={cancelCellEditConfirm}
-													disabled={cellEditApplying}>閉じる</button
+													disabled={cellEditApplying}
 												>
+													閉じる
+												</button>
 											</div>
 										</div>
 									{/if}
@@ -7867,14 +7882,18 @@
 											<button
 												type="button"
 												data-testid="tag-bulk-enable-open"
-												onclick={() => openBulkPanel('enable')}>一括で有効化</button
+												onclick={() => openBulkPanel('enable')}
 											>
+												一括で有効化
+											</button>
 											<button
 												type="button"
 												class="secondary"
 												data-testid="tag-bulk-disable-open"
-												onclick={() => openBulkPanel('disable')}>一括で無効化</button
+												onclick={() => openBulkPanel('disable')}
 											>
+												一括で無効化
+											</button>
 											<button
 												type="button"
 												class="secondary"
@@ -7883,26 +7902,34 @@
 												title={selectedTagsMixedKind
 													? '種別（plc/computed/internal）が混在する選択ではグループ移動できません'
 													: undefined}
-												onclick={() => openBulkPanel('move')}>グループへ一括移動</button
+												onclick={() => openBulkPanel('move')}
 											>
+												グループへ一括移動
+											</button>
 											<button
 												type="button"
 												class="secondary"
 												data-testid="tag-bulk-offset-copy-open"
-												onclick={() => openBulkPanel('offset-copy')}>オフセットコピー</button
+												onclick={() => openBulkPanel('offset-copy')}
 											>
+												オフセットコピー
+											</button>
 											<button
 												type="button"
 												class="danger"
 												data-testid="tag-bulk-delete-open"
-												onclick={() => openBulkPanel('delete')}>一括で削除</button
+												onclick={() => openBulkPanel('delete')}
 											>
+												一括で削除
+											</button>
 											<button
 												type="button"
 												class="secondary"
 												data-testid="tag-bulk-clear-selection"
-												onclick={() => (selectedIds = new Set())}>選択解除</button
+												onclick={() => (selectedIds = new Set())}
 											>
+												選択解除
+											</button>
 										</div>
 									{/if}
 									{#if canWrite && bulkAction !== null && bulkAction !== 'offset-copy'}
@@ -7981,15 +8008,19 @@
 													type="button"
 													data-testid="tag-bulk-apply"
 													disabled={bulkApplying || bulkTargetCount === 0}
-													onclick={handleApplyBulk}>この内容で一括反映</button
+													onclick={handleApplyBulk}
 												>
+													この内容で一括反映
+												</button>
 												<button
 													type="button"
 													class="secondary"
 													data-testid="tag-bulk-cancel"
 													onclick={closeBulkPanel}
-													disabled={bulkApplying}>キャンセル</button
+													disabled={bulkApplying}
 												>
+													キャンセル
+												</button>
 											</div>
 										</div>
 									{/if}
@@ -8011,10 +8042,10 @@
 													placeholder="100"
 													data-testid="tag-bulk-offset-copy-words"
 												/>
-												<span class="hint"
-													>正の整数を指定してください（例: 100 → D3000 起点のタグ群を D3100
-													起点へ複製）。</span
-												>
+												<span class="hint">
+													正の整数を指定してください（例: 100 → D3000 起点のタグ群を D3100
+													起点へ複製）。
+												</span>
 											</label>
 
 											{#if bulkOffsetCopyResult}
@@ -8105,13 +8136,15 @@
 													class="secondary"
 													data-testid="tag-bulk-offset-copy-cancel"
 													onclick={closeBulkPanel}
-													disabled={bulkOffsetCopyApplying}>キャンセル</button
+													disabled={bulkOffsetCopyApplying}
 												>
+													キャンセル
+												</button>
 											</div>
 											{#if bulkOffsetCopyTagInputs && !bulkOffsetCopyValidatedFresh}
-												<span class="hint"
-													>先に「検証」を実行してください（内容を変更すると再検証が必要）。</span
-												>
+												<span class="hint">
+													先に「検証」を実行してください（内容を変更すると再検証が必要）。
+												</span>
 											{/if}
 										</div>
 									{/if}
@@ -8134,13 +8167,17 @@
 											<a
 												class="onboarding-cta"
 												href={confirmCtaHref}
-												onclick={() => (searchQuery = '')}>確認: 値・品質・時刻を見る</a
+												onclick={() => (searchQuery = '')}
 											>
+												確認: 値・品質・時刻を見る
+											</a>
 											<button
 												type="button"
 												class="secondary"
-												onclick={() => (confirmCtaHref = null)}>閉じる</button
+												onclick={() => (confirmCtaHref = null)}
 											>
+												閉じる
+											</button>
 										</div>
 									{/if}
 									<p class="note">
@@ -8188,9 +8225,9 @@
 										{:else if loadError}
 											<div class="reload-banner">
 												<span class="err">{loadError}</span>
-												<button type="button" class="secondary" onclick={() => void reload()}
-													>再試行</button
-												>
+												<button type="button" class="secondary" onclick={() => void reload()}>
+													再試行
+												</button>
 												<span class="hint">前回の読込内容を表示しています。</span>
 											</div>
 										{/if}
@@ -8332,8 +8369,9 @@
 		class="value-cell quality-{cell.qualityClass}"
 		data-testid="tag-quality-cell"
 		title={cell.qualityLabel === UNVERIFIED_LABEL ? UNVERIFIED_TITLE : undefined}
-		>{cell.qualityLabel}</span
 	>
+		{cell.qualityLabel}
+	</span>
 {/snippet}
 
 {#snippet logPanel()}
@@ -8699,9 +8737,9 @@
 			<p class="note">
 				複数の異なるフィールド（名前・型）をまとめて登録します。<strong>自動割付</strong>は
 				ベースアドレスから、各フィールドが占有するワード数（bit/i16/u16 は+1、i32/u32/f32
-				は+2、i64/u64/f64 は+4、string は文字列長ぶん）だけずつ連続したアドレスへ割り付けます。<strong
-					>手動割付</strong
-				>は各フィールドのアドレスを個別に指定します。
+				は+2、i64/u64/f64 は+4、string は文字列長ぶん）だけずつ連続したアドレスへ割り付けます。<strong>
+					手動割付
+				</strong>は各フィールドのアドレスを個別に指定します。
 			</p>
 			{#if structForm.collectionGroupId !== ''}
 				<!-- T19 S1-c（UX-33）と同じ理由 - openContinuousDrawer 参照。 -->
@@ -8740,9 +8778,9 @@
 							).placeholder}
 							data-testid="struct-reg-base-address"
 						/>
-						<span class="hint"
-							>ワード内のビット指定は使えません。ワードのアドレスを指定してください。</span
-						>
+						<span class="hint">
+							ワード内のビット指定は使えません。ワードのアドレスを指定してください。
+						</span>
 					</label>
 				{/if}
 				<label class="field checkbox">
@@ -8913,9 +8951,9 @@
 						登録
 					</button>
 					{#if !structValidatedFresh}
-						<span class="hint"
-							>先に「検証」を実行してください（フォームを変更すると再検証が必要）。</span
-						>
+						<span class="hint">
+							先に「検証」を実行してください（フォームを変更すると再検証が必要）。
+						</span>
 					{/if}
 				</div>
 			{/if}
@@ -8977,8 +9015,10 @@
 					type="button"
 					class="secondary"
 					data-testid="tag-csv-template-download"
-					onclick={handleDownloadCsvTemplate}>テンプレートをダウンロード</button
+					onclick={handleDownloadCsvTemplate}
 				>
+					テンプレートをダウンロード
+				</button>
 			</div>
 
 			<div class="field">
@@ -9006,8 +9046,10 @@
 						type="button"
 						class="secondary"
 						data-testid="tag-csv-error-download"
-						onclick={handleDownloadCsvErrorRows}>エラー行をCSVでダウンロード</button
+						onclick={handleDownloadCsvErrorRows}
 					>
+						エラー行をCSVでダウンロード
+					</button>
 				</div>
 			{:else if csvParseResult?.ok && csvParseResult.rows.length === 0}
 				<p class="note">インポートする行がありません。</p>
@@ -9056,12 +9098,14 @@
 					<button
 						type="button"
 						onclick={handleApplyCsv}
-						disabled={!csvValidatedFresh || isDrawerBusy()}>登録</button
+						disabled={!csvValidatedFresh || isDrawerBusy()}
 					>
+						登録
+					</button>
 					{#if !csvValidatedFresh}
-						<span class="hint"
-							>先に「検証」を実行してください（ファイルを差し替えると再検証が必要）。</span
-						>
+						<span class="hint">
+							先に「検証」を実行してください（ファイルを差し替えると再検証が必要）。
+						</span>
 					{/if}
 				</div>
 			{:else if csvParseResult?.ok && csvMode === 'update' && csvCanonicalByLine === null && csvParseResult.rows.length > 0}
@@ -9109,8 +9153,10 @@
 							type="button"
 							class="secondary"
 							data-testid="tag-csv-error-download"
-							onclick={handleDownloadCsvErrorRows}>エラー行をCSVでダウンロード</button
+							onclick={handleDownloadCsvErrorRows}
 						>
+							エラー行をCSVでダウンロード
+						</button>
 					</div>
 				{/if}
 
@@ -9128,18 +9174,21 @@
 						data-testid="tag-csv-update-validate"
 						onclick={handleValidateCsvUpdate}
 						disabled={csvUpdateClassification.updateRows.length === 0 || isDrawerBusy()}
-						>検証</button
 					>
+						検証
+					</button>
 					<button
 						type="button"
 						data-testid="tag-csv-update-apply"
 						onclick={handleApplyCsvUpdate}
-						disabled={!csvUpdateValidatedFresh || isDrawerBusy()}>更新を適用</button
+						disabled={!csvUpdateValidatedFresh || isDrawerBusy()}
 					>
+						更新を適用
+					</button>
 					{#if csvUpdateClassification.updateRows.length > 0 && !csvUpdateValidatedFresh}
-						<span class="hint"
-							>先に「検証」を実行してください（ファイルを差し替えると再検証が必要）。</span
-						>
+						<span class="hint">
+							先に「検証」を実行してください（ファイルを差し替えると再検証が必要）。
+						</span>
 					{/if}
 				</div>
 			{/if}

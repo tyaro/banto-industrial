@@ -384,11 +384,11 @@
 					bind:value={readScopesText}
 					rows="3"
 					placeholder="例: line1.fast.temp01, line1.fast.*"></textarea>
-				<span class="hint"
-					>catalog（タグ一覧・PLCアドレス）は上の read
+				<span class="hint">
+					catalog（タグ一覧・PLCアドレス）は上の read
 					と同様に絞られません。ここで指定したタグ以外は値の読み取りのみ403になります。上の read
-					にチェックすると、ここでの指定に関わらず全タグを読めます。</span
-				>
+					にチェックすると、ここでの指定に関わらず全タグを読めます。
+				</span>
 			</label>
 			<label class="field wide">
 				write
@@ -398,9 +398,9 @@
 					bind:value={writeScopesText}
 					rows="3"
 					placeholder="例: line1.press.temp, line1.press.pressure"></textarea>
-				<span class="hint"
-					>ワイルドカードは使えません（タグを明示列挙）。実際の書き込みAPI自体は本スライスの範囲外です。</span
-				>
+				<span class="hint">
+					ワイルドカードは使えません（タグを明示列挙）。実際の書き込みAPI自体は本スライスの範囲外です。
+				</span>
 			</label>
 			<fieldset class="field wide ingest">
 				<legend>取り込み（任意、push 接続へ値を送る。接続を選ぶと id で縛ります）</legend>
@@ -416,11 +416,11 @@
 						</label>
 					{/each}
 				{/if}
-				<span class="hint"
-					>スコープは ingest:#&lbrace;接続 id&rbrace;
+				<span class="hint">
+					スコープは ingest:#&lbrace;接続 id&rbrace;
 					になり、接続を改名しても使い続けられます。取り込みのスコープだけではタグの値を読めず、read・admin
-					のスコープでは送れません（それぞれ別に付けます）。</span
-				>
+					のスコープでは送れません（それぞれ別に付けます）。
+				</span>
 			</fieldset>
 			{#if createErrors.scopes}<span class="err">{createErrors.scopes}</span>{/if}
 			<label class="field">
@@ -475,11 +475,9 @@
 									<span class="badge badge-expiring-soon">期限接近</span>
 								{/if}
 							</td>
-							<td
-								>{key.revokedAt === null
-									? '有効'
-									: `失効済み（${formatSqliteUtc(key.revokedAt)}）`}</td
-							>
+							<td>
+								{key.revokedAt === null ? '有効' : `失効済み（${formatSqliteUtc(key.revokedAt)}）`}
+							</td>
 							<td>
 								{#if key.trippedAt === null}
 									-

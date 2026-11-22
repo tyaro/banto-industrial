@@ -476,8 +476,9 @@
 							<p class="empty-hint">
 								現在値は収集中にだけ表示されます。
 								{#if canEdit}
-									<a href={resolveAppPath('/settings/collect')}>収集の設定</a
-									>で収集を開始してください。
+									<a href={resolveAppPath('/settings/collect')}>
+										収集の設定
+									</a>で収集を開始してください。
 								{/if}
 							</p>
 						</div>

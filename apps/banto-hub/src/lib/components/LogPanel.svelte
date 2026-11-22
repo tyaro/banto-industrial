@@ -51,8 +51,10 @@
 					class="tool-button"
 					aria-pressed={!hiddenSources.includes(source)}
 					data-testid="log-filter-{source}"
-					onclick={() => toggleSource(source)}>{LOG_SOURCE_LABELS[source]}</button
+					onclick={() => toggleSource(source)}
 				>
+					{LOG_SOURCE_LABELS[source]}
+				</button>
 			{/each}
 		</div>
 		<span class="log-spacer"></span>
@@ -65,20 +67,29 @@
 				type="button"
 				class="tool-button"
 				data-testid="log-resume"
-				onclick={() => feed.resume()}>再開</button
+				onclick={() => feed.resume()}
 			>
+				再開
+			</button>
 		{:else}
-			<button type="button" class="tool-button" data-testid="log-pause" onclick={() => feed.pause()}
-				>一時停止</button
+			<button
+				type="button"
+				class="tool-button"
+				data-testid="log-pause"
+				onclick={() => feed.pause()}
 			>
+				一時停止
+			</button>
 		{/if}
 		<button
 			type="button"
 			class="tool-button"
 			data-testid="log-clear"
 			title="表示中の行を消します（記録は消しません）"
-			onclick={() => feed.clear()}>消去</button
+			onclick={() => feed.clear()}
 		>
+			消去
+		</button>
 		<span class="log-count">{views.length} 件</span>
 	</div>
 	<div class="log-table-wrap">

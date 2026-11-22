@@ -2018,8 +2018,10 @@
 							<p class="load-error" role="alert">
 								ドライバ一覧を読み込めませんでした（{driversError}）。<button
 									type="button"
-									onclick={() => void reloadDrivers()}>再試行</button
+									onclick={() => void reloadDrivers()}
 								>
+									再試行
+								</button>
 							</p>
 						{:else if drivers === null}
 							<p class="loading">ドライバ一覧を読み込み中…</p>
@@ -2320,8 +2322,10 @@
 													<p class="load-error" role="alert">
 														ドライバ一覧を読み込めませんでした（{driversError}）。<button
 															type="button"
-															onclick={() => void reloadDrivers()}>再試行</button
+															onclick={() => void reloadDrivers()}
 														>
+															再試行
+														</button>
 													</p>
 												{/if}
 												<UnsavedChangesNotice

@@ -308,9 +308,9 @@
 				{creatingBackup ? '作成中…' : '今すぐバックアップ'}
 			</button>
 			{#if tauri}
-				<button type="button" class="secondary" onclick={handleOpenBackupsFolder}
-					>フォルダを開く</button
-				>
+				<button type="button" class="secondary" onclick={handleOpenBackupsFolder}>
+					フォルダを開く
+				</button>
 			{/if}
 		</div>
 

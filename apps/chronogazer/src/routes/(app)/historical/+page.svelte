@@ -544,16 +544,16 @@
 					{#if status?.state === 'unavailable'}
 						<p class="note warn" role="alert">
 							{HISTORY_UNAVAILABLE_MESSAGE}
-							<button type="button" class="secondary" onclick={() => (retryToken += 1)}
-								>再試行</button
-							>
+							<button type="button" class="secondary" onclick={() => (retryToken += 1)}>
+								再試行
+							</button>
 						</p>
 					{:else if status?.state === 'error'}
 						<p class="note warn" role="alert">
 							{status.message}
-							<button type="button" class="secondary" onclick={() => (retryToken += 1)}
-								>再試行</button
-							>
+							<button type="button" class="secondary" onclick={() => (retryToken += 1)}>
+								再試行
+							</button>
 						</p>
 					{/if}
 					{#if loading}

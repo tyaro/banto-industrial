@@ -845,9 +845,9 @@
 					<div class="db-source-connection">
 						<h3>
 							{conn.connection_name}
-							<span class="state-chip {dbSourceStateClass(conn.state)}"
-								>{dbSourceStateLabel(conn.state)}</span
-							>
+							<span class="state-chip {dbSourceStateClass(conn.state)}">
+								{dbSourceStateLabel(conn.state)}
+							</span>
 						</h3>
 						<dl class="summary">
 							<dt>直近ポーリング</dt>
@@ -1318,9 +1318,9 @@
 				</tbody>
 			</table>
 			<p class="note">
-				BantoHubSink は「サービス」一覧・DB Sink サイドカー（<a href={resolveAppPath('/sink')}
-					>DB Sink</a
-				>画面参照）の Windows サービスです。インストールは
+				BantoHubSink は「サービス」一覧・DB Sink サイドカー（<a href={resolveAppPath('/sink')}>
+					DB Sink
+				</a>画面参照）の Windows サービスです。インストールは
 				<code>banto-hub-sink.exe install</code> を管理者権限で実行してください（本画面からは行えません）。
 			</p>
 		{/if}

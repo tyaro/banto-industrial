@@ -357,8 +357,9 @@
 				{/each}
 			</select>
 			{#if dbConnectionOptions.length === 0}
-				<span class="hint">postgres 接続がありません。先にタグ画面から接続を作成してください。</span
-				>
+				<span class="hint">
+					postgres 接続がありません。先にタグ画面から接続を作成してください。
+				</span>
 			{/if}
 			{#if errors.dbConnectionId}<span class="err">{errors.dbConnectionId}</span>{/if}
 		</label>

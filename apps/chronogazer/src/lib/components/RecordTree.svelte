@@ -112,8 +112,9 @@
 			class="icon"
 			aria-hidden="true"
 			title={isHubConnection(connection) ? 'Hub 経由' : 'PLC 直結'}
-			>{isHubConnection(connection) ? '🔗' : '🔌'}</span
 		>
+			{isHubConnection(connection) ? '🔗' : '🔌'}
+		</span>
 		<span class="label">{connection.name}</span>
 		{#each connectionMarks(connection).slice(1) as mark (mark)}
 			<span class="badge" class:sim={mark === 'シミュレーション'}>{mark}</span>
