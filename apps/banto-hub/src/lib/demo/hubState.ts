@@ -362,6 +362,13 @@ export class HubRegistry {
 			}
 			// 名前の一意は、更新を当てた後の状態で下で見る（同じバッチの他の行を含む）。
 			const fieldErrors = this.validateTag(row, row.id, [], false);
+			// 単体 PUT と違い 409 ではなく行エラー（本物の update_batch_tx と同じ形）。
+			if (row.expectedRevision !== undefined && row.expectedRevision !== current.revision) {
+				fieldErrors.push({
+					field: 'expectedRevision',
+					message: '他のクライアントがこのタグを更新済みです。再読込してから保存してください。'
+				});
+			}
 			if (fieldErrors.length > 0) errors.push({ index, id: row.id, fieldErrors });
 			else updates.push(this.#buildTag(row.id, row, current.revision + 1, current));
 		});

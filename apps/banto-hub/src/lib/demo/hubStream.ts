@@ -25,7 +25,7 @@ interface WireValue {
 	tag: string;
 	id: number;
 	v: number | null;
-	q: 'good';
+	q: 'good' | 'bad';
 	t: number;
 }
 
@@ -37,8 +37,8 @@ interface Subscription {
 	/** 具体名。 */
 	exact: Set<string>;
 	ids: Set<number>;
-	/** タグごとに最後に送った値（`t` と `v`）。変わっていなければ送らない。 */
-	sent: Map<number, { t: number; v: number | null }>;
+	/** タグごとに最後に送った値（`t`・`v`・`q`）。変わっていなければ送らない。 */
+	sent: Map<number, { t: number; v: number | null; q: 'good' | 'bad' }>;
 }
 
 type Subscribe = { op: 'subscribe'; id: number; tags?: unknown; ids?: unknown };
@@ -85,26 +85,38 @@ function evaluate(
 	snapshot: boolean
 ): WireValue[] {
 	const values: WireValue[] = [];
+	const present = new Set<number>();
 	for (const tag of registry.tags) {
 		const group = registry.group(tag.collectionGroupId);
 		const connection = group ? registry.connection(group.plcConnectionId) : undefined;
 		if (!group || !connection) continue;
-		if (!tag.enabled || !group.enabled || !connection.enabled) continue;
 		const externalName = `${connection.name}.${group.name}.${tag.name}`;
 		if (!matches(sub, externalName, tag.id)) continue;
+		present.add(tag.id);
+		const last = sub.sent.get(tag.id);
+		if (!tag.enabled || !group.enabled || !connection.enabled) {
+			// 本物（`effective_current_view`）は無効のタグを `v: null`・`q: bad` で返す。
+			// 値を送ったことがあるものだけ、1 回送って消す（`t` は直近のまま）。
+			if (last && last.q === 'good') {
+				sub.sent.set(tag.id, { t: last.t, v: null, q: 'bad' });
+				values.push({ tag: externalName, id: tag.id, v: null, q: 'bad', t: last.t });
+			}
+			continue;
+		}
 		const t = demoSampleTime(nowMs, group.periodMs);
 		const v = demoTagValue(
 			{ id: tag.id, dataType: tag.dataType, decimals: tag.decimals, periodMs: group.periodMs },
 			t
 		);
-		const last = sub.sent.get(tag.id);
-		if (!snapshot && last && (last.t === t || last.v === v)) {
-			if (last.t !== t) sub.sent.set(tag.id, { t, v: last.v });
+		if (!snapshot && last && last.q === 'good' && (last.t === t || last.v === v)) {
+			if (last.t !== t) sub.sent.set(tag.id, { t, v: last.v, q: 'good' });
 			continue;
 		}
-		sub.sent.set(tag.id, { t, v });
+		sub.sent.set(tag.id, { t, v, q: 'good' });
 		values.push({ tag: externalName, id: tag.id, v, q: 'good', t });
 	}
+	// 削除・マッチしなくなったタグは「消えた」通知なしに追跡をやめる（本物と同じ。戻れば新規扱い）。
+	for (const id of sub.sent.keys()) if (!present.has(id)) sub.sent.delete(id);
 	return values;
 }
 

@@ -82,12 +82,19 @@ describe('HubRegistry（模擬の登録）', () => {
 		expect(r.groups.some((g) => g.id === g1.id)).toBe(false);
 		expect(r.tags.some((t) => t.collectionGroupId === g1.id)).toBe(false);
 		expect(r.revision).toBe(rev0 + 1);
-		const conn = r.connections[0];
+		// 配下にグループとタグが残っているもう一方の接続を消す（連鎖）。
+		const conn = r.connections.find((c) => r.groups.some((g) => g.plcConnectionId === c.id))!;
 		const groupIds = r.groups.filter((g) => g.plcConnectionId === conn.id).map((g) => g.id);
+		const tagCount = r.tags.filter((t) => groupIds.includes(t.collectionGroupId)).length;
+		expect(groupIds.length).toBeGreaterThan(0);
+		expect(tagCount).toBeGreaterThan(0);
+		const tagsBefore = r.tags.length;
 		const result = r.deleteConnection(conn.id);
-		expect(result.deletedGroups).toBe(groupIds.length);
+		expect(result).toEqual({ deletedGroups: groupIds.length, deletedTags: tagCount });
+		expect(r.connections.some((c) => c.id === conn.id)).toBe(false);
 		expect(r.groups.some((g) => g.plcConnectionId === conn.id)).toBe(false);
 		expect(r.tags.some((t) => groupIds.includes(t.collectionGroupId))).toBe(false);
+		expect(r.tags).toHaveLength(tagsBefore - tagCount);
 		expect(r.revision).toBe(rev0 + 2);
 	});
 
@@ -121,6 +128,32 @@ describe('HubRegistry（模擬の登録）', () => {
 			{ ...toInput(x, x.collectionGroupId), name: b.name }
 		];
 		expect(r.updateTagsBatch(swap, false).ok).toBe(true);
+	});
+
+	it('一括更新の expectedRevision が合わない行は行エラーで、全件を反映しない（dry run も）', () => {
+		const r = new HubRegistry();
+		const [a, b] = r.tags;
+		const row = (t: typeof a, extra: object) =>
+			({ ...t, unit: 'zz', ...extra }) as unknown as TagInput & { id: number };
+		const rev0 = r.revision;
+		const rows = [
+			row(a, { expectedRevision: a.revision }),
+			row(b, { expectedRevision: b.revision + 5 })
+		];
+		for (const dryRun of [true, false]) {
+			const res = r.updateTagsBatch(rows, dryRun);
+			expect(res.ok).toBe(false);
+			expect(res.errors).toHaveLength(1);
+			expect(res.errors[0].index).toBe(1);
+			expect(res.errors[0].id).toBe(b.id);
+			expect(res.errors[0].fieldErrors.map((e) => e.field)).toEqual(['expectedRevision']);
+		}
+		expect(r.tag(a.id)!.unit).toBe(a.unit);
+		expect(r.revision).toBe(rev0);
+		// 合えば通る（省略も通る）。
+		const ok = r.updateTagsBatch([row(a, { expectedRevision: a.revision }), row(b, {})], false);
+		expect(ok.ok).toBe(true);
+		expect(r.tag(a.id)!.unit).toBe('zz');
 	});
 });
 
@@ -188,6 +221,64 @@ describe('/api/v1/stream の模擬', () => {
 		registry.createTag({ ...NEW_TAG, name: 'again' });
 		expect(peer.sent).toHaveLength(count);
 		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it('無効にしたタグは v: null・q: bad を 1 回送り、有効に戻すと値が戻る（タグ単体・グループ）', () => {
+		let now = 1_700_000_000_000;
+		const registry = new HubRegistry();
+		const peer = fakeConnection();
+		createHubSocketRoute(registry, () => now).connect(peer.connection);
+		peer.say({ op: 'subscribe', id: 1, tags: ['line1.press.*'], mode: 'on_change' });
+		type Row = { id: number; v: number | null; q: string; t: number };
+		const rowsOf = (from: number) =>
+			peer.sent.slice(from).flatMap((m) => (m.values as Row[] | undefined) ?? []);
+		const tag = registry.tags.find((t) => t.collectionGroupId === registry.groups[0].id)!;
+		const step = () => {
+			now += 250;
+			vi.advanceTimersByTime(250);
+		};
+
+		// タグ単体。
+		let from = peer.sent.length;
+		registry.updateTag(tag.id, { ...tag, enabled: false } as unknown as TagInput);
+		step();
+		let rows = rowsOf(from).filter((r) => r.id === tag.id);
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toMatchObject({ v: null, q: 'bad' });
+		// 無効のままなら再送しない。
+		from = peer.sent.length;
+		for (let i = 0; i < 8; i++) step();
+		expect(rowsOf(from).filter((r) => r.id === tag.id)).toHaveLength(0);
+		// 有効に戻すと、値が good で戻る。
+		from = peer.sent.length;
+		registry.updateTag(tag.id, { ...registry.tag(tag.id)!, enabled: true } as unknown as TagInput);
+		step();
+		rows = rowsOf(from).filter((r) => r.id === tag.id);
+		expect(rows).toHaveLength(1);
+		expect(rows[0].q).toBe('good');
+
+		// グループ。
+		const group = registry.groups[0];
+		const inGroup = registry.tags.filter((t) => t.collectionGroupId === group.id).length;
+		from = peer.sent.length;
+		registry.updateGroup(group.id, { ...group, querySql: undefined, enabled: false });
+		step();
+		rows = rowsOf(from);
+		expect(rows).toHaveLength(inGroup);
+		expect(rows.every((r) => r.v === null && r.q === 'bad')).toBe(true);
+		from = peer.sent.length;
+		registry.updateGroup(group.id, { ...group, querySql: undefined, enabled: true });
+		step();
+		rows = rowsOf(from);
+		expect(rows).toHaveLength(inGroup);
+		expect(rows.every((r) => r.q === 'good')).toBe(true);
+
+		// 削除は「消えた」通知を送らない。
+		from = peer.sent.length;
+		registry.deleteTag(tag.id);
+		step();
+		expect(rowsOf(from).filter((r) => r.id === tag.id)).toHaveLength(0);
+		peer.hangUp();
 	});
 
 	it('形の悪い購読は error、ping は pong', () => {

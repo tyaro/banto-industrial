@@ -18,9 +18,17 @@ function groupNode(page: Page, name: string) {
 	return page.getByRole('tree').getByRole('treeitem', { name: new RegExp(`^${name} \\(`) });
 }
 
-/** 値の列の文字列（数値のセルが 1 つでも出ているか）を、行の外部名で引く。 */
+/** 外部名で引いた行（アドレス・単位など、ほかの列も含む）。 */
 function row(page: Page, name: string) {
 	return page.getByRole('row').filter({ has: page.getByRole('gridcell', { name, exact: true }) });
+}
+
+/** 行の「現在値」の列のセルだけ（列見出しの位置で引く。アドレスの数字に当たらないように）。 */
+async function valueCellText(page: Page, name: string): Promise<string> {
+	const headers = await page.getByRole('columnheader').allInnerTexts();
+	const index = headers.findIndex((h) => h.includes('現在値'));
+	expect(index, '「現在値」の列見出し').toBeGreaterThanOrEqual(0);
+	return row(page, name).getByRole('gridcell').nth(index).innerText();
 }
 
 test('Hub /tags: 初期のタグが見え、値が出て変わり、「再接続中…」が出ない', async ({
@@ -42,10 +50,11 @@ test('Hub /tags: 初期のタグが見え、値が出て変わり、「再接続
 	await expect(page.getByRole('gridcell', { name: 'press_mode', exact: true })).toBeVisible();
 
 	// 値: 数値（f32・小数 2 桁）が出て、しばらくすると変わる。
-	const pressure = row(page, 'press_pressure');
-	await expect(pressure).toContainText(/\d+\.\d\d/);
-	const first = await pressure.innerText();
-	await expect.poll(async () => pressure.innerText(), { timeout: 30_000 }).not.toBe(first);
+	await expect.poll(() => valueCellText(page, 'press_pressure')).toMatch(/^\s*\d+\.\d\d/);
+	const first = await valueCellText(page, 'press_pressure');
+	await expect
+		.poll(() => valueCellText(page, 'press_pressure'), { timeout: 30_000 })
+		.not.toBe(first);
 
 	await expect(page.getByText('再接続中…')).toHaveCount(0);
 	expect(traffic.forbidden()).toEqual([]);
@@ -77,7 +86,8 @@ test('Hub /tags: タグの追加・編集・削除が一覧に反映され、本
 	const added = page.getByRole('gridcell', { name: 'demo_added', exact: true });
 	await expect(added).toBeVisible();
 	// 追加したタグにも値が出る（`config_changed` で catalog を引き直し、購読に入る）。
-	await expect(row(page, 'demo_added')).toContainText(/\d/);
+	// （アドレスは 40100 なので、値の列のセルだけを見る。）
+	await expect.poll(() => valueCellText(page, 'demo_added')).toMatch(/\d/);
 
 	// 編集（単位）。
 	await added.click();
@@ -98,11 +108,24 @@ test('Hub /tags: タグの追加・編集・削除が一覧に反映され、本
 	await expect(page.getByRole('gridcell', { name: 'demo_added', exact: true })).toHaveCount(0);
 	await expect(page.getByText('削除できません')).toHaveCount(0);
 
-	// 読み直すと初期のデータに戻る（保存しない）。
+	// 初期のタグ（pump_flow）の単位も編集して残す。
+	await search.fill('pump_flow');
+	await expect(row(page, 'pump_flow')).toContainText('L/min');
+	await page.getByRole('gridcell', { name: 'pump_flow', exact: true }).click();
+	const editFlow = page.getByRole('complementary', { name: 'pump_flow を編集' });
+	await expect(editFlow).toBeVisible();
+	await editFlow.getByLabel('単位').fill('rpm');
+	await editFlow.getByRole('button', { name: /^保存/ }).first().click();
+	await expect(row(page, 'pump_flow')).toContainText('rpm');
+
+	// 読み直すと、その編集は消えて初期のデータ（L/min）に戻る（保存しない）。
 	await page.reload();
 	await groupNode(page, 'pump').click();
 	await expect(page.getByPlaceholder('外部名・名前・アドレスで検索')).toHaveValue('');
 	await expect(page.getByRole('gridcell', { name: 'pump_flow', exact: true })).toBeVisible();
+	await expect(row(page, 'pump_flow')).toContainText('L/min');
+	await expect(row(page, 'pump_flow')).not.toContainText('rpm');
+	await expect(page.getByRole('gridcell', { name: 'demo_added', exact: true })).toHaveCount(0);
 
 	await page.waitForTimeout(1000);
 	expect(traffic.forbidden()).toEqual([]);
