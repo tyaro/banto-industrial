@@ -13,11 +13,6 @@
  * this is a small, dedicated surface (one list read + one settings read/
  * write) with its own Tauri command names, not a `{resource}_list`-shaped
  * CRUD resource.
- *
- * Plain `vite dev`/`vite preview` (spec §11.1's third environment, no Rust
- * backend at all): there is no audit-log database to read, so every export
- * here throws/rejects with a `ProviderError` carrying `DEMO_MODE_MESSAGE`,
- * mirroring `usersAdmin.ts`'s `isUsersAdminAvailable()`/`demoModeError()`.
  */
 import { invoke } from '@tauri-apps/api/core';
 import {
@@ -54,17 +49,6 @@ export interface AuditLogEntry {
 export interface AuditSettings {
 	retentionDays: number | null;
 	retentionRows: number | null;
-}
-
-export const DEMO_MODE_MESSAGE = 'デモモードでは利用できません';
-
-function demoModeError(): ProviderError {
-	return new ProviderError({ kind: 'other', message: DEMO_MODE_MESSAGE });
-}
-
-/** Is this environment backed by a real audit-log database (Tauri or the embedded server)? False in plain-browser demo mode. */
-export function isAuditLogAvailable(): boolean {
-	return getBantoMode() !== 'demo';
 }
 
 const ERROR_KINDS = new Set([
@@ -221,7 +205,6 @@ export async function listAuditLog(
 	asOfId: number | null = null,
 	signal?: AbortSignal
 ): Promise<AuditLogList> {
-	if (!isAuditLogAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		return invokeCommand<AuditLogList>(
 			'audit_log_list',
@@ -280,7 +263,6 @@ export function createAuditLogResource(
 
 /** Current audit-log retention policy. Any authenticated role may call this (it only feeds a settings-screen display) - see `audit_config_get`'s Rust doc comment. */
 export async function getAuditConfig(): Promise<AuditSettings> {
-	if (!isAuditLogAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<AuditSettings>('audit_config_get');
 	return httpRequest<AuditSettings>('/api/audit-log/config', { method: 'GET' });
 }
@@ -300,14 +282,12 @@ export interface AuditSpoolStatus {
 
 /** 監査の保留の状態。`admin` 限定（監査ログ画面の警告帯が読む）。 */
 export async function getAuditSpoolStatus(): Promise<AuditSpoolStatus> {
-	if (!isAuditLogAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<AuditSpoolStatus>('audit_spool_status');
 	return httpRequest<AuditSpoolStatus>('/api/audit-log/spool', { method: 'GET' });
 }
 
 /** Persist a new retention policy. `admin`-only (rejected with a `forbidden` `ProviderError` otherwise). */
 export async function setAuditConfig(config: AuditSettings): Promise<AuditSettings> {
-	if (!isAuditLogAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		return invokeCommand<AuditSettings>('audit_config_apply', {
 			retentionDays: config.retentionDays,

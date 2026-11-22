@@ -9,10 +9,6 @@
  * どちらも同じ `chronogazer_core::collect::CollectorService` を通るので、
  * 床も形も経路で割れない。
  *
- * プレーンな `vite dev`/`vite preview`（Rust backend 無し）では収集ランタイム
- * そのものが無いので、すべて `DEMO_MODE_MESSAGE` で reject する
- * （`hubAdmin.ts` の `isHubAvailable()`/`demoModeError()` と同じ作法）。
- *
  * **床（両経路で同じ）**:
  * - 読み取り（`collect_status` / `collect_connections` / `collect_events_list`）
  *   = **viewer 以上**（`chronogazer_core::collect::COLLECT_READ_ROLE`）。
@@ -425,17 +421,6 @@ export function collectDailyReportQuery(params: CollectDailyReportParams): strin
 	}).toString();
 }
 
-export const DEMO_MODE_MESSAGE = 'デモモードでは利用できません';
-
-function demoModeError(): ProviderError {
-	return new ProviderError({ kind: 'other', message: DEMO_MODE_MESSAGE });
-}
-
-/** Is this environment backed by a real collector (Tauri or the embedded server)? */
-export function isCollectAvailable(): boolean {
-	return getBantoMode() !== 'demo';
-}
-
 const ERROR_KINDS = new Set([
 	'not_found',
 	'validation',
@@ -520,7 +505,6 @@ async function httpJson<T>(path: string, method: string, signal?: AbortSignal): 
  * 通らない**ので、画面はこれをポーリングしてよい。
  */
 export async function getCollectStatus(signal?: AbortSignal): Promise<CollectorStateView> {
-	if (!isCollectAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<CollectorStateView>('collect_status');
 	return httpJson<CollectorStateView>('/api/collect', 'GET', signal);
 }
@@ -540,7 +524,6 @@ export type ValuesResponse = Readout<Record<string, CurrentSampleView>> & {
  * `quality: 'invalid'`・`value: null` で載る。応答には `serverNowMs` が添わる。
  */
 export async function getCollectValues(signal?: AbortSignal): Promise<ValuesResponse> {
-	if (!isCollectAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<ValuesResponse>('collect_values');
 	return httpJson<ValuesResponse>('/api/collect/values', 'GET', signal);
 }
@@ -552,7 +535,6 @@ export async function getCollectValues(signal?: AbortSignal): Promise<ValuesResp
 export async function getCollectConnections(
 	signal?: AbortSignal
 ): Promise<Readout<Record<string, ConnectionView>>> {
-	if (!isCollectAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri')
 		return invokeCommand<Readout<Record<string, ConnectionView>>>('collect_connections');
 	return httpJson<Readout<Record<string, ConnectionView>>>(
@@ -584,7 +566,6 @@ export async function listCollectEvents(
 	asOfId: number | null,
 	signal?: AbortSignal
 ): Promise<Readout<CollectEventList>> {
-	if (!isCollectAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri')
 		return invokeCommand<Readout<CollectEventList>>('collect_events_list', {
 			offset,
@@ -613,7 +594,6 @@ export async function getCollectHistory(
 	params: CollectHistoryParams,
 	signal?: AbortSignal
 ): Promise<Readout<CollectHistory>> {
-	if (!isCollectAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri')
 		return invokeCommand<Readout<CollectHistory>>('collect_history', {
 			tagIds: [...params.tagIds],
@@ -637,7 +617,6 @@ export async function getCollectExport(
 	params: CollectExportParams,
 	signal?: AbortSignal
 ): Promise<Readout<CollectExport>> {
-	if (!isCollectAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri')
 		return invokeCommand<Readout<CollectExport>>('collect_export', {
 			tagIds: [...params.tagIds],
@@ -662,7 +641,6 @@ export async function getCollectDailyReport(
 	params: CollectDailyReportParams,
 	signal?: AbortSignal
 ): Promise<Readout<CollectDailyReport>> {
-	if (!isCollectAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri')
 		return invokeCommand<Readout<CollectDailyReport>>('collect_daily_report', {
 			tagIds: [...params.tagIds],
@@ -732,7 +710,6 @@ export async function runCollectAction(
 	action: CollectAction,
 	signal?: AbortSignal
 ): Promise<CollectOutcome> {
-	if (!isCollectAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<CollectOutcome>(ACTION_COMMAND[action]);
 	return httpJson<CollectOutcome>(ACTION_PATH[action], 'POST', signal);
 }

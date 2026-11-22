@@ -24,7 +24,7 @@ import {
 
 // `./setup` の実体は読み込んだだけで環境判定を始めるので、使う口だけを
 // 差し替える。`mode` で REST（`server`）と Tauri を切り替える。
-const env = vi.hoisted(() => ({ mode: 'server' as 'server' | 'tauri' | 'demo' }));
+const env = vi.hoisted(() => ({ mode: 'server' as 'server' | 'tauri' }));
 const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock('./setup', () => ({
 	CSRF_HEADER: { 'X-Banto-Client': 'banto' },
@@ -154,11 +154,6 @@ describe('listAuditLog', () => {
 			['audit_log_list', { params }],
 			['audit_log_list', { params, asOfId: 7 }]
 		]);
-	});
-
-	it('デモモードでは読まない', async () => {
-		env.mode = 'demo';
-		await expect(listAuditLog(params, null)).rejects.toBeInstanceOf(ProviderError);
 	});
 });
 

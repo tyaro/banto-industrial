@@ -3,7 +3,7 @@
 // chronogazer 固有の差（#392 B2-2、2026-10-14）: `server` モード（サービスの
 // `chronogazer-server` の HTTP の画面）では Tauri のコマンドの代わりに REST
 // （`GET`/`PUT /api/settings/server`、B2-1）を呼び、応答の `restartRequired` を持つ。
-// demo では reject する。エラーの正規化は `restJson.ts` に寄せた（doc が挙げる
+// エラーの正規化は `restJson.ts` に寄せた（doc が挙げる
 // `systemAdmin.ts` は ChronoGazer には無い）。
 /**
  * The embedded-server (LAN access) settings (spec §11.4). Inside the Tauri
@@ -16,7 +16,6 @@
  * (spec §11.3).
  */
 import { invoke } from '@tauri-apps/api/core';
-import { ProviderError } from '@banto/admin-core';
 import { restJson, toProviderError } from './restJson';
 import { getBantoMode } from './setup';
 
@@ -49,13 +48,6 @@ export interface ServerStatus {
 	restartRequired?: boolean;
 }
 
-/** The message a settings call rejects with when there is no backend (plain `vite dev`/demo). */
-export const SERVER_SETTINGS_DEMO_MESSAGE = 'デモモードでは利用できません';
-
-function demoModeError(): ProviderError {
-	return new ProviderError({ kind: 'other', message: SERVER_SETTINGS_DEMO_MESSAGE });
-}
-
 async function invokeCommand<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 	try {
 		return (await invoke(cmd, args)) as T;
@@ -68,7 +60,6 @@ async function invokeCommand<T>(cmd: string, args?: Record<string, unknown>): Pr
 export async function getServerStatus(): Promise<ServerStatus> {
 	const mode = getBantoMode();
 	if (mode === 'server') return restJson<ServerStatus>('/api/settings/server', { method: 'GET' });
-	if (mode === 'demo') throw demoModeError();
 	return invokeCommand('server_status');
 }
 
@@ -86,6 +77,5 @@ export async function applyServerSettings(
 			body: { enabled, bind, port, viewerPublic }
 		});
 	}
-	if (mode === 'demo') throw demoModeError();
 	return invokeCommand('server_apply', { enabled, bind, port, viewerPublic });
 }

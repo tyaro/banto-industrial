@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { isProviderError } from '@banto/admin-core';
 
 const mocks = vi.hoisted(() => ({
-	mode: 'server' as 'tauri' | 'server' | 'demo',
+	mode: 'server' as 'tauri' | 'server',
 	invoke: vi.fn(),
 	token: 'tok' as string | null
 }));
@@ -123,7 +123,7 @@ describe('serverAdmin（LAN の公開設定）', () => {
 		await expect(getServerStatus()).rejects.toMatchObject({ message: 'サーバーに接続できません' });
 	});
 
-	it('tauri モードはコマンド、demo は reject（fetch しない）', async () => {
+	it('tauri モードはコマンド（fetch しない）', async () => {
 		mocks.mode = 'tauri';
 		mocks.invoke.mockResolvedValueOnce(serverView);
 		await getServerStatus();
@@ -138,9 +138,6 @@ describe('serverAdmin（LAN の公開設定）', () => {
 			port: 1,
 			viewerPublic: false
 		});
-		mocks.mode = 'demo';
-		await expect(getServerStatus()).rejects.toSatisfy(isProviderError);
-		await expect(applyServerSettings(true, '0.0.0.0', 1, false)).rejects.toSatisfy(isProviderError);
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 });

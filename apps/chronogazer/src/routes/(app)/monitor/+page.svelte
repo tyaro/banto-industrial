@@ -42,7 +42,6 @@
 	import { canWriteResources } from '#lib/permissions.js';
 	import { monitorGroupHref, resolveAppPath } from '#lib/navigation.js';
 	import { collectTimeLabel, getCollectValues } from '#lib/banto/collectAdmin.js';
-	import { DEMO_MODE_MESSAGE, isTagRegistryAvailable } from '#lib/banto/tagRegistryAdmin.js';
 	import { displayGroupCatalog } from '#lib/monitor/displayGroupCatalog.svelte.js';
 	import { ValuesPoller } from '#lib/monitor/valuesPoller.svelte.js';
 	import {
@@ -95,7 +94,6 @@
 		trendPenInfos
 	} from '#lib/monitor/trendLogic.js';
 
-	const available = isTagRegistryAvailable();
 	const canEdit = $derived(canWriteResources(sessionStore.role) && !sessionStore.publicViewer);
 	/** 閲覧公開のセッションは記録を開けない（ガードが監視へ戻す）ので、リンクを出さない。 */
 	const tagsHref = $derived(sessionStore.publicViewer ? null : resolveAppPath('/tags'));
@@ -198,7 +196,7 @@
 		const period = periodMs;
 		const visible = pageVisible;
 		untrack(() => {
-			if (!available || target === null || period === null || !visible) {
+			if (target === null || period === null || !visible) {
 				poller.stop();
 			} else {
 				poller.start(target.id, period);
@@ -336,7 +334,6 @@
 	}
 
 	onMount(() => {
-		if (!available) return;
 		pageVisible = document.visibilityState === 'visible';
 		document.addEventListener('visibilitychange', onVisibilityChange);
 		void reload();
@@ -356,11 +353,7 @@
 		<h2>監視</h2>
 	</div>
 
-	{#if !available}
-		<div class="empty-state">
-			<p class="empty-message">{DEMO_MODE_MESSAGE}</p>
-		</div>
-	{:else if groups === null && displayGroupCatalog.error !== null}
+	{#if groups === null && displayGroupCatalog.error !== null}
 		<div class="empty-state" role="alert">
 			<p class="empty-message">表示グループを読み込めませんでした</p>
 			<p class="empty-hint">{displayGroupCatalog.error}</p>

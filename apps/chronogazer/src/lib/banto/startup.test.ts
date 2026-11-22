@@ -3,7 +3,8 @@
 // chronogazer 固有の差: デモのビルドは `server`（下の試験の注記）。chronogazer 固有のテストは `setup.test.ts`。
 /**
  * Startup resolution (Issue #286): Tauri / LAN browser (server-served) /
- * intended demo, plus the transient-failure paths that must NOT become demo.
+ * the demo build, plus the transient-failure paths (incl. a static host's 404)
+ * that stay on the "cannot connect" screen.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { probeBackend, PROBE_TIMEOUT_MS, type BackendProbe } from './environment';
@@ -48,18 +49,13 @@ describe('resolveStartupTarget', () => {
 		expect(probe).not.toHaveBeenCalled();
 	});
 
-	it('static host answering "no API here" is the demo', async () => {
-		const { deps } = makeDeps(['none']);
-		expect(await resolveStartupTarget(deps)).toBe('demo');
-	});
-
 	it('LAN browser: Banto server answering is server mode', async () => {
 		const { deps, statuses } = makeDeps(['server']);
 		expect(await resolveStartupTarget(deps)).toBe('server');
 		expect(statuses).toEqual(['connecting']);
 	});
 
-	it('transient failure then success: auto retry reaches server, never demo', async () => {
+	it('transient failure then success: auto retry reaches server', async () => {
 		const { deps, statuses, probe } = makeDeps(['unreachable', 'unreachable', 'server']);
 		expect(await resolveStartupTarget(deps)).toBe('server');
 		expect(probe).toHaveBeenCalledTimes(3);
@@ -106,8 +102,10 @@ describe('probeBackend', () => {
 		expect(await probeWith(async () => json(500, { kind: 'internal' }))).toBe('server');
 	});
 
-	it('static host 404 HTML -> none (demo)', async () => {
-		expect(await probeWith(async () => new Response('<html>', { status: 404 }))).toBe('none');
+	it('static host 404 / 405 / 410 HTML -> unreachable (no offline demo any more)', async () => {
+		for (const status of [404, 405, 410]) {
+			expect(await probeWith(async () => new Response('<html>', { status }))).toBe('unreachable');
+		}
 	});
 
 	it('network error -> unreachable', async () => {

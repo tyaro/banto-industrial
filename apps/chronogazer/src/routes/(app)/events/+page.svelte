@@ -12,7 +12,6 @@
 	 *   任せる（`collectAdmin.ts` の `createCollectEventsResource`）。
 	 * - 件数は総件数を一覧の上に出す。
 	 * - 並びは**新しい順**でサーバー側に固定。
-	 * - デモモード（プレーンな `vite dev`/`preview`、backend 無し）では案内文だけ。
 	 *
 	 * **監査ログ画面と違うところは 4 つ**で、いずれもこの口の性質から来る:
 	 *
@@ -45,13 +44,11 @@
 	import { untrack } from 'svelte';
 	import { BantoGrid, GridState, type GridColumn } from '@banto/grid-svelte';
 	import {
-		DEMO_MODE_MESSAGE,
 		collectTimeLabel,
 		createCollectEventsResource,
 		eventKindLabel,
 		eventLevelLabel,
 		eventsView,
-		isCollectAvailable,
 		type CollectEventRow
 	} from '#lib/banto/collectAdmin.js';
 	import {
@@ -59,8 +56,6 @@
 		resolveKeyLabel,
 		type KeyNames
 	} from '#lib/banto/collectNames.js';
-
-	const available = isCollectAvailable();
 
 	/**
 	 * 内部キー（`conn:<id>` / `tag:<id>`）→ 名前（#383 段階3 P5）。読めていない間・
@@ -152,7 +147,6 @@
 	// 状態（`loading` など）にこの effect を依存させない（`/audit-log` の同じ
 	// effect と同じ理由・同じ書き方）。後始末で飛行中の要求を中断する。
 	$effect(() => {
-		if (!available) return;
 		untrack(() => {
 			events.ensureRange(0, 100);
 			void refreshKeyNames();
@@ -183,25 +177,20 @@
 		<h2>イベント</h2>
 	</div>
 
-	{#if !available}
-		<p class="note">
-			{DEMO_MODE_MESSAGE}。単体ブラウザのデモモードには収集ランタイムがないため、この機能はデスクトップアプリまたはLANアクセス（組み込みサーバー）でのみ利用できます。
-		</p>
-	{:else}
-		<!--
+	<!--
 			「読めなかった」「0 件」「まだ一度も読めていない」を別々に出す。
 			まだ一度も読めていないうちは件数を言わない（0 件と言い切らない）。
 		-->
-		<p class="note">{view.note}</p>
+	<p class="note">{view.note}</p>
 
-		{#if view.errorText}
-			<p class="error">{view.errorText}</p>
-		{/if}
-		{#if view.expiredText}
-			<p class="error">{view.expiredText}</p>
-		{/if}
+	{#if view.errorText}
+		<p class="error">{view.errorText}</p>
+	{/if}
+	{#if view.expiredText}
+		<p class="error">{view.expiredText}</p>
+	{/if}
 
-		<!--
+	<!--
 			**「再読み込み」は常に出す**（#409 レビュー P2-4）。失敗からの再試行
 			だけでなく、**新しいイベントを取り込む唯一の導線**でもあるため:
 			一覧は世代の最初の応答で `asOfId`（スナップショット境界）を固定し、
@@ -219,22 +208,21 @@
 
 			**処理中でも押せる**（2026-10-06 オーナー決定。監査ログ画面と同じ）。
 		-->
-		<div class="actions">
-			<button type="button" onclick={reload}>再読み込み</button>
-		</div>
+	<div class="actions">
+		<button type="button" onclick={reload}>再読み込み</button>
+	</div>
 
-		<section class="grid-wrap">
-			<BantoGrid
-				mode="server"
-				state={gridState}
-				rows={events.rows}
-				totalRows={events.totalCount ?? 0}
-				{columns}
-				getRowId={(row) => row.id}
-				onVisibleRangeChange={handleVisibleRangeChange}
-			/>
-		</section>
-	{/if}
+	<section class="grid-wrap">
+		<BantoGrid
+			mode="server"
+			state={gridState}
+			rows={events.rows}
+			totalRows={events.totalCount ?? 0}
+			{columns}
+			getRowId={(row) => row.id}
+			onVisibleRangeChange={handleVisibleRangeChange}
+		/>
+	</section>
 </div>
 
 <style>

@@ -23,7 +23,7 @@
  *   guard then confirms the session as usual and the SAME URL opens (or goes
  *   to /login, the public viewer, or the session-check retry page).
  *
- * A failed probe stays "not ready" (never demo, #286): the deferral is
+ * A failed probe stays "not ready" (never an offline mode, #286): the deferral is
  * transport only, it decides nothing about the environment.
  */
 import { error } from '@sveltejs/kit';

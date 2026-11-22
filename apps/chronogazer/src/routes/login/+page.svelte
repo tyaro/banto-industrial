@@ -28,8 +28,7 @@
 	// for a LAN browser client (`createHttpAuthProvider` switches its token's
 	// storage between sessionStorage/localStorage based on this flag). Inside
 	// the Tauri webview a session already lives exactly as long as the window
-	// does, and the plain-browser demo provider has no persistence story at
-	// all - showing the checkbox there would offer a choice that does
+	// does - showing the checkbox there would offer a choice that does
 	// nothing, so it's gated on `getBantoMode() === 'server'`. Set once
 	// `bantoReady` resolves (below) - `getBantoMode()` reads the real
 	// environment only after that probe finishes, same as `mode`.
@@ -44,8 +43,7 @@
 	// 「閲覧のみで続ける」（I2b、admin-template v3.0.0 の login と同じ、
 	// ADR-0012）: LAN のブラウザ（`server` モード、`showRemember` と同じ条件）
 	// だけ - Tauri の窓には LAN 向けの閲覧公開の面は無く（この窓の「ログイン
-	// 不要」は M11 が受け持つ）、単体ブラウザのデモにはトークンを発行する
-	// バックエンドが無い。`status()` が返ってから決める。
+	// 不要」は M11 が受け持つ）。`status()` が返ってから決める。
 	let showContinueAsViewer = $state(false);
 
 	// #392 B2-2（2026-10-14 オーナー決定 3・7）: サービスの host（`chronogazer-server`）の
@@ -58,9 +56,6 @@
 	let showContinueAsThisPc = $state(false);
 	let showLocalGrantOptIn = $state(false);
 	let localGrantOptIn = $state(true);
-	// #612: 「デモは admin / admin」の案内は demo だけ（サービスの画面・LAN・Tauri の窓で
-	// 出すと、そのアカウントがあるように読めて誤解を招く。`loginEntries`）。
-	let showDemoAccountHint = $state(false);
 
 	const LOGIN_SUPERSEDED_MESSAGE = '別のセッションが先に確定しました。現在のセッションで開きます。';
 
@@ -78,7 +73,6 @@
 			showContinueAsViewer = entries.continueAsViewer;
 			showContinueAsThisPc = entries.continueAsThisPc;
 			showLocalGrantOptIn = entries.localGrantOptIn;
-			showDemoAccountHint = entries.demoAccountHint;
 		})();
 	});
 
@@ -245,9 +239,6 @@
 	{:else if mode === 'login'}
 		<form onsubmit={submitLogin}>
 			<h1>🏮 ChronoGazer</h1>
-			{#if showDemoAccountHint}
-				<p class="note">単体ブラウザ（デモ）モードは admin / admin でログインできます。</p>
-			{/if}
 
 			<label>
 				ユーザー名

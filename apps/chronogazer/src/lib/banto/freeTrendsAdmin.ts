@@ -5,7 +5,6 @@
  * - Tauri webview -> `invoke()` の `free_trends_*` コマンド（`apps/chronogazer/src-tauri/src/lib.rs`）。
  * - LAN ブラウザ（組み込みサーバー） -> `/api/free-trends[...]`
  *   （`apps/chronogazer/core/src/rest/free_trends.rs`）。
- * - 単体ブラウザのデモモード -> DB が無いので `DEMO_MODE_MESSAGE` で拒否。
  *
  * 自由トレンドは全員で共有する名前付きのペンの組。開くのは全員（ログインなしのセッションと
  * API キーも）、作れるのはアカウントのログイン（viewer 以上）とこの PC からの接続（localDesktop）、
@@ -14,12 +13,7 @@
  * ペンの属性は表示グループと同じ語彙（`PenStyle`）。
  */
 import type { Pen, PenStyle } from './displayGroupsAdmin';
-import {
-	demoModeError,
-	httpRequest,
-	invokeCommand,
-	isTagRegistryAvailable
-} from './tagRegistryAdmin';
+import { httpRequest, invokeCommand } from './tagRegistryAdmin';
 import { getBantoMode } from './setup';
 
 /** 保存できる自由トレンドの数（Rust の `MAX_FREE_TRENDS`）。 */
@@ -61,19 +55,16 @@ export interface FreeTrendInput {
 }
 
 export async function listFreeTrends(): Promise<FreeTrend[]> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<FreeTrend[]>('free_trends_list');
 	return httpRequest<FreeTrend[]>('/api/free-trends', { method: 'GET' });
 }
 
 export async function getFreeTrend(id: number): Promise<FreeTrend> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<FreeTrend>('free_trends_get', { id });
 	return httpRequest<FreeTrend>(`/api/free-trends/${id}`, { method: 'GET' });
 }
 
 export async function createFreeTrend(input: FreeTrendInput): Promise<FreeTrend> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		return invokeCommand<FreeTrend>('free_trends_create', { input });
 	}
@@ -81,7 +72,6 @@ export async function createFreeTrend(input: FreeTrendInput): Promise<FreeTrend>
 }
 
 export async function updateFreeTrend(id: number, input: FreeTrendInput): Promise<FreeTrend> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		return invokeCommand<FreeTrend>('free_trends_update', { id, input });
 	}
@@ -89,7 +79,6 @@ export async function updateFreeTrend(id: number, input: FreeTrendInput): Promis
 }
 
 export async function deleteFreeTrend(id: number): Promise<void> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		await invokeCommand<void>('free_trends_delete', { id });
 		return;

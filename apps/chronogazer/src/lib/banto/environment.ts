@@ -64,20 +64,20 @@ export const CSRF_HEADER = { 'X-Banto-Client': 'banto' } as const;
  * What the same-origin `GET /api/auth/check` probe found out (Issue #286).
  * Deployment kind ("which environment is this build served from") and
  * communication state ("did the probe get through right now") are different
- * questions; this three-way result keeps them apart:
+ * questions; this two-way result keeps them apart:
  *
  * - `server`      - Banto's embedded server answered (LAN browser, `banto-serve`).
- * - `none`        - the origin answered, but it is definitively not Banto: a
- *                   static host / `vite preview` returning its own 404 for an
- *                   unknown `/api` path. That is the intended demo hosting.
- * - `unreachable` - no usable answer: network error, timeout, or a response
- *                   that is neither Banto's nor a plain "no such route" (a
- *                   reverse proxy's HTML 502/503 while the backend is down,
- *                   a bare 5xx...). Transient by nature - it MUST NOT be read
- *                   as "this is the demo" (that silently swaps a real backend
- *                   for in-memory sample data and never switches back).
+ * - `unreachable` - no usable answer: network error, timeout, a plain 404/405/410
+ *                   from a static host / `vite dev` that is not Banto, or a
+ *                   response that is neither Banto's nor a usable one (a reverse
+ *                   proxy's HTML 502/503 while the backend is down, a bare 5xx...).
+ *                   Handled as "cannot connect" (retry, then the reconnect screen);
+ *                   it MUST NOT be read as some offline sample mode. The old
+ *                   in-memory demo is gone: the GitHub Pages demo is the
+ *                   `VITE_BANTO_DEMO=1` build (`isDemoBuild()`, docs/demo-pages-design.md),
+ *                   which never probes.
  */
-export type BackendProbe = 'server' | 'none' | 'unreachable';
+export type BackendProbe = 'server' | 'unreachable';
 
 /** Upper bound for one probe request; a hung connection must not pin the splash screen forever. */
 export const PROBE_TIMEOUT_MS = 5000;
@@ -88,9 +88,8 @@ export const PROBE_TIMEOUT_MS = 5000;
  * - `200`/`401`, or any response carrying Banto's JSON error body
  *   (`{ "kind": ... }`, Issue #204: e.g. a `500` when the server could not
  *   check an account) -> `server`.
- * - `404`/`405`/`410` without that body -> `none` (a static host answering
- *   for itself).
- * - Everything else, including fetch exceptions and the timeout -> `unreachable`.
+ * - Everything else (404/405/410 without that body, fetch exceptions, the timeout)
+ *   -> `unreachable`.
  *
  * Callers check `isTauri()` first (Tauri never probes). `fetchImpl` is
  * injectable for tests.
@@ -113,9 +112,7 @@ export async function probeBackend(
 		) {
 			return 'server';
 		}
-		return response.status === 404 || response.status === 405 || response.status === 410
-			? 'none'
-			: 'unreachable';
+		return 'unreachable';
 	} catch {
 		return 'unreachable';
 	}

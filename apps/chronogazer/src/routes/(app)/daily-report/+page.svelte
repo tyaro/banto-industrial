@@ -20,16 +20,8 @@
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { canWriteResources } from '#lib/permissions.js';
 	import { resolveAppPath } from '#lib/navigation.js';
-	import {
-		getCollectDailyReport,
-		isCollectAvailable,
-		type CollectDailyReport
-	} from '#lib/banto/collectAdmin.js';
-	import {
-		DEMO_MODE_MESSAGE,
-		isTagRegistryAvailable,
-		listTags
-	} from '#lib/banto/tagRegistryAdmin.js';
+	import { getCollectDailyReport, type CollectDailyReport } from '#lib/banto/collectAdmin.js';
+	import { listTags } from '#lib/banto/tagRegistryAdmin.js';
 	import { displayGroupCatalog } from '#lib/monitor/displayGroupCatalog.svelte.js';
 	import {
 		INITIAL_TAG_META,
@@ -65,7 +57,6 @@
 		type ReportTagInfo
 	} from '#lib/dailyReport/dailyReportLogic.js';
 
-	const available = isTagRegistryAvailable() && isCollectAvailable();
 	const canEdit = $derived(canWriteResources(sessionStore.role) && !sessionStore.publicViewer);
 
 	// --- URL（グループ・日付） ---------------------------------------------------
@@ -218,7 +209,7 @@
 	$effect(() => {
 		const key = dataKey;
 		void retryToken;
-		if (key === null || !available) return;
+		if (key === null) return;
 		const req = untrack(() => request);
 		if (req === null) return;
 		const mine = ++generation;
@@ -274,7 +265,6 @@
 	const reportEmpty = $derived(outcome?.state === 'ready' && isEmptyReport(outcome.data));
 
 	onMount(() => {
-		if (!available) return;
 		void reload();
 		const timer = setInterval(() => (now = Date.now()), 30_000);
 		return () => clearInterval(timer);
@@ -286,11 +276,7 @@
 		<h2>日報</h2>
 	</div>
 
-	{#if !available}
-		<div class="empty-state">
-			<p class="empty-message">{DEMO_MODE_MESSAGE}</p>
-		</div>
-	{:else if groups === null && displayGroupCatalog.error !== null}
+	{#if groups === null && displayGroupCatalog.error !== null}
 		<div class="empty-state" role="alert">
 			<p class="empty-message">表示グループを読み込めませんでした</p>
 			<p class="empty-hint">{displayGroupCatalog.error}</p>

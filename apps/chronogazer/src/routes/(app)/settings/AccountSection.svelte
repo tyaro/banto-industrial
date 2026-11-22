@@ -28,8 +28,7 @@
 
 	// Optional on `AuthProvider` (spec §3.3): older/custom providers may not
 	// implement it, in which case the section below shows a note instead of
-	// the form (all three built-in providers - demo/Tauri/HTTP - do
-	// implement it, demo's just always fails with a fixed message).
+	// the form (both built-in providers - Tauri/HTTP - implement it).
 	const changePassword = getAuthProvider().changePassword;
 
 	let currentPassword = $state('');

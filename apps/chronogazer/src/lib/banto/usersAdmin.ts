@@ -16,12 +16,6 @@
  * `/api/{resource}/list`. A small dedicated client mirroring
  * providers/tauri.ts + providers/http.ts's error handling is simpler and
  * clearer than bending the generic contract to fit.
- *
- * Plain `vite dev`/`vite preview` (spec §11.1's third environment, no Rust
- * backend at all): there is no account database to manage, so every export
- * here throws/rejects with a `ProviderError` carrying `DEMO_MODE_MESSAGE`;
- * `isUsersAdminAvailable()` lets the users page check this up front instead
- * of always trying and catching.
  */
 import { invoke } from '@tauri-apps/api/core';
 import { getAuthProvider, isProviderError, ProviderError, type ErrorBody } from '@banto/admin-core';
@@ -56,17 +50,6 @@ export interface CreateUserInput {
 export interface UpdateUserInput {
 	displayName: string;
 	role: Role;
-}
-
-export const DEMO_MODE_MESSAGE = 'デモモードでは利用できません';
-
-function demoModeError(): ProviderError {
-	return new ProviderError({ kind: 'other', message: DEMO_MODE_MESSAGE });
-}
-
-/** Is this environment backed by a real account database (Tauri or the embedded server)? False in plain-browser demo mode. */
-export function isUsersAdminAvailable(): boolean {
-	return getBantoMode() !== 'demo';
 }
 
 const ERROR_KINDS = new Set([
@@ -156,13 +139,11 @@ async function httpRequest<T>(path: string, init: HttpInit): Promise<T> {
 }
 
 export async function listUsers(): Promise<UserSummary[]> {
-	if (!isUsersAdminAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<UserSummary[]>('users_list');
 	return httpRequest<UserSummary[]>('/api/users', { method: 'GET' });
 }
 
 export async function createUser(input: CreateUserInput): Promise<CreatedUser> {
-	if (!isUsersAdminAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		return invokeCommand<CreatedUser>('users_create', {
 			username: input.username,
@@ -175,7 +156,6 @@ export async function createUser(input: CreateUserInput): Promise<CreatedUser> {
 }
 
 export async function updateUser(id: number, input: UpdateUserInput): Promise<UserSummary> {
-	if (!isUsersAdminAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		return invokeCommand<UserSummary>('users_update', {
 			id,
@@ -187,7 +167,6 @@ export async function updateUser(id: number, input: UpdateUserInput): Promise<Us
 }
 
 export async function resetUserPassword(id: number, newPassword: string): Promise<void> {
-	if (!isUsersAdminAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		await invokeCommand<void>('users_reset_password', { id, newPassword });
 		return;
@@ -202,7 +181,6 @@ export async function resetUserPassword(id: number, newPassword: string): Promis
 }
 
 export async function deleteUser(id: number): Promise<void> {
-	if (!isUsersAdminAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		await invokeCommand<void>('users_delete', { id });
 		return;

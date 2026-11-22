@@ -13,12 +13,7 @@
  * - 一覧を読めなかったときは、その部分だけ名前が無い（キーのまま）。名前の
  *   解決に失敗しても、イベントや状態の表示自体は止めない。
  */
-import {
-	listCollectionGroups,
-	listPlcConnections,
-	listTags,
-	isTagRegistryAvailable
-} from './tagRegistryAdmin';
+import { listCollectionGroups, listPlcConnections, listTags } from './tagRegistryAdmin';
 
 /** キー（`conn:<id>` / `tag:<id>`）→ 表示名。 */
 export type KeyNames = ReadonlyMap<string, string>;
@@ -77,10 +72,8 @@ export function createKeyNamesRefresher(
 
 /**
  * レジストリから名前を読む。一覧ごとに失敗を吸収する（読めなかった部分は空）。
- * デモモード（backend 無し）では何も読まない。
  */
 export async function loadKeyNames(): Promise<Map<string, string>> {
-	if (!isTagRegistryAvailable()) return new Map();
 	const [connections, groups, tags] = await Promise.all([
 		listPlcConnections().catch(() => []),
 		listCollectionGroups().catch(() => []),

@@ -7,7 +7,7 @@
 	 *
 	 * - 選択は `<select>` と URL の `?id=<id>`（優先順位は `?id=` → この端末で最後に見たもの →
 	 *   先頭。判断は `freeTrendLogic.ts`）。一覧に無い `?id=` は断る。
-	 * - 状態は別々に出す: 読み込み中 / 読めなかった（やり直し）/ 0 件 / デモモード / 表示中。
+	 * - 状態は別々に出す: 読み込み中 / 読めなかった（やり直し）/ 0 件 / 表示中。
 	 * - 時間窓の初期値は保存された `timeWindowSec`。選び直しはこの画面の中だけ（保存しない）。
 	 * - 削除は `canEdit`（作った人か editor 以上）が真のときだけ。確認のうえ消し、一覧を読み直す。
 	 * - ライブの段取りは監視と共通の `LiveTrend`（`liveTrend.svelte.ts`）。
@@ -33,7 +33,6 @@
 	import { navigating, page } from '$app/state';
 	import { resolveAppPath } from '#lib/navigation.js';
 	import { collectTimeLabel, getCollectValues } from '#lib/banto/collectAdmin.js';
-	import { DEMO_MODE_MESSAGE, isTagRegistryAvailable } from '#lib/banto/tagRegistryAdmin.js';
 	import { formatSqliteUtc } from '#lib/banto/sqliteTime.js';
 	import {
 		MAX_FREE_TREND_NAME_CHARS,
@@ -126,8 +125,6 @@
 		colorSlotVar,
 		effectiveColorSlot
 	} from '../groups/groupsPageLogic';
-
-	const available = isTagRegistryAvailable();
 
 	/** localStorage はアクセスそのものが投げることがある（プライベートモード等）。 */
 	function deviceStorage(): Storage | undefined {
@@ -675,7 +672,7 @@
 		const period = periodMs;
 		const visible = pageVisible;
 		untrack(() => {
-			if (!available || target === null || period === null || !visible) {
+			if (target === null || period === null || !visible) {
 				poller.stop();
 			} else {
 				poller.start(target.id, period);
@@ -813,7 +810,6 @@
 	}
 
 	onMount(() => {
-		if (!available) return;
 		pageVisible = document.visibilityState === 'visible';
 		document.addEventListener('visibilitychange', onVisibilityChange);
 		void reload();
@@ -834,7 +830,7 @@
 <div class="page">
 	<div class="page-header">
 		<h2>自由トレンド</h2>
-		{#if available && list !== null && list.length > 0}
+		{#if list !== null && list.length > 0}
 			<label class="picker">
 				<span>表示する自由トレンド</span>
 				<select
@@ -856,7 +852,7 @@
 				</button>
 			{/if}
 		{/if}
-		{#if available && list !== null && canCreate && !creating}
+		{#if list !== null && canCreate && !creating}
 			<button
 				type="button"
 				data-testid="free-trend-new"
@@ -871,11 +867,7 @@
 		{/if}
 	</div>
 
-	{#if !available}
-		<div class="empty-state">
-			<p class="empty-message">{DEMO_MODE_MESSAGE}</p>
-		</div>
-	{:else if list === null && listError !== null}
+	{#if list === null && listError !== null}
 		<div class="empty-state" role="alert">
 			<p class="empty-message">自由トレンドを読み込めませんでした</p>
 			<p class="empty-hint">{listError}</p>
