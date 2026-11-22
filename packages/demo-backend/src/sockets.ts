@@ -147,8 +147,10 @@ export function createDemoWebSocketClass(
 				if (this.readyState !== 0) return;
 				this.readyState = 1;
 				this.protocol = list[0] ?? '';
-				fire(this, new Event('open'));
+				// 模擬の受け口（onMessage）を先に登録してから open を配る。onopen の中で
+				// 同期に send するクライアントの message を取りこぼさないため。
 				found.route.connect(connection);
+				if (this.readyState === 1) fire(this, new Event('open'));
 			});
 		}
 
@@ -158,9 +160,8 @@ export function createDemoWebSocketClass(
 			}
 			if (this.readyState !== 1) return;
 			const text = typeof data === 'string' ? data : '';
-			const listeners = [...this.#messageListeners];
 			later(() => {
-				for (const listener of listeners) listener(text);
+				for (const listener of [...this.#messageListeners]) listener(text);
 			});
 		}
 

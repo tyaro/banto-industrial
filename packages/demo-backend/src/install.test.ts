@@ -240,6 +240,32 @@ describe('WebSocket', () => {
 		await vi.waitFor(() => expect(ws.readyState).toBe(3));
 		expect(RealWebSocket).not.toHaveBeenCalled();
 	});
+
+	it('onopen の中で同期に send した message も模擬に届く。connect の中の send は open の後に届く', async () => {
+		const received: string[] = [];
+		const { target } = setup({
+			http: [],
+			sockets: [
+				{
+					path: '/api/v1/stream',
+					connect(conn) {
+						conn.onMessage((data) => received.push(data));
+						conn.send('greeting');
+					}
+				}
+			]
+		});
+		const ws = new target.WebSocket!('ws://anywhere.example/api/v1/stream');
+		const events: string[] = [];
+		ws.onopen = () => {
+			events.push('open');
+			ws.send('x');
+		};
+		ws.onmessage = (e) => events.push(`message:${String(e.data)}`);
+		await vi.waitFor(() => expect(events).toEqual(['open', 'message:greeting']));
+		await vi.waitFor(() => expect(received).toEqual(['x']));
+		ws.close();
+	});
 });
 
 describe('EventSource', () => {
