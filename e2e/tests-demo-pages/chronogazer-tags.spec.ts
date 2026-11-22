@@ -138,3 +138,20 @@ test('ChronoGazer /tags: 収集グループの追加と、タグが残るグル�
 	expect(traffic.forbidden()).toEqual([]);
 	expect(traffic.unsupported).toEqual([]);
 });
+
+test('ChronoGazer /monitor: 直に開いても、履歴の口を含め未実装の警告が出ない', async ({
+	page,
+	baseURL
+}) => {
+	const traffic = recordTraffic(page, new URL(baseURL!).origin);
+	await page.goto(`${SITE}/chronogazer/monitor`);
+	await expect(page.getByRole('heading', { name: '監視', exact: true })).toBeVisible();
+	// `TrendFeed` は最初の 1 回の履歴を `HISTORY_FLUSH_GRACE_MS`（2 秒）待ってから読む。
+	// 模擬は fetch の境目で動くので要求は network に出ない。猶予より十分長く置いて、
+	// 履歴の要求が模擬に届いた後で数える。
+	await page.waitForTimeout(4500);
+	expect(traffic.unsupported).toEqual([]);
+	// 空の通知の枠（alert）は常にある。中身のある alert が無いことを見る。
+	await expect(page.getByRole('alert').filter({ hasText: /\S/ })).toHaveCount(0);
+	expect(traffic.forbidden()).toEqual([]);
+});

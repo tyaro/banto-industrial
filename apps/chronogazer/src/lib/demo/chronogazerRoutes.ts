@@ -6,8 +6,8 @@
  *
  * どの口が要るかは、デモのビルドで `/tags` を開き、模擬の「口がありません」の警告から
  * 拾った（2026-11-22・2026-11-23）。応答の型は各 `*Admin.ts` から取る（模擬の側で書き直さない）。
- * `/api/tags/from-hub`・`/api/hub*`・履歴・表示グループの編集は、今のデモの対象外で 501
- * （押して初めて呼ばれる。履歴・トレンドは次の PR の `/monitor`）。現在値（`/api/collect/values`）は
+ * `/api/tags/from-hub`・`/api/hub*`・表示グループの編集は、今のデモの対象外で 501
+ * （押して初めて呼ばれる）。履歴は `/monitor` を開くだけで呼ばれるので空で返す（本当の模擬は次の PR）。現在値（`/api/collect/values`）は
  * `/monitor` を開いたときの起動で呼ばれるので模擬する。
  */
 import {
@@ -18,7 +18,7 @@ import {
 	type DemoHttpRoute,
 	type DemoRequest
 } from '@banto-industrial/demo-backend';
-import type { ValuesResponse } from '#lib/banto/collectAdmin.js';
+import type { CollectHistory, Readout, ValuesResponse } from '#lib/banto/collectAdmin.js';
 import type {
 	CollectionGroupInput,
 	ExclusionView,
@@ -53,11 +53,18 @@ function guarded(handle: (req: DemoRequest) => Response | Promise<Response>) {
 	};
 }
 
-/** `GET /api/collect/values` の模擬: 登録中の有効なタグ全部の現在値（タグ ID と時刻だけで決まる純関数）。 */
+/**
+ * `GET /api/collect/values` の模擬: 収集の対象になるタグの現在値（タグ ID と時刻だけで決まる純関数）。
+ * 本物は、タグ自身・収集グループ・PLC 接続のどれかが無効なら収集の構成に入れない
+ * （`crates/banto-collect/src/config.rs` の `enabled` の絞り込み）ので、キーごと載せない。
+ */
 function valuesOf(registry: ChronoGazerRegistry, nowMs: number): ValuesResponse {
 	const data: Extract<ValuesResponse, { state: 'ready' }>['data'] = {};
 	for (const tag of registry.tags) {
+		if (!tag.enabled) continue;
 		const group = registry.group(tag.collectionGroupId);
+		if (!group?.enabled) continue;
+		if (!registry.connections.find((c) => c.id === group.plcConnectionId)?.enabled) continue;
 		const sampleMs = demoSampleTime(nowMs, group?.periodMs);
 		data[`tag:${tag.id}`] = {
 			value: demoTagValue({ id: tag.id, dataType: tag.dataType, periodMs: group?.periodMs }, nowMs),
@@ -67,6 +74,29 @@ function valuesOf(registry: ChronoGazerRegistry, nowMs: number): ValuesResponse 
 		};
 	}
 	return { state: 'ready', data, serverNowMs: nowMs };
+}
+
+/**
+ * 系列の無い履歴。`tagIds` のうちレジストリに居ないタグだけを `unknownTagIds` に並べる（本物と同じ意味。
+ * 重複は除く）。居るタグは系列が無いだけで、無いタグとは扱わない。
+ */
+function emptyHistory(
+	registry: ChronoGazerRegistry,
+	query: URLSearchParams
+): Readout<CollectHistory> {
+	const ids = (query.get('tagIds') ?? '')
+		.split(',')
+		.map((s) => Number(s))
+		.filter((n) => Number.isInteger(n) && !registry.tag(n));
+	return {
+		state: 'ready',
+		data: {
+			fromMs: Number(query.get('fromMs') ?? 0),
+			toMs: Number(query.get('toMs') ?? 0),
+			series: [],
+			unknownTagIds: [...new Set(ids)]
+		}
+	};
 }
 
 function idOf(req: DemoRequest): number {
@@ -86,6 +116,13 @@ export function createChronoGazerRoutes(
 			method: 'GET',
 			path: '/api/collect/values',
 			handle: () => json(valuesOf(registry, Date.now()))
+		},
+		// 履歴の本当の模擬は次の PR。`/monitor` が最初のグループで読むので、系列の無い空の履歴を返す
+		// （本物の `core/src/rest.rs` の collect_history の試験と同じ形。要求の期間はそのまま返す）。
+		{
+			method: 'GET',
+			path: '/api/collect/history',
+			handle: (req) => json(emptyHistory(registry, req.url.searchParams))
 		},
 
 		// --- 接続 ---

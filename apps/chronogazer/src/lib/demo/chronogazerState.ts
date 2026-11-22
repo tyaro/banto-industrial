@@ -295,15 +295,24 @@ export class ChronoGazerRegistry {
 		return updated;
 	}
 
-	/** タグを消す。そのしきい値と、表示グループのペンも外す。 */
+	/**
+	 * タグを消す。そのしきい値も消す。表示グループのペンに使われていれば、参照元を並べて 422 で断り
+	 * 何も消さない（本物 `display_groups.rs` の `delete_tag_unless_referenced`。自由トレンドは模擬しない）。
+	 */
 	deleteTag(id: number): void {
 		if (!this.tag(id)) throw new DemoNotFoundError('tags', id);
+		const referrers = this.displayGroups.filter((g) => g.pens.some((p) => p.tagId === id));
+		if (referrers.length > 0) {
+			const names = referrers.map((g) => `「${g.name}」`).join('');
+			throw new DemoValidationError([
+				{
+					field: 'displayGroups',
+					message: `このタグは表示グループ${names}のペンに割り当てられているため削除できません。先に「表示グループ」ページでペンから外してください`
+				}
+			]);
+		}
 		this.tags = this.tags.filter((t) => t.id !== id);
 		this.thresholds = this.thresholds.filter((t) => t.tagId !== id);
-		this.displayGroups = this.displayGroups.map((g) => ({
-			...g,
-			pens: g.pens.filter((p) => p.tagId !== id)
-		}));
 	}
 
 	// --- しきい値 ---------------------------------------------------------

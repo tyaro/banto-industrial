@@ -101,18 +101,34 @@ describe('ChronoGazerRegistry（模擬の登録）', () => {
 		expect(r.group(g.id)).toBeUndefined();
 	});
 
-	it('タグを消すと、しきい値と表示グループのペンも消える', () => {
+	it('表示グループのペンに使われているタグの削除は 422 で断り、何も消さない', () => {
 		const r = new ChronoGazerRegistry();
-		r.updateThresholds(1, {
+		r.updateThresholds(1, { thresholdLl: null, thresholdL: 1, thresholdH: 5, thresholdHh: null });
+		const pens = r.displayGroups.map((g) => g.pens.length);
+		const error = validation(() => r.deleteTag(1));
+		expect(error.status).toBe(422);
+		expect(error.fieldErrors).toHaveLength(1);
+		expect(error.fieldErrors[0].field).toBe('displayGroups');
+		expect(error.fieldErrors[0].message).toContain(`「${r.displayGroups[0].name}」`);
+		expect(error.fieldErrors[0].message).toContain('ペンに割り当てられているため削除できません');
+		expect(r.tag(1)).toBeDefined();
+		expect(r.thresholds).toHaveLength(1);
+		expect(r.displayGroups.map((g) => g.pens.length)).toEqual(pens);
+	});
+
+	it('参照の無いタグは消せて、しきい値も消える', () => {
+		const r = new ChronoGazerRegistry();
+		const created = r.createTag(NEW_TAG);
+		r.updateThresholds(created.id, {
 			thresholdLl: null,
 			thresholdL: 1,
 			thresholdH: 5,
 			thresholdHh: null
 		});
-		expect(r.thresholdsOf(1).revision).toBe(1);
-		r.deleteTag(1);
+		expect(r.thresholds).toHaveLength(1);
+		r.deleteTag(created.id);
+		expect(r.tag(created.id)).toBeUndefined();
 		expect(r.thresholds).toHaveLength(0);
-		expect(r.displayGroups[0].pens.some((p) => p.tagId === 1)).toBe(false);
 	});
 
 	it('しきい値: 保存の無いタグは全部 null・revision 0。古い版は 409', () => {
@@ -133,12 +149,14 @@ describe('ChronoGazerRegistry（模擬の登録）', () => {
 });
 
 describe('createChronoGazerRoutes（口）', () => {
-	function call(routes: DemoHttpRoute[], method: string, path: string, body?: unknown) {
+	function call(routes: DemoHttpRoute[], method: string, fullPath: string, body?: unknown) {
+		const url = new URL(fullPath, 'http://demo.local');
+		const path = url.pathname;
 		for (const route of routes) {
 			if (route.method !== method) continue;
 			const params = matchPath(route.path, path);
 			if (!params) continue;
-			return route.handle({ params, json: async () => body } as unknown as DemoRequest);
+			return route.handle({ params, url, json: async () => body } as unknown as DemoRequest);
 		}
 		throw new Error(`口が無い: ${method} ${path}`);
 	}
@@ -164,6 +182,58 @@ describe('createChronoGazerRoutes（口）', () => {
 		expect(Object.keys(body.data)).toHaveLength(20);
 		expect(body.data['tag:1']).toMatchObject({ quality: 'good' });
 		expect(typeof body.serverNowMs).toBe('number');
+	});
+
+	it('無効なタグ・グループ・接続の値は載らず、有効に戻すと戻る', async () => {
+		const r = new ChronoGazerRegistry();
+		const routes = createChronoGazerRoutes(r);
+		const keys = async () =>
+			Object.keys((await (await call(routes, 'GET', '/api/collect/values')).json()).data);
+		const base = (await keys()).length;
+		expect(await keys()).toContain('tag:1');
+
+		const tag = r.tag(1)!;
+		await call(routes, 'PUT', '/api/tags/1', { ...tag, enabled: false });
+		expect(await keys()).not.toContain('tag:1');
+		expect(await keys()).toHaveLength(base - 1);
+		await call(routes, 'PUT', '/api/tags/1', { ...tag, enabled: true });
+		expect(await keys()).toContain('tag:1');
+
+		const group = r.group(tag.collectionGroupId)!;
+		const inGroup = r.tags.filter((t) => t.collectionGroupId === group.id).length;
+		await call(routes, 'PUT', `/api/collection-groups/${group.id}`, { ...group, enabled: false });
+		expect(await keys()).toHaveLength(base - inGroup);
+		await call(routes, 'PUT', `/api/collection-groups/${group.id}`, { ...group, enabled: true });
+		expect(await keys()).toHaveLength(base);
+
+		const conn = r.connections.find((c) => c.id === group.plcConnectionId)!;
+		await call(routes, 'PUT', `/api/plc-connections/${conn.id}`, { ...conn, enabled: false });
+		expect(await keys()).not.toContain('tag:1');
+		await call(routes, 'PUT', `/api/plc-connections/${conn.id}`, { ...conn, enabled: true });
+		expect(await keys()).toHaveLength(base);
+	});
+
+	it('GET /api/collect/history は系列の無い空の履歴を返し、居ないタグだけを unknownTagIds に並べる', async () => {
+		const routes = createChronoGazerRoutes();
+		const res = await call(
+			routes,
+			'GET',
+			'/api/collect/history?tagIds=1%2C1%2C9999%2C9999&fromMs=1000&toMs=61000&bins=60'
+		);
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({
+			state: 'ready',
+			data: { fromMs: 1000, toMs: 61000, series: [], unknownTagIds: [9999] }
+		});
+	});
+
+	it('DELETE /api/tags/:id は使用中のタグを 422 displayGroups で断る', async () => {
+		const routes = createChronoGazerRoutes();
+		const res = await call(routes, 'DELETE', '/api/tags/1');
+		expect(res.status).toBe(422);
+		const body = await res.json();
+		expect(body.kind).toBe('validation');
+		expect(body.field_errors[0].field).toBe('displayGroups');
 	});
 
 	it('接続の削除（グループが残る）は 422', async () => {
