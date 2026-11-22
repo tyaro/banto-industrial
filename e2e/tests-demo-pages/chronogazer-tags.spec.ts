@@ -144,12 +144,16 @@ test('ChronoGazer /monitor: 直に開いても、履歴の口を含め未実装�
 	baseURL
 }) => {
 	const traffic = recordTraffic(page, new URL(baseURL!).origin);
+	// `TrendFeed` は最初の 1 回の履歴を `HISTORY_FLUSH_GRACE_MS`（2 秒）待ってから読む。
+	// 模擬は fetch の境目で動くので要求は network に出ない。模擬が履歴を返した印（console）を、
+	// 遷移の前から待ち受けて、応答を実際に受けた後で数える。
+	const historyServed = page.waitForEvent('console', {
+		predicate: (m) => m.text().startsWith('demo: 履歴を返しました'),
+		timeout: 15000
+	});
 	await page.goto(`${SITE}/chronogazer/monitor`);
 	await expect(page.getByRole('heading', { name: '監視', exact: true })).toBeVisible();
-	// `TrendFeed` は最初の 1 回の履歴を `HISTORY_FLUSH_GRACE_MS`（2 秒）待ってから読む。
-	// 模擬は fetch の境目で動くので要求は network に出ない。猶予より十分長く置いて、
-	// 履歴の要求が模擬に届いた後で数える。
-	await page.waitForTimeout(4500);
+	await historyServed;
 	expect(traffic.unsupported).toEqual([]);
 	// 空の通知の枠（alert）は常にある。中身のある alert が無いことを見る。
 	await expect(page.getByRole('alert').filter({ hasText: /\S/ })).toHaveCount(0);

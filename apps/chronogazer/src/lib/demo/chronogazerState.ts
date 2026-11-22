@@ -303,11 +303,12 @@ export class ChronoGazerRegistry {
 		if (!this.tag(id)) throw new DemoNotFoundError('tags', id);
 		const referrers = this.displayGroups.filter((g) => g.pens.some((p) => p.tagId === id));
 		if (referrers.length > 0) {
+			// 本物の文に続けて、デモ固有の案内を足す（本物と違う理由: デモは表示グループのページが使えず、ペンから外せない）。
 			const names = referrers.map((g) => `「${g.name}」`).join('');
 			throw new DemoValidationError([
 				{
 					field: 'displayGroups',
-					message: `このタグは表示グループ${names}のペンに割り当てられているため削除できません。先に「表示グループ」ページでペンから外してください`
+					message: `このタグは表示グループ${names}のペンに割り当てられているため削除できません。先に「表示グループ」ページでペンから外してください（デモでは表示グループを編集できません。新しく追加したタグで削除を試せます）`
 				}
 			]);
 		}

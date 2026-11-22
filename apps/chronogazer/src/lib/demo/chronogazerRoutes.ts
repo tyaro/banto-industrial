@@ -122,7 +122,11 @@ export function createChronoGazerRoutes(
 		{
 			method: 'GET',
 			path: '/api/collect/history',
-			handle: (req) => json(emptyHistory(registry, req.url.searchParams))
+			handle: (req) => {
+				// E2E が「模擬の履歴の応答を実際に返した」ことを待つ印（デモのビルドにだけある模擬のコード）。
+				console.debug('demo: 履歴を返しました');
+				return json(emptyHistory(registry, req.url.searchParams));
+			}
 		},
 
 		// --- 接続 ---

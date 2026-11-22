@@ -111,6 +111,7 @@ describe('ChronoGazerRegistry（模擬の登録）', () => {
 		expect(error.fieldErrors[0].field).toBe('displayGroups');
 		expect(error.fieldErrors[0].message).toContain(`「${r.displayGroups[0].name}」`);
 		expect(error.fieldErrors[0].message).toContain('ペンに割り当てられているため削除できません');
+		expect(error.fieldErrors[0].message).toContain('デモでは表示グループを編集できません');
 		expect(r.tag(1)).toBeDefined();
 		expect(r.thresholds).toHaveLength(1);
 		expect(r.displayGroups.map((g) => g.pens.length)).toEqual(pens);
