@@ -826,6 +826,11 @@ fn build_group_runtime(config: &StoreConfig) -> HashMap<String, GroupRuntime> {
 /// #623 PR4: ファイルは `place` で開く（[`DataPlace::Managed`] なら握ってから）。設定の
 /// 不一致で付け替えるとき・スキーマを読めない/作れないときは、開いた pool を閉じ終えてから
 /// 握りを離す（[`WritableFile::close`]）。
+///
+/// #1304: スキーマは [`schema::create_schema`] で「空なら作る」。作れなかったファイルを名前で
+/// 消すことはしない（`open_writable` は既存のファイルも開き、`Managed` の握りも `close` で
+/// 離れるので、消す時点で同じファイルだと言えない。使われている収集ファイルを消しうる）。
+/// 表の無いファイル（前回の作成の失敗の残骸）は、次の open が同じ連番で作り直す。
 async fn resolve_file(
     place: &DataPlace,
     config: &StoreConfig,
@@ -833,7 +838,7 @@ async fn resolve_file(
     date: LocalDate,
     created_at_ms: i64,
 ) -> Result<(WritableFile, u32), TstoreError> {
-    let seq = match place.latest_file_for_date(date)? {
+    let (file, seq) = match place.latest_file_for_date(date)? {
         Some(existing) => {
             let name = existing
                 .path
@@ -842,32 +847,77 @@ async fn resolve_file(
                 .expect("一覧から選んだ名前は UTF-8")
                 .to_string();
             let file = place.open_writable(&name).await?;
-            let file_meta = match schema::read_file_meta(&file.pool).await {
-                Ok(meta) => meta,
+            match schema::read_file_meta(&file.pool).await {
+                Ok(meta) if meta.config_hash == config_hash => return Ok((file, existing.seq)),
+                Ok(_) => {
+                    file.close().await;
+                    let seq = existing.seq + 1;
+                    (
+                        place
+                            .open_writable(&schema::data_file_name(date, seq))
+                            .await?,
+                        seq,
+                    )
+                }
+                // #1304: `tstore_meta` が無い。表の無い残骸なら同じ連番で作り直す。別の表がある
+                // ファイルは `create_schema` が何も変えずに AlreadyInitialized を返し、読み直しで
+                // 今までどおり `Uninitialized` の誤りになる。
+                Err(TstoreError::Uninitialized(_)) => (file, existing.seq),
                 Err(err) => {
                     file.close().await;
                     return Err(err);
                 }
-            };
-            if file_meta.config_hash == config_hash {
-                return Ok((file, existing.seq));
             }
-            file.close().await;
-            existing.seq + 1
         }
-        None => 1,
+        None => (
+            place
+                .open_writable(&schema::data_file_name(date, 1))
+                .await?,
+            1,
+        ),
     };
+    init_or_adopt(place, file, seq, config, config_hash, date, created_at_ms).await
+}
 
-    let file = place
-        .open_writable(&schema::data_file_name(date, seq))
-        .await?;
-    if let Err(err) =
-        schema::create_schema(&file.pool, config, config_hash, date, created_at_ms).await
-    {
-        file.close().await;
-        return Err(err);
+/// 開いた `file`（連番 `seq`）を「空なら作る」で初期化する（#1304）。ロックを取った時点で
+/// 別の初期化が済んでいたら（[`schema::SchemaInit::AlreadyInitialized`]）、メタ情報を読み直し、
+/// `config_hash` が合えばそのファイルを使い、合わなければ次の連番へ進む（既存のファイルの
+/// 設定が違うときの付け替えと同じ規則）。どの分かれでも、表のあるファイルには書かない。
+/// 読み直しが誤り（他の表があって `tstore_meta` が無い・版が合わない）なら、その誤りを返す。
+async fn init_or_adopt(
+    place: &DataPlace,
+    mut file: WritableFile,
+    mut seq: u32,
+    config: &StoreConfig,
+    config_hash: &str,
+    date: LocalDate,
+    created_at_ms: i64,
+) -> Result<(WritableFile, u32), TstoreError> {
+    loop {
+        match schema::create_schema(&file.pool, config, config_hash, date, created_at_ms).await {
+            Ok(schema::SchemaInit::Created) => return Ok((file, seq)),
+            Ok(schema::SchemaInit::AlreadyInitialized) => {
+                match schema::read_file_meta(&file.pool).await {
+                    Ok(meta) if meta.config_hash == config_hash => return Ok((file, seq)),
+                    Ok(_) => {
+                        file.close().await;
+                        seq += 1;
+                        file = place
+                            .open_writable(&schema::data_file_name(date, seq))
+                            .await?;
+                    }
+                    Err(err) => {
+                        file.close().await;
+                        return Err(err);
+                    }
+                }
+            }
+            Err(err) => {
+                file.close().await;
+                return Err(err);
+            }
+        }
     }
-    Ok((file, seq))
 }
 
 #[cfg(test)]
@@ -1430,6 +1480,214 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, TstoreError::Config(_)));
+    }
+
+    // --- #1304: 空のファイルの残骸 ----------------------------------------
+
+    fn wide_config(tags: usize) -> StoreConfig {
+        StoreConfig {
+            groups: vec![GroupConfig {
+                key: "wide".to_string(),
+                name: "Wide".to_string(),
+                period_ms: 1_000,
+                tags: (0..tags).map(|i| tag(&format!("t{i}"), None, 0)).collect(),
+            }],
+        }
+    }
+
+    /// `create_schema` が 3 つの表を作った後で失敗する設定（試験だけの差し込み）。
+    fn failing_config() -> StoreConfig {
+        let mut config = wide_config(10);
+        config.groups[0].key = schema::TEST_FAIL_CREATE_KEY.to_string();
+        config
+    }
+
+    fn data_dir_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_create_schema_leaves_an_empty_file_the_next_open_initializes() {
+        // create_schema が表を作った途中で失敗する（#1304 の筋書き。試験だけの差し込み）。
+        // トランザクションが戻るので、ファイルは表の無いまま残る（名前で消すことはしない）。
+        let dir = TempDir::new("create-schema-fails");
+        let clock = clock_at(DAY1_START_MS);
+        let err = TsWriter::open(dir.path(), failing_config(), clock.clone()).await;
+        assert!(err.is_err(), "作成の途中の失敗で open は失敗する");
+        let date = LocalDate::from_epoch_ms(DAY1_START_MS, OFFSET_MS);
+        let name = schema::data_file_name(date, 1);
+        assert!(
+            data_dir_names(dir.path()).contains(&name),
+            "表の無いファイルは残る"
+        );
+        let pool = schema::connect_readonly(&dir.path().join(&name))
+            .await
+            .unwrap();
+        assert!(
+            sqlx::query("SELECT name FROM sqlite_master LIMIT 1")
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+                .is_none(),
+            "作りかけの表は残らない"
+        );
+        pool.close().await;
+
+        // 失敗の原因が無い設定で open すると、同じ連番で作れる。
+        let writer = TsWriter::open(dir.path(), wide_config(10), clock)
+            .await
+            .expect("原因が無ければ open できる");
+        writer.close().await.unwrap();
+        let files = list_data_files(dir.path()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].seq, 1, "残った空のファイルの連番を使う");
+    }
+
+    /// 本体と `-wal` のバイト列、`-wal`・`-shm` の有無（`-shm` の中身は読み手の接続でも
+    /// 変わるので有無だけ）。
+    fn file_set_snapshot(dir: &Path, name: &str) -> (Vec<u8>, Option<Vec<u8>>, bool) {
+        let body = std::fs::read(dir.join(name)).unwrap();
+        let wal = std::fs::read(dir.join(format!("{name}-wal"))).ok();
+        let shm = dir.join(format!("{name}-shm")).exists();
+        (body, wal, shm)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_schema_does_not_touch_a_file_in_use() {
+        // #1304: 別の書き手が使っている初期化済みのファイルに作成の口が当たっても、
+        // 何も書かずに AlreadyInitialized を返す（作成で失敗する設定でも試みない）。
+        let dir = TempDir::new("in-use");
+        let writer = TsWriter::open(dir.path(), two_group_config(), clock_at(DAY1_START_MS))
+            .await
+            .unwrap();
+        for i in 0..3 {
+            writer
+                .append("g1", DAY1_START_MS + i * 1_000, &[Some(i as f64), None])
+                .await
+                .unwrap();
+        }
+        writer.flush().await.unwrap();
+        let date = LocalDate::from_epoch_ms(DAY1_START_MS, OFFSET_MS);
+        let name = schema::data_file_name(date, 1);
+        let before = file_set_snapshot(dir.path(), &name);
+
+        let place = DataPlace::Path(dir.path().to_path_buf());
+        let other = place.open_writable(&name).await.unwrap();
+        let meta_before = schema::read_file_meta(&other.pool).await.unwrap();
+        let outcome = schema::create_schema(
+            &other.pool,
+            &failing_config(),
+            "other-hash",
+            date,
+            DAY1_START_MS,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, schema::SchemaInit::AlreadyInitialized);
+        assert_eq!(
+            schema::read_file_meta(&other.pool)
+                .await
+                .unwrap()
+                .config_hash,
+            meta_before.config_hash
+        );
+        // 設定が違うと、読み直してから次の連番へ進む（seq 1 には書かない）。
+        let (next, seq) = init_or_adopt(
+            &place,
+            other,
+            1,
+            &wide_config(10),
+            &compute_config_hash(&wide_config(10)),
+            date,
+            DAY1_START_MS,
+        )
+        .await
+        .unwrap();
+        assert_eq!(seq, 2);
+        next.close().await;
+        assert_eq!(
+            file_set_snapshot(dir.path(), &name),
+            before,
+            "seq 1 は変わらない"
+        );
+
+        writer.close().await.unwrap();
+        let reader = TsReader::open(&dir.path().join(&name)).await.unwrap();
+        let samples = reader
+            .read_range("g1", DAY1_START_MS, DAY1_START_MS + 10_000)
+            .await
+            .unwrap();
+        assert_eq!(samples.len(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_creates_the_schema_in_an_existing_empty_file() {
+        let dir = TempDir::new("empty-file-leftover");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let date = LocalDate::from_epoch_ms(DAY1_START_MS, OFFSET_MS);
+        let name = schema::data_file_name(date, 1);
+        // 表の無い空の SQLite ファイル（前回の失敗の残骸）を作る。
+        let pool = schema::connect_writable(&dir.path().join(&name))
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let clock = clock_at(DAY1_START_MS);
+        let writer = TsWriter::open(dir.path(), two_group_config(), clock)
+            .await
+            .expect("空のファイルがあっても open できる");
+        writer
+            .append("g1", DAY1_START_MS, &[Some(1.0), None])
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        let files = list_data_files(dir.path()).unwrap();
+        assert_eq!(files.len(), 1, "同じ連番のファイルを使う");
+        assert_eq!(files[0].seq, 1);
+        let reader = TsReader::open(&files[0].path).await.unwrap();
+        let samples = reader
+            .read_range("g1", DAY1_START_MS, DAY1_START_MS + 1_000)
+            .await
+            .unwrap();
+        assert_eq!(samples.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_still_rejects_a_file_with_other_tables_but_no_tstore_meta() {
+        let dir = TempDir::new("foreign-file");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let date = LocalDate::from_epoch_ms(DAY1_START_MS, OFFSET_MS);
+        let name = schema::data_file_name(date, 1);
+        let pool = schema::connect_writable(&dir.path().join(&name))
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE other (x INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO other (x) VALUES (1), (2)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let before = file_set_snapshot(dir.path(), &name);
+
+        let err = TsWriter::open(dir.path(), two_group_config(), clock_at(DAY1_START_MS))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TstoreError::Uninitialized(_)));
+        assert_eq!(
+            file_set_snapshot(dir.path(), &name),
+            before,
+            "他の表のあるファイルは変わらない"
+        );
+        assert_eq!(list_data_files(dir.path()).unwrap().len(), 1);
     }
 
     // --- crash / WAL-recovery on reopen (H7 ②, docs/improvement-plan.md) --

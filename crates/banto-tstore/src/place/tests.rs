@@ -653,3 +653,175 @@ async fn prune_waits_for_a_held_reader_to_close() {
     assert_eq!(report.deleted.len(), 1);
     assert!(held.names().is_empty(), "{:?}", held.names());
 }
+
+// --- #1304: 空のファイルの初期化と、使われているファイルを変えないこと -------------
+
+fn wide_config(tags: usize) -> StoreConfig {
+    StoreConfig {
+        groups: vec![GroupConfig {
+            key: "g1".to_string(),
+            name: "Group 1".to_string(),
+            period_ms: 1_000,
+            tags: (0..tags)
+                .map(|i| TagColumn {
+                    key: format!("t{i}"),
+                    name: format!("Tag t{i}"),
+                    data_type: "f32".to_string(),
+                    unit: None,
+                    decimals: 1,
+                })
+                .collect(),
+        }],
+    }
+}
+
+/// `create_schema` が 3 つの表を作った後で失敗する設定（試験だけの差し込み）。
+fn failing_config() -> StoreConfig {
+    let mut config = wide_config(10);
+    config.groups[0].key = crate::schema::TEST_FAIL_CREATE_KEY.to_string();
+    config
+}
+
+/// 本体と `-wal` のバイト列、`-wal`・`-shm` の有無（`-shm` の中身は接続でも変わるので有無だけ）。
+fn file_set_snapshot(dir: &Path, name: &str) -> (Vec<u8>, Option<Vec<u8>>, bool) {
+    let body = std::fs::read(dir.join(name)).unwrap();
+    let wal = std::fs::read(dir.join(format!("{name}-wal"))).ok();
+    let shm = dir.join(format!("{name}-shm")).exists();
+    (body, wal, shm)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_schema_does_not_touch_a_held_file_in_use() {
+    for mode in modes() {
+        let held = held(mode);
+        let place = held.place();
+        let writer = open(place.clone(), clock_at(DAY1_START_MS)).await;
+        for i in 0..3 {
+            writer
+                .append("g1", DAY1_START_MS + i * 1_000, &[Some(i as f64)])
+                .await
+                .unwrap();
+        }
+        writer.flush().await.unwrap();
+        let before = file_set_snapshot(&held.data_path, &day1_name());
+
+        // 書き手が開いたままのファイルを、別の口から握って作成を当てる（作成で失敗する
+        // 設定でも、表があるので試みずに戻る）。
+        let other = place.open_writable(&day1_name()).await.unwrap();
+        let outcome = crate::schema::create_schema(
+            &other.pool,
+            &failing_config(),
+            "other-hash",
+            LocalDate::from_epoch_ms(DAY1_START_MS, OFFSET_MS),
+            DAY1_START_MS,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            crate::schema::SchemaInit::AlreadyInitialized,
+            "{mode:?}"
+        );
+        other.close().await;
+        assert_eq!(
+            file_set_snapshot(&held.data_path, &day1_name()),
+            before,
+            "{mode:?}: 本体・-wal・-shm は変わらない"
+        );
+
+        // 違う設定の書き手は次の連番へ進み、seq 1 には書かない。
+        let next = TsWriter::open_in(
+            place.clone(),
+            wide_config(10),
+            clock_at(DAY1_START_MS),
+            WriterOptions::default(),
+        )
+        .await
+        .unwrap();
+        next.close().await.unwrap();
+        assert_eq!(
+            file_set_snapshot(&held.data_path, &day1_name()),
+            before,
+            "{mode:?}"
+        );
+
+        writer.close().await.unwrap();
+        assert_eq!(
+            tsquery_style_count(&held.data_path.join(day1_name())).await,
+            3,
+            "{mode:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_create_leaves_an_empty_held_file_the_next_open_initializes() {
+    for mode in modes() {
+        let held = held(mode);
+        let err = TsWriter::open_in(
+            held.place(),
+            failing_config(),
+            clock_at(DAY1_START_MS),
+            WriterOptions::default(),
+        )
+        .await;
+        assert!(err.is_err(), "{mode:?}: 作成の途中の失敗で open は失敗する");
+        assert!(held.names().contains(&day1_name()), "{mode:?}");
+
+        // 表の無いファイルは、次の open が同じ連番で作り直す。
+        let writer = open(held.place(), clock_at(DAY1_START_MS)).await;
+        writer
+            .append("g1", DAY1_START_MS, &[Some(1.0)])
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+        let seqs: Vec<u32> = held
+            .place()
+            .list_data_files()
+            .unwrap()
+            .iter()
+            .map(|f| f.seq)
+            .collect();
+        assert_eq!(seqs, vec![1], "{mode:?}");
+        assert_eq!(
+            tsquery_style_count(&held.data_path.join(day1_name())).await,
+            1,
+            "{mode:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_file_with_other_tables_is_rejected_and_left_as_is() {
+    for mode in modes() {
+        let held = held(mode);
+        // 置き場の握りで開いて作る（Guarded は PERSIST_WAL で `-wal`・`-shm` が残る、その形を
+        // 前の状態にする）。
+        let file = held.place().open_writable(&day1_name()).await.unwrap();
+        sqlx::query("CREATE TABLE other (x INTEGER)")
+            .execute(&file.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO other (x) VALUES (1), (2)")
+            .execute(&file.pool)
+            .await
+            .unwrap();
+        file.close().await;
+        let before = file_set_snapshot(&held.data_path, &day1_name());
+
+        let err = TsWriter::open_in(
+            held.place(),
+            config(),
+            clock_at(DAY1_START_MS),
+            WriterOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, TstoreError::Uninitialized(_)), "{mode:?}");
+        assert_eq!(
+            file_set_snapshot(&held.data_path, &day1_name()),
+            before,
+            "{mode:?}: 他の表のあるファイルは変わらない"
+        );
+    }
+}
