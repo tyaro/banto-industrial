@@ -37,6 +37,15 @@ pub struct TagColumn {
     pub decimals: u8,
 }
 
+/// 1 グループ（1 つの `samples_<n>` 表）に載せられるタグの上限（#1303）。
+///
+/// 表は `ptime` の 1 列 ＋ タグ 1 本につき 1 列で、SQLite の既定の列数の上限
+/// （`SQLITE_MAX_COLUMN` = 2000）を超えると表を作れない。2000 − 1（`ptime`）= 1999。
+/// これは仕様の上限で（オーナー決定 2026-11-22、表を分けて外す案は採らない）、
+/// タグの登録の時点で断る（`banto_tags::MAX_COLLECTED_TAGS_PER_GROUP` は同じ値。
+/// banto-collect の試験が一致を確かめる）。
+pub const MAX_TAGS_PER_GROUP: usize = 1999;
+
 /// One collection group's worth of columns, sharing one `samples_<n>` table
 /// (design: "収集周期はタグ毎ではなく収集グループ毎" - `banto_tags`'s
 /// `CollectionGroup`, mirrored here independently).
@@ -87,6 +96,16 @@ impl StoreConfig {
                 return Err(TstoreError::Config(format!(
                     "グループ {} の period_ms は0より大きい必要があります",
                     group.key
+                )));
+            }
+
+            if group.tags.len() > MAX_TAGS_PER_GROUP {
+                return Err(TstoreError::Config(format!(
+                    "グループ {}（{}）のタグが {} 本あります。1 グループは {} 本までです（#1303）",
+                    group.key,
+                    group.name,
+                    group.tags.len(),
+                    MAX_TAGS_PER_GROUP
                 )));
             }
 
@@ -173,6 +192,24 @@ mod tests {
             period_ms: 1_000,
             tags,
         }
+    }
+
+    /// #1303: 1999 本ちょうどは通り、2000 本は誤り（グループ名・本数・上限が出る）。
+    #[test]
+    fn validate_rejects_more_tags_than_the_column_limit() {
+        let many = |n: usize| -> StoreConfig {
+            StoreConfig {
+                groups: vec![group("g1", (0..n).map(|i| tag(&format!("t{i}"))).collect())],
+            }
+        };
+        many(MAX_TAGS_PER_GROUP).validate().unwrap();
+        let err = many(MAX_TAGS_PER_GROUP + 1).validate().unwrap_err();
+        let TstoreError::Config(message) = err else {
+            panic!("expected Config error");
+        };
+        assert!(message.contains("Group g1"), "{message}");
+        assert!(message.contains("2000"), "{message}");
+        assert!(message.contains("1999"), "{message}");
     }
 
     fn sample_config() -> StoreConfig {

@@ -972,6 +972,108 @@ pub(crate) fn is_db_column_identifier(address: &str) -> bool {
 /// [`validate_tag_kind_placement_tx`]: a tag's collection group joined back
 /// to the connection it collects from. Kept as a constant so the pool-taking
 /// and transaction-taking twins cannot query different things.
+/// 1 つの収集グループに載せられる（banto-tstore の表の列になる）タグの上限（#1303）。
+///
+/// banto-tstore の `MAX_TAGS_PER_GROUP` と同じ値（`ptime` の 1 列と SQLite の列数の上限
+/// 2000 から来る 1999）。banto-tags は banto-tstore に依存しないので値を写しており、
+/// banto-collect の試験が一致を確かめる。オーナー決定（2026-11-22）: 表を分けて上限を
+/// 外さず、登録の時点で断る。
+pub const MAX_COLLECTED_TAGS_PER_GROUP: usize = 1999;
+
+/// 収集（`banto_collect::build_config`）が tstore の列にするタグか。有効で、文字列でない
+/// もの（無効・文字列は列にならない）。置き場の接続が `virtual`（calc/mem）・`postgres`
+/// のグループは別に除く（[`group_capacity_errors_tx`]）。アドレス不正などで収集側が
+/// 除くタグも、ここでは多めに数える（安全側）。
+fn counts_toward_group_capacity(input: &TagInput) -> bool {
+    input.enabled && input.data_type != STRING_DATA_TYPE
+}
+
+/// #1303: これからの書き込み（作成・更新の組）で、収集グループの列の数が `max` を超える
+/// 行を探す。`rows` は `(移し先のグループ ID, 列になるか, 更新なら自分の ID)`。戻りは行ごと
+/// （超える行だけ `Some`）。数え方は「今の DB の有効な文字列でないタグ（更新の対象の
+/// 行は除く）＋ 新しい状態で列になる行」。呼び出し側の書き込みと同じトランザクションの
+/// 接続で呼ぶこと（`BEGIN IMMEDIATE` の書き込みの錠の下なので、並行の要求との合計も
+/// 数え間違えない）。
+async fn group_capacity_errors_tx(
+    connection: &mut SqliteConnection,
+    rows: &[(i64, bool, Option<i64>)],
+    max: usize,
+) -> Result<Vec<Option<FieldError>>, BantoError> {
+    let mut errors: Vec<Option<FieldError>> = vec![None; rows.len()];
+    let own_ids: HashSet<i64> = rows.iter().filter_map(|(_, _, id)| *id).collect();
+    let mut groups: Vec<i64> = rows
+        .iter()
+        .filter(|(_, counts, _)| *counts)
+        .map(|(group, _, _)| *group)
+        .collect();
+    groups.sort_unstable();
+    groups.dedup();
+    for group_id in groups {
+        let placement: Option<(String, String)> = sqlx::query_as(
+            "SELECT cg.name, pc.protocol FROM collection_groups cg              JOIN plc_connections pc ON pc.id = cg.plc_connection_id WHERE cg.id = ?",
+        )
+        .bind(group_id)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(banto_storage::storage_error)?;
+        let Some((group_name, protocol)) = placement else {
+            continue;
+        };
+        if protocol == VIRTUAL_PROTOCOL || protocol == POSTGRES_PROTOCOL {
+            continue;
+        }
+        let existing: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM tags WHERE collection_group_id = ? AND enabled = 1 AND data_type <> ?",
+        )
+        .bind(group_id)
+        .bind(STRING_DATA_TYPE)
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(banto_storage::storage_error)?;
+        let kept = existing.iter().filter(|id| !own_ids.contains(id)).count();
+        let incoming = rows
+            .iter()
+            .filter(|(group, counts, _)| *counts && *group == group_id)
+            .count();
+        let total = kept + incoming;
+        if total > max {
+            let message = format!(
+                "収集グループ「{group_name}」のタグは {max} 本までです（この操作で {total} 本になります）。別の収集グループに分けてください"
+            );
+            for (index, (group, counts, _)) in rows.iter().enumerate() {
+                if *counts && *group == group_id {
+                    errors[index] = Some(FieldError {
+                        field: "collectionGroupId".to_string(),
+                        message: message.clone(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(errors)
+}
+
+/// 1 本の作成・更新の [`group_capacity_errors_tx`]。超えるなら検証の誤りにする。
+async fn ensure_group_capacity_tx(
+    connection: &mut SqliteConnection,
+    input: &TagInput,
+    own_id: Option<i64>,
+    max: usize,
+) -> Result<(), BantoError> {
+    let rows = [(
+        input.collection_group_id,
+        counts_toward_group_capacity(input),
+        own_id,
+    )];
+    let mut errors = group_capacity_errors_tx(connection, &rows, max).await?;
+    match errors.remove(0) {
+        Some(error) => Err(BantoError::Validation {
+            field_errors: vec![error],
+        }),
+        None => Ok(()),
+    }
+}
+
 const PLACEMENT_CONNECTION_SQL: &str =
     "SELECT pc.id, pc.name, pc.protocol FROM collection_groups cg \
      JOIN plc_connections pc ON pc.id = cg.plc_connection_id \
@@ -2512,6 +2614,15 @@ impl TagService {
         let mut validated = validate_tag_input(&input, self.rules())?;
         let placement = validate_tag_kind_placement(&self.pool, &input, None).await?;
         validated.address = placement.address;
+        // #1303: 旧経路（registry なし）は錠の下でないので並行には弱い（relay-wright 向けの互換のみ）。
+        {
+            let mut conn = self
+                .pool
+                .acquire()
+                .await
+                .map_err(banto_storage::storage_error)?;
+            ensure_group_capacity_tx(&mut conn, &input, None, MAX_COLLECTED_TAGS_PER_GROUP).await?;
+        }
         // AssertSqlSafe: insert_tag_sql() は固定の列名・プレースホルダのみで
         // 構築される文字列で外部入力は含まれない（本ファイル内の関数定義参照）。
         sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(insert_tag_sql()))
@@ -2554,6 +2665,8 @@ impl TagService {
         )
         .await?;
         validated.address = placement.address;
+        // #1303: 収集グループの列の上限（書き込みと同じトランザクションの中で数える）。
+        ensure_group_capacity_tx(connection, &input, None, MAX_COLLECTED_TAGS_PER_GROUP).await?;
         // AssertSqlSafe: insert_tag_sql() は固定の列名・プレースホルダのみで
         // 構築される文字列で外部入力は含まれない（本ファイル内の関数定義参照）。
         sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(insert_tag_sql()))
@@ -2618,6 +2731,16 @@ impl TagService {
         let mut validated = validate_tag_input(&input, self.rules())?;
         let placement = validate_tag_kind_placement(&self.pool, &input, Some(id)).await?;
         validated.address = placement.address;
+        // #1303: 旧経路（registry なし）。create と同じく並行には弱い。
+        {
+            let mut conn = self
+                .pool
+                .acquire()
+                .await
+                .map_err(banto_storage::storage_error)?;
+            ensure_group_capacity_tx(&mut conn, &input, Some(id), MAX_COLLECTED_TAGS_PER_GROUP)
+                .await?;
+        }
         let expected_revision = input.expected_revision;
         let sql = update_tag_sql(expected_revision.is_some());
         // AssertSqlSafe: update_tag_sql() は expected_revision の有無で固定の
@@ -2709,6 +2832,10 @@ impl TagService {
         )
         .await?;
         validated.address = placement.address;
+        // #1303: 収集グループの列の上限。同じグループの中の更新は自分を除いて数えるので増えない。
+        ensure_group_capacity_tx(connection, &input, Some(id), MAX_COLLECTED_TAGS_PER_GROUP)
+            .await
+            .map_err(TagUpdateError::Banto)?;
         let expected_revision = input.expected_revision;
         let sql = update_tag_sql(expected_revision.is_some());
         // AssertSqlSafe: update() と同じ理由 - update_tag_sql() は固定の
@@ -3042,6 +3169,26 @@ impl TagService {
                     }
                 }
             }
+        }
+
+        // #1303: 収集グループの列の上限（グループごとの合計。同じバッチの更新は自分を除いて数える）。
+        let capacity_rows: Vec<(i64, bool, Option<i64>)> = updates
+            .iter()
+            .map(|(id, input)| {
+                (
+                    input.collection_group_id,
+                    counts_toward_group_capacity(input),
+                    Some(*id),
+                )
+            })
+            .collect();
+        for (index, error) in
+            group_capacity_errors_tx(connection, &capacity_rows, MAX_COLLECTED_TAGS_PER_GROUP)
+                .await?
+                .into_iter()
+                .enumerate()
+        {
+            row_errors[index].extend(error);
         }
 
         let errors: Vec<BatchTagUpdateError> = row_errors
@@ -3410,6 +3557,26 @@ impl TagService {
             }
         }
 
+        // #1303: 収集グループの列の上限（グループごとの合計）。
+        let capacity_rows: Vec<(i64, bool, Option<i64>)> = inputs
+            .iter()
+            .map(|input| {
+                (
+                    input.collection_group_id,
+                    counts_toward_group_capacity(input),
+                    None,
+                )
+            })
+            .collect();
+        for (index, error) in
+            group_capacity_errors_tx(connection, &capacity_rows, MAX_COLLECTED_TAGS_PER_GROUP)
+                .await?
+                .into_iter()
+                .enumerate()
+        {
+            row_errors[index].extend(error);
+        }
+
         let errors: Vec<BatchTagError> = row_errors
             .into_iter()
             .enumerate()
@@ -3659,6 +3826,34 @@ impl TagService {
             }
         }
 
+        // #1303: 収集グループの列の上限（グループごとの合計）。
+        let capacity_rows: Vec<(i64, bool, Option<i64>)> = inputs
+            .iter()
+            .map(|input| {
+                (
+                    input.collection_group_id,
+                    counts_toward_group_capacity(input),
+                    None,
+                )
+            })
+            .collect();
+        let mut capacity_conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(banto_storage::storage_error)?;
+        for (index, error) in group_capacity_errors_tx(
+            &mut capacity_conn,
+            &capacity_rows,
+            MAX_COLLECTED_TAGS_PER_GROUP,
+        )
+        .await?
+        .into_iter()
+        .enumerate()
+        {
+            row_errors[index].extend(error);
+        }
+
         let errors: Vec<BatchTagError> = row_errors
             .into_iter()
             .enumerate()
@@ -3850,6 +4045,163 @@ mod tests {
             retain: false,
             expected_revision: None,
         }
+    }
+
+    // --- #1303: 収集グループの列の上限 ---------------------------------
+
+    async fn second_group(svc: &TagService) -> i64 {
+        CollectionGroupService::new(svc.pool.clone())
+            .create(CollectionGroupInput {
+                name: "OtherGroup".to_string(),
+                plc_connection_id: PlcConnectionService::new(svc.pool.clone())
+                    .list(ListParams::default())
+                    .await
+                    .unwrap()
+                    .rows[0]
+                    .id,
+                period_ms: 1_000,
+                enabled: true,
+                default_writable: true,
+                query_sql: None,
+            })
+            .await
+            .unwrap()
+            .id
+    }
+
+    async fn fill_group(svc: &TagService, group_id: i64, count: usize) {
+        let inputs: Vec<TagInput> = (0..count)
+            .map(|i| sample_input(&format!("Fill{i}"), group_id))
+            .collect();
+        match svc.create_batch(inputs, false).await.unwrap() {
+            BatchTagOutcome::Valid { count: n, .. } => assert_eq!(n, count),
+            BatchTagOutcome::Invalid(errors) => panic!("fill failed: {errors:?}"),
+        }
+    }
+
+    fn assert_capacity_error(err: BantoError) {
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "collectionGroupId");
+                assert!(
+                    field_errors[0].message.contains("1999"),
+                    "{}",
+                    field_errors[0].message
+                );
+                assert!(
+                    field_errors[0].message.contains("Group1")
+                        || field_errors[0].message.contains("OtherGroup"),
+                    "{}",
+                    field_errors[0].message
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn group_accepts_exactly_the_limit_and_rejects_one_more() {
+        let (svc, group_id) = setup().await;
+        fill_group(&svc, group_id, MAX_COLLECTED_TAGS_PER_GROUP - 1).await;
+        // 1999 本目は通る。
+        let last = svc
+            .create(sample_input("Last", group_id))
+            .await
+            .expect("1999th tag");
+        // 2000 本目は断る。
+        assert_capacity_error(
+            svc.create(sample_input("TooMany", group_id))
+                .await
+                .unwrap_err(),
+        );
+        // 無効なタグ・文字列のタグは列にならないので通る。
+        let mut disabled = sample_input("Disabled", group_id);
+        disabled.enabled = false;
+        let disabled = svc.create(disabled).await.expect("disabled tag");
+        let mut string_tag = sample_input("Str", group_id);
+        string_tag.data_type = STRING_DATA_TYPE.to_string();
+        string_tag.string_length = Some(8);
+        svc.create(string_tag).await.expect("string tag");
+        // 同じグループの中の更新は本数が変わらないので通る。
+        let mut renamed = sample_input("Last2", group_id);
+        renamed.expected_revision = Some(last.revision);
+        svc.update(last.id, renamed)
+            .await
+            .expect("same-group update");
+        // 満杯のグループで無効→有効にすると断る。
+        let mut enable = sample_input("Disabled", group_id);
+        enable.expected_revision = Some(disabled.revision);
+        assert_capacity_error(svc.update(disabled.id, enable).await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn batch_create_crossing_the_limit_is_rejected_per_row() {
+        let (svc, group_id) = setup().await;
+        fill_group(&svc, group_id, MAX_COLLECTED_TAGS_PER_GROUP - 1).await;
+        let two = vec![sample_input("B1", group_id), sample_input("B2", group_id)];
+        match svc.create_batch(two.clone(), false).await.unwrap() {
+            BatchTagOutcome::Invalid(errors) => {
+                assert_eq!(errors.len(), 2);
+                assert!(errors.iter().all(|e| e
+                    .field_errors
+                    .iter()
+                    .any(|f| f.field == "collectionGroupId")));
+            }
+            BatchTagOutcome::Valid { .. } => panic!("must be rejected"),
+        }
+        // 何も書かれていない。1 本なら通る。
+        assert!(matches!(
+            svc.create_batch(two[..1].to_vec(), false).await.unwrap(),
+            BatchTagOutcome::Valid { count: 1, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn moving_a_tag_into_a_full_group_is_rejected() {
+        let (svc, group_id) = setup().await;
+        let other = second_group(&svc).await;
+        fill_group(&svc, group_id, MAX_COLLECTED_TAGS_PER_GROUP).await;
+        let tag = svc.create(sample_input("Mover", other)).await.unwrap();
+
+        // 1 本の更新。
+        let mut moved = sample_input("Mover", group_id);
+        moved.expected_revision = Some(tag.revision);
+        assert_capacity_error(svc.update(tag.id, moved.clone()).await.unwrap_err());
+
+        // 一括更新（旧グループ → 満杯のグループ）。
+        let mut tx = svc.pool.begin().await.unwrap();
+        let outcome = svc
+            .update_batch_tx(&mut tx, &[(tag.id, moved)])
+            .await
+            .unwrap();
+        match outcome {
+            BatchTagUpdateOutcome::Invalid(errors) => {
+                assert_eq!(errors.len(), 1);
+                assert_eq!(errors[0].field_errors[0].field, "collectionGroupId");
+            }
+            BatchTagUpdateOutcome::Valid { .. } => panic!("must be rejected"),
+        }
+        drop(tx);
+
+        // 満杯のグループの中の一括更新（名前だけ）は通る。
+        let fills = svc
+            .list(ListParams::default())
+            .await
+            .unwrap()
+            .rows
+            .into_iter()
+            .filter(|t| t.collection_group_id == group_id)
+            .take(2)
+            .collect::<Vec<_>>();
+        let updates: Vec<(i64, TagInput)> = fills
+            .iter()
+            .map(|t| (t.id, sample_input(&format!("{}x", t.name), group_id)))
+            .collect();
+        let mut tx = svc.pool.begin().await.unwrap();
+        assert!(matches!(
+            svc.update_batch_tx(&mut tx, &updates).await.unwrap(),
+            BatchTagUpdateOutcome::Valid { count: 2, .. }
+        ));
     }
 
     // --- CRUD round trip -----------------------------------------------

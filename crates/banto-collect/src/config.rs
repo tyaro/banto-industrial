@@ -1570,6 +1570,15 @@ mod tests {
     use banto_driver_api::DataType;
     use banto_plc::Address;
 
+    /// #1303: 登録側（banto-tags）が断る上限と、tstore の表の列の上限は同じ値。
+    #[test]
+    fn tag_registration_limit_matches_the_tstore_column_limit() {
+        assert_eq!(
+            banto_tags::MAX_COLLECTED_TAGS_PER_GROUP,
+            banto_tstore::MAX_TAGS_PER_GROUP
+        );
+    }
+
     /// The built-in drivers (Modbus TCP and SLMP) every plan is read through
     /// since R2b-3a-3.
     fn drivers() -> &'static DriverRegistry {
