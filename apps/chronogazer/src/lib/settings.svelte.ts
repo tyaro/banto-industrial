@@ -4,7 +4,7 @@
  * Persistence (spec §12.1, M12): TWO layers per setting -
  * - localStorage, written synchronously on every change. This is the FOUC
  *   cache: app.html's inline script restores `banto.theme`/`banto.preset`
- *   from it before first paint, and it is also the whole story in demo mode.
+ *   from it before first paint, and it is the fallback until the real provider is wired.
  * - the mode-matched `UiSettingsProvider` (`getUiSettings()`, setup.ts):
  *   Tauri settings DB / REST `settings` table, written fire-and-forget on
  *   every change (an unauthenticated write fails server-side and is

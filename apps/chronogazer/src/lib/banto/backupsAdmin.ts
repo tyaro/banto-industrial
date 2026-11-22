@@ -27,11 +27,6 @@
  *   or 一覧から選択" but only the LAN browser can arbitrarily pick a local
  *   file to upload over HTTP). Tauri restores are staged from the existing
  *   `backups/` list only, via `stageRestoreFromBackup`.
- *
- * Plain `vite dev`/`vite preview` (spec §11.1's third environment, no Rust
- * backend at all): there is no database file to back up, so every export
- * here throws/rejects with a `ProviderError` carrying `DEMO_MODE_MESSAGE`,
- * mirroring `usersAdmin.ts`'s `isUsersAdminAvailable()`/`demoModeError()`.
  */
 import { invoke } from '@tauri-apps/api/core';
 import { getAuthProvider, isProviderError, ProviderError, type ErrorBody } from '@banto/admin-core';
@@ -54,17 +49,6 @@ export interface PendingRestoreInfo {
 export interface OpenFolderResult {
 	opened: boolean;
 	path: string;
-}
-
-export const DEMO_MODE_MESSAGE = 'デモモードでは利用できません';
-
-function demoModeError(): ProviderError {
-	return new ProviderError({ kind: 'other', message: DEMO_MODE_MESSAGE });
-}
-
-/** Is this environment backed by a real backup/restore service (Tauri or the embedded server)? False in plain-browser demo mode. */
-export function isBackupsAvailable(): boolean {
-	return getBantoMode() !== 'demo';
 }
 
 const ERROR_KINDS = new Set([
@@ -158,14 +142,12 @@ async function httpJson<T>(path: string, init: HttpJsonInit): Promise<T> {
 
 /** `admin`-only: create a new backup (`VACUUM INTO`). */
 export async function createBackup(): Promise<BackupInfo> {
-	if (!isBackupsAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<BackupInfo>('backups_create');
 	return httpJson<BackupInfo>('/api/backups', { method: 'POST' });
 }
 
 /** `admin`-only: list existing backups, newest first. */
 export async function listBackups(): Promise<BackupInfo[]> {
-	if (!isBackupsAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<BackupInfo[]>('backups_list');
 	return httpJson<BackupInfo[]>('/api/backups', { method: 'GET' });
 }
@@ -181,7 +163,6 @@ export async function listBackups(): Promise<BackupInfo[]> {
  * inside the webview.
  */
 export async function downloadBackup(fileName: string): Promise<void> {
-	if (!isBackupsAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		throw new ProviderError({
 			kind: 'other',
@@ -216,7 +197,6 @@ export async function downloadBackup(fileName: string): Promise<void> {
 
 /** `admin`-only, Tauri only: open the `backups/` directory in the OS file explorer. */
 export async function openBackupsFolder(): Promise<OpenFolderResult> {
-	if (!isBackupsAvailable()) throw demoModeError();
 	if (getBantoMode() !== 'tauri') {
 		throw new ProviderError({
 			kind: 'other',
@@ -228,7 +208,6 @@ export async function openBackupsFolder(): Promise<OpenFolderResult> {
 
 /** `admin`-only: stage a restore from an existing backup already listed by `listBackups()`. Applied at next startup (spec M17). */
 export async function stageRestoreFromBackup(fileName: string): Promise<void> {
-	if (!isBackupsAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		await invokeCommand<void>('backups_stage_restore', { fileName });
 		return;
@@ -248,7 +227,6 @@ export async function stageRestoreFromBackup(fileName: string): Promise<void> {
  * startup).
  */
 export async function uploadAndStageRestore(file: File): Promise<void> {
-	if (!isBackupsAvailable()) throw demoModeError();
 	if (getBantoMode() !== 'server') {
 		throw new ProviderError({
 			kind: 'other',
@@ -275,7 +253,6 @@ export async function uploadAndStageRestore(file: File): Promise<void> {
 
 /** `admin`-only: the currently-staged restore, if any. */
 export async function getPendingRestore(): Promise<PendingRestoreInfo | null> {
-	if (!isBackupsAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri')
 		return invokeCommand<PendingRestoreInfo | null>('backups_pending');
 	return httpJson<PendingRestoreInfo | null>('/api/backups/pending-restore', { method: 'GET' });
@@ -283,7 +260,6 @@ export async function getPendingRestore(): Promise<PendingRestoreInfo | null> {
 
 /** `admin`-only: cancel a staged restore. */
 export async function cancelPendingRestore(): Promise<void> {
-	if (!isBackupsAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		await invokeCommand<void>('backups_cancel_restore');
 		return;

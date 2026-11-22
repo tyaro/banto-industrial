@@ -127,8 +127,6 @@
 		updateTag,
 		deleteTag,
 		listConfigExclusions,
-		isTagRegistryAvailable,
-		DEMO_MODE_MESSAGE,
 		ALLOWED_PERIOD_MS,
 		type PlcConnection,
 		type PlcConnectionInput,
@@ -186,7 +184,6 @@
 		type ListLoadState
 	} from './tagsPageLogic';
 
-	const available = isTagRegistryAvailable();
 	const canWrite = $derived(canWriteResources(sessionStore.role));
 
 	/**
@@ -379,7 +376,6 @@
 	let connectionsGeneration = 0;
 
 	async function reloadConnections(): Promise<void> {
-		if (!available) return;
 		// レビュー P2-C: 作成・保存の直後に `GET` が 2 本飛ぶと着順は発行順と
 		// 一致しない。この再取得の世代を控え、応答の適用時に照合する。
 		connectionsGeneration += 1;
@@ -796,7 +792,6 @@
 	let groupsGeneration = 0;
 
 	async function reloadGroups(): Promise<void> {
-		if (!available) return;
 		groupsGeneration += 1;
 		const generation = groupsGeneration;
 		groupsLoading = true;
@@ -1014,7 +1009,6 @@
 	let tagsGeneration = 0;
 
 	async function reloadTags(): Promise<void> {
-		if (!available) return;
 		tagsGeneration += 1;
 		const generation = tagsGeneration;
 		tagsLoading = true;
@@ -1838,7 +1832,6 @@
 	const exclusionMarksView = $derived(configExclusionsView(exclusionMarksState));
 
 	async function reloadConfigExclusions(): Promise<void> {
-		if (!available) return;
 		exclusionMarksGeneration += 1;
 		const generation = exclusionMarksGeneration;
 		exclusionMarksLoading = true;
@@ -1879,368 +1872,370 @@
 
 <div class="page">
 	<h2>記録</h2>
-	{#if !available}
-		<p class="note">
-			{DEMO_MODE_MESSAGE}。単体ブラウザのデモモードにはレジストリDBが無いため、この機能はTauriアプリまたはLANアクセス（組み込みサーバー）でのみ利用できます。
-		</p>
-	{:else}
-		<!--
+
+	<!--
 			#414 段階2: 今の設定で収集を開始したら外されるもの。判定は Rust の
 			結果をそのまま出す（文言はタグなら保存時の拒否理由と同じ）。0 件なら
 			出さない。読めていない・読めなかったときは「無い」と言わない。
 		-->
-		{#if exclusionMarksView !== 'none'}
-			<section class="config-exclusions" aria-label="収集の開始時に外される設定">
-				<h3>収集の開始時に外される設定</h3>
-				{#if exclusionMarksView === 'loading'}
-					<p class="loading">判定を読み込み中…</p>
-				{:else if exclusionMarksView === 'failed'}
-					<p class="load-error" role="alert">
-						判定を読み込めませんでした（{exclusionMarksError}）。不正な設定が無いという意味ではありません。
-						<button
-							type="button"
-							onclick={() => void reloadConfigExclusions()}
-							disabled={exclusionMarksLoading}
-						>
-							再試行
-						</button>
-					</p>
-				{:else}
-					<p class="note exclusion-note">
-						次の設定は不正なため、収集の開始時に外されます（残りは収集されます）。直すと、次の「収集を再起動」から収集されます。
-					</p>
-					<ul class="exclusion-marks">
-						{#each listRows(exclusionMarksState) as mark (mark.key)}
-							<li>
-								<span class="exclusion-unit">{exclusionUnitLabel(mark.unit)}</span>
-								<strong>{mark.name}</strong>: {mark.message}
-							</li>
-						{/each}
-					</ul>
-				{/if}
-			</section>
-		{/if}
+	{#if exclusionMarksView !== 'none'}
+		<section class="config-exclusions" aria-label="収集の開始時に外される設定">
+			<h3>収集の開始時に外される設定</h3>
+			{#if exclusionMarksView === 'loading'}
+				<p class="loading">判定を読み込み中…</p>
+			{:else if exclusionMarksView === 'failed'}
+				<p class="load-error" role="alert">
+					判定を読み込めませんでした（{exclusionMarksError}）。不正な設定が無いという意味ではありません。
+					<button
+						type="button"
+						onclick={() => void reloadConfigExclusions()}
+						disabled={exclusionMarksLoading}
+					>
+						再試行
+					</button>
+				</p>
+			{:else}
+				<p class="note exclusion-note">
+					次の設定は不正なため、収集の開始時に外されます（残りは収集されます）。直すと、次の「収集を再起動」から収集されます。
+				</p>
+				<ul class="exclusion-marks">
+					{#each listRows(exclusionMarksState) as mark (mark.key)}
+						<li>
+							<span class="exclusion-unit">{exclusionUnitLabel(mark.unit)}</span>
+							<strong>{mark.name}</strong>: {mark.message}
+						</li>
+					{/each}
+				</ul>
+			{/if}
+		</section>
+	{/if}
 
-		<!--
+	<!--
 			#1179 PR4b: 右ペイン。記録項目の詳細（編集・しきい値・削除）か、作成
 			フォーム（記録項目・接続先・収集グループ）のどれか 1 つ。編集者以上の
 			ときだけ開く（閲覧者は行を選んでも開かない）。閉じるのはヘッダーの
 			「閉じる」と、作成・削除の成功の後（未保存なら確かめる）。
 		-->
-		{#snippet rightPaneContent()}
-			<div class="detail-pane" data-testid="record-detail-pane">
-				<div class="detail-pane-header">
-					<h3>{rightPaneTitle}</h3>
-					<button
-						type="button"
-						class="pane-close"
-						onclick={requestCloseRightPane}
-						disabled={rightPaneBusy()}
-						aria-label="閉じる"
+	{#snippet rightPaneContent()}
+		<div class="detail-pane" data-testid="record-detail-pane">
+			<div class="detail-pane-header">
+				<h3>{rightPaneTitle}</h3>
+				<button
+					type="button"
+					class="pane-close"
+					onclick={requestCloseRightPane}
+					disabled={rightPaneBusy()}
+					aria-label="閉じる"
+				>
+					×
+				</button>
+			</div>
+			<div class="detail-pane-body">
+				{#if rightPane === 'tag' && selectedTag && canWrite}
+					<UnsavedChangesNotice pending={editTagStore.isDirty} label={UNSAVED_NOTICE} />
+					{#if selectedTagIsHub}
+						<p class="note">
+							Hub 経由のタグです。アドレスは Hub
+							のタグ名（外部名）で、スケーリングは設定できません（Hub は工学値を送ります）。
+						</p>
+					{/if}
+					<BantoForm
+						schema={tagSchema(TAG_EDIT, selectedTagIsHub)}
+						store={editTagStore}
+						onSubmit={saveTag}
+						submitting={savingTag || deletingTag}
+						submitLabel="保存"
 					>
-						×
-					</button>
-				</div>
-				<div class="detail-pane-body">
-					{#if rightPane === 'tag' && selectedTag && canWrite}
-						<UnsavedChangesNotice pending={editTagStore.isDirty} label={UNSAVED_NOTICE} />
-						{#if selectedTagIsHub}
-							<p class="note">
-								Hub 経由のタグです。アドレスは Hub
-								のタグ名（外部名）で、スケーリングは設定できません（Hub は工学値を送ります）。
-							</p>
-						{/if}
-						<BantoForm
-							schema={tagSchema(TAG_EDIT, selectedTagIsHub)}
-							store={editTagStore}
-							onSubmit={saveTag}
-							submitting={savingTag || deletingTag}
-							submitLabel="保存"
+						<button
+							type="button"
+							class="danger"
+							onclick={handleDeleteTag}
+							disabled={savingTag || deletingTag || savingThresholds}
 						>
-							<button
-								type="button"
-								class="danger"
-								onclick={handleDeleteTag}
-								disabled={savingTag || deletingTag || savingThresholds}
-							>
-								削除
-							</button>
-						</BantoForm>
+							削除
+						</button>
+					</BantoForm>
 
-						<div class="thresholds-pane">
-							<h4>しきい値（記録計の設定）</h4>
-							<p class="note">
-								タグの定義とは別に保存します。空欄は設定なしです（色・帯・しきい値のイベントを出しません）。収集中なら「収集を再起動」で反映されます。
+					<div class="thresholds-pane">
+						<h4>しきい値（記録計の設定）</h4>
+						<p class="note">
+							タグの定義とは別に保存します。空欄は設定なしです（色・帯・しきい値のイベントを出しません）。収集中なら「収集を再起動」で反映されます。
+						</p>
+						{#if thresholdsError !== null}
+							<p class="load-error" role="alert">
+								しきい値を読めませんでした（{thresholdsError}）。
+								<button type="button" onclick={() => selectedTag && loadThresholds(selectedTag.id)}>
+									再読み込み
+								</button>
 							</p>
-							{#if thresholdsError !== null}
-								<p class="load-error" role="alert">
-									しきい値を読めませんでした（{thresholdsError}）。
-									<button
-										type="button"
-										onclick={() => selectedTag && loadThresholds(selectedTag.id)}
-									>
-										再読み込み
-									</button>
-								</p>
-							{:else if selectedThresholds === null}
-								<p class="loading">しきい値を読み込んでいます…</p>
-							{:else}
-								<UnsavedChangesNotice
-									pending={editThresholdsStore.isDirty}
-									label={UNSAVED_NOTICE}
-								/>
-								<BantoForm
-									schema={thresholdSchema(TAG_THR)}
-									store={editThresholdsStore}
-									onSubmit={saveThresholds}
-									submitting={savingThresholds || savingTag || deletingTag}
-									submitLabel="しきい値を保存"
+						{:else if selectedThresholds === null}
+							<p class="loading">しきい値を読み込んでいます…</p>
+						{:else}
+							<UnsavedChangesNotice pending={editThresholdsStore.isDirty} label={UNSAVED_NOTICE} />
+							<BantoForm
+								schema={thresholdSchema(TAG_THR)}
+								store={editThresholdsStore}
+								onSubmit={saveThresholds}
+								submitting={savingThresholds || savingTag || deletingTag}
+								submitLabel="しきい値を保存"
+							/>
+						{/if}
+					</div>
+				{:else if rightPane === 'createTag' && canWrite}
+					<UnsavedChangesNotice pending={createTagStore.isDirty} label={UNSAVED_NOTICE} />
+					{#if createTagIsHub}
+						<p class="note">
+							Hub 経由のグループです。アドレスは Hub
+							のタグ名（外部名）で、スケーリングは設定できません（Hub は工学値を送ります）。
+						</p>
+					{/if}
+					<BantoForm
+						schema={tagSchema(TAG_CREATE, createTagIsHub)}
+						store={createTagStore}
+						onSubmit={handleCreateTag}
+						submitting={creatingTag}
+						submitLabel="作成"
+					/>
+				{:else if rightPane === 'createConnection' && canWrite}
+					{#if driversError}
+						<p class="load-error" role="alert">
+							ドライバ一覧を読み込めませんでした（{driversError}）。<button
+								type="button"
+								onclick={() => void reloadDrivers()}
+							>
+								再試行
+							</button>
+						</p>
+					{:else if drivers === null}
+						<p class="loading">ドライバ一覧を読み込み中…</p>
+					{:else if protocolOptions.length === 0}
+						<p class="load-error" role="alert">利用できるドライバがありません。</p>
+					{:else}
+						<p class="note">
+							PLC に直接つなぐ接続先です。Hub 経由の接続先は「記録項目」の「Hub
+							から追加」で作られます。
+						</p>
+						<UnsavedChangesNotice
+							pending={createConnectionStore.isDirty ||
+								Object.values(createDriverState.touched).some(Boolean)}
+							label={UNSAVED_NOTICE}
+						/>
+						<BantoForm
+							schema={connectionSchema(PLC_CREATE)}
+							store={createConnectionStore}
+							onSubmit={handleCreateConnection}
+							submitting={creatingConnection}
+							submitLabel="作成"
+						>
+							{#if driverFor(String(createConnectionStore.values[`${PLC_CREATE}Protocol`] ?? ''))}
+								{@const driver = driverFor(
+									String(createConnectionStore.values[`${PLC_CREATE}Protocol`] ?? '')
+								)!}
+								<DriverSettingsForm
+									schema={driver.settingsSchema.fields}
+									bind:value={createDriverState}
+									errors={createDriverErrors}
+									readOnly={creatingConnection}
+									idPrefix="plc-create-driver"
 								/>
 							{/if}
-						</div>
-					{:else if rightPane === 'createTag' && canWrite}
-						<UnsavedChangesNotice pending={createTagStore.isDirty} label={UNSAVED_NOTICE} />
-						{#if createTagIsHub}
-							<p class="note">
-								Hub 経由のグループです。アドレスは Hub
-								のタグ名（外部名）で、スケーリングは設定できません（Hub は工学値を送ります）。
-							</p>
-						{/if}
-						<BantoForm
-							schema={tagSchema(TAG_CREATE, createTagIsHub)}
-							store={createTagStore}
-							onSubmit={handleCreateTag}
-							submitting={creatingTag}
-							submitLabel="作成"
-						/>
-					{:else if rightPane === 'createConnection' && canWrite}
-						{#if driversError}
-							<p class="load-error" role="alert">
-								ドライバ一覧を読み込めませんでした（{driversError}）。<button
-									type="button"
-									onclick={() => void reloadDrivers()}
-								>
-									再試行
-								</button>
-							</p>
-						{:else if drivers === null}
-							<p class="loading">ドライバ一覧を読み込み中…</p>
-						{:else if protocolOptions.length === 0}
-							<p class="load-error" role="alert">利用できるドライバがありません。</p>
-						{:else}
-							<p class="note">
-								PLC に直接つなぐ接続先です。Hub 経由の接続先は「記録項目」の「Hub
-								から追加」で作られます。
-							</p>
-							<UnsavedChangesNotice
-								pending={createConnectionStore.isDirty ||
-									Object.values(createDriverState.touched).some(Boolean)}
-								label={UNSAVED_NOTICE}
-							/>
-							<BantoForm
-								schema={connectionSchema(PLC_CREATE)}
-								store={createConnectionStore}
-								onSubmit={handleCreateConnection}
-								submitting={creatingConnection}
-								submitLabel="作成"
-							>
-								{#if driverFor(String(createConnectionStore.values[`${PLC_CREATE}Protocol`] ?? ''))}
-									{@const driver = driverFor(
-										String(createConnectionStore.values[`${PLC_CREATE}Protocol`] ?? '')
-									)!}
-									<DriverSettingsForm
-										schema={driver.settingsSchema.fields}
-										bind:value={createDriverState}
-										errors={createDriverErrors}
-										readOnly={creatingConnection}
-										idPrefix="plc-create-driver"
-									/>
-								{/if}
-							</BantoForm>
-						{/if}
-					{:else if rightPane === 'createGroup' && canWrite}
-						<!-- #394 レビュー P1-3: 「先に作成してください」は依存先を
+						</BantoForm>
+					{/if}
+				{:else if rightPane === 'createGroup' && canWrite}
+					<!-- #394 レビュー P1-3: 「先に作成してください」は依存先を
 						**読めて0件**のときだけ。読めていないときにこれを出すと、
 						既にある接続を重複登録させてしまう。 -->
-						{#if groupCreateGate === 'needs-prerequisite'}
-							<p class="note">
-								先に接続先を1件以上作成してください（Hub 経由の接続先は「記録項目」の「Hub
-								から追加」で作られます）。
-							</p>
-						{:else if groupCreateGate === 'dependency-loading'}
-							<p class="note">接続先の一覧を読み込んでいます…</p>
-						{:else if groupCreateGate === 'dependency-failed'}
-							<p class="load-error" role="alert">
-								接続先の一覧を読み込めなかったため、作成フォームを表示できません（{connectionsError}）。
-								<button
-									type="button"
-									onclick={() => void reloadConnections()}
-									disabled={connectionsLoading}
-								>
-									再試行
-								</button>
-							</p>
-						{:else}
-							<UnsavedChangesNotice pending={createGroupStore.isDirty} label={UNSAVED_NOTICE} />
-							<BantoForm
-								schema={groupSchema(GROUP_CREATE)}
-								store={createGroupStore}
-								onSubmit={handleCreateGroup}
-								submitting={creatingGroup}
-								submitLabel="作成"
-							/>
-						{/if}
+					{#if groupCreateGate === 'needs-prerequisite'}
+						<p class="note">
+							先に接続先を1件以上作成してください（Hub 経由の接続先は「記録項目」の「Hub
+							から追加」で作られます）。
+						</p>
+					{:else if groupCreateGate === 'dependency-loading'}
+						<p class="note">接続先の一覧を読み込んでいます…</p>
+					{:else if groupCreateGate === 'dependency-failed'}
+						<p class="load-error" role="alert">
+							接続先の一覧を読み込めなかったため、作成フォームを表示できません（{connectionsError}）。
+							<button
+								type="button"
+								onclick={() => void reloadConnections()}
+								disabled={connectionsLoading}
+							>
+								再試行
+							</button>
+						</p>
+					{:else}
+						<UnsavedChangesNotice pending={createGroupStore.isDirty} label={UNSAVED_NOTICE} />
+						<BantoForm
+							schema={groupSchema(GROUP_CREATE)}
+							store={createGroupStore}
+							onSubmit={handleCreateGroup}
+							submitting={creatingGroup}
+							submitLabel="作成"
+						/>
 					{/if}
-				</div>
+				{/if}
 			</div>
-		{/snippet}
+		</div>
+	{/snippet}
 
-		<!--
+	<!--
 			#1179 PR4b: 左ツリー・中央タブ・右の詳細の 3 ペイン（`@banto/ui` の
 			`ThreePaneLayout`）。狭幅の判定はビューポート（`mobileNavStore.isNarrow`、
 			HUB と同じ）。退避・トグル・Esc・スクリム・フォーカスの出入りは部品が持つ。
 			帯には、ツリーを閉じていても何で絞っているか分かるよう、選択中の名前を出す。
 		-->
-		<div class="records-frame">
-			<ThreePaneLayout
-				narrowOverride={mobileNavStore.isNarrow}
-				bind:leftDrawerOpen={treeOpen}
-				bind:rightDrawerOpen
-				bind:narrow={layoutNarrow}
-				right={rightPane !== null && canWrite ? rightPaneContent : undefined}
-				messages={{
-					threePaneLeft: () => TREE_PANE_LABEL,
-					threePaneResizeLeft: () => `${TREE_PANE_LABEL}の幅`,
-					threePaneRight: () => rightPaneTitle,
-					threePaneResizeRight: () => `${rightPaneTitle}の幅`
-				}}
-			>
-				{#snippet left()}
-					<div class="tree-pane" data-testid="record-tree-pane">
-						{#if canWrite}
-							<div class="tree-toolbar">
-								<button type="button" class="secondary" onclick={openCreateConnection}>
-									接続先を追加
-								</button>
-								<button type="button" class="secondary" onclick={openCreateGroup}>
-									収集グループを追加
-								</button>
-							</div>
-						{/if}
-						<!-- #394 レビュー P1-3: 「読めていない」を「0件」として描かない。 -->
-						{#if connectionsView === 'failed'}
-							<p class="load-error" role="alert">
-								接続先の一覧を読み込めませんでした（{connectionsError}）。登録が0件という意味ではありません。
-								<button
-									type="button"
-									onclick={() => void reloadConnections()}
-									disabled={connectionsLoading}
-								>
-									再試行
-								</button>
-							</p>
-						{/if}
-						{#if groupsView === 'failed'}
-							<p class="load-error" role="alert">
-								収集グループの一覧を読み込めませんでした（{groupsError}）。登録が0件という意味ではありません。
-								<button type="button" onclick={() => void reloadGroups()} disabled={groupsLoading}>
-									再試行
-								</button>
-							</p>
-						{/if}
-						{#if connectionsRetry}
-							<p class="load-error" role="alert">
-								接続先の一覧を更新できませんでした（{connectionsError}）。表示は最後に読み込めた内容です。
-								<button
-									type="button"
-									onclick={() => void reloadConnections()}
-									disabled={connectionsLoading}
-								>
-									再試行
-								</button>
-							</p>
-						{/if}
-						{#if groupsRetry}
-							<p class="load-error" role="alert">
-								収集グループの一覧を更新できませんでした（{groupsError}）。表示は最後に読み込めた内容です。
-								<button type="button" onclick={() => void reloadGroups()} disabled={groupsLoading}>
-									再試行
-								</button>
-							</p>
-						{/if}
-						{#if connectionsView === 'loading' || groupsView === 'loading'}
-							<p class="loading">読み込み中…</p>
-						{:else if connectionsView !== 'failed' && groupsView !== 'failed'}
-							<RecordTree
-								connections={connectionRows}
-								groups={groupRows}
-								records={tagRows}
-								selectedId={treeSelectedId}
-								selectionFollowsFocus={!layoutNarrow}
-								onselect={handleTreeSelect}
-							/>
-						{/if}
-					</div>
-				{/snippet}
-				{#snippet titleContent()}
-					<span class="tree-selection" data-testid="record-tree-selection">
-						{treeSelectionLabel}
-					</span>
-				{/snippet}
-				<div class="center-pane">
-					<!--
+	<div class="records-frame">
+		<ThreePaneLayout
+			narrowOverride={mobileNavStore.isNarrow}
+			bind:leftDrawerOpen={treeOpen}
+			bind:rightDrawerOpen
+			bind:narrow={layoutNarrow}
+			right={rightPane !== null && canWrite ? rightPaneContent : undefined}
+			messages={{
+				threePaneLeft: () => TREE_PANE_LABEL,
+				threePaneResizeLeft: () => `${TREE_PANE_LABEL}の幅`,
+				threePaneRight: () => rightPaneTitle,
+				threePaneResizeRight: () => `${rightPaneTitle}の幅`
+			}}
+		>
+			{#snippet left()}
+				<div class="tree-pane" data-testid="record-tree-pane">
+					{#if canWrite}
+						<div class="tree-toolbar">
+							<button type="button" class="secondary" onclick={openCreateConnection}>
+								接続先を追加
+							</button>
+							<button type="button" class="secondary" onclick={openCreateGroup}>
+								収集グループを追加
+							</button>
+						</div>
+					{/if}
+					<!-- #394 レビュー P1-3: 「読めていない」を「0件」として描かない。 -->
+					{#if connectionsView === 'failed'}
+						<p class="load-error" role="alert">
+							接続先の一覧を読み込めませんでした（{connectionsError}）。登録が0件という意味ではありません。
+							<button
+								type="button"
+								onclick={() => void reloadConnections()}
+								disabled={connectionsLoading}
+							>
+								再試行
+							</button>
+						</p>
+					{/if}
+					{#if groupsView === 'failed'}
+						<p class="load-error" role="alert">
+							収集グループの一覧を読み込めませんでした（{groupsError}）。登録が0件という意味ではありません。
+							<button type="button" onclick={() => void reloadGroups()} disabled={groupsLoading}>
+								再試行
+							</button>
+						</p>
+					{/if}
+					{#if connectionsRetry}
+						<p class="load-error" role="alert">
+							接続先の一覧を更新できませんでした（{connectionsError}）。表示は最後に読み込めた内容です。
+							<button
+								type="button"
+								onclick={() => void reloadConnections()}
+								disabled={connectionsLoading}
+							>
+								再試行
+							</button>
+						</p>
+					{/if}
+					{#if groupsRetry}
+						<p class="load-error" role="alert">
+							収集グループの一覧を更新できませんでした（{groupsError}）。表示は最後に読み込めた内容です。
+							<button type="button" onclick={() => void reloadGroups()} disabled={groupsLoading}>
+								再試行
+							</button>
+						</p>
+					{/if}
+					{#if connectionsView === 'loading' || groupsView === 'loading'}
+						<p class="loading">読み込み中…</p>
+					{:else if connectionsView !== 'failed' && groupsView !== 'failed'}
+						<RecordTree
+							connections={connectionRows}
+							groups={groupRows}
+							records={tagRows}
+							selectedId={treeSelectedId}
+							selectionFollowsFocus={!layoutNarrow}
+							onselect={handleTreeSelect}
+						/>
+					{/if}
+				</div>
+			{/snippet}
+			{#snippet titleContent()}
+				<span class="tree-selection" data-testid="record-tree-selection">
+					{treeSelectionLabel}
+				</span>
+			{/snippet}
+			<div class="center-pane">
+				<!--
 						中央はタブで「記録項目」と「設定」を切り替える。「すべて」と閲覧者には
 						「設定」が無いので、タブ列ごと隠す（`hideSingleTab`）。`value` は関数
 						バインディング: 未保存の確認でキャンセルされたら、getter が元のタブを
 						返す（`setActiveTabFromTabs`、HUB と同じ）。
 					-->
-					<div class="view-tabs" class:single={viewTabs.length === 1}>
-						<Tabs
-							tabs={viewTabs}
-							hideSingleTab
-							bind:value={() => activeTab, setActiveTabFromTabs}
-							label="表示の切り替え"
-						>
-							{#snippet panel(id)}
-								{#if id === 'list'}
-									<div class="list-pane">
-										<div class="toolbar">
-											{#if canWrite}
-												{#if registrationGroup}
-													<button type="button" onclick={openCreateTag}>記録項目を追加</button>
-												{/if}
-												<!-- #383 段階3 P4: Hub のカタログから登録する。 -->
-												<button
-													type="button"
-													class="secondary"
-													onclick={() => (hubDialogOpen = true)}
-												>
-													Hub から追加
-												</button>
+				<div class="view-tabs" class:single={viewTabs.length === 1}>
+					<Tabs
+						tabs={viewTabs}
+						hideSingleTab
+						bind:value={() => activeTab, setActiveTabFromTabs}
+						label="表示の切り替え"
+					>
+						{#snippet panel(id)}
+							{#if id === 'list'}
+								<div class="list-pane">
+									<div class="toolbar">
+										{#if canWrite}
+											{#if registrationGroup}
+												<button type="button" onclick={openCreateTag}>記録項目を追加</button>
 											{/if}
-										</div>
-										{#if canWrite && !registrationGroup}
-											<p class="note" data-testid="record-add-hint">
-												左のツリーで収集グループを選ぶと、記録項目を追加できます。
-											</p>
+											<!-- #383 段階3 P4: Hub のカタログから登録する。 -->
+											<button
+												type="button"
+												class="secondary"
+												onclick={() => (hubDialogOpen = true)}
+											>
+												Hub から追加
+											</button>
 										{/if}
-										<p class="note">
-											{canWrite
-												? '行をクリックすると右に詳細が表示されます。'
-												: '閲覧のみ（編集には編集者以上の権限が必要です）。'}
+									</div>
+									{#if canWrite && !registrationGroup}
+										<p class="note" data-testid="record-add-hint">
+											左のツリーで収集グループを選ぶと、記録項目を追加できます。
 										</p>
-										{#if hasSimulationConnection}
-											<!-- #413: 記録されないことを常に分かるようにする。 -->
-											<p class="note simulation-note" role="note">
-												ツリーで「シミュレーション」の印が付いた接続先は、実機の代わりに内蔵シミュレータへ接続します。値は現在値・イベントには出ますが、データファイルには記録されません。切替は「収集を再起動」で反映されます（実際の動作は「設定
-												&gt; 収集」の接続ごとの状態で確認できます）。
-											</p>
-										{/if}
-										{#if tagsView === 'loading'}
-											<p class="loading">読み込み中…</p>
-										{:else if tagsView === 'failed'}
+									{/if}
+									<p class="note">
+										{canWrite
+											? '行をクリックすると右に詳細が表示されます。'
+											: '閲覧のみ（編集には編集者以上の権限が必要です）。'}
+									</p>
+									{#if hasSimulationConnection}
+										<!-- #413: 記録されないことを常に分かるようにする。 -->
+										<p class="note simulation-note" role="note">
+											ツリーで「シミュレーション」の印が付いた接続先は、実機の代わりに内蔵シミュレータへ接続します。値は現在値・イベントには出ますが、データファイルには記録されません。切替は「収集を再起動」で反映されます（実際の動作は「設定
+											&gt; 収集」の接続ごとの状態で確認できます）。
+										</p>
+									{/if}
+									{#if tagsView === 'loading'}
+										<p class="loading">読み込み中…</p>
+									{:else if tagsView === 'failed'}
+										<p class="load-error" role="alert">
+											記録項目の一覧を読み込めませんでした（{tagsError}）。登録が0件という意味ではありません。
+											<button
+												type="button"
+												onclick={() => void reloadTags()}
+												disabled={tagsLoading}
+											>
+												再試行
+											</button>
+										</p>
+									{:else}
+										{#if tagsRetry}
 											<p class="load-error" role="alert">
-												記録項目の一覧を読み込めませんでした（{tagsError}）。登録が0件という意味ではありません。
+												一覧を更新できませんでした（{tagsError}）。表示は最後に読み込めた内容です。
 												<button
 													type="button"
 													onclick={() => void reloadTags()}
@@ -2249,162 +2244,146 @@
 													再試行
 												</button>
 											</p>
-										{:else}
-											{#if tagsRetry}
-												<p class="load-error" role="alert">
-													一覧を更新できませんでした（{tagsError}）。表示は最後に読み込めた内容です。
-													<button
-														type="button"
-														onclick={() => void reloadTags()}
-														disabled={tagsLoading}
-													>
-														再試行
-													</button>
-												</p>
-											{/if}
-											<!-- #391 レビュー A / #394 追補: 保存中・削除中は行の選択を
+										{/if}
+										<!-- #391 レビュー A / #394 追補: 保存中・削除中は行の選択を
 											操作できないようにする（`selectTag` 自体のガードに加え、
 											見た目でも伝える）。 -->
-											<div
-												class="grid-wrap"
-												data-testid="record-list"
-												class:saving={savingTag || deletingTag}
-												aria-disabled={savingTag || deletingTag}
-											>
-												<BantoGrid
-													rows={visibleTagRows}
-													columns={tagColumns}
-													getRowId={(t) => t.id}
-													onRowClick={canWrite ? selectTag : undefined}
-												/>
-											</div>
-										{/if}
-									</div>
-								{:else}
-									<div class="settings-pane" data-testid="record-settings">
-										{#if target.type === 'connection' && selectedConnection && canWrite}
-											{#if selectedConnectionIsHub}
-												<!-- #383 段階3 P4: Hub 接続は読み取り専用（ホスト・ポートを持たない）。 -->
-												<h3>{selectedConnection.name}（Hub 経由の接続先）</h3>
-												<p class="note">
-													Hub から受信するタグの入れ物です。接続先と API キーは「設定 &gt;
-													Hub接続」（管理者）で設定します。記録項目は「記録項目」の「Hub
-													から追加」で登録します。配下に収集グループがある間は削除できません。
-												</p>
-												<UnsavedChangesNotice
-													pending={editHubConnectionStore.isDirty}
-													label={UNSAVED_NOTICE}
-												/>
-												<BantoForm
-													schema={hubConnectionSchema(HUB_EDIT)}
-													store={editHubConnectionStore}
-													onSubmit={saveHubConnection}
-													submitting={savingConnection || deletingConnection}
-													submitLabel="保存"
-												>
-													<button
-														type="button"
-														class="danger"
-														onclick={handleDeleteConnection}
-														disabled={savingConnection || deletingConnection}
-													>
-														削除
-													</button>
-												</BantoForm>
-											{:else}
-												<h3>{selectedConnection.name} を編集</h3>
-												<!-- #413: 一覧の「動作」列の代わり（レジストリの値）。 -->
-												<p class="note" data-testid="record-connection-mode">
-													動作: {connectionModeLabel(selectedConnection.simulation)}
-												</p>
-												{#if driversError}
-													<!-- ドライバの欄はドライバ一覧が読めてから出る（保存済みの値は残る）。 -->
-													<p class="load-error" role="alert">
-														ドライバ一覧を読み込めませんでした（{driversError}）。<button
-															type="button"
-															onclick={() => void reloadDrivers()}
-														>
-															再試行
-														</button>
-													</p>
-												{/if}
-												<UnsavedChangesNotice
-													pending={editConnectionStore.isDirty ||
-														Object.values(editDriverState.touched).some(Boolean)}
-													label={UNSAVED_NOTICE}
-												/>
-												<BantoForm
-													schema={connectionSchema(PLC_EDIT)}
-													store={editConnectionStore}
-													onSubmit={saveConnection}
-													submitting={savingConnection || deletingConnection}
-													submitLabel="保存"
-												>
-													{#if driverFor(String(editConnectionStore.values[`${PLC_EDIT}Protocol`] ?? ''))}
-														{@const driver = driverFor(
-															String(editConnectionStore.values[`${PLC_EDIT}Protocol`] ?? '')
-														)!}
-														<DriverSettingsForm
-															schema={driver.settingsSchema.fields}
-															bind:value={editDriverState}
-															errors={editDriverErrors}
-															readOnly={savingConnection || deletingConnection}
-															idPrefix="plc-edit-driver"
-														/>
-													{/if}
-													<button
-														type="button"
-														class="danger"
-														onclick={handleDeleteConnection}
-														disabled={savingConnection || deletingConnection}
-													>
-														削除
-													</button>
-												</BantoForm>
-											{/if}
-										{:else if target.type === 'group' && selectedGroup && canWrite}
-											<h3>{selectedGroup.name} を編集</h3>
+										<div
+											class="grid-wrap"
+											data-testid="record-list"
+											class:saving={savingTag || deletingTag}
+											aria-disabled={savingTag || deletingTag}
+										>
+											<BantoGrid
+												rows={visibleTagRows}
+												columns={tagColumns}
+												getRowId={(t) => t.id}
+												onRowClick={canWrite ? selectTag : undefined}
+											/>
+										</div>
+									{/if}
+								</div>
+							{:else}
+								<div class="settings-pane" data-testid="record-settings">
+									{#if target.type === 'connection' && selectedConnection && canWrite}
+										{#if selectedConnectionIsHub}
+											<!-- #383 段階3 P4: Hub 接続は読み取り専用（ホスト・ポートを持たない）。 -->
+											<h3>{selectedConnection.name}（Hub 経由の接続先）</h3>
+											<p class="note">
+												Hub から受信するタグの入れ物です。接続先と API キーは「設定 &gt;
+												Hub接続」（管理者）で設定します。記録項目は「記録項目」の「Hub
+												から追加」で登録します。配下に収集グループがある間は削除できません。
+											</p>
 											<UnsavedChangesNotice
-												pending={editGroupStore.isDirty}
+												pending={editHubConnectionStore.isDirty}
 												label={UNSAVED_NOTICE}
 											/>
 											<BantoForm
-												schema={groupSchema(GROUP_EDIT)}
-												store={editGroupStore}
-												onSubmit={saveGroup}
-												submitting={savingGroup || deletingGroup}
+												schema={hubConnectionSchema(HUB_EDIT)}
+												store={editHubConnectionStore}
+												onSubmit={saveHubConnection}
+												submitting={savingConnection || deletingConnection}
 												submitLabel="保存"
 											>
 												<button
 													type="button"
 													class="danger"
-													onclick={handleDeleteGroup}
-													disabled={savingGroup || deletingGroup}
+													onclick={handleDeleteConnection}
+													disabled={savingConnection || deletingConnection}
 												>
 													削除
 												</button>
 											</BantoForm>
 										{:else}
-											<p class="loading">読み込み中…</p>
+											<h3>{selectedConnection.name} を編集</h3>
+											<!-- #413: 一覧の「動作」列の代わり（レジストリの値）。 -->
+											<p class="note" data-testid="record-connection-mode">
+												動作: {connectionModeLabel(selectedConnection.simulation)}
+											</p>
+											{#if driversError}
+												<!-- ドライバの欄はドライバ一覧が読めてから出る（保存済みの値は残る）。 -->
+												<p class="load-error" role="alert">
+													ドライバ一覧を読み込めませんでした（{driversError}）。<button
+														type="button"
+														onclick={() => void reloadDrivers()}
+													>
+														再試行
+													</button>
+												</p>
+											{/if}
+											<UnsavedChangesNotice
+												pending={editConnectionStore.isDirty ||
+													Object.values(editDriverState.touched).some(Boolean)}
+												label={UNSAVED_NOTICE}
+											/>
+											<BantoForm
+												schema={connectionSchema(PLC_EDIT)}
+												store={editConnectionStore}
+												onSubmit={saveConnection}
+												submitting={savingConnection || deletingConnection}
+												submitLabel="保存"
+											>
+												{#if driverFor(String(editConnectionStore.values[`${PLC_EDIT}Protocol`] ?? ''))}
+													{@const driver = driverFor(
+														String(editConnectionStore.values[`${PLC_EDIT}Protocol`] ?? '')
+													)!}
+													<DriverSettingsForm
+														schema={driver.settingsSchema.fields}
+														bind:value={editDriverState}
+														errors={editDriverErrors}
+														readOnly={savingConnection || deletingConnection}
+														idPrefix="plc-edit-driver"
+													/>
+												{/if}
+												<button
+													type="button"
+													class="danger"
+													onclick={handleDeleteConnection}
+													disabled={savingConnection || deletingConnection}
+												>
+													削除
+												</button>
+											</BantoForm>
 										{/if}
-									</div>
-								{/if}
-							{/snippet}
-						</Tabs>
-					</div>
+									{:else if target.type === 'group' && selectedGroup && canWrite}
+										<h3>{selectedGroup.name} を編集</h3>
+										<UnsavedChangesNotice pending={editGroupStore.isDirty} label={UNSAVED_NOTICE} />
+										<BantoForm
+											schema={groupSchema(GROUP_EDIT)}
+											store={editGroupStore}
+											onSubmit={saveGroup}
+											submitting={savingGroup || deletingGroup}
+											submitLabel="保存"
+										>
+											<button
+												type="button"
+												class="danger"
+												onclick={handleDeleteGroup}
+												disabled={savingGroup || deletingGroup}
+											>
+												削除
+											</button>
+										</BantoForm>
+									{:else}
+										<p class="loading">読み込み中…</p>
+									{/if}
+								</div>
+							{/if}
+						{/snippet}
+					</Tabs>
 				</div>
-			</ThreePaneLayout>
-		</div>
+			</div>
+		</ThreePaneLayout>
+	</div>
 
-		{#if canWrite}
-			<HubImportDialog
-				open={hubDialogOpen}
-				connections={connectionRows}
-				groups={groupRows}
-				onclose={() => (hubDialogOpen = false)}
-				onregistered={() => void afterHubRegistration()}
-			/>
-		{/if}
+	{#if canWrite}
+		<HubImportDialog
+			open={hubDialogOpen}
+			connections={connectionRows}
+			groups={groupRows}
+			onclose={() => (hubDialogOpen = false)}
+			onregistered={() => void afterHubRegistration()}
+		/>
 	{/if}
 </div>
 

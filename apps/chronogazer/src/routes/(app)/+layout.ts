@@ -53,7 +53,7 @@ import { publicNavItems, resolveAppPath } from '#lib/navigation.js';
 //   (S-42/S-52) and confirms it. Its result is handled the same way:
 //   `unverified` is the error page, not /login (S-66); only a confirmed
 //   `none` goes to /login. Only the HTTP provider implements `status()`'s
-//   `grants` and `enterGrant()`; Tauri/demo go straight to /login.
+//   `grants` and `enterGrant()`; Tauri goes straight to /login.
 // - #392 B2-2: before the public viewer, the `localDesktop` grant (this PC's
 //   connection to the service, `chronogazer-server`) is tried first -
 //   `enterCredentiallessGrant` chains the two `grantFallback`s

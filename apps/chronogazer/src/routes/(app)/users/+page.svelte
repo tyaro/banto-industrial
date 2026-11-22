@@ -1,9 +1,7 @@
 <script lang="ts">
 	/**
 	 * ユーザー管理画面（spec M10 RBAC）。`admin` のみ到達（+page.ts が非adminを
-	 * ダッシュボードへリダイレクト）。デモモード（プレーンな vite dev/preview、
-	 * バックエンドなし）ではアカウントDBそのものが存在しないため、案内文のみ表示
-	 * する（isUsersAdminAvailable()）。
+	 * ダッシュボードへリダイレクト）。
 	 *
 	 * 一覧はBantoGrid（クライアントモード、全件を一度に取得）。BantoGridの
 	 * セル編集は「1カラム=1値」のインライン編集向けで、行ごとの複数ボタン（削除
@@ -21,11 +19,9 @@
 	import {
 		createUser,
 		deleteUser,
-		isUsersAdminAvailable,
 		listUsers,
 		resetUserPassword,
 		updateUser,
-		DEMO_MODE_MESSAGE,
 		type Role as UserRole,
 		type UserSummary
 	} from '#lib/banto/usersAdmin.js';
@@ -43,8 +39,6 @@
 	function errorMessage(err: unknown): string {
 		return isProviderError(err) ? err.message : String(err);
 	}
-
-	const available = isUsersAdminAvailable();
 
 	const createSchema: FormSchema = {
 		fields: [
@@ -75,7 +69,6 @@
 	let loading = $state(false);
 
 	async function reload(): Promise<void> {
-		if (!available) return;
 		loading = true;
 		try {
 			users = await listUsers();
@@ -226,67 +219,61 @@
 <div class="page">
 	<h2>ユーザー管理</h2>
 
-	{#if !available}
-		<p class="note">
-			{DEMO_MODE_MESSAGE}。単体ブラウザのデモモードにはアカウントDBがないため、この機能はTauriアプリまたはLANアクセス（組み込みサーバー）でのみ利用できます。
-		</p>
-	{:else}
-		<section class="create">
-			<h3>新規作成</h3>
-			<UnsavedChangesNotice pending={createDirty} label={UNSAVED_NOTICE} />
-			<BantoForm
-				schema={createSchema}
-				store={createStore}
-				onSubmit={handleCreate}
-				submitting={creating}
-				submitLabel="作成"
-			/>
-		</section>
+	<section class="create">
+		<h3>新規作成</h3>
+		<UnsavedChangesNotice pending={createDirty} label={UNSAVED_NOTICE} />
+		<BantoForm
+			schema={createSchema}
+			store={createStore}
+			onSubmit={handleCreate}
+			submitting={creating}
+			submitLabel="作成"
+		/>
+	</section>
 
-		<section class="list">
-			<h3>アカウント一覧</h3>
-			<p class="note">行をクリックすると下に編集パネルが表示されます。</p>
-			{#if loading && users.length === 0}
-				<p class="loading">読み込み中…</p>
-			{:else}
-				<div class="grid-wrap">
-					<BantoGrid rows={users} {columns} getRowId={(user) => user.id} onRowClick={selectUser} />
-				</div>
-			{/if}
-		</section>
-
-		{#if selected}
-			<section class="detail">
-				<h3>{selected.username} を編集</h3>
-				<UnsavedChangesNotice pending={editDirty || resetDirty} label={UNSAVED_NOTICE} />
-				<label class="field">
-					表示名
-					<input type="text" bind:value={editDisplayName} />
-				</label>
-				<label class="field">
-					ロール
-					<select bind:value={editRole}>
-						{#each roleOptions as option (option.value)}
-							<option value={option.value}>{option.label}</option>
-						{/each}
-					</select>
-				</label>
-				<div class="actions">
-					<button type="button" onclick={saveEdit} disabled={saving}>保存</button>
-					<button type="button" class="danger" onclick={handleDelete}>削除</button>
-				</div>
-
-				<div class="reset">
-					<label class="field">
-						新しいパスワード（8文字以上）
-						<input type="password" bind:value={resetPassword} autocomplete="new-password" />
-					</label>
-					<button type="button" onclick={saveReset} disabled={resetting}>
-						パスワードをリセット
-					</button>
-				</div>
-			</section>
+	<section class="list">
+		<h3>アカウント一覧</h3>
+		<p class="note">行をクリックすると下に編集パネルが表示されます。</p>
+		{#if loading && users.length === 0}
+			<p class="loading">読み込み中…</p>
+		{:else}
+			<div class="grid-wrap">
+				<BantoGrid rows={users} {columns} getRowId={(user) => user.id} onRowClick={selectUser} />
+			</div>
 		{/if}
+	</section>
+
+	{#if selected}
+		<section class="detail">
+			<h3>{selected.username} を編集</h3>
+			<UnsavedChangesNotice pending={editDirty || resetDirty} label={UNSAVED_NOTICE} />
+			<label class="field">
+				表示名
+				<input type="text" bind:value={editDisplayName} />
+			</label>
+			<label class="field">
+				ロール
+				<select bind:value={editRole}>
+					{#each roleOptions as option (option.value)}
+						<option value={option.value}>{option.label}</option>
+					{/each}
+				</select>
+			</label>
+			<div class="actions">
+				<button type="button" onclick={saveEdit} disabled={saving}>保存</button>
+				<button type="button" class="danger" onclick={handleDelete}>削除</button>
+			</div>
+
+			<div class="reset">
+				<label class="field">
+					新しいパスワード（8文字以上）
+					<input type="password" bind:value={resetPassword} autocomplete="new-password" />
+				</label>
+				<button type="button" onclick={saveReset} disabled={resetting}>
+					パスワードをリセット
+				</button>
+			</div>
+		</section>
 	{/if}
 </div>
 

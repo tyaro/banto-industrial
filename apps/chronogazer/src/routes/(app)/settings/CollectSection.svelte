@@ -69,7 +69,6 @@
 		connectionStatusLabel,
 		getCollectConnections,
 		getCollectStatus,
-		isCollectAvailable,
 		isCollectStale,
 		isPollGenerationCurrent,
 		isPollResultFresh,
@@ -90,7 +89,6 @@
 	} from '#lib/banto/collectNames.js';
 	import { errorMessage } from './shared';
 
-	const available = isCollectAvailable();
 	/** 操作は editor 以上（`chronogazer_core::collect::COLLECT_OPERATION_ROLE`）。 */
 	const canOperate = $derived(canWriteResources(sessionStore.role));
 
@@ -273,7 +271,7 @@
 	}
 
 	function startPolling(): void {
-		if (!available || polling) return;
+		if (polling) return;
 		polling = true;
 		void pollThenSchedule(pollGeneration);
 	}
@@ -288,7 +286,6 @@
 	}
 
 	onMount(() => {
-		if (!available) return;
 		document.addEventListener('visibilitychange', onVisibilityChange);
 		void refreshKeyNames();
 		if (document.visibilityState === 'visible') startPolling();
@@ -305,139 +302,133 @@
 <section>
 	<h2>収集</h2>
 
-	{#if available}
-		<p class="status">
-			状態: <strong>{statusHeadline}</strong>
-		</p>
-		<!--
+	<p class="status">
+		状態: <strong>{statusHeadline}</strong>
+	</p>
+	<!--
 			恒久的に失敗したら、そう言う。表示は消さず「いつ取得できた表示か」を
 			添える（トーストは出さない - 明示操作のエラー表示を上書きしない）。
 		-->
-		{#if statusStale}
-			<p class="note poll-stale" role="status">{collectStaleNote('status', lastStatusAt)}</p>
-		{/if}
-		{#if status}
-			<p class="note">{collectStateDetail(status)}</p>
-		{/if}
+	{#if statusStale}
+		<p class="note poll-stale" role="status">{collectStaleNote('status', lastStatusAt)}</p>
+	{/if}
+	{#if status}
+		<p class="note">{collectStateDetail(status)}</p>
+	{/if}
 
-		<!--
+	<!--
 			#414 段階2: 開始時に外した設定。**不正なものがあることは必ず分かる
 			ようにする**（オーナー決定）ので、1 件でもあれば見出しと一覧を出す。
 			一覧は状態の中にあるので、停止・再起動で状態が変われば入れ替わる。
 		-->
-		{#if exclusionsHeadline}
-			<div class="collect-exclusions" role="status">
-				<h3 class="collect-subheading">{exclusionsHeadline}</h3>
-				<!-- 説明文は状態ごと（`collectExclusionsNote`）。全部外れた noTargets で
+	{#if exclusionsHeadline}
+		<div class="collect-exclusions" role="status">
+			<h3 class="collect-subheading">{exclusionsHeadline}</h3>
+			<!-- 説明文は状態ごと（`collectExclusionsNote`）。全部外れた noTargets で
 				「収集しています」と言わない（#422 レビュー P2）。 -->
-				{#if exclusionsNote}
-					<p class="note">
-						{exclusionsNote.summary}
-						{#if exclusionsNote.fix !== null}
-							<a href={resolveAppPath('/tags')}>記録</a>{exclusionsNote.fix}
+			{#if exclusionsNote}
+				<p class="note">
+					{exclusionsNote.summary}
+					{#if exclusionsNote.fix !== null}
+						<a href={resolveAppPath('/tags')}>記録</a>{exclusionsNote.fix}
+					{/if}
+				</p>
+				{#each exclusionsNote.guides as guide (guide.reason)}
+					<p class="note exclusion-guide" data-reason={guide.reason}>
+						{guide.text}
+						{#if guide.link}
+							<a href={resolveAppPath(guide.link.path)}>{guide.link.label}</a>
 						{/if}
 					</p>
-					{#each exclusionsNote.guides as guide (guide.reason)}
-						<p class="note exclusion-guide" data-reason={guide.reason}>
-							{guide.text}
-							{#if guide.link}
-								<a href={resolveAppPath(guide.link.path)}>{guide.link.label}</a>
-							{/if}
-						</p>
-					{/each}
-				{/if}
-				<table class="collect-exclusion-list">
-					<thead>
+				{/each}
+			{/if}
+			<table class="collect-exclusion-list">
+				<thead>
+					<tr>
+						<th scope="col">種類</th>
+						<th scope="col">名前</th>
+						<th scope="col">理由</th>
+					</tr>
+				</thead>
+				<tbody>
+					{#each exclusions as exclusion (exclusion.key)}
 						<tr>
-							<th scope="col">種類</th>
-							<th scope="col">名前</th>
-							<th scope="col">理由</th>
+							<td>{exclusionUnitLabel(exclusion.unit)}</td>
+							<td>{exclusion.name}</td>
+							<td>{exclusion.message}</td>
 						</tr>
-					</thead>
-					<tbody>
-						{#each exclusions as exclusion (exclusion.key)}
-							<tr>
-								<td>{exclusionUnitLabel(exclusion.unit)}</td>
-								<td>{exclusion.name}</td>
-								<td>{exclusion.message}</td>
-							</tr>
-						{/each}
-					</tbody>
-				</table>
-			</div>
-		{/if}
+					{/each}
+				</tbody>
+			</table>
+		</div>
+	{/if}
 
-		<!--
+	<!--
 			操作は editor 以上にだけ**出す**（`disabled` にして見せない）。
 			viewer に押せないボタンを並べても、できることが増えないため。
 		-->
-		{#if canOperate}
-			<div class="collect-actions">
-				{#each ACTIONS as action (action)}
-					<button type="button" onclick={() => operate(action)} disabled={busy}>
-						{collectActionLabel(action)}
-					</button>
-				{/each}
-			</div>
-		{:else}
-			<p class="note">収集の開始・停止・再起動は、編集者以上のアカウントで行えます。</p>
-		{/if}
+	{#if canOperate}
+		<div class="collect-actions">
+			{#each ACTIONS as action (action)}
+				<button type="button" onclick={() => operate(action)} disabled={busy}>
+					{collectActionLabel(action)}
+				</button>
+			{/each}
+		</div>
+	{:else}
+		<p class="note">収集の開始・停止・再起動は、編集者以上のアカウントで行えます。</p>
+	{/if}
 
-		<!--
+	<!--
 			`pending`（受け付けたがまだ終わっていない）・打ち切り（待つのを
 			やめただけ）・エラー（未受付を含む）は**別の行・別の文言**。
 			言い分けは `collectOperationDisplay` の表を参照。
 		-->
-		{#if opNotice}
-			<p class="note operation-notice" role="status">{opNotice}</p>
-		{/if}
-		{#if opError}
-			<p class="error">{opError}</p>
-		{/if}
+	{#if opNotice}
+		<p class="note operation-notice" role="status">{opNotice}</p>
+	{/if}
+	{#if opError}
+		<p class="error">{opError}</p>
+	{/if}
 
-		<h3 class="collect-subheading">接続ごとの状態</h3>
-		{#if connectionsStale}
-			<p class="note poll-stale" role="status">
-				{collectStaleNote('connections', lastConnectionsAt)}
-			</p>
-		{/if}
-		{#if connections}
-			<p class="note">{collectConnectionsNote(connections.state, connectionEntries.length)}</p>
-			{#if connectionEntries.length > 0}
-				<table class="collect-connections">
-					<thead>
-						<tr>
-							<th scope="col">接続</th>
-							<th scope="col">状態</th>
-							<th scope="col">記録</th>
-						</tr>
-					</thead>
-					<tbody>
-						{#each connectionEntries as [key, value] (key)}
-							{@const simulationNote = connectionSimulationNote(value)}
-							<tr>
-								<td class="collect-key" title={key}>{resolveKeyLabel(key, keyNames)}</td>
-								<td>{connectionStatusLabel(value)}</td>
-								<td class:simulation-note={simulationNote !== null}>
-									{simulationNote ?? '記録対象'}
-								</td>
-							</tr>
-						{/each}
-					</tbody>
-				</table>
-			{/if}
-		{:else}
-			<p class="note">接続ごとの状態はまだ取得できていません。</p>
-		{/if}
-
-		<p class="note">
-			収集の開始・停止・接続の切断などの記録は「イベント」画面で見られます。「記録」ページでの変更（接続のシミュレーションの切替を含む）は自動では反映されません（「収集を再起動」で反映します）。
-		</p>
-	{:else}
-		<p class="note">
-			収集はデスクトップアプリ、またはデスクトップアプリが公開しているLANサーバー経由でのみ利用できます。
+	<h3 class="collect-subheading">接続ごとの状態</h3>
+	{#if connectionsStale}
+		<p class="note poll-stale" role="status">
+			{collectStaleNote('connections', lastConnectionsAt)}
 		</p>
 	{/if}
+	{#if connections}
+		<p class="note">{collectConnectionsNote(connections.state, connectionEntries.length)}</p>
+		{#if connectionEntries.length > 0}
+			<table class="collect-connections">
+				<thead>
+					<tr>
+						<th scope="col">接続</th>
+						<th scope="col">状態</th>
+						<th scope="col">記録</th>
+					</tr>
+				</thead>
+				<tbody>
+					{#each connectionEntries as [key, value] (key)}
+						{@const simulationNote = connectionSimulationNote(value)}
+						<tr>
+							<td class="collect-key" title={key}>{resolveKeyLabel(key, keyNames)}</td>
+							<td>{connectionStatusLabel(value)}</td>
+							<td class:simulation-note={simulationNote !== null}>
+								{simulationNote ?? '記録対象'}
+							</td>
+						</tr>
+					{/each}
+				</tbody>
+			</table>
+		{/if}
+	{:else}
+		<p class="note">接続ごとの状態はまだ取得できていません。</p>
+	{/if}
+
+	<p class="note">
+		収集の開始・停止・接続の切断などの記録は「イベント」画面で見られます。「記録」ページでの変更（接続のシミュレーションの切替を含む）は自動では反映されません（「収集を再起動」で反映します）。
+	</p>
 </section>
 
 <style>

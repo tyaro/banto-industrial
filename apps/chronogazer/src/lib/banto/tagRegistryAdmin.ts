@@ -9,9 +9,6 @@
  * - LAN ブラウザ（組み込みサーバー） -> `fetch()` の
  *   `/api/plc-connections[...]` / `/api/collection-groups[...]` /
  *   `/api/tags[...]` REST ルート（`apps/chronogazer/core/src/rest.rs`）。
- * - 単体ブラウザのデモモード（`vite dev`/`vite preview`）-> レジストリDBが
- *   無いので全呼び出しが `DEMO_MODE_MESSAGE` で拒否される。
- *   `isTagRegistryAvailable()` で事前に判定できる。
  *
  * 3エンティティとも editor-write / viewer-read（R0 §3.6）で、REST/Tauri
  * 両経路が同じ内容で監査する。型は `chronogazer_core::rest` の camelCase
@@ -185,18 +182,7 @@ export interface TagInput {
 
 // --- environment/error plumbing (usersAdmin.ts と同じ作法) ------------------
 
-export const DEMO_MODE_MESSAGE = 'デモモードでは利用できません';
 const NETWORK_ERROR_MESSAGE = 'サーバーに接続できません';
-
-/** デモモードの拒否（`displayGroupsAdmin.ts` も使う）。 */
-export function demoModeError(): ProviderError {
-	return new ProviderError({ kind: 'other', message: DEMO_MODE_MESSAGE });
-}
-
-/** レジストリDBを持つ環境（Tauri または組み込みサーバー）か？ デモモードなら false。 */
-export function isTagRegistryAvailable(): boolean {
-	return getBantoMode() !== 'demo';
-}
 
 const ERROR_KINDS = new Set([
 	'not_found',
@@ -284,19 +270,16 @@ export async function httpRequest<T>(path: string, init: HttpInit): Promise<T> {
 // --- PLC connections --------------------------------------------------------
 
 export async function listDrivers(): Promise<DriverInfo[]> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<DriverInfo[]>('drivers_list');
 	return httpRequest<DriverInfo[]>('/api/drivers', { method: 'GET' });
 }
 
 export async function listPlcConnections(): Promise<PlcConnection[]> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<PlcConnection[]>('plc_connections_list');
 	return httpRequest<PlcConnection[]>('/api/plc-connections', { method: 'GET' });
 }
 
 export async function createPlcConnection(input: PlcConnectionInput): Promise<PlcConnection> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		return invokeCommand<PlcConnection>('plc_connections_create', { input });
 	}
@@ -307,7 +290,6 @@ export async function updatePlcConnection(
 	id: number,
 	input: PlcConnectionInput
 ): Promise<PlcConnection> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		return invokeCommand<PlcConnection>('plc_connections_update', { id, input });
 	}
@@ -315,7 +297,6 @@ export async function updatePlcConnection(
 }
 
 export async function deletePlcConnection(id: number): Promise<void> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		await invokeCommand<void>('plc_connections_delete', { id });
 		return;
@@ -335,7 +316,6 @@ export async function deletePlcConnection(id: number): Promise<void> {
  * 収集が走っていなくても返る。
  */
 export async function listConfigExclusions(): Promise<ExclusionView[]> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		return invokeCommand<ExclusionView[]>('config_exclusions_list');
 	}
@@ -345,7 +325,6 @@ export async function listConfigExclusions(): Promise<ExclusionView[]> {
 // --- collection groups ------------------------------------------------------
 
 export async function listCollectionGroups(): Promise<CollectionGroup[]> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		return invokeCommand<CollectionGroup[]>('collection_groups_list');
 	}
@@ -353,7 +332,6 @@ export async function listCollectionGroups(): Promise<CollectionGroup[]> {
 }
 
 export async function createCollectionGroup(input: CollectionGroupInput): Promise<CollectionGroup> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		return invokeCommand<CollectionGroup>('collection_groups_create', { input });
 	}
@@ -364,7 +342,6 @@ export async function updateCollectionGroup(
 	id: number,
 	input: CollectionGroupInput
 ): Promise<CollectionGroup> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		return invokeCommand<CollectionGroup>('collection_groups_update', { id, input });
 	}
@@ -375,7 +352,6 @@ export async function updateCollectionGroup(
 }
 
 export async function deleteCollectionGroup(id: number): Promise<void> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		await invokeCommand<void>('collection_groups_delete', { id });
 		return;
@@ -389,13 +365,11 @@ export async function deleteCollectionGroup(id: number): Promise<void> {
 // --- tags -------------------------------------------------------------------
 
 export async function listTags(): Promise<Tag[]> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<Tag[]>('tags_list');
 	return httpRequest<Tag[]>('/api/tags', { method: 'GET' });
 }
 
 export async function createTag(input: TagInput): Promise<Tag> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		return invokeCommand<Tag>('tags_create', { input });
 	}
@@ -403,7 +377,6 @@ export async function createTag(input: TagInput): Promise<Tag> {
 }
 
 export async function updateTag(id: number, input: TagInput): Promise<Tag> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		return invokeCommand<Tag>('tags_update', { id, input });
 	}
@@ -411,7 +384,6 @@ export async function updateTag(id: number, input: TagInput): Promise<Tag> {
 }
 
 export async function deleteTag(id: number): Promise<void> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		await invokeCommand<void>('tags_delete', { id });
 		return;
@@ -477,7 +449,6 @@ export interface HubRegistrationResult {
 export async function registerTagsFromHub(
 	input: HubTagRegistration
 ): Promise<HubRegistrationResult> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		return invokeCommand<HubRegistrationResult>('tags_register_from_hub', { input });
 	}

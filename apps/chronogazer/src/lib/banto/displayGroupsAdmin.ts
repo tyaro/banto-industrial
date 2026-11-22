@@ -6,7 +6,6 @@
  *   （`apps/chronogazer/src-tauri/src/lib.rs`）。
  * - LAN ブラウザ（組み込みサーバー） -> `/api/display-groups[...]`
  *   （`apps/chronogazer/core/src/rest/display_groups.rs`）。
- * - 単体ブラウザのデモモード -> DB が無いので `DEMO_MODE_MESSAGE` で拒否。
  *
  * 読み取りは viewer 以上、書き込みは editor 以上（R0 §3.6）。両経路とも同じ
  * サービス・同じ検証（`chronogazer_core::display_groups::validate_display_group`）
@@ -15,12 +14,7 @@
  * タグの値を読み取り専用で見せるだけ（recorder-requirements.md §3.7.1）。
  */
 import type { HubTagRow, Tag } from './tagRegistryAdmin';
-import {
-	demoModeError,
-	httpRequest,
-	invokeCommand,
-	isTagRegistryAvailable
-} from './tagRegistryAdmin';
+import { httpRequest, invokeCommand } from './tagRegistryAdmin';
 import { getBantoMode } from './setup';
 
 /** 表示種別（§3.2 の 4 種固定）。 */
@@ -161,7 +155,6 @@ export interface DisplayGroupInput {
 }
 
 export async function listDisplayGroups(): Promise<DisplayGroup[]> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<DisplayGroup[]>('display_groups_list');
 	return httpRequest<DisplayGroup[]>('/api/display-groups', { method: 'GET' });
 }
@@ -169,7 +162,6 @@ export async function listDisplayGroups(): Promise<DisplayGroup[]> {
 export async function createDisplayGroup(
 	input: DisplayGroupInput
 ): Promise<DisplayGroupSaveResponse> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		return invokeCommand<DisplayGroupSaveResponse>('display_groups_create', { input });
 	}
@@ -183,7 +175,6 @@ export async function updateDisplayGroup(
 	id: number,
 	input: DisplayGroupInput
 ): Promise<DisplayGroupSaveResponse> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		return invokeCommand<DisplayGroupSaveResponse>('display_groups_update', { id, input });
 	}
@@ -194,7 +185,6 @@ export async function updateDisplayGroup(
 }
 
 export async function deleteDisplayGroup(id: number): Promise<void> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		await invokeCommand<void>('display_groups_delete', { id });
 		return;
@@ -207,7 +197,6 @@ export async function deleteDisplayGroup(id: number): Promise<void> {
 
 /** 並べ替え: 全グループの ID を新しい順で 1 回ずつ。 */
 export async function reorderDisplayGroups(ids: number[]): Promise<DisplayGroup[]> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		return invokeCommand<DisplayGroup[]>('display_groups_reorder', { ids });
 	}

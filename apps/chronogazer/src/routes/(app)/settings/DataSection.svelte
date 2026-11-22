@@ -3,25 +3,18 @@
 	 * データカテゴリ（監査ログの保持ポリシー/バックアップ・リストア）
 	 * （#359 chronogazer 分）。元 `+page.svelte` の「監査ログの保持
 	 * ポリシー」「バックアップ/リストア」セクションから markup・state・
-	 * 関数を無改変で移した。いずれも admin 限定 かつ 各機能の可用性
-	 * （`auditAvailable`/`backupsAvailable`）ガード付き。
+	 * 関数を無改変で移した。いずれも admin 限定。
 	 */
 	import { isTauri } from '#lib/banto/setup.js';
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { isAdmin } from '#lib/permissions.js';
 	import { toastStore } from '#lib/toast.svelte.js';
-	import {
-		getAuditConfig,
-		isAuditLogAvailable,
-		setAuditConfig,
-		type AuditSettings
-	} from '#lib/banto/auditLogAdmin.js';
+	import { getAuditConfig, setAuditConfig, type AuditSettings } from '#lib/banto/auditLogAdmin.js';
 	import {
 		cancelPendingRestore,
 		createBackup,
 		downloadBackup,
 		getPendingRestore,
-		isBackupsAvailable,
 		listBackups,
 		openBackupsFolder,
 		stageRestoreFromBackup,
@@ -39,10 +32,8 @@
 	// Unlike server/auth-mode settings, this section is not Tauri-only:
 	// `auditLogAdmin.ts` has a REST fallback (`GET`/`PUT /api/audit-log/config`,
 	// spec M14 Phase B) so a LAN browser admin can also see/change the
-	// retention policy, not just the desktop app - so this section is gated
-	// on `auditAvailable` (real backend, not the plain-browser demo) rather
-	// than `tauri`.
-	const auditAvailable = isAuditLogAvailable();
+	// retention policy, not just the desktop app - so it is shown to any admin
+	// (not gated on `tauri`).
 
 	let auditConfig = $state<AuditSettings | null>(null);
 	// 0 is the wire sentinel for "unlimited" on both fields (spec M14,
@@ -79,7 +70,7 @@
 	}
 
 	$effect(() => {
-		if (!auditAvailable || !isAdmin(sessionStore.role)) return;
+		if (!isAdmin(sessionStore.role)) return;
 		void (async () => {
 			try {
 				applyAuditConfigToDrafts(await getAuditConfig());
@@ -108,10 +99,8 @@
 	}
 
 	// --- M17: SQLite backup/restore (Tauri + LAN browser, admin only) -------
-	// Same availability gate as the audit-log section above (real backend,
-	// not the plain-browser demo) - `backupsAdmin.ts`'s REST fallback means a
-	// LAN browser admin gets this section too, not just the desktop app.
-	const backupsAvailable = isBackupsAvailable();
+	// `backupsAdmin.ts`'s REST fallback means a LAN browser admin gets this
+	// section too, not just the desktop app.
 
 	let backups = $state<BackupInfo[]>([]);
 	let pendingRestore = $state<PendingRestoreInfo | null>(null);
@@ -143,7 +132,7 @@
 	}
 
 	$effect(() => {
-		if (!backupsAvailable || !isAdmin(sessionStore.role)) return;
+		if (!isAdmin(sessionStore.role)) return;
 		void (async () => {
 			loadingBackups = true;
 			backupsError = null;
@@ -251,7 +240,7 @@
 	}
 </script>
 
-{#if auditAvailable && isAdmin(sessionStore.role)}
+{#if isAdmin(sessionStore.role)}
 	<section>
 		<h2>監査ログの保持ポリシー</h2>
 
@@ -299,7 +288,7 @@
 	</section>
 {/if}
 
-{#if backupsAvailable && isAdmin(sessionStore.role)}
+{#if isAdmin(sessionStore.role)}
 	<section>
 		<h2>バックアップ/リストア</h2>
 

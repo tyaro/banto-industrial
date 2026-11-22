@@ -64,9 +64,7 @@
 		listTags,
 		listCollectionGroups,
 		listPlcConnections,
-		isTagRegistryAvailable,
 		ALLOWED_PERIOD_MS,
-		DEMO_MODE_MESSAGE,
 		type Tag,
 		type CollectionGroup,
 		type PlcConnection
@@ -80,7 +78,6 @@
 		getCollectConnections,
 		getCollectStatus,
 		getCollectValues,
-		isCollectAvailable,
 		runCollectAction,
 		runWithLimit,
 		toCollectStateView,
@@ -163,7 +160,6 @@
 		type GroupDraft
 	} from './groupsPageLogic';
 
-	const available = isTagRegistryAvailable();
 	/** 新しい収集グループの周期の既定（`DEFAULT_HUB_GROUP_PERIOD_MS` と同じ 1 秒）。 */
 	const DEFAULT_PERIOD = 1000;
 	const periodOptions = ALLOWED_PERIOD_MS.map((ms) => ({
@@ -587,9 +583,7 @@
 	const POLL_KEY = 0;
 
 	const valuesWanted = $derived(
-		available &&
-			isCollectAvailable() &&
-			pageVisible &&
+		pageVisible &&
 			draftReady &&
 			activeTab === 'pens' &&
 			(pickMode !== null || draft.pens.some((pen) => pen.tagId !== null))
@@ -657,7 +651,7 @@
 
 	/** 今回の取得が最新として採用され `collectState` に書かれたときだけ `true`。 */
 	async function refreshCollectState(): Promise<boolean> {
-		if (disposed || !available || !isCollectAvailable()) return false;
+		if (disposed) return false;
 		const gen = ++collectGen;
 		let next: CollectorStateView | null = null;
 		try {
@@ -1084,7 +1078,6 @@
 	});
 
 	$effect(() => {
-		if (!available) return;
 		void reloadGroups();
 		void reloadTags();
 	});
@@ -1093,145 +1086,148 @@
 <div class="page">
 	<h2>表示グループ</h2>
 
-	{#if !available}
-		<p class="note">
-			{DEMO_MODE_MESSAGE}。単体ブラウザのデモモードにはDBが無いため、この機能はTauriアプリまたはLANアクセス（組み込みサーバー）でのみ利用できます。
-		</p>
-	{:else}
-		<!--
+	<!--
 			#1179 PR6a: 右ペイン = 選んだペンの設定（タグの選択と色）。編集者以上の
 			ときだけ開く。ペンの編集は中央の下書きを直接書き換える（保存は中央の上）。
 		-->
-		{#snippet rightPaneContent()}
-			<div class="detail-pane" data-testid="display-group-pen-pane">
-				<div class="detail-pane-header">
-					<h3>{rightPaneTitle}</h3>
-					<button type="button" class="pane-close" onclick={closeRightPane} aria-label="閉じる">
-						×
-					</button>
-				</div>
-				<div class="detail-pane-body">
-					{#if pickMode !== null}
-						<PenTagPicker
-							mode={pickMode}
-							title={pickMode === 'add'
-								? `タグ追加中・追加先: ${pickTargetName}`
-								: `ペン ${(selectedPen ?? 0) + 1} のタグを選び直す`}
-							{connections}
-							{collectionGroups}
-							tags={tags ?? []}
-							hub={hubCatalog}
-							{hubLoading}
-							{hubError}
-							used={tagsUsedByOtherPens(draft, pickMode === 'replace' ? selectedPen : null)}
-							remaining={remainingPens(draft)}
-							max={MAX_PENS}
-							values={valuesTable}
-							valuesNote={valuesNoteText}
-							disabled={busy}
-							onpick={handlePick}
-							onback={backFromPicker}
-							onrefresh={() => void refreshPicker()}
-						/>
-					{:else if selectedPen !== null && selectedPen < draft.pens.length}
-						{@const index = selectedPen}
-						{@const pen = draft.pens[index]}
-						{@const summary = describePenTag(pen, tagsById, collectionGroups, connections)}
-						<fieldset class="editor" disabled={busy}>
-							<div class="current-tag" data-testid="pen-current-tag">
-								<span class="field-label">ペン {index + 1} のタグ</span>
-								<strong>{summary?.name ?? 'タグ未選択'}</strong>
-								{#if summary?.connection || summary?.group}
-									<span class="meta">
-										{[summary?.connection, summary?.group].filter(Boolean).join(' / ')}
-									</span>
-								{/if}
-								{#if summary?.unregistered}
-									<span class="unreg-badge">未登録（保存で記録に追加）</span>
-								{/if}
-								<button type="button" class="secondary" onclick={startReplace}>
-									タグを選び直す
-								</button>
-							</div>
-							<label class="field">
-								<span>ペン {index + 1} の色</span>
-								<select
-									value={pen.colorSlot === null ? '' : String(pen.colorSlot)}
-									onchange={(e) => setPenColor(index, e.currentTarget.value)}
-								>
-									<option value="">既定（色 {defaultColorSlot(index)}）</option>
-									{#each Array.from({ length: COLOR_SLOTS }, (_, i) => i + 1) as colorSlot (colorSlot)}
-										<option value={String(colorSlot)}>色 {colorSlot}</option>
-									{/each}
-								</select>
-							</label>
-						</fieldset>
-						{@const penTag = pen.tagId !== null ? tagsById.get(pen.tagId) : pen.hubTag}
-						<PenStyleEditor
-							{index}
-							{pen}
-							texts={pen.texts}
-							tag={penTag}
-							thresholdTagId={pen.tagId}
-							thresholds={thresholdsByTag}
-							thresholdsFailed={thresholdsError !== null}
-							disabled={busy}
-							trendOnlyNote={draft.kind !== 'trend'}
-							errors={fieldErrors.penRows[index] ?? []}
-							onchange={(patch) => setPenStyle(index, patch)}
-							ontext={(field, text) => setPenAxisText(index, field, text)}
-						/>
-						<p class="note">変更は下書きに入り、中央の上の「保存」で確定します。</p>
-					{/if}
-				</div>
+	{#snippet rightPaneContent()}
+		<div class="detail-pane" data-testid="display-group-pen-pane">
+			<div class="detail-pane-header">
+				<h3>{rightPaneTitle}</h3>
+				<button type="button" class="pane-close" onclick={closeRightPane} aria-label="閉じる">
+					×
+				</button>
 			</div>
-		{/snippet}
+			<div class="detail-pane-body">
+				{#if pickMode !== null}
+					<PenTagPicker
+						mode={pickMode}
+						title={pickMode === 'add'
+							? `タグ追加中・追加先: ${pickTargetName}`
+							: `ペン ${(selectedPen ?? 0) + 1} のタグを選び直す`}
+						{connections}
+						{collectionGroups}
+						tags={tags ?? []}
+						hub={hubCatalog}
+						{hubLoading}
+						{hubError}
+						used={tagsUsedByOtherPens(draft, pickMode === 'replace' ? selectedPen : null)}
+						remaining={remainingPens(draft)}
+						max={MAX_PENS}
+						values={valuesTable}
+						valuesNote={valuesNoteText}
+						disabled={busy}
+						onpick={handlePick}
+						onback={backFromPicker}
+						onrefresh={() => void refreshPicker()}
+					/>
+				{:else if selectedPen !== null && selectedPen < draft.pens.length}
+					{@const index = selectedPen}
+					{@const pen = draft.pens[index]}
+					{@const summary = describePenTag(pen, tagsById, collectionGroups, connections)}
+					<fieldset class="editor" disabled={busy}>
+						<div class="current-tag" data-testid="pen-current-tag">
+							<span class="field-label">ペン {index + 1} のタグ</span>
+							<strong>{summary?.name ?? 'タグ未選択'}</strong>
+							{#if summary?.connection || summary?.group}
+								<span class="meta">
+									{[summary?.connection, summary?.group].filter(Boolean).join(' / ')}
+								</span>
+							{/if}
+							{#if summary?.unregistered}
+								<span class="unreg-badge">未登録（保存で記録に追加）</span>
+							{/if}
+							<button type="button" class="secondary" onclick={startReplace}>
+								タグを選び直す
+							</button>
+						</div>
+						<label class="field">
+							<span>ペン {index + 1} の色</span>
+							<select
+								value={pen.colorSlot === null ? '' : String(pen.colorSlot)}
+								onchange={(e) => setPenColor(index, e.currentTarget.value)}
+							>
+								<option value="">既定（色 {defaultColorSlot(index)}）</option>
+								{#each Array.from({ length: COLOR_SLOTS }, (_, i) => i + 1) as colorSlot (colorSlot)}
+									<option value={String(colorSlot)}>色 {colorSlot}</option>
+								{/each}
+							</select>
+						</label>
+					</fieldset>
+					{@const penTag = pen.tagId !== null ? tagsById.get(pen.tagId) : pen.hubTag}
+					<PenStyleEditor
+						{index}
+						{pen}
+						texts={pen.texts}
+						tag={penTag}
+						thresholdTagId={pen.tagId}
+						thresholds={thresholdsByTag}
+						thresholdsFailed={thresholdsError !== null}
+						disabled={busy}
+						trendOnlyNote={draft.kind !== 'trend'}
+						errors={fieldErrors.penRows[index] ?? []}
+						onchange={(patch) => setPenStyle(index, patch)}
+						ontext={(field, text) => setPenAxisText(index, field, text)}
+					/>
+					<p class="note">変更は下書きに入り、中央の上の「保存」で確定します。</p>
+				{/if}
+			</div>
+		</div>
+	{/snippet}
 
-		<!--
+	<!--
 			#1179 PR6a: 左の一覧・中央のタブ・右のペイン設定の 3 ペイン（`@banto/ui` の
 			`ThreePaneLayout`）。狭幅の判定はビューポート（`mobileNavStore.isNarrow`）。
 			帯には、一覧を閉じていても何を開いているか分かるよう、選択中の名前を出す。
 		-->
-		<div class="groups-frame">
-			<ThreePaneLayout
-				narrowOverride={mobileNavStore.isNarrow}
-				bind:leftDrawerOpen={listOpen}
-				bind:rightDrawerOpen
-				bind:narrow={layoutNarrow}
-				right={penPaneOpen ? rightPaneContent : undefined}
-				messages={{
-					threePaneLeft: () => LIST_PANE_LABEL,
-					threePaneResizeLeft: () => `${LIST_PANE_LABEL}の幅`,
-					threePaneRight: () => rightPaneTitle,
-					threePaneResizeRight: () => `${rightPaneTitle}の幅`
-				}}
-			>
-				{#snippet left()}
-					<div class="list-pane" data-testid="display-group-list-pane">
-						{#if canWrite}
-							<div class="list-toolbar">
-								<button
-									type="button"
-									class="secondary"
-									onclick={startNew}
-									disabled={busy || atGroupLimit || groups === null}
-								>
-									表示グループを追加
-								</button>
-							</div>
-						{/if}
-						{#if canWrite && atGroupLimit}
-							<p class="note">
-								表示グループは {MAX_DISPLAY_GROUPS} 個までです。新しく作るには不要なグループを削除してください。
-							</p>
-						{/if}
+	<div class="groups-frame">
+		<ThreePaneLayout
+			narrowOverride={mobileNavStore.isNarrow}
+			bind:leftDrawerOpen={listOpen}
+			bind:rightDrawerOpen
+			bind:narrow={layoutNarrow}
+			right={penPaneOpen ? rightPaneContent : undefined}
+			messages={{
+				threePaneLeft: () => LIST_PANE_LABEL,
+				threePaneResizeLeft: () => `${LIST_PANE_LABEL}の幅`,
+				threePaneRight: () => rightPaneTitle,
+				threePaneResizeRight: () => `${rightPaneTitle}の幅`
+			}}
+		>
+			{#snippet left()}
+				<div class="list-pane" data-testid="display-group-list-pane">
+					{#if canWrite}
+						<div class="list-toolbar">
+							<button
+								type="button"
+								class="secondary"
+								onclick={startNew}
+								disabled={busy || atGroupLimit || groups === null}
+							>
+								表示グループを追加
+							</button>
+						</div>
+					{/if}
+					{#if canWrite && atGroupLimit}
+						<p class="note">
+							表示グループは {MAX_DISPLAY_GROUPS} 個までです。新しく作るには不要なグループを削除してください。
+						</p>
+					{/if}
 
-						<section class="group-list-section" aria-label="表示グループの一覧">
-							{#if groups === null && groupsError === null}
-								<p class="loading">読み込み中…</p>
-							{:else if groups === null}
+					<section class="group-list-section" aria-label="表示グループの一覧">
+						{#if groups === null && groupsError === null}
+							<p class="loading">読み込み中…</p>
+						{:else if groups === null}
+							<p class="load-error" role="alert">
+								表示グループの一覧を読み込めませんでした（{groupsError}）。登録が0件という意味ではありません。
+								<button type="button" onclick={() => void reloadGroups()} disabled={groupsLoading}>
+									再試行
+								</button>
+							</p>
+						{:else}
+							{#if groupsError !== null}
 								<p class="load-error" role="alert">
-									表示グループの一覧を読み込めませんでした（{groupsError}）。登録が0件という意味ではありません。
+									一覧を更新できませんでした（{groupsError}）。表示は最後に読み込めた内容です。
 									<button
 										type="button"
 										onclick={() => void reloadGroups()}
@@ -1240,471 +1236,450 @@
 										再試行
 									</button>
 								</p>
+							{/if}
+							{#if groups.length === 0}
+								<p class="note">表示グループはまだありません。</p>
 							{:else}
-								{#if groupsError !== null}
-									<p class="load-error" role="alert">
-										一覧を更新できませんでした（{groupsError}）。表示は最後に読み込めた内容です。
-										<button
-											type="button"
-											onclick={() => void reloadGroups()}
-											disabled={groupsLoading}
-										>
-											再試行
-										</button>
-									</p>
-								{/if}
-								{#if groups.length === 0}
-									<p class="note">表示グループはまだありません。</p>
-								{:else}
-									<ul class="group-list">
-										{#each groups as group, index (group.id)}
-											<li class:selected={selected === group.id}>
+								<ul class="group-list">
+									{#each groups as group, index (group.id)}
+										<li class:selected={selected === group.id}>
+											<button
+												type="button"
+												class="group-open"
+												aria-current={selected === group.id ? 'true' : undefined}
+												onclick={() => selectGroup(group)}
+												disabled={busy}
+											>
+												<span class="group-name">{group.name}</span>
+												{#if group.bundle !== null}
+													<span class="group-bundle" title="束">{group.bundle}</span>
+												{/if}
+												<span class="group-meta">
+													{kindLabel(group.kind)}・ペン {group.pens.length} 本
+												</span>
+											</button>
+											{#if canWrite}
 												<button
 													type="button"
-													class="group-open"
-													aria-current={selected === group.id ? 'true' : undefined}
-													onclick={() => selectGroup(group)}
-													disabled={busy}
+													class="icon"
+													aria-label={`${group.name} を上へ`}
+													onclick={() => void moveGroup(group.id, -1)}
+													disabled={busy || index === 0}
 												>
-													<span class="group-name">{group.name}</span>
-													{#if group.bundle !== null}
-														<span class="group-bundle" title="束">{group.bundle}</span>
-													{/if}
-													<span class="group-meta">
-														{kindLabel(group.kind)}・ペン {group.pens.length} 本
-													</span>
+													↑
 												</button>
-												{#if canWrite}
-													<button
-														type="button"
-														class="icon"
-														aria-label={`${group.name} を上へ`}
-														onclick={() => void moveGroup(group.id, -1)}
-														disabled={busy || index === 0}
-													>
-														↑
-													</button>
-													<button
-														type="button"
-														class="icon"
-														aria-label={`${group.name} を下へ`}
-														onclick={() => void moveGroup(group.id, 1)}
-														disabled={busy || index === groups.length - 1}
-													>
-														↓
-													</button>
-												{/if}
-											</li>
-										{/each}
-									</ul>
-								{/if}
+												<button
+													type="button"
+													class="icon"
+													aria-label={`${group.name} を下へ`}
+													onclick={() => void moveGroup(group.id, 1)}
+													disabled={busy || index === groups.length - 1}
+												>
+													↓
+												</button>
+											{/if}
+										</li>
+									{/each}
+								</ul>
 							{/if}
-						</section>
-					</div>
-				{/snippet}
-				{#snippet titleContent()}
-					<span class="list-selection" data-testid="display-group-selection">
-						{listSelectionLabel}
-					</span>
-				{/snippet}
+						{/if}
+					</section>
+				</div>
+			{/snippet}
+			{#snippet titleContent()}
+				<span class="list-selection" data-testid="display-group-selection">
+					{listSelectionLabel}
+				</span>
+			{/snippet}
 
-				<div class="center-pane" data-testid="display-group-center">
-					{#if selected === null}
-						<p class="note">
-							{canWrite
-								? '左の一覧から表示グループを選ぶか、「表示グループを追加」で作ります。'
-								: '左の一覧から表示グループを選んでください。'}
-						</p>
-					{:else if !draftReady}
-						<p class="loading">読み込み中…</p>
-					{:else}
-						<!--
+			<div class="center-pane" data-testid="display-group-center">
+				{#if selected === null}
+					<p class="note">
+						{canWrite
+							? '左の一覧から表示グループを選ぶか、「表示グループを追加」で作ります。'
+							: '左の一覧から表示グループを選んでください。'}
+					</p>
+				{:else if !draftReady}
+					<p class="loading">読み込み中…</p>
+				{:else}
+					<!--
 							保存・取り消し・未保存の表示・楽観ロックの案内は、どちらのタブでも見える
 							ようタブの外（中央の上）に置く。下書きはグループ単位で一つ。
 						-->
-						<div class="edit-bar">
-							<div class="edit-bar-head">
-								<h3>
-									{selected === 'new' ? '新しい表示グループ' : (selectedGroup?.name ?? '')}
-								</h3>
-								<UnsavedChangesNotice pending={dirty} label={UNSAVED_NOTICE} />
-							</div>
-
-							{#if fieldErrors.revision.length > 0}
-								<p class="load-error" role="alert">
-									{fieldErrors.revision.join(' / ')}
-									<button type="button" onclick={() => void reloadLatest()} disabled={busy}>
-										{reloadingLatest ? '読み込み中…' : '最新の内容を読み込む（入力を破棄）'}
-									</button>
-								</p>
-								{#if latestReloadError !== null}
-									<p class="load-error" role="alert">
-										最新の内容を読み込めませんでした（{latestReloadError}）。入力はそのまま残っています。
-									</p>
-								{/if}
-							{/if}
-
-							{#if errorTabs.settings || errorTabs.pens}
-								<p class="load-error" role="alert" data-testid="display-group-error-tabs">
-									保存できませんでした。
-									{#if errorTabs.settings}
-										<button type="button" onclick={() => setActiveTab('settings')}>設定</button>
-									{/if}
-									{#if errorTabs.settings && errorTabs.pens}と{/if}
-									{#if errorTabs.pens}
-										<button type="button" onclick={() => setActiveTab('pens')}>ペン</button>
-									{/if}
-									タブの入力を確かめてください
-								</p>
-							{/if}
-
-							<div class="apply-band" data-testid="apply-band" data-kind={band.kind}>
-								<span class="apply-text" role="status">{band.text}</span>
-								{#if band.reflect !== null}
-									<button
-										type="button"
-										data-testid="apply-reflect"
-										onclick={() => void reflectToRecording()}
-										disabled={band.reflect.disabled}
-										title={band.reflect.title ?? undefined}
-									>
-										{band.reflect.label}
-									</button>
-								{/if}
-							</div>
-							{#if reflectNotice}
-								<p class="note" role="status">{reflectNotice}</p>
-							{/if}
-							{#if reflectError}
-								<p class="load-error" role="alert">{reflectError}</p>
-							{/if}
-
-							<div class="actions">
-								{#if canWrite}
-									<button type="button" class="primary" onclick={() => void save()} disabled={busy}>
-										{selected === 'new' ? '作成' : '保存'}
-									</button>
-									<button type="button" onclick={discardChanges} disabled={busy || !dirty}>
-										{UNSAVED_DISCARD}
-									</button>
-									{#if selected === 'new'}
-										<button type="button" onclick={cancelNew} disabled={busy}>やめる</button>
-									{/if}
-								{:else}
-									<p class="note">閲覧のみ（編集には編集者以上の権限が必要です）。</p>
-								{/if}
-							</div>
+					<div class="edit-bar">
+						<div class="edit-bar-head">
+							<h3>
+								{selected === 'new' ? '新しい表示グループ' : (selectedGroup?.name ?? '')}
+							</h3>
+							<UnsavedChangesNotice pending={dirty} label={UNSAVED_NOTICE} />
 						</div>
 
-						<div class="view-tabs">
-							<Tabs
-								tabs={viewTabs}
-								bind:value={() => activeTab, setActiveTab}
-								label="表示の切り替え"
-							>
-								{#snippet panel(id)}
-									{#if id === 'pens'}
-										<div class="pens">
-											<div class="pens-head">
-												<span class="pens-title">ペン（{draft.pens.length} / {MAX_PENS}）</span>
-												{#if canWrite}
-													<button
-														type="button"
-														class="secondary"
-														data-testid="display-group-add-tag"
-														onclick={openTagPicker}
-														disabled={busy || tags === null}
-													>
-														タグを追加
-													</button>
-												{/if}
-											</div>
-											{#if tagsError !== null}
-												<p class="load-error" role="alert">
-													タグの一覧を読み込めませんでした（{tagsError}）。
-													<button type="button" onclick={() => void reloadTags()}>再試行</button>
-												</p>
+						{#if fieldErrors.revision.length > 0}
+							<p class="load-error" role="alert">
+								{fieldErrors.revision.join(' / ')}
+								<button type="button" onclick={() => void reloadLatest()} disabled={busy}>
+									{reloadingLatest ? '読み込み中…' : '最新の内容を読み込む（入力を破棄）'}
+								</button>
+							</p>
+							{#if latestReloadError !== null}
+								<p class="load-error" role="alert">
+									最新の内容を読み込めませんでした（{latestReloadError}）。入力はそのまま残っています。
+								</p>
+							{/if}
+						{/if}
+
+						{#if errorTabs.settings || errorTabs.pens}
+							<p class="load-error" role="alert" data-testid="display-group-error-tabs">
+								保存できませんでした。
+								{#if errorTabs.settings}
+									<button type="button" onclick={() => setActiveTab('settings')}>設定</button>
+								{/if}
+								{#if errorTabs.settings && errorTabs.pens}と{/if}
+								{#if errorTabs.pens}
+									<button type="button" onclick={() => setActiveTab('pens')}>ペン</button>
+								{/if}
+								タブの入力を確かめてください
+							</p>
+						{/if}
+
+						<div class="apply-band" data-testid="apply-band" data-kind={band.kind}>
+							<span class="apply-text" role="status">{band.text}</span>
+							{#if band.reflect !== null}
+								<button
+									type="button"
+									data-testid="apply-reflect"
+									onclick={() => void reflectToRecording()}
+									disabled={band.reflect.disabled}
+									title={band.reflect.title ?? undefined}
+								>
+									{band.reflect.label}
+								</button>
+							{/if}
+						</div>
+						{#if reflectNotice}
+							<p class="note" role="status">{reflectNotice}</p>
+						{/if}
+						{#if reflectError}
+							<p class="load-error" role="alert">{reflectError}</p>
+						{/if}
+
+						<div class="actions">
+							{#if canWrite}
+								<button type="button" class="primary" onclick={() => void save()} disabled={busy}>
+									{selected === 'new' ? '作成' : '保存'}
+								</button>
+								<button type="button" onclick={discardChanges} disabled={busy || !dirty}>
+									{UNSAVED_DISCARD}
+								</button>
+								{#if selected === 'new'}
+									<button type="button" onclick={cancelNew} disabled={busy}>やめる</button>
+								{/if}
+							{:else}
+								<p class="note">閲覧のみ（編集には編集者以上の権限が必要です）。</p>
+							{/if}
+						</div>
+					</div>
+
+					<div class="view-tabs">
+						<Tabs tabs={viewTabs} bind:value={() => activeTab, setActiveTab} label="表示の切り替え">
+							{#snippet panel(id)}
+								{#if id === 'pens'}
+									<div class="pens">
+										<div class="pens-head">
+											<span class="pens-title">ペン（{draft.pens.length} / {MAX_PENS}）</span>
+											{#if canWrite}
+												<button
+													type="button"
+													class="secondary"
+													data-testid="display-group-add-tag"
+													onclick={openTagPicker}
+													disabled={busy || tags === null}
+												>
+													タグを追加
+												</button>
 											{/if}
-											{#each fieldErrors.pens as message, i (i)}
-												<p class="field-error">{message}</p>
-											{/each}
-											{#if valuesNoteText !== null}
-												<p class="note values-note" data-testid="pen-values-note" role="status">
-													{valuesNoteText}
-												</p>
-											{/if}
-											{#if draft.pens.length === 0}
-												<p class="note">
-													ペンがありません。{canWrite ? '「タグを追加」でタグを割り当てます。' : ''}
-												</p>
-											{:else}
-												<ol class="pen-list">
-													{#each draft.pens as pen, index (index)}
-														{@const slot = effectiveColorSlot(pen, index)}
-														{#snippet penSummary()}
-															<span
-																class="swatch"
-																style:background={colorSlotVar(slot)}
-																aria-hidden="true"
-															></span>
-															<span class="pen-number">ペン {index + 1}</span>
-															<span class="pen-tag">
-																{pen.hubTag !== null
-																	? pen.hubTag.name
-																	: pen.tagId === null
-																		? 'タグ未選択'
-																		: tagLabel(pen.tagId)}
-																{#if pen.hubTag !== null}
-																	<span class="unreg-badge">未登録（保存で記録に追加）</span>
-																{/if}
-																{#if penApplyStates[index]?.label}
-																	<span
-																		class="apply-badge"
-																		data-testid="pen-apply-state"
-																		data-kind={penApplyStates[index].kind}
-																	>
-																		{penApplyStates[index].label}
-																	</span>
-																{/if}
-															</span>
-															{@const cell = valueCell(
-																// 未登録の Hub のタグは隣のバッジが「未登録」を示すので、品質には重ねない。
-																pen.hubTag === null && pen.tagId !== null
-																	? { kind: 'tag', tagId: pen.tagId }
-																	: { kind: 'none' },
-																tagsById,
-																valuesTable
+										</div>
+										{#if tagsError !== null}
+											<p class="load-error" role="alert">
+												タグの一覧を読み込めませんでした（{tagsError}）。
+												<button type="button" onclick={() => void reloadTags()}>再試行</button>
+											</p>
+										{/if}
+										{#each fieldErrors.pens as message, i (i)}
+											<p class="field-error">{message}</p>
+										{/each}
+										{#if valuesNoteText !== null}
+											<p class="note values-note" data-testid="pen-values-note" role="status">
+												{valuesNoteText}
+											</p>
+										{/if}
+										{#if draft.pens.length === 0}
+											<p class="note">
+												ペンがありません。{canWrite ? '「タグを追加」でタグを割り当てます。' : ''}
+											</p>
+										{:else}
+											<ol class="pen-list">
+												{#each draft.pens as pen, index (index)}
+													{@const slot = effectiveColorSlot(pen, index)}
+													{#snippet penSummary()}
+														<span
+															class="swatch"
+															style:background={colorSlotVar(slot)}
+															aria-hidden="true"
+														></span>
+														<span class="pen-number">ペン {index + 1}</span>
+														<span class="pen-tag">
+															{pen.hubTag !== null
+																? pen.hubTag.name
+																: pen.tagId === null
+																	? 'タグ未選択'
+																	: tagLabel(pen.tagId)}
+															{#if pen.hubTag !== null}
+																<span class="unreg-badge">未登録（保存で記録に追加）</span>
+															{/if}
+															{#if penApplyStates[index]?.label}
+																<span
+																	class="apply-badge"
+																	data-testid="pen-apply-state"
+																	data-kind={penApplyStates[index].kind}
+																>
+																	{penApplyStates[index].label}
+																</span>
+															{/if}
+														</span>
+														{@const cell = valueCell(
+															// 未登録の Hub のタグは隣のバッジが「未登録」を示すので、品質には重ねない。
+															pen.hubTag === null && pen.tagId !== null
+																? { kind: 'tag', tagId: pen.tagId }
+																: { kind: 'none' },
+															tagsById,
+															valuesTable
+														)}
+														<span class="pen-value" data-testid="pen-value" data-state={cell.state}>
+															<span class="pen-value-text">{cell.text}</span>
+															{#if cell.quality !== null}
+																<span class="pen-quality">{cell.quality}</span>
+															{/if}
+														</span>
+														<span
+															class="thresholds"
+															title="しきい値は「記録」ページの「しきい値（記録計の設定）」で変更します"
+														>
+															しきい値: {penThresholdText(
+																pen.tagId,
+																pen.tagId !== null && tagsById.has(pen.tagId),
+																thresholdsByTag,
+																thresholdsError !== null
 															)}
-															<span
-																class="pen-value"
-																data-testid="pen-value"
-																data-state={cell.state}
+														</span>
+													{/snippet}
+													<li class="pen" class:selected={penPaneOpen && selectedPen === index}>
+														{#if canWrite}
+															<button
+																type="button"
+																class="pen-open"
+																data-testid={`display-group-pen-${index + 1}`}
+																aria-current={penPaneOpen && selectedPen === index
+																	? 'true'
+																	: undefined}
+																onclick={() => openPen(index)}
 															>
-																<span class="pen-value-text">{cell.text}</span>
-																{#if cell.quality !== null}
-																	<span class="pen-quality">{cell.quality}</span>
-																{/if}
-															</span>
-															<span
-																class="thresholds"
-																title="しきい値は「記録」ページの「しきい値（記録計の設定）」で変更します"
-															>
-																しきい値: {penThresholdText(
-																	pen.tagId,
-																	pen.tagId !== null && tagsById.has(pen.tagId),
-																	thresholdsByTag,
-																	thresholdsError !== null
-																)}
-															</span>
-														{/snippet}
-														<li class="pen" class:selected={penPaneOpen && selectedPen === index}>
-															{#if canWrite}
+																{@render penSummary()}
+															</button>
+															<span class="pen-actions">
 																<button
 																	type="button"
-																	class="pen-open"
-																	data-testid={`display-group-pen-${index + 1}`}
-																	aria-current={penPaneOpen && selectedPen === index
-																		? 'true'
-																		: undefined}
-																	onclick={() => openPen(index)}
+																	class="icon"
+																	aria-label={`ペン ${index + 1} を上へ`}
+																	onclick={() => movePenAt(index, -1)}
+																	disabled={busy || index === 0}
 																>
-																	{@render penSummary()}
+																	↑
 																</button>
-																<span class="pen-actions">
-																	<button
-																		type="button"
-																		class="icon"
-																		aria-label={`ペン ${index + 1} を上へ`}
-																		onclick={() => movePenAt(index, -1)}
-																		disabled={busy || index === 0}
-																	>
-																		↑
-																	</button>
-																	<button
-																		type="button"
-																		class="icon"
-																		aria-label={`ペン ${index + 1} を下へ`}
-																		onclick={() => movePenAt(index, 1)}
-																		disabled={busy || index === draft.pens.length - 1}
-																	>
-																		↓
-																	</button>
-																	<button
-																		type="button"
-																		class="icon"
-																		aria-label={`ペン ${index + 1} を外す`}
-																		onclick={() => removePenAt(index)}
-																		disabled={busy}
-																	>
-																		×
-																	</button>
-																</span>
-															{:else}
-																<div class="pen-open static">{@render penSummary()}</div>
-															{/if}
-															{#each fieldErrors.penRows[index] ?? [] as message, i (i)}
-																<span class="field-error pen-error">{message}</span>
-															{/each}
-														</li>
-													{/each}
-												</ol>
-											{/if}
-											{#if canWrite && hasHubPens(draft)}
-												{@const target = draft.hubTarget ?? fallbackTarget}
-												<fieldset class="hub-target" disabled={busy} data-testid="hub-target">
-													<legend>Hub から新しく記録するタグの登録先</legend>
-													{#if hubGroups.length > 0}
-														<label class="choice">
-															<input
-																type="radio"
-																name="display-group-hub-target"
-																checked={target.kind === 'existing'}
-																onchange={() => setTargetKind('existing')}
-															/>
-															既存の Hub の収集グループ
-														</label>
-														{#if target.kind === 'existing'}
-															<select
-																aria-label="登録先の収集グループ"
-																value={target.collectionGroupId === null
-																	? ''
-																	: String(target.collectionGroupId)}
-																onchange={(e) => setTargetGroup(e.currentTarget.value)}
-															>
-																{#each hubGroups as hubGroup (hubGroup.id)}
-																	<option value={String(hubGroup.id)}>{hubGroup.name}</option>
-																{/each}
-															</select>
+																<button
+																	type="button"
+																	class="icon"
+																	aria-label={`ペン ${index + 1} を下へ`}
+																	onclick={() => movePenAt(index, 1)}
+																	disabled={busy || index === draft.pens.length - 1}
+																>
+																	↓
+																</button>
+																<button
+																	type="button"
+																	class="icon"
+																	aria-label={`ペン ${index + 1} を外す`}
+																	onclick={() => removePenAt(index)}
+																	disabled={busy}
+																>
+																	×
+																</button>
+															</span>
+														{:else}
+															<div class="pen-open static">{@render penSummary()}</div>
 														{/if}
-													{/if}
+														{#each fieldErrors.penRows[index] ?? [] as message, i (i)}
+															<span class="field-error pen-error">{message}</span>
+														{/each}
+													</li>
+												{/each}
+											</ol>
+										{/if}
+										{#if canWrite && hasHubPens(draft)}
+											{@const target = draft.hubTarget ?? fallbackTarget}
+											<fieldset class="hub-target" disabled={busy} data-testid="hub-target">
+												<legend>Hub から新しく記録するタグの登録先</legend>
+												{#if hubGroups.length > 0}
 													<label class="choice">
 														<input
 															type="radio"
 															name="display-group-hub-target"
-															checked={target.kind === 'new'}
-															onchange={() => setTargetKind('new')}
+															checked={target.kind === 'existing'}
+															onchange={() => setTargetKind('existing')}
 														/>
-														新しい収集グループを作る{hubGroups.length === 0
-															? '（Hub 接続も作成します）'
-															: ''}
+														既存の Hub の収集グループ
 													</label>
-													{#if target.kind === 'new'}
-														<div class="new-group">
-															<label class="field">
-																<span>名前</span>
-																<input
-																	type="text"
-																	maxlength="100"
-																	value={target.name}
-																	oninput={(e) => setTargetName(e.currentTarget.value)}
-																/>
-															</label>
-															<label class="field">
-																<span>収集周期</span>
-																<select
-																	value={target.periodMs}
-																	onchange={(e) => setTargetPeriod(e.currentTarget.value)}
-																>
-																	{#each periodOptions as option (option.value)}
-																		<option value={option.value}>{option.label}</option>
-																	{/each}
-																</select>
-															</label>
-														</div>
+													{#if target.kind === 'existing'}
+														<select
+															aria-label="登録先の収集グループ"
+															value={target.collectionGroupId === null
+																? ''
+																: String(target.collectionGroupId)}
+															onchange={(e) => setTargetGroup(e.currentTarget.value)}
+														>
+															{#each hubGroups as hubGroup (hubGroup.id)}
+																<option value={String(hubGroup.id)}>{hubGroup.name}</option>
+															{/each}
+														</select>
 													{/if}
-													{#each fieldErrors.hubTagGroup as message, i (i)}
-														<p class="field-error">{message}</p>
-													{/each}
-												</fieldset>
-											{/if}
-											<p class="note">しきい値はタグの設定で、ここでは確認だけできます。</p>
+												{/if}
+												<label class="choice">
+													<input
+														type="radio"
+														name="display-group-hub-target"
+														checked={target.kind === 'new'}
+														onchange={() => setTargetKind('new')}
+													/>
+													新しい収集グループを作る{hubGroups.length === 0
+														? '（Hub 接続も作成します）'
+														: ''}
+												</label>
+												{#if target.kind === 'new'}
+													<div class="new-group">
+														<label class="field">
+															<span>名前</span>
+															<input
+																type="text"
+																maxlength="100"
+																value={target.name}
+																oninput={(e) => setTargetName(e.currentTarget.value)}
+															/>
+														</label>
+														<label class="field">
+															<span>収集周期</span>
+															<select
+																value={target.periodMs}
+																onchange={(e) => setTargetPeriod(e.currentTarget.value)}
+															>
+																{#each periodOptions as option (option.value)}
+																	<option value={option.value}>{option.label}</option>
+																{/each}
+															</select>
+														</label>
+													</div>
+												{/if}
+												{#each fieldErrors.hubTagGroup as message, i (i)}
+													<p class="field-error">{message}</p>
+												{/each}
+											</fieldset>
+										{/if}
+										<p class="note">しきい値はタグの設定で、ここでは確認だけできます。</p>
+									</div>
+								{:else}
+									<fieldset class="editor" disabled={!canWrite || busy}>
+										<label class="field">
+											<span>名前</span>
+											<input type="text" maxlength="100" bind:value={draft.name} />
+											{#each fieldErrors.name as message, i (i)}
+												<span class="field-error">{message}</span>
+											{/each}
+										</label>
+
+										<div class="field">
+											<label for="group-bundle-input">束（任意）</label>
+											<input
+												id="group-bundle-input"
+												aria-describedby="group-bundle-note"
+												type="text"
+												maxlength={MAX_BUNDLE_CHARS}
+												list="group-bundle-names"
+												bind:value={draft.bundle}
+											/>
+											<datalist id="group-bundle-names">
+												{#each bundleNames as bundle (bundle)}
+													<option value={bundle}></option>
+												{/each}
+											</datalist>
+											<span class="note" id="group-bundle-note">
+												同じ名前の束を付けたグループは、監視画面で 1 つの束にまとまります。
+											</span>
+											{#each fieldErrors.bundle as message, i (i)}
+												<span class="field-error">{message}</span>
+											{/each}
 										</div>
-									{:else}
-										<fieldset class="editor" disabled={!canWrite || busy}>
-											<label class="field">
-												<span>名前</span>
-												<input type="text" maxlength="100" bind:value={draft.name} />
-												{#each fieldErrors.name as message, i (i)}
-													<span class="field-error">{message}</span>
-												{/each}
-											</label>
 
-											<div class="field">
-												<label for="group-bundle-input">束（任意）</label>
-												<input
-													id="group-bundle-input"
-													aria-describedby="group-bundle-note"
-													type="text"
-													maxlength={MAX_BUNDLE_CHARS}
-													list="group-bundle-names"
-													bind:value={draft.bundle}
-												/>
-												<datalist id="group-bundle-names">
-													{#each bundleNames as bundle (bundle)}
-														<option value={bundle}></option>
-													{/each}
-												</datalist>
-												<span class="note" id="group-bundle-note">
-													同じ名前の束を付けたグループは、監視画面で 1 つの束にまとまります。
-												</span>
-												{#each fieldErrors.bundle as message, i (i)}
-													<span class="field-error">{message}</span>
+										<label class="field">
+											<span>表示種別</span>
+											<select
+												value={draft.kind}
+												onchange={(e) => setKind(e.currentTarget.value as DisplayKind)}
+											>
+												{#each KIND_OPTIONS as option (option.value)}
+													<option value={option.value}>{option.label}</option>
 												{/each}
-											</div>
+											</select>
+											{#each fieldErrors.kind as message, i (i)}
+												<span class="field-error">{message}</span>
+											{/each}
+										</label>
 
+										{#if draft.kind === 'trend'}
 											<label class="field">
-												<span>表示種別</span>
+												<span>既定の時間窓</span>
 												<select
-													value={draft.kind}
-													onchange={(e) => setKind(e.currentTarget.value as DisplayKind)}
+													value={String(draft.timeWindowSec)}
+													onchange={(e) => (draft.timeWindowSec = Number(e.currentTarget.value))}
 												>
-													{#each KIND_OPTIONS as option (option.value)}
-														<option value={option.value}>{option.label}</option>
+													{#each TIME_WINDOW_OPTIONS as option (option.value)}
+														<option value={String(option.value)}>{option.label}</option>
 													{/each}
 												</select>
-												{#each fieldErrors.kind as message, i (i)}
+												{#each fieldErrors.timeWindowSec as message, i (i)}
 													<span class="field-error">{message}</span>
 												{/each}
 											</label>
-
-											{#if draft.kind === 'trend'}
-												<label class="field">
-													<span>既定の時間窓</span>
-													<select
-														value={String(draft.timeWindowSec)}
-														onchange={(e) => (draft.timeWindowSec = Number(e.currentTarget.value))}
-													>
-														{#each TIME_WINDOW_OPTIONS as option (option.value)}
-															<option value={String(option.value)}>{option.label}</option>
-														{/each}
-													</select>
-													{#each fieldErrors.timeWindowSec as message, i (i)}
-														<span class="field-error">{message}</span>
-													{/each}
-												</label>
-											{/if}
-										</fieldset>
-										{#if canWrite && typeof selected === 'number'}
-											<div class="actions">
-												<button
-													type="button"
-													class="danger"
-													onclick={() => void remove()}
-													disabled={busy}
-												>
-													削除
-												</button>
-											</div>
 										{/if}
+									</fieldset>
+									{#if canWrite && typeof selected === 'number'}
+										<div class="actions">
+											<button
+												type="button"
+												class="danger"
+												onclick={() => void remove()}
+												disabled={busy}
+											>
+												削除
+											</button>
+										</div>
 									{/if}
-								{/snippet}
-							</Tabs>
-						</div>
-					{/if}
-				</div>
-			</ThreePaneLayout>
-		</div>
-	{/if}
+								{/if}
+							{/snippet}
+						</Tabs>
+					</div>
+				{/if}
+			</div>
+		</ThreePaneLayout>
+	</div>
 </div>
 
 <style>

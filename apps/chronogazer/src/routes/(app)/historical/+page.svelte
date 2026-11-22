@@ -32,10 +32,8 @@
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { canWriteResources } from '#lib/permissions.js';
 	import { resolveAppPath } from '#lib/navigation.js';
-	import { getCollectHistory, isCollectAvailable } from '#lib/banto/collectAdmin.js';
+	import { getCollectHistory } from '#lib/banto/collectAdmin.js';
 	import {
-		DEMO_MODE_MESSAGE,
-		isTagRegistryAvailable,
 		listCollectionGroups,
 		listTags,
 		type CollectionGroup,
@@ -86,7 +84,6 @@
 	} from '#lib/historical/historyLogic.js';
 	import { toTrendPens } from '#lib/monitor/trendPens.js';
 
-	const available = isTagRegistryAvailable() && isCollectAvailable();
 	const canEdit = $derived(canWriteResources(sessionStore.role) && !sessionStore.publicViewer);
 
 	// --- URL（グループ・期間）と表示範囲 ------------------------------------------
@@ -322,7 +319,7 @@
 	$effect(() => {
 		const key = requestKey;
 		void retryToken;
-		if (key === null || !available) {
+		if (key === null) {
 			untrack(() => (loading = false));
 			return;
 		}
@@ -375,7 +372,6 @@
 	);
 
 	onMount(() => {
-		if (!available) return;
 		void reload();
 		const timer = setInterval(() => (now = Date.now()), 30_000);
 		return () => {
@@ -391,11 +387,7 @@
 		<h2>ヒストリカル</h2>
 	</div>
 
-	{#if !available}
-		<div class="empty-state">
-			<p class="empty-message">{DEMO_MODE_MESSAGE}</p>
-		</div>
-	{:else if groups === null && displayGroupCatalog.error !== null}
+	{#if groups === null && displayGroupCatalog.error !== null}
 		<div class="empty-state" role="alert">
 			<p class="empty-message">表示グループを読み込めませんでした</p>
 			<p class="empty-hint">{displayGroupCatalog.error}</p>

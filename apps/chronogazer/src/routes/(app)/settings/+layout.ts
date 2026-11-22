@@ -1,7 +1,5 @@
 import { isAdmin } from '#lib/permissions.js';
 import { getBantoMode, isTauri } from '#lib/banto/setup.js';
-import { isAuditLogAvailable } from '#lib/banto/auditLogAdmin.js';
-import { isBackupsAvailable } from '#lib/banto/backupsAdmin.js';
 import { sessionStore } from '#lib/session.svelte.js';
 import { authSettingsStore } from './authSettingsStore.svelte';
 import { canManageAuthMode, errorMessage } from './shared';
@@ -22,9 +20,8 @@ import { SETTINGS_CATEGORIES, type SettingsCategoryId } from './categories';
  *   section だけが `tauri && isAdmin` だが、カテゴリ自体はアカウント
  *   section があるので常に可視）。
  * - `connectivity`: 元「LANアクセス」section の `isAdmin(sessionStore.role)`。
- * - `data`: 元「監査ログの保持ポリシー」`auditAvailable && isAdmin` と
- *   「バックアップ/リストア」`backupsAvailable && isAdmin` の OR
- *   （どちらか一方でも見えれば data カテゴリ自体は可視）。
+ * - `data`: 元「監査ログの保持ポリシー」「バックアップ/リストア」はどちらも
+ *   `isAdmin`（旧 demo の可用性の条件は無くした）。
  * - `security`: 元「認証」section の `tauri && canManageAuthMode`
  *   （`canManageAuthMode` は `shared.ts` 参照）。#392 B2-2 で、サービスの host
  *   （`chronogazer-server`）の HTTP の画面（`server` モード）でも admin なら出す:
@@ -86,7 +83,7 @@ export async function load({ parent }) {
 		appearance: true,
 		account: true,
 		connectivity: admin,
-		data: admin && (isAuditLogAvailable() || isBackupsAvailable()),
+		data: admin,
 		security: (tauri && canManageAuthMode()) || (server && admin && localGrantSupported),
 		hub: admin,
 		collect: true,

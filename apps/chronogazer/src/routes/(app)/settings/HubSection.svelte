@@ -67,7 +67,6 @@
 		hubTimeLabel,
 		HUB_UI_REREAD_TIMEOUT_MS,
 		HUB_UI_TIMEOUT_MS,
-		isHubAvailable,
 		isPollGenerationCurrent,
 		isPollResultFresh,
 		isSubscriptionStale,
@@ -93,8 +92,6 @@
 	import { guardUnsavedChanges, UNSAVED_NOTICE } from '#lib/unsavedChanges.js';
 	import { errorMessage } from './shared';
 	import { resolveAppPath } from '#lib/navigation.js';
-
-	const available = isHubAvailable();
 
 	/** 購読状態のポーリング間隔（ms）。ネットワークを伴わない読み取り。 */
 	const SUBSCRIPTION_POLL_MS = 2000;
@@ -213,11 +210,10 @@
 	 * 数えていた。P4 で選択はこの画面から外した。）
 	 */
 	const unsavedInput = $derived(
-		available &&
-			// 入力欄が**見えている間だけ**数える。隠れた欄の下書きは、利用者から見えず
-			// 取り消す手段も無いので、数えると消せない「未保存」になる（#520 のレビュー
-			// P2）。加えて、接続・切断の成功で欄が消えるときは下書きも空にする。
-			((manualKeyShown && manualKeyDraft !== '') || endpointDraft.trim() !== (serverEndpoint ?? ''))
+		// 入力欄が**見えている間だけ**数える。隠れた欄の下書きは、利用者から見えず
+		// 取り消す手段も無いので、数えると消せない「未保存」になる（#520 のレビュー
+		// P2）。加えて、接続・切断の成功で欄が消えるときは下書きも空にする。
+		(manualKeyShown && manualKeyDraft !== '') || endpointDraft.trim() !== (serverEndpoint ?? '')
 	);
 	/**
 	 * 登録済みの Hub タグと、その現在値（読み取り専用、#383 段階3 P4）。値は
@@ -425,7 +421,6 @@
 	 * が入れ替わるたびに評価し直すので、間隔の経過もそこで拾う。
 	 */
 	$effect(() => {
-		if (!available) return;
 		const current = subscription;
 		if (busy) return;
 		untrack(() => void recheckStaleStatus(current, false));
@@ -456,7 +451,6 @@
 	}
 
 	$effect(() => {
-		if (!available) return;
 		void run(async (signal) => {
 			const view = await getHubStatus(signal);
 			if (signal.aborted) return;
@@ -618,7 +612,7 @@
 	 * 購読ブロックが最初の周期まで出ない。
 	 */
 	function startPolling(): void {
-		if (!available || polling) return;
+		if (polling) return;
 		polling = true;
 		void pollThenSchedule(pollGeneration);
 	}
@@ -633,7 +627,6 @@
 	}
 
 	onMount(() => {
-		if (!available) return;
 		document.addEventListener('visibilitychange', onVisibilityChange);
 		if (document.visibilityState === 'visible') startPolling();
 	});
@@ -650,75 +643,70 @@
 	<section>
 		<h2>Hub接続</h2>
 
-		{#if available}
-			<div class="server-fields">
-				<label class="field hub-endpoint">
-					接続先URL
-					<input
-						type="url"
-						placeholder="https://127.0.0.1:8723"
-						bind:value={endpointDraft}
-						disabled={busy}
-					/>
-				</label>
-			</div>
+		<div class="server-fields">
+			<label class="field hub-endpoint">
+				接続先URL
+				<input
+					type="url"
+					placeholder="https://127.0.0.1:8723"
+					bind:value={endpointDraft}
+					disabled={busy}
+				/>
+			</label>
+		</div>
 
-			<!--
+		<!--
 				オーナーレビュー P2-1: 状態を再確認できていない間は「接続」も止める。
 				打ち切った `connect` がまだ走っているかもしれない状態で押し直せると、
 				Hub 側にキーを二重に発行しうる。
 			-->
-			<button
-				type="button"
-				onclick={connect}
-				disabled={busy || statusUnconfirmed || endpointDraft.trim() === ''}
-			>
-				接続
-			</button>
-			<UnsavedChangesNotice pending={unsavedInput} label={UNSAVED_NOTICE} />
+		<button
+			type="button"
+			onclick={connect}
+			disabled={busy || statusUnconfirmed || endpointDraft.trim() === ''}
+		>
+			接続
+		</button>
+		<UnsavedChangesNotice pending={unsavedInput} label={UNSAVED_NOTICE} />
 
-			<p class="status">
-				状態: <strong>{statusDisplay.label}</strong>
-			</p>
-			<p class="note">{statusDisplay.detail}</p>
-			{#if endpointProblem}
-				<p class="error" role="status">{endpointProblem}</p>
+		<p class="status">
+			状態: <strong>{statusDisplay.label}</strong>
+		</p>
+		<p class="note">{statusDisplay.detail}</p>
+		{#if endpointProblem}
+			<p class="error" role="status">{endpointProblem}</p>
+		{/if}
+		<!-- ライブ領域は常に描き、中身だけを出し入れする（初回描画の role="status" は読み上げられないことがある。#1149 のレビュー P2） -->
+		<div class="tls-warnings-region" role="status">
+			{#if tlsWarnings.length > 0}
+				<p class="tls-warnings-lead">同じ PC の Hub の証明書について:</p>
+				<ul class="tls-warnings">
+					{#each tlsWarnings as warning, i (i)}
+						<li>{warning}</li>
+					{/each}
+				</ul>
 			{/if}
-			<!-- ライブ領域は常に描き、中身だけを出し入れする（初回描画の role="status" は読み上げられないことがある。#1149 のレビュー P2） -->
-			<div class="tls-warnings-region" role="status">
-				{#if tlsWarnings.length > 0}
-					<p class="tls-warnings-lead">同じ PC の Hub の証明書について:</p>
-					<ul class="tls-warnings">
-						{#each tlsWarnings as warning, i (i)}
-							<li>{warning}</li>
-						{/each}
-					</ul>
-				{/if}
-			</div>
-			{#if showStatusRecheckButton(statusDisplay, status, configured)}
-				<!--
+		</div>
+		{#if showStatusRecheckButton(statusDisplay, status, configured)}
+			<!--
 					#449 再レビュー P2 / 3 回目のレビュー: 取り直しに失敗した、または
 					Hub に到達できないときは、読み取り専用の再取得を出す（`status()` は
 					読み取りだけで、キーを発行しない）。
 				-->
-				<button
-					type="button"
-					onclick={() => recheckStaleStatus(subscription, true)}
-					disabled={busy}
-				>
-					状態を再取得
-				</button>
-			{/if}
+			<button type="button" onclick={() => recheckStaleStatus(subscription, true)} disabled={busy}>
+				状態を再取得
+			</button>
+		{/if}
 
-			{#if keyName}
-				<p class="note">このアプリのAPIキー名: <code>{keyName}</code></p>
-			{/if}
+		{#if keyName}
+			<p class="note">このアプリのAPIキー名: <code>{keyName}</code></p>
+		{/if}
 
-			{#if hubError}
-				<p class="error">{hubError}</p>
-			{/if}
+		{#if hubError}
+			<p class="error">{hubError}</p>
+		{/if}
 
-			<!--
+		<!--
 				オーナーレビュー P2-1: 打ち切りのあと状態も読み直せなかったときは、
 				警告を出すだけでなく**接続先に依存する変更操作を止める**。警告は
 				`hubError` とは別に持つ（`run()` が冒頭で `hubError` を消すので、
@@ -726,181 +714,176 @@
 				**画面全体は操作不能にしない** - 読み取り専用の「状態を再取得」で
 				必ず抜けられる。
 			-->
-			{#if statusUnconfirmedNotice}
-				<p class="note status-unconfirmed" role="status">{statusUnconfirmedNotice}</p>
-			{/if}
-			{#if statusUnconfirmed}
-				<div class="hub-actions">
-					<button type="button" onclick={reconfirmStatus} disabled={busy}>状態を再取得</button>
-				</div>
-			{/if}
+		{#if statusUnconfirmedNotice}
+			<p class="note status-unconfirmed" role="status">{statusUnconfirmedNotice}</p>
+		{/if}
+		{#if statusUnconfirmed}
+			<div class="hub-actions">
+				<button type="button" onclick={reconfirmStatus} disabled={busy}>状態を再取得</button>
+			</div>
+		{/if}
 
-			{#if manualKeyShown}
-				<div class="server-fields">
-					<label class="field hub-endpoint">
-						APIキー（Hubの管理画面で発行したもの）
-						<input type="password" autocomplete="off" bind:value={manualKeyDraft} disabled={busy} />
-					</label>
-				</div>
-				<!--
+		{#if manualKeyShown}
+			<div class="server-fields">
+				<label class="field hub-endpoint">
+					APIキー（Hubの管理画面で発行したもの）
+					<input type="password" autocomplete="off" bind:value={manualKeyDraft} disabled={busy} />
+				</label>
+			</div>
+			<!--
 					「接続」と同じ理由で、状態を再確認できていない間は採用も止める
 					（打ち切った採用がまだ走っていれば、押し直しはキーの二重発行）。
 				-->
-				<button
-					type="button"
-					onclick={adopt}
-					disabled={busy ||
-						statusUnconfirmed ||
-						manualKeyDraft.trim() === '' ||
-						endpointDraft.trim() === ''}
-				>
-					このキーを採用
+			<button
+				type="button"
+				onclick={adopt}
+				disabled={busy ||
+					statusUnconfirmed ||
+					manualKeyDraft.trim() === '' ||
+					endpointDraft.trim() === ''}
+			>
+				このキーを採用
+			</button>
+		{/if}
+
+		{#if status.state === 'connected'}
+			<div class="hub-actions">
+				<button type="button" onclick={refresh} disabled={busy || statusUnconfirmed}>
+					一覧を更新
 				</button>
+			</div>
+			{#if tags}
+				<p class="note">Hubのタグ: {tags.length}件</p>
 			{/if}
+		{/if}
 
-			{#if status.state === 'connected'}
-				<div class="hub-actions">
-					<button type="button" onclick={refresh} disabled={busy || statusUnconfirmed}>
-						一覧を更新
-					</button>
-				</div>
-				{#if tags}
-					<p class="note">Hubのタグ: {tags.length}件</p>
-				{/if}
-			{/if}
-
-			{#if subscription}
-				<h3 class="hub-subheading">購読</h3>
-				<p class="status">
-					購読: <strong>{hubSubscriptionHeadline(subscription.state, subscriptionStale)}</strong>
-				</p>
-				<!--
+		{#if subscription}
+			<h3 class="hub-subheading">購読</h3>
+			<p class="status">
+				購読: <strong>{hubSubscriptionHeadline(subscription.state, subscriptionStale)}</strong>
+			</p>
+			<!--
 					レビュー P2-A: ポーリングが 2 回連続で失敗したら、この表示が
 					今の状態ではないと言う。トーストは出さない（明示操作の
 					エラー表示を上書きしない）ので、このブロックの中で示す。
 					値の表は消さない - 消すと「0 件」に潰れて別の嘘になる。
 				-->
-				{#if subscriptionStale}
-					<p class="note poll-stale" role="status">{hubPollStaleNote(lastPolledAt)}</p>
-				{/if}
-				<p class="note">{hubSubscriptionDetail(subscription, statusDisplay.guidance)}</p>
-				{#if credentialGuidanceLine}
-					<p class="note hub-credential-guidance" role="status">{credentialGuidanceLine}</p>
-				{/if}
-				<!--
+			{#if subscriptionStale}
+				<p class="note poll-stale" role="status">{hubPollStaleNote(lastPolledAt)}</p>
+			{/if}
+			<p class="note">{hubSubscriptionDetail(subscription, statusDisplay.guidance)}</p>
+			{#if credentialGuidanceLine}
+				<p class="note hub-credential-guidance" role="status">{credentialGuidanceLine}</p>
+			{/if}
+			<!--
 					購読全体の最終受信時刻。値の表の行ごとの `t` は
 					「この行がいつの値か」であって、購読が生きているかの
 					目安にはならないので別に出す。
 				-->
-				<p class="note">
-					最終受信: {hubLastValueLabel(subscription.lastValueAt, subscription.state)}
-				</p>
+			<p class="note">
+				最終受信: {hubLastValueLabel(subscription.lastValueAt, subscription.state)}
+			</p>
 
-				<!--
+			<!--
 					`hubSubscriptionDetail` が「停止（エラー: …）」としてエラーを
 					すでに述べている場合だけ、この行を省く（同じことを 2 行続けて
 					読ませない）。それ以外では、説明文の補足として型名を出す。
 				-->
-				{#if subscription.lastError && showLastErrorLine}
-					<p class="note">直近のエラー: <code>{subscription.lastError}</code></p>
-				{/if}
+			{#if subscription.lastError && showLastErrorLine}
+				<p class="note">直近のエラー: <code>{subscription.lastError}</code></p>
+			{/if}
 
-				{#if subscription.unresolved.length > 0}
-					<p class="note">
-						次のタグは見つかりませんでした（Hubから消えたか、権限で見えないタグです）。{hubRemainderNote(
-							subscription.subscribedCount
-						)}
-					</p>
-					<ul class="hub-unresolved">
-						{#each subscription.unresolved as name (name)}
-							<li><span class="hub-tag-name">{name}</span></li>
-						{/each}
-					</ul>
-				{/if}
+			{#if subscription.unresolved.length > 0}
+				<p class="note">
+					次のタグは見つかりませんでした（Hubから消えたか、権限で見えないタグです）。{hubRemainderNote(
+						subscription.subscribedCount
+					)}
+				</p>
+				<ul class="hub-unresolved">
+					{#each subscription.unresolved as name (name)}
+						<li><span class="hub-tag-name">{name}</span></li>
+					{/each}
+				</ul>
+			{/if}
 
-				<!--
+			<!--
 					「購読できないタグ」は「Hubから消えた」とは理由も直し方も
 					違う（Hub側のタグ定義を直す vs Hubにタグを戻す）ので、同じ
 					一覧に混ぜない。
 				-->
-				{#if subscription.unsupported.length > 0}
-					<p class="note">
-						次のタグはそのままでは購読できません（名前にカンマを含む、他のタグと同じタグを指しているなど）。Hub側のタグ定義を確認してください。{hubRemainderNote(
-							subscription.subscribedCount
-						)}
-					</p>
-					<ul class="hub-unresolved">
-						{#each subscription.unsupported as name (name)}
-							<li><span class="hub-tag-name">{name}</span></li>
-						{/each}
-					</ul>
-				{/if}
+			{#if subscription.unsupported.length > 0}
+				<p class="note">
+					次のタグはそのままでは購読できません（名前にカンマを含む、他のタグと同じタグを指しているなど）。Hub側のタグ定義を確認してください。{hubRemainderNote(
+						subscription.subscribedCount
+					)}
+				</p>
+				<ul class="hub-unresolved">
+					{#each subscription.unsupported as name (name)}
+						<li><span class="hub-tag-name">{name}</span></li>
+					{/each}
+				</ul>
+			{/if}
 
-				<!--
+			<!--
 					#383 段階3 P4: 購読するタグはこの画面では選ばない。「記録」で登録した
 					Hub 経由のタグ（「Hub から追加」）を、収集の有無に関わらず購読する。
 				-->
-				<h3 class="hub-subheading">登録済みのHubタグ</h3>
-				<p class="note">
-					購読するのは<a href={resolveAppPath('/tags')}>記録</a>の「Hub
-					から追加」で登録したタグです（収集していなくても購読し、ここに現在値を出します）。登録を変えると購読を張り直すため、収集中は数周期のあいだ
-					Hub 経由のタグが不良（Bad）になり、切断・再接続のイベントが記録されます。「記録」で Hub
-					接続を無効にしている間は、その接続のタグを購読しません。
-				</p>
-				{#if legacySelection.length > 0}
-					<p class="note legacy-selection" role="status">
-						以前この画面で選んでいたタグが{legacySelection.length}件あります。今は購読していません。「記録」の「Hub
-						から追加」を開くと、あらかじめチェックされます（登録するか「以前の選択を使わない」で消えます）。
-					</p>
-				{/if}
-				{#if registeredRows.length > 0}
-					<table class="hub-values" aria-label="登録済みのHubタグ">
-						<thead>
-							<tr>
-								<th scope="col">タグ</th>
-								<th scope="col">値</th>
-								<th scope="col">品質</th>
-								<th scope="col">時刻</th>
-							</tr>
-						</thead>
-						<tbody>
-							{#each registeredRows as row (row.name)}
-								<tr>
-									<td class="hub-tag-name">{row.name}</td>
-									<td>{row.value?.v ?? '—'}</td>
-									<td>{row.value?.q ?? '—'}</td>
-									<td>{row.value ? hubTimeLabel(row.value.t) : '—'}</td>
-								</tr>
-							{/each}
-						</tbody>
-					</table>
-					{#if subscription.values.length === 0}
-						<p class="note">値を受信していません。</p>
-					{/if}
-				{:else}
-					<p class="note">Hub経由のタグはまだ登録されていません。</p>
-				{/if}
-			{/if}
-
-			{#if configured}
-				<div class="hub-actions">
-					<button type="button" onclick={disconnect} disabled={busy || statusUnconfirmed}>
-						切断
-					</button>
-				</div>
-				<p class="note">
-					「切断」はこのアプリの設定と保存済みAPIキーだけを削除します。Hub側のAPIキーは失効しません（必要ならHubの管理画面で失効させてください）。
-				</p>
-			{/if}
-
+			<h3 class="hub-subheading">登録済みのHubタグ</h3>
 			<p class="note">
-				Hubが試運転モード（ロックダウン前）なら、読み取り専用のAPIキーを自動で発行して安全に保管します。試運転モードのHubは同じPC上でしか待ち受けないため、この自動発行は同一PCに限られます。ロックダウン済みのHubには自動発行せず、管理者が発行したAPIキーの手入力に切り替わります。
+				購読するのは<a href={resolveAppPath('/tags')}>記録</a>の「Hub
+				から追加」で登録したタグです（収集していなくても購読し、ここに現在値を出します）。登録を変えると購読を張り直すため、収集中は数周期のあいだ
+				Hub 経由のタグが不良（Bad）になり、切断・再接続のイベントが記録されます。「記録」で Hub
+				接続を無効にしている間は、その接続のタグを購読しません。
 			</p>
-		{:else}
+			{#if legacySelection.length > 0}
+				<p class="note legacy-selection" role="status">
+					以前この画面で選んでいたタグが{legacySelection.length}件あります。今は購読していません。「記録」の「Hub
+					から追加」を開くと、あらかじめチェックされます（登録するか「以前の選択を使わない」で消えます）。
+				</p>
+			{/if}
+			{#if registeredRows.length > 0}
+				<table class="hub-values" aria-label="登録済みのHubタグ">
+					<thead>
+						<tr>
+							<th scope="col">タグ</th>
+							<th scope="col">値</th>
+							<th scope="col">品質</th>
+							<th scope="col">時刻</th>
+						</tr>
+					</thead>
+					<tbody>
+						{#each registeredRows as row (row.name)}
+							<tr>
+								<td class="hub-tag-name">{row.name}</td>
+								<td>{row.value?.v ?? '—'}</td>
+								<td>{row.value?.q ?? '—'}</td>
+								<td>{row.value ? hubTimeLabel(row.value.t) : '—'}</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+				{#if subscription.values.length === 0}
+					<p class="note">値を受信していません。</p>
+				{/if}
+			{:else}
+				<p class="note">Hub経由のタグはまだ登録されていません。</p>
+			{/if}
+		{/if}
+
+		{#if configured}
+			<div class="hub-actions">
+				<button type="button" onclick={disconnect} disabled={busy || statusUnconfirmed}>
+					切断
+				</button>
+			</div>
 			<p class="note">
-				Hub接続はデスクトップアプリ、またはデスクトップアプリが公開しているLANサーバー経由でのみ設定できます。
+				「切断」はこのアプリの設定と保存済みAPIキーだけを削除します。Hub側のAPIキーは失効しません（必要ならHubの管理画面で失効させてください）。
 			</p>
 		{/if}
+
+		<p class="note">
+			Hubが試運転モード（ロックダウン前）なら、読み取り専用のAPIキーを自動で発行して安全に保管します。試運転モードのHubは同じPC上でしか待ち受けないため、この自動発行は同一PCに限られます。ロックダウン済みのHubには自動発行せず、管理者が発行したAPIキーの手入力に切り替わります。
+		</p>
 	</section>
 {/if}
 

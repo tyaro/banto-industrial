@@ -19,7 +19,6 @@
 	import { buildCommands, loadRecentCommandIds, recordRecentCommand } from '#lib/commands.js';
 	import { commandPaletteStore } from '#lib/commandPalette.svelte.js';
 	import { displayGroupCatalog } from '#lib/monitor/displayGroupCatalog.svelte.js';
-	import { isTagRegistryAvailable } from '#lib/banto/tagRegistryAdmin.js';
 
 	// R1-D: 表示グループの「グループ: ◯◯ を表示」は一覧に追従させる（開いて
 	// いる間に一覧が読めたら、その場で足す）。一覧は監視画面と共有の
@@ -27,7 +26,7 @@
 	// 出す）。読めなくてもパレットは使える - グループのコマンドが出ないだけ
 	// （前に読めた一覧があればそれを使う）。
 	const commands = $derived(buildCommands(displayGroupCatalog.groups ?? []));
-	if (isTagRegistryAvailable()) void displayGroupCatalog.refresh();
+	void displayGroupCatalog.refresh();
 	// Read once per mount (i.e. once per open) - recency only needs to reflect
 	// what was true when the palette opened.
 	const recentIds = loadRecentCommandIds();

@@ -9,11 +9,6 @@
  * API キーの保存先も 1 つしかない（#392 B2-4b からは OS キーリングではなく、
  * データのルートの `secrets\hub-keys` にある DPAPI のファイル）。
  *
- * プレーンな `vite dev`/`vite preview`（Rust backend 無し）では Hub 接続を
- * 保持する場所そのものが無いため、すべて `DEMO_MODE_MESSAGE` で reject
- * する（`backupsAdmin.ts` の `isBackupsAvailable()`/`demoModeError()` と
- * 同じ作法）。
- *
  * **平文の API キーはこの層を一方向にしか通らない**: `adoptHubKey` の引数
  * として送るだけで、応答型（[`HubView`]）にキーを含むフィールドは無い。
  */
@@ -161,17 +156,6 @@ export interface HubSubscription {
 	tlsWarnings?: string[];
 }
 
-export const DEMO_MODE_MESSAGE = 'デモモードでは利用できません';
-
-function demoModeError(): ProviderError {
-	return new ProviderError({ kind: 'other', message: DEMO_MODE_MESSAGE });
-}
-
-/** Is this environment backed by a real Hub bootstrap (Tauri or the embedded server)? */
-export function isHubAvailable(): boolean {
-	return getBantoMode() !== 'demo';
-}
-
 const ERROR_KINDS = new Set([
 	'not_found',
 	'validation',
@@ -275,7 +259,6 @@ async function httpJson<T>(path: string, init: HttpJsonInit): Promise<T> {
  * 全体の上限については [`HUB_UI_TIMEOUT_MS`] を参照。
  */
 export async function getHubStatus(signal?: AbortSignal): Promise<HubView> {
-	if (!isHubAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<HubView>('hub_status');
 	return httpJson<HubView>('/api/hub', { method: 'GET', signal });
 }
@@ -294,7 +277,6 @@ export async function getHubStatus(signal?: AbortSignal): Promise<HubView> {
  * 採用しない**ことだけを保証する。
  */
 export async function getHubSubscription(signal?: AbortSignal): Promise<HubSubscription> {
-	if (!isHubAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<HubSubscription>('hub_subscription');
 	return httpJson<HubSubscription>('/api/hub/subscription', { method: 'GET', signal });
 }
@@ -306,14 +288,12 @@ export async function getHubSubscription(signal?: AbortSignal): Promise<HubSubsc
  * この操作は非冪等なので、打ち切った側は「失敗した」と言ってはいけない。
  */
 export async function connectHub(endpoint: string, signal?: AbortSignal): Promise<HubView> {
-	if (!isHubAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<HubView>('hub_connect', { endpoint });
 	return httpJson<HubView>('/api/hub/connect', { method: 'POST', body: { endpoint }, signal });
 }
 
 /** `admin`-only: タグ一覧の再取得。 */
 export async function refreshHubCatalog(signal?: AbortSignal): Promise<HubView> {
-	if (!isHubAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<HubView>('hub_refresh_catalog');
 	return httpJson<HubView>('/api/hub/refresh', { method: 'POST', signal });
 }
@@ -338,7 +318,6 @@ export interface HubCatalog {
  * Hub から読み直すので、ダイアログを開いたとき・「一覧を更新」のときだけ呼ぶ。
  */
 export async function getHubCatalog(signal?: AbortSignal): Promise<HubCatalog> {
-	if (!isHubAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<HubCatalog>('hub_catalog');
 	return httpJson<HubCatalog>('/api/hub/catalog', { method: 'GET', signal });
 }
@@ -348,7 +327,6 @@ export async function getHubCatalog(signal?: AbortSignal): Promise<HubCatalog> {
  * 使わない」、#383 段階3 P4）。
  */
 export async function dismissLegacyHubSelection(signal?: AbortSignal): Promise<void> {
-	if (!isHubAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		await invokeCommand<void>('hub_dismiss_legacy_selection');
 		return;
@@ -373,7 +351,6 @@ export async function adoptHubKey(
 	key: string,
 	signal?: AbortSignal
 ): Promise<HubView> {
-	if (!isHubAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri')
 		return invokeCommand<HubView>('hub_adopt_manual_key', { endpoint, key });
 	return httpJson<HubView>('/api/hub/adopt-key', {
@@ -385,7 +362,6 @@ export async function adoptHubKey(
 
 /** `admin`-only: 切断（ローカルの設定と保存したキーのみ。Hub 側のキーは残る）。 */
 export async function disconnectHub(signal?: AbortSignal): Promise<HubView> {
-	if (!isHubAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<HubView>('hub_disconnect');
 	return httpJson<HubView>('/api/hub', { method: 'DELETE', signal });
 }

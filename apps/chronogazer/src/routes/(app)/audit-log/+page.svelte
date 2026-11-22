@@ -22,10 +22,6 @@
 	 * 「再読み込み」で新しい世代にする。以前は同じ判断を自前で持っていた
 	 * （`auditBlocks.ts` と `/events` と共通の `#lib/blockCache.ts`、#410）。
 	 * `/events` も同じリソースに寄せたので、`#lib/blockCache.ts` は削除した。
-	 *
-	 * デモモード（プレーンな vite dev/preview、バックエンドなし）では
-	 * 監査ログDBそのものが存在しないため、案内文のみ表示する
-	 * （isAuditLogAvailable()、usersAdmin.ts と同じ流儀）。
 	 */
 	import { untrack } from 'svelte';
 	import {
@@ -39,15 +35,11 @@
 	import { auditSpoolNotice } from '#lib/banto/auditSpoolWarning.js';
 	import {
 		AUDIT_SNAPSHOT_EXPIRED_MESSAGE,
-		DEMO_MODE_MESSAGE,
 		createAuditLogResource,
 		getAuditConfig,
 		getAuditSpoolStatus,
-		isAuditLogAvailable,
 		type AuditLogEntry
 	} from '#lib/banto/auditLogAdmin.js';
-
-	const available = isAuditLogAvailable();
 
 	const actionLabels: Record<string, string> = {
 		create: '作成',
@@ -174,7 +166,6 @@
 	// the state `ensureRange()` publishes (`loading` etc.) either. The cleanup
 	// aborts whatever is still in flight when the page is left.
 	$effect(() => {
-		if (!available) return;
 		untrack(() => auditLog.ensureRange(0, 100));
 		return () => auditLog.dispose();
 	});
@@ -233,7 +224,6 @@
 	let spoolWarning: string | null = $state(null);
 
 	async function loadSpoolWarning(): Promise<void> {
-		if (!available) return;
 		try {
 			spoolWarning = auditSpoolNotice({ kind: 'ok', status: await getAuditSpoolStatus() });
 		} catch {
@@ -250,7 +240,6 @@
 	let retentionNote: string | null = $state(null);
 
 	$effect(() => {
-		if (!available) return;
 		void (async () => {
 			try {
 				const config = await getAuditConfig();
@@ -271,95 +260,89 @@
 		<h2>監査ログ</h2>
 	</div>
 
-	{#if !available}
-		<p class="note">
-			{DEMO_MODE_MESSAGE}。単体ブラウザのデモモードには監査ログDBがないため、この機能はTauriアプリまたはLANアクセス（組み込みサーバー）でのみ利用できます。
-		</p>
-	{:else}
-		{#if spoolWarning}
-			<p class="error" role="alert" data-testid="audit-spool-warning">{spoolWarning}</p>
-		{/if}
+	{#if spoolWarning}
+		<p class="error" role="alert" data-testid="audit-spool-warning">{spoolWarning}</p>
+	{/if}
 
-		{#if retentionNote}
-			<p class="note">{retentionNote}</p>
-		{/if}
+	{#if retentionNote}
+		<p class="note">{retentionNote}</p>
+	{/if}
 
-		<!--
+	<!--
 			「まだ読めていない」「読めなかった」「0 件」を別々に出す（#410、banto #248）。
 			件数が `null` のうちは件数を言わない（0 件と言い切らない）。
 		-->
-		<p class="note">
-			{#if auditLog.totalCount === null}
-				{auditLog.failures.length > 0
-					? '監査ログを読み込めていません。'
-					: '監査ログを読み込んでいます。'}
-			{:else}
-				{auditLog.totalCount.toLocaleString()}件の記録があります。行をクリックすると下に詳細が表示されます。
-			{/if}
-		</p>
-
-		{#if loadFailure?.kind === 'error'}
-			<p class="error" role="alert">{loadFailure.error.message}</p>
+	<p class="note">
+		{#if auditLog.totalCount === null}
+			{auditLog.failures.length > 0
+				? '監査ログを読み込めていません。'
+				: '監査ログを読み込んでいます。'}
+		{:else}
+			{auditLog.totalCount.toLocaleString()}件の記録があります。行をクリックすると下に詳細が表示されます。
 		{/if}
-		{#if auditLog.expired}
-			<p class="error" role="alert">{AUDIT_SNAPSHOT_EXPIRED_MESSAGE}</p>
-		{/if}
+	</p>
 
-		<!--
+	{#if loadFailure?.kind === 'error'}
+		<p class="error" role="alert">{loadFailure.error.message}</p>
+	{/if}
+	{#if auditLog.expired}
+		<p class="error" role="alert">{AUDIT_SNAPSHOT_EXPIRED_MESSAGE}</p>
+	{/if}
+
+	<!--
 			**「再読み込み」は常に出す**（#410。`/events` の #409 レビュー P2-4 と
 			同じ理由）: 失敗からの再試行だけでなく、**新しい記録を取り込む唯一の
 			導線**でもある - 一覧は世代の最初の応答で `asOfId`（スナップショット
 			境界）を固定するので、新しい世代を始めない限り後から記録された行は
 			入らない。処理中でも押せる（banto #248）。自動ポーリングは足さない。
 		-->
-		<div class="actions">
-			<button type="button" onclick={reload}>再読み込み</button>
-		</div>
+	<div class="actions">
+		<button type="button" onclick={reload}>再読み込み</button>
+	</div>
 
-		<section class="grid-wrap">
-			<BantoGrid
-				mode="server"
-				state={gridState}
-				rows={auditLog.rows}
-				totalRows={auditLog.totalCount ?? 0}
-				{columns}
-				getRowId={(row) => row.id}
-				rowClass={auditRowClass}
-				onRowClick={selectRow}
-				onParamsChange={handleParamsChange}
-				onVisibleRangeChange={handleVisibleRangeChange}
-			/>
+	<section class="grid-wrap">
+		<BantoGrid
+			mode="server"
+			state={gridState}
+			rows={auditLog.rows}
+			totalRows={auditLog.totalCount ?? 0}
+			{columns}
+			getRowId={(row) => row.id}
+			rowClass={auditRowClass}
+			onRowClick={selectRow}
+			onParamsChange={handleParamsChange}
+			onVisibleRangeChange={handleVisibleRangeChange}
+		/>
+	</section>
+
+	{#if selected}
+		<section class="detail">
+			<h3>詳細（ID: {selected.id}）</h3>
+			<dl>
+				<dt>時刻</dt>
+				<dd>{formatSqliteUtc(selected.ts)}</dd>
+				<dt>ユーザー</dt>
+				<dd>{selected.actorUsername ?? '-'}</dd>
+				<dt>ロール</dt>
+				<dd>{selected.actorRole ?? '-'}</dd>
+				<dt>アクション</dt>
+				<dd>{actionLabel(selected.action)}</dd>
+				<dt>リソース</dt>
+				<dd>{selected.resource}</dd>
+				<dt>対象ID</dt>
+				<dd>{selected.entityId ?? '-'}</dd>
+				<dt>経路</dt>
+				<dd>{originLabel(selected.origin)}</dd>
+				<dt>結果</dt>
+				<dd class:alert={selected.result === 'denied' || selected.result === 'failed'}>
+					{resultLabel(selected.result)}
+				</dd>
+			</dl>
+			{#if selectedDetail}
+				<h4>詳細情報（JSON）</h4>
+				<pre>{selectedDetail}</pre>
+			{/if}
 		</section>
-
-		{#if selected}
-			<section class="detail">
-				<h3>詳細（ID: {selected.id}）</h3>
-				<dl>
-					<dt>時刻</dt>
-					<dd>{formatSqliteUtc(selected.ts)}</dd>
-					<dt>ユーザー</dt>
-					<dd>{selected.actorUsername ?? '-'}</dd>
-					<dt>ロール</dt>
-					<dd>{selected.actorRole ?? '-'}</dd>
-					<dt>アクション</dt>
-					<dd>{actionLabel(selected.action)}</dd>
-					<dt>リソース</dt>
-					<dd>{selected.resource}</dd>
-					<dt>対象ID</dt>
-					<dd>{selected.entityId ?? '-'}</dd>
-					<dt>経路</dt>
-					<dd>{originLabel(selected.origin)}</dd>
-					<dt>結果</dt>
-					<dd class:alert={selected.result === 'denied' || selected.result === 'failed'}>
-						{resultLabel(selected.result)}
-					</dd>
-				</dl>
-				{#if selectedDetail}
-					<h4>詳細情報（JSON）</h4>
-					<pre>{selectedDetail}</pre>
-				{/if}
-			</section>
-		{/if}
 	{/if}
 </div>
 

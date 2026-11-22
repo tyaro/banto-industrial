@@ -1,13 +1,13 @@
 /**
  * `setup.ts` の `bantoReady` が起動時の環境判定（banto v3.0.0 #286、I2c）を
- * 本当に使っているかの確認。判定そのもの（`probeBackend` の 3 値と
+ * 本当に使っているかの確認。判定そのもの（`probeBackend` の 2 値と
  * `resolveStartupTarget` の流れ）は admin-template の写しの
  * `startup.test.ts` が固定している。ここは chronogazer の合成ルート
  * （`setup.ts`）を、**本物の** `environment.ts` / `startup.ts` /
  * `startupState.svelte.ts` の上で動かし、次を見る:
  *
  * - LAN/REST のビルドで `/api/auth/check` に一時的に届かない（fetch の例外・
- *   逆プロキシの `503`・Banto の本文を持たない `500`）とき、demo に落ちない。
+ *   逆プロキシの `503`・Banto の本文を持たない `500`）とき、offline の模擬に落ちない。
  *   `initBanto` を呼ばずに起動待ちのまま「サーバーに接続できません」になり、
  *   届くようになってから「再接続」すると server になる。以前の
  *   `isEmbeddedServer()` はこの 3 つを全部「サーバー無し」と読んで demo
@@ -15,8 +15,8 @@
  * - `VITE_BANTO_DEMO=1` のビルド（GitHub Pages のデモ、docs/demo-pages-design.md §3.1）は、
  *   タブの中の模擬（`#lib/demo/`）を入れ終えてから、probe せずに `server` の provider で起動する。
  *   トークンはデモ専用のキー。模擬の初期化が失敗したら通常の provider を作らずに reject する。
- * - 同じオリジンが「`/api` は無い」と確定的に答えた（静的ホストの `404`）
- *   ときも demo（admin-template と同じ。`vite dev`/`vite preview` の経路）。
+ * - 同じオリジンが `404`（静的ホスト・`vite dev`）と答えたときも届かない扱い（旧 demo は
+ *   消した、docs/demo-pages-design.md §3.2）: 起動待ちのまま「サーバーに接続できません」。
  *
  * `initBanto` / `connectEvents` だけ差し替える（プロバイダーの配線そのもの
  * ではなく、どの経路を選んだかを見るため）。
@@ -84,13 +84,13 @@ async function loadSetup() {
 // 再 import はこのキャッシュで速くなる。初回 import は負荷の高い Windows で 5 秒を
 // 超えることがあり（#554 の検証 2026-10-10）、タイムアウトしたテストの import が
 // 孤立したまま次のテスト中に `bantoReady` を走らせて、次の fetch モックを
-// 叩く不具合を起こした。404 は「/api は無い」の確定応答で demo になり、
+// 叩く不具合を起こした。401 は Banto の応答で server になり、
 // タイマーも再試行も使わない。
 beforeAll(async () => {
 	vi.stubGlobal('location', { origin: 'http://lan.test' });
 	vi.stubGlobal(
 		'fetch',
-		vi.fn(async () => new Response('<html>', { status: 404 }))
+		vi.fn(async () => json(401, { kind: 'unauthorized' }))
 	);
 	try {
 		const setup = await import('./setup');
@@ -122,67 +122,71 @@ afterEach(async () => {
 	vi.unstubAllEnvs();
 }, 60_000);
 
-describe('bantoReady: 一時的に届かないときは demo に落ちない（#286）', { timeout: 30_000 }, () => {
-	const transient: [string, () => Promise<Response>][] = [
-		[
-			'fetch の例外（サーバーが止まっている）',
-			async () => {
-				throw new TypeError('fetch failed');
-			}
-		],
-		['逆プロキシの HTML 503', async () => new Response('<html>', { status: 503 })],
-		['Banto の本文を持たない 500', async () => json(500, { error: 'x' })]
-	];
+describe(
+	'bantoReady: 一時的に届かないときは offline の模擬に落ちない（#286）',
+	{ timeout: 30_000 },
+	() => {
+		const transient: [string, () => Promise<Response>][] = [
+			[
+				'fetch の例外（サーバーが止まっている）',
+				async () => {
+					throw new TypeError('fetch failed');
+				}
+			],
+			['逆プロキシの HTML 503', async () => new Response('<html>', { status: 503 })],
+			['Banto の本文を持たない 500', async () => json(500, { error: 'x' })]
+		];
 
-	for (const [label, failure] of transient) {
-		it(`${label}: 起動待ちのまま「接続できません」になり、再接続で server になる`, async () => {
-			let up = false;
-			const fetchMock = vi.fn(async () => (up ? json(200, false) : failure()));
-			vi.stubGlobal('fetch', fetchMock);
+		for (const [label, failure] of transient) {
+			it(`${label}: 起動待ちのまま「接続できません」になり、再接続で server になる`, async () => {
+				let up = false;
+				const fetchMock = vi.fn(async () => (up ? json(200, false) : failure()));
+				vi.stubGlobal('fetch', fetchMock);
 
-			const { setup, state, settled } = await loadSetup();
+				const { setup, state, settled } = await loadSetup();
+				await runAutoRetries();
+
+				expect(fetchMock).toHaveBeenCalledTimes(STARTUP_AUTO_RETRIES + 1);
+				expect(state.startupState.status).toBe('unreachable');
+				expect(settled()).toBe(false);
+				expect(core.initBanto).not.toHaveBeenCalled();
+
+				// 利用者が「再接続」を押すまでは再試行しない（叩き続けない）。
+				await vi.advanceTimersByTimeAsync(STARTUP_RETRY_DELAY_MS * 10);
+				expect(fetchMock).toHaveBeenCalledTimes(STARTUP_AUTO_RETRIES + 1);
+
+				up = true;
+				state.retryStartup();
+				await setup.bantoReady;
+
+				expect(setup.getBantoMode()).toBe('server');
+				expect(core.initBanto).toHaveBeenCalledTimes(1);
+				expect(core.connectEvents).toHaveBeenCalledTimes(1);
+			});
+		}
+
+		it('自動再試行のうちに届けば「接続できません」を出さずに server', async () => {
+			let calls = 0;
+			vi.stubGlobal(
+				'fetch',
+				vi.fn(async () => {
+					calls += 1;
+					if (calls === 1) throw new TypeError('fetch failed');
+					return json(401, { kind: 'unauthorized' });
+				})
+			);
+
+			const { setup, state } = await loadSetup();
 			await runAutoRetries();
-
-			expect(fetchMock).toHaveBeenCalledTimes(STARTUP_AUTO_RETRIES + 1);
-			expect(state.startupState.status).toBe('unreachable');
-			expect(settled()).toBe(false);
-			expect(core.initBanto).not.toHaveBeenCalled();
-
-			// 利用者が「再接続」を押すまでは再試行しない（叩き続けない）。
-			await vi.advanceTimersByTimeAsync(STARTUP_RETRY_DELAY_MS * 10);
-			expect(fetchMock).toHaveBeenCalledTimes(STARTUP_AUTO_RETRIES + 1);
-
-			up = true;
-			state.retryStartup();
 			await setup.bantoReady;
 
 			expect(setup.getBantoMode()).toBe('server');
-			expect(core.initBanto).toHaveBeenCalledTimes(1);
-			expect(core.connectEvents).toHaveBeenCalledTimes(1);
+			expect(state.startupState.status).toBe('connecting');
 		});
 	}
+);
 
-	it('自動再試行のうちに届けば「接続できません」を出さずに server', async () => {
-		let calls = 0;
-		vi.stubGlobal(
-			'fetch',
-			vi.fn(async () => {
-				calls += 1;
-				if (calls === 1) throw new TypeError('fetch failed');
-				return json(401, { kind: 'unauthorized' });
-			})
-		);
-
-		const { setup, state } = await loadSetup();
-		await runAutoRetries();
-		await setup.bantoReady;
-
-		expect(setup.getBantoMode()).toBe('server');
-		expect(state.startupState.status).toBe('connecting');
-	});
-});
-
-describe('bantoReady: demo になる経路', { timeout: 30_000 }, () => {
+describe('bantoReady: デモのビルド・静的ホスト', { timeout: 30_000 }, () => {
 	it('VITE_BANTO_DEMO=1 のビルドは模擬を入れ終えてから、probe せずに server（デモ専用のトークンのキー）', async () => {
 		vi.stubEnv('VITE_BANTO_DEMO', '1');
 		const fetchMock = vi.fn(async () => json(200, false));
@@ -223,16 +227,18 @@ describe('bantoReady: demo になる経路', { timeout: 30_000 }, () => {
 		expect(setup.isBantoReady()).toBe(false);
 	});
 
-	it('静的ホストの 404（「/api は無い」と確定）は demo', async () => {
+	it('静的ホストの 404 も届かない扱い: initBanto を呼ばず「接続できません」', async () => {
 		vi.stubGlobal(
 			'fetch',
 			vi.fn(async () => new Response('<html>', { status: 404 }))
 		);
 
-		const { setup } = await loadSetup();
-		await setup.bantoReady;
+		const { state, settled } = await loadSetup();
+		await runAutoRetries();
 
-		expect(setup.getBantoMode()).toBe('demo');
+		expect(state.startupState.status).toBe('unreachable');
+		expect(settled()).toBe(false);
+		expect(core.initBanto).not.toHaveBeenCalled();
 		expect(core.connectEvents).not.toHaveBeenCalled();
 	});
 

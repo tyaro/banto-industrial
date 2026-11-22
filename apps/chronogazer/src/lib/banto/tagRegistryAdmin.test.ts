@@ -1,5 +1,5 @@
 /**
- * `tagRegistryAdmin.ts` の Tauri/REST 分岐とデモモード拒否のユニットテスト
+ * `tagRegistryAdmin.ts` の Tauri/REST 分岐のユニットテスト
  * （#383 段階2a / R1-B）。`usersAdmin.ts` にはテストが無いため、同じリポジトリ
  * 内の同種クライアント（`apps/banto-hub/src/lib/banto/tagRegistryAdmin.test.ts`
  * の doc comment 参照）が採る回避策に倣う: `tagRegistryAdmin.ts` は
@@ -13,13 +13,10 @@
  * テストできる。
  *
  * 固定したい核心:
- * 1. デモモード（`getBantoMode() === 'demo'`）では全呼び出しが
- *    `DEMO_MODE_MESSAGE` で reject される（`invoke`/`fetch` のどちらも
- *    呼ばれない）。
- * 2. Tauri モードでは `invoke()` が正しいコマンド名・引数で呼ばれる。
- * 3. サーバーモードでは `fetch()` が正しい REST パス・メソッド・
+ * 1. Tauri モードでは `invoke()` が正しいコマンド名・引数で呼ばれる。
+ * 2. サーバーモードでは `fetch()` が正しい REST パス・メソッド・
  *    ヘッダー（CSRFヘッダー・Bearer トークン）で呼ばれる。
- * 4. REST のエラー応答（`{kind:"validation", field_errors:[...]}`）が
+ * 3. REST のエラー応答（`{kind:"validation", field_errors:[...]}`）が
  *    `ProviderError` としてそのまま投げられる（画面がフィールドへ
  *    マッピングできるように）。
  */
@@ -31,7 +28,7 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 const testState = vi.hoisted(() => {
 	// `describe()`相当のミニ版（`@banto/admin-core`の`errors.ts`と同じ
 	// マッピング）。テストが使う kind（validation/other）だけ本物と同じ
-	// 文言にする - `.message` を見るテスト（デモモード等）と
+	// 文言にする - `.message` を見るテストと
 	// `.body.field_errors` を見るテスト（validation）の両方が本物と
 	// 同じ挙動になる。
 	function describe(body: { kind: string; message?: string }): string {
@@ -47,7 +44,7 @@ const testState = vi.hoisted(() => {
 		}
 	}
 	return {
-		bantoMode: 'demo' as 'tauri' | 'server' | 'demo',
+		bantoMode: 'server' as 'tauri' | 'server',
 		ProviderErrorFake
 	};
 });
@@ -81,8 +78,6 @@ import {
 	createTag,
 	deleteTag,
 	listConfigExclusions,
-	isTagRegistryAvailable,
-	DEMO_MODE_MESSAGE,
 	ALLOWED_PERIOD_MS,
 	type PlcConnectionInput,
 	type CollectionGroupInput,
@@ -127,38 +122,7 @@ function mockFetchOnce(response: { status: number; ok: boolean; body: unknown })
 
 beforeEach(() => {
 	vi.restoreAllMocks();
-	testState.bantoMode = 'demo';
-});
-
-describe('isTagRegistryAvailable', () => {
-	it('デモモードでは false、それ以外では true', () => {
-		testState.bantoMode = 'demo';
-		expect(isTagRegistryAvailable()).toBe(false);
-		testState.bantoMode = 'tauri';
-		expect(isTagRegistryAvailable()).toBe(true);
-		testState.bantoMode = 'server';
-		expect(isTagRegistryAvailable()).toBe(true);
-	});
-});
-
-describe('デモモード（バックエンドが無い）', () => {
-	it('全エンティティの全操作が DEMO_MODE_MESSAGE で reject され、invoke/fetch は一切呼ばれない', async () => {
-		testState.bantoMode = 'demo';
-		const fetchSpy = vi.fn();
-		vi.stubGlobal('fetch', fetchSpy);
-
-		await expect(listPlcConnections()).rejects.toThrow(DEMO_MODE_MESSAGE);
-		await expect(listDrivers()).rejects.toThrow(DEMO_MODE_MESSAGE);
-		await expect(createPlcConnection(connectionInput)).rejects.toThrow(DEMO_MODE_MESSAGE);
-		await expect(listCollectionGroups()).rejects.toThrow(DEMO_MODE_MESSAGE);
-		await expect(createCollectionGroup(groupInput)).rejects.toThrow(DEMO_MODE_MESSAGE);
-		await expect(listTags()).rejects.toThrow(DEMO_MODE_MESSAGE);
-		await expect(createTag(tagInput)).rejects.toThrow(DEMO_MODE_MESSAGE);
-		await expect(listConfigExclusions()).rejects.toThrow(DEMO_MODE_MESSAGE);
-
-		expect(invoke).not.toHaveBeenCalled();
-		expect(fetchSpy).not.toHaveBeenCalled();
-	});
+	testState.bantoMode = 'server';
 });
 
 describe('Tauri モード', () => {

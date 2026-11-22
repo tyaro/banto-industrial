@@ -16,7 +16,6 @@
  *   autologin does not exist (no desktop process to log in) - those calls
  *   reject with a fixed message. A `localGrant` change is accepted only from
  *   this PC (`hostInfo.ts`'s `settingsEditableHere`).
- * - **Plain-browser demo**: rejects (no backend).
  */
 import { invoke } from '@tauri-apps/api/core';
 import { ProviderError } from '@banto/admin-core';
@@ -73,8 +72,6 @@ export const DESKTOP_ONLY_MESSAGE =
 	'この設定はデスクトップアプリの画面でのみ変更できます（サービスではこの PC からの接続の設定を使います）';
 /** `tauri` モードで使えない操作（`localGrant`）の reject の本文。 */
 export const SERVICE_ONLY_MESSAGE = 'この PC からの接続の設定はサービスの画面でのみ変更できます';
-/** demo の reject の本文。 */
-export const AUTH_SETTINGS_DEMO_MESSAGE = 'デモモードでは利用できません';
 
 function rejectWith(message: string): never {
 	throw new ProviderError({ kind: 'other', message });
@@ -94,7 +91,6 @@ export async function getAuthSettings(): Promise<AuthSettings> {
 	if (mode === 'server') {
 		return fromRest(await restJson<AuthConfigView>('/api/settings/auth', { method: 'GET' }));
 	}
-	if (mode === 'demo') rejectWith(AUTH_SETTINGS_DEMO_MESSAGE);
 	return call<AuthSettings>('auth_config_get');
 }
 
@@ -106,7 +102,6 @@ export async function getAuthSettings(): Promise<AuthSettings> {
 export async function applyLocalGrant(localGrant: LocalGrantSetting): Promise<AuthSettings> {
 	const mode = getBantoMode();
 	if (mode === 'tauri') rejectWith(SERVICE_ONLY_MESSAGE);
-	if (mode === 'demo') rejectWith(AUTH_SETTINGS_DEMO_MESSAGE);
 	return fromRest(
 		await restJson<AuthConfigView>('/api/settings/auth', { method: 'PUT', body: { localGrant } })
 	);
@@ -115,7 +110,6 @@ export async function applyLocalGrant(localGrant: LocalGrantSetting): Promise<Au
 function requireTauri(): void {
 	const mode = getBantoMode();
 	if (mode === 'server') rejectWith(DESKTOP_ONLY_MESSAGE);
-	if (mode === 'demo') rejectWith(AUTH_SETTINGS_DEMO_MESSAGE);
 }
 
 /** Toggle login-not-required mode and its synthetic-identity role. `admin`-only, EXCEPT while the mode is currently on (escape hatch - see `auth_config_apply`'s Rust doc comment). */

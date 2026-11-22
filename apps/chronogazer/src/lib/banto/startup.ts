@@ -5,7 +5,7 @@
 // サーバーを入れ、HTTP の provider がそれと話す）。それ以外は無改変。
 /**
  * Startup environment resolution (Issue #286). Pure (all effects injected) so
- * the Tauri / LAN-browser / intended-demo / transient-failure paths are unit
+ * the Tauri / LAN-browser / demo-build / transient-failure paths are unit
  * testable; setup.ts (the composition root) supplies the real dependencies.
  *
  * Deployment kind is decided explicitly, never inferred from a failed request:
@@ -14,14 +14,14 @@
  *                               server is the in-tab mock setup.ts installed)
  * - otherwise probe `/api/auth/check`:
  *     server      -> `server`
- *     none        -> `demo` (a static host definitively answered "no API here")
- *     unreachable -> NOT demo: retry a bounded number of times automatically,
- *                    then show a "cannot connect" state and wait for the
- *                    user's retry. Resolves only once a real answer arrives.
+ *     unreachable -> (incl. a static host's plain 404) retry a bounded number of
+ *                    times automatically, then show a "cannot connect" state and
+ *                    wait for the user's retry. Resolves only once a real answer
+ *                    arrives.
  */
 import type { BackendProbe } from './environment';
 
-export type StartupTarget = 'tauri' | 'server' | 'demo';
+export type StartupTarget = 'tauri' | 'server';
 
 /** Automatic re-probes after the first failure before the "cannot connect" screen appears. */
 export const STARTUP_AUTO_RETRIES = 2;
@@ -49,7 +49,6 @@ export async function resolveStartupTarget(deps: StartupDeps): Promise<StartupTa
 		for (let attempt = 0; attempt <= STARTUP_AUTO_RETRIES; attempt++) {
 			const result = await deps.probe();
 			if (result === 'server') return 'server';
-			if (result === 'none') return 'demo';
 			if (attempt < STARTUP_AUTO_RETRIES) await deps.sleep(STARTUP_RETRY_DELAY_MS);
 		}
 		deps.setStatus('unreachable');
