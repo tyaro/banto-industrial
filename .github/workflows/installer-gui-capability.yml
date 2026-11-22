@@ -10,8 +10,11 @@ on:
 permissions:
   contents: read
 
+# タグの push と手動の実行は run_id で独立した group にする。ref で束ねると、同じ ref の別の実行に
+# 取り消されたり、待機中の run が 1 本だけの仕様で次の run に置き換えられたりする(2026-11-22 レビュー)。
+# PR・branch の push は今まで通り ref で束ねる。
 concurrency:
-  group: installer-gui-capability-${{ github.ref }}
+  group: installer-gui-capability-${{ (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && github.run_id || github.ref }}
   cancel-in-progress: false
 
 jobs:
