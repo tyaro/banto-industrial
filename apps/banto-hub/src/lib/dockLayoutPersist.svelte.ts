@@ -15,7 +15,7 @@
  * が枠の中にあれば `tick()` を待ってフォーカスを直す）の後で `wideLayout`・`narrowShown` を確定
  * する。広い → 狭いの間は `narrowShown` がまだ false なので、`layoutSnapshot()` は狭い表示の一時
  * の木を返してしまう（狭い → 広いの間は控えた広い配置を返すが、確定前の値には違いないので同じく
- * 見送る）。部品の公開の口に「確定した」印は無いので、求める表示（`narrowOverride` に渡す値）と
+ * 見送る）。部品の公開の口に「確定した」印は無いので（確定の口を tyaro/banto#791 で提案した。入ったら置き換える）、求める表示（`narrowOverride` に渡す値）と
  * 実際の表示（`bind:narrow`。部品の中で `narrowShown` を `$effect.pre` で写した値）が食い違って
  * いる間は保存しない。確定すると `narrow` が換わって effect が走り直し、確定後の
  * `layoutSnapshot()` を渡す（変わっていなければ保存の口が同じ値として書かない）。

@@ -13,6 +13,9 @@
  *
  * 狭い表示では部品が追加パネルを隠す（閉じた浮動になる）ので、狭い表示の一時の配置を
  * そのまま渡せば偽になる。
+ *
+ * 部品の内部の木の形に頼る回り道なので、同じ判定の口（`isOnScreen`）を tyaro/banto#792 で
+ * 提案した。入ったら置き換える。
  */
 import type { DockLayout, DockNode } from '@banto/dock-svelte';
 
