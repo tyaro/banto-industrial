@@ -13,7 +13,8 @@
 	import { getSessionController, notify } from '@banto/admin-core';
 	import { isLeavingForLogin, leaveForLogin } from '#lib/banto/logout.svelte.js';
 	import { isNavigationSettled } from '#lib/banto/navigationSettled.svelte.js';
-	import { resolveAppPath } from '#lib/navigation.js';
+	import { isDemoTargetPath, resolveAppPath } from '#lib/navigation.js';
+	import { page } from '$app/state';
 	import { OWNER_CHANGE_POLICY, watchOwnerChanges } from '#lib/banto/ownerChange.js';
 	import Header from '#lib/components/Header.svelte';
 	import Sidebar from '#lib/components/Sidebar.svelte';
@@ -271,7 +272,20 @@
 		<main>
 			{#if data.sessionGeneration === sessionController.snapshot.generation}
 				{#key data.sessionGeneration}
-					{@render children()}
+					<!-- デモ（docs/demo-pages-design.md §3.4）: 対象外の画面は中身を描かず案内を出す。外側の
+					     分岐は定数だけにする（呼び出しを含む条件は実行時の derived になり、製品のビルドから
+					     デモの部品が消えない）。動的 import も同じ理由 - 製品のビルドにデモの文言を入れない。 -->
+					{#if import.meta.env.VITE_BANTO_DEMO === '1'}
+						{#if isDemoTargetPath(page.url.pathname)}
+							{@render children()}
+						{:else}
+							{#await import('#lib/components/DemoOutOfScope.svelte') then demoNotice}
+								<demoNotice.default />
+							{/await}
+						{/if}
+					{:else}
+						{@render children()}
+					{/if}
 				{/key}
 			{/if}
 		</main>

@@ -5,11 +5,11 @@
 #   （`v*`。例 `v0.3.0-alpha.4`）だけ（既定は main）。ほかのブランチ・ref は断る。
 # - **公開の関門**（2026-11-23 オーナーのレビュー #1309）: 「公開の関門」ステップが、
 #   チェックアウトした版に `e2e/tests-demo-pages/public-gate.spec.ts` が無ければ落とす。
-#   このファイルは 2b-2（共通ナビを対象の画面だけに絞る・ログアウトを隠す／「デモを最初から」
-#   に替える・組み立てた成果物でメニュー操作を確かめる）で足される。後段の E2E ゲートは
-#   対象の ref 自身の試験を走らせるので、「このファイルがある + E2E が通る」ことが
-#   公開の条件が満たされている証拠になる。2b-2 より前の版にはこのファイルが無く、
-#   配信できない（2b-2 が入るまで、このワークフローは必ずここで落ちる。意図どおり）。
+#   このファイルは 2b-2（共通ナビを対象の画面だけに絞る・対象外の画面は案内を出す・ログアウトを
+#   「デモを最初から」に替える・組み立てた成果物でメニュー操作を確かめる）で足された。
+#   後段の「公開の関門の試験」ステップが、そのファイルを**名指しで**走らせる（Playwright は
+#   試験が 0 件なら失敗にするので、走ったことの証拠になる）。2b-2 より前の版にはこのファイルが
+#   無く、配信できない。
 # - 何を作るか: `pnpm demo:build`（scripts/build-demo-pages.mjs）が Hub（/tags）と
 #   ChronoGazer（/tags・/monitor）の画面を、通信の境目（fetch・WebSocket）を模擬に
 #   差し替えて静的に書き出す（出力は `target/demo-pages/`）。バックエンドは動かさない。
@@ -104,6 +104,12 @@ jobs:
       # 組み立てた成果物（target/demo-pages）を静的に配信して確かめる。落ちたら配信しない。
       - name: E2E gate (demo-pages)
         run: pnpm e2e:demo-pages
+
+      # 公開の関門の試験を名指しで走らせ、走ったことを確かめる（上の全体の E2E に含まれていても、
+      # ファイルの取り違え・絞り込みで 0 件になれば Playwright が失敗にする）。組み立て直さず、
+      # 試験済みの target/demo-pages をそのまま配信する。
+      - name: 公開の関門の試験 (public-gate)
+        run: pnpm exec playwright test --config=e2e/demo-pages.playwright.config.ts "$DEMO_PUBLIC_GATE_SPEC"
 
       - name: Upload Playwright report (demo-pages)
         if: failure()

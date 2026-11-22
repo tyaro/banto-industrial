@@ -17,14 +17,25 @@ import { goto } from '$app/navigation';
 import type { PaletteCommand } from '@banto/admin-core';
 import { logoutAndLeave } from './banto/logout.svelte';
 import { notifyLogoutOutcome } from './banto/logoutNotice';
-import { monitorGroupHref, navItems, publicNavItems, resolveAppPath } from './navigation';
+import {
+	DEMO_NAV_PATHS,
+	IS_DEMO_BUILD,
+	monitorGroupHref,
+	navItems,
+	publicNavItems,
+	resolveAppPath
+} from './navigation';
 import type { DisplayGroup } from './banto/displayGroupsAdmin';
 import { settings } from './settings.svelte';
 import { sessionStore } from './session.svelte';
 import { isAdmin } from './permissions';
 
 function navigationCommands(): PaletteCommand[] {
-	return navItems.map((item) => ({
+	// デモのビルドは対象画面だけ（`DEMO_NAV_PATHS`、メニューと同じ）。
+	const items = IS_DEMO_BUILD
+		? navItems.filter((item) => DEMO_NAV_PATHS.includes(item.path))
+		: navItems;
+	return items.map((item) => ({
 		id: `nav.${item.path}`,
 		title: item.label,
 		group: 'ナビゲーション',
@@ -94,7 +105,8 @@ function sessionCommands(): PaletteCommand[] {
 			// Same condition as Header.svelte's logout button: hidden in
 			// login-not-required mode (spec M11 - there's no session to end) and
 			// for a 閲覧公開 session (I2b - the header shows 「ログイン」 instead).
-			visible: () => !sessionStore.authDisabled && !sessionStore.publicViewer,
+			// デモのビルドにログアウトは無い（ヘッダーの「デモを最初から」へ置き換える）。
+			visible: () => !IS_DEMO_BUILD && !sessionStore.authDisabled && !sessionStore.publicViewer,
 			run: async () => {
 				// banto v2.0.0 (#260): same as Header.svelte's logout.
 				await logoutAndLeave(() => goto(resolveAppPath('/login')), { notify: notifyLogoutOutcome });

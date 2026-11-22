@@ -10,7 +10,7 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { hubLogout } from '#lib/banto/hubLogout.js';
-	import { pageTitle, resolveAppPath } from '#lib/navigation.js';
+	import { DEMO_NAV_PATHS, pageTitle, resolveAppPath } from '#lib/navigation.js';
 	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
 	import { NAV_TOGGLE_ATTR, SIDEBAR_ID } from '#lib/mobileNav.js';
 	import { settings } from '#lib/settings.svelte.js';
@@ -174,7 +174,17 @@
 		🔍
 	</button>
 
-	{#if !sessionStore.authDisabled}
+	{#if import.meta.env.VITE_BANTO_DEMO === '1'}
+		<!-- デモ（docs/demo-pages-design.md §3.4）: ログアウトは無い（ログイン画面にデモの模擬が無く、
+		     戻れなくなる）。状態は全部メモリなので、入口を読み込み直せば最初に戻る。 -->
+		<button
+			type="button"
+			class="icon-button"
+			onclick={() => location.assign(resolveAppPath(DEMO_NAV_PATHS[0]))}
+		>
+			デモを最初から
+		</button>
+	{:else if !sessionStore.authDisabled}
 		<button type="button" class="icon-button" onclick={logout}>ログアウト</button>
 	{/if}
 </header>
