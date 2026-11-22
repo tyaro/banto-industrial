@@ -1280,6 +1280,8 @@ test('run_wasm: workspace 全体・WASM に関わる host・banto-driver-wasm / 
 	// WASM に関わる host のソース・rust-wasm が走らせる試験・共通の補助・host の Cargo.toml。
 	for (const f of [
 		'apps/banto-hub/host/src/bin/banto_hub/wasm_plugins.rs',
+		'apps/banto-hub/host/src/bin/banto-hub.rs',
+		'apps/banto-hub/host/src/bin/banto_hub/win_service.rs',
 		'apps/banto-hub/host/tests/t12_connection_test.rs',
 		'apps/banto-hub/host/tests/t12_slmp_wasm/mod.rs',
 		'apps/banto-hub/host/tests/t12_modbus_wasm_join/mod.rs',
@@ -1308,8 +1310,9 @@ test('run_wasm: workspace 全体・WASM に関わる host・banto-driver-wasm / 
 		assert.match(j.rust_args, /(^| )-p banto-driver-wasm( |$)/, f);
 		assert.match(j.rust_args, /(^| )-p banto-hub-host( |$)/, f);
 	}
-	// WASM に届かない共有 crate は走らない。
-	for (const f of ['crates/banto-tags/src/lib.rs', 'crates/banto-rtsp/src/lib.rs']) {
+	// WASM に届かない共有 crate は走らない（banto-tags は banto-drivers の通常の依存なので
+	// 届く。下の「実グラフ: run_wasm」で確かめる）。
+	for (const f of ['crates/banto-instance-lock/src/lib.rs', 'crates/banto-rtsp/src/lib.rs']) {
 		assert.equal(pr([f]).run_wasm, false, f);
 	}
 	// workspace 全体（Cargo.lock・toolchain・.github）は常に走る。
@@ -1322,6 +1325,20 @@ test('run_wasm: workspace 全体・WASM に関わる host・banto-driver-wasm / 
 	assert.equal(derive({}, ['banto-plc', 'banto-hub-host']).run_wasm, false);
 	// ほかのジョブの判定（driver-api など）には混ぜない。
 	assert.equal(pr(['apps/banto-hub/host/src/bin/banto_hub/wasm_plugins.rs']).run_driver_api, false);
+});
+
+test('実グラフ: run_wasm は banto-drivers・banto-driver-wasm に届く crate（banto-tags など）で true、届かない crate で false', () => {
+	const g = real();
+	const run = (/** @type {string} */ f) =>
+		classify({ event: 'pull_request', files: [f], graph: g }).jobs.run_wasm;
+	// banto-drivers の通常の依存（banto-tags・banto-driver-engine など）の変更は届く。
+	for (const c of ['banto-tags', 'banto-plc-address', 'banto-driver-engine', 'banto-drivers']) {
+		assert.equal(run(`crates/${c}/src/lib.rs`), true, c);
+	}
+	// banto-drivers・banto-driver-wasm のどちらにも届かない crate は false。
+	for (const c of ['banto-rtsp', 'banto-instance-lock', 'banto-tstore']) {
+		assert.equal(run(`crates/${c}/src/lib.rs`), false, c);
+	}
 });
 
 test('run_wasm: main への push は常に true（PR で省いた分は push で検証する）', () => {

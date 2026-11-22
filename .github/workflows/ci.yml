@@ -42,7 +42,7 @@
 #   Rust 系のジョブ（rust・rust-test-build・rust-test・rust-wasm・rust-db-source・linux-clippy・
 #   driver-api）は走らせない（2026-11-22 オーナー決定）。Rust が読む `static/`・`src-tauri/`・
 #   `core/`・`host/`・`installer/` と、Rust の試験が読む `bridgeLoad.fixtures.json` は今までどおり。
-# - rust-wasm は、host の WASM に関わるソース/試験（`wasm_plugins.rs`・tests/t12_*・*wasm*・
+# - rust-wasm は、host の WASM に関わるソース/試験（`wasm_plugins.rs`・`banto-hub.rs`・`win_service.rs`・tests/t12_*・*wasm*・
 #   tests/common・host の Cargo.toml）と、依存グラフで banto-driver-wasm / banto-drivers に届く
 #   共有 crate の変更のときだけ（PR）。host のほかの場所を壊した変更は PR では気づかず、main の
 #   push で初めて落ちうる。オーナーが受け入れた（2026-11-22）。

@@ -129,7 +129,7 @@ export const RULES = [
 	// nextest で走らせる試験（t12_*・*wasm*・共通の tests/common）。
 	// rust-wasm の試験の名前（ci.yml の `-E`）を足したら、ここも合わせる。
 	{
-		re: /^apps\/banto-hub\/host\/(Cargo\.toml$|src\/bin\/banto_hub\/wasm_plugins\.rs$|tests\/(common\/|t12_|[a-z0-9_]*wasm[a-z0-9_]*\.rs$))/,
+		re: /^apps\/banto-hub\/host\/(Cargo\.toml$|src\/bin\/(banto-hub\.rs$|banto_hub\/(wasm_plugins|win_service)\.rs$)|tests\/(common\/|t12_|[a-z0-9_]*wasm[a-z0-9_]*\.rs$))/,
 		areas: ['hub', 'wasm'],
 		why: 'banto-hub（WASM Hub components の host・試験）'
 	},
