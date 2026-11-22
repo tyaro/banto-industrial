@@ -1,6 +1,8 @@
 // banto v3.0.0（タグ v3.0.0 = f0dcece）の admin-template
 // `apps/admin-template/src/lib/banto/startup.ts` からコピー（I2c、banto #286）。
-// chronogazer 固有の差: なし（本文は無改変）。
+// chronogazer 固有の差: デモのビルド（`VITE_BANTO_DEMO=1`）は `demo` ではなく `server`
+// （GitHub Pages のデモ、docs/demo-pages-design.md §3.1。`setup.ts` が先にタブの中の模擬の
+// サーバーを入れ、HTTP の provider がそれと話す）。それ以外は無改変。
 /**
  * Startup environment resolution (Issue #286). Pure (all effects injected) so
  * the Tauri / LAN-browser / intended-demo / transient-failure paths are unit
@@ -8,7 +10,8 @@
  *
  * Deployment kind is decided explicitly, never inferred from a failed request:
  * - Tauri webview            -> `tauri`
- * - build marked as the demo -> `demo` (no probe; `VITE_BANTO_DEMO=1`)
+ * - build marked as the demo -> `server` (no probe; `VITE_BANTO_DEMO=1`: the
+ *                               server is the in-tab mock setup.ts installed)
  * - otherwise probe `/api/auth/check`:
  *     server      -> `server`
  *     none        -> `demo` (a static host definitively answered "no API here")
@@ -40,7 +43,7 @@ export interface StartupDeps {
 
 export async function resolveStartupTarget(deps: StartupDeps): Promise<StartupTarget> {
 	if (deps.isTauri()) return 'tauri';
-	if (deps.isDemoBuild()) return 'demo';
+	if (deps.isDemoBuild()) return 'server';
 	for (;;) {
 		deps.setStatus('connecting');
 		for (let attempt = 0; attempt <= STARTUP_AUTO_RETRIES; attempt++) {

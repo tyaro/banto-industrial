@@ -41,6 +41,9 @@ importers:
 
   apps/banto-hub:
     dependencies:
+      '@banto-industrial/demo-backend':
+        specifier: workspace:*
+        version: link:../../packages/demo-backend
       '@banto/admin-core':
         specifier: github:tyaro/banto#v7.9.0&path:packages/admin-core
         version: https://codeload.github.com/tyaro/banto/tar.gz/c017882a654754dfed87bf558a319c96ba136716#path:packages/admin-core
@@ -102,6 +105,9 @@ importers:
 
   apps/chronogazer:
     dependencies:
+      '@banto-industrial/demo-backend':
+        specifier: workspace:*
+        version: link:../../packages/demo-backend
       '@banto-industrial/trend':
         specifier: workspace:*
         version: link:../../packages/trend
@@ -163,6 +169,15 @@ importers:
       vite:
         specifier: ^8.3.8
         version: 8.3.8(jiti@2.7.0)
+      vitest:
+        specifier: ^5.1.1
+        version: 5.1.1(vite@8.3.8(jiti@2.7.0))
+
+  packages/demo-backend:
+    devDependencies:
+      typescript:
+        specifier: ^6.0.3
+        version: 6.0.3
       vitest:
         specifier: ^5.1.1
         version: 5.1.1(vite@8.3.8(jiti@2.7.0))

@@ -47,9 +47,13 @@
 	trackFirstNavigation();
 	const startupDeferred = $derived(isStartupDeferral(page.error));
 	let started = $state(false);
-	void bantoReady.then(() => {
-		started = true;
-	});
+	// reject（デモの模擬の初期化の失敗）は下の `{:catch}` が出す。ここでは握りつぶす。
+	void bantoReady.then(
+		() => {
+			started = true;
+		},
+		() => {}
+	);
 	$effect(() => {
 		if (startupDeferred && started && isNavigationSettled()) {
 			void refreshAll();
@@ -66,4 +70,19 @@
 		{@render children()}
 		<ToastHost store={toastStore} />
 	{/if}
+{:catch}
+	<!-- デモ（docs/demo-pages-design.md §3.1）: 模擬を入れられなかったら通常の provider は
+	     作られていない。ここで止まる。製品のビルドは今までどおり何も出さない。 -->
+	{#if import.meta.env.VITE_BANTO_DEMO === '1'}
+		<p class="demo-start-failed" role="alert">デモを始められませんでした</p>
+	{/if}
 {/await}
+
+<style>
+	.demo-start-failed {
+		min-height: 100vh;
+		display: grid;
+		place-items: center;
+		color: var(--banto-text-muted);
+	}
+</style>

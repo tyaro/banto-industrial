@@ -71,8 +71,22 @@ const notifier: Notifier = { notify: (kind, message) => toastStore.push(kind, me
  * この Promise が掃除の完了を待つ）。
  */
 export const bantoReady: Promise<void> = (async () => {
-	await purgeLoopbackRememberedToken();
-	const authProvider = createHttpAuthProvider();
+	// デモ（GitHub Pages、docs/demo-pages-design.md §3.1・§3.2）: 模擬を入れ終えてから通常の
+	// provider を作る。`import.meta.env.VITE_BANTO_DEMO` はビルドの時点で定数になるので、
+	// 製品のビルドではこの分岐と `#lib/demo/` の chunk ごと消える。模擬の import か初期化が
+	// 失敗したら、ここで reject して通常の provider を作らない（root layout が止まった画面を
+	// 出す）。デモのトークンは専用のキーで、loopback の掃除（実在のサーバーへの失効の要求）は
+	// しない。
+	let tokenStorageKey: string | undefined;
+	if (import.meta.env.VITE_BANTO_DEMO === '1') {
+		const demo = await import('#lib/demo/index.js');
+		tokenStorageKey = (await demo.startDemo()).tokenStorageKey;
+	} else {
+		await purgeLoopbackRememberedToken();
+	}
+	const authProvider = createHttpAuthProvider(
+		tokenStorageKey === undefined ? {} : { storageKey: tokenStorageKey }
+	);
 	const dataProvider = createHttpDataProvider({ getToken: authProvider.getToken });
 	// 書き込みのキーごとの直列化・トークンが替わった書き込みの破棄は banto v7.8.0
 	// （`createHttpUiSettings`、banto#707）が持つ。

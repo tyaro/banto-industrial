@@ -124,7 +124,9 @@ export async function probeBackend(
 /**
  * Explicit "this build is the static demo" marker (Issue #286): set
  * `VITE_BANTO_DEMO=1` at build time (the GitHub Pages workflow does) and the
- * app goes straight to the in-memory demo providers without probing at all.
+ * app goes straight to the `server` providers without probing at all - they
+ * talk to the in-tab mock server `setup.ts` installs first (GitHub Pages のデモ、
+ * docs/demo-pages-design.md §3.1。以前は InMemory の demo の provider だった).
  * Builds without it (Tauri, the LAN-served `build/` embedded by banto-server)
  * never fall back to demo because of a failed request.
  */
