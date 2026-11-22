@@ -95,7 +95,8 @@ function parseTagIds(raw: string): number[] {
 	const trimmed = raw.trim();
 	if (trimmed === '') return [];
 	const ids = trimmed.split(',').map((part) => part.trim());
-	if (ids.some((part) => !/^[+-]?\d+$/.test(part))) {
+	// 本物は i64 で受ける。デモは `Number` で扱うので safe integer の外（`Infinity` になる長い整数も）は断る。
+	if (ids.some((part) => !/^[+-]?\d+$/.test(part) || !Number.isSafeInteger(Number(part)))) {
 		throw new DemoValidationError([
 			{ field: 'tagIds', message: 'タグ ID はカンマ区切りの整数で指定してください' }
 		]);

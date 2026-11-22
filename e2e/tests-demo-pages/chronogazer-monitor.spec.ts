@@ -53,6 +53,19 @@ test('ChronoGazer /monitor: 直に開くとトレンドに線が描かれ、時�
 	const base = currentServed;
 	await expect.poll(() => currentServed, { timeout: 15000 }).toBeGreaterThan(base + 1);
 
+	// 現在値が線に反映される: 時間窓を 1 分に絞ると、追従中の窓の右端は時計とともに進む。画面が現在値を捨てて
+	// 履歴だけで線を描いていると、線の右端は履歴の終わりで止まり、窓だけが進むので、待つほど線の右端と描画の
+	// 領域の右端の間が開く（8 秒で窓の 13% 超）。現在値が書き足されていれば、右端は直近のポーリングに追い付いている。
+	await page.locator('select:has(option[value="60"])').first().selectOption('60');
+	await expect(lines).not.toHaveCount(0);
+	await page.waitForTimeout(8000);
+	const gapRatio = await lines.first().evaluate((el) => {
+		const svg = el.ownerSVGElement ?? el.closest('svg');
+		const plot = svg!.getBoundingClientRect();
+		return (plot.right - el.getBoundingClientRect().right) / plot.width;
+	});
+	expect(gapRatio).toBeLessThan(0.05);
+
 	expect(traffic.unsupported).toEqual([]);
 	await expect(page.getByRole('alert').filter({ hasText: /\S/ })).toHaveCount(0);
 	expect(traffic.forbidden()).toEqual([]);

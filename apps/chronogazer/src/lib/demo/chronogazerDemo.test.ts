@@ -251,6 +251,12 @@ describe('createChronoGazerRoutes（口）', () => {
 		expect(await fields(`tagIds=1&fromMs=0&toMs=${32 * 86_400_000}&bins=10`)).toEqual(['toMs']);
 		expect(await fields(`tagIds=1&fromMs=${now - 1000}&toMs=${now}&bins=0`)).toEqual(['bins']);
 		expect(await fields(`tagIds=1&fromMs=${now - 1000}&toMs=${now}&bins=2001`)).toEqual(['bins']);
+		// safe integer の外（とても長い 10 進は Infinity になる）も tagIds の 422。
+		for (const bad of ['9007199254740993', '9'.repeat(400), '1,9007199254740993']) {
+			expect(await fields(`tagIds=${bad}&fromMs=${now - 1000}&toMs=${now}&bins=10`)).toEqual([
+				'tagIds'
+			]);
+		}
 		const many = Array.from({ length: 17 }, (_, i) => i + 1).join(',');
 		expect(await fields(`tagIds=${many}&fromMs=${now - 1000}&toMs=${now}&bins=10`)).toEqual([
 			'tagIds'
