@@ -8,9 +8,13 @@
 // - **判定の漏れは「必要なテストが走らない」側の失敗になる**ので、どの規則にも
 //   当たらないパスはフル CI に倒す（`full`）。迷うものは実行する側に倒す。
 // - 規則は上から順に見て、最初に当たったものを採る（具体的なものを先に書く）。
-// - push（main）・PR 以外の起動・`.github/**` の変更は、呼び出し側または規則で
-//   フル CI にする（main への push が常にフルなのは、Swatinem/rust-cache が main で
+// - PR 以外の起動・`.github/**` の変更は、呼び出し側または規則でフル CI にする。
+//   main への push も、docs だけの変更でなければフル（Swatinem/rust-cache が main で
 //   保存するキャッシュを workspace 全体のものに保つため。ci.yml の rust ジョブ参照）。
+//   **docs だけの push は PR の docs だけと同じ（Lint だけ）にする**（#ci-speed、
+//   2026-11-23）。docs だけの変更では Cargo.lock も Rust のソースも変わらないので、
+//   main のキャッシュを保存し直す必要がない。差分が取れない push（複数コミット・
+//   force push・タグ）は files が null なのでフル。
 //
 // 共有 crate（`crates/<name>/`）の変更は、依存グラフで絞る（2026-10-16 オーナー決定）:
 // - 依存グラフは `cargo metadata --format-version 1 --no-deps --offline`（ネットワーク
@@ -546,13 +550,21 @@ export function derive(a, crateAffected = []) {
  *   グラフ（`graphFromMetadata()`）。null なら `crates/` の変更は workspace 全体。
  */
 export function classify({ event, files, graph = null }) {
-	const forced =
-		event !== 'pull_request'
-			? `${event} イベント（PR 以外）はフル CI`
-			: files === null
-				? '差分を取得できなかった（安全側でフル CI）'
-				: null;
 	const { areas, matches } = classifyAreas(files ?? []);
+	// push（main）は、変更が docs だけのときに限りフルにしない（#ci-speed、2026-11-23）。
+	const docsOnlyPush =
+		event === 'push' &&
+		files !== null &&
+		areas.docs &&
+		Object.entries(areas).every(([k, v]) => k === 'docs' || !v);
+	const forced =
+		event === 'pull_request' || docsOnlyPush
+			? files === null
+				? '差分を取得できなかった（安全側でフル CI）'
+				: null
+			: event === 'push'
+				? 'push（main・タグ）は docs だけの変更でない限りフル CI'
+				: `${event} イベント（PR 以外）はフル CI`;
 	if (forced) areas.full = true;
 	const crates = resolveCrates(areas, matches, graph);
 	return { areas, matches, forced, crates, jobs: derive(areas, crates.affected) };
@@ -580,7 +592,7 @@ function main() {
 	if (filesPath && process.env.CI_DIFF_OK === 'true') {
 		files = readFileSync(filesPath, 'utf8').split('\n');
 	}
-	// グラフは PR で crates/ に触れたときだけ読む（push はどのみちフル CI）。
+	// グラフは PR で crates/ に触れたときだけ読む（push はフルか docs だけなので要らない）。
 	// 読めなければ null のまま = crates/ の変更は workspace 全体に倒れる。
 	/** @type {RustGraph | null} */
 	let graph = null;
