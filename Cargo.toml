@@ -368,3 +368,27 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.gimli]
 opt-level = 3
+
+# #ci-speed（2026-11-23）: SQLite・sqlx・SHA-2 も同じく dev・テストで最適化する。nextest の
+# 大きい試験（banto-hub-core・banto-hub-host の mcp・chronogazer-core）は SQLite のファイルを
+# 作ってマイグレーションを流す試験が多く、SQLite 本体（C）・sqlx の行の変換とクエリ実行・
+# マイグレーションのチェックサムの SHA-2 が、最適化なし（opt-level 0）だと遅いと見込んだ。
+# `libsqlite3-sys` は cc crate が crate の opt-level から C の最適化も決めるので、C の SQLite
+# にも効く。対象は実行時にリンクされる crate だけで、proc-macro（`sqlx-macros`・
+# `sqlx-macros-core`）は入れない（ビルド時にしか走らず、最適化してもビルドが増えるだけ）。
+# `cargo tree -i <名前> -e normal --workspace` で確かめた: `sqlx-mysql` は通常の依存として
+# 出ないので入れない。`sha2` は 0.10.9（async-opcua-crypto・cranelift-codegen 経由）と
+# 0.11.1（sqlx-core 経由）の 2 つの版があり、プロファイルの指定は名前だけで両方に効く。
+# `digest`・`hmac` は入れない（まず sha2 だけで測る）。
+# 効果は、この PR の CI の nextest の junit を前（#1318 のフル CI。合計 2717 秒・5634 本）と
+# 比べて確かめる（数字は後から書き足す）。
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
+[profile.dev.package.sqlx-core]
+opt-level = 3
+[profile.dev.package.sqlx-sqlite]
+opt-level = 3
+[profile.dev.package.sqlx-postgres]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
