@@ -5,7 +5,8 @@
 #             ├─ frontend-hub           （条件付き）
 #             ├─ frontend-chronogazer   （条件付き）
 #             ├─ rust                   （条件付き。fmt / clippy。対象は workspace 全体か -p に絞る）
-#             ├─ rust-test-build        （条件付き。テストを 1 回だけビルドして nextest archive にし、doctest も回す。対象は rust と同じ）
+#             ├─ rust-doctest           （条件付き。並列で `cargo test --doc`。対象は rust と同じ）
+#             ├─ rust-test-build        （条件付き。テストを 1 回だけビルドして nextest archive にする。対象は rust と同じ）
 #             │    ├─ rust-test         （rust-test-build の後。アーカイブを 3 台にシャーディングして実行）
 #             │    └─ rust-wasm         （条件付き。WASM Hub components の ignored テスト。workspace 全体・WASM に関わる host のソース/試験・
 #             │                           banto-driver-wasm / banto-drivers に届く crate の変更のとき。main への push は常に走る（2026-11-22）。
@@ -41,7 +42,7 @@
 #   設定は全 frontend + 両 E2E。
 # - 画面だけの変更（`apps/banto-hub/src/**`・`apps/chronogazer/src/**` と、アプリ直下の
 #   package.json・vite/vitest/svelte の設定・tsconfig）は、frontend-<app> と e2e-<app> だけ走らせ、
-#   Rust 系のジョブ（rust・rust-test-build・rust-test・rust-wasm・rust-db-source・linux-clippy・
+#   Rust 系のジョブ（rust・rust-test-build・rust-doctest・rust-test・rust-wasm・rust-db-source・linux-clippy・
 #   driver-api）は走らせない（2026-11-22 オーナー決定）。Rust が読む `static/`・`src-tauri/`・
 #   `core/`・`host/`・`installer/` と、Rust の試験が読む `bridgeLoad.fixtures.json` は今までどおり。
 # - rust-wasm は、host の WASM に関わるソース/試験（`wasm_plugins.rs`・`banto-hub.rs`・`win_service.rs`・tests/t12_*・*wasm*・
@@ -61,10 +62,12 @@
 # テストバイナリを 1 回だけビルドして nextest archive（artifact `nextest-archive`、
 # 保持 1 日）にし、rust-test が 3 台のシャードでそれを展開して走らせる（ビルドしない。
 # 目的は Windows ランナーの使用時間の削減で、待ち時間は縮まらない）。doctest は nextest
-# で走らないので、rust-test-build が archive 作成後に `cargo test --doc` を回す
-# （archive ビルドでコンパイル済みの lib を再利用でき、rust ジョブで test プロファイルを
-# もう 1 回フルビルドするより速い。rust ジョブの所要時間が最長だった）。rust・
-# rust-test-build はどちらも `run_rust` と `rust_args`（ci-changes.mjs の出力）を使う。
+# で走らないので `cargo test --doc` を別に回す。以前は rust-test-build が archive 作成後に
+# 回していた（コンパイル済みの lib を再利用でき、rust ジョブで test プロファイルを
+# もう 1 回フルビルドするより速い）が、シャードが doctest の 47〜65 秒を待つので、
+# 2026-11-23 に並列の `rust-doctest` ジョブへ分けた（依存のキャッシュは読むだけ。
+# lib はもう 1 回ビルドするので Windows ランナーの時間は増える。オーナーが受け入れた）。
+# rust・rust-test-build・rust-doctest はいずれも `run_rust` と `rust_args`（ci-changes.mjs の出力）を使う。
 # デバッグ情報は `CARGO_PROFILE_DEV_DEBUG=line-tables-only` で軽くしている。
 # `--timings` は rust ジョブの clippy と rust-test-build の archive ビルドに付け、crate
 # ごとのビルド時間の HTML を artifact（`cargo-timings-clippy`・`cargo-timings-test`、
@@ -335,7 +338,7 @@ jobs:
     # saves (and PRs restore) stays a full-workspace cache.
     #
     # #ci-speed（2026-10-19）: nextest は下の `rust-test` ジョブへ分けた。このジョブは
-    # fmt / clippy だけを回す（doctest は rust-test-build）。
+    # fmt / clippy だけを回す（doctest は rust-doctest）。
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -386,7 +389,7 @@ jobs:
   #   （ビルド → テストが直列になる）ことは承知の上で、ビルドの 3 重化をやめる。
   # - 新しく足した最初の 1 回はキャッシュが外れて、ビルドが長くなる。
   rust-test-build:
-    name: Rust test build (nextest archive / doctest)
+    name: Rust test build (nextest archive)
     needs: changes
     if: needs.changes.outputs.run_rust == 'true'
     runs-on: windows-latest
@@ -418,14 +421,6 @@ jobs:
           path: nextest-archive.tar.zst
           if-no-files-found: error
           retention-days: 1
-      # nextest は doctest を走らせない。archive のビルドでコンパイル済みの lib を
-      # 再利用できるので、rust ジョブで test プロファイルをもう 1 回フルビルドせず
-      # ここで回す。シャードはこのジョブを待つので doctest の分だけ開始が遅れる
-      # （実測: doctest 本体は約 5 秒 + doc のコンパイル）。archive のアップロードを
-      # 先に済ませてから回す。doctest が落ちるとこのジョブが失敗し、シャードは
-      # 走らない（ci-gate も赤になるので見落としはしない）。
-      - name: test (doctest)
-        run: cargo test --doc ${{ needs.changes.outputs.rust_args }}
       # crate ごとのビルド時間（nextest のテストビルド）。失敗しても残す。
       - name: Upload cargo timings
         if: always()
@@ -435,6 +430,35 @@ jobs:
           path: target/cargo-timings/cargo-timing-*.html
           if-no-files-found: ignore
           retention-days: 14
+
+  # #ci-speed（2026-11-23）: doctest を `rust-test-build` から別ジョブに切り出した。
+  # rust-test-build の末尾に直列で付けると、シャード（rust-test）と rust-wasm が
+  # doctest の分（47〜65 秒）だけ待たされてクリティカルパスに乗る。別ジョブなら
+  # archive → シャードの流れと並列に走る。
+  # - 依存のキャッシュは rust-test-build が main で保存したものを読むだけ
+  #   （save-if: false。リポジトリのキャッシュ上限 10GB のため、理由は上の
+  #   rust-test-build のコメント）。env もキーに入るので rust-test-build と揃える。
+  # - workspace の lib はこのジョブでもう 1 回ビルドする。Windows ランナーの使用時間は
+  #   増えるが、待ち時間を縮める代わりとしてオーナーが受け入れた。
+  rust-doctest:
+    name: Rust doctest
+    needs: changes
+    if: needs.changes.outputs.run_rust == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      # rust-test-build と同じ（rust-cache のキーに CARGO_* の env が入るので揃える）。
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-test
+          save-if: false
+      # nextest は doctest を走らせないので、ここで回す。
+      - name: test (doctest)
+        run: cargo test --doc ${{ needs.changes.outputs.rust_args }}
 
   # #ci-speed（2026-10-28）: WASM Hub components の ignored テスト（約 17 分）を
   # `rust-test-build` から別ジョブに切り出した。rust-test-build の末尾に直列で付けると、
@@ -1530,6 +1554,7 @@ jobs:
       - frontend-chronogazer
       - rust
       - rust-test-build
+      - rust-doctest
       - rust-wasm
       - rust-test
       - rust-db-source
@@ -1580,6 +1605,7 @@ jobs:
           check frontend-chronogazer run_frontend_chronogazer
           check rust run_rust
           check rust-test-build run_rust
+          check rust-doctest run_rust
           check rust-wasm run_wasm
           check rust-test run_rust
           check rust-db-source run_rust_db_source
