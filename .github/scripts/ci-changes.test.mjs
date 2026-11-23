@@ -802,8 +802,30 @@ for (const [name, files, expected] of TABLE) {
 	});
 }
 
-test('push（main）は変更内容に関係なくフル', () => {
-	assert.deepEqual(classify({ event: 'push', files: ['docs/plan.md'] }).jobs, ALL);
+test('push（main）で docs だけなら PR の docs だけと同じ', () => {
+	const files = ['docs/plan.md', 'docs/hub/tag-server-design.md', 'README.md'];
+	const r = classify({ event: 'push', files });
+	assert.equal(r.forced, null);
+	assert.deepEqual(r.jobs, NONE);
+	assert.deepEqual(r.jobs, classify({ event: 'pull_request', files }).jobs);
+});
+
+test('push（main）で docs 以外が 1 つでも混ざればフル', () => {
+	for (const other of [
+		'crates/banto-rtsp/src/lib.rs',
+		'.github/workflows/ci.yml',
+		'unknown-dir/foo.bin'
+	]) {
+		const r = classify({ event: 'push', files: ['docs/plan.md', 'README.md', other] });
+		assert.ok(r.forced, other);
+		assert.deepEqual(r.jobs, ALL, other);
+	}
+});
+
+test('push（main）で差分が無い・取れないときはフル', () => {
+	assert.deepEqual(classify({ event: 'push', files: null }).jobs, ALL);
+	assert.deepEqual(classify({ event: 'push', files: [] }).jobs, ALL);
+	assert.deepEqual(classify({ event: 'push', files: [''] }).jobs, ALL);
 });
 
 test('PR 以外の起動（workflow_dispatch 等）はフル', () => {
@@ -1565,11 +1587,8 @@ test('実グラフ: run_wasm は banto-drivers・banto-driver-wasm に届く cra
 });
 
 test('run_wasm: main への push は常に true（PR で省いた分は push で検証する）', () => {
-	for (const f of [
-		'apps/banto-hub/host/src/lib.rs',
-		'docs/plan.md',
-		'apps/banto-hub/src/app.css'
-	]) {
+	// docs だけの push は例外（Lint だけ。2026-11-23 #ci-speed）。
+	for (const f of ['apps/banto-hub/host/src/lib.rs', 'apps/banto-hub/src/app.css']) {
 		const r = classify({ event: 'push', files: [f], graph: G });
 		assert.equal(r.jobs.run_wasm, true, f);
 		assert.equal(r.jobs.rust_args, '--workspace', f);

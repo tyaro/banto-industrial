@@ -9,7 +9,7 @@
 #             ├─ rust-test-build        （条件付き。テストを 1 回だけビルドして nextest archive にする。対象は rust と同じ）
 #             │    ├─ rust-test         （rust-test-build の後。アーカイブを 3 台にシャーディングして実行）
 #             │    └─ rust-wasm         （条件付き。WASM Hub components の ignored テスト。workspace 全体・WASM に関わる host のソース/試験・
-#             │                           banto-driver-wasm / banto-drivers に届く crate の変更のとき。main への push は常に走る（2026-11-22）。
+#             │                           banto-driver-wasm / banto-drivers に届く crate の変更のとき。main への push は docs だけでなければ走る（2026-11-22）。
 #             │                           rust-test-build の後で、アーカイブを再利用しテストはビルドしない。ゲストの wasm だけビルドする）
 #             ├─ rust-db-source         （条件付き。PostgreSQL）
 #             ├─ linux-clippy           （条件付き。昇格まわりの 2 crate を ubuntu で）
@@ -25,7 +25,10 @@
 #
 # 判定は `.github/scripts/ci-changes.mjs`（純関数 + 判定表テスト
 # `ci-changes.test.mjs`。ローカルでは `node --test .github/scripts/ci-changes.test.mjs`）。
-# - push（main）と PR 以外の起動はフル CI（安全側）。
+# - PR 以外の起動（タグの push・手動）はフル CI（安全側）。main への push もフルだが、
+#   1 コミットだけの push で変更が docs だけなら PR の docs だけと同じ（Lint だけ）。
+#   docs だけでは Cargo.lock も Rust のソースも変わらず、main のキャッシュを保存し直す
+#   必要がない（#ci-speed、2026-11-23）。
 # - `.github/**`・`scripts/**`・どの規則にも当たらないパスはフル CI。
 # - `crates/<name>/**` は、そのパッケージと、それに（推移的に）依存する workspace の
 #   パッケージだけを `-p` で clippy / test する（依存グラフは changes ジョブで
@@ -174,9 +177,27 @@ jobs:
 
       - name: List changed files
         id: diff
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        env:
+          CI_EVENT: ${{ github.event_name }}
+          CI_BEFORE: ${{ github.event.before }}
         run: |
           out="$RUNNER_TEMP/changed.txt"
+          # main への push（#ci-speed、2026-11-23）: HEAD^1 が push 前の先端と一致する
+          # = 1 コミットだけの push（squash マージの通常の形）のときだけ差分を取る。
+          # 複数コミット・force push・before が 0 埋めなら ok=false でフル CI。
+          if [ "$CI_EVENT" = push ]; then
+            if [ "$(git rev-parse -q --verify 'HEAD^1' 2>/dev/null)" = "$CI_BEFORE" ] \
+              && git -c core.quotePath=false diff --name-only --no-renames 'HEAD^1' HEAD > "$out"; then
+              echo "ok=true" >> "$GITHUB_OUTPUT"
+              echo "changed files: $(wc -l < "$out")"
+              cat "$out"
+            else
+              echo "ok=false" >> "$GITHUB_OUTPUT"
+              echo "::warning::push の差分が 1 コミットぶんではないのでフル CI にする"
+            fi
+            exit 0
+          fi
           # HEAD^2 が無い = マージコミットではない（想定外の checkout）。
           # そのときは ok=false にして判定側でフル CI に倒す。
           if git rev-parse --verify -q 'HEAD^2' >/dev/null \
@@ -334,7 +355,8 @@ jobs:
     # no credentials - no token or insteadOf rewrite is needed here.
     #
     # #468: the job id stays `rust` so Swatinem/rust-cache keeps its existing
-    # key. main pushes always run the full workspace, so the cache main
+    # key. main pushes run the full workspace (except docs-only pushes, 2026-11-23, #ci-speed:
+    # nothing cached changes), so the cache main
     # saves (and PRs restore) stays a full-workspace cache.
     #
     # #ci-speed（2026-10-19）: nextest は下の `rust-test` ジョブへ分けた。このジョブは
