@@ -344,14 +344,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # rustfmt only parses/reformats - no compilation, so it always covers
+      # every workspace member (cheap), whatever the clippy/test scope below.
+      # #ci-speed（2026-11-23）: fmt はコンパイルせずキャッシュも使わないので、rust-cache の復元（約 80 秒）より前に回し、整形の誤りを早く知らせる。
+      - name: fmt
+        run: cargo fmt --all --check
       # `cache-workspace-crates` は見送った（#638 レビュー: rust-cache のキーにソースの中身が入らず、完全一致の復元では保存されない。checkout で更新時刻も新しくなり、自前の crate は結局ビルドし直しになる）。
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # rustfmt only parses/reformats - no compilation, so it always covers
-      # every workspace member (cheap), whatever the clippy/test scope below.
-      - name: fmt
-        run: cargo fmt --all --check
       # Scope (`rust_args`, from the changes job): `--workspace` when the root
       # Cargo.toml/Cargo.lock, toolchain, proto, .cargo, .config or .github
       # changed (and on every push to main); otherwise `-p` for the touched
