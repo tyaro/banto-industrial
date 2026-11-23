@@ -1151,12 +1151,17 @@ jobs:
   # apt でのシステムパッケージ導入は不要: banto-hub-core は Tauri/WebKitGTK に
   # 依存しない（`e2e-hub` ジョブが同じ ubuntu-latest で
   # `cargo build -p banto-hub-host --bin banto-hub`（core を含む）を素で通しているのが実証）。
+  #
+  # 2026-11-23: banto-hub-host の統合試験 mcp の 1 件（実 PostgreSQL の接続テスト）と、
+  # banto-hub-core の rest の同名の 1 件も、ここで走らせる。ci-changes.mjs の
+  # JOB_PACKAGES には host を足さない（足すとほぼ全部の共有 crate の変更でこのジョブが走る。
+  # host の試験ファイルは apps/banto-hub/** なので、今の規則でもこのジョブは走る）。
   rust-db-source:
     name: Rust (db-source / PostgreSQL)
     needs: changes
     if: needs.changes.outputs.run_rust_db_source == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:16
@@ -1186,6 +1191,26 @@ jobs:
       # 含む - こちらも BANTO_TEST_PG_URL があるときだけ実 DB を触る）。
       - name: test (db_source unit)
         run: cargo test -p banto-hub-core --lib db_source
+      # `BANTO_TEST_PG_URL` が無いと skip する試験で、これまで CI のどこでも実 DB で走って
+      # いなかった（2026-11-23 に足した）。`--exact` は 0 件一致でも緑になるので、1 件走った
+      # ことと skip の分岐を通っていないことを出力で確かめる。
+      - name: test (rest postgres_connections, real PostgreSQL)
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p banto-hub-core --lib -- --exact rest::tests::postgres_connections::test_saved_connection_against_a_real_postgresql_returns_the_server_version --nocapture 2>&1 | tee "$RUNNER_TEMP/pg-one.log"
+          grep -q 'test result: ok. 1 passed' "$RUNNER_TEMP/pg-one.log" || { echo "::error::the test did not run exactly once (renamed?)"; exit 1; }
+          if grep -q 'skipped: BANTO_TEST_PG_URL unset' "$RUNNER_TEMP/pg-one.log"; then echo "::error::the test skipped (BANTO_TEST_PG_URL unset)"; exit 1; fi
+      # 同じ試験の host 版。`banto-hub-host` の統合試験 mcp をこのジョブでビルドする
+      # （e2e-hub が同じ ubuntu で `cargo build -p banto-hub-host --bin banto-hub` を通して
+      # いるので apt は要らない）。上と同じく、これまで CI のどこでも実 DB で走っていなかった。
+      - name: test (host mcp test_saved_connection, real PostgreSQL)
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p banto-hub-host --test mcp -- --exact test_saved_connection_against_a_real_postgresql_returns_the_server_version --nocapture 2>&1 | tee "$RUNNER_TEMP/pg-one.log"
+          grep -q 'test result: ok. 1 passed' "$RUNNER_TEMP/pg-one.log" || { echo "::error::the test did not run exactly once (renamed?)"; exit 1; }
+          if grep -q 'skipped: BANTO_TEST_PG_URL unset' "$RUNNER_TEMP/pg-one.log"; then echo "::error::the test skipped (BANTO_TEST_PG_URL unset)"; exit 1; fi
       # R2a-3a: db_source と DB ブリッジ（R2a-3b）が共有する crate（列→f64 の変換・
       # 列の解決・品質の梯子・接続オプション）。単体テストは PostgreSQL なしで走る
       # が、この crate を触ったときに確実にこのジョブも走るよう（ci-changes.mjs の

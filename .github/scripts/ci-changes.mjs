@@ -249,6 +249,8 @@ export const RUST_PACKAGES = {
  * - rust-db-source: `-p banto-hub-core`（db_source）と `-p banto-hub-sink`、加えて
  *   `-p banto-db-source`（R2a-3a。db_source・DB ブリッジが共有する crate。単体テストは
  *   PostgreSQL なしで走るが、ジョブの段で `cargo test -p banto-db-source` も流す）
+ *   さらに `banto-hub-host` の統合試験 mcp の 1 件も走らせる（host は JOB_PACKAGES に足さない。
+ *   試験ファイルが apps/banto-hub/** にあり、今の規則でもこのジョブは走る）
  * - linux-clippy: `-p chronogazer-elev -p banto-hub-core --lib`、`-p banto-hub-host
  *   --all-targets`（R1-7a で bin が移った先）、加えて
  *   `-p banto-instance-lock` の clippy・test（その段は Rust の対象にこの crate が
