@@ -251,6 +251,20 @@ pub fn resolve_hub_root(
     resolve_hub_root_impl(cfg!(windows), env_root, program_data, xdg, home)
 }
 
+/// env（`BANTO_HUB_ROOT`・`ProgramData`・`XDG_DATA_HOME`・`HOME`）から hub の root を
+/// 解決する（[`resolve_hub_root`] に env を渡すだけ）。起動（`HubRuntime::start` の
+/// profile 排他）・CLI の `create-admin`（`crate::first_admin::run_create_admin`）・
+/// [`resolve_profile_paths_from_env`] が**この 1 つ**を通る（banto v8 追従、
+/// docs/banto-v8-upgrade-plan.md §5 の 3「CLI はサービスと同じ DB・権限を使う」）。
+pub fn resolve_hub_root_from_env() -> PathBuf {
+    resolve_hub_root(
+        std::env::var("BANTO_HUB_ROOT").ok().as_deref(),
+        std::env::var("ProgramData").ok().as_deref(),
+        std::env::var("XDG_DATA_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
 /// env（`BANTO_HUB_ROOT`/`BANTO_HUB_PROFILE`）から[`ProfilePaths`]を解決する。
 /// [`build_hub_config_from_env`]の内側で使うのと同じ root/profile_id 解決
 /// ロジックを、`db_path`/`data_dir_override`の上書き適用より前の状態
@@ -259,12 +273,7 @@ pub fn resolve_hub_root(
 /// `logs_dir`だけを先に必要とする。[`build_hub_config_from_env`]自身も
 /// これを呼ぶ。
 pub fn resolve_profile_paths_from_env() -> ProfilePaths {
-    let root = resolve_hub_root(
-        std::env::var("BANTO_HUB_ROOT").ok().as_deref(),
-        std::env::var("ProgramData").ok().as_deref(),
-        std::env::var("XDG_DATA_HOME").ok().as_deref(),
-        std::env::var("HOME").ok().as_deref(),
-    );
+    let root = resolve_hub_root_from_env();
 
     let requested_profile_id = std::env::var("BANTO_HUB_PROFILE")
         .ok()

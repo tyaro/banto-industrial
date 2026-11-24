@@ -1003,6 +1003,7 @@ dependencies = [
  "chrono",
  "embed-resource",
  "futures-util",
+ "libc",
  "ring",
  "rumqttc",
  "rumqttd",

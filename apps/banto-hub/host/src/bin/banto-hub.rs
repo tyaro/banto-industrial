@@ -82,6 +82,8 @@
 // バイナリターゲットとして自動検出してしまう（`[[bin]]`で明示済みの
 // `banto-hub`とは別に、`win_service.rs`単体にも`fn main()`を要求される）
 // ため、直下ではなくサブディレクトリ + `#[path]`で読み込む。
+#[path = "banto_hub/password_input.rs"]
+mod password_input;
 #[path = "banto_hub/wasm_plugins.rs"]
 mod wasm_plugins;
 #[cfg(windows)]
@@ -141,7 +143,7 @@ fn print_usage() {
     eprintln!("  create-admin --username <名前> [--display-name <表示名>]");
     eprintln!("                Hub の設定 DB に管理者のアカウントを作り、同時にロックダウン（ログイン必須）");
     eprintln!(
-        "                にする。パスワードは標準入力の 1 行目から読む（例: < password.txt）。"
+        "                にする。パスワードは端末なら非表示で 2 回尋ね、パイプ・ファイルなら 1 行目を読む。"
     );
     eprintln!("                Hub・サービスを止めてから実行する");
     #[cfg(windows)]
@@ -190,29 +192,28 @@ fn parse_create_admin_args(args: &[String]) -> Result<CreateAdminArgs, String> {
     })
 }
 
-/// 標準入力の 1 行目をパスワードとして読む（末尾の改行だけを落とす。空白は残す）。
-/// 端末からの入力は画面に表示されてしまうので受け付けない（ファイルかパイプで渡す）。
-/// 非表示の入力（上流 #866 の `password_input`）は後で足す。
-fn read_password_from_stdin() -> Result<String, String> {
-    use std::io::{BufRead, IsTerminal};
-    let stdin = std::io::stdin();
-    if stdin.is_terminal() {
-        return Err(
-            "パスワードは端末からは受け付けません（入力が表示されるため）。\
-             パスワードをファイルに書いて < password.txt で渡してください"
-                .to_string(),
-        );
+/// 新しい管理者のパスワードを読む（上流 banto の `banto-serve create-admin` と同じ、#866）。
+/// 端末からは入力を表示せず 2 回尋ねる（打ち間違えると唯一の管理者がログインできない）。
+/// パイプ・ファイルからは標準入力の 1 行目（末尾の改行だけを落とす。空白は残す）。
+fn read_new_password() -> Result<String, String> {
+    use crate::password_input as pw;
+    if !pw::stdin_is_terminal() {
+        return pw::read_password_line(&mut std::io::stdin().lock())
+            .map_err(|err| format!("パスワードを読めませんでした: {err}"));
     }
-    let mut line = String::new();
-    stdin
-        .lock()
-        .read_line(&mut line)
-        .map_err(|err| format!("パスワードを読めませんでした: {err}"))?;
-    let trimmed = line
-        .strip_suffix('\n')
-        .map(|rest| rest.strip_suffix('\r').unwrap_or(rest))
-        .unwrap_or(&line);
-    Ok(trimmed.to_string())
+    let (first, second) = pw::read_password_twice_hidden(
+        "パスワード（入力は表示されません）: ",
+        "パスワード（確認のためもう一度）: ",
+    )
+    .map_err(|err| {
+        format!(
+            "パスワードを非表示で読めませんでした: {err}（Git Bash・MSYS などの疑似端末では使えません。             PowerShell・cmd・通常の端末で実行するか、パスワードをファイルに書いて < password.txt で渡してください）"
+        )
+    })?;
+    if !pw::confirmation_matches(&first, &second) {
+        return Err("2 回の入力が一致しません".to_string());
+    }
+    Ok(first)
 }
 
 /// `banto-hub create-admin`。待ち受けずに終わる。プロセスの終了コードを返す。
@@ -225,7 +226,7 @@ fn create_admin(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let password = match read_password_from_stdin() {
+    let password = match read_new_password() {
         Ok(password) => password,
         Err(message) => {
             eprintln!("banto-hub: {message}。DB には触れていません");

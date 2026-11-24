@@ -89,8 +89,9 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(h.icacls_explicit_users_aces("  BUILTIN\\Users:(I)(RX)\n"), [])
 
     def test_status(self):
-        self.assertTrue(h.status_initialized({"initialized": True, "grants": {}}))
-        self.assertFalse(h.status_initialized({"initialized": False}))
+        self.assertTrue(h.status_initialized({"lockedDown": True}))
+        self.assertFalse(h.status_initialized({"lockedDown": False}))
+        self.assertFalse(h.status_initialized({"initialized": True}))
         self.assertFalse(h.status_initialized({}))
 
 

@@ -133,12 +133,9 @@ pub async fn run_create_admin(
     let _lock = if config.skip_profile_lock {
         None
     } else {
-        let root = crate::profile_paths::resolve_hub_root(
-            std::env::var("BANTO_HUB_ROOT").ok().as_deref(),
-            std::env::var("ProgramData").ok().as_deref(),
-            std::env::var("XDG_DATA_HOME").ok().as_deref(),
-            std::env::var("HOME").ok().as_deref(),
-        );
+        // 起動（`HubRuntime::start`）と同じ root の解き方（同じ関数）。`config` は起動と
+        // 同じ `build_hub_config_from_env` で組む（bin の `create_admin`）。
+        let root = crate::profile_paths::resolve_hub_root_from_env();
         let paths = crate::profile_paths::resolve_profile_paths(&root, &config.profile_id)
             .map_err(|err| BantoError::Other(format!("profile の場所を決められません: {err}")))?;
         Some(

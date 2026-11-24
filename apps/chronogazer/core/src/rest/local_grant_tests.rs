@@ -394,6 +394,69 @@ async fn a_lan_listener_never_issues() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+/// banto v8（docs/banto-v8-upgrade-plan.md §5 の 3）: ログインなし（新しい DB の既定、
+/// ロールは admin）でも、LAN の peer には管理者の権限が広がらない。grant は出ず、資格情報
+/// なしの管理の口は 401、組み込みの `admin` でもログインできない（この PC の listener・
+/// LAN の listener の両方のルーター、Host が loopback でも LAN の名前でも）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_login_gives_a_lan_peer_no_admin_rights() {
+    for always_on_listener in [true, false] {
+        let f = fixture(
+            LocalGrantStart::NoLogin(Role::Admin),
+            always_on_listener,
+            &[],
+        )
+        .await;
+        for host in [Some(LOCAL_HOST), Some("192.168.1.5:8721")] {
+            let at = format!("listener {always_on_listener} host {host:?}");
+            let (status, _) = grant(&f.router, Some(LAN), host).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{at}");
+            for (method, path, body) in [
+                ("GET", "/api/settings/auth", None),
+                ("GET", "/api/users", None),
+                (
+                    "PUT",
+                    "/api/settings/auth",
+                    Some(json!({ "localGrant": "admin" })),
+                ),
+                (
+                    "POST",
+                    "/api/users",
+                    Some(json!({ "username": "intruder", "password": PASSWORD,
+                                "displayName": "x", "role": "admin" })),
+                ),
+            ] {
+                let (status, reply) =
+                    send(&f.router, method, path, Some(LAN), host, None, body).await;
+                assert_eq!(
+                    status,
+                    StatusCode::UNAUTHORIZED,
+                    "{at} {method} {path}: {reply}"
+                );
+            }
+            let (_, reply) = send(
+                &f.router,
+                "POST",
+                "/api/auth/login",
+                Some(LAN),
+                host,
+                None,
+                Some(json!({ "username": "admin", "password": PASSWORD })),
+            )
+            .await;
+            // banto のログインの失敗は `200 { success: false }`。
+            assert_ne!(reply["success"], true, "{at}: {reply}");
+            assert!(reply["token"].is_null(), "{at}: {reply}");
+        }
+        assert_eq!(grant_logins(&f.audit).await, 0);
+        let accounts = f.users.list_users().await.expect("list_users");
+        assert!(
+            accounts.iter().all(|user| user.username != "intruder"),
+            "an account was created from the LAN"
+        );
+    }
+}
+
 /// 初期化後: 設定 `off`（既定）は `403`。viewer・editor・admin はその role で発行する。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn initialized_issues_the_configured_role() {

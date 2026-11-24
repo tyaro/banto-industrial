@@ -214,7 +214,7 @@ use crate::profile_lock::{
     try_acquire_profile_lock, try_acquire_profile_lock_in, HubHostKind, ProfileDirs,
     ProfileDirsError, ProfileLockError, ProfileLockGuard,
 };
-use crate::profile_paths::{resolve_hub_root, resolve_profile_paths, DB_FILE_NAME};
+use crate::profile_paths::{resolve_hub_root_from_env, resolve_profile_paths, DB_FILE_NAME};
 use crate::rest::{api_router_with_controller, opcua_settings_router, user_auth_state};
 use crate::settings::{HubSettingsExt, SettingsService};
 use crate::subscribe_core::EVAL_TICK_MS;
@@ -487,12 +487,7 @@ impl HubRuntime {
         let profile_lock: Option<ProfileLockGuard> = if skip_profile_lock {
             None
         } else {
-            let root = resolve_hub_root(
-                std::env::var("BANTO_HUB_ROOT").ok().as_deref(),
-                std::env::var("ProgramData").ok().as_deref(),
-                std::env::var("XDG_DATA_HOME").ok().as_deref(),
-                std::env::var("HOME").ok().as_deref(),
-            );
+            let root = resolve_hub_root_from_env();
             let guard = resolve_profile_paths(&root, &profile_id)
                 .map_err(ProfileLockError::from)
                 .and_then(|paths| match &given_dirs {

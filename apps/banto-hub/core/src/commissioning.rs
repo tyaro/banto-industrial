@@ -73,6 +73,10 @@ use crate::users::{ReservedUsernames, Role, UsersService};
 /// でユーザー数によるフォールバック判定は撤回した）。
 pub(crate) const KEY_LOCKED_DOWN: &str = "commissioning.locked_down";
 
+/// banto の認証モードの設定のキー（`banto_admin_services::settings` の `auth.disabled`。
+/// 上流の定数は公開されていない）。[`CommissioningService::lock_down`] が `false` を書く。
+const KEY_AUTH_DISABLED: &str = "auth.disabled";
+
 /// 試運転モードの grant セッション（[`commissioning_grant_spec`]）の固定
 /// identity の `id`。実在ユーザーの `username`（`users.username`は
 /// 空文字を許さない・`MIN_USERNAME_LEN = 1`）とは絶対に衝突しない固定値と
@@ -243,9 +247,11 @@ pub fn enforce_loopback_when_commissioning(bind: &str, locked_down: bool) -> Res
     }
     Err(format!(
         "banto-hub: 試運転モード（未ロックダウン）のまま非 loopback バインド（{bind}）で\
-         起動することはできません。対処: (a) 管理 UI からロックダウンを実行してから\
-         起動し直すか、(b) server.bind / BANTO_BIND を 127.0.0.1 等の loopback アドレスに\
-         変更してください。（docs/hub/tag-server-design.md §5.6「試運転モードとロックダウン」\
+         起動することはできません。対処: (a) Hub・サービスを止めて \
+         `banto-hub create-admin --username <名前>`（パスワードは標準入力）で最初の管理者を\
+         作る（同時にロックダウンします）か、loopback で起動して管理 UI からロックダウンを\
+         実行してから起動し直すか、(b) server.bind / BANTO_BIND を 127.0.0.1 等の loopback \
+         アドレスに変更してください。（docs/hub/tag-server-design.md §5.6「試運転モードとロックダウン」\
          制約1: 認証なしの状態をネットワークへ露出させないための安全装置です）"
     ))
 }
@@ -341,6 +347,12 @@ impl CommissioningService {
             if !self.users.has_admin().await? {
                 return Err(no_admin_account_error());
             }
+            // banto v8: 新しい DB は `0015_auth_mode_defaults.sql` が `auth.disabled = true` を
+            // 入れる。Hub の認証は banto の既定のログイン必須（`AuthState` の
+            // `switch_auth_mode` を呼ばない）で `auth.disabled` を読まないが、CLI の
+            // `create-admin`（`crate::first_admin`）と同じく、ロックダウンの前に banto の
+            // 設定もログイン必須に揃える（食い違った DB を残さない）。
+            self.settings.set(KEY_AUTH_DISABLED, "false").await?;
             self.settings.set(KEY_LOCKED_DOWN, "true").await?;
             self.state.set_locked_down(true);
         }

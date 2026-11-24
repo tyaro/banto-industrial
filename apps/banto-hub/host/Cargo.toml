@@ -38,10 +38,18 @@ tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
 # #392 B3-3b（監査 C4）: `banto-hub-elev` の `main` の先頭の
 # `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`（昇格したプロセスの DLL の
 # 探し先を System32 に限る）。R1-7a で core から移した。
+# banto v8（上流 #866 の写し）: `banto-hub create-admin` のパスワードの非表示の入力
+# （`src/bin/banto_hub/password_input.rs`、`GetConsoleMode`・`SetConsoleMode`）。
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_LibraryLoader",
+    "Win32_System_Console",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+# banto v8（上流 #866 の写し）: 同じ非表示の入力の termios。Cargo.lock に既にある 0.2.191
+# （推移的な依存）で、新しいパッケージは増えない。
+libc = "0.2"
 
 [target.'cfg(windows)'.dev-dependencies]
 # `bin/banto_hub/win_service_tests.rs`（Windows 専用）の
