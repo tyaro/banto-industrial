@@ -166,21 +166,25 @@ async def run(binary: Path):
     with tempfile.TemporaryDirectory(prefix="banto-hub-opcua-") as temp:
         root = Path(temp)
         env = child_env(root, http_port, profile)
-        env["BANTO_ALLOW_SETUP"] = "1"
+        admin_password = "Interop-201-test-password!"
         log_path = root / "hub.log"
         process = None
         api_key = None
         with log_path.open("w+b") as log:
             rest = Rest(f"http://127.0.0.1:{http_port}")
             try:
+                # banto v8: 最初の管理者は Hub 起動前に create-admin で作る
+                subprocess.run(
+                    [str(binary), "create-admin", "--username", "interop-admin",
+                     "--display-name", "Interop test"],
+                    env=env, input=(admin_password + "\n").encode(),
+                    stdout=log, stderr=subprocess.STDOUT, check=True, timeout=120,
+                )
                 process = start_hub(binary, env, log)
                 wait_rest(rest, process)
-                admin_password = "Interop-201-test-password!"
-                session = rest.expect("POST", "/api/auth/setup", {
+                rest.token = rest.expect("POST", "/api/auth/login", {
                     "username": "interop-admin", "password": admin_password,
-                    "displayName": "Interop test",
-                }, admin=False)
-                rest.token = session["token"]
+                }, admin=False)["token"]
 
                 connections = rest.expect("GET", "/api/plc-connections")
                 mem = next((c for c in connections if c.get("name") == "mem"), None)
@@ -274,7 +278,6 @@ async def run(binary: Path):
 
                 stop_hub(process)
                 process = None
-                env.pop("BANTO_ALLOW_SETUP", None)
                 process = start_hub(binary, env, log)
                 rest = Rest(f"http://127.0.0.1:{http_port}")
                 wait_rest(rest, process)
