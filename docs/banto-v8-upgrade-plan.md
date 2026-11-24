@@ -1,7 +1,7 @@
 # banto v8.0.0 への追従の計画
 
 作成日: 2026-11-24
-状態: **計画**（2026-11-24。オーナー決定 3 件と、PR1 の受け入れ条件 3 件（§5、オーナーのレビュー）を記録。実装は未着手）
+状態: **実装中**（2026-11-24。PR0a は #1336 で済み、PR0c は本 PR（#1336 の次）。PR1 は未着手。オーナー決定 3 件と、PR1 の受け入れ条件 3 件（§5、オーナーのレビュー）を記録）
 
 関連: [banto v8.0.0 のリリースノート](https://github.com/tyaro/banto/releases/tag/v8.0.0)、banto の `docs/upgrading.md` 4.2 節、banto の ADR-0034（持ち主の id と組み込みの `admin`）・ADR-0035（書き込みを切断から切り離す）。
 
@@ -40,8 +40,8 @@
 
 ## 4. PR の分け方
 
-1. **PR0a（v7.9 のまま、機械的）**: 試験・E2E で作るユーザーの名前を `admin` から替える。v7.9 でもできるなら、試験の `setup_first_user` を `create_user(.., Role::Admin)` に替える。
-2. **PR0c**: `libsqlite3-sys` 0.40 と `deny.toml` の除外の削除（v7.9 のまま出せるかを先に確かめる）。
+1. **PR0a（v7.9 のまま、機械的。#1336 で済み。ユーザー名だけを `testadmin` に替え、`setup_first_user` は PR1 で替える）**: 試験・E2E で作るユーザーの名前を `admin` から替える。v7.9 でもできるなら、試験の `setup_first_user` を `create_user(.., Role::Admin)` に替える。
+2. **PR0c**: `libsqlite3-sys` 0.40 と `deny.toml` の除外の削除（済み。sqlx-sqlite 0.9.1 は `>=0.30.1, <0.41.0` を受けるので v7.9 のまま出せた。Cargo.lock は libsqlite3-sys の項だけを手で書き換えた）。
 3. **PR1（必須・大）**: Cargo と npm のタグを同時に v8.0.0 へ。§3 の必須の行を全部と、§5 の受け入れ条件。Hub と CG を別の worktree で作り、1 つの PR に集める。上位モデルが監査する。
 4. 以降は任意（回り道の置き換え）: `isOnScreen`（`dockPanelOnScreen.ts` を消す）、`onRowContextMenu`（`/tags` の `rowClass`）、系列色 16（`--bi-chart-9〜16`）、`narrowViewport`（`mobileNav*`・`viewportWatch` の写し）、CG の `run_detached` を外す、`createDockLayoutStore`・`onLayoutCommit`、`@banto/charts/testing` で描画の回帰試験、デモの `storage: 'memory'`、Node 26。
 
