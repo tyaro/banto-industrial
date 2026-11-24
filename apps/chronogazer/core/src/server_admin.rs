@@ -54,6 +54,12 @@
 //! ログイン不要モード自体を `local_grant` に置き換える」）。自動ログインは OS キーリング
 //! （利用者ごと）にパスワードを持つデスクトップだけの機能なので REST に出さない。
 //!
+//! banto v8: 新しい DB はログイン不要モード（`auth.disabled = true`）で始まり、その間は
+//! `localGrant` を保存しても発行の条件には効かない（`crate::local_grant` の
+//! `LocalGrantStart::NoLogin`。起動時のロールで開いたまま）。サービスをログイン必須に
+//! するのは `chronogazer-server create-admin`（[`crate::first_admin`]）で、効くのはその後。
+//! 画面は応答の `disabled` を見てその旨を出す（`SecuritySection.svelte`）。
+//!
 //! `localGrant` を変えたら、保存の後に発行済みの `localDesktop` のトークンを失効させる
 //! （ADR-0017 の順序）。新しい値で発行するのは次の起動から（[`crate::local_grant`] の
 //! 「ロールの変更は再起動で反映」）。
@@ -813,7 +819,7 @@ async fn auth_settings_put(State(state): State<SettingsAdminState>, req: Request
         .any(|field| body.contains_key(*field))
     {
         return ApiError(BantoError::BadRequest(
-            "ログイン不要モードは REST からは変更できません（デスクトップの画面の設定から変更してください。サービスではこの PC からの接続（localGrant）を使います）".to_string(),
+            "ログイン不要モードは REST からは変更できません（デスクトップの画面の設定から変更してください。サービスではこの PC からの接続（localGrant）を使います。サービスをログイン必須にするには、サービスを止めて chronogazer-server create-admin で最初の管理者を作ります）".to_string(),
         ))
         .into_response();
     }

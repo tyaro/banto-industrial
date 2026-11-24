@@ -873,7 +873,7 @@ mod tests {
         old.dangerous_set_table_name(MIGRATIONS_TABLE);
         old.run(&pool).await.unwrap();
         sqlx::query(
-            "INSERT INTO users (username, password_hash, display_name, account_uid)              VALUES ('probe', 'x', 'Probe', 'probe-uid')",
+            "INSERT INTO users (username, password_hash, display_name, account_uid) VALUES ('probe', 'x', 'Probe', 'probe-uid')",
         )
         .execute(&pool)
         .await
@@ -985,7 +985,7 @@ mod tests {
     async fn a_shared_history_with_banto_tags_version_1_is_before_the_schema_reset() {
         let pool = banto_storage::connect_sqlite_memory().await.unwrap();
         sqlx::raw_sql(
-            "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL,              installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, success BOOLEAN NOT NULL,              checksum BLOB NOT NULL, execution_time BIGINT NOT NULL);              INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)              VALUES (1, 'plc connections', 1, x'00', 0);              CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+            "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL); INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (1, 'plc connections', 1, x'00', 0); CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )
         .execute(&pool)
         .await

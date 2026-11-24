@@ -61,6 +61,8 @@
 //! パスワードは引数に入れず標準入力の 1 行目（末尾の改行だけを落とす）。この開発用
 //! サーバーは配布しないので、端末からの非表示入力は持たない（Hub の `create-admin` とは
 //! 違う）。予約名 `admin` は作れない。実行の間はサーバーを止めておく（同じ DB の排他を取る）。
+//! 書き込み（管理者・`auth.disabled = false`・監査）は `chronogazer-server create-admin` と同じ
+//! 1 つのトランザクション（`chronogazer_core::first_admin`）。予約されたリストアがあれば止める。
 //!
 //! `BANTO_VIEWER_PUBLIC` は admin-template v3.0.0 の `banto-serve.rs` の同名の
 //! 入口を写したもの（開発・E2E 用）。保存されて
@@ -158,8 +160,14 @@ async fn create_admin(args: &[String], db_path: &str) -> i32 {
         .display_name
         .clone()
         .unwrap_or_else(|| parsed.username.clone());
-    // 起動と同じ入口（排他・旧形式の確認・リストア予約・migration）で DB を開く。
+    // 予約されたリストアがあれば止める（`chronogazer-server create-admin` と同じ。
+    // `EngineRuntime::open` が適用してしまう前に）。
     let db_path_buf = PathBuf::from(db_path);
+    if let Err(err) = chronogazer_core::first_admin::refuse_a_pending_restore(&db_path_buf) {
+        eprintln!("banto-serve: {err}");
+        return 1;
+    }
+    // 起動と同じ入口（排他・旧形式の確認・migration）で DB を開く。
     let opened = match EngineRuntime::open(EngineConfig {
         drivers: EngineConfig::builtin_drivers(),
         data_base: EngineConfig::db_dir_of(&db_path_buf),
@@ -185,24 +193,18 @@ async fn create_admin(args: &[String], db_path: &str) -> i32 {
             return 1;
         }
     };
-    let created = chronogazer_core::users::UsersService::new(chronogazer_core::db::Db::Sqlite(
-        opened.pool().clone(),
-    ))
-    .create_user(
-        &parsed.username,
-        &password,
-        &display_name,
-        chronogazer_core::users::Role::Admin,
+    // 管理者・ログイン必須・監査を 1 つのトランザクションで（`chronogazer-server
+    // create-admin` と同じ関数）。
+    let result = chronogazer_core::first_admin::create_admin_and_require_login_on(
+        opened.pool(),
+        chronogazer_core::first_admin::NewAdmin {
+            username: &parsed.username,
+            password: &password,
+            display_name: &display_name,
+        },
     )
-    .await;
-    let result = match created {
-        Ok(user) => opened
-            .settings()
-            .set("auth.disabled", "false")
-            .await
-            .map(|()| user),
-        Err(err) => Err(err),
-    };
+    .await
+    .map(|created| created.user);
     // Windows は開いた SQLite のファイルを握るので、返る前に閉じる。
     opened.close().await;
     match result {
@@ -214,7 +216,10 @@ async fn create_admin(args: &[String], db_path: &str) -> i32 {
             0
         }
         Err(err) => {
-            eprintln!("banto-serve: 管理者のアカウントを作れませんでした: {err}");
+            eprintln!(
+                "banto-serve: 管理者のアカウントを作れませんでした: {}（アカウント・認証の設定は変更していません）",
+                chronogazer_core::first_admin::failure_reason(&err)
+            );
             1
         }
     }

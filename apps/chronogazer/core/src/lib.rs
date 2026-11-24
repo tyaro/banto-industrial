@@ -26,6 +26,8 @@ pub mod free_trends;
 pub mod endpoint;
 pub mod engine;
 pub mod events;
+// banto v8: サービスの最初の管理者（`chronogazer-server create-admin`・`banto-serve create-admin`）。
+pub mod first_admin;
 // #332: Hub 接続（`banto-hub-bootstrap` の配線）。keyring は src-tauri、
 // `banto-serve` は `hub::UnavailableKeyStore` を渡す - モジュール doc 参照。
 pub mod hub;

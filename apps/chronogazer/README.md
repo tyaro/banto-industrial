@@ -107,7 +107,8 @@ target\debug\chronogazer-server.exe        # Ctrl-C で停止
   まとめていても同じ。外のページからの DNS rebinding も防ぐ。#392 B2-1、2026-10-14）。この PC のブラウザで
   `http://127.0.0.1:<port>/` を開けばログインなしで入れる（LAN からは管理者の権限を得られない。試験 `no_login_gives_a_lan_peer_no_admin_rights`）。
 - **この PC からの接続（ログインなし、#392 B2-1）**: 要求の送り元と `Host` の両方がこの PC のときだけ、`POST /api/auth/grant/localDesktop` でログインせずにセッションを受け取れる。最初の
-  管理者を作るまでの間は管理者、作った後は設定 `auth.local_grant`（`off`・`viewer`・`editor`・`admin`、
+  管理者を `chronogazer-server create-admin`（下の「最初の管理者」）で作るまでの間（新しい DB はログインなし）は
+  管理者、作った後は設定 `auth.local_grant`（`off`・`viewer`・`editor`・`admin`、
   **既定 `off`**）の権限。受け取った記録は監査ログに `login`（`via: localGrant`、操作者 `localDesktop`）で残る。
   設定は管理者がこの PC から `PUT /api/settings/auth`（`{"localGrant":"viewer"}` など）で変える（LAN からは
   変えられない）。発行をやめる方向は
@@ -131,7 +132,7 @@ target\debug\chronogazer-server.exe        # Ctrl-C で停止
   ため最終の書き出しが切れうる。起動の直後（PLC に接続中）にウィンドウを閉じると、`collection_stopped` が
   残らないことがある（行は失わない）。コンソールの文字を選択して出力が止まっていると、コンソールへの写しだけ
   諦める（ログには残る）。`logs\` と DB は同じ PC の他の利用者から読める（サービス化の権限の整理まで）。
-  管理者を `create-admin` で作るまでの間は、同じ PC のプログラムがログインなしで管理者として入れる
+  管理者を `chronogazer-server create-admin` で作るまでの間は、同じ PC のプログラムがログインなしで管理者として入れる
   （デスクトップ版のログインなしと同じ範囲。ブラウザーで開いた外のページからは `Host` の確認で作れない）。
 
 #### Windows サービスとして動かす（2026-10-15〜、#392 B3-2b）
@@ -166,7 +167,15 @@ B3-4）が行う。手で行うときは**管理者として実行した PowerSh
    `sc.exe query ChronoGazer`、ログは `<データ>\logs\chronogazer-server-YYYY-MM-DD.log`（コンソール版と同じ
    ファイル。サービスの行は「Windows サービス」「SCM の STOP」「PRESHUTDOWN」を含む）。動いている間は
    デスクトップ版の ChronoGazer を起動すると、プロセスの中でエンジンを動かさずにサービスの画面を開く。
-4. ★ 解除: `& 'C:\Program Files\ChronoGazer\chronogazer-server.exe' uninstall`（動いていれば止めてから解除。
+4. ★ **最初の管理者**（banto v8）: 新しい DB はログインなしで始まり、その間はこの PC から誰でも管理者として
+   入れる。サービスには画面・REST からログイン必須へ切り替える口が無いので、**サービスを止めて**
+   `& 'C:\Program Files\ChronoGazer\chronogazer-server.exe' create-admin --username <名前> [--display-name <表示名>]`
+   を実行する（`Stop-Service ChronoGazer` の後。動いている間は何も書かずに断る）。パスワードは端末なら非表示で
+   2 回尋ね、パイプ・ファイルなら 1 行目を読む（Git Bash などの疑似端末では `< password.txt` で渡す）。管理者の
+   作成と `auth.disabled=false` は 1 つのトランザクションで、監査ログに残る。予約されたリストアがあれば止まる。
+   次の起動からこの PC からの接続は設定 `auth.local_grant`（既定 `off`）どおりになる（v7 と同じく `admin` にすれば
+   開く）。ログインなしの間に画面で `localGrant` を保存しても、効くのはこの後から。
+5. ★ 解除: `& 'C:\Program Files\ChronoGazer\chronogazer-server.exe' uninstall`（動いていれば止めてから解除。
    インストール利用者の記録も消える。**データは残す**）。
 
 - **終了コード**（`sc.exe query ChronoGazer` の `SERVICE_EXIT_CODE`）: 0 正常、1 後始末が時間内に終わらなかった・

@@ -739,12 +739,12 @@ pub async fn revert_to_commissioning_with_audit(
     audit
         .try_record(crate::audit::AuditEntry {
             actor_username: Some(actor),
+            actor_id: None,
+            actor_kind: Some(crate::audit::ACTOR_KIND_CLI),
             // アプリ側のロール概念に対応する値が無い（ログインを要求しない
             // 状態へ戻す操作そのものなので、ロールを引けるログイン
             // セッションが存在しない） - `None`のままにする
             // （`crate::audit`は`actor_role: None`を「未認証イベント」で
-            actor_id: None,
-            actor_kind: Some(crate::audit::ACTOR_KIND_CLI),
             // 許容済み、`login_failed`の既存例と同じ扱い）。
             actor_role: None,
             action: "commissioning_revert",

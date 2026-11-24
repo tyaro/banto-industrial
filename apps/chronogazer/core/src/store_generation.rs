@@ -12,7 +12,7 @@
 //!
 //! - 設定 DB は、最初の起動で乱数の「保存先の世代 id」を設定 [`GENERATION_KEY`] に書く
 //!   （[`db_generation`]）。DB の作り直しでは新しい id になる。DB のバックアップから戻すと
-//!   その DB の id に戻る（同じ DB の履歴なので、同じ保存先を使える）。
+//!   その DB の id に戻り、同じ保存先をそのまま使う（下の「限界」）。
 //! - 保存先のフォルダには、使い始めるときに印のファイル [`MARKER_FILE_NAME`]（中身は世代 id）
 //!   を置く。
 //! - 起動（`crate::engine` の 6.、書き込みの確かめと収集より前）に [`claim_dir`]
@@ -28,6 +28,18 @@
 //! - 既定の保存先は v8 から `./data/history`（[`crate::settings::default_data_dir`]）。v8 より前の
 //!   既定 `./data` の直下の旧い日付ファイルには触れず、既定のままの利用者は新しい場所で
 //!   動き始める。
+//!
+//! # 限界（見分けるのは DB の作り直しだけ）
+//!
+//! 世代 id は「どの DB が作った保存先か」を見分けるだけで、同じ DB の**いつの時点か**は見分け
+//! ない。接続・グループ・タグの id は `INTEGER PRIMARY KEY AUTOINCREMENT`（banto-tags の
+//! migration）なので、1 つの DB の中では消した id を使い回さない（`sqlite_sequence` の最大値の
+//! 先から振る）。ところが同じ DB の**旧いバックアップを戻す**と `sqlite_sequence` も戻るので、
+//! バックアップの後に作って消した（または戻した時点では無い）タグの id が、戻した後に作る
+//! 別のタグに再び付きうる。保存先にはその id の鍵（`tag:<id>`）の時系列ファイルが残っている
+//! ので、**その期間の旧い値が新しいタグの履歴に混ざりうる**。これは v8 より前からある経路で、
+//! 世代の印では防げない（同じ世代）。戻した後に新しいタグを足すなら、保存先を新しいフォルダに
+//! 変えるか、戻す前の保存先を退避する。
 //!
 //! 「中身」に数えないのは、safe-root の印（[`banto_safe_root::mode::MARKER_NAME`]。サービスが
 //! フォルダを握るときに置く）と、書き込みの確かめの一時ファイルの残り
@@ -100,6 +112,12 @@ impl ClaimError {
     }
 }
 
+/// 断ったときの、窓の無いサービス（`chronogazer-server`）向けの対処（独立レビュー P3。
+/// デスクトップは起動時の窓で保存先を選び直せるが、サービスには窓が無い）。
+const SERVICE_HINT: &str =
+    "サービス（chronogazer-server）では、このフォルダを退避するか名前を変えて\
+     から起動し直してください（退避した旧い履歴は残ります）";
+
 impl std::fmt::Display for ClaimError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -111,7 +129,7 @@ impl std::fmt::Display for ClaimError {
                 "時系列データの保存先 {} には、この版の印の無いファイルがあります（v8 より前の版の \
                  ChronoGazer の履歴か、関係の無いファイル）。旧い履歴が新しいタグに混ざらないよう、\
                  このフォルダには書き込まずに止めました（中身は変えていません）。\
-                 保存先を空のフォルダか新しいフォルダに変えてください（旧い履歴はそのまま残せます）",
+                 保存先を空のフォルダか新しいフォルダに変えてください（旧い履歴はそのまま残せます）。{SERVICE_HINT}",
                 dir.display()
             ),
             Self::Refused {
@@ -122,7 +140,7 @@ impl std::fmt::Display for ClaimError {
                 "時系列データの保存先 {} は、別の設定 DB（作り直す前の DB など）の保存先です。\
                  旧い履歴が新しいタグに混ざらないよう、このフォルダには書き込まずに止めました\
                  （中身は変えていません）。保存先を空のフォルダか新しいフォルダに変えるか、\
-                 その保存先を作った DB に戻してください",
+                 その保存先を作った DB に戻してください。{SERVICE_HINT}",
                 dir.display()
             ),
             Self::Io { dir, reason } => write!(
@@ -175,7 +193,88 @@ pub fn claim_dir(dir: &Path, generation: &str) -> Result<(), ClaimError> {
     if !inspect_dir(dir, generation)? {
         return Ok(());
     }
-    write_marker_path(dir, generation).map_err(|err| io(format!("印を書けません: {err}")))
+    let marker = dir.join(MARKER_FILE_NAME);
+    put_marker(
+        dir,
+        generation,
+        &mut || match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+        {
+            Ok(file) => Ok(Some(file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Err(err) => Err(err.to_string()),
+        },
+        &mut || match std::fs::read_to_string(&marker) {
+            Ok(contents) => Ok(Some(contents)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.to_string()),
+        },
+        &mut || write_marker_path(dir, generation).map_err(|err| err.to_string()),
+    )?;
+    // 前の版（一時ファイル → 付け替え）の書きかけの残りは、使い始めたら消す（無ければ何もしない）。
+    let _ = std::fs::remove_file(dir.join(MARKER_TEMP_FILE_NAME));
+    Ok(())
+}
+
+/// 印の書きかけを待つ回数と間隔（[`put_marker`]）。`create_new` から中身を書き終えるまでは
+/// 一瞬なので、空の印が続くのは書きかけで落ちた残りだけ。
+const EMPTY_MARKER_RETRIES: u32 = 20;
+const EMPTY_MARKER_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// 印を「無ければ作る（`create_new`）、あれば読み直して比べる」で置く（独立レビュー P3）。
+///
+/// [`inspect_dir`] で空と見てから印を置くまでの間に、別の DB（別のプロセス）が同じ空の
+/// フォルダを使い始めると、両方が通っていた（どちらも一時ファイル → 付け替えで上書き）。
+/// `create_new` は 1 つしか成功しないので、負けた側は勝った側の印を読み、世代が違えば
+/// [`StoreRefusal::OtherGeneration`] で断る（何も書かない）。
+///
+/// 読んだ印が空なら、勝った側が書いている最中か、書きかけで落ちた残り。少し待って読み直し、
+/// 空のままなら残りとして `overwrite`（一時ファイル → 付け替え）で書き直す。この書き直しの
+/// 間だけは、同時に使い始めた 2 つが両方通りうる（落ちた残りと同時の起動が重なったとき）。
+///
+/// - `create_new`: 作れたら書き込みで開いたファイル、既にあれば `None`。
+/// - `read`: 印の中身（無ければ `None`）。
+fn put_marker(
+    shown: &Path,
+    generation: &str,
+    create_new: &mut dyn FnMut() -> Result<Option<std::fs::File>, String>,
+    read: &mut dyn FnMut() -> Result<Option<String>, String>,
+    overwrite: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), ClaimError> {
+    let io = |reason: String| ClaimError::Io {
+        dir: shown.to_path_buf(),
+        reason,
+    };
+    if let Some(mut file) = create_new().map_err(|err| io(format!("印を書けません: {err}")))?
+    {
+        file.write_all(&marker_contents(generation))
+            .and_then(|()| file.sync_all())
+            .map_err(|err| io(format!("印を書けません: {err}")))?;
+        return Ok(());
+    }
+    for attempt in 0..=EMPTY_MARKER_RETRIES {
+        let found = read()
+            .map_err(|err| io(format!("印を読めません: {err}")))?
+            .ok_or_else(|| io("印が読む前に消えました".to_string()))?;
+        let found = found.trim();
+        if found == generation {
+            return Ok(());
+        }
+        if !found.is_empty() {
+            return Err(ClaimError::Refused {
+                dir: shown.to_path_buf(),
+                refusal: StoreRefusal::OtherGeneration {
+                    found: found.to_string(),
+                },
+            });
+        }
+        if attempt < EMPTY_MARKER_RETRIES {
+            std::thread::sleep(EMPTY_MARKER_WAIT);
+        }
+    }
+    overwrite().map_err(|err| io(format!("印を書けません: {err}")))
 }
 
 /// [`claim_dir`] の、書かない版。`Ok(true)` = 使える（印はまだ無い・無いフォルダ）、
@@ -210,7 +309,7 @@ pub fn inspect_dir(dir: &Path, generation: &str) -> Result<bool, ClaimError> {
     })
 }
 
-/// 印を一時ファイルに書いてから付け替える（書きかけの印を残さない）。
+/// 印を一時ファイルに書いてから付け替える（書きかけの空の印を書き直すときだけ。[`put_marker`]）。
 fn write_marker_path(dir: &Path, generation: &str) -> std::io::Result<()> {
     let temp = dir.join(MARKER_TEMP_FILE_NAME);
     {
@@ -260,8 +359,32 @@ pub fn claim_managed_dir(
             refusal,
         })?;
     if write {
-        dir.write_atomic(MARKER_FILE_NAME, &marker_contents(generation))
-            .map_err(|err| io(format!("印を書けません: {err:?}")))?;
+        // パスの版と同じく「無ければ作る、あれば読み直して比べる」（[`put_marker`]）。
+        // 作るのも読むのも握ったハンドル基準。
+        put_marker(
+            path,
+            generation,
+            &mut || {
+                dir.create_new(MARKER_FILE_NAME)
+                    .map_err(|err| format!("{err:?}"))
+            },
+            &mut || {
+                let Some(mut file) = dir
+                    .open_read(MARKER_FILE_NAME)
+                    .map_err(|err| format!("{err:?}"))?
+                else {
+                    return Ok(None);
+                };
+                let mut contents = String::new();
+                std::io::Read::read_to_string(&mut file, &mut contents)
+                    .map_err(|err| err.to_string())?;
+                Ok(Some(contents))
+            },
+            &mut || {
+                dir.write_atomic(MARKER_FILE_NAME, &marker_contents(generation))
+                    .map_err(|err| format!("{err:?}"))
+            },
+        )?;
     }
     Ok(())
 }
@@ -345,6 +468,99 @@ mod tests {
         );
     }
 
+    /// 独立レビュー P3: 空と見た後に別の DB が先に印を置いていたら（`create_new` に負けたら）、
+    /// 読み直した印の世代で断り、何も書かない。
+    #[test]
+    fn losing_the_marker_race_to_another_generation_refuses() {
+        let shown = Path::new("store");
+        let mut overwritten = false;
+        let err = put_marker(
+            shown,
+            "gen-b",
+            &mut || Ok(None),
+            &mut || Ok(Some("gen-a\n".to_string())),
+            &mut || {
+                overwritten = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ClaimError::Refused {
+                refusal: StoreRefusal::OtherGeneration { ref found },
+                ..
+            } if found == "gen-a"
+        ));
+        assert!(!overwritten);
+        // 同じ世代（同じ DB の 2 回目）なら通る。
+        put_marker(
+            shown,
+            "gen-a",
+            &mut || Ok(None),
+            &mut || Ok(Some("gen-a\n".to_string())),
+            &mut || panic!("書き直さない"),
+        )
+        .unwrap();
+    }
+
+    /// 勝った側の書きかけ（空の印）は待って読み直す。空のままなら落ちた残りとして書き直す。
+    #[test]
+    fn an_empty_marker_is_waited_for_then_rewritten() {
+        let shown = Path::new("store");
+        let mut reads = 0;
+        let err = put_marker(
+            shown,
+            "gen-b",
+            &mut || Ok(None),
+            &mut || {
+                reads += 1;
+                Ok(Some(if reads < 3 { "" } else { "gen-a\n" }.to_string()))
+            },
+            &mut || panic!("書き直さない"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ClaimError::Refused { .. }));
+        let mut overwritten = false;
+        put_marker(
+            shown,
+            "gen-b",
+            &mut || Ok(None),
+            &mut || Ok(Some(String::new())),
+            &mut || {
+                overwritten = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(overwritten);
+    }
+
+    /// 2 つの DB が同じ空のフォルダを同時に使い始めても、通るのは 1 つだけ。
+    #[test]
+    fn two_generations_claiming_one_empty_folder_at_once_admit_one() {
+        let dir = TempDir::new();
+        let store = dir.path().join("history");
+        std::fs::create_dir_all(&store).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = ["gen-a", "gen-b"]
+            .into_iter()
+            .map(|generation| {
+                let (store, barrier) = (store.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    claim_dir(&store, generation).is_ok()
+                })
+            })
+            .collect();
+        let admitted = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(admitted, 1);
+    }
+
     /// 印の書きかけの一時ファイルが残っていても（書きかけで落ちた後）、起動は止まらず、次の
     /// `claim_dir` が印を書き直して一時ファイルも残さない。
     #[test]
@@ -357,8 +573,7 @@ mod tests {
         claim_dir(&store, "gen-a").unwrap();
         assert_eq!(
             std::fs::read_to_string(store.join(MARKER_FILE_NAME)).unwrap(),
-            "gen-a
-"
+            "gen-a\n"
         );
         assert!(!store.join(MARKER_TEMP_FILE_NAME).exists());
     }

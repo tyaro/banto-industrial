@@ -249,6 +249,15 @@
 			<p class="note">この設定は、サービスを動かしている PC から開いた画面でだけ変更できます。</p>
 		{/if}
 
+		{#if authSettingsStore.value?.disabled}
+			<p class="note" data-testid="local-grant-no-login-note">
+				いまはログインなしの設定のため、この PC
+				からは誰でもログインなしの権限で入れます。ここで保存した権限が効くのは、サービスを止めて
+				<code>chronogazer-server create-admin --username &lt;名前&gt;</code>
+				で最初の管理者を作った後（ログイン必須になった後）からです。
+			</p>
+		{/if}
+
 		{#if authSettingsStore.value?.localGrantRestartRequired}
 			<p class="note">
 				保存した権限で入れるのは、サービスを次に起動したときからです（「使わない」にするのはすぐ効きます）。

@@ -10,6 +10,9 @@
 //! ```text
 //! chronogazer-server.exe            コンソールで起動（Ctrl-C で停止）
 //! chronogazer-server.exe --help     使い方
+//! chronogazer-server.exe create-admin --username <名前> [--display-name <表示名>]
+//!                                   最初の管理者を作り、ログイン必須にする（banto v8。
+//!                                   サービス・アプリを止めてから。`chronogazer_server/create_admin.rs`）
 //! chronogazer-server.exe install [--install-user-sid S-1-5-21-…]
 //!                                   サービス `ChronoGazer` を登録（管理者、Windows だけ）
 //! chronogazer-server.exe uninstall  登録を解除（データは残す。管理者、Windows だけ）
@@ -101,6 +104,12 @@ mod log_prune;
 mod service;
 #[path = "chronogazer_server/start.rs"]
 mod start;
+// banto v8: 最初の管理者（`create-admin`）。パスワードの入力は Hub の `banto-hub create-admin`
+// と同じファイルを共有する（上流 banto の `banto-serve` の写し。変えるときは両方の bin で効く）。
+#[path = "chronogazer_server/create_admin.rs"]
+mod create_admin;
+#[path = "../../../../banto-hub/host/src/bin/banto_hub/password_input.rs"]
+mod password_input;
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -131,6 +140,7 @@ fn main() {
     };
     let code = match mode {
         Mode::Console(options) => run(options),
+        Mode::CreateAdmin(parsed) => create_admin::run(parsed),
         #[cfg(windows)]
         Mode::RunService => service::run_service_dispatcher(),
         #[cfg(windows)]
@@ -152,6 +162,9 @@ struct CliOptions {
 enum Mode {
     /// コンソール（引数なし、B1-5 のまま）。
     Console(CliOptions),
+    /// 最初の管理者を作る（`create-admin --username <名前> [--display-name <表示名>]`。
+    /// banto v8。どの OS でも使える）。
+    CreateAdmin(create_admin::CreateAdminArgs),
     /// SCM がサービスの開始で呼ぶ（`run-service`）。
     #[cfg(windows)]
     RunService,
@@ -175,6 +188,10 @@ const SERVICE_COMMANDS: [&str; 3] = [
 
 /// 引数の解釈。`Ok(None)` は使い方の表示だけ。
 fn parse_args(args: &[String]) -> Result<Option<Mode>, String> {
+    if args.first().map(String::as_str) == Some(create_admin::CREATE_ADMIN_ARG) {
+        return create_admin::parse_create_admin_args(&args[1..])
+            .map(|parsed| Some(Mode::CreateAdmin(parsed)));
+    }
     if let Some(command) = args
         .first()
         .filter(|first| SERVICE_COMMANDS.contains(&first.as_str()))
@@ -262,6 +279,15 @@ fn print_usage() {
         "  データ: 環境変数 {}（絶対パス）、既定 %ProgramData%\\ChronoGazer",
         chronogazer_core::paths::ROOT_ENV
     );
+    eprintln!("最初の管理者（サービス・アプリを止めてから）:");
+    eprintln!("  chronogazer-server.exe create-admin --username <名前> [--display-name <表示名>]");
+    eprintln!(
+        "    管理者のアカウントを作り、同時にログイン必須にする。パスワードは端末なら非表示で"
+    );
+    eprintln!(
+        "    2 回尋ね、パイプ・ファイルなら 1 行目を読む。新しい DB はログインなしで始まり、"
+    );
+    eprintln!("    その間はこの PC（loopback）から誰でも管理者として入れる");
     eprintln!("  ログ: <データ>\\logs\\chronogazer-server-YYYY-MM-DD.log");
     #[cfg(windows)]
     {
@@ -977,10 +1003,17 @@ async fn announce(server: &StartedServer, stop_hint: &str) {
         }
         let local_grant = engine.services().local_grant;
         match local_grant.issued_role() {
-            Some(role) if matches!(local_grant, LocalGrantStart::NoLogin(_)) => println!(
-                "{SERVER_LABEL}: ログインなしの設定の間、この PC（http://127.0.0.1:{port}/）からはログインなしで {} として入れます",
-                role.as_str()
-            ),
+            Some(role) if matches!(local_grant, LocalGrantStart::NoLogin(_)) => {
+                println!(
+                    "{SERVER_LABEL}: ログインなしの設定の間、この PC（http://127.0.0.1:{port}/）からはログインなしで {} として入れます",
+                    role.as_str()
+                );
+                // banto v8: サービスにはログイン必須へ切り替える画面・REST の口が無い
+                // （`chronogazer_core::first_admin`）。
+                println!(
+                    "{SERVER_LABEL}: ログイン必須にするには、サービスを止めて chronogazer-server create-admin --username <名前> で最初の管理者を作ってください（それまではこの PC の誰でも入れます）"
+                );
+            }
             Some(role) => println!(
                 "{SERVER_LABEL}: この PC（http://127.0.0.1:{port}/）からはログインなしで {} として入れます（設定 auth.local_grant）",
                 role.as_str()

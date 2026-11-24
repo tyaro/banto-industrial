@@ -681,6 +681,11 @@ impl OpenedServer {
         &self.layout
     }
 
+    /// 開いた設定 DB（`crate::first_admin` が起動と同じ開き方の DB に書く）。
+    pub fn pool(&self) -> &crate::db::DbPool {
+        self.opened.pool()
+    }
+
     /// 開いたまま閉じる（排他と pool を返す）。
     pub async fn close(self) {
         self.opened.close().await;

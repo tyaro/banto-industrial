@@ -207,7 +207,7 @@ fn read_new_password() -> Result<String, String> {
     )
     .map_err(|err| {
         format!(
-            "パスワードを非表示で読めませんでした: {err}（Git Bash・MSYS などの疑似端末では使えません。             PowerShell・cmd・通常の端末で実行するか、パスワードをファイルに書いて < password.txt で渡してください）"
+            "パスワードを非表示で読めませんでした: {err}（Git Bash・MSYS などの疑似端末では使えません。PowerShell・cmd・通常の端末で実行するか、パスワードをファイルに書いて < password.txt で渡してください）"
         )
     })?;
     if !pw::confirmation_matches(&first, &second) {

@@ -1201,3 +1201,90 @@ async fn a_server_without_the_dev_switch_refuses_loopback_http_hub() {
     server.send("ctrl-c");
     assert_eq!(server.wait_exit().await.code(), Some(0));
 }
+
+// --- create-admin（banto v8） ----------------------------------------------------
+
+/// `chronogazer-server create-admin --username owner`（パスワードはパイプの 1 行目）。
+fn create_admin(sandbox: &Sandbox, password_line: &str) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_chronogazer-server"))
+        .args(["create-admin", "--username", "owner"])
+        .env("CHRONOGAZER_ROOT", &sandbox.root)
+        .env("APPDATA", &sandbox.appdata)
+        .env("LOCALAPPDATA", &sandbox.local_appdata)
+        .env_remove("BANTO_DB")
+        .current_dir(&sandbox.cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("chronogazer-server create-admin を起動できる");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(password_line.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// この PC（loopback）からの `GET /api/auth/status` の `grants.localDesktop`。
+async fn local_desktop_open(port: u16) -> serde_json::Value {
+    let (status, body) = request(
+        reqwest::Method::GET,
+        format!("http://127.0.0.1:{port}/api/auth/status"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    body["grants"]["localDesktop"].clone()
+}
+
+/// 独立レビュー P1: 新しい DB（ログインなし）のサービスは loopback に admin の grant を
+/// 出す。サービスを止めて `create-admin` を実行すると、次の起動では設定
+/// `auth.local_grant`（既定 off）どおりに閉じ、作った管理者でログインできる。動いている
+/// 間の `create-admin` は何も書かずに断る。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_admin_closes_the_no_login_grant_of_the_service() {
+    let sandbox = Sandbox::new();
+    prepare_root(&sandbox, None, false).await;
+
+    let mut server = Server::spawn(&sandbox, sandbox.root.to_str().unwrap());
+    let port = wait_ready(&sandbox, &server).await;
+    assert_eq!(local_desktop_open(port).await, true);
+    assert!(
+        sandbox.output_text().contains("create-admin"),
+        "{}",
+        sandbox.output_text()
+    );
+    // 動いている間は断る（何も書かない）。
+    let refused = create_admin(&sandbox, "password123\n");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("何も変更していません"), "{stderr}");
+    server.send("ctrl-c");
+    assert_eq!(server.wait_exit().await.code(), Some(0));
+
+    let created = create_admin(&sandbox, "password123\n");
+    assert_eq!(
+        created.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    let mut server = Server::spawn(&sandbox, sandbox.root.to_str().unwrap());
+    let port = wait_ready(&sandbox, &server).await;
+    assert_eq!(local_desktop_open(port).await, false);
+    let (status, body) = request(
+        reqwest::Method::POST,
+        format!("http://127.0.0.1:{port}/api/auth/login"),
+        None,
+        Some(serde_json::json!({"username":"owner","password":"password123"})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    server.send("ctrl-c");
+    assert_eq!(server.wait_exit().await.code(), Some(0));
+    sandbox.assert_profile_untouched();
+}
