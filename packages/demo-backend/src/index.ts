@@ -80,3 +80,4 @@ export {
 	type DemoHistoryPoint,
 	type DemoHistoryTag
 } from './tagHistory';
+export { createUiSettingsRoutes, DEMO_UI_SETTING_ABSENT_REVISION } from './uiSettings';

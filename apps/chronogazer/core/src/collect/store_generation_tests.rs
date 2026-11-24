@@ -235,7 +235,7 @@ async fn a_pre_v8_store_is_refused_and_the_new_default_leaves_it_alone() {
     assert_eq!(refusal_of(&err), &StoreRefusal::Unmarked, "{err:?}");
     assert_eq!(
         crate::startup_recovery::classify(&err),
-        crate::startup_recovery::FailureKind::StoreDirUnwritable
+        crate::startup_recovery::FailureKind::StoreDirRefused
     );
     assert_eq!(snapshot(&old_store), before, "旧い保存先が変わった");
 

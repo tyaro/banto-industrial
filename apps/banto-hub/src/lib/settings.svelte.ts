@@ -190,12 +190,17 @@ class Settings {
 			launcherPosition: this.#editGen(LAUNCHER_POSITION_SETTING)
 		};
 		try {
-			const [mode, preset, navLayout, launcherPosition] = await Promise.all([
+			const [modeSnap, presetSnap, navLayoutSnap, launcherPositionSnap] = await Promise.all([
 				ui.get(MODE_SETTING),
 				ui.get(PRESET_SETTING),
 				ui.get(NAV_LAYOUT_SETTING),
 				ui.get(LAUNCHER_POSITION_SETTING)
 			]);
+			// v8: get は { value, revision } を返す。
+			const mode = modeSnap.value;
+			const preset = presetSnap.value;
+			const navLayout = navLayoutSnap.value;
+			const launcherPosition = launcherPositionSnap.value;
 			if (isCurrent()) {
 				if (isThemeMode(mode) && this.#editGen(MODE_SETTING) === started.mode)
 					this.#applyThemeMode(mode);

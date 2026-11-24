@@ -32,9 +32,9 @@ function flush(): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-const ALICE: Identity = { id: 'alice', name: 'Alice' };
-const BOB: Identity = { id: 'bob', name: 'Bob' };
-const CAROL: Identity = { id: 'carol', name: 'Carol' };
+const ALICE: Identity = { id: 'alice', name: 'Alice', accountId: 'alice' };
+const BOB: Identity = { id: 'bob', name: 'Bob', accountId: 'bob' };
+const CAROL: Identity = { id: 'carol', name: 'Carol', accountId: 'carol' };
 
 /** A standard provider whose answers the test settles; `change()` = another tab's login/logout (reported). */
 function provider() {
@@ -119,12 +119,12 @@ describe('wiring ②: another tab’s login as a different user (#257, I-17, I-2
 
 		expect(h.notify).toHaveBeenCalledTimes(1);
 		expect(h.notify).toHaveBeenCalledWith('rebuild', {
-			from: 'account:alice',
-			to: 'account:bob'
+			from: 'acct:alice',
+			to: 'acct:bob'
 		});
 		expect(h.goToLogin).not.toHaveBeenCalled();
 		expect(controller.snapshot.pendingOwnerChange).toBeNull();
-		expect(controller.snapshot.owner).toBe('account:bob');
+		expect(controller.snapshot.owner).toBe('acct:bob');
 	});
 
 	it("S-37: 'relogin' notifies and goes to /login (the shared token is not cleared - the policy has no way to)", async () => {
@@ -139,12 +139,12 @@ describe('wiring ②: another tab’s login as a different user (#257, I-17, I-2
 		await flush();
 
 		expect(h.notify).toHaveBeenCalledWith('relogin', {
-			from: 'account:alice',
-			to: 'account:bob'
+			from: 'acct:alice',
+			to: 'acct:bob'
 		});
 		expect(h.goToLogin).toHaveBeenCalledTimes(1);
 		expect(logout).not.toHaveBeenCalled();
-		expect(controller.snapshot).toMatchObject({ status: 'active', owner: 'account:bob' });
+		expect(controller.snapshot).toMatchObject({ status: 'active', owner: 'acct:bob' });
 	});
 
 	it('S-59: the same user again (re-login in another tab): +2 generations, no notice', async () => {
@@ -160,7 +160,7 @@ describe('wiring ②: another tab’s login as a different user (#257, I-17, I-2
 
 		expect(controller.snapshot).toMatchObject({
 			status: 'active',
-			owner: 'account:alice',
+			owner: 'acct:alice',
 			generation: generation + 2
 		});
 		expect(h.notify).not.toHaveBeenCalled();
@@ -179,8 +179,8 @@ describe('wiring ②: another tab’s login as a different user (#257, I-17, I-2
 		await confirm(controller, () => p.active(BOB));
 		await confirm(controller, () => p.active(BOB));
 		expect(controller.snapshot.pendingOwnerChange).toEqual({
-			from: 'account:alice',
-			to: 'account:bob'
+			from: 'acct:alice',
+			to: 'acct:bob'
 		});
 
 		// The layout mounts again (the retry button, controller kept).

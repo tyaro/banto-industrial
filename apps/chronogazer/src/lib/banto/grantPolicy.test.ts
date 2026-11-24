@@ -21,8 +21,7 @@ import {
 	enterPublicViewer,
 	enterThisPc,
 	localDesktopAvailable,
-	loginEntries,
-	needsFirstAdmin
+	loginEntries
 } from './grantPolicy';
 
 /**
@@ -86,7 +85,7 @@ async function enter(status: GrantStatus, grantable: string[]) {
 describe('enterCredentiallessGrant（localDesktop → publicViewer）', () => {
 	it('localDesktop が使えれば、閲覧公開も ON でも localDesktop に入る（オーナー決定 2）', async () => {
 		const { result, enterGrant } = await enter(
-			{ initialized: true, grants: { localDesktop: true, publicViewer: true } },
+			{ grants: { localDesktop: true, publicViewer: true } },
 			['localDesktop', 'publicViewer']
 		);
 		expect(result.snapshot.status).toBe('active');
@@ -95,15 +94,13 @@ describe('enterCredentiallessGrant（localDesktop → publicViewer）', () => {
 	});
 
 	it('未初期化でも localDesktop が使えれば入る（オーナー決定 1）', async () => {
-		const { result } = await enter({ initialized: false, grants: { localDesktop: true } }, [
-			'localDesktop'
-		]);
+		const { result } = await enter({ grants: { localDesktop: true } }, ['localDesktop']);
 		expect(result.snapshot.kind).toBe('localDesktop');
 	});
 
 	it('localDesktop が使えなければ閲覧公開', async () => {
 		const { result, enterGrant } = await enter(
-			{ initialized: true, grants: { localDesktop: false, publicViewer: true } },
+			{ grants: { localDesktop: false, publicViewer: true } },
 			['publicViewer']
 		);
 		expect(result.snapshot.kind).toBe('publicViewer');
@@ -112,7 +109,7 @@ describe('enterCredentiallessGrant（localDesktop → publicViewer）', () => {
 
 	it('localDesktop の発行が断られたら（403）閲覧公開を試す', async () => {
 		const { result, enterGrant } = await enter(
-			{ initialized: true, grants: { localDesktop: true, publicViewer: true } },
+			{ grants: { localDesktop: true, publicViewer: true } },
 			['publicViewer']
 		);
 		expect(result.snapshot.kind).toBe('publicViewer');
@@ -120,7 +117,7 @@ describe('enterCredentiallessGrant（localDesktop → publicViewer）', () => {
 	});
 
 	it('どちらも使えなければ確定した none のまま（ガードが /login へ）', async () => {
-		const { result, enterGrant } = await enter({ initialized: true, grants: {} }, []);
+		const { result, enterGrant } = await enter({ grants: {} }, []);
 		expect(result.outcome).toBe('confirmed');
 		expect(result.snapshot.status).toBe('none');
 		expect(enterGrant).not.toHaveBeenCalled();
@@ -134,7 +131,7 @@ describe('enterPublicViewer（「閲覧のみで続ける」は明示的に閲�
 		const result = await enterPublicViewer(getSessionController(), p.auth);
 		return { result, enterGrant: p.enterGrant, logout: p.logout };
 	}
-	const both = { initialized: true, grants: { localDesktop: true, publicViewer: true } };
+	const both = { grants: { localDesktop: true, publicViewer: true } };
 
 	it('既に localDesktop のセッション（戻るで来た）なら、ログアウトしてから publicViewer に切り替える', async () => {
 		const { result, enterGrant, logout } = await viewer(
@@ -164,7 +161,7 @@ describe('enterPublicViewer（「閲覧のみで続ける」は明示的に閲�
 
 	it('localDesktop も使えるときでも publicViewer に入る（localDesktop を試さない）', async () => {
 		const { result, enterGrant } = await viewer(
-			{ initialized: true, grants: { localDesktop: true, publicViewer: true } },
+			{ grants: { localDesktop: true, publicViewer: true } },
 			['localDesktop', 'publicViewer']
 		);
 		expect(result.snapshot.status).toBe('active');
@@ -174,7 +171,7 @@ describe('enterPublicViewer（「閲覧のみで続ける」は明示的に閲�
 
 	it('閲覧公開が OFF なら none のまま（localDesktop には入らない）', async () => {
 		const { result, enterGrant } = await viewer(
-			{ initialized: true, grants: { localDesktop: true, publicViewer: false } },
+			{ grants: { localDesktop: true, publicViewer: false } },
 			['localDesktop']
 		);
 		expect(result.snapshot.status).toBe('none');
@@ -185,7 +182,7 @@ describe('enterPublicViewer（「閲覧のみで続ける」は明示的に閲�
 describe('enterThisPc（「この PC として続ける」も明示的に選ぶ）', () => {
 	it('既に publicViewer なら、ログアウトしてから localDesktop に切り替える', async () => {
 		const p = grantProvider(
-			{ initialized: true, grants: { localDesktop: true, publicViewer: true } },
+			{ grants: { localDesktop: true, publicViewer: true } },
 			['localDesktop', 'publicViewer'],
 			'publicViewer'
 		);
@@ -197,10 +194,7 @@ describe('enterThisPc（「この PC として続ける」も明示的に選ぶ�
 	});
 
 	it('localDesktop が使えなければ none（呼び出し側は進まない）', async () => {
-		const p = grantProvider({ initialized: true, grants: { publicViewer: true } }, [
-			'localDesktop',
-			'publicViewer'
-		]);
+		const p = grantProvider({ grants: { publicViewer: true } }, ['localDesktop', 'publicViewer']);
 		initBanto({ dataProvider: {} as DataProvider, authProvider: p.auth, resources: [] });
 		const result = await enterThisPc(getSessionController(), p.auth);
 		expect(p.enterGrant).not.toHaveBeenCalled();
@@ -230,75 +224,48 @@ describe('enteredKind（呼び出し側が進むか）', () => {
 	});
 });
 
-describe('localDesktopAvailable・needsFirstAdmin', () => {
+describe('localDesktopAvailable', () => {
 	it('grants.localDesktop が true のときだけ使える（無い・false・status 無しは使えない）', () => {
-		expect(localDesktopAvailable({ initialized: true, grants: { localDesktop: true } })).toBe(true);
-		expect(localDesktopAvailable({ initialized: true, grants: { localDesktop: false } })).toBe(
-			false
-		);
-		expect(localDesktopAvailable({ initialized: true })).toBe(false);
+		expect(localDesktopAvailable({ grants: { localDesktop: true } })).toBe(true);
+		expect(localDesktopAvailable({ grants: { localDesktop: false } })).toBe(false);
+		expect(localDesktopAvailable({})).toBe(false);
 		expect(localDesktopAvailable(undefined)).toBe(false);
-	});
-
-	it('案内の帯は localDesktop のセッションで未初期化と読めたときだけ', () => {
-		expect(needsFirstAdmin(true, { initialized: false })).toBe(true);
-		expect(needsFirstAdmin(true, { initialized: true })).toBe(false);
-		expect(needsFirstAdmin(true, undefined)).toBe(false);
-		expect(needsFirstAdmin(false, { initialized: false })).toBe(false);
 	});
 });
 
 describe('loginEntries（ログイン画面の出し分け）', () => {
 	const none = {
 		continueAsThisPc: false,
-		continueAsViewer: false,
-		localGrantOptIn: false
+		continueAsViewer: false
 	};
 	const cases: [string, 'tauri' | 'server', GrantStatus | undefined, typeof none][] = [
 		[
 			'server・初期化済み・localDesktop → この PC として続ける',
 			'server',
-			{ initialized: true, grants: { localDesktop: true } },
+			{ grants: { localDesktop: true } },
 			{ ...none, continueAsThisPc: true }
-		],
-		[
-			'server・未初期化・localDesktop → 初回セットアップの選択',
-			'server',
-			{ initialized: false, grants: { localDesktop: true } },
-			{ ...none, localGrantOptIn: true }
-		],
-		[
-			'server・未初期化・localDesktop なし（LAN の画面）→ 選択を出さない',
-			'server',
-			{ initialized: false, grants: { localDesktop: false } },
-			none
 		],
 		[
 			'server・閲覧公開 ON → 閲覧のみで続ける',
 			'server',
-			{ initialized: true, grants: { publicViewer: true } },
+			{ grants: { publicViewer: true } },
 			{ ...none, continueAsViewer: true }
 		],
 		[
 			'server・両方',
 			'server',
-			{ initialized: true, grants: { localDesktop: true, publicViewer: true } },
+			{ grants: { localDesktop: true, publicViewer: true } },
 			{ ...none, continueAsThisPc: true, continueAsViewer: true }
 		],
 		['server・status が読めない', 'server', undefined, none],
-		[
-			'tauri は何も出さない',
-			'tauri',
-			{ initialized: false, grants: { localDesktop: true, publicViewer: true } },
-			none
-		],
+		['tauri は何も出さない', 'tauri', { grants: { localDesktop: true, publicViewer: true } }, none],
 		[
 			'server（サービスの画面）・初期化済み・localDesktop なし → 何も出さない',
 			'server',
-			{ initialized: true, grants: { localDesktop: false } },
+			{ grants: { localDesktop: false } },
 			none
 		],
-		['tauri・初期化済み → 何も出さない', 'tauri', { initialized: true }, none]
+		['tauri・初期化済み → 何も出さない', 'tauri', {}, none]
 	];
 	for (const [label, mode, status, expected] of cases) {
 		it(label, () => {

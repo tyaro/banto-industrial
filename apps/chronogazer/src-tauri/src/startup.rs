@@ -289,6 +289,10 @@ fn failure_text(kind: FailureKind) -> (&'static str, &'static str) {
             "時系列データの保存先に書き込めません",
             "設定されている時系列データの保存先のフォルダに書き込めないため、起動を止めました（USB メモリやネットワークドライブが外れている、ドライブが無い、権限が無い など）。差し直す・権限を直すなどした後に「もう一度確かめる」を押すか、保存先のフォルダを選び直すか、既定の場所に戻すと起動を続けられます。どれを選んでも、今のデータベースや記録は消しません。",
         ),
+        FailureKind::StoreDirRefused => (
+            "時系列データの保存先は使えません",
+            "設定されている時系列データの保存先のフォルダは、別の設定データベースの履歴か、v8 より前の版の ChronoGazer の履歴（この版の印が無い）が入っているため、この DB の保存先としては使わないことにして、起動を止めました。旧い履歴が新しいタグに混ざらないようにするためです。このフォルダの中身は変えていません。保存先のフォルダを空のフォルダか新しいフォルダに選び直すか、既定の場所に戻すと起動を続けられます（旧い履歴はそのまま残せます）。旧い履歴を別の場所へ移した後は「もう一度確かめる」でも続けられます。",
+        ),
         FailureKind::DatabaseCorrupt => (
             "データベースが壊れています",
             "設定のデータベース（アカウント・接続・タグ・設定）が壊れていて開けないため、起動を止めました。バックアップから戻すか、新しく作り直すと起動できます。どちらを選んでも、今のデータベースのファイルは名前を変えて残します（消しません）。",
@@ -1064,6 +1068,7 @@ mod tests {
         for kind in [
             FailureKind::StoreDirUnreadable,
             FailureKind::StoreDirUnwritable,
+            FailureKind::StoreDirRefused,
             FailureKind::DatabaseCorrupt,
             FailureKind::DatabaseUnopenable,
             FailureKind::DatabaseFromNewerVersion,

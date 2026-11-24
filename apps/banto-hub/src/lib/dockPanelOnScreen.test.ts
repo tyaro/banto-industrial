@@ -10,7 +10,7 @@ const panel = (id: string, collapsed?: boolean) => ({
 });
 
 function layout(partial: Partial<DockLayout>): DockLayout {
-	return { version: 2, floating: [], docked: null, ...partial } as DockLayout;
+	return { version: 4, floating: [], docked: null, ...partial } as DockLayout;
 }
 
 const win = (id: string, open: boolean, collapsed?: boolean) => ({
@@ -61,7 +61,7 @@ describe('isDockPanelOnScreen', () => {
 
 	it('自動で隠した帯は引き出している間だけ真', () => {
 		const l = layout({
-			autoHidden: [{ node: panel('log'), edge: 'bottom', slot: { kind: 'root' } }]
+			autoHidden: [{ node: panel('log'), edge: 'bottom' }]
 		} as never);
 		expect(isDockPanelOnScreen(l, 'log', null)).toBe(false);
 		expect(isDockPanelOnScreen(l, 'log', 'log')).toBe(true);

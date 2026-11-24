@@ -13,14 +13,15 @@ vi.mock('./banto/setup', () => ({
 			if (getOverride) {
 				const override = getOverride;
 				getOverride = null;
-				return override();
+				return { value: await override(), revision: '0' };
 			}
-			return store.get(key) ?? null;
+			return { value: store.get(key) ?? null, revision: '0' };
 		},
 		set: async (key: string, value: string) => {
 			if (failing.set) throw new Error('401');
 			setLog.push(key);
 			store.set(key, value);
+			return { revision: '1' };
 		}
 	})
 }));

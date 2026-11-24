@@ -371,7 +371,9 @@ pub fn console_guidance(kind: FailureKind, layout: &DataLayout) -> Vec<String> {
 fn choices_need_store_setting(kind: FailureKind) -> bool {
     matches!(
         kind,
-        FailureKind::StoreDirUnreadable | FailureKind::StoreDirUnwritable
+        FailureKind::StoreDirUnreadable
+            | FailureKind::StoreDirUnwritable
+            | FailureKind::StoreDirRefused
     )
 }
 

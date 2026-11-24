@@ -100,8 +100,7 @@ async function commissioning(): Promise<void> {
 /** ロックダウン: サーバーが grant のトークンを全部失効させ、grant ももう出さない。 */
 function lockedDown(): void {
 	hub.routes.identity = async () => jsonResponse(401, { kind: 'unauthorized' });
-	hub.routes.authStatus = async () =>
-		jsonResponse(200, { initialized: true, grants: { commissioning: false } });
+	hub.routes.authStatus = async () => jsonResponse(200, { grants: { commissioning: false } });
 	hub.routes.grant = async () => jsonResponse(403, { kind: 'forbidden' });
 }
 

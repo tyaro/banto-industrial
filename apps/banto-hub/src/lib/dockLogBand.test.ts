@@ -63,7 +63,7 @@ describe('lowScreenDefaultLayout', () => {
 
 	it('ログが木に無い配置（狭い表示など）はそのまま', () => {
 		const layout: DockLayout = {
-			version: 2,
+			version: 4,
 			docked: { type: 'panel', id: 'center', title: '中央' },
 			floating: []
 		} as DockLayout;

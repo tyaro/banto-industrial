@@ -31,8 +31,9 @@
 //!
 //! 「中身」に数えないのは、safe-root の印（[`banto_safe_root::mode::MARKER_NAME`]。サービスが
 //! フォルダを握るときに置く）と、書き込みの確かめの一時ファイルの残り
-//! （`.chronogazer-write-check-*`）だけ。それ以外は何でも中身として断る（関係の無いファイルの
-//! あるフォルダを保存先にしない）。
+//! （`.chronogazer-write-check-*`）、印の書きかけの一時ファイルの残り
+//! （`.chronogazer-store-generation.tmp`）だけ。それ以外は何でも中身として断る（関係の無い
+//! ファイルのあるフォルダを保存先にしない）。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -47,6 +48,10 @@ pub const GENERATION_KEY: &str = "data.store_generation";
 
 /// 保存先のフォルダに置く印のファイル（中身は世代 id）。
 pub const MARKER_FILE_NAME: &str = ".chronogazer-store-generation";
+
+/// 印を書くときの一時ファイル（[`write_marker_path`]）。書きかけで落ちた残りは中身に数えない
+/// （数えると、次の起動が「印の無いファイルがある」と止まる）。
+const MARKER_TEMP_FILE_NAME: &str = ".chronogazer-store-generation.tmp";
 
 /// 書き込みの確かめの一時ファイルの接頭辞（`startup_recovery::check_writable_dir` と
 /// `service_data_dir::check_service_writable_dir`）。落ちたときの残りを中身に数えない。
@@ -134,6 +139,7 @@ impl std::error::Error for ClaimError {}
 /// 中身に数えない名前か（モジュール doc の最後）。
 fn ignored(name: &str) -> bool {
     name == MARKER_FILE_NAME
+        || name == MARKER_TEMP_FILE_NAME
         || name == banto_safe_root::mode::MARKER_NAME
         || name.starts_with(WRITE_CHECK_PREFIX)
 }
@@ -206,7 +212,7 @@ pub fn inspect_dir(dir: &Path, generation: &str) -> Result<bool, ClaimError> {
 
 /// 印を一時ファイルに書いてから付け替える（書きかけの印を残さない）。
 fn write_marker_path(dir: &Path, generation: &str) -> std::io::Result<()> {
-    let temp = dir.join(format!("{MARKER_FILE_NAME}.tmp"));
+    let temp = dir.join(MARKER_TEMP_FILE_NAME);
     {
         let mut file = std::fs::File::create(&temp)?;
         file.write_all(&marker_contents(generation))?;
@@ -295,6 +301,19 @@ mod tests {
                 found: "other".to_string()
             })
         );
+        // 印の一時ファイル（書きかけで落ちた残り）は中身に数えない。
+        assert_eq!(
+            decide(&names(&[MARKER_TEMP_FILE_NAME]), None, gen),
+            Ok(true)
+        );
+        assert_eq!(
+            decide(
+                &names(&[MARKER_FILE_NAME, MARKER_TEMP_FILE_NAME]),
+                Some(""),
+                gen
+            ),
+            Ok(true)
+        );
         assert_eq!(decide(&names(&[MARKER_FILE_NAME]), Some(""), gen), Ok(true));
         assert!(decide(&names(&[MARKER_FILE_NAME, "x"]), Some(""), gen).is_err());
     }
@@ -324,6 +343,24 @@ mod tests {
             std::fs::read_to_string(store.join(MARKER_FILE_NAME)).unwrap(),
             "gen-a\n"
         );
+    }
+
+    /// 印の書きかけの一時ファイルが残っていても（書きかけで落ちた後）、起動は止まらず、次の
+    /// `claim_dir` が印を書き直して一時ファイルも残さない。
+    #[test]
+    fn a_leftover_marker_temp_file_does_not_stop_the_start() {
+        let dir = TempDir::new();
+        let store = dir.path().join("history");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join(MARKER_TEMP_FILE_NAME), b"gen-").unwrap();
+        assert!(inspect_dir(&store, "gen-a").unwrap());
+        claim_dir(&store, "gen-a").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(store.join(MARKER_FILE_NAME)).unwrap(),
+            "gen-a
+"
+        );
+        assert!(!store.join(MARKER_TEMP_FILE_NAME).exists());
     }
 
     /// 印の無い中身のあるフォルダ（v8 より前の保存先）は断られ、何も足されない。

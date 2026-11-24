@@ -53,7 +53,7 @@ export async function seedNavLayout(page: Page, layout: 'sidebar' | 'launcher'):
 				init?.method ?? (input instanceof Request ? input.method : 'GET')
 			).toUpperCase();
 			if (method === 'GET' && /\/api\/ui-settings\/shell\.navLayout(\?|$)/.test(url)) {
-				return new Response(JSON.stringify({ value }), {
+				return new Response(JSON.stringify({ value, revision: '1' }), {
 					status: 200,
 					headers: { 'content-type': 'application/json' }
 				});

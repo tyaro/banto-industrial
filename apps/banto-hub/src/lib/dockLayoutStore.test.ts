@@ -12,7 +12,7 @@ function layout(share: number): StoredDockLayout {
 	return {
 		schema: 1,
 		panels: ['left', 'center'],
-		layout: { version: 3, floating: [], docked: { share } }
+		layout: { version: 4, floating: [], docked: { share } }
 	};
 }
 
@@ -25,11 +25,12 @@ function fakeProvider(initial?: string) {
 	const set = vi.fn(async (key: string, value: string) => {
 		if (failSet) throw new Error('offline');
 		values.set(key, value);
+		return { revision: '1' };
 	});
 	const provider = {
 		get: vi.fn(async (key: string) => {
 			if (gate) await gate;
-			return values.get(key) ?? null;
+			return { value: values.get(key) ?? null, revision: '0' };
 		}),
 		set
 	} as unknown as UiSettingsProvider;

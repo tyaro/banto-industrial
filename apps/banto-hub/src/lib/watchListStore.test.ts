@@ -17,13 +17,20 @@ import { WATCH_LIMIT, serializeWatchList } from './watchList';
 const KEY = 'hub.watch.v1';
 const LOCAL_KEY = 'banto.watch.v1.account%3A1';
 
+/** v8 の `UiSettingsProvider.get` の答え（`{ value, revision }`）。 */
+type UiSnapshot = { value: string | null; revision: string };
+
 /** サーバーの代わり。既定は即答。場面ごとに `get`・`set` の振る舞いを `mock...Once` で替える。 */
 function fakeProvider(initial?: string) {
 	const values = new Map<string, string>();
 	if (initial !== undefined) values.set(KEY, initial);
-	const get = vi.fn(async (key: string): Promise<string | null> => values.get(key) ?? null);
-	const set = vi.fn(async (key: string, value: string): Promise<void> => {
+	const get = vi.fn(async (key: string): Promise<UiSnapshot> => ({
+		value: values.get(key) ?? null,
+		revision: '0'
+	}));
+	const set = vi.fn(async (key: string, value: string): Promise<{ revision: string }> => {
 		values.set(key, value);
+		return { revision: '1' };
 	});
 	const provider = { get, set } as unknown as UiSettingsProvider;
 	/** 次の GET を `release()` まで返さない。 */
@@ -31,8 +38,8 @@ function fakeProvider(initial?: string) {
 		let release: () => void = () => undefined;
 		get.mockImplementationOnce(
 			(key: string) =>
-				new Promise<string | null>((resolve) => {
-					release = () => resolve(values.get(key) ?? null);
+				new Promise<UiSnapshot>((resolve) => {
+					release = () => resolve({ value: values.get(key) ?? null, revision: '0' });
 				})
 		);
 		return { release: () => release() };
@@ -530,7 +537,10 @@ describe('createWatchListStore', () => {
 		expect(server.get.mock.calls.length).toBe(calls + 1);
 		expect(wake).not.toBeNull();
 		server.get.mockReset();
-		server.get.mockImplementation(async () => server.values.get(KEY) ?? null);
+		server.get.mockImplementation(async () => ({
+			value: server.values.get(KEY) ?? null,
+			revision: '0'
+		}));
 		shown = true;
 		wake!();
 		await settle();

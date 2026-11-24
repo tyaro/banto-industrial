@@ -12,15 +12,12 @@
 		PUBLIC_VIEWER_GRANT_KIND
 	} from '#lib/banto/grantPolicy.js';
 
-	// Undecided until `status()` resolves (or is absent, treated as
-	// "already initialized" - see below): render nothing rather than
+	// Undecided until `status()` resolves: render nothing rather than
 	// flashing one form then the other.
-	let mode: 'loading' | 'setup' | 'login' = $state('loading');
+	let mode: 'loading' | 'login' = $state('loading');
 
 	let username = $state('');
 	let password = $state('');
-	let displayName = $state('');
-	let passwordConfirm = $state('');
 	let error: string | null = $state(null);
 	let submitting = $state(false);
 
@@ -35,7 +32,7 @@
 	let showRemember = $state(false);
 	let remember = $state(false);
 
-	// banto v2.0.0（#260、design §6.1）: ログイン・初回セットアップが
+	// banto v2.0.0（#260、design §6.1）: ログインが
 	// `superseded`（別のログイン・ログアウトが先に確定し、このログインは何も
 	// 保存しなかった）を返したら、エラーではなく通知して /monitor へ移る。保護
 	// ガード（`(app)/+layout.ts`）が今保存されている資格情報で確定する。
@@ -50,12 +47,7 @@
 	// この PC からの画面だけ（`status().grants.localDesktop`、`loginEntries`）。
 	// - 「この PC として続ける」: ログアウトの後はガードの外のこの画面に来るので自動では
 	//   入り直さない。押したらガードのかかる画面へ移り、ガードが `localDesktop` に入る。
-	// - 初回セットアップの「この PC からはログインなしで使う（管理者）」: 既定でチェック。
-	//   選ぶと setup の本文に `localGrant: 'admin'` を載せ、サーバーが設定
-	//   `auth.local_grant` を admin にする（設定の既定は off のまま）。
 	let showContinueAsThisPc = $state(false);
-	let showLocalGrantOptIn = $state(false);
-	let localGrantOptIn = $state(true);
 
 	const LOGIN_SUPERSEDED_MESSAGE = '別のセッションが先に確定しました。現在のセッションで開きます。';
 
@@ -64,15 +56,12 @@
 			await bantoReady; // provider selection (spec §11.1's three-way probe) must finish first
 			showRemember = getBantoMode() === 'server';
 			const status = await getAuthProvider().status?.();
-			// No `status()` on this provider (an older/custom AuthProvider,
-			// spec §3.3's members are optional for backward compatibility):
-			// behave as if an account already exists, i.e. the normal login
-			// form.
-			mode = status && !status.initialized ? 'setup' : 'login';
+			// banto v8: 初回セットアップの画面は無い（新しい DB はログインなしで
+			// 始まり、最初の管理者はユーザー管理で作る）。常に通常のログイン画面。
+			mode = 'login';
 			const entries = loginEntries(getBantoMode(), status);
 			showContinueAsViewer = entries.continueAsViewer;
 			showContinueAsThisPc = entries.continueAsThisPc;
-			showLocalGrantOptIn = entries.localGrantOptIn;
 		})();
 	});
 
@@ -141,102 +130,10 @@
 			submitting = false;
 		}
 	}
-
-	async function submitSetup(event: SubmitEvent) {
-		event.preventDefault();
-		error = null;
-
-		if (password.length < 8) {
-			error = 'パスワードは8文字以上で入力してください';
-			return;
-		}
-		if (password !== passwordConfirm) {
-			error = 'パスワードが一致しません';
-			return;
-		}
-
-		submitting = true;
-		try {
-			const setup = getAuthProvider().setup;
-			if (!setup) {
-				error = 'この環境では初期セットアップに対応していません';
-				return;
-			}
-			const optedIn = showLocalGrantOptIn && localGrantOptIn;
-			const params: Record<string, unknown> = { username, password, displayName };
-			if (optedIn) params.localGrant = 'admin';
-			const result = await setup(params);
-			if (result.success) {
-				if (optedIn) {
-					// setup は作った管理者のトークンを保存して返す。この PC からの接続で
-					// 使い続けると選んだので、そのセッションを閉じてから（`enterGrant` は
-					// 資格情報が無いときだけ入る）ガードのかかる画面へ移り、ガードが
-					// `localDesktop`（サーバーが setup の応答の前に設定を admin にした）に
-					// 入る。設定を保存できなかったときは grant が閉じたままなので、ガードは
-					// ログイン画面へ戻す（fail closed）。
-					try {
-						await getAuthProvider().logout();
-					} catch {
-						// 閉じられなくてもガードが今の資格情報で確定する。
-					}
-				}
-				goto(resolveAppPath('/monitor'));
-			} else if (result.superseded) {
-				notify('info', LOGIN_SUPERSEDED_MESSAGE);
-				goto(resolveAppPath('/monitor'));
-			} else {
-				error = result.error ?? 'セットアップに失敗しました';
-			}
-		} finally {
-			submitting = false;
-		}
-	}
 </script>
 
 <div class="page">
-	{#if mode === 'setup'}
-		<form onsubmit={submitSetup}>
-			<h1>🏮 ChronoGazer</h1>
-			<p class="note">初回起動です。管理者アカウントを作成してください。</p>
-
-			<label>
-				表示名
-				<input type="text" bind:value={displayName} autocomplete="name" />
-			</label>
-
-			<label>
-				ユーザー名
-				<input type="text" bind:value={username} autocomplete="username" />
-			</label>
-
-			<label>
-				パスワード（8文字以上）
-				<input type="password" bind:value={password} autocomplete="new-password" />
-			</label>
-
-			<label>
-				パスワード（確認）
-				<input type="password" bind:value={passwordConfirm} autocomplete="new-password" />
-			</label>
-
-			{#if showLocalGrantOptIn}
-				<label class="remember">
-					<input type="checkbox" bind:checked={localGrantOptIn} />
-					この PC からはログインなしで使う（管理者）
-				</label>
-				<p class="note opt-in-note">
-					この PC で動いているプログラムは誰でも管理者として操作できます。共用の PC
-					では外してください（あとで設定の「セキュリティ」から変えられます）。
-				</p>
-			{/if}
-
-			{#if error}
-				<p class="error">{error}</p>
-			{/if}
-
-			<button type="submit" disabled={submitting}>アカウントを作成</button>
-		</form>
-	{:else if mode === 'login'}
+	{#if mode === 'login'}
 		<form onsubmit={submitLogin}>
 			<h1>🏮 ChronoGazer</h1>
 
@@ -315,13 +212,6 @@
 		font-size: 1.5rem;
 	}
 
-	.note {
-		margin: 0;
-		text-align: center;
-		color: var(--banto-text-muted);
-		font-size: 0.8rem;
-	}
-
 	label {
 		display: flex;
 		flex-direction: column;
@@ -353,11 +243,6 @@
 	.remember input {
 		padding: 0;
 		width: auto;
-	}
-
-	.opt-in-note {
-		margin-top: -0.6rem;
-		text-align: left;
 	}
 
 	.error {

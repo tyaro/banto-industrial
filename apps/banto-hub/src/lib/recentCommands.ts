@@ -119,7 +119,7 @@ export async function syncRecentFromProvider(
 	removeLegacyCopy();
 	let serverIds: string[];
 	try {
-		serverIds = parseRecentIds(await getUiSettings().get(RECENT_SETTING));
+		serverIds = parseRecentIds((await getUiSettings().get(RECENT_SETTING)).value);
 	} catch {
 		// Best-effort: 失敗したらメモリの記録だけを持つ。次のセッションの取り込みでやり直す。
 		if (seq === syncSeq && isCurrent()) syncState = 'failed';

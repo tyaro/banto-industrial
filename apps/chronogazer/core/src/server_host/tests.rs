@@ -185,6 +185,7 @@ fn exit_codes_follow_the_service_convention() {
         FailureKind::LegacyDatabase,
         FailureKind::StoreDirUnreadable,
         FailureKind::StoreDirUnwritable,
+        FailureKind::StoreDirRefused,
         FailureKind::DatabaseCorrupt,
         FailureKind::DatabaseUnopenable,
         FailureKind::DatabaseFromNewerVersion,

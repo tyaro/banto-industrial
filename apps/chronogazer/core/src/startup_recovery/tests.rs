@@ -316,7 +316,7 @@ async fn corrupt_db_is_classified_then_recreated_keeping_the_old_file() {
         ),
         "{err:?}"
     );
-    assert_eq!(classify(&err), FailureKind::StoreDirUnwritable);
+    assert_eq!(classify(&err), FailureKind::StoreDirRefused);
     assert_eq!(snapshot(&store), store_before, "前の保存先に触れた");
     // 前の保存先を退けると、新しい DB で起動できる。
     std::fs::rename(&store, dir.path().join("data").join("history-old")).unwrap();

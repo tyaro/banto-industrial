@@ -30,10 +30,11 @@ vi.mock('./banto/setup', () => ({
 			if (gate) await gate;
 			if (failGet) throw new Error('offline');
 			returned.set(key, snapshot);
-			return snapshot;
+			return { value: snapshot, revision: '0' };
 		},
 		set: async (key: string, value: string) => {
 			store.set(key, value);
+			return { revision: '1' };
 		}
 	})
 }));

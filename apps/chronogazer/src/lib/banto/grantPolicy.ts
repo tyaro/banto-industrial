@@ -5,10 +5,9 @@
  *
  * 1. **`localDesktop`（この PC からの接続、B2-1）**: サービスの host
  *    （`chronogazer-server`）が、この PC からの要求（peer と Host の両方が loopback）
- *    にだけ開く。未初期化の間は admin、初期化後は設定 `auth.local_grant` の role。
- *    `status().grants.localDesktop` が `true` のときだけ入る（未初期化でも初期化済み
- *    でも同じ。2026-10-14 オーナー決定 1: 最初の管理者がいない間もログインなしで
- *    入り、画面の上の案内から初回セットアップへ誘う）。
+ *    にだけ開く。権限はログインなしの間は `auth.disabled_role`、ログイン必須なら設定
+ *    `auth.local_grant` の role（banto v8: 初回セットアップは無くなった）。
+ *    `status().grants.localDesktop` が `true` のときだけ入る。
  * 2. **`publicViewer`（閲覧公開、ADR-0012）**: `server.viewerPublic` が ON のとき。
  *
  * 順序は `localDesktop` が先（オーナー決定 2）: この PC からは、閲覧だけの公開より
@@ -38,17 +37,6 @@ export const PUBLIC_VIEWER_GRANT_KIND = 'publicViewer';
 /** `status()` が `localDesktop` を使えると言っているか（無い・`false` は使えない）。 */
 export function localDesktopAvailable(status: GrantStatus | undefined): boolean {
 	return status?.grants?.[LOCAL_DESKTOP_GRANT_KIND] === true;
-}
-
-/**
- * 最初の管理者がまだいない（未初期化）ことを、`localDesktop` のセッションに案内するか
- * （画面の上の帯。`SetupBanner.svelte`）。`status` が読めない・初期化済みなら出さない。
- */
-export function needsFirstAdmin(
-	localDesktopSession: boolean,
-	status: GrantStatus | undefined
-): boolean {
-	return localDesktopSession && status !== undefined && status.initialized === false;
 }
 
 /**
@@ -145,22 +133,16 @@ export function enteredKind(result: ResolveResult, kind: string): boolean {
 	);
 }
 
-/** ログイン画面（`routes/login/+page.svelte`）に出す、資格情報なしの口と初回セットアップの選択。 */
+/** ログイン画面（`routes/login/+page.svelte`）に出す、資格情報なしの口。 */
 export interface LoginEntries {
 	/** 「この PC として続ける」（`localDesktop`、オーナー決定 3）。 */
 	continueAsThisPc: boolean;
 	/** 「閲覧のみで続ける」（`publicViewer`、I2b）。 */
 	continueAsViewer: boolean;
-	/**
-	 * 初回セットアップの「この PC からはログインなしで使う（管理者）」（オーナー決定 7、
-	 * 既定でチェック）。未初期化で `localDesktop` が使えるとき（= サービスの host の、この
-	 * PC からの画面）だけ。
-	 */
-	localGrantOptIn: boolean;
 }
 
 /**
- * ログイン画面の出し分け（純関数）。資格情報なしの口と初回セットアップの選択は
+ * ログイン画面の出し分け（純関数）。資格情報なしの口は
  * LAN/サービスの HTTP の画面（`server` モード）だけで、Tauri の窓には出さない
  * （Tauri の窓のログイン不要は M11 の受け持ち）。`status` が読めなければ出さない。
  */
@@ -171,14 +153,12 @@ export function loginEntries(
 	if (mode !== 'server' || status === undefined) {
 		return {
 			continueAsThisPc: false,
-			continueAsViewer: false,
-			localGrantOptIn: false
+			continueAsViewer: false
 		};
 	}
 	const local = localDesktopAvailable(status);
 	return {
-		continueAsThisPc: status.initialized && local,
-		continueAsViewer: status.grants?.[PUBLIC_VIEWER_GRANT_KIND] === true,
-		localGrantOptIn: !status.initialized && local
+		continueAsThisPc: local,
+		continueAsViewer: status.grants?.[PUBLIC_VIEWER_GRANT_KIND] === true
 	};
 }

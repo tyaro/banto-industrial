@@ -59,8 +59,8 @@ function memoryStorage(): Storage {
 	} as Storage;
 }
 
-const ALICE: Identity = { id: 'alice', name: 'Alice' };
-const BOB: Identity = { id: 'bob', name: 'Bob' };
+const ALICE: Identity = { id: 'alice', name: 'Alice', accountId: 'alice' };
+const BOB: Identity = { id: 'bob', name: 'Bob', accountId: 'bob' };
 
 /**
  * A standard provider: every `resolve()` answer and the logout response are
@@ -189,7 +189,7 @@ describe('logoutAndLeave (I-10, I-18)', () => {
 		p.login();
 		p.active(BOB);
 		await flush();
-		expect(controller.snapshot.owner).toBe('account:bob');
+		expect(controller.snapshot.owner).toBe('acct:bob');
 		const scope = currentSessionScope();
 		saveListViewState(scope, 'items:server', { sort: [], filters: [] });
 		const generation = controller.snapshot.generation;
@@ -204,7 +204,7 @@ describe('logoutAndLeave (I-10, I-18)', () => {
 
 		expect(controller.snapshot).toMatchObject({
 			status: 'active',
-			owner: 'account:bob',
+			owner: 'acct:bob',
 			generation
 		});
 		expect(loadListViewState(scope, 'items:server')).not.toBeNull();
@@ -278,7 +278,7 @@ describe('logoutAndLeave (I-10, I-18)', () => {
 		await expect(done).resolves.toBe('stayed');
 		expect(notify).toHaveBeenCalledTimes(1);
 		expect(notify).toHaveBeenCalledWith('stayed');
-		expect(getSessionController().snapshot.owner).toBe('account:alice');
+		expect(getSessionController().snapshot.owner).toBe('acct:alice');
 		expect(goToLogin).not.toHaveBeenCalled();
 	});
 

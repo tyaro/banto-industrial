@@ -75,8 +75,7 @@ export function installHub() {
 		/** `GET /api/auth/identity`。既定は「セッション無し」（`200 null`）。 */
 		identity: (async () => jsonResponse(200, null)) as Route,
 		/** `GET /api/auth/status`。既定は「初期化済み・試運転の grant は出せない」。 */
-		authStatus: (async () =>
-			jsonResponse(200, { initialized: true, grants: { commissioning: false } })) as Route,
+		authStatus: (async () => jsonResponse(200, { grants: { commissioning: false } })) as Route,
 		/** `POST /api/auth/grant/commissioning`。既定は `403`（ロックダウン済み／loopback でない）。 */
 		grant: (async () => jsonResponse(403, { kind: 'forbidden' })) as Route,
 		/** `POST /api/auth/logout`。 */
@@ -125,6 +124,8 @@ export const identityOf = (id: string, role = 'admin', kind?: string) => ({
 	id,
 	name: id,
 	role,
+	// banto v8: アカウントの identity だけが accountId を持つ（grant には載せない）。
+	...(kind === undefined || kind === 'account' ? { accountId: id } : {}),
 	...(kind === undefined ? {} : { kind })
 });
 
@@ -156,8 +157,7 @@ export function commissioningHub(
 	token = 'grant-token',
 	extra: Record<string, ReturnType<typeof identityOf>> = {}
 ): void {
-	hub.routes.authStatus = async () =>
-		jsonResponse(200, { initialized: true, grants: { commissioning: true } });
+	hub.routes.authStatus = async () => jsonResponse(200, { grants: { commissioning: true } });
 	hub.routes.grant = async () => jsonResponse(200, { success: true, token });
 	hub.routes.identity = identityByToken({ ...extra, [token]: COMMISSIONING_GRANT_IDENTITY });
 }

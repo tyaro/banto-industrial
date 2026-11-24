@@ -175,8 +175,8 @@ describe('(app) guard: credential-less entries in order (#392 B2-2)', () => {
 		const [, , ticket, options] = mocks.grantFallback.mock.calls[0];
 		expect(ticket).toEqual({ generation: 1 });
 		expect(options.kind).toBe('localDesktop');
-		expect(options.available({ initialized: false, grants: { localDesktop: true } })).toBe(true);
-		expect(options.available({ initialized: true, grants: { publicViewer: true } })).toBe(false);
+		expect(options.available({ grants: { localDesktop: true } })).toBe(true);
+		expect(options.available({ grants: { publicViewer: true } })).toBe(false);
 	});
 
 	it('falls back to publicViewer with the ticket of the confirmed none, then /login', async () => {
