@@ -9066,13 +9066,13 @@ mod tests {
     #[tokio::test]
     async fn s96_config_apply_true_again_keeps_seq_for_the_same_role_and_advances_it_for_another() {
         let state = app_state().await;
-        enable_local_from_an_admin_session(&state, "testadmin").await;
+        enable_local_from_an_admin_session(&state, "admin").await;
         let (session, seq) = read_slot(&state);
         assert!(is_local(&session));
         let logins = audit_action_count(&state, "login").await;
         let logouts = audit_action_count(&state, "logout").await;
 
-        auth_config_apply_body(&state, true, "testadmin")
+        auth_config_apply_body(&state, true, "admin")
             .await
             .expect("same apply");
         assert_eq!(
@@ -9104,7 +9104,7 @@ mod tests {
     #[tokio::test]
     async fn s96_a_resolve_that_read_the_old_local_role_does_not_write_it_back() {
         let state = app_state().await;
-        enable_local_from_an_admin_session(&state, "testadmin").await;
+        enable_local_from_an_admin_session(&state, "admin").await;
 
         // The old resolve: slot and store read (admin), then held.
         let (cached, seq_at_entry) = read_slot(&state);
@@ -9342,7 +9342,7 @@ mod tests {
         save_fails_after_the_mode(&mut state);
         let (_, seq) = read_slot(&state);
 
-        let result = auth_config_apply_body(&state, true, "testadmin").await;
+        let result = auth_config_apply_body(&state, true, "admin").await;
         assert!(matches!(result, Err(BantoError::Storage(_))), "{result:?}");
         assert!(
             state
@@ -9357,7 +9357,7 @@ mod tests {
         assert!(is_local(&session), "follows disabled = true: {session:?}");
         assert_eq!(seq_on, seq + 1);
 
-        let result = auth_config_apply_body(&state, false, "testadmin").await;
+        let result = auth_config_apply_body(&state, false, "admin").await;
         assert!(result.is_err());
         assert!(
             !state
@@ -9381,7 +9381,7 @@ mod tests {
     #[tokio::test]
     async fn s102_a_stale_settle_reports_the_slot_value_not_the_older_read() {
         let state = app_state().await;
-        enable_local_from_an_admin_session(&state, "testadmin").await;
+        enable_local_from_an_admin_session(&state, "admin").await;
         let (cached, seq_at_entry) = read_slot(&state);
         let cached = cached.expect("Local(admin)");
         let fresh = read_session_source(&state, &cached).await.unwrap();
@@ -9505,13 +9505,13 @@ mod tests {
     #[tokio::test]
     async fn s99_config_apply_false_ends_local_at_once_and_an_old_resolve_is_stale() {
         let state = app_state().await;
-        enable_local_from_an_admin_session(&state, "testadmin").await;
+        enable_local_from_an_admin_session(&state, "admin").await;
         let (cached, seq_n) = read_slot(&state);
         let cached = cached.expect("Local(admin)");
         let fresh = read_session_source(&state, &cached).await.unwrap();
         assert!(fresh.is_some(), "read while the mode was on");
 
-        auth_config_apply_body(&state, false, "testadmin")
+        auth_config_apply_body(&state, false, "admin")
             .await
             .expect("disable");
         assert_eq!(read_slot(&state), (None, seq_n + 1));
@@ -9556,7 +9556,7 @@ mod tests {
         assert!(login.success);
         let before = read_slot(&state);
 
-        auth_config_apply_body(&state, false, "testadmin")
+        auth_config_apply_body(&state, false, "admin")
             .await
             .expect("re-save false");
         assert_eq!(read_slot(&state), before);
@@ -9733,7 +9733,7 @@ mod tests {
         run_until_held!(logout, hold);
         assert_eq!(read_slot(&state), (None, login.seq + 1), "A is cleared");
 
-        let apply = auth_config_apply_body(&state, true, "testadmin");
+        let apply = auth_config_apply_body(&state, true, "admin");
         tokio::pin!(apply);
         assert_stays_pending!(apply);
         hold.release.send(()).unwrap();
@@ -9773,11 +9773,11 @@ mod tests {
         state.set_session_for_test(Some(DesktopSession::Account(admin)));
         let mut hold = hold_after_save(&mut state);
 
-        let apply_on = auth_config_apply_body(&state, true, "testadmin");
+        let apply_on = auth_config_apply_body(&state, true, "admin");
         tokio::pin!(apply_on);
         run_until_held!(apply_on, hold);
 
-        let apply_off = auth_config_apply_body(&state, false, "testadmin");
+        let apply_off = auth_config_apply_body(&state, false, "admin");
         tokio::pin!(apply_off);
         assert_stays_pending!(apply_off);
         assert!(
@@ -9845,7 +9845,7 @@ mod tests {
         tokio::pin!(logout);
         run_until_held!(logout, hold);
 
-        let apply_off = auth_config_apply_body(&state, false, "testadmin");
+        let apply_off = auth_config_apply_body(&state, false, "admin");
         tokio::pin!(apply_off);
         assert_stays_pending!(apply_off);
         assert!(
@@ -10080,7 +10080,7 @@ mod tests {
         ));
 
         // Still viewer: the escape hatch lets it raise the role to admin.
-        auth_config_apply_body(&state, true, "testadmin")
+        auth_config_apply_body(&state, true, "admin")
             .await
             .expect("viewer raises the role (escape hatch)");
         assert_eq!(local_role(&state), Role::Admin);
@@ -10115,7 +10115,7 @@ mod tests {
 
         // With the mode off and no session, the escape hatch is closed.
         assert!(matches!(
-            auth_config_apply_body(&state, true, "testadmin").await,
+            auth_config_apply_body(&state, true, "admin").await,
             Err(BantoError::Unauthorized)
         ));
     }
