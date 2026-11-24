@@ -7,11 +7,10 @@
 //! （`crate::rest::X`）は親の re-export で保つ。
 
 use super::{
-    AuditActor, Extension,
     commit_catalog_and_notify, default_payload_enabled, json, preflight_transaction,
     queue_pending_registry_change, record_write, registry_before, registry_change_should_queue,
-    require_editor, storage_api_error, ApiError, CollectionGroup, CollectionGroupInput,
-    Deserialize, HeaderMap, IntoResponse, Json, ListParams, Path, RegistryMutationError,
+    require_editor, storage_api_error, ApiError, AuditActor, CollectionGroup, CollectionGroupInput,
+    Deserialize, Extension, HeaderMap, IntoResponse, Json, ListParams, Path, RegistryMutationError,
     RegistryMutationResult, Response, Serialize, State, StatusCode, TagRegistryState,
 };
 

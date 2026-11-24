@@ -228,7 +228,12 @@ async fn test_app(label: &str) -> TestApp {
     // exercise the production wiring.
     let audit = audit_spool::build_audit_service(Db::Sqlite(pool.clone()), &env.data_dir());
     users
-        .create_user("testadmin", "password123", "管理者", banto_hub_core::users::Role::Admin)
+        .create_user(
+            "testadmin",
+            "password123",
+            "管理者",
+            banto_hub_core::users::Role::Admin,
+        )
         .await
         .expect("setup_first_user");
 

@@ -7,14 +7,13 @@
 //! （`crate::rest::X`）は親の re-export で保つ。
 
 use super::{
-    AuditActor, Extension,
     actor_for_token, api_key_rejection_response, api_key_verdict, bearer_token, broadcast,
     forbidden_response, get, json, middleware, put, record_write, require_editor, require_session,
-    unauthorized_response, ApiError, ApiKeysService, Arc, AuditLogService, AuthGate, AuthState,
-    BantoError, CollectorManager, Deserialize, FieldError, FromStr, HeaderMap, IntoResponse, Json,
-    OperationKind, Path, PlcConnectionService, Response, Role, Router, Serialize, ServerEvent,
-    SinkGroup, SinkGroupInput, SinkGroupService, SinkGroupStatusPush, SinkStatusStore, State,
-    StatusCode, TagEntry,
+    unauthorized_response, ApiError, ApiKeysService, Arc, AuditActor, AuditLogService, AuthGate,
+    AuthState, BantoError, CollectorManager, Deserialize, Extension, FieldError, FromStr,
+    HeaderMap, IntoResponse, Json, OperationKind, Path, PlcConnectionService, Response, Role,
+    Router, Serialize, ServerEvent, SinkGroup, SinkGroupInput, SinkGroupService,
+    SinkGroupStatusPush, SinkStatusStore, State, StatusCode, TagEntry,
 };
 use crate::api_keys::HubScopeChecks;
 

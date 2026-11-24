@@ -119,7 +119,12 @@ async fn test_app(label: &str) -> TestApp {
     // (`CommissioningService::lock_down`'s `has_admin` guard), which
     // scenario 5 needs.
     users
-        .create_user("testadmin", "password123", "管理者", banto_hub_core::users::Role::Admin)
+        .create_user(
+            "testadmin",
+            "password123",
+            "管理者",
+            banto_hub_core::users::Role::Admin,
+        )
         .await
         .expect("setup_first_user");
 

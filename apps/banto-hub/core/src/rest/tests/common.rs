@@ -140,7 +140,12 @@ async fn test_env_on_pool(
     let plc_connections = manager.plc_connections();
 
     users
-        .create_user("testadmin", "password123", "管理者", crate::users::Role::Admin)
+        .create_user(
+            "testadmin",
+            "password123",
+            "管理者",
+            crate::users::Role::Admin,
+        )
         .await
         .expect("setup_first_user");
     users

@@ -7,14 +7,14 @@
 //! で使う。外から使われるパス（`crate::rest::X`）は親の re-export で保つ。
 
 use super::{
-    broadcast, record_as, AuditActor, Extension, commit_catalog_and_notify, default_payload_enabled, get, json,
-    middleware, post, preflight_api_error, preflight_transaction, record_write,
+    broadcast, commit_catalog_and_notify, default_payload_enabled, get, json, middleware, post,
+    preflight_api_error, preflight_transaction, record_as, record_write,
     redact_pending_change_for_response, registry_before, reject_delete_if_referenced_by_sink_group,
     reject_hub_connection_protocol, remove_tag_from_all_sink_groups, require_session,
-    require_session_role, storage_api_error, ApiError, Arc, AsyncMutex,
+    require_session_role, storage_api_error, ApiError, Arc, AsyncMutex, AuditActor,
     AuditLogService, AuthGate, AuthState, BantoError, BatchTagDeleteOutcome, BatchTagOutcome,
     BatchTagUpdateOutcome, CollectionController, CollectionGroupPayload, CollectionGroupService,
-    CollectorManager, Deserialize, FieldError, IntoResponse, Json, OperationKind, Path,
+    CollectorManager, Deserialize, Extension, FieldError, IntoResponse, Json, OperationKind, Path,
     PendingChange, PendingChangesService, PlcConnectionPayload, PlcConnectionResponse,
     PlcConnectionService, Query, Response, Role, Router, Serialize, ServerEvent, SessionRoleGuard,
     State, StatusCode, TagBatchUpdatePayload, TagInput, TagPayload, TagService, TagUpdateError,

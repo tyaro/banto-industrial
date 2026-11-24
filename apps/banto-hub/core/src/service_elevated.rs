@@ -1752,7 +1752,12 @@ mod tests {
         let pool = crate::db::migrate_memory().await.expect("migrate_memory");
         let users = crate::users::UsersService::new(crate::db::Db::Sqlite(pool.clone()));
         users
-            .create_user("owner", "old-password-1", "オーナー", crate::users::Role::Admin)
+            .create_user(
+                "owner",
+                "old-password-1",
+                "オーナー",
+                crate::users::Role::Admin,
+            )
             .await
             .expect("setup_first_user");
 
@@ -1794,7 +1799,12 @@ mod tests {
         let settings = crate::settings::SettingsService::new(crate::db::Db::Sqlite(pool.clone()));
         let users = crate::users::UsersService::new(crate::db::Db::Sqlite(pool.clone()));
         users
-            .create_user("owner", "password123", "オーナー", crate::users::Role::Admin)
+            .create_user(
+                "owner",
+                "password123",
+                "オーナー",
+                crate::users::Role::Admin,
+            )
             .await
             .expect("setup_first_user");
         let auth = banto_server::AuthState::new(

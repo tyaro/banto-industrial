@@ -107,8 +107,8 @@ use banto_collect::{
 use banto_core::{BantoError, ErrorBody, FieldError, ListParams, ListResult};
 use banto_server::routes::{
     actor_for_token, audit_log_router, audit_logout_middleware, extra_auth_router, record_as,
-    record_denied_as, record_write, record_write_as, ui_settings_router, users_router,
-    AuditActor, LogoutAuditState,
+    record_denied_as, record_write, record_write_as, ui_settings_router, users_router, AuditActor,
+    LogoutAuditState,
 };
 use banto_server::{
     auth_routes, require_banto_client_header, sse_route, ApiError, AuthState, AuthenticatedSession,
@@ -685,7 +685,9 @@ async fn require_session_role(
             // [`require_session`] が載せた写し（`Extension<AuditActor>`）。
             // 無いのは #431 の例外だけで、そのときはメモリ上のトークンから作る。
             let actor = req.extensions().get::<AuditActor>().cloned().or_else(|| {
-                identity.as_ref().and_then(|_| actor_for_token(req.headers(), &guard.auth))
+                identity
+                    .as_ref()
+                    .and_then(|_| actor_for_token(req.headers(), &guard.auth))
             });
             if let Some(actor) = &actor {
                 let method = req.method().as_str().to_string();

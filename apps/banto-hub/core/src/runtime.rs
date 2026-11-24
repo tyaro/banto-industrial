@@ -701,10 +701,7 @@ impl HubRuntime {
         // banto v8（ADR-0034 §2・§4・§9）: 組み込みの `admin` の行がちょうど 1 つ、予約名と
         // 同じ名前のアカウントが無いことを確かめ、組み込みの行の id を読む（名前では引かない）。
         // 満たさない DB は名前と対処を書いたエラーで起動を止める（直さない）。
-        let startup_users = users
-            .check_startup()
-            .await
-            .map_err(HubStartError::InitDb)?;
+        let startup_users = users.check_startup().await.map_err(HubStartError::InitDb)?;
 
         // PORT/BANTO_BIND/BANTO_HUB_DATA (via `*_override`) override the
         // persisted settings, which in turn fall back to their own defaults
@@ -2709,7 +2706,12 @@ mod tests {
             .into_owned();
         let pool = init_db(&db_path).await.expect("init DB");
         UsersService::new(Db::Sqlite(pool.clone()))
-            .create_user("testadmin", "password123", "管理者", crate::users::Role::Admin)
+            .create_user(
+                "testadmin",
+                "password123",
+                "管理者",
+                crate::users::Role::Admin,
+            )
             .await
             .expect("setup admin");
         pool.close().await;
@@ -2859,7 +2861,12 @@ mod tests {
             .into_owned();
         let pool = init_db(&db_path).await.expect("init DB");
         UsersService::new(Db::Sqlite(pool.clone()))
-            .create_user("testadmin", "password123", "管理者", crate::users::Role::Admin)
+            .create_user(
+                "testadmin",
+                "password123",
+                "管理者",
+                crate::users::Role::Admin,
+            )
             .await
             .expect("setup admin");
         pool.close().await;
@@ -4259,7 +4266,12 @@ Host: {addr}
             .into_owned();
         let pool = init_db(&db_path).await.expect("init DB");
         UsersService::new(Db::Sqlite(pool.clone()))
-            .create_user("testadmin", "password123", "管理者", crate::users::Role::Admin)
+            .create_user(
+                "testadmin",
+                "password123",
+                "管理者",
+                crate::users::Role::Admin,
+            )
             .await
             .expect("setup admin");
         pool.close().await;

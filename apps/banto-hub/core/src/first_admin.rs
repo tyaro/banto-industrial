@@ -216,16 +216,13 @@ mod tests {
     async fn a_refused_account_writes_nothing() {
         let pool = crate::db::init_db_memory().await.unwrap();
         for username in ["admin", "Admin", crate::commissioning::SYNTHETIC_ACTOR_ID] {
-            let err = create_admin_and_lock_down_on(
-                &pool,
-                NewAdmin {
-                    username,
-                    ..OWNER
-                },
-            )
-            .await
-            .unwrap_err();
-            assert!(!matches!(err, BantoError::Storage(_)), "{username}: {err:?}");
+            let err = create_admin_and_lock_down_on(&pool, NewAdmin { username, ..OWNER })
+                .await
+                .unwrap_err();
+            assert!(
+                !matches!(err, BantoError::Storage(_)),
+                "{username}: {err:?}"
+            );
         }
         let settings = crate::settings::SettingsService::new(crate::db::Db::Sqlite(pool.clone()));
         assert!(!crate::commissioning::resolve_locked_down(&settings)

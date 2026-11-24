@@ -34,8 +34,7 @@ use super::{
 };
 use crate::clock_read::ClockReadView;
 use crate::clock_sync::{
-    parse_settings, ClockSyncRecord, ClockSyncSettings, ClockSyncView, ClockTrigger,
-    AUDIT_RESOURCE,
+    parse_settings, ClockSyncRecord, ClockSyncSettings, ClockSyncView, ClockTrigger, AUDIT_RESOURCE,
 };
 use axum::body::Bytes;
 use serde_json::json;

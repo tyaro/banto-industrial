@@ -379,7 +379,12 @@ async fn an_issuance_parked_before_the_insert_loses_to_a_lock_down_that_complete
     let users = UsersService::new(Db::Sqlite(pool.clone()));
     let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
     users
-        .create_user("testadmin", "password123", "管理者", crate::users::Role::Admin)
+        .create_user(
+            "testadmin",
+            "password123",
+            "管理者",
+            crate::users::Role::Admin,
+        )
         .await
         .expect("setup_first_user");
     let auth = user_auth_state(users.clone(), audit.clone());

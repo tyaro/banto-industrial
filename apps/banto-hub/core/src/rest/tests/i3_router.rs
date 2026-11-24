@@ -84,7 +84,12 @@ async fn audit_rows(pool: &sqlx::SqlitePool, action: &str) -> Vec<Option<String>
 async fn a_failed_login_records_a_bounded_username() {
     let (router, pool, users, _dir) = banto_wiring_env().await;
     users
-        .create_user("testadmin", "password123", "管理者", crate::users::Role::Admin)
+        .create_user(
+            "testadmin",
+            "password123",
+            "管理者",
+            crate::users::Role::Admin,
+        )
         .await
         .unwrap();
     let long_name = "x".repeat(4096);
@@ -137,7 +142,12 @@ async fn a_failed_login_records_a_bounded_username() {
 async fn only_a_logout_that_ends_a_session_is_audited() {
     let (router, pool, users, _dir) = banto_wiring_env().await;
     users
-        .create_user("testadmin", "password123", "管理者", crate::users::Role::Admin)
+        .create_user(
+            "testadmin",
+            "password123",
+            "管理者",
+            crate::users::Role::Admin,
+        )
         .await
         .unwrap();
     let token = session_login(&router, "testadmin", false).await;

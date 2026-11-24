@@ -393,7 +393,12 @@ async fn test_app(label: &str) -> TestApp {
     let users = UsersService::new(Db::Sqlite(pool.clone()));
     let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
     users
-        .create_user("testadmin", "password123", "管理者", banto_hub_core::users::Role::Admin)
+        .create_user(
+            "testadmin",
+            "password123",
+            "管理者",
+            banto_hub_core::users::Role::Admin,
+        )
         .await
         .expect("setup_first_user");
 
@@ -530,7 +535,12 @@ async fn all_simulation_test_app(label: &str) -> AllSimulationTestApp {
     let users = UsersService::new(Db::Sqlite(pool.clone()));
     let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
     users
-        .create_user("testadmin", "password123", "管理者", banto_hub_core::users::Role::Admin)
+        .create_user(
+            "testadmin",
+            "password123",
+            "管理者",
+            banto_hub_core::users::Role::Admin,
+        )
         .await
         .expect("setup_first_user");
 

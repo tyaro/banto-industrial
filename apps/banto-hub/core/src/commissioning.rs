@@ -432,7 +432,12 @@ mod tests {
     async fn unset_state_resolves_to_commissioning_mode_regardless_of_users() {
         let (settings, users) = services().await;
         users
-            .create_user("owner", "password123", "オーナー", crate::users::Role::Admin)
+            .create_user(
+                "owner",
+                "password123",
+                "オーナー",
+                crate::users::Role::Admin,
+            )
             .await
             .expect("setup_first_user");
 
@@ -496,7 +501,12 @@ mod tests {
         // 付き）を迂回して直接 SQL でロールを書き換え、「admin が1人も
         // いない」状況を再現する。
         users
-            .create_user("owner", "password123", "オーナー", crate::users::Role::Admin)
+            .create_user(
+                "owner",
+                "password123",
+                "オーナー",
+                crate::users::Role::Admin,
+            )
             .await
             .expect("setup_first_user");
         sqlx::query("UPDATE users SET role = 'editor' WHERE username = 'owner'")
@@ -524,7 +534,12 @@ mod tests {
     async fn lock_down_succeeds_with_an_admin_account_and_persists() {
         let (settings, users) = services().await;
         users
-            .create_user("owner", "password123", "オーナー", crate::users::Role::Admin)
+            .create_user(
+                "owner",
+                "password123",
+                "オーナー",
+                crate::users::Role::Admin,
+            )
             .await
             .expect("setup_first_user");
 
@@ -548,7 +563,12 @@ mod tests {
     async fn lock_down_is_idempotent_when_already_locked_down() {
         let (settings, users) = services().await;
         users
-            .create_user("owner", "password123", "オーナー", crate::users::Role::Admin)
+            .create_user(
+                "owner",
+                "password123",
+                "オーナー",
+                crate::users::Role::Admin,
+            )
             .await
             .expect("setup_first_user");
         let service = CommissioningService::load(settings, users, auth())
@@ -566,7 +586,12 @@ mod tests {
     async fn revert_to_commissioning_flips_state_back() {
         let (settings, users) = services().await;
         users
-            .create_user("owner", "password123", "オーナー", crate::users::Role::Admin)
+            .create_user(
+                "owner",
+                "password123",
+                "オーナー",
+                crate::users::Role::Admin,
+            )
             .await
             .expect("setup_first_user");
         let service = CommissioningService::load(settings, users, auth())
@@ -589,7 +614,12 @@ mod tests {
     async fn lock_down_revokes_the_commissioning_grant_tokens_after_persisting_the_flag() {
         let (settings, users) = services().await;
         users
-            .create_user("owner", "password123", "オーナー", crate::users::Role::Admin)
+            .create_user(
+                "owner",
+                "password123",
+                "オーナー",
+                crate::users::Role::Admin,
+            )
             .await
             .expect("setup_first_user");
         let auth = auth();

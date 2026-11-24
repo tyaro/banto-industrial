@@ -10,12 +10,11 @@
 //! 503 を返し、何も変えず・監査もしない。
 
 use super::{
-    AuditActor, Extension,
     get, json, middleware, post, record_write, require_session, require_session_role,
-    shutting_down_response, ApiError, ApiKeysService, Arc, AuditLogService, AuthGate, AuthState,
-    BantoError, CollectorManager, Deserialize, ErrorBody, FieldError, IntoResponse,
-    IssuedApiKey, Json, OperationKind, Path, Response, Role, Router, Serialize, SessionRoleGuard,
-    State, StatusCode, ToSchema,
+    shutting_down_response, ApiError, ApiKeysService, Arc, AuditActor, AuditLogService, AuthGate,
+    AuthState, BantoError, CollectorManager, Deserialize, ErrorBody, Extension, FieldError,
+    IntoResponse, IssuedApiKey, Json, OperationKind, Path, Response, Role, Router, Serialize,
+    SessionRoleGuard, State, StatusCode, ToSchema,
 };
 use crate::api_keys::ApiKeyDeleteOutcome;
 use axum::routing::delete;

@@ -140,7 +140,9 @@ fn print_usage() {
     eprintln!("  （引数なし）  コンソールモードで起動（Ctrl-C で停止）");
     eprintln!("  create-admin --username <名前> [--display-name <表示名>]");
     eprintln!("                Hub の設定 DB に管理者のアカウントを作り、同時にロックダウン（ログイン必須）");
-    eprintln!("                にする。パスワードは標準入力の 1 行目から読む（例: < password.txt）。");
+    eprintln!(
+        "                にする。パスワードは標準入力の 1 行目から読む（例: < password.txt）。"
+    );
     eprintln!("                Hub・サービスを止めてから実行する");
     #[cfg(windows)]
     {
