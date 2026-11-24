@@ -972,13 +972,14 @@ async fn announce(server: &StartedServer, stop_hint: &str) {
         let port = addr.port();
         if server.exposes_lan().await {
             println!(
-                "{SERVER_LABEL}: 最初の管理者の作成とログインなしの接続は、この PC の http://127.0.0.1:{port}/ からだけ行えます（LAN からは閉じています）"
+                "{SERVER_LABEL}: ログインなしの接続は、この PC の http://127.0.0.1:{port}/ からだけ行えます（LAN からは閉じています）"
             );
         }
         let local_grant = engine.services().local_grant;
         match local_grant.issued_role() {
-            Some(_) if local_grant == LocalGrantStart::Uninitialized => println!(
-                "{SERVER_LABEL}: 最初の管理者を作るまでの間、この PC（http://127.0.0.1:{port}/）からはログインなしで管理者として入れます"
+            Some(role) if matches!(local_grant, LocalGrantStart::NoLogin(_)) => println!(
+                "{SERVER_LABEL}: ログインなしの設定の間、この PC（http://127.0.0.1:{port}/）からはログインなしで {} として入れます",
+                role.as_str()
             ),
             Some(role) => println!(
                 "{SERVER_LABEL}: この PC（http://127.0.0.1:{port}/）からはログインなしで {} として入れます（設定 auth.local_grant）",

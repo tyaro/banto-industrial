@@ -374,7 +374,7 @@ async fn wait_running(running: &Running) {
     .await;
 }
 
-/// 一時ルートの DB を作り、待ち受けを port 0 にする。`plc_port` があれば、
+/// 一時ルートの DB を作り、管理者 `testadmin` を作り、待ち受けを port 0 にする。`plc_port` があれば、
 /// シミュレータの Modbus TCP の接続・グループ（100ms）・タグを 1 つずつ登録する。
 async fn prepare_root_db(layout: &DataLayout, plc_port: Option<u16>) {
     std::fs::create_dir_all(layout.root()).unwrap();
@@ -383,6 +383,16 @@ async fn prepare_root_db(layout: &DataLayout, plc_port: Option<u16>) {
         .set("server.port", "0")
         .await
         .unwrap();
+    // 管理者のアカウント（[`setup_admin`]。banto v8 で初回セットアップは無くなった）。
+    chronogazer_core::users::UsersService::new(Db::Sqlite(pool.clone()))
+        .create_user(
+            "testadmin",
+            "admin-pass-1",
+            "管理者",
+            chronogazer_core::users::Role::Admin,
+        )
+        .await
+        .expect("create_user");
     if let Some(port) = plc_port {
         let conn = PlcConnectionService::new(pool.clone())
             .create(PlcConnectionInput {
@@ -482,16 +492,13 @@ async fn get_json(url: String, token: Option<&str>) -> serde_json::Value {
     serde_json::from_str(&response.text().await.unwrap_or_default()).unwrap_or_default()
 }
 
-/// この PC からは最初の管理者を作れる（token が返る）。
+/// 管理者 `testadmin` でログインした token（アカウントは [`prepare_root_db`] が作る）。
 async fn setup_admin(port: u16) -> String {
     let response = reqwest::Client::new()
-        .post(format!("http://127.0.0.1:{port}/api/auth/setup"))
+        .post(format!("http://127.0.0.1:{port}/api/auth/login"))
         .header("X-Banto-Client", "banto")
         .header("Content-Type", "application/json")
-        .body(
-            serde_json::json!({"username":"testadmin","password":"admin-pass-1","displayName":"管理者"})
-                .to_string(),
-        )
+        .body(serde_json::json!({"username":"testadmin","password":"admin-pass-1"}).to_string())
         .send()
         .await
         .expect("send");

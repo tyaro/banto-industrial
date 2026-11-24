@@ -68,10 +68,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use banto_core::{BantoError, ErrorBody};
-use banto_server::routes::{actor_identity, bearer_token, require_role_at_least, RoleGuard};
+use banto_server::routes::{
+    actor_for_token, bearer_token, require_role_at_least, AuditActor, RoleGuard,
+};
 use banto_server::{
     bind as bind_listener, lan_urls_for_bind, request_is_loopback_local, require_auth, ApiError,
-    AuthState, GrantKind, Identity, RunningServer, ServerConfig,
+    AuthState, GrantKind, RunningServer, ServerConfig,
 };
 use qrcode::render::svg;
 use qrcode::QrCode;
@@ -293,12 +295,8 @@ pub async fn current_status(
 
 // --- 適用（デスクトップと REST で共有） ------------------------------------------
 
-/// 監査に残す操作者。
-#[derive(Debug, Clone, Copy)]
-pub struct ApplyActor<'a> {
-    pub username: Option<&'a str>,
-    pub role: Option<&'a str>,
-}
+/// 監査に残す操作者（banto v8、ADR-0034 §3 の `AuditActor`。無ければ主体の欄は空）。
+pub type ApplyActor<'a> = Option<&'a AuditActor>;
 
 /// [`apply_server_settings`] に要るもの。
 pub struct ApplyContext<'a> {
@@ -590,16 +588,15 @@ async fn record(
     detail: serde_json::Value,
 ) {
     ctx.audit
-        .record(AuditEntry {
-            actor_username: actor.username,
-            actor_role: actor.role,
-            action: "settings_change",
-            resource: "settings",
-            entity_id: None,
-            detail: Some(detail),
-            origin: ctx.origin,
+        .record(AuditEntry::by(
+            actor,
+            ctx.origin,
+            "settings_change",
+            "settings",
+            None,
+            Some(detail),
             result,
-        })
+        ))
         .await;
 }
 
@@ -722,7 +719,7 @@ async fn server_settings_put(State(state): State<SettingsAdminState>, req: Reque
     // 本文が届くのを待つ間に、別の `PUT /api/settings/auth` が `localDesktop` の grant を
     // 失効させると、後から引いた操作者は空になるのに、認可済みの変更は適用されて操作者
     // なしで監査に残る。
-    let actor = actor_identity(req.headers(), &state.auth);
+    let actor = actor_for_token(req.headers(), &state.auth);
     // lock を取った後の再確認に使う（所有値にして切り離したタスクへ渡す）。
     let token = bearer_token(req.headers()).map(str::to_owned);
     let Json(payload) = match Json::<ServerSettingsPayload>::from_request(req, &()).await {
@@ -754,15 +751,7 @@ async fn server_settings_put(State(state): State<SettingsAdminState>, req: Reque
             log_label: state.log_label,
             recheck_token: token.as_deref(),
         };
-        apply_server_settings(
-            &ctx,
-            config,
-            ApplyActor {
-                username: actor.as_ref().map(|identity| identity.id.as_str()),
-                role: actor.as_ref().map(|identity| identity.role.as_str()),
-            },
-        )
-        .await
+        apply_server_settings(&ctx, config, actor.as_ref()).await
     })
     .await;
     match applied {
@@ -784,13 +773,12 @@ async fn auth_view_for(
     saved: LocalGrantSetting,
 ) -> Result<AuthConfigView, BantoError> {
     let auth = state.settings.auth_config().await?;
-    let initialized = state.users.is_initialized().await?;
     Ok(AuthConfigView {
         disabled: auth.disabled,
         disabled_role: auth.disabled_role,
         local_grant: saved.as_str(),
         local_grant_supported: state.local_grant != LocalGrantStart::Unsupported,
-        local_grant_restart_required: state.local_grant.restart_required(saved, initialized),
+        local_grant_restart_required: state.local_grant.restart_required(saved, !auth.disabled),
     })
 }
 
@@ -814,7 +802,7 @@ async fn auth_settings_put(State(state): State<SettingsAdminState>, req: Request
     // 自身のトークンも消し、後から引くと操作者が空のまま特権の変更が監査に残る
     // （banto-hub の lock-down と同じ扱い）。本文を待つ間に別の要求が失効させた場合も
     // 同じ（`server_settings_put` と同じ扱い）。
-    let actor = actor_identity(req.headers(), &state.auth);
+    let actor = actor_for_token(req.headers(), &state.auth);
     let token = bearer_token(req.headers()).map(str::to_owned);
     let Json(body) =
         match Json::<serde_json::Map<String, serde_json::Value>>::from_request(req, &()).await {
@@ -860,7 +848,7 @@ async fn auth_settings_put(State(state): State<SettingsAdminState>, req: Request
 
 async fn auth_settings_apply(
     state: &SettingsAdminState,
-    actor: Option<Identity>,
+    actor: Option<AuditActor>,
     value: LocalGrantSetting,
     token: Option<String>,
 ) -> Result<AuthConfigView, ApiError> {
@@ -888,19 +876,18 @@ async fn auth_settings_apply(
     };
     state
         .audit
-        .record(AuditEntry {
-            actor_username: actor.as_ref().map(|identity| identity.id.as_str()),
-            actor_role: actor.as_ref().map(|identity| identity.role.as_str()),
-            action: "settings_change",
-            resource: "settings",
-            entity_id: None,
-            detail: Some(serde_json::json!({
+        .record(AuditEntry::by(
+            actor.as_ref(),
+            "rest",
+            "settings_change",
+            "settings",
+            None,
+            Some(serde_json::json!({
                 "localGrant": value.as_str(),
                 "revokedGrants": revoked,
             })),
-            origin: "rest",
-            result: "ok",
-        })
+            "ok",
+        ))
         .await;
     Ok(view?)
 }

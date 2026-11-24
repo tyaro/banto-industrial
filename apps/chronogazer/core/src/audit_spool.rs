@@ -212,7 +212,9 @@ mod tests {
         audit_a
             .record(crate::audit::AuditEntry {
                 actor_username: None,
+                actor_id: None,
                 actor_role: None,
+                actor_kind: None,
                 action: "settings_change",
                 resource: "settings",
                 entity_id: None,

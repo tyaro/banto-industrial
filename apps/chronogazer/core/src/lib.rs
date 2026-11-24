@@ -121,7 +121,7 @@ pub fn listening_urls(addr: std::net::SocketAddr) -> Vec<String> {
 // 自前のコピーに入っていなかった banto v2.1.0 のセキュリティ修正 - 初回
 // セットアップの原子化（#277）、未認証ログアウト・失敗ログインの監査の増幅
 // （#278）、バックアップ保存先の DB ごとの分離（#280）- はこれで入る。
-pub use banto_admin_services::{audit, backup, users};
+pub use banto_admin_services::{audit, backup, ui_settings, users};
 
 // #383 段階2a / R1-B（レジストリ CRUD）: banto-tags の3サービスと行型を
 // re-export し、`src-tauri`（invariant: このアプリ自身の新規依存を持たない -

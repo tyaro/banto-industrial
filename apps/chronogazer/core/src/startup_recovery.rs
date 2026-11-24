@@ -308,6 +308,8 @@ impl RecoveryNote {
         AuditEntry {
             actor_username: None,
             actor_role: None,
+            actor_id: None,
+            actor_kind: None,
             action: "startup_recovery",
             resource: "startup",
             entity_id: None,
@@ -499,6 +501,7 @@ fn is_transient(err: &std::io::Error) -> bool {
 pub async fn list_backups(db_path: &Path) -> Result<Vec<BackupInfo>, BantoError> {
     let pool = banto_storage::connect_sqlite_memory().await?;
     let result = BackupService::new(db_path.to_path_buf(), Db::Sqlite(pool.clone()))
+        .with_migrations(crate::db::sqlite_restore_manifest())
         .list()
         .await;
     pool.close().await;
@@ -589,7 +592,11 @@ pub async fn restore_from_backup(
     stamp: &str,
 ) -> Result<Prepared, RecoveryError> {
     restore_with(db_path, backup_file_name, stamp, |path| async move {
-        BackupService::apply_pending_restore_at_startup(&path).await
+        BackupService::apply_pending_restore_at_startup(
+            &path,
+            &crate::db::sqlite_restore_manifest(),
+        )
+        .await
     })
     .await
 }
@@ -608,7 +615,8 @@ where
     let pool = banto_storage::connect_sqlite_memory()
         .await
         .map_err(|err| RecoveryError(format!("リストアの準備に失敗しました: {err}")))?;
-    let backup = BackupService::new(db_path.to_path_buf(), Db::Sqlite(pool.clone()));
+    let backup = BackupService::new(db_path.to_path_buf(), Db::Sqlite(pool.clone()))
+        .with_migrations(crate::db::sqlite_restore_manifest());
     let result = async {
         backup
             .stage_restore_from_file(backup_file_name)

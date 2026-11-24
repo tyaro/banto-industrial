@@ -85,6 +85,7 @@ fn grant_token(auth: &AuthState, kind: GrantKind, id: &str, role: &str) -> Strin
             id: id.to_string(),
             name: id.to_string(),
             role: role.to_string(),
+            account_id: None,
         },
         Arc::new(|| Box::pin(async { Ok(true) })),
     );

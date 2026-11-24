@@ -85,9 +85,6 @@ async fn main() {
         .unwrap_or(DEFAULT_PORT);
     let bind = std::env::var("BANTO_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
     let db_path = std::env::var("BANTO_DB").unwrap_or_else(|_| DEFAULT_DB_PATH.to_string());
-    let allow_setup = std::env::var("BANTO_ALLOW_SETUP")
-        .map(|value| value == "1")
-        .unwrap_or(false);
     let seed_viewer_public = std::env::var("BANTO_VIEWER_PUBLIC")
         .map(|value| value == "1")
         .unwrap_or(false);
@@ -143,7 +140,6 @@ async fn main() {
         attach_hub: hub_memory_keys,
         host: ChronoGazerHost::Serve,
         listen: EngineListen::Required(ServerConfig { bind, port }),
-        allow_setup,
         seed_viewer_public,
         log_label: "banto-serve",
         audit_origin: "rest",
@@ -168,13 +164,7 @@ async fn main() {
             println!("  {url}");
         }
     }
-    if allow_setup {
-        println!("banto-serve: first-run setup is ENABLED (BANTO_ALLOW_SETUP=1) - POST /api/auth/setup will create the first account");
-    } else {
-        println!(
-            "banto-serve: first-run setup is DISABLED - set BANTO_ALLOW_SETUP=1 to allow POST /api/auth/setup"
-        );
-    }
+    // banto v8（ADR-0034 §7）: 初回セットアップ（`POST /api/auth/setup`・`BANTO_ALLOW_SETUP`）は無い。
     if seed_viewer_public {
         println!("banto-serve: public viewing is ENABLED (BANTO_VIEWER_PUBLIC=1) - POST /api/auth/grant/publicViewer will hand out anonymous viewer sessions");
     }

@@ -242,17 +242,10 @@ async fn request(
     (status, serde_json::from_str(&text).unwrap_or_default())
 }
 
-/// LAN に出していないので、最初の管理者を作れる（token が返る）。
+/// 管理者 `testadmin` でログインした token（アカウントは [`prepare_root`] が作る。
+/// banto v8 で初回セットアップ `POST /api/auth/setup` は無くなった）。
 async fn setup_admin(port: u16) -> String {
-    let (status, body) = request(
-        reqwest::Method::POST,
-        format!("http://127.0.0.1:{port}/api/auth/setup"),
-        None,
-        Some(serde_json::json!({"username":"testadmin","password":ADMIN_PASSWORD,"displayName":"管理者"})),
-    )
-    .await;
-    assert_eq!(status, 200, "{body}");
-    body["token"].as_str().expect("token").to_string()
+    login(port).await
 }
 
 async fn login(port: u16) -> String {
@@ -269,13 +262,23 @@ async fn login(port: u16) -> String {
 
 // --- DB の準備と読み戻し -------------------------------------------------------
 
-/// 一時ルートの DB を作り、待ち受けを port 0（OS が選ぶ）にする。`plc_port` が
+/// 一時ルートの DB を作り、管理者 `testadmin` を作り、待ち受けを port 0（OS が選ぶ）にする。`plc_port` が
 /// あれば、シミュレータの Modbus TCP の接続 1・グループ 1（100ms）・タグ 1 を登録する。
 async fn prepare_root(sandbox: &Sandbox, plc_port: Option<u16>, hub: bool) {
     std::fs::create_dir_all(&sandbox.root).unwrap();
     let pool = init_db(sandbox.layout().db_path()).await.expect("init_db");
     let settings = SettingsService::new(Db::Sqlite(pool.clone()));
     settings.set("server.port", "0").await.unwrap();
+    // 管理者のアカウント（[`setup_admin`]。認証モードは新しい DB の既定のログインなしのまま）。
+    chronogazer_core::users::UsersService::new(Db::Sqlite(pool.clone()))
+        .create_user(
+            "testadmin",
+            ADMIN_PASSWORD,
+            "管理者",
+            chronogazer_core::users::Role::Admin,
+        )
+        .await
+        .expect("create_user");
     if let Some(port) = plc_port {
         register(&pool, "modbus-tcp", "127.0.0.1", port, "40001", "u16").await;
     }

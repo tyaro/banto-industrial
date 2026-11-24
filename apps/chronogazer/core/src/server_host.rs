@@ -605,7 +605,6 @@ fn engine_config(data_base: PathBuf, db_path: PathBuf, host: ChronoGazerHost) ->
         attach_hub: true,
         host,
         listen: EngineListen::Disabled,
-        allow_setup: false,
         seed_viewer_public: false,
         log_label: SERVER_LABEL,
         audit_origin: "rest",
