@@ -1008,6 +1008,72 @@ async fn a_banto_v7_reservation_over_a_v8_db_is_neither_applied_nor_deleted() {
     );
 }
 
+/// 新しい版の予約を置いて止めた v8 のプロファイル（予約は検査を通る正しいもの）。
+async fn a_v8_profile_with_a_v8_reservation(root: &Path) -> PathBuf {
+    let engine = start(root).await;
+    let backup = engine.services().backup.create().await.expect("backup");
+    engine
+        .services()
+        .backup
+        .stage_restore_from_file(&backup.file_name)
+        .await
+        .expect("予約できる");
+    stop(engine).await;
+    let db_path = root.join("chronogazer.sqlite3");
+    let pending = BackupService::pending_restore_file(&db_path).unwrap();
+    assert!(pending.is_file());
+    pending
+}
+
+/// 予約があるのに今の DB の形式を確かめられないとき、予約を当てずに止まり、DB・`-wal`・
+/// 予約は byte で変わらない（オーナーのレビュー P2）。
+async fn assert_undetermined_stop_touches_nothing(root: &Path, pending: &Path) {
+    let db_path = root.join("chronogazer.sqlite3");
+    let before = snapshot(root);
+    let err = match EngineRuntime::start(config(root)).await {
+        Ok(_) => panic!("形式を確かめられない DB の上に予約を当てて起動した"),
+        Err(err) => err,
+    };
+    match &err {
+        EngineStartError::Database(InitDbError::Undetermined(undetermined)) => {
+            assert_eq!(undetermined.path, db_path);
+            assert_eq!(undetermined.pending, pending);
+            let text = err.to_string();
+            assert!(text.contains("予約"), "{text}");
+            assert!(text.contains(&pending.display().to_string()), "{text}");
+        }
+        other => panic!("確かめられないで止まるはず: {other:?}"),
+    }
+    assert_eq!(classify(&err), FailureKind::Other);
+    assert_eq!(snapshot(root), before, "プロファイルのファイルが変わった");
+    assert!(pending.is_file(), "予約が消えた");
+    drop(acquire_for_db(&db_path, ChronoGazerHost::Serve).expect("失敗の後は排他が返っている"));
+}
+
+/// (a) 空でない `-wal` が残った今の DB（前の起動が落ちたまま）＋ 新版の予約: `immutable` では
+/// `-wal` を読めず形式を確かめられないので、予約を当てずに止まる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reservation_over_a_db_with_a_leftover_wal_is_not_applied() {
+    let dir = TempDir::new();
+    let pending = a_v8_profile_with_a_v8_reservation(dir.path()).await;
+    // 閉じきっていない変更の残り（中身は SQLite が読むことは無い。止まる前に読まない）。
+    std::fs::write(
+        dir.path().join("chronogazer.sqlite3-wal"),
+        vec![0x37u8; 4096],
+    )
+    .unwrap();
+    assert_undetermined_stop_touches_nothing(dir.path(), &pending).await;
+}
+
+/// (b) 開けない今の DB ＋ 新版の予約: 予約を当てずに止まる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reservation_over_an_unreadable_db_is_not_applied() {
+    let dir = TempDir::new();
+    let pending = a_v8_profile_with_a_v8_reservation(dir.path()).await;
+    std::fs::write(dir.path().join("chronogazer.sqlite3"), vec![0x5au8; 8192]).unwrap();
+    assert_undetermined_stop_touches_nothing(dir.path(), &pending).await;
+}
+
 /// 同じく §5 の 2: 新しい版で取ったバックアップは、予約 → 再起動で正しく戻る（起動時の検査
 /// `CandidateCheck` を通り、`restore_applied` が監査に残る）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

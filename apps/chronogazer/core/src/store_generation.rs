@@ -21,7 +21,12 @@
 //!   - 印の id が DB と同じ: 使う;
 //!   - 印が無いのに中身がある（v8 より前の版の保存先・関係の無いフォルダ）: [`StoreRefusal::Unmarked`];
 //!   - 印の id が DB と違う（作り直す前の DB の保存先・別の DB の保存先）:
-//!     [`StoreRefusal::OtherGeneration`]。
+//!     [`StoreRefusal::OtherGeneration`];
+//!   - 印が空・書きかけ（改行で終わっていない）: [`StoreRefusal::IncompleteMarker`]。印を置く
+//!     途中で落ちた残りと見えても**自動では書き直さない**（オーナーのレビュー P2）。別々の DB の
+//!     プロセスは profile の排他を共有しないので、2 つが同時に書き直すと両方が同じ保存先で
+//!     収集を始め、`grp:<id>`・`tag:<id>` の値が混ざる。ほかに ChronoGazer が使っていないことを
+//!     人が確かめてから印のファイルを消すか、空の保存先を選ぶ。
 //!
 //!   断るときは、そのフォルダに**一切書かず**、印以外の中身は開かずに（一覧だけ）名前と対処を
 //!   書いたエラーで止める（`EngineStartError::StoreGeneration`）。旧い履歴は消さずに残る。
@@ -61,8 +66,8 @@ pub const GENERATION_KEY: &str = "data.store_generation";
 /// 保存先のフォルダに置く印のファイル（中身は世代 id）。
 pub const MARKER_FILE_NAME: &str = ".chronogazer-store-generation";
 
-/// 印を書くときの一時ファイル（[`write_marker_path`]）。書きかけで落ちた残りは中身に数えない
-/// （数えると、次の起動が「印の無いファイルがある」と止まる）。
+/// 前の版が印を書くときに使った一時ファイル（一時ファイル → 付け替え）。書きかけで落ちた
+/// 残りは中身に数えない（数えると、次の起動が「印の無いファイルがある」と止まる）。
 const MARKER_TEMP_FILE_NAME: &str = ".chronogazer-store-generation.tmp";
 
 /// 書き込みの確かめの一時ファイルの接頭辞（`startup_recovery::check_writable_dir` と
@@ -92,6 +97,9 @@ pub enum StoreRefusal {
     Unmarked,
     /// 印の id がこの DB と違う（作り直す前の DB・別の DB の保存先）。
     OtherGeneration { found: String },
+    /// 印が空か書きかけ（改行で終わっていない）。印を置く途中で落ちた残りか、別のプロセスが
+    /// いま書いている最中。自動では書き直さない（モジュール doc「形」）。
+    IncompleteMarker,
 }
 
 /// [`claim_dir`] の失敗。
@@ -143,6 +151,19 @@ impl std::fmt::Display for ClaimError {
                  その保存先を作った DB に戻してください。{SERVICE_HINT}",
                 dir.display()
             ),
+            Self::Refused {
+                dir,
+                refusal: StoreRefusal::IncompleteMarker,
+            } => write!(
+                f,
+                "時系列データの保存先 {} の印のファイル {MARKER_FILE_NAME} が壊れています（空か書きかけ。\
+                 印を置く途中で止まった残りか、別の ChronoGazer がいま使い始めているところです）。\
+                 2 つの設定 DB が同じ保存先を使って履歴が混ざらないよう、このフォルダには書き込まずに\
+                 止めました（中身は変えていません）。ほかに ChronoGazer（デスクトップ・サービス）が\
+                 このフォルダを使っていないことを確かめてから印のファイルを消すか、保存先を空の\
+                 フォルダか新しいフォルダに変えてください。{SERVICE_HINT}",
+                dir.display()
+            ),
             Self::Io { dir, reason } => write!(
                 f,
                 "時系列データの保存先 {} を確かめられませんでした: {reason}",
@@ -165,15 +186,25 @@ fn ignored(name: &str) -> bool {
 /// 一覧と印の中身から決める（純関数）。`Ok(true)` = 印を書いて使う、`Ok(false)` = そのまま使う。
 fn decide(names: &[String], marker: Option<&str>, generation: &str) -> Result<bool, StoreRefusal> {
     let has_content = names.iter().any(|name| !ignored(name));
-    match marker.map(str::trim) {
-        Some(found) if found == generation => Ok(false),
-        // 書きかけで落ちた空の印は、ほかに中身が無ければ書き直す。
-        Some("") if !has_content => Ok(true),
-        Some(found) => Err(StoreRefusal::OtherGeneration {
-            found: found.to_string(),
-        }),
+    match marker {
+        Some(raw) => judge_marker(raw, generation).map(|()| false),
         None if has_content => Err(StoreRefusal::Unmarked),
         None => Ok(true),
+    }
+}
+
+/// 読んだ印の中身を比べる（純関数）。`Ok(())` = この DB の印。空・改行で終わらない印は
+/// 書きかけとして [`StoreRefusal::IncompleteMarker`]（自動では書き直さない。モジュール doc「形」）。
+fn judge_marker(raw: &str, generation: &str) -> Result<(), StoreRefusal> {
+    let found = raw.trim();
+    if found == generation {
+        Ok(())
+    } else if found.is_empty() || !raw.ends_with('\n') {
+        Err(StoreRefusal::IncompleteMarker)
+    } else {
+        Err(StoreRefusal::OtherGeneration {
+            found: found.to_string(),
+        })
     }
 }
 
@@ -211,7 +242,6 @@ pub fn claim_dir(dir: &Path, generation: &str) -> Result<(), ClaimError> {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err.to_string()),
         },
-        &mut || write_marker_path(dir, generation).map_err(|err| err.to_string()),
     )?;
     // 前の版（一時ファイル → 付け替え）の書きかけの残りは、使い始めたら消す（無ければ何もしない）。
     let _ = std::fs::remove_file(dir.join(MARKER_TEMP_FILE_NAME));
@@ -219,7 +249,7 @@ pub fn claim_dir(dir: &Path, generation: &str) -> Result<(), ClaimError> {
 }
 
 /// 印の書きかけを待つ回数と間隔（[`put_marker`]）。`create_new` から中身を書き終えるまでは
-/// 一瞬なので、空の印が続くのは書きかけで落ちた残りだけ。
+/// 一瞬なので、待っても書きかけのままなのは書きかけで落ちた残り（断る）。
 const EMPTY_MARKER_RETRIES: u32 = 20;
 const EMPTY_MARKER_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -230,9 +260,10 @@ const EMPTY_MARKER_WAIT: std::time::Duration = std::time::Duration::from_millis(
 /// `create_new` は 1 つしか成功しないので、負けた側は勝った側の印を読み、世代が違えば
 /// [`StoreRefusal::OtherGeneration`] で断る（何も書かない）。
 ///
-/// 読んだ印が空なら、勝った側が書いている最中か、書きかけで落ちた残り。少し待って読み直し、
-/// 空のままなら残りとして `overwrite`（一時ファイル → 付け替え）で書き直す。この書き直しの
-/// 間だけは、同時に使い始めた 2 つが両方通りうる（落ちた残りと同時の起動が重なったとき）。
+/// 読んだ印が空・書きかけなら、勝った側が書いている最中か、書きかけで落ちた残り。最大 1 秒
+/// 待って読み直し（勝った側の世代で正しく断る・通すため）、書きかけのままなら
+/// [`StoreRefusal::IncompleteMarker`] で断る。**自動では書き直さない**（オーナーのレビュー P2。
+/// 書き直すと、落ちた残りに同時に当たった 2 つの DB が両方通りうる）。
 ///
 /// - `create_new`: 作れたら書き込みで開いたファイル、既にあれば `None`。
 /// - `read`: 印の中身（無ければ `None`）。
@@ -241,7 +272,6 @@ fn put_marker(
     generation: &str,
     create_new: &mut dyn FnMut() -> Result<Option<std::fs::File>, String>,
     read: &mut dyn FnMut() -> Result<Option<String>, String>,
-    overwrite: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<(), ClaimError> {
     let io = |reason: String| ClaimError::Io {
         dir: shown.to_path_buf(),
@@ -254,27 +284,25 @@ fn put_marker(
             .map_err(|err| io(format!("印を書けません: {err}")))?;
         return Ok(());
     }
-    for attempt in 0..=EMPTY_MARKER_RETRIES {
+    let mut attempt = 0;
+    loop {
         let found = read()
             .map_err(|err| io(format!("印を読めません: {err}")))?
             .ok_or_else(|| io("印が読む前に消えました".to_string()))?;
-        let found = found.trim();
-        if found == generation {
-            return Ok(());
-        }
-        if !found.is_empty() {
-            return Err(ClaimError::Refused {
-                dir: shown.to_path_buf(),
-                refusal: StoreRefusal::OtherGeneration {
-                    found: found.to_string(),
-                },
-            });
-        }
-        if attempt < EMPTY_MARKER_RETRIES {
-            std::thread::sleep(EMPTY_MARKER_WAIT);
+        match judge_marker(&found, generation) {
+            Ok(()) => return Ok(()),
+            Err(StoreRefusal::IncompleteMarker) if attempt < EMPTY_MARKER_RETRIES => {
+                attempt += 1;
+                std::thread::sleep(EMPTY_MARKER_WAIT);
+            }
+            Err(refusal) => {
+                return Err(ClaimError::Refused {
+                    dir: shown.to_path_buf(),
+                    refusal,
+                })
+            }
         }
     }
-    overwrite().map_err(|err| io(format!("印を書けません: {err}")))
 }
 
 /// [`claim_dir`] の、書かない版。`Ok(true)` = 使える（印はまだ無い・無いフォルダ）、
@@ -307,21 +335,6 @@ pub fn inspect_dir(dir: &Path, generation: &str) -> Result<bool, ClaimError> {
         dir: dir.to_path_buf(),
         refusal,
     })
-}
-
-/// 印を一時ファイルに書いてから付け替える（書きかけの空の印を書き直すときだけ。[`put_marker`]）。
-fn write_marker_path(dir: &Path, generation: &str) -> std::io::Result<()> {
-    let temp = dir.join(MARKER_TEMP_FILE_NAME);
-    {
-        let mut file = std::fs::File::create(&temp)?;
-        file.write_all(&marker_contents(generation))?;
-        file.sync_all()?;
-    }
-    let renamed = std::fs::rename(&temp, dir.join(MARKER_FILE_NAME));
-    if renamed.is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
-    renamed
 }
 
 /// [`claim_dir`] の、サービスが握ったフォルダ（`service_data_dir`）で扱う版。一覧・読み書きは
@@ -380,10 +393,6 @@ pub fn claim_managed_dir(
                     .map_err(|err| err.to_string())?;
                 Ok(Some(contents))
             },
-            &mut || {
-                dir.write_atomic(MARKER_FILE_NAME, &marker_contents(generation))
-                    .map_err(|err| format!("{err:?}"))
-            },
         )?;
     }
     Ok(())
@@ -429,16 +438,26 @@ mod tests {
             decide(&names(&[MARKER_TEMP_FILE_NAME]), None, gen),
             Ok(true)
         );
+        // 空・書きかけ（改行で終わらない）の印は、ほかに中身が無くても書き直さずに断る
+        // （オーナーのレビュー P2）。
+        for (list, marker) in [
+            (&[MARKER_FILE_NAME, MARKER_TEMP_FILE_NAME][..], ""),
+            (&[MARKER_FILE_NAME][..], ""),
+            (&[MARKER_FILE_NAME][..], "  \n"),
+            (&[MARKER_FILE_NAME][..], "oth"),
+            (&[MARKER_FILE_NAME, "x"][..], ""),
+        ] {
+            assert_eq!(
+                decide(&names(list), Some(marker), gen),
+                Err(StoreRefusal::IncompleteMarker),
+                "{list:?} {marker:?}"
+            );
+        }
+        // 同じ世代なら、改行が欠けていても通す（中身は揃っている）。
         assert_eq!(
-            decide(
-                &names(&[MARKER_FILE_NAME, MARKER_TEMP_FILE_NAME]),
-                Some(""),
-                gen
-            ),
-            Ok(true)
+            decide(&names(&[MARKER_FILE_NAME]), Some("abc"), gen),
+            Ok(false)
         );
-        assert_eq!(decide(&names(&[MARKER_FILE_NAME]), Some(""), gen), Ok(true));
-        assert!(decide(&names(&[MARKER_FILE_NAME, "x"]), Some(""), gen).is_err());
     }
 
     /// 無いフォルダは作って印を書き、2 回目は同じ世代で通る。別の世代は断られ、印は変わらない。
@@ -473,17 +492,9 @@ mod tests {
     #[test]
     fn losing_the_marker_race_to_another_generation_refuses() {
         let shown = Path::new("store");
-        let mut overwritten = false;
-        let err = put_marker(
-            shown,
-            "gen-b",
-            &mut || Ok(None),
-            &mut || Ok(Some("gen-a\n".to_string())),
-            &mut || {
-                overwritten = true;
-                Ok(())
-            },
-        )
+        let err = put_marker(shown, "gen-b", &mut || Ok(None), &mut || {
+            Ok(Some("gen-a\n".to_string()))
+        })
         .unwrap_err();
         assert!(matches!(
             err,
@@ -492,48 +503,107 @@ mod tests {
                 ..
             } if found == "gen-a"
         ));
-        assert!(!overwritten);
         // 同じ世代（同じ DB の 2 回目）なら通る。
-        put_marker(
-            shown,
-            "gen-a",
-            &mut || Ok(None),
-            &mut || Ok(Some("gen-a\n".to_string())),
-            &mut || panic!("書き直さない"),
-        )
+        put_marker(shown, "gen-a", &mut || Ok(None), &mut || {
+            Ok(Some("gen-a\n".to_string()))
+        })
         .unwrap();
     }
 
-    /// 勝った側の書きかけ（空の印）は待って読み直す。空のままなら落ちた残りとして書き直す。
+    /// 勝った側の書きかけ（空の印）は待って読み直し、書き終えた印の世代で決める。待っても
+    /// 書きかけのままなら（落ちた残り）断る。どちらでも書き直さない（オーナーのレビュー P2）。
     #[test]
-    fn an_empty_marker_is_waited_for_then_rewritten() {
+    fn an_incomplete_marker_is_waited_for_then_refused() {
         let shown = Path::new("store");
         let mut reads = 0;
-        let err = put_marker(
-            shown,
-            "gen-b",
-            &mut || Ok(None),
-            &mut || {
-                reads += 1;
-                Ok(Some(if reads < 3 { "" } else { "gen-a\n" }.to_string()))
-            },
-            &mut || panic!("書き直さない"),
-        )
+        let err = put_marker(shown, "gen-b", &mut || Ok(None), &mut || {
+            reads += 1;
+            Ok(Some(if reads < 3 { "" } else { "gen-a\n" }.to_string()))
+        })
         .unwrap_err();
-        assert!(matches!(err, ClaimError::Refused { .. }));
-        let mut overwritten = false;
-        put_marker(
-            shown,
-            "gen-b",
-            &mut || Ok(None),
-            &mut || Ok(Some(String::new())),
-            &mut || {
-                overwritten = true;
-                Ok(())
-            },
-        )
+        assert!(matches!(
+            err,
+            ClaimError::Refused {
+                refusal: StoreRefusal::OtherGeneration { .. },
+                ..
+            }
+        ));
+        let mut reads = 0;
+        put_marker(shown, "gen-b", &mut || Ok(None), &mut || {
+            reads += 1;
+            Ok(Some(if reads < 3 { "gen-" } else { "gen-b\n" }.to_string()))
+        })
         .unwrap();
-        assert!(overwritten);
+        let err = put_marker(shown, "gen-b", &mut || Ok(None), &mut || {
+            Ok(Some(String::new()))
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ClaimError::Refused {
+                refusal: StoreRefusal::IncompleteMarker,
+                ..
+            }
+        ));
+        assert!(err.to_string().contains("印のファイル"));
+    }
+
+    /// 中断で空の印が残った保存先: 単独でも、別の世代の 2 つが同時に使い始めても、どちらも
+    /// 通さず、印も中身も変えない（オーナーのレビュー P2）。
+    #[test]
+    fn a_leftover_empty_marker_is_never_claimed() {
+        let dir = TempDir::new();
+        let store = dir.path().join("history");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join(MARKER_FILE_NAME), b"").unwrap();
+        std::fs::write(store.join("20260101-001.sqlite3"), b"rows").unwrap();
+        let snapshot = || {
+            let mut listed: Vec<(String, Vec<u8>)> = std::fs::read_dir(&store)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (
+                        entry.file_name().to_string_lossy().into_owned(),
+                        std::fs::read(entry.path()).unwrap(),
+                    )
+                })
+                .collect();
+            listed.sort();
+            listed
+        };
+        let before = snapshot();
+        let refused = |result: Result<(), ClaimError>| {
+            matches!(
+                result,
+                Err(ClaimError::Refused {
+                    refusal: StoreRefusal::IncompleteMarker,
+                    ..
+                })
+            )
+        };
+        assert!(refused(claim_dir(&store, "gen-a")));
+        assert!(matches!(
+            inspect_dir(&store, "gen-a"),
+            Err(ClaimError::Refused {
+                refusal: StoreRefusal::IncompleteMarker,
+                ..
+            })
+        ));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = ["gen-a", "gen-b"]
+            .into_iter()
+            .map(|generation| {
+                let (store, barrier) = (store.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    claim_dir(&store, generation)
+                })
+            })
+            .collect();
+        for handle in handles {
+            assert!(refused(handle.join().unwrap()));
+        }
+        assert_eq!(snapshot(), before);
     }
 
     /// 2 つの DB が同じ空のフォルダを同時に使い始めても、通るのは 1 つだけ。

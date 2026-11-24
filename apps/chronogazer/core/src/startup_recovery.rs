@@ -228,6 +228,9 @@ pub fn classify(err: &EngineStartError) -> FailureKind {
     match err {
         EngineStartError::InstanceLock(_) => FailureKind::AlreadyRunning,
         EngineStartError::Database(InitDbError::Legacy(_)) => FailureKind::LegacyDatabase,
+        // 予約があるのに形式を確かめられない（`crate::db::refuse_legacy_profile`）: 予約を当てる・
+        // DB を作り直す選択肢は出さず、文言の対処（予約を一時的に移す など）に任せて終了だけ。
+        EngineStartError::Database(InitDbError::Undetermined(_)) => FailureKind::Other,
         EngineStartError::Database(InitDbError::Storage(err)) => {
             classify_storage_message(&err.to_string())
         }

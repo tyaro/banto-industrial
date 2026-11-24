@@ -21,6 +21,8 @@
 //!    （banto v8 への追従）で今の DB と予約のファイルを読み取り専用で確かめ、どちらかが
 //!    旧形式なら何も変えずに [`EngineStartError::Database`]（`InitDbError::Legacy`）を返す
 //!    （適用が旧形式の DB の上に予約を当てる・旧形式の予約を「不正」として消すのを防ぐ）。
+//!    予約があるのに形式を確かめられない（開けない・空でない `-wal` が残っている など）ときも、
+//!    予約を当てずに `InitDbError::Undetermined` で止まる。
 //!    次に予約の適用（`BackupService::apply_pending_restore_at_startup`、pool を作る前で
 //!    なければならない）。適用の失敗では起動は止めない（今までどおり）。予約は banto の検査
 //!    （履歴と [`crate::db::sqlite_restore_manifest`] の起動時の検査）を通ったものだけが当たる。
@@ -498,6 +500,9 @@ impl std::fmt::Display for EngineStartError {
             // 旧形式の DB は、何をすればよいかを書いた文言をそのまま出す
             // （`crate::db` のモジュール doc「旧形式の DB の拒否」）。
             Self::Database(InitDbError::Legacy(legacy)) => legacy.fmt(f),
+            // 予約があるのに形式を確かめられない（`crate::db::refuse_legacy_profile`）も、対処を
+            // 書いた文言をそのまま出す。
+            Self::Database(InitDbError::Undetermined(undetermined)) => undetermined.fmt(f),
             Self::Database(err) => write!(f, "DB の初期化に失敗しました: {err}"),
             Self::Hub(err) => write!(f, "Hub 接続の初期化に失敗しました: {err}"),
             Self::StoreConfig { source, .. } => {

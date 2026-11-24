@@ -83,7 +83,9 @@
 //! `init_db` だけで断ると、旧形式の DB の上に予約が先に当たる・旧形式の予約が黙って消される
 //! （banto は検査に通らない予約を起動時に消す）。そこで起動は予約の適用の**前に**
 //! [`refuse_legacy_profile`] で、今の DB と予約のファイルを読み取り専用で確かめ、どちらかが
-//! 旧形式なら何も変えずに止まる（docs/banto-v8-upgrade-plan.md §5 の 2）。
+//! 旧形式なら何も変えずに止まる（docs/banto-v8-upgrade-plan.md §5 の 2）。予約があるのに
+//! 形式を確かめられない（開けない・読めない・空でない `-wal` が残っている）ときも、予約を
+//! 当てずに止まる（[`InitDbError::Undetermined`]。オーナーのレビュー P2）。
 
 use banto_core::BantoError;
 use sqlx::SqlitePool;
@@ -175,6 +177,51 @@ impl fmt::Display for LegacyDatabase {
 
 impl std::error::Error for LegacyDatabase {}
 
+/// リストアの予約があるのに、今の DB か予約のファイルの形式（v8 か、旧形式か）を確かめられ
+/// なかった（[`refuse_legacy_profile`]）。予約を当てずに止める。`Display` がそのまま利用者
+/// 向けの説明になる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndeterminedDatabase {
+    /// 確かめられなかったファイル（今の DB か予約のファイル）。
+    pub path: PathBuf,
+    /// リストアの予約のファイル。
+    pub pending: PathBuf,
+    /// 確かめられなかった理由。
+    pub reason: String,
+}
+
+impl fmt::Display for UndeterminedDatabase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.path == self.pending {
+            write!(
+                f,
+                "バックアップからの戻しの予約 {} の形式（この版のものか、v8.0.0 より前の版の\
+                 ものか）を確かめられないため、予約を当てずに起動を止めました（{}）。\
+                 今の DB と予約のファイルは変えていません。戻しをやめるなら、ChronoGazer を\
+                 終了してから予約のファイルを別の場所へ移して起動し直してください。",
+                self.path.display(),
+                self.reason
+            )
+        } else {
+            write!(
+                f,
+                "今の DB {} の形式（この版のものか、v8.0.0 より前の版のものか）を確かめられない\
+                 ため、バックアップからの戻しの予約 {} を当てずに起動を止めました（{}）。\
+                 今の DB・その -wal・予約のファイルは変えていません。ChronoGazer を終了してから\
+                 予約のファイルを一時的に別の場所へ移して一度起動し、正常に終了してから\
+                 （今の DB の形式が確かめられ、-wal が DB へ畳まれます）予約のファイルを元の\
+                 場所へ戻して起動し直してください。今の DB が壊れているなら、その DB と隣の\
+                 -wal・-shm を別の名前へ退避してから起動し直すと、予約が当たります。",
+                self.path.display(),
+                self.pending.display(),
+                self.reason
+            )
+        }
+    }
+}
+
+impl std::error::Error for UndeterminedDatabase {}
+
 /// [`init_db`] の失敗。旧形式の DB（[`InitDbError::Legacy`]）と、それ以外の
 /// 接続・migration の失敗（[`InitDbError::Storage`]）を呼び出し側で分けられる
 /// ようにする。
@@ -182,6 +229,8 @@ impl std::error::Error for LegacyDatabase {}
 pub enum InitDbError {
     /// 旧形式の DB。起動を拒否する。
     Legacy(LegacyDatabase),
+    /// リストアの予約があるのに、形式を確かめられなかった（[`refuse_legacy_profile`]）。
+    Undetermined(UndeterminedDatabase),
     /// 接続または migration の失敗。
     Storage(BantoError),
 }
@@ -190,6 +239,7 @@ impl fmt::Display for InitDbError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Legacy(legacy) => legacy.fmt(f),
+            Self::Undetermined(undetermined) => undetermined.fmt(f),
             Self::Storage(err) => err.fmt(f),
         }
     }
@@ -199,6 +249,7 @@ impl std::error::Error for InitDbError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Legacy(legacy) => Some(legacy),
+            Self::Undetermined(undetermined) => Some(undetermined),
             Self::Storage(err) => Some(err),
         }
     }
@@ -216,6 +267,7 @@ impl From<InitDbError> for BantoError {
     fn from(err: InitDbError) -> Self {
         match err {
             InitDbError::Legacy(legacy) => BantoError::Other(legacy.to_string()),
+            InitDbError::Undetermined(undetermined) => BantoError::Other(undetermined.to_string()),
             InitDbError::Storage(err) => err,
         }
     }
@@ -426,39 +478,114 @@ fn hex_of(bytes: &[u8]) -> String {
 /// [`InitDbError::Legacy`]（`path` は旧形式だったファイル）を返す。
 ///
 /// ファイルは `immutable` の読み取り専用で開く（書き込み・ロック・`-wal`・`-shm` を作らない。
-/// バイトは変わらない）。そのため `-wal` にだけある変更は見えない: そこで見逃した今の DB は、
-/// この後の [`init_db`] の判定が断る（予約は適用された後になる。v7 の DB は閉じるときに
-/// `-wal` を本体へ畳むので、実際に起きるのは前の版が落ちたままの DB だけ）。
-/// 無いファイルは飛ばす。開けない・読めないファイルも飛ばす（旧形式とは言えない。壊れた
-/// DB は今までの経路 - 予約は banto の検査、今の DB は `init_db` - が扱う）。
+/// バイトは変わらない）。`immutable` は `-wal`（とロールバックの `-journal`）を読まないので、
+/// 空でない `-wal`・`-journal` が隣にあるファイルは「確かめられない」とする（読み取り専用でも
+/// WAL を読むには `-shm` を作る・書くことがあり、バイトを変えずには読めない）。
+///
+/// - **予約があるとき**: 今の DB を「無い／v8／旧形式／確かめられない」に分け、確かめられない
+///   （開けない・読めない・空でない `-wal` が残っている）なら、予約を当てずに
+///   [`InitDbError::Undetermined`] で止まる（オーナーのレビュー P2。確かめずに当てると、
+///   旧形式の DB を保ったまま止まる約束を守れない）。予約のファイルも同じ考えで確かめ、
+///   空でない `-wal`・`-journal` が隣にあって確かめられなければ止まる（黙って当てない・消さない）。
+///   予約のファイルそのものが開けない・読めない（SQLite のファイルでない など）ときは今までどおり
+///   飛ばす: 旧形式の DB とは言えず、banto の起動時の検査が「不正」として当てずに消す
+///   （守るべき旧い DB ではない。`a_pending_restore_warning_is_written_to_the_daily_log`）。
+/// - **予約が無いとき**: 今の DB が旧形式なら止まり、確かめられないなら飛ばす（今までどおり。
+///   この後の [`init_db`] が判定し、開けない DB は起動時の対処の窓が扱う）。
 pub async fn refuse_legacy_profile(db_path: &Path) -> Result<(), InitDbError> {
     let pending = crate::backup::BackupService::pending_restore_file(db_path).ok();
-    for path in [Some(db_path.to_path_buf()), pending].into_iter().flatten() {
-        if let Some(kind) = legacy_kind_of_file(&path).await {
-            return Err(InitDbError::Legacy(LegacyDatabase { path, kind }));
+    let pending = match pending {
+        Some(pending) if tokio::fs::try_exists(&pending).await.unwrap_or(true) => Some(pending),
+        _ => None,
+    };
+    for path in [Some(db_path.to_path_buf()), pending.clone()]
+        .into_iter()
+        .flatten()
+    {
+        match format_of_file(&path).await {
+            FileFormat::Absent | FileFormat::Current => {}
+            FileFormat::Legacy(kind) => {
+                return Err(InitDbError::Legacy(LegacyDatabase { path, kind }));
+            }
+            FileFormat::Unreadable(_) if Some(&path) == pending.as_ref() => {}
+            FileFormat::Undetermined(reason) | FileFormat::Unreadable(reason) => {
+                if let Some(pending) = &pending {
+                    return Err(InitDbError::Undetermined(UndeterminedDatabase {
+                        path,
+                        pending: pending.clone(),
+                        reason,
+                    }));
+                }
+            }
         }
     }
     Ok(())
 }
 
-/// `path` の DB を変えずに開いて [`legacy_kind_of`]。無い・開けない・読めないなら `None`。
-async fn legacy_kind_of_file(path: &Path) -> Option<LegacyKind> {
+/// [`format_of_file`] の結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileFormat {
+    /// ファイルが無い。
+    Absent,
+    /// 旧形式ではない（v8 の DB か、表の無い空の DB）。
+    Current,
+    /// 旧形式。
+    Legacy(LegacyKind),
+    /// 空でない `-wal`・`-journal` が隣にあり、`immutable` では確かめられない（理由）。
+    Undetermined(String),
+    /// 開けない・読めない（理由）。
+    Unreadable(String),
+}
+
+/// `path` の DB を変えずに開いて [`legacy_kind_of`]（[`refuse_legacy_profile`] の doc）。
+async fn format_of_file(path: &Path) -> FileFormat {
     use sqlx::sqlite::SqliteConnectOptions;
     use sqlx::{ConnectOptions, Connection};
-    if !tokio::fs::try_exists(path).await.unwrap_or(false) {
-        return None;
+    match tokio::fs::try_exists(path).await {
+        Ok(true) => {}
+        Ok(false) => return FileFormat::Absent,
+        Err(err) => return FileFormat::Undetermined(format!("有無を確かめられません: {err}")),
     }
-    let mut conn = SqliteConnectOptions::new()
+    for suffix in ["-wal", "-journal"] {
+        let mut side = path.as_os_str().to_owned();
+        side.push(suffix);
+        let side = PathBuf::from(side);
+        match tokio::fs::metadata(&side).await {
+            Ok(meta) if meta.len() == 0 => {}
+            Ok(_) => {
+                return FileFormat::Undetermined(format!(
+                    "閉じきっていない変更 {} が残っています。前に使った ChronoGazer が正常に\
+                     終了しなかったときに残ります",
+                    side.display()
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return FileFormat::Undetermined(format!(
+                    "{} を確かめられません: {err}",
+                    side.display()
+                ));
+            }
+        }
+    }
+    let mut conn = match SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(false)
         .read_only(true)
         .immutable(true)
         .connect()
         .await
-        .ok()?;
-    let kind = legacy_kind_of(&mut conn).await.ok().flatten();
+    {
+        Ok(conn) => conn,
+        Err(err) => return FileFormat::Unreadable(format!("開けません: {err}")),
+    };
+    let kind = legacy_kind_of(&mut conn).await;
     let _ = conn.close().await;
-    kind
+    match kind {
+        Ok(Some(kind)) => FileFormat::Legacy(kind),
+        Ok(None) => FileFormat::Current,
+        Err(err) => FileFormat::Unreadable(format!("読めません: {err}")),
+    }
 }
 
 async fn run_migrations(pool: &SqlitePool) -> Result<(), BantoError> {
