@@ -2677,7 +2677,7 @@ mod tests {
         let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
 
         users
-            .setup_first_user("admin", "password123", "管理者")
+            .setup_first_user("testadmin", "password123", "管理者")
             .await
             .expect("setup_first_user");
         users
@@ -2714,7 +2714,7 @@ mod tests {
         );
 
         let admin_token = auth
-            .login("admin", "password123")
+            .login("testadmin", "password123")
             .await
             .expect("admin login");
         let editor_token = auth
@@ -3691,7 +3691,7 @@ mod tests {
         };
 
         users
-            .setup_first_user("admin", "password123", "管理者")
+            .setup_first_user("testadmin", "password123", "管理者")
             .await
             .expect("setup_first_user");
         users
@@ -3705,7 +3705,7 @@ mod tests {
 
         let auth = user_auth_state(users.clone(), audit.clone());
         let admin_token = auth
-            .login("admin", "password123")
+            .login("testadmin", "password123")
             .await
             .expect("admin login");
         let editor_token = auth
@@ -3788,7 +3788,7 @@ mod tests {
         let audit = AuditLogService::new(Db::Sqlite(pool));
 
         users
-            .setup_first_user("admin", "password123", "管理者")
+            .setup_first_user("testadmin", "password123", "管理者")
             .await
             .expect("setup_first_user");
         users
@@ -3802,7 +3802,7 @@ mod tests {
 
         let auth = user_auth_state(users.clone(), audit.clone());
         let admin_token = auth
-            .login("admin", "password123")
+            .login("testadmin", "password123")
             .await
             .expect("admin login");
         let editor_token = auth
@@ -4177,7 +4177,7 @@ mod tests {
             .iter()
             .find(|r| r["action"] == "settings_change" && r["resource"] == "settings")
             .unwrap_or_else(|| panic!("expected a settings_change/settings entry, got {rows:?}"));
-        assert_eq!(entry["actorUsername"], "admin");
+        assert_eq!(entry["actorUsername"], "testadmin");
         assert_eq!(entry["origin"], "rest");
         assert_eq!(entry["result"], "ok");
     }
@@ -4263,7 +4263,7 @@ mod tests {
             .iter()
             .find(|r| r["action"] == "create" && r["resource"] == "users")
             .expect("expected a create/users entry");
-        assert_eq!(entry["actorUsername"], "admin");
+        assert_eq!(entry["actorUsername"], "testadmin");
         let detail = entry["detail"].as_str().expect("detail should be set");
         assert!(
             !detail.contains("supersecret1"),

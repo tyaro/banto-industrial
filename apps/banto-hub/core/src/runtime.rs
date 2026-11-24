@@ -2720,7 +2720,7 @@ mod tests {
             .into_owned();
         let pool = init_db(&db_path).await.expect("init DB");
         UsersService::new(Db::Sqlite(pool.clone()))
-            .setup_first_user("admin", "password123", "管理者")
+            .setup_first_user("testadmin", "password123", "管理者")
             .await
             .expect("setup admin");
         pool.close().await;
@@ -2745,7 +2745,7 @@ mod tests {
             "login",
             "POST",
             None,
-            Some(&serde_json::json!({"username": "admin", "password": "password123"})),
+            Some(&serde_json::json!({"username": "testadmin", "password": "password123"})),
             Duration::from_secs(10),
         )
         .await;
@@ -2871,7 +2871,7 @@ mod tests {
             .into_owned();
         let pool = init_db(&db_path).await.expect("init DB");
         UsersService::new(Db::Sqlite(pool.clone()))
-            .setup_first_user("admin", "password123", "管理者")
+            .setup_first_user("testadmin", "password123", "管理者")
             .await
             .expect("setup admin");
         pool.close().await;
@@ -2891,7 +2891,7 @@ mod tests {
         .await
         .expect("start Hub");
         let addr = hub.local_addr();
-        let login_payload = r#"{"username":"admin","password":"password123"}"#;
+        let login_payload = r#"{"username":"testadmin","password":"password123"}"#;
         let login_request = format!(
             "POST /api/auth/login HTTP/1.0\r\nHost: {addr}\r\nX-Banto-Client: banto\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{login_payload}",
             login_payload.len()
@@ -4279,7 +4279,7 @@ Host: {addr}
             .into_owned();
         let pool = init_db(&db_path).await.expect("init DB");
         UsersService::new(Db::Sqlite(pool.clone()))
-            .setup_first_user("admin", "password123", "管理者")
+            .setup_first_user("testadmin", "password123", "管理者")
             .await
             .expect("setup admin");
         pool.close().await;
@@ -4306,7 +4306,7 @@ Host: {addr}
             "login",
             "POST",
             None,
-            Some(&serde_json::json!({ "username": "admin", "password": "password123" })),
+            Some(&serde_json::json!({ "username": "testadmin", "password": "password123" })),
             bound,
         )
         .await;

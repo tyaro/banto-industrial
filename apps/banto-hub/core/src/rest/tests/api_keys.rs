@@ -1053,7 +1053,7 @@ async fn opcua_settings_put_is_503_after_the_shutdown_closed_it() {
     let users = UsersService::new(Db::Sqlite(env.pool.clone()));
     let audit = AuditLogService::new(Db::Sqlite(env.pool.clone()));
     let auth = user_auth_state(users, audit.clone());
-    let token = auth.login("admin", "password123").await.unwrap();
+    let token = auth.login("testadmin", "password123").await.unwrap();
     let (tx, _rx) = tokio_broadcast::channel(16);
     let router = opcua_settings_router(
         env.manager.clone(),

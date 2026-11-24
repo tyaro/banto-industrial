@@ -613,7 +613,7 @@ async fn an_admin_issues_lists_revokes_and_deletes_keys_and_each_is_audited() {
             .iter()
             .find(|r| r.resource == "api_keys" && r.action == action)
             .unwrap_or_else(|| panic!("no {action} entry: {rows:?}"));
-        assert_eq!(entry.actor_username.as_deref(), Some("admin"));
+        assert_eq!(entry.actor_username.as_deref(), Some("testadmin"));
         assert_eq!(entry.actor_role.as_deref(), Some("admin"));
         assert_eq!(entry.origin, "rest");
         assert_eq!(entry.entity_id.as_deref(), Some(id.to_string().as_str()));

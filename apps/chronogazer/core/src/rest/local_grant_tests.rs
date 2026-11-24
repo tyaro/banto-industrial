@@ -72,7 +72,11 @@ async fn fixture_with(
     let settings = SettingsService::new(db.clone());
     let audit = AuditLogService::new(db.clone());
     for (i, role) in accounts.iter().enumerate() {
-        let name = role.as_str();
+        let name = if *role == Role::Admin {
+            "testadmin"
+        } else {
+            role.as_str()
+        };
         if i == 0 {
             assert_eq!(*role, Role::Admin, "最初のアカウントは admin");
             users
@@ -303,7 +307,7 @@ async fn uninitialized_issues_admin_until_the_first_account_exists() {
     assert!(!f.users.is_initialized().await.unwrap());
 
     // setup（Host の確認つき）で最初の管理者を作ると、grant の admin は終わる。
-    let setup = json!({ "username": "admin", "password": PASSWORD, "displayName": "管理者" });
+    let setup = json!({ "username": "testadmin", "password": PASSWORD, "displayName": "管理者" });
     let (status, body) = send(
         &f.router,
         "POST",
@@ -451,7 +455,7 @@ async fn changing_the_setting_closes_now_and_reopens_after_a_restart() {
         Some(viewer),
     )
     .await;
-    let admin = login(&f.router, "admin").await;
+    let admin = login(&f.router, "testadmin").await;
     let editor = login(&f.router, "editor").await;
     let (_, local_token) = grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await;
     let local_token = local_token.expect("token");
@@ -555,7 +559,7 @@ async fn changing_the_setting_closes_now_and_reopens_after_a_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn setup_on_the_always_on_listener_needs_a_request_from_this_pc() {
     let f = fixture(LocalGrantStart::Uninitialized, true, &[]).await;
-    let setup = json!({ "username": "admin", "password": PASSWORD, "displayName": "管理者" });
+    let setup = json!({ "username": "testadmin", "password": PASSWORD, "displayName": "管理者" });
     for (peer, host) in [
         (Some(LAN), Some(LOCAL_HOST)),
         (Some(LAN), Some("192.168.1.5:8721")),
@@ -619,7 +623,7 @@ async fn server_settings_are_admin_only_and_put_needs_a_server_host() {
         &[Role::Admin, Role::Viewer],
     )
     .await;
-    let admin = login(&f.router, "admin").await;
+    let admin = login(&f.router, "testadmin").await;
     let viewer = login(&f.router, "viewer").await;
     let get = |token: String| {
         let router = f.router.clone();
@@ -721,7 +725,7 @@ async fn auth_disabled_fields_are_refused_even_when_null() {
         &[Role::Admin],
     )
     .await;
-    let admin = login(&f.router, "admin").await;
+    let admin = login(&f.router, "testadmin").await;
     for body in [
         json!({ "localGrant": "viewer", "disabled": null }),
         json!({ "localGrant": "viewer", "disabledRole": null }),
@@ -809,7 +813,7 @@ async fn encoded_kind_spellings_are_audited_and_still_checked() {
     }
 
     // 別表記の接頭辞・status・setup は、LAN から送っても何も開けない。
-    let setup = json!({ "username": "admin", "password": PASSWORD, "displayName": "管理者" });
+    let setup = json!({ "username": "testadmin", "password": PASSWORD, "displayName": "管理者" });
     for (method, path, body) in [
         ("POST", "/api/auth/gr%61nt/localDesktop", None),
         ("GET", "/api/auth/st%61tus", None),
@@ -866,7 +870,7 @@ async fn reserved_usernames_are_refused_on_the_rest_paths() {
         Some(LOCAL),
         Some(LOCAL_HOST),
         None,
-        Some(json!({ "username": "admin", "password": PASSWORD, "displayName": "管理者" })),
+        Some(json!({ "username": "testadmin", "password": PASSWORD, "displayName": "管理者" })),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -982,7 +986,7 @@ async fn array_bodies_are_refused_on_the_account_paths() {
     let f = fixture(LocalGrantStart::Uninitialized, true, &[]).await;
     for body in [
         json!(["localDesktop", PASSWORD, "x"]),
-        json!(["admin", PASSWORD, "管理者"]),
+        json!(["testadmin", PASSWORD, "管理者"]),
     ] {
         let (status, response) = send(
             &f.router,
@@ -1005,7 +1009,7 @@ async fn array_bodies_are_refused_on_the_account_paths() {
         Some(LOCAL),
         Some(LOCAL_HOST),
         None,
-        Some(json!({ "username": "admin", "password": PASSWORD, "displayName": "管理者" })),
+        Some(json!({ "username": "testadmin", "password": PASSWORD, "displayName": "管理者" })),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -1088,7 +1092,7 @@ async fn deeply_nested_bodies_cannot_bypass_the_reserved_name_check() {
         &[Role::Admin],
     )
     .await;
-    let admin = login(&f.router, "admin").await;
+    let admin = login(&f.router, "testadmin").await;
     let create = format!(
         r#"{{"username":"localDesktop","password":"{PASSWORD}","displayName":"x","role":"viewer","unused":{nested}}}"#
     );
@@ -2040,7 +2044,7 @@ async fn each_auth_put_answers_with_the_value_it_saved() {
     let viewer = LocalGrantSetting::Role(Role::Viewer);
     let start = LocalGrantStart::Initialized(viewer);
     let f = fixture_with(start, true, &[Role::Admin], Some(viewer)).await;
-    let admin = login(&f.router, "admin").await;
+    let admin = login(&f.router, "testadmin").await;
     let (_, local_token) = grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await;
     let local_token = local_token.expect("token");
 
@@ -2154,7 +2158,7 @@ async fn concurrent_auth_puts_each_answer_with_their_own_value() {
         Some(viewer),
     )
     .await;
-    let admin = login(&f.router, "admin").await;
+    let admin = login(&f.router, "testadmin").await;
     // 起動時は viewer: viewer と off は再起動不要、editor と admin は要る。
     let values = [
         ("off", false),

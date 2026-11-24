@@ -1201,12 +1201,12 @@ mod tests {
             always_on_listener: true,
         };
         let body = |value: serde_json::Value| {
-            serde_json::json!({ "username": "admin", "localGrant": value })
+            serde_json::json!({ "username": "testadmin", "localGrant": value })
                 .as_object()
                 .unwrap()
                 .clone()
         };
-        let without = serde_json::json!({ "username": "admin" })
+        let without = serde_json::json!({ "username": "testadmin" })
             .as_object()
             .unwrap()
             .clone();

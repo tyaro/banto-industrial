@@ -228,7 +228,7 @@ async fn test_app_with(label: &str, revalidation: Option<StreamRevalidationTimin
     let users = UsersService::new(Db::Sqlite(pool.clone()));
     let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
     users
-        .setup_first_user("admin", "password123", "管理者")
+        .setup_first_user("testadmin", "password123", "管理者")
         .await
         .expect("setup_first_user");
 
@@ -251,7 +251,7 @@ async fn test_app_with(label: &str, revalidation: Option<StreamRevalidationTimin
         SessionValidation::lookup(user_session_lookup(verify_users_lookup)),
     );
     let admin_token = auth
-        .login("admin", "password123")
+        .login("testadmin", "password123")
         .await
         .expect("admin login");
 

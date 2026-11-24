@@ -595,7 +595,7 @@ async fn manual_clock_sync_sets_the_clock_and_is_audited_with_the_operator() {
     assert_eq!(peer.clock(), success_frames());
     let rows = audit_rows(&app).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0].0.as_deref(), Some("admin"));
+    assert_eq!(rows[0].0.as_deref(), Some("testadmin"));
     assert_eq!((rows[0].1.as_str(), rows[0].2.as_str()), ("rest", "ok"));
     let (_, got) =
         super::admin_write(&app.router, "GET", &path(id), &app.admin_token, json!({})).await;

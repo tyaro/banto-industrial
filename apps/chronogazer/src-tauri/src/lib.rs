@@ -6223,7 +6223,7 @@ mod tests {
         let admin = state
             .services
             .users
-            .create_user("admin", "password123", "管理者", Role::Admin)
+            .create_user("testadmin", "password123", "管理者", Role::Admin)
             .await
             .expect("create_user");
         state.set_session_for_test(Some(DesktopSession::Account(admin)));
@@ -6249,7 +6249,7 @@ mod tests {
             .iter()
             .find(|r| r.action == "backup")
             .unwrap_or_else(|| panic!("expected a backup entry, got {:?}", audit.rows));
-        assert_eq!(entry.actor_username.as_deref(), Some("admin"));
+        assert_eq!(entry.actor_username.as_deref(), Some("testadmin"));
         assert_eq!(entry.resource, "backups");
         assert_eq!(entry.entity_id.as_deref(), Some(info.file_name.as_str()));
         assert_eq!(entry.origin, "tauri");
@@ -6284,7 +6284,7 @@ mod tests {
         let admin = state
             .services
             .users
-            .create_user("admin", "password123", "管理者", Role::Admin)
+            .create_user("testadmin", "password123", "管理者", Role::Admin)
             .await
             .expect("create_user");
         state.set_session_for_test(Some(DesktopSession::Account(admin)));
@@ -6315,7 +6315,7 @@ mod tests {
             .iter()
             .find(|r| r.action == "restore_staged")
             .unwrap_or_else(|| panic!("expected a restore_staged entry, got {:?}", audit.rows));
-        assert_eq!(entry.actor_username.as_deref(), Some("admin"));
+        assert_eq!(entry.actor_username.as_deref(), Some("testadmin"));
         assert_eq!(entry.resource, "backups");
         assert_eq!(entry.origin, "tauri");
         assert_eq!(entry.result, "ok");
@@ -6397,7 +6397,7 @@ mod tests {
         let admin = state
             .services
             .users
-            .create_user("admin", "password123", "管理者", Role::Admin)
+            .create_user("testadmin", "password123", "管理者", Role::Admin)
             .await
             .expect("create_user");
         state.set_session_for_test(Some(DesktopSession::Account(admin)));
@@ -7789,7 +7789,7 @@ mod tests {
             .expect("init_db_memory");
         let users = UsersService::new(Db::Sqlite(pool.clone()));
         users
-            .setup_first_user("admin", "password123", "管理者")
+            .setup_first_user("testadmin", "password123", "管理者")
             .await
             .unwrap();
         let alice = users
@@ -7801,9 +7801,9 @@ mod tests {
             .await
             .unwrap();
 
-        let admin = desktop_login(&pool, "admin").await;
+        let admin = desktop_login(&pool, "testadmin").await;
         let router = router_for(&admin);
-        let admin_rest = rest_login(&admin.services.rest_auth, "admin", false).await;
+        let admin_rest = rest_login(&admin.services.rest_auth, "testadmin", false).await;
         let alice_rest = rest_login(&admin.services.rest_auth, "alice", false).await;
         let alice_rest_remember = rest_login(&admin.services.rest_auth, "alice", true).await;
         let alice_self_rest = rest_login(&admin.services.rest_auth, "alice", false).await;
@@ -8153,7 +8153,7 @@ mod tests {
         let admin = state
             .services
             .users
-            .setup_first_user("admin", "password123", "管理者")
+            .setup_first_user("testadmin", "password123", "管理者")
             .await
             .expect("setup_first_user");
         state.set_session_for_test(Some(DesktopSession::Account(admin)));
@@ -8173,7 +8173,7 @@ mod tests {
             .iter()
             .find(|r| r.action == "settings_change" && r.resource == "settings")
             .unwrap_or_else(|| panic!("expected a settings_change entry, got {:?}", audit.rows));
-        assert_eq!(entry.actor_username.as_deref(), Some("admin"));
+        assert_eq!(entry.actor_username.as_deref(), Some("testadmin"));
         assert_eq!(entry.actor_role.as_deref(), Some("admin"));
         assert_eq!(entry.entity_id, None);
         assert_eq!(entry.origin, "tauri");
@@ -8196,12 +8196,12 @@ mod tests {
         let admin = state
             .services
             .users
-            .setup_first_user("admin", "password123", "管理者")
+            .setup_first_user("testadmin", "password123", "管理者")
             .await
             .expect("setup_first_user");
         state.set_session_for_test(Some(DesktopSession::Account(admin)));
 
-        autologin_enable_body(&state, "admin", "password123")
+        autologin_enable_body(&state, "testadmin", "password123")
             .await
             .expect("autologin_enable should succeed");
 
@@ -8216,7 +8216,7 @@ mod tests {
             .iter()
             .find(|r| r.action == "settings_change" && r.resource == "settings")
             .unwrap_or_else(|| panic!("expected a settings_change entry, got {:?}", audit.rows));
-        assert_eq!(entry.actor_username.as_deref(), Some("admin"));
+        assert_eq!(entry.actor_username.as_deref(), Some("testadmin"));
         assert_eq!(entry.entity_id, None);
         assert_eq!(entry.result, "ok");
         let detail: serde_json::Value =
@@ -8224,7 +8224,7 @@ mod tests {
                 .expect("detail is json");
         assert_eq!(
             detail,
-            serde_json::json!({ "autologinEnabled": true, "username": "admin" })
+            serde_json::json!({ "autologinEnabled": true, "username": "testadmin" })
         );
     }
 
@@ -8238,7 +8238,7 @@ mod tests {
         let admin = state
             .services
             .users
-            .setup_first_user("admin", "password123", "管理者")
+            .setup_first_user("testadmin", "password123", "管理者")
             .await
             .expect("setup_first_user");
         state.set_session_for_test(Some(DesktopSession::Account(admin)));
@@ -8258,7 +8258,7 @@ mod tests {
             .iter()
             .find(|r| r.action == "settings_change" && r.resource == "settings")
             .unwrap_or_else(|| panic!("expected a settings_change entry, got {:?}", audit.rows));
-        assert_eq!(entry.actor_username.as_deref(), Some("admin"));
+        assert_eq!(entry.actor_username.as_deref(), Some("testadmin"));
         assert_eq!(entry.entity_id, None);
         assert_eq!(entry.result, "ok");
         let detail: serde_json::Value =
@@ -8428,7 +8428,7 @@ mod tests {
         let admin = state
             .services
             .users
-            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .setup_first_user("testadmin", SLOT_PASSWORD, "Admin")
             .await
             .expect("setup_first_user");
         state.set_session_for_test(Some(DesktopSession::Account(admin)));
@@ -9012,14 +9012,14 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .setup_first_user("testadmin", SLOT_PASSWORD, "Admin")
             .await
             .unwrap();
-        let login = login_body(&state, "admin".to_string(), SLOT_PASSWORD.to_string())
+        let login = login_body(&state, "testadmin".to_string(), SLOT_PASSWORD.to_string())
             .await
             .expect("login");
         assert!(login.success);
-        assert!(is_account(&read_slot(&state).0, "admin"));
+        assert!(is_account(&read_slot(&state).0, "testadmin"));
 
         let config = auth_config_apply_body(&state, true, "viewer")
             .await
@@ -9035,7 +9035,7 @@ mod tests {
 
         let logouts = audit_rows(&state, "logout").await;
         assert_eq!(logouts.len(), 1);
-        assert_eq!(logouts[0].0.as_deref(), Some("admin"));
+        assert_eq!(logouts[0].0.as_deref(), Some("testadmin"));
         let detail: serde_json::Value =
             serde_json::from_str(logouts[0].1.as_deref().expect("detail")).unwrap();
         assert_eq!(detail, serde_json::json!({ "reason": "auth_disabled" }));
@@ -9066,13 +9066,13 @@ mod tests {
     #[tokio::test]
     async fn s96_config_apply_true_again_keeps_seq_for_the_same_role_and_advances_it_for_another() {
         let state = app_state().await;
-        enable_local_from_an_admin_session(&state, "admin").await;
+        enable_local_from_an_admin_session(&state, "testadmin").await;
         let (session, seq) = read_slot(&state);
         assert!(is_local(&session));
         let logins = audit_action_count(&state, "login").await;
         let logouts = audit_action_count(&state, "logout").await;
 
-        auth_config_apply_body(&state, true, "admin")
+        auth_config_apply_body(&state, true, "testadmin")
             .await
             .expect("same apply");
         assert_eq!(
@@ -9104,7 +9104,7 @@ mod tests {
     #[tokio::test]
     async fn s96_a_resolve_that_read_the_old_local_role_does_not_write_it_back() {
         let state = app_state().await;
-        enable_local_from_an_admin_session(&state, "admin").await;
+        enable_local_from_an_admin_session(&state, "testadmin").await;
 
         // The old resolve: slot and store read (admin), then held.
         let (cached, seq_at_entry) = read_slot(&state);
@@ -9144,13 +9144,13 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .setup_first_user("testadmin", SLOT_PASSWORD, "Admin")
             .await
             .unwrap();
         let admin = state
             .services
             .users
-            .get_by_username("admin")
+            .get_by_username("testadmin")
             .await
             .unwrap()
             .unwrap();
@@ -9197,7 +9197,7 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .setup_first_user("testadmin", SLOT_PASSWORD, "Admin")
             .await
             .unwrap();
 
@@ -9215,13 +9215,17 @@ mod tests {
         );
         assert!(recorded.ends_with('…'), "{recorded}");
         // 上限以内の名前はそのまま（切り詰めは長すぎるときだけ）。
-        login_body(&state, "admin".to_string(), "wrong-password".to_string())
-            .await
-            .expect("login");
+        login_body(
+            &state,
+            "testadmin".to_string(),
+            "wrong-password".to_string(),
+        )
+        .await
+        .expect("login");
         assert!(audit_rows(&state, "login_failed")
             .await
             .iter()
-            .any(|(name, _)| name.as_deref() == Some("admin")));
+            .any(|(name, _)| name.as_deref() == Some("testadmin")));
     }
 
     /// I2b（PR #499 レビュー P2）: 汎用の `settings_set` は `server.*`
@@ -9236,7 +9240,7 @@ mod tests {
         let admin = state
             .services
             .users
-            .get_by_username("admin")
+            .get_by_username("testadmin")
             .await
             .unwrap()
             .unwrap();
@@ -9323,14 +9327,14 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .setup_first_user("testadmin", SLOT_PASSWORD, "Admin")
             .await
             .unwrap();
         state.set_session_for_test(Some(DesktopSession::Account(
             state
                 .services
                 .users
-                .get_by_username("admin")
+                .get_by_username("testadmin")
                 .await
                 .unwrap()
                 .unwrap(),
@@ -9338,7 +9342,7 @@ mod tests {
         save_fails_after_the_mode(&mut state);
         let (_, seq) = read_slot(&state);
 
-        let result = auth_config_apply_body(&state, true, "admin").await;
+        let result = auth_config_apply_body(&state, true, "testadmin").await;
         assert!(matches!(result, Err(BantoError::Storage(_))), "{result:?}");
         assert!(
             state
@@ -9353,7 +9357,7 @@ mod tests {
         assert!(is_local(&session), "follows disabled = true: {session:?}");
         assert_eq!(seq_on, seq + 1);
 
-        let result = auth_config_apply_body(&state, false, "admin").await;
+        let result = auth_config_apply_body(&state, false, "testadmin").await;
         assert!(result.is_err());
         assert!(
             !state
@@ -9377,7 +9381,7 @@ mod tests {
     #[tokio::test]
     async fn s102_a_stale_settle_reports_the_slot_value_not_the_older_read() {
         let state = app_state().await;
-        enable_local_from_an_admin_session(&state, "admin").await;
+        enable_local_from_an_admin_session(&state, "testadmin").await;
         let (cached, seq_at_entry) = read_slot(&state);
         let cached = cached.expect("Local(admin)");
         let fresh = read_session_source(&state, &cached).await.unwrap();
@@ -9501,13 +9505,13 @@ mod tests {
     #[tokio::test]
     async fn s99_config_apply_false_ends_local_at_once_and_an_old_resolve_is_stale() {
         let state = app_state().await;
-        enable_local_from_an_admin_session(&state, "admin").await;
+        enable_local_from_an_admin_session(&state, "testadmin").await;
         let (cached, seq_n) = read_slot(&state);
         let cached = cached.expect("Local(admin)");
         let fresh = read_session_source(&state, &cached).await.unwrap();
         assert!(fresh.is_some(), "read while the mode was on");
 
-        auth_config_apply_body(&state, false, "admin")
+        auth_config_apply_body(&state, false, "testadmin")
             .await
             .expect("disable");
         assert_eq!(read_slot(&state), (None, seq_n + 1));
@@ -9543,20 +9547,20 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .setup_first_user("testadmin", SLOT_PASSWORD, "Admin")
             .await
             .unwrap();
-        let login = login_body(&state, "admin".to_string(), SLOT_PASSWORD.to_string())
+        let login = login_body(&state, "testadmin".to_string(), SLOT_PASSWORD.to_string())
             .await
             .expect("login");
         assert!(login.success);
         let before = read_slot(&state);
 
-        auth_config_apply_body(&state, false, "admin")
+        auth_config_apply_body(&state, false, "testadmin")
             .await
             .expect("re-save false");
         assert_eq!(read_slot(&state), before);
-        assert!(is_account(&before.0, "admin"));
+        assert!(is_account(&before.0, "testadmin"));
         assert_eq!(audit_action_count(&state, "logout").await, 0);
     }
 
@@ -9572,14 +9576,14 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .setup_first_user("testadmin", SLOT_PASSWORD, "Admin")
             .await
             .unwrap();
         state.set_session_for_test(Some(DesktopSession::Account(
             state
                 .services
                 .users
-                .get_by_username("admin")
+                .get_by_username("testadmin")
                 .await
                 .unwrap()
                 .unwrap(),
@@ -9587,7 +9591,7 @@ mod tests {
         let (_, seq_before) = read_slot(&state);
         let mut hold = hold_verify(&mut state);
 
-        let login = login_body(&state, "admin".to_string(), SLOT_PASSWORD.to_string());
+        let login = login_body(&state, "testadmin".to_string(), SLOT_PASSWORD.to_string());
         tokio::pin!(login);
         run_until_held!(login, hold);
 
@@ -9619,14 +9623,14 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .setup_first_user("testadmin", SLOT_PASSWORD, "Admin")
             .await
             .unwrap();
         state.set_session_for_test(Some(DesktopSession::Account(
             state
                 .services
                 .users
-                .get_by_username("admin")
+                .get_by_username("testadmin")
                 .await
                 .unwrap()
                 .unwrap(),
@@ -9637,7 +9641,7 @@ mod tests {
         let before = read_slot(&state);
         let logins = audit_action_count(&state, "login").await;
 
-        let result = login_body(&state, "admin".to_string(), SLOT_PASSWORD.to_string())
+        let result = login_body(&state, "testadmin".to_string(), SLOT_PASSWORD.to_string())
             .await
             .expect("login");
 
@@ -9729,7 +9733,7 @@ mod tests {
         run_until_held!(logout, hold);
         assert_eq!(read_slot(&state), (None, login.seq + 1), "A is cleared");
 
-        let apply = auth_config_apply_body(&state, true, "admin");
+        let apply = auth_config_apply_body(&state, true, "testadmin");
         tokio::pin!(apply);
         assert_stays_pending!(apply);
         hold.release.send(()).unwrap();
@@ -9763,17 +9767,17 @@ mod tests {
         let admin = state
             .services
             .users
-            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .setup_first_user("testadmin", SLOT_PASSWORD, "Admin")
             .await
             .unwrap();
         state.set_session_for_test(Some(DesktopSession::Account(admin)));
         let mut hold = hold_after_save(&mut state);
 
-        let apply_on = auth_config_apply_body(&state, true, "admin");
+        let apply_on = auth_config_apply_body(&state, true, "testadmin");
         tokio::pin!(apply_on);
         run_until_held!(apply_on, hold);
 
-        let apply_off = auth_config_apply_body(&state, false, "admin");
+        let apply_off = auth_config_apply_body(&state, false, "testadmin");
         tokio::pin!(apply_off);
         assert_stays_pending!(apply_off);
         assert!(
@@ -9788,7 +9792,7 @@ mod tests {
         );
         let (session, seq) = read_slot(&state);
         assert!(
-            is_account(&session, "admin"),
+            is_account(&session, "testadmin"),
             "not re-bound yet: {session:?}"
         );
         assert_eq!(seq, 1);
@@ -9841,7 +9845,7 @@ mod tests {
         tokio::pin!(logout);
         run_until_held!(logout, hold);
 
-        let apply_off = auth_config_apply_body(&state, false, "admin");
+        let apply_off = auth_config_apply_body(&state, false, "testadmin");
         tokio::pin!(apply_off);
         assert_stays_pending!(apply_off);
         assert!(
@@ -10047,7 +10051,7 @@ mod tests {
         let admin = state
             .services
             .users
-            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .setup_first_user("testadmin", SLOT_PASSWORD, "Admin")
             .await
             .unwrap();
         state.set_session_for_test(Some(DesktopSession::Account(admin)));
@@ -10076,7 +10080,7 @@ mod tests {
         ));
 
         // Still viewer: the escape hatch lets it raise the role to admin.
-        auth_config_apply_body(&state, true, "admin")
+        auth_config_apply_body(&state, true, "testadmin")
             .await
             .expect("viewer raises the role (escape hatch)");
         assert_eq!(local_role(&state), Role::Admin);
@@ -10111,7 +10115,7 @@ mod tests {
 
         // With the mode off and no session, the escape hatch is closed.
         assert!(matches!(
-            auth_config_apply_body(&state, true, "admin").await,
+            auth_config_apply_body(&state, true, "testadmin").await,
             Err(BantoError::Unauthorized)
         ));
     }
@@ -10292,7 +10296,7 @@ mod tests {
         let admin = state
             .services
             .users
-            .setup_first_user("admin", "password123", "管理者")
+            .setup_first_user("testadmin", "password123", "管理者")
             .await
             .expect("setup_first_user");
         state.set_session_for_test(Some(DesktopSession::Account(admin)));
@@ -10570,7 +10574,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, 403);
-        let account = rest_login(&state.services.rest_auth, "admin", false).await;
+        let account = rest_login(&state.services.rest_auth, "testadmin", false).await;
 
         apply(&state, true, port, false).await.expect("OFF");
 

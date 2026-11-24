@@ -278,7 +278,7 @@ async fn commissioning_lock_down_flips_state_and_revokes_the_grant() {
 #[tokio::test]
 async fn commissioning_lock_down_fails_without_any_admin_account() {
     let env = test_env_unlocked().await;
-    sqlx::query("UPDATE users SET role = 'editor' WHERE username = 'admin'")
+    sqlx::query("UPDATE users SET role = 'editor' WHERE username = 'testadmin'")
         .execute(&env.pool)
         .await
         .expect("downgrade the only admin via raw SQL");
@@ -339,7 +339,7 @@ async fn the_commissioning_grant_can_delete_users_but_not_the_last_admin() {
             .unwrap()
     };
     let viewer = id_of("viewer1");
-    let admin = id_of("admin");
+    let admin = id_of("testadmin");
 
     // 最後の admin のガードは `BantoError::Other`（従来どおり 500 の形）。
     let (status, body) = admin_delete(&env.router, &format!("/api/users/{admin}"), &token).await;
@@ -355,7 +355,7 @@ async fn the_commissioning_grant_can_delete_users_but_not_the_last_admin() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|u| u["username"] == "admin"),
+            .any(|u| u["username"] == "testadmin"),
         "{after}"
     );
     let (status, _) = admin_delete(&env.router, &format!("/api/users/{viewer}"), &token).await;
@@ -379,7 +379,7 @@ async fn an_issuance_parked_before_the_insert_loses_to_a_lock_down_that_complete
     let users = UsersService::new(Db::Sqlite(pool.clone()));
     let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
     users
-        .setup_first_user("admin", "password123", "管理者")
+        .setup_first_user("testadmin", "password123", "管理者")
         .await
         .expect("setup_first_user");
     let auth = user_auth_state(users.clone(), audit.clone());
