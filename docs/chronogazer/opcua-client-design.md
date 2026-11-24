@@ -1,7 +1,7 @@
 # ChronoGazer の OPC UA のクライアント（共有のドライバ）の設計
 
 作成日: 2026-11-24
-状態: **設計（2026-11-24 のオーナー決定を記録。実装は banto v8 の後で、未着手）**
+状態: **設計確定（2026-11-24 のオーナー決定を記録。§7 の 11 項目も同日に決めた。実装は banto v8 の後で、未着手）**
 関連: [#1324](https://github.com/tyaro/banto-industrial/issues/1324)（Hub 経由の専用のつなぎをやめ、OPC UA でつなぐ）、[#678](https://github.com/tyaro/banto-industrial/issues/678)（OPC UA のクライアントのドライバ）、[#383](https://github.com/tyaro/banto-industrial/issues/383)（3 ドライバの決定。この設計で改める）、[#700](https://github.com/tyaro/banto-industrial/pull/700)（OPC UA のクライアントは WASM の対象外）、[#1306](https://github.com/tyaro/banto-industrial/issues/1306)（記録の持ち主は ChronoGazer）、tyaro/banto-opcua の [ADR-0005](https://github.com/tyaro/banto-opcua/blob/v0.2.0/docs/adr/0005-client-as-hub-driver.md)・[ADR-0006](https://github.com/tyaro/banto-opcua/blob/v0.2.0/docs/adr/0006-client-subscription-latest-values.md)、提案 [banto-opcua#54](https://github.com/tyaro/banto-opcua/issues/54)（セキュリティ）・[#55](https://github.com/tyaro/banto-opcua/issues/55)（属性）・[#56](https://github.com/tyaro/banto-opcua/issues/56)（型）、[記録計要件](recorder-requirements.md) §7、[画面改善案](chronogazer-ui-improvement-proposal.md) §5、[タグサーバーの設計](../hub/tag-server-design.md) §3.4.1・§5.5、[Driver API の設計](../hub/driver/banto-driver-api-design.md)
 
 ## 1. 目的と範囲・決まったこと
@@ -23,6 +23,7 @@ ChronoGazer（記録計）が、Hub にも他社の OPC UA サーバーにも、
 | 2026-11-24 | ChronoGazer の Hub 経由の専用のつなぎ（banto-tagclient・banto-hub-bootstrap・Hub の TLS の固定・`hub_tags` など）をやめ、共有のドライバの OPC UA のクライアントで Hub にも他社のサーバーにもつなぐ。**#383（SLMP / Modbus TCP / Hub 経由の 3 ドライバ、2026-09-17）を改める**。互換は保たない（旧い形は OPC UA のドライバができた後に消す）。 | #1324                         |
 | 2026-11-24 | **ChronoGazer は OPC UA から周期で記録する**。今の SLMP・Modbus と同じく、収集グループの周期で 1 回ずつ記録する。購読は最新値を持つために使ってよいが、記録の単位は周期。                                                                                                                                                                     | この設計                      |
 | 2026-11-24 | **string のタグは記録しない**。記録するのは数値と bit だけ。string は理由を添えて選べなくする。                                                                                                                                                                                                                                               | この設計                      |
+| 2026-11-24 | §7 の 11 項目を決めた（推奨どおり。6 は今の Hub 経由のつなぎが未リリースなので利用者への配慮をせず消す、7 は確かめる相手に UaExpert を足す）。                                                                                                                                                                                                | この設計                      |
 | 2026-11-24 | 今回は設計書まで。実装は banto v8 の後。                                                                                                                                                                                                                                                                                                      | この設計                      |
 
 ### 1.2 なぜ OPC UA にするか（#1324 の要約）
@@ -79,7 +80,7 @@ ChronoGazer（記録計）が、Hub にも他社の OPC UA サーバーにも、
 
 **共有の crate の中の Hub 経由の部分**
 
-- `crates/banto-tags`: 接続の種別 `hub`（`HUB_PROTOCOL`、`normalize_hub_input`、`validate_hub_tag_address`、外部名の長さ `MAX_HUB_EXTERNAL_NAME_LEN`）、migration `0019`（`hub` を許す・`idx_plc_connections_single_hub`、0025 で作り直し）と `0020`（外部名の一意のトリガ）。消すには新しい migration が要る（索引・トリガを落とす。残っている `hub` の接続の行は、互換を保たないので消すか、起動の時に断る。§7 の決めること 6）。
+- `crates/banto-tags`: 接続の種別 `hub`（`HUB_PROTOCOL`、`normalize_hub_input`、`validate_hub_tag_address`、外部名の長さ `MAX_HUB_EXTERNAL_NAME_LEN`）、migration `0019`（`hub` を許す・`idx_plc_connections_single_hub`、0025 で作り直し）と `0020`（外部名の一意のトリガ）。消すには新しい migration が要る（索引・トリガを落とし、残っている `hub` の接続を配下の収集グループ・記録項目ごと消す。§7 の 6）。
 - `crates/banto-collect`: `hub` の接続を外す・読む分岐。**`ExternalSource` の仕組みそのものは残す**（Hub の取り込み口 `push` が使っている。`apps/banto-hub/core/src/ingest/mod.rs`）。
 - `apps/banto-hub/core/src/rest.rs` の `reject_hub_connection_protocol`（Hub が `hub` 接続を断る口）。種別が消えれば要らない。
 
@@ -90,7 +91,7 @@ ChronoGazer（記録計）が、Hub にも他社の OPC UA サーバーにも、
 - `apps/chronogazer/src/lib/demo/chronogazerRoutes.ts` の「`/api/hub*` は 501」の注記。
 - `e2e/tests/user-settings-hub.spec.ts`・`user-tags-from-hub.spec.ts`・`user-display-groups-hub.spec.ts`・`user-simulator-monitor-hub.spec.ts`、`user-unsaved-changes.spec.ts` の Hub の部分。
 
-**設定 DB の値**: 設定の KV の `hub.record`・`hub.installation_id`。消すときは、残っている値を読まずに無視するか消す（互換は保たない）。
+**設定 DB の値**: 設定の KV の `hub.record`・`hub.installation_id`。段 5 の migration で消す（互換は保たない）。
 
 **docs**: [recorder-requirements.md](recorder-requirements.md)（§3.1・§3.7.2 の #383 段階 3 の記述）、[chronogazer-service-design.md](chronogazer-service-design.md)（Hub のキーの置き場）、[chronogazer-ui-improvement-proposal.md](chronogazer-ui-improvement-proposal.md) §5、[banto-hub-client-bootstrap.md](../hub/banto-hub-client-bootstrap.md)、[hub-desktop-tls-design.md](../hub/hub-desktop-tls-design.md) のクライアント（ChronoGazer）の節、[tag-server-design.md](../hub/tag-server-design.md) §7 の「ChronoGazer の banto-hub 経由ドライバ」の行、[implementation-checklist.md](../implementation-checklist.md) の Hub 経由の行、[docs/README.md](../README.md) の索引。どの節を直すかは段 5 で `rg` で拾い直す。
 
@@ -99,7 +100,7 @@ ChronoGazer（記録計）が、Hub にも他社の OPC UA サーバーにも、
 - `crates/banto-tagclient`: Hub のデスクトップシェルの health probe（`apps/banto-hub/core/Cargo.toml` の `PinnedHubTls`、#644 PR4）と `apps/banto-hub-sink`（S5）が使う。SCADA の設計（[scada-design.md](../scada/scada-design.md)）も前提にしている。
 - `crates/banto-hub-tls-trust`: Hub 本体（`banto-hub-core`・`src-tauri`）が使う。
 - `crates/banto-hub-squat-harness`: Hub・Sink・tagclient の試験が使う。
-- `crates/banto-hub-bootstrap`: ChronoGazer のほかの通常の依存は無い（`banto-secret-store` が KeyStore のアダプタのために依存）。残すかは §7 の決めること 3。
+- `crates/banto-hub-bootstrap`: ChronoGazer のほかの通常の依存は無い（`banto-secret-store` が KeyStore のアダプタのために依存）。§7 の 3 のとおり、段 5 の着手のときに SCADA で使う予定を確かめ、無ければ消す。
 
 ### 2.4 Hub の OPC UA サーバーの今
 
@@ -127,7 +128,7 @@ ChronoGazer（記録計）が、Hub にも他社の OPC UA サーバーにも、
   - 依存は git の tag で固定する（`deny.toml` の `required-git-spec = "tag"`。`allow-git` に banto-opcua と async-opcua は入っている）。サーバーと同じ `async-opcua` のリビジョンにそろえる（tag-server-design §3.4.1 の 4）。
   - crates.io に公開する `banto-driver-api` は git の依存を持てないので、ドライバは公開しない。
 - **WASM の対象外**（#700、plugin-design §6.1）。セキュアチャネル・セッション・購読の状態を持つので、組み込みのセッション型のまま残す。
-- `banto-drivers` に入れると、Hub と ChronoGazer の両方の依存の木に `async-opcua`（クライアントの feature）が入る。ChronoGazer は今まで持っていなかった依存なので、ビルドの時間・バイナリの大きさ・`deny.toml` の例外（RUSTSEC-2023-0071 は 2027-01-15 まで、Phase 3 で見直す）が ChronoGazer にも掛かる。Cargo の feature でドライバを選べるようにするかは段 3 の着手のときに決める（§7 の決めること 8）。
+- `banto-drivers` に入れると、Hub と ChronoGazer の両方の依存の木に `async-opcua`（クライアントの feature）が入る。ChronoGazer は今まで持っていなかった依存なので、ビルドの時間・バイナリの大きさ・`deny.toml` の例外（RUSTSEC-2023-0071 は 2027-01-15 まで、Phase 3 で見直す）が ChronoGazer にも掛かる。Cargo の feature でドライバを選べるようにするかは段 3 の着手のときに決める（§7 の 8。最初は入れない）。
 
 ### 3.2 アドレス（NodeId の文字列）
 
@@ -166,7 +167,7 @@ ChronoGazer の記録は `f64` と bit だけ（§2.2）。ChronoGazer で受け
 | 配列・それ以外の型（DateTime・構造体など） | 選べない                   | 読めてもそのタグだけ Bad（ADR-0005: 部品が「対応しない値」にする）                                                                  |
 
 - **string を選べなくする理由**（画面と REST・MCP のエラーに出す文言の元）: ChronoGazer の記録は数値の時系列（`f64` の列）で、トレンド・統計・帳票はどれも数値を前提にしている。文字の値を持つ場所が保存の形に無い。今の「Hub から追加」も文字列は登録しない（`hub_tags.rs` の規則）。
-- **記録項目の型と読んだ値の型が違うとき**（#678 の「数値どうしなら変換して受け付ける」）: Hub は数値を全部 Double で出すので、記録項目を `i16` などで登録すると毎回変換が入る。推奨: **整数の型の記録項目に小数や範囲外の値が来たら、そのタグだけ Bad にする**（黙って丸めない・切り詰めない）。Hub につなぐときの既定の型は `f64` を案内する（§7 の決めること 5）。
+- **記録項目の型と読んだ値の型が違うとき**（#678 の「数値どうしなら変換して受け付ける」）: Hub は数値を全部 Double で出すので、記録項目を `i16` などで登録すると毎回変換が入る。**整数の型の記録項目に小数や範囲外の値が来たら、そのタグだけ Bad にする**（黙って丸めない・切り詰めない）。Hub につなぐときの既定の型は `f64` を案内する（§7 の 5）。
 - string を選べなくするのは ChronoGazer の側の規則にする。Hub の #678 は string を扱うので、ドライバの `supported_kinds` は string を含めてよい。ChronoGazer の登録で数値と bit だけに絞る（今の `banto-tags` の登録の型の確かめに、ChronoGazer の規則を足す）。
 - なお、`banto-driver-api` の string の型（`TagKind::Str { words, encoding }`）は PLC の語の並びを前提にした形で、OPC UA の String には合わない。Hub で string を扱うときの写し方は #678 の着手のときに決める（ChronoGazer には関係しない）。
 
@@ -177,7 +178,7 @@ ChronoGazer の記録は `f64` と bit だけ（§2.2）。ChronoGazer で受け
   - Uncertain → Stale（記録は `null`。今の Hub 経由の「stale は `null`」と同じ）
   - Bad → Bad（記録は `null`）
 - **今の Driver API では Uncertain を返せない**（§2.1。`read_batch` の項目は値か `ItemError` だけ）。直し方は §3.6。
-- **記録の時刻**（推奨。§7 の決めること 1）: **今と同じく周期の時刻（ホストの時計の `ptime_ms`）で記録し、SourceTimestamp は記録に使わない**。
+- **記録の時刻**（§7 の 1 で決めた）: **今と同じく周期の時刻（ホストの時計の `ptime_ms`）で記録し、SourceTimestamp は記録に使わない**。
   - 保存は「1 周期 = 1 行 = 1 つの時刻」なので（§2.2）、タグごとの SourceTimestamp を時刻として残す場所が無い。グループの中で時刻がばらばらになり、行の形を変えることになる。
   - SourceTimestamp は相手によって当てにならない。付けないサーバーがある（ADR-0005: 部品は現在時刻で補わない）、機器の時計がずれている（#1162 の PLC の時計）、購読ではサーバーの既定のフィルタ（値か StatusCode が変わったら通知）のため、値が変わらない間は最後に変わったときの時刻のまま。SourceTimestamp で鮮度を判定すると、変わらない定常値が古く見える。今の Hub 経由の H4（Hub の `t` で鮮度を判定しない）と同じく、鮮度の判定にも使わない。
   - なお Hub の OPC UA サーバーは、照合の鍵（`opcua.rs` の `ReadingKey`）に採取の時刻を含むので、周期 Read では値が同じでも Hub の採取ごとに SourceTimestamp が進む見込み（コードからの推定。段 4 で確かめる）。
@@ -186,7 +187,7 @@ ChronoGazer の記録は `f64` と bit だけ（§2.2）。ChronoGazer で受け
 
 ### 3.6 Driver API に足すもの
 
-Uncertain（Stale）と SourceTimestamp をドライバから渡すために、`banto-driver-api` に口を足す。推奨は次の形（§7 の決めること 2）。
+Uncertain（Stale）と SourceTimestamp をドライバから渡すために、`banto-driver-api` に口を足す。次の形にする（§7 の 2 で決めた）。
 
 - `Session` に、品質と時刻つきで読む**既定の実装つきのメソッド**を足す（例: `read_batch_detailed`。既定は `read_batch` を呼んで Good・時刻無しに包む）。返す型は新しい `#[non_exhaustive]` の型（例: `Reading { value, quality, source_time_ms }`）。
   - trait に既定つきのメソッドを足すのは破壊的変更にならない（設計 §9.1 と同じ考え）。`Value` は変えない。
@@ -203,7 +204,7 @@ Uncertain（Stale）と SourceTimestamp をドライバから渡すために、`
   - 最初の通知が届く前は `BadWaitingForInitialData`（Bad）。購読を失った・作り直すまでは接続ごとの失敗。
   - async-opcua のサーバーは 1 つの購読に 1000 ノードまで（ADR-0006）。部品は購読を複数に分けない（後回し）ので、1 つの接続で 1000 本を超えると超えた分は `BadTooManyMonitoredItems`。ChronoGazer の収集グループは 1999 本まで登録できる（#1303）ので、**購読の接続は 1000 本までと画面で案内する**か、接続を分けてもらう。
 - 読み方は接続ごと（ADR-0006）。速く変わるタグだけ購読、は接続を分けて行う。
-- 推奨: 最初の版（段 4）は周期 Read だけを出し、購読は段 4 の後半か次の PR で出す（#678 の「購読は後から」と同じ順）。Hub の OPC UA につなぐ場合の既定をどちらにするかは §7 の決めること 4。
+- 最初の版（段 4）は周期 Read だけを出し、購読は段 4 の後半か次の PR で出す（#678 の「購読は後から」と同じ順）。Hub の OPC UA につなぐ場合は、購読が入ったら購読を勧める（§7 の 4）。
 
 ## 4. ChronoGazer での使い方
 
@@ -217,7 +218,7 @@ Uncertain（Stale）と SourceTimestamp をドライバから渡すために、`
 ### 4.2 記録項目の登録
 
 - **段 4（最初の版）**: NodeId を手で入れる（#678）。今の「記録」ページの右ペイン・CSV の取り込み・MCP の `create_tag` がそのまま使える（アドレスの欄に NodeId）。型は数値と bit だけを選べる（§3.4）。単位・小数桁は利用者が入れる。
-- **Hub から集める人の手間**: Hub の外部名を写して `nsu=urn:banto:opcua:tags;s=` を前に付ける。Hub の管理画面（`/tags`）から NodeId を写しやすくする（例: 行のメニューに「OPC UA の NodeId をコピー」）のは、Hub の側の小さな作業として段 2 に入れてよい（§7 の決めること 7）。
+- **Hub から集める人の手間**: Hub の外部名を写して `nsu=urn:banto:opcua:tags;s=` を前に付ける。Hub の管理画面（`/tags`）から NodeId を写しやすくする（例: 行のメニューに「OPC UA の NodeId をコピー」）のは、Hub の側の小さな作業として段 2 に入れてよい（§7 の 10）。
 - **後の段（Browse）**: 相手のサーバーをブラウズして選ぶ。単位・説明（banto-opcua#55 の後）・型を写して登録する。今の「Hub から追加」（`HubImportDialog.svelte`）の置き換えになる。Driver API に Browse の口が無いので、足し方（ドライバの任意のメソッドにするか、`opcua` だけの口にするか）はその段で決める。画面は画面改善の段階 1（左ツリー＝接続先の 3 ペイン）に合わせる（#678 の 2026-11-17 のコメント）。
 
 ### 4.3 表示グループのタグの選択
@@ -238,7 +239,7 @@ Uncertain（Stale）と SourceTimestamp をドライバから渡すために、`
 - Hub の OPC UA サーバーも None・Anonymous だけで、クライアントを選ばない。LAN へ出すと、同じ LAN の誰でも Hub の全部のタグを読める（読み取り専用なので書かれはしない）。
 - **LAN の別の機械の Hub・他社のサーバーに安全につなぐには、banto-opcua#54**（SecurityPolicy・署名と暗号化・UserName・証明書の信頼の一覧をサーバーとクライアントに）が要る。入ったら、クライアントの証明書・相手のサーバーの証明書の信頼・資格情報の保存を、#1017 の証明書・Trust の管理と同じ考え方で Hub と ChronoGazer の両方に作る（#678 の 2026-11-17 のコメント）。資格情報（UserName のパスワード）は `secret_keys` にして、今の接続の秘密と同じく封印して DB に置く（`plc_connection_secrets`）。
 - Phase 3 で暗号化を入れると RUSTSEC-2023-0071（RSA）にクライアントも当たる（ADR-0005 の帰結、`deny.toml` の例外の期限 2027-01-15）。
-- **#54 までの推奨の構成**（§7 の決めること 9）:
+- **#54 までの推奨の構成**（§7 の 9）:
   1. **Hub につなぐのは同じ PC の Hub に限る**（`opc.tcp://127.0.0.1:4840/`。Hub の OPC UA の既定の待受のまま）。値は PC の外に出ない。今の Hub 経由のつなぎ（同じ PC は TLS の固定、#644）と比べると、同じ PC の別のプロセスが Hub の止まっている間に 4840 を先に取ると偽の値を記録しうる。秘密（API キー）を送らないので、#644 で守っていた「秘密が漏れる」は起きない。
   2. 別の機械の Hub・他社のサーバーへは、閉じた制御 LAN の中で、平文であることを利用者が受け入れたときだけ使う（画面の表示で知らせる）。ChronoGazer の側で宛先を 127.0.0.1 に限る仕組みは入れない（他社のサーバーにつなげなくなる）。
   3. Hub の OPC UA を LAN に出す（`bind` を変える）のは、#54 の後を推奨とする。Hub の管理画面にも平文で LAN に出していることを出す（Hub の側の作業、段 2）。
@@ -247,33 +248,35 @@ Uncertain（Stale）と SourceTimestamp をドライバから渡すために、`
 
 実装は banto v8 の後。各段は小さな PR に分ける。
 
-| 段  | 中身                                                                                                                                                                                                | 前提                                                                         | 完了の条件                                                                                                                                                                                                                           |
-| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 1   | **banto-opcua の側**: #54（セキュリティ）・#55（属性）・#56（型）。提案は出してある。ChronoGazer の最初の版（None・Anonymous、同じ PC）は #54 を待たずに進められる                                  | なし                                                                         | #55・#56 の入った版のタグが打たれる（#54 は段 4 の前提にしない）                                                                                                                                                                     |
-| 2   | **Hub の側**: 単位・説明・レンジを OPC UA へ渡す（#55 の版に上げる）。数値の型をそのまま出すか（#56）。LAN へ出すときの表示。外部名から NodeId を写す口（§4.2、任意）                               | 段 1 の #55（#56）                                                           | Hub の OPC UA を読むと EngineeringUnits・Description・EURange が出る。Hub の OPC UA の試験が緑                                                                                                                                       |
-| 3   | **共有のドライバ（#678）**: `banto-driver-api` に品質と時刻の口（§3.6）、`crates/banto-driver-opcua`、`banto-drivers` に登録。Hub で接続・NodeId の手入力・周期 Read・書き込み・平文の表示          | banto-opcua-client の採用できる版（v0.2.0 で足りるかは着手のときに確かめる） | #678 の受入れ条件（opc-plc と banto-opcua のサーバーを相手に、収集・書き込み・切断と再接続、存在しない NodeId はそのタグだけ Bad、分割 Write の途中切断の区別、cargo-deny と CI が緑）。適合試験（`banto-driver-conformance`）を通す |
-| 4   | **ChronoGazer で使う**: 登録簿に入るので接続・記録項目はほぼそのまま。数値と bit だけに絞る規則、string の理由の文言、Uncertain→Stale、平文の表示、購読（後半または次の PR）                        | 段 3                                                                         | 同じ PC の Hub の OPC UA から周期で記録でき、トレンド・履歴・日報に出る。Hub を止めると Bad、戻すと自動で戻る。string は選べず理由が出る。E2E（Hub の OPC UA か banto-opcua のサーバーを相手に）が緑                                 |
-| 5   | **Hub 経由のつなぎを消す・docs を直す**: §2.3 の一覧。`hub` の接続の種別を消す migration、設定の KV の扱い、画面・E2E・docs（recorder-requirements の §7 の行、banto-hub-client-bootstrap.md など） | 段 4 がリリースに入る（オーナーの判断）                                      | `rg -n 'hub_tags\|HubService\|from-hub\|hubTag' apps/chronogazer` が空。ChronoGazer の依存から `banto-hub-bootstrap`・`banto-tagclient`・`banto-hub-tls-trust` が消える（`cargo metadata` で確かめる）。CI が緑                      |
-| 6   | **Browse**（後の段）: 相手のサーバーをブラウズして記録項目を選ぶ。単位・説明を写す                                                                                                                  | 段 4、#55（単位を写すなら）                                                  | 「Hub から追加」と同じ使い勝手で、Hub・他社のサーバーのノードを選んで登録できる                                                                                                                                                      |
-| 7   | **セキュリティ**（#54 の後）: SecurityPolicy・UserName・証明書の信頼の管理を Hub と ChronoGazer に                                                                                                  | banto-opcua#54、#1017 の考え方                                               | 暗号化した接続で LAN の Hub・他社のサーバーから記録できる                                                                                                                                                                            |
+| 段  | 中身                                                                                                                                                                                                | 前提                                                                         | 完了の条件                                                                                                                                                                                                                                                                  |
+| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | **banto-opcua の側**: #54（セキュリティ）・#55（属性）・#56（型）。提案は出してある。ChronoGazer の最初の版（None・Anonymous、同じ PC）は #54 を待たずに進められる                                  | なし                                                                         | #55・#56 の入った版のタグが打たれる（#54 は段 4 の前提にしない）                                                                                                                                                                                                            |
+| 2   | **Hub の側**: 単位・説明・レンジを OPC UA へ渡す（#55 の版に上げる）。数値の型をそのまま出すか（#56）。LAN へ出すときの表示。外部名から NodeId を写す口（§4.2、任意）                               | 段 1 の #55（#56）                                                           | Hub の OPC UA を読むと EngineeringUnits・Description・EURange が出る（UaExpert で確かめる）。Hub の OPC UA の試験が緑                                                                                                                                                       |
+| 3   | **共有のドライバ（#678）**: `banto-driver-api` に品質と時刻の口（§3.6）、`crates/banto-driver-opcua`、`banto-drivers` に登録。Hub で接続・NodeId の手入力・周期 Read・書き込み・平文の表示          | banto-opcua-client の採用できる版（v0.2.0 で足りるかは着手のときに確かめる） | #678 の受入れ条件（opc-plc と banto-opcua のサーバーを相手に、収集・書き込み・切断と再接続、存在しない NodeId はそのタグだけ Bad、分割 Write の途中切断の区別、cargo-deny と CI が緑）。適合試験（`banto-driver-conformance`）を通す                                        |
+| 4   | **ChronoGazer で使う**: 登録簿に入るので接続・記録項目はほぼそのまま。数値と bit だけに絞る規則、string の理由の文言、Uncertain→Stale、平文の表示、購読（後半または次の PR）                        | 段 3                                                                         | 同じ PC の Hub の OPC UA から周期で記録でき、トレンド・履歴・日報に出る。Hub を止めると Bad、戻すと自動で戻る。string は選べず理由が出る。E2E（Hub の OPC UA か banto-opcua のサーバーを相手に）が緑。同じ Hub に UaExpert からもつなぎ、ChronoGazer の記録と値・品質が合う |
+| 5   | **Hub 経由のつなぎを消す・docs を直す**: §2.3 の一覧。`hub` の接続の種別を消す migration、設定の KV の扱い、画面・E2E・docs（recorder-requirements の §7 の行、banto-hub-client-bootstrap.md など） | 段 4 がリリースに入る（オーナーの判断）                                      | `rg -n 'hub_tags\|HubService\|from-hub\|hubTag' apps/chronogazer` が空。ChronoGazer の依存から `banto-hub-bootstrap`・`banto-tagclient`・`banto-hub-tls-trust` が消える（`cargo metadata` で確かめる）。CI が緑                                                             |
+| 6   | **Browse**（後の段）: 相手のサーバーをブラウズして記録項目を選ぶ。単位・説明を写す                                                                                                                  | 段 4、#55（単位を写すなら）                                                  | 「Hub から追加」と同じ使い勝手で、Hub・他社のサーバーのノードを選んで登録できる                                                                                                                                                                                             |
+| 7   | **セキュリティ**（#54 の後）: SecurityPolicy・UserName・証明書の信頼の管理を Hub と ChronoGazer に                                                                                                  | banto-opcua#54、#1017 の考え方                                               | 暗号化した接続で LAN の Hub・他社のサーバーから記録できる                                                                                                                                                                                                                   |
 
-- 段 5 は「互換を保たない」（#1324）。段 4 の版と段 5 の版の間で、今の Hub 経由の利用者は記録項目を作り直す（アドレスを外部名から NodeId に替える）。作り直しの手順はリリースノートに書く。記録済みの時系列はタグの id で持っているので、同じ記録項目のアドレスと接続を付け替えられれば履歴はつながる（付け替えを許すかは段 5 で決める。今の `banto-tags` は、配下に収集グループがある接続の種別を `hub` との間で替えることを断る）。
+- 段 5 は「互換を保たない」（#1324）。今の Hub 経由のつなぎはリリースしていないので、利用者への配慮（付け替えの口・作り直しの手順・起動の時の案内）は入れない（§7 の 6）。`hub` の接続は migration で配下の収集グループ・記録項目ごと消し、設定の KV の `hub.record`・`hub.installation_id` も消す。
 
-## 7. 決めること
+## 7. 決めたこと（2026-11-24 オーナー決定）
 
-| #   | 項目                                                                            | 推奨                                                                                                                                                                                                                                                                                                                                               |
-| --- | ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | 記録の時刻の出どころ（周期の時刻か SourceTimestamp か）                         | **周期の時刻（ホストの時計）**。保存が 1 周期 1 行で、タグごとの時刻を持てない。SourceTimestamp は付かない・機器の時計がずれる・購読では最後に変わったときの時刻のまま、と当てにならない。SourceTimestamp は診断の表示だけに使う（§3.5）                                                                                                           |
-| 2   | Uncertain と SourceTimestamp をドライバから渡す口                               | `Session` に既定の実装つきのメソッド（品質と時刻つきの読み取り）を足す。`ItemError` に足す案は採らない（§3.6）                                                                                                                                                                                                                                     |
-| 3   | banto-hub-bootstrap・banto-tagclient を、ChronoGazer が使わなくなった後に残すか | **banto-tagclient は残す**（Hub のシェルの health probe・Sink・SCADA の設計が使う）。**banto-hub-bootstrap は、SCADA（scada-design.md の Runtime PC 側の保管先の記述が banto-hub-bootstrap の方式を前提にしている）で使う予定があるかをオーナーに確かめ、無ければ段 5 で消す**。#1293〜#1295 は Sink・SCADA のために要るかで残すか閉じるかを決める |
-| 4   | Hub の OPC UA につなぐときの既定の読み方                                        | 最初は周期 Read（#678 の順）。購読が入ったら、Hub につなぐときは購読を勧める（Hub の負荷が小さい）。1000 本の上限を画面で案内する                                                                                                                                                                                                                  |
-| 5   | 整数の型の記録項目に小数・範囲外の値が来たとき                                  | そのタグだけ Bad（黙って丸めない）。Hub につなぐときの既定の型は `f64` を案内する                                                                                                                                                                                                                                                                  |
-| 6   | 段 5 で残っている `hub` の接続・記録項目の扱い                                  | migration で `hub` の接続を配下ごと消すのではなく、起動の時に「Hub 経由の接続は使えなくなりました。OPC UA の接続に付け替えてください」として収集から外し、利用者が付け替えるか消す（記録済みの時系列を残すため）。付け替え（接続の種別の変更）を許すかも段 5 で決める                                                                              |
-| 7   | 他社の OPC UA サーバーを最初の対象にどこまで含めるか                            | 最初に確かめる相手は **Hub の OPC UA・banto-opcua のサーバー・opc-plc**（#678 の試験と同じ）。実機の他社のサーバー（PLC の OPC UA ユニットなど）は多くが暗号化を求めるので #54 の後に回す。None で動く他社のゲートウェイがあれば、段 4 の実機確認に足す                                                                                            |
-| 8   | ドライバを Cargo の feature で選べるようにするか                                | 最初は入れない（Hub と ChronoGazer の両方が使うので常に入れる）。ChronoGazer のビルドの時間・大きさが目立って増えたら考える                                                                                                                                                                                                                        |
-| 9   | #54 までの推奨の構成                                                            | Hub は同じ PC（`127.0.0.1:4840`）に限るのを推奨。LAN は閉じた制御 LAN で平文を受け入れたときだけ。ChronoGazer の側で宛先を絞る仕組みは入れない（§5）                                                                                                                                                                                               |
-| 10  | Browse の段の時期と形                                                           | 段 4 の後、画面改善の段階 1（左ツリー＝接続先）と合わせて。Driver API に Browse の口を足すか、`opcua` だけの口にするかはその段で決める。それまでは Hub の管理画面から NodeId を写す口（段 2、任意）で手間を減らす                                                                                                                                  |
-| 11  | Hub の名前空間の URI の扱い                                                     | Hub の名前空間の URI は設定で変えられる（既定 `urn:banto:opcua:tags`）。ChronoGazer は `nsu=` で書くので、Hub の URI を変えると全部のタグが `BadNodeIdUnknown` になる。Hub の管理画面の URI の欄に、変えるとクライアントの NodeId が変わることを書く                                                                                               |
+11 項目とも推奨どおりに決めた。6 と 7 はオーナーの指示で次のとおり直した。
+
+| #   | 項目                                                                            | 決定                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| --- | ------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | 記録の時刻の出どころ（周期の時刻か SourceTimestamp か）                         | **周期の時刻（ホストの時計）**。保存が 1 周期 1 行で、タグごとの時刻を持てない。SourceTimestamp は付かない・機器の時計がずれる・購読では最後に変わったときの時刻のまま、と当てにならない。SourceTimestamp は診断の表示だけに使う（§3.5）                                                                                                                                                                                                                                            |
+| 2   | Uncertain と SourceTimestamp をドライバから渡す口                               | `Session` に既定の実装つきのメソッド（品質と時刻つきの読み取り）を足す。`ItemError` に足す案は採らない（§3.6）                                                                                                                                                                                                                                                                                                                                                                      |
+| 3   | banto-hub-bootstrap・banto-tagclient を、ChronoGazer が使わなくなった後に残すか | **banto-tagclient は残す**（Hub のシェルの health probe・Sink・SCADA の設計が使う）。**banto-hub-bootstrap は、段 5 の着手のときに SCADA（scada-design.md の Runtime PC 側の保管先の記述が banto-hub-bootstrap の方式を前提にしている）で使う予定があるかを確かめ、無ければ消す**。#1293〜#1295 は Sink・SCADA のために要るかで残すか閉じるかを決める                                                                                                                               |
+| 4   | Hub の OPC UA につなぐときの既定の読み方                                        | 最初は周期 Read（#678 の順）。購読が入ったら、Hub につなぐときは購読を勧める（Hub の負荷が小さい）。1000 本の上限を画面で案内する                                                                                                                                                                                                                                                                                                                                                   |
+| 5   | 整数の型の記録項目に小数・範囲外の値が来たとき                                  | そのタグだけ Bad（黙って丸めない）。Hub につなぐときの既定の型は `f64` を案内する                                                                                                                                                                                                                                                                                                                                                                                                   |
+| 6   | 段 5 で残っている `hub` の接続・記録項目の扱い                                  | **今の Hub 経由のつなぎはリリースしていないので、利用者への配慮はしない**（オーナーの指示）。migration で `hub` の接続を配下の収集グループ・記録項目ごと消し、設定の KV の `hub.*` も消す。付け替えの口・起動の時の案内・リリースノートの作り直しの手順は作らない                                                                                                                                                                                                                   |
+| 7   | 他社の OPC UA の相手を最初の対象にどこまで含めるか                              | 最初に確かめる相手は **Hub の OPC UA・banto-opcua のサーバー・opc-plc に、UaExpert（Unified Automation の OPC UA のクライアント）を足す**（オーナーの指示）。UaExpert は他社のクライアントとして Hub の OPC UA サーバーにつなぎ、ブラウズ・属性（単位・説明・レンジ）・型・品質・購読を確かめる（段 2・段 4 の実機確認）。実機の他社のサーバー（PLC の OPC UA ユニットなど）は多くが暗号化を求めるので #54 の後に回す。None で動く他社のゲートウェイがあれば、段 4 の実機確認に足す |
+| 8   | ドライバを Cargo の feature で選べるようにするか                                | 最初は入れない（Hub と ChronoGazer の両方が使うので常に入れる）。ChronoGazer のビルドの時間・大きさが目立って増えたら考える                                                                                                                                                                                                                                                                                                                                                         |
+| 9   | #54 までの推奨の構成                                                            | Hub は同じ PC（`127.0.0.1:4840`）に限るのを推奨。LAN は閉じた制御 LAN で平文を受け入れたときだけ。ChronoGazer の側で宛先を絞る仕組みは入れない（§5）                                                                                                                                                                                                                                                                                                                                |
+| 10  | Browse の段の時期と形                                                           | 段 4 の後、画面改善の段階 1（左ツリー＝接続先）と合わせて。Driver API に Browse の口を足すか、`opcua` だけの口にするかはその段で決める。それまでは Hub の管理画面から NodeId を写す口（段 2、任意）で手間を減らす                                                                                                                                                                                                                                                                   |
+| 11  | Hub の名前空間の URI の扱い                                                     | Hub の名前空間の URI は設定で変えられる（既定 `urn:banto:opcua:tags`）。ChronoGazer は `nsu=` で書くので、Hub の URI を変えると全部のタグが `BadNodeIdUnknown` になる。Hub の管理画面の URI の欄に、変えるとクライアントの NodeId が変わることを書く                                                                                                                                                                                                                                |
 
 ## 8. 小さな現場の負荷の注意
 
