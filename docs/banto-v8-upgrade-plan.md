@@ -1,7 +1,7 @@
 # banto v8.0.0 への追従の計画
 
 作成日: 2026-11-24
-状態: **計画**（2026-11-24。オーナー決定 3 件を記録。実装は未着手）
+状態: **計画**（2026-11-24。オーナー決定 3 件と、PR1 の受け入れ条件 3 件（§5、オーナーのレビュー）を記録。実装は未着手）
 
 関連: [banto v8.0.0 のリリースノート](https://github.com/tyaro/banto/releases/tag/v8.0.0)、banto の `docs/upgrading.md` 4.2 節、banto の ADR-0034（持ち主の id と組み込みの `admin`）・ADR-0035（書き込みを切断から切り離す）。
 
@@ -14,7 +14,7 @@
 
 ## 2. オーナー決定（2026-11-24）
 
-1. **DB は作り直す**。上流と同じく、v8 より前の DB は起動時に分かりやすい文言で断る。migration は上流と byte 等価の写しを保つ。自前の移行は書かない。Hub のタグ・接続・収集グループ、ChronoGazer の表示グループ・ペン・自由トレンド・記録計の設定は消える（試験機の v0.3.0-alpha.4 の設定は入れ直す）。ChronoGazer の時系列のファイルは DB の外なので残る。
+1. **DB は作り直す**。上流と同じく、v8 より前の DB は起動時に分かりやすい文言で断る。migration は上流と byte 等価の写しを保つ。自前の移行は書かない。Hub のタグ・接続・収集グループ、ChronoGazer の表示グループ・ペン・自由トレンド・記録計の設定は消える（試験機の v0.3.0-alpha.4 の設定は入れ直す）。ChronoGazer の時系列のファイルは DB の外なので残すが、新版は別の場所を使い、既定では読まない（§5 の 1）。
 2. **Hub のサービス（ヘッドレス）の最初の管理者は、CLI の `create-admin` で作る**（上流の `banto-serve create-admin` と同じ形）。初回セットアップの画面・`/api/auth/setup` は無くす。インストーラの案内も直す。
 3. **ChronoGazer のデスクトップの localDesktop の opt-in は、v8 の「ログインなし＝組み込みの `admin`」に寄せる**。「未初期化なら」という判定は無くなるので、自前の判定を減らす。
 
@@ -42,13 +42,24 @@
 
 1. **PR0a（v7.9 のまま、機械的）**: 試験・E2E で作るユーザーの名前を `admin` から替える。v7.9 でもできるなら、試験の `setup_first_user` を `create_user(.., Role::Admin)` に替える。
 2. **PR0c**: `libsqlite3-sys` 0.40 と `deny.toml` の除外の削除（v7.9 のまま出せるかを先に確かめる）。
-3. **PR1（必須・大）**: Cargo と npm のタグを同時に v8.0.0 へ。§3 の必須の行を全部。Hub と CG を別の worktree で作り、1 つの PR に集める。上位モデルが監査する。
+3. **PR1（必須・大）**: Cargo と npm のタグを同時に v8.0.0 へ。§3 の必須の行を全部と、§5 の受け入れ条件。Hub と CG を別の worktree で作り、1 つの PR に集める。上位モデルが監査する。
 4. 以降は任意（回り道の置き換え）: `isOnScreen`（`dockPanelOnScreen.ts` を消す）、`onRowContextMenu`（`/tags` の `rowClass`）、系列色 16（`--bi-chart-9〜16`）、`narrowViewport`（`mobileNav*`・`viewportWatch` の写し）、CG の `run_detached` を外す、`createDockLayoutStore`・`onLayoutCommit`、`@banto/charts/testing` で描画の回帰試験、デモの `storage: 'memory'`、Node 26。
 
-## 5. PR1 で確かめること
+## 5. PR1 の受け入れ条件（2026-11-24 オーナーのレビュー、#1331）
 
-- ChronoGazer の時系列のファイルがタグの id で引いているか。DB を作り直して id が 1 から振り直されると、前の履歴が新しいタグに見えるおそれがある。見えるなら、作り直しの案内に「データの置き場も移す」を足す。
-- 0015（`auth.disabled` の初期値）を写すか。認証モードの読み取りがその行を必須にするか。
+1. **[P1] ChronoGazer の旧い履歴は残すが、新しい DB からは既定で読まない**。収集は設定 DB の連番から `grp:<id>`・`tag:<id>` を作り（`crates/banto-collect/src/config.rs`）、`crates/banto-tsquery/src/plan.rs` はファイルをその組で照合し、設定 DB の世代やタグ名を照合しない。DB を作り直して別の設備の新しいタグに同じ id が付くと、旧い値がそのタグの履歴になる。
+   - 旧い `data.dir`（既定の場所と、設定で変えた場所の両方）を消さずに残し、新版は別の場所を使う。案内だけで済ませない。
+   - id を使い回す試験で、履歴・日報・CSV に旧い値が混ざらないことを確かめる。
+2. **[P2] 旧い形式の拒否と、予約済みのリストアの順序**。ChronoGazer の起動は「排他 → 予約の適用 → `init_db`」（`apps/chronogazer/core/src/engine.rs`）。旧い形式の検知を `init_db` に足すだけでは、リストアが先に通る経路を取りこぼす。
+   - v7 の実プロファイルと、v7 の予約があるプロファイルで、新版が旧い DB・履歴に書かずに安全に止まることを試験にする。
+   - 新版のバックアップは正しく戻せることを試験にする。
+3. **[P2] 新しい DB の認証の初期値を、サービスの起動まで通して確かめる**。上流の `0015_auth_mode_defaults.sql` は、設定の行もアカウントも無い DB に `auth.disabled=true` を入れる。
+   - Hub のサービスでは、`create-admin` の前の遠隔のアクセスを管理者として通さない。CLI はサービスと同じ DB・権限を使う。作った後は期待どおりログイン必須になる。これを PR1 の試験にする。
+   - ChronoGazer の localDesktop は、今の peer と Host のループバックの条件を残し、LAN 側へ管理者の権限を広げないことを確かめる。
+
+## 6. PR1 でほかに確かめること
+
+- 認証モードの読み取りが `auth.disabled` の行を必須にするか（0015 を写すかは §5 の 3 と合わせて決める）。
 - Hub の試運転の grant・`DisabledNoRevocation`（`commissioning.rs`・`service_elevated.rs`）が本番の経路で ui-settings を読み書きできるか。
 - 2 MiB を超える本文を受ける口が無いか（Hub の ingest は 1 MiB の上限、CG のバックアップのリストア）。
 - #1260 は上流（C3）で片付いた。`acct:` の形に追従した時点で閉じるかはオーナー。
