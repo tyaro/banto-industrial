@@ -29,6 +29,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+	HUB_ADMIN_DISPLAY_NAME,
+	HUB_ADMIN_PASSWORD,
+	HUB_ADMIN_USERNAME
+} from './tests-banto-hub/banto-hub-auth';
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(dirname, '..');
@@ -42,6 +47,14 @@ const BASE_URL = `http://127.0.0.1:${PORT}`;
 const dbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'banto-hub-perf-e2e-'));
 const dbPath = path.join(dbDir, 'banto-hub-perf-e2e.sqlite3');
 process.env.BANTO_HUB_PERF_E2E_DB_DIR = dbDir;
+
+// profile・root も一時の値（デスクトップシェルが `default` を握っていても起動できる）。
+const hubRoot = path.join(dbDir, 'root');
+fs.mkdirSync(hubRoot, { recursive: true });
+
+// banto v8: 管理者は起動の前に `banto-hub create-admin` で作る（本体 e2e の config と同じ。
+// ロックダウンも同時に行われるので、Hub は最初からロックダウン済み）。
+const serveWithFirstAdmin = path.join(dirname, 'serve-with-first-admin.mjs');
 
 const bantoHubBin = path.join(
 	repoRoot,
@@ -76,7 +89,7 @@ export default defineConfig({
 	},
 	projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
 	webServer: {
-		command: bantoHubBin,
+		command: `node "${serveWithFirstAdmin}" "${bantoHubBin}"`,
 		url: BASE_URL,
 		reuseExistingServer: false,
 		timeout: 30_000,
@@ -84,7 +97,11 @@ export default defineConfig({
 			PORT: String(PORT),
 			BANTO_BIND: '127.0.0.1',
 			BANTO_DB: dbPath,
-			BANTO_ALLOW_SETUP: '1'
+			BANTO_HUB_ROOT: hubRoot,
+			BANTO_HUB_PROFILE: 'e2e-perf',
+			BANTO_E2E_ADMIN_USERNAME: HUB_ADMIN_USERNAME,
+			BANTO_E2E_ADMIN_PASSWORD: HUB_ADMIN_PASSWORD,
+			BANTO_E2E_ADMIN_DISPLAY_NAME: HUB_ADMIN_DISPLAY_NAME
 		}
 	}
 });

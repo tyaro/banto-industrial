@@ -4,8 +4,8 @@
  *
  * Runs against the `banto-serve` that `public-viewer.playwright.config.ts`
  * starts with `BANTO_VIEWER_PUBLIC=1` (own port 8804, own fresh DB). One
- * shared page in file order: scenarios 1-3 run against a DB with ZERO users;
- * scenario 4 creates the first admin and later state builds on it.
+ * shared page in file order: the admin is made by `banto-serve create-admin` before the server starts
+ * (banto v8), and scenario 4 signs in as it - later state builds on that.
  *
  * What it proves end to end on the real REST path:
  *   1. without logging in, the allowed screens (監視・自由トレンド・ヒストリカル・日報・イベント)
@@ -17,7 +17,7 @@
  *      are not redirected to /login: the viewer session is already confirmed,
  *      and only an unconfirmed session goes to /login;
  *   3. the sidebar lists only the allowed items;
- *   4. "ログイン" leads to the setup/login screen and signing in switches to a
+ *   4. "ログイン" leads to the login screen and signing in switches to a
  *      normal session (full nav, ログアウト instead of ログイン, and the
  *      restricted screens open);
  *   5. (R1-D の D-4) 監視画面の 4 種（デジタル・バー・計器・トレンド）が閲覧者にも
@@ -34,7 +34,6 @@ import { expect, test, type APIRequestContext, type Page } from '@playwright/tes
 
 const ADMIN_USERNAME = 'pv-admin';
 const ADMIN_PASSWORD = 'E2ePvAdminPass1';
-const ADMIN_DISPLAY_NAME = 'E2E閲覧公開管理者';
 
 const ALLOWED = [
 	{ path: '/monitor', label: '監視' },
@@ -197,31 +196,18 @@ test.describe.serial('ChronoGazer viewer-public mode', () => {
 		await expect(page.getByTestId('free-trend-edit')).toHaveCount(0);
 	});
 
-	test('4. "ログイン" leads to the setup screen; signing in switches to a normal session', async () => {
+	test('4. "ログイン" leads to the login screen; signing in switches to a normal session', async () => {
 		await loginButton(page).click();
 		await expect(page).toHaveURL(/\/login$/);
 
-		// Zero users -> setup form (same as smoke scenario 1). Playwright's CI
-		// retry re-runs this whole serial group against the SAME server and DB
-		// (the admin already exists after a first attempt got this far), so
-		// the screen is a login form then: accept either, with the same
-		// credentials. Scenarios 1-3 are unaffected by an existing account -
-		// an anonymous visit is still the synthetic viewer while the flag is on.
-		const displayName = page.getByLabel('表示名');
-		const usernameField = page.getByLabel('ユーザー名');
-		// Both forms have the username field; 表示名 exists only in the setup form.
-		await expect(usernameField).toBeVisible();
-		if (await displayName.isVisible()) {
-			await displayName.fill(ADMIN_DISPLAY_NAME);
-			await usernameField.fill(ADMIN_USERNAME);
-			await page.getByLabel('パスワード（8文字以上）').fill(ADMIN_PASSWORD);
-			await page.getByLabel('パスワード（確認）').fill(ADMIN_PASSWORD);
-			await page.getByRole('button', { name: 'アカウントを作成' }).click();
-		} else {
-			await usernameField.fill(ADMIN_USERNAME);
-			await page.getByLabel('パスワード').fill(ADMIN_PASSWORD);
-			await page.getByRole('button', { name: 'ログイン', exact: true }).click();
-		}
+		// banto v8: no setup form. The admin was made by `banto-serve create-admin` before the
+		// server started (public-viewer.playwright.config.ts), so this is the login form.
+		// Scenarios 1-3 are unaffected by the account - an anonymous visit is still the
+		// synthetic viewer while the flag is on.
+		await expect(page.getByLabel('表示名')).toHaveCount(0);
+		await page.getByLabel('ユーザー名').fill(ADMIN_USERNAME);
+		await page.getByLabel('パスワード').fill(ADMIN_PASSWORD);
+		await page.getByRole('button', { name: 'ログイン', exact: true }).click();
 
 		await expect(page).toHaveURL(/\/monitor$/);
 		await expect(page.getByRole('button', { name: 'ログアウト' })).toBeVisible();

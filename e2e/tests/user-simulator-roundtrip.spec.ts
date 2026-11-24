@@ -52,7 +52,7 @@
  * （`banto-serve` の `resolve_data_dir`）。DB の置き場は `playwright.config.ts`
  * が実行ごとに 1 回だけ作った一時ディレクトリで、ワーカーは内部用の変数
  * `CHRONOGAZER_E2E_RUN_DIR`（`e2e/chronogazer-e2e-run-dir.ts`）で受け取る。
- * ここでは Node の `fs` で `<dbDir>/data` の `YYYYMMDD-NNN.sqlite3`（または
+ * ここでは Node の `fs` で `<dbDir>/data/history` の `YYYYMMDD-NNN.sqlite3`（または
  * その WAL `-wal`）に**この試行の収集中に書き込みがあったこと**（大きさか
  * 更新時刻が変わったこと）を確かめる（中のサンプル行までは Rust の
  * `apps/chronogazer/core/tests/collect_roundtrip.rs` が確かめている）。
@@ -471,7 +471,9 @@ test.describe.serial('chronogazer 開発用 PLC 相手の収集の一巡（R1-C 
 			fs.existsSync(path.join(dbDir, DB_FILE_NAME)),
 			`${dbDir} に banto-serve の DB が無い（別の一時ディレクトリを見ている）`
 		).toBe(true);
-		dataDir = path.join(dbDir, 'data');
+		// banto v8 追従: 既定の保存先は `<dbDir>/data/history`（旧い `<dbDir>/data` の履歴とは分ける。
+		// `chronogazer_core::settings::default_data_dir`・`store_generation`）。
+		dataDir = path.join(dbDir, 'data', 'history');
 	});
 
 	test.afterAll(async () => {

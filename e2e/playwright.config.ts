@@ -20,7 +20,7 @@
  * on state the previous one created (the admin account, ...), mirroring how
  * a person would actually click through the app once. That is also why
  * `webServer` always starts a fresh server against a fresh temp-directory
- * SQLite file: scenario 1 exercises the first-run setup screen, which only
+ * SQLite file: scenario 1 logs in as the administrator `create-admin` made on it, which only
  * appears against a database with zero users - reusing a server/db left
  * over from a previous run would skip it.
  */
@@ -30,6 +30,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { E2E_ADMIN } from './first-admin';
 import { RUN_DIR_ENV, RUN_MARKER_FILE, RUN_TOKEN_ENV, ownsRunDir } from './chronogazer-e2e-run-dir';
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -104,6 +105,8 @@ const devPlcBin = path.join(
 	process.platform === 'win32' ? 'dev_plc.exe' : 'dev_plc'
 );
 
+const serveWithFirstAdmin = path.join(dirname, 'serve-with-first-admin.mjs');
+
 const bantoServeBin = path.join(
 	repoRoot,
 	'target',
@@ -144,7 +147,9 @@ export default defineConfig({
 	projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
 	webServer: [
 		{
-			command: bantoServeBin,
+			// banto v8: `serve-with-first-admin.mjs` runs `banto-serve create-admin` on the fresh
+			// database first (account + login required), then starts the server.
+			command: `node "${serveWithFirstAdmin}" "${bantoServeBin}"`,
 			url: BASE_URL,
 			// Never reuse a leftover server: it would carry over yesterday's
 			// (already-set-up) database, which breaks scenario 1's "database
@@ -155,9 +160,10 @@ export default defineConfig({
 				PORT: String(PORT),
 				BANTO_BIND: '127.0.0.1',
 				BANTO_DB: dbPath,
-				// chronogazer-core/src/bin/banto-serve.rs: POST /api/auth/setup is
-				// 403'd unless explicitly opted into - required for scenario 1.
-				BANTO_ALLOW_SETUP: '1',
+				// The account `create-admin` makes (e2e/first-admin.ts).
+				BANTO_E2E_ADMIN_USERNAME: E2E_ADMIN.username,
+				BANTO_E2E_ADMIN_PASSWORD: E2E_ADMIN.password,
+				BANTO_E2E_ADMIN_DISPLAY_NAME: E2E_ADMIN.displayName,
 				// #383 段階3 P5: Hub の API キーをプロセス内メモリに置き、収集にも
 				// Hub を繋ぐ（`user-simulator-monitor-hub.spec.ts` がモック Hub 相手に
 				// Hub 経由のタグの収集を通す）。既定の banto-serve は OS キーリングが無く、

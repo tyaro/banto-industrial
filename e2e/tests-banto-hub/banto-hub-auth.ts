@@ -23,17 +23,13 @@ export const CSRF_HEADERS = { 'X-Banto-Client': 'banto' } as const;
 export const TOKEN_STORAGE_KEY = 'banto.auth.token';
 
 /**
- * 両 spec ファイルが共有する唯一の管理者アカウント。`banto-hub-smoke.spec.ts`
- * が最初の1件目としてこの資格情報で初回セットアップ（`POST /api/auth/setup`）
- * を実 DOM 経由で行う想定（testMatch のファイル名順で smoke →
- * tags-continuous、workers:1/fullyParallel:false なので決定的に smoke が
- * 先に走る）。{@link ensureLoggedIn} は「未初期化なら setup、初期化済みなら
- * login」を自動判定するので、実行順が入れ替わっても2つ目の spec は同じ
- * 資格情報でログインできる（setup は一度しか成功しないため、想定と異なる
- * 順で実行された場合の保険）。
- * したがって `fetchAuthToken`/`ensureLoggedIn` を使う新規 spec は、ファイル名を
- * `banto-hub-smoke.spec.ts` より辞書順で後になるように付けること（smoke より
- * 先に走ると smoke の初回セットアップ DOM 検証を壊す）。
+ * 全 spec が共有する唯一の管理者アカウント。banto v8（ADR-0034 §7）で初回セットアップ
+ * （`POST /api/auth/setup`）は無くなり、このアカウントは**サーバーの起動の前に**
+ * `banto-hub create-admin` が作る（`e2e/serve-with-first-admin.mjs`。両方の config の
+ * `webServer`）。create-admin は管理者の作成・ログイン必須・試運転の口のロックダウンを
+ * 1 度に行うので、E2E の Hub は最初からロックダウン済みで、どの spec も同じ資格情報で
+ * ログインする（実行の順序に依らない）。ユーザー名 `admin` は組み込みの管理者が使う
+ * 予約名なので作れない。
  */
 export const HUB_ADMIN_USERNAME = 'e2e-hub-admin';
 export const HUB_ADMIN_PASSWORD = 'E2eHubAdminPass1';
@@ -46,34 +42,20 @@ interface AuthActionResponse {
 }
 
 /**
- * `GET /api/auth/status` → 未初期化なら `POST /api/auth/setup`、初期化済み
- * なら `POST /api/auth/login` のどちらかでベアラートークンを取得する。
- * `request`（`page.request`/`APIRequestContext`）は UI を経由せず直接 HTTP
- * を叩く - タグ連続登録 DOM テスト（`banto-hub-tags-continuous.spec.ts`）
- * では認証自体は本題ではないため、フォーム入力より速く安定させる。
+ * `POST /api/auth/login` でベアラートークンを取得する。`request`（`page.request`/
+ * `APIRequestContext`）は UI を経由せず直接 HTTP を叩く - タグ連続登録 DOM テスト
+ * （`banto-hub-tags-continuous.spec.ts`）などでは認証自体は本題ではないため、フォーム入力より
+ * 速く安定させる。
  */
 export async function fetchAuthToken(request: APIRequestContext): Promise<string> {
-	const statusRes = await request.get('/api/auth/status', { headers: CSRF_HEADERS });
-	const status = (await statusRes.json()) as { initialized: boolean };
-
-	const response = status.initialized
-		? await request.post('/api/auth/login', {
-				headers: CSRF_HEADERS,
-				data: { username: HUB_ADMIN_USERNAME, password: HUB_ADMIN_PASSWORD }
-			})
-		: await request.post('/api/auth/setup', {
-				headers: CSRF_HEADERS,
-				data: {
-					username: HUB_ADMIN_USERNAME,
-					password: HUB_ADMIN_PASSWORD,
-					displayName: HUB_ADMIN_DISPLAY_NAME
-				}
-			});
+	const response = await request.post('/api/auth/login', {
+		headers: CSRF_HEADERS,
+		data: { username: HUB_ADMIN_USERNAME, password: HUB_ADMIN_PASSWORD }
+	});
 
 	const body = (await response.json()) as AuthActionResponse;
 	if (!body.success || !body.token) {
-		const action = status.initialized ? 'login' : 'setup';
-		throw new Error(`banto-hub ${action} に失敗しました: ${body.error ?? '不明なエラー'}`);
+		throw new Error(`banto-hub login に失敗しました: ${body.error ?? '不明なエラー'}`);
 	}
 	return body.token;
 }

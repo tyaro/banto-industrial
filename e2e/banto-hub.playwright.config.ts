@@ -38,6 +38,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+	HUB_ADMIN_DISPLAY_NAME,
+	HUB_ADMIN_PASSWORD,
+	HUB_ADMIN_USERNAME
+} from './tests-banto-hub/banto-hub-auth';
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(dirname, '..');
@@ -53,12 +58,10 @@ const BASE_URL = `http://127.0.0.1:${PORT}`;
 // ダウン）は収集中の構成 CRUD が即時・無停止で反映されるようになったため、
 // 「収集中の CRUD は未適用キューへ積まれる」ことを見る
 // `banto-hub-status-pending-apply-cancel.spec.ts` だけは**ロックダウン済み**の
-// サーバーが要る。一方このスイートの他の spec は試運転モード（＝認証バイパス
-// 無しでも admin トークンで動くが、ロックダウンすると初回セットアップ前提の
-// smoke が壊れる）を前提に組まれていて、同じサーバーを途中でロックダウンする
-// と後続が壊れる（`banto-hub-tags-tree-context-menu.spec.ts` 冒頭の注記と
-// 同じ理由）。そこで upstream banto の e2e `public-viewer`（別ポートの2本目
-// banto-serve）と同じ型で、サーバーごと分ける。
+// サーバーが要る。banto v8 追従で、2 台とも `create-admin` により最初からロック
+// ダウン済みになった（下の firstAdminEnv）ので、台を分ける理由は薄れたが、
+// 専用サーバー・専用 spec の構成（`LOCKED_DOWN_SPECS`）はそのまま残している
+// （ロックダウン専用の spec が他の spec の状態に触れない分離として）。
 //
 // ポートは 8802 - 8798 chronogazer / 8805 banto-hub 本体（2026-10-09 に 8799 から移した） /
 // 8800 relay-wright / 8801 banto-hub perf（`banto-hub-perf.playwright.config.ts`）
@@ -120,6 +123,24 @@ const lockedDownDbPath = path.join(dbDir, 'banto-hub-e2e-locked-down.sqlite3');
 const lockedDownRoot = path.join(dbDir, 'locked-down-root');
 fs.mkdirSync(lockedDownRoot, { recursive: true });
 
+// 1台目も profile・root を一時の値にする（banto v8 追従）。`banto-hub create-admin` は
+// 起動と同じ profile の排他を取る（Hub が動いていれば取れず止まる）ので、この PC で
+// デスクトップシェルが `default` を握っていても邪魔されないようにする。
+const mainRoot = path.join(dbDir, 'main-root');
+fs.mkdirSync(mainRoot, { recursive: true });
+
+// banto v8（ADR-0034 §5/§7）: 初回セットアップ（`POST /api/auth/setup`・`BANTO_ALLOW_SETUP`）は
+// 無い。新しい DB は管理者を作るまでログインなしで、`banto-hub create-admin` が管理者の作成・
+// ログイン必須・試運転の口のロックダウンを 1 度に行う。`serve-with-first-admin.mjs` が起動の
+// 前にそれを実行する（パスワードは標準入力で渡す）。**create-admin はロックダウンもするので、
+// 起動する Hub はどちらも最初からロックダウン済み**（試運転モードの Hub は E2E に無い）。
+const serveWithFirstAdmin = path.join(dirname, 'serve-with-first-admin.mjs');
+const firstAdminEnv = {
+	BANTO_E2E_ADMIN_USERNAME: HUB_ADMIN_USERNAME,
+	BANTO_E2E_ADMIN_PASSWORD: HUB_ADMIN_PASSWORD,
+	BANTO_E2E_ADMIN_DISPLAY_NAME: HUB_ADMIN_DISPLAY_NAME
+};
+
 const bantoHubBin = path.join(
 	repoRoot,
 	'target',
@@ -177,7 +198,7 @@ export default defineConfig({
 	],
 	webServer: [
 		{
-			command: bantoHubBin,
+			command: `node "${serveWithFirstAdmin}" "${bantoHubBin}"`,
 			url: BASE_URL,
 			// 前回実行の(既にセットアップ済みの)DB を引き継ぐと、setup 画面の
 			// 「ユーザー0件」前提が崩れる - chronogazer 側と同じ理由で常に
@@ -188,18 +209,16 @@ export default defineConfig({
 				PORT: String(PORT),
 				BANTO_BIND: '127.0.0.1',
 				BANTO_DB: dbPath,
-				// apps/banto-hub/host/src/bin/banto-hub.rs: POST /api/auth/setup は
-				// 明示的に opt-in しないと 403 になる - 初回セットアップ画面の
-				// シナリオに必要。
-				BANTO_ALLOW_SETUP: '1'
+				BANTO_HUB_ROOT: mainRoot,
+				BANTO_HUB_PROFILE: 'e2e-main',
+				...firstAdminEnv
 			}
 		},
 		{
 			// #341: ロックダウン済み専用（`chromium-locked-down` プロジェクト）。
-			// 起動時点では1台目と同じ試運転モードで、spec の `beforeAll` が
-			// 初回セットアップ → `POST /api/commissioning/lock-down` まで進める
-			// （ロックダウンは不可逆なので、専用サーバーでしかできない）。
-			command: bantoHubBin,
+			// 起動の前に `create-admin` がロックダウンまで済ませる（spec の
+			// `beforeAll` の `POST /api/commissioning/lock-down` は冪等で、何もしない）。
+			command: `node "${serveWithFirstAdmin}" "${bantoHubBin}"`,
 			url: LOCKED_DOWN_BASE_URL,
 			reuseExistingServer: false,
 			timeout: 30_000,
@@ -209,11 +228,11 @@ export default defineConfig({
 				// （`enforce_loopback_when_commissioning`、設計 §5.6）。
 				BANTO_BIND: '127.0.0.1',
 				BANTO_DB: lockedDownDbPath,
-				BANTO_ALLOW_SETUP: '1',
 				// 上記 `lockedDownRoot` のコメント参照（profile 排他ロックを
 				// 1台目と分ける）。
 				BANTO_HUB_ROOT: lockedDownRoot,
-				BANTO_HUB_PROFILE: 'e2e-locked-down'
+				BANTO_HUB_PROFILE: 'e2e-locked-down',
+				...firstAdminEnv
 			}
 		}
 	]
