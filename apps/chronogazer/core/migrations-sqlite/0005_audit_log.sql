@@ -6,7 +6,9 @@ CREATE TABLE audit_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts TEXT NOT NULL DEFAULT (datetime('now')),
   actor_username TEXT,          -- NULL = unauthenticated (e.g. a login failure before any session exists)
+  actor_id INTEGER,       -- users.id of the actor (v8.0.0 baseline, ADR-0034 §1/§3); NULL when the actor is no users row. No FK: entries outlive the account
   actor_role TEXT,               -- role AT THE TIME of the action, not looked up later
+  actor_kind TEXT,               -- channel the actor came through (ADR-0034 section 3): 'account'|'local'|'grant:<kind>'|'cli'|an app's own word; NULL = no actor. A record only, never used to authorize
   action TEXT NOT NULL,          -- 'create'|'update'|'delete'|'login'|'login_failed'|'logout'|'setup'|'password_reset'|'settings_change'|'denied' etc.
   resource TEXT NOT NULL,        -- 'items'|'users'|'settings'|'auth' etc.
   entity_id TEXT,                -- target id as text, NULL if not applicable
