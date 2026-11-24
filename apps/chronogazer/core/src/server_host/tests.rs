@@ -547,7 +547,7 @@ async fn get_json(url: &str) -> (u16, serde_json::Value) {
 /// `POST /api/auth/setup`（最初の管理者の作成）。
 async fn post_setup(url: &str) -> (u16, serde_json::Value) {
     let body = serde_json::json!({
-        "username": "admin",
+        "username": "testadmin",
         "password": "admin-pass-1",
         "displayName": "管理者",
     });

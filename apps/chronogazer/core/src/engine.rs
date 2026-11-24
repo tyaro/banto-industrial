@@ -2043,7 +2043,7 @@ mod tests {
     /// `POST /api/auth/setup` の HTTP の状態（最初の管理者の作成）。
     async fn post_setup(addr: SocketAddr) -> u16 {
         let body = serde_json::json!({
-            "username": "admin",
+            "username": "testadmin",
             "password": "admin-pass-1",
             "displayName": "管理者",
         });
@@ -2713,7 +2713,7 @@ mod tests {
             "/api/auth/login",
             &host,
             None,
-            Some(serde_json::json!({ "username": "admin", "password": "admin-pass-1" })),
+            Some(serde_json::json!({ "username": "testadmin", "password": "admin-pass-1" })),
         )
         .await;
         assert_eq!(status, 200, "{body}");
@@ -2881,7 +2881,7 @@ mod tests {
             "/api/auth/login",
             &loopback.to_string(),
             None,
-            Some(serde_json::json!({ "username": "admin", "password": "admin-pass-1" })),
+            Some(serde_json::json!({ "username": "testadmin", "password": "admin-pass-1" })),
         )
         .await;
         let token = body["token"].as_str().expect("token").to_string();
@@ -3021,7 +3021,7 @@ mod tests {
             "/api/auth/login",
             &host,
             None,
-            Some(serde_json::json!({ "username": "admin", "password": "admin-pass-1" })),
+            Some(serde_json::json!({ "username": "testadmin", "password": "admin-pass-1" })),
         )
         .await;
         let token = body["token"].as_str().expect("token").to_string();
@@ -3386,7 +3386,7 @@ mod tests {
             &host,
             None,
             &serde_json::json!({
-                "username": "admin", "password": "admin-pass-1", "displayName": "管理者"
+                "username": "testadmin", "password": "admin-pass-1", "displayName": "管理者"
             }),
         );
         let mut stream = tokio::net::TcpStream::connect(loopback)

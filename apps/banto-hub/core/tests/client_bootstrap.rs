@@ -119,7 +119,7 @@ async fn test_app(label: &str) -> TestApp {
     // (`CommissioningService::lock_down`'s `has_admin` guard), which
     // scenario 5 needs.
     users
-        .setup_first_user("admin", "password123", "管理者")
+        .setup_first_user("testadmin", "password123", "管理者")
         .await
         .expect("setup_first_user");
 

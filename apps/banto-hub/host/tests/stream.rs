@@ -223,7 +223,7 @@ async fn test_app_with(
     let users = UsersService::new(Db::Sqlite(pool.clone()));
     let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
     users
-        .setup_first_user("admin", "password123", "管理者")
+        .setup_first_user("testadmin", "password123", "管理者")
         .await
         .expect("setup_first_user");
 
@@ -246,7 +246,7 @@ async fn test_app_with(
         SessionValidation::lookup(user_session_lookup(verify_users_lookup)),
     );
     let token = auth
-        .login("admin", "password123")
+        .login("testadmin", "password123")
         .await
         .expect("admin login");
     // #430: セッションの失効のテストが、ほかのアカウントでログインし、
@@ -2119,7 +2119,7 @@ async fn change_password_via_rest(app: &TestApp, token: &str, current: &str, new
 
 async fn admin_id(app: &TestApp) -> i64 {
     app.users
-        .get_by_username("admin")
+        .get_by_username("testadmin")
         .await
         .unwrap()
         .expect("admin exists")

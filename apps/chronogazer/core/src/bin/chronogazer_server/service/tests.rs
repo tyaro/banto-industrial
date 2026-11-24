@@ -489,7 +489,7 @@ async fn setup_admin(port: u16) -> String {
         .header("X-Banto-Client", "banto")
         .header("Content-Type", "application/json")
         .body(
-            serde_json::json!({"username":"admin","password":"admin-pass-1","displayName":"管理者"})
+            serde_json::json!({"username":"testadmin","password":"admin-pass-1","displayName":"管理者"})
                 .to_string(),
         )
         .send()
@@ -770,7 +770,7 @@ async fn a_request_held_open_across_scm_stop_cannot_write_after_relaxing() {
     let spool_before = spool_files(&layout);
 
     // ヘッダと本文の一部だけ送って保留する（本物の TCP。keep-alive のまま）。
-    let body = serde_json::json!({"username":"admin","password":"wrong-pass-1"}).to_string();
+    let body = serde_json::json!({"username":"testadmin","password":"wrong-pass-1"}).to_string();
     let (head, tail) = body.split_at(10);
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", endpoint.port)).expect("connect");
     stream

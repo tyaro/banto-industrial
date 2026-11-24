@@ -248,7 +248,7 @@ async fn setup_admin(port: u16) -> String {
         reqwest::Method::POST,
         format!("http://127.0.0.1:{port}/api/auth/setup"),
         None,
-        Some(serde_json::json!({"username":"admin","password":ADMIN_PASSWORD,"displayName":"管理者"})),
+        Some(serde_json::json!({"username":"testadmin","password":ADMIN_PASSWORD,"displayName":"管理者"})),
     )
     .await;
     assert_eq!(status, 200, "{body}");
@@ -260,7 +260,7 @@ async fn login(port: u16) -> String {
         reqwest::Method::POST,
         format!("http://127.0.0.1:{port}/api/auth/login"),
         None,
-        Some(serde_json::json!({"username":"admin","password":ADMIN_PASSWORD})),
+        Some(serde_json::json!({"username":"testadmin","password":ADMIN_PASSWORD})),
     )
     .await;
     assert_eq!(status, 200, "{body}");

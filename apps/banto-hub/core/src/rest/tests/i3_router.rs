@@ -137,7 +137,7 @@ async fn concurrent_first_setups_create_exactly_one_account() {
 async fn a_failed_login_records_a_bounded_username() {
     let (router, pool, users, _dir) = banto_wiring_env().await;
     users
-        .setup_first_user("admin", "password123", "管理者")
+        .setup_first_user("testadmin", "password123", "管理者")
         .await
         .unwrap();
     let long_name = "x".repeat(4096);
@@ -190,10 +190,10 @@ async fn a_failed_login_records_a_bounded_username() {
 async fn only_a_logout_that_ends_a_session_is_audited() {
     let (router, pool, users, _dir) = banto_wiring_env().await;
     users
-        .setup_first_user("admin", "password123", "管理者")
+        .setup_first_user("testadmin", "password123", "管理者")
         .await
         .unwrap();
-    let token = session_login(&router, "admin", false).await;
+    let token = session_login(&router, "testadmin", false).await;
 
     let logout = |token: Option<String>| {
         let router = router.clone();
@@ -215,7 +215,7 @@ async fn only_a_logout_that_ends_a_session_is_audited() {
     assert!(logout(Some(token.clone())).await.is_success());
     assert_eq!(
         audit_rows(&pool, "logout").await,
-        vec![Some("admin".to_string())]
+        vec![Some("testadmin".to_string())]
     );
 
     // 終えた後の同じトークンは、もう何も終えない。

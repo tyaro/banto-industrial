@@ -140,7 +140,7 @@ async fn test_env_on_pool(
     let plc_connections = manager.plc_connections();
 
     users
-        .setup_first_user("admin", "password123", "管理者")
+        .setup_first_user("testadmin", "password123", "管理者")
         .await
         .expect("setup_first_user");
     users
@@ -167,7 +167,7 @@ async fn test_env_on_pool(
         SessionValidation::lookup(user_session_lookup(users.clone())),
     );
     let admin_token = auth
-        .login("admin", "password123")
+        .login("testadmin", "password123")
         .await
         .expect("admin login");
     let viewer_token = auth

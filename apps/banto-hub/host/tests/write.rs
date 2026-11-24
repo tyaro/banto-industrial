@@ -228,7 +228,7 @@ async fn test_app(label: &str) -> TestApp {
     // exercise the production wiring.
     let audit = audit_spool::build_audit_service(Db::Sqlite(pool.clone()), &env.data_dir());
     users
-        .setup_first_user("admin", "password123", "管理者")
+        .setup_first_user("testadmin", "password123", "管理者")
         .await
         .expect("setup_first_user");
 
@@ -251,7 +251,7 @@ async fn test_app(label: &str) -> TestApp {
         SessionValidation::lookup(user_session_lookup(verify_users_lookup)),
     );
     let admin_token = auth
-        .login("admin", "password123")
+        .login("testadmin", "password123")
         .await
         .expect("admin login");
 

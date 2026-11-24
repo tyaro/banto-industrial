@@ -1053,12 +1053,12 @@ mod tests {
         let db = || crate::db::Db::Sqlite(pool.clone());
         let users = crate::users::UsersService::new(db());
         users
-            .setup_first_user("admin", "password123", "管理者")
+            .setup_first_user("testadmin", "password123", "管理者")
             .await
             .expect("setup admin");
         let audit = crate::audit::AuditLogService::new(db());
         let auth = crate::rest::user_auth_state(users, audit.clone());
-        let token = auth.login("admin", "password123").await.expect("login");
+        let token = auth.login("testadmin", "password123").await.expect("login");
         let (events, _rx) = tokio::sync::broadcast::channel(16);
         let router = crate::rest::opcua_settings_router(
             manager.clone(),
