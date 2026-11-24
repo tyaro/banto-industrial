@@ -1,7 +1,9 @@
 # banto-hub OPC UA 検証
 
 状態: **自動 interop smoke 実装・Linux 実接続検証済み。Windows Service と UaExpert の実機確認は、2026-11-01 に専用 VM ではなく既にサービスがある PC で、起動・停止・再起動と UaExpert の項目まで確かめた（下の「手動試験記録」。確かめた項目はすべて期待どおり）。専用 VM での実施と、サービスの登録・登録解除は未確認。**
-最終更新: 2026-11-01（#201・#943: Windows Service と UaExpert の手動試験を、S7 の機材の BantoHub サービスを別の profile に切り替えて行い、記録の表を埋めた。サービスの鍵と証明書の置き場の ACL と、再起動での再利用も記録した。専用 VM でない PC で行う手順を「既にサービスがある PC で行うとき」に足した）。2026-10-17（#634: 有効化の PUT は起動の完了を待たずに返るので、手順 4 に状態の API での確認を足した。#636: 手動確認の手順 7 の文言の重複を直し、Machine 環境変数を消す後始末を手順 8 として追加）。2026-10-16（#201、Hub #627 マージ後の外部クライアント試験を追加）。
+最終更新: 2026-11-25（banto v8 の注記を足した）。前回: 2026-11-01（#201・#943: Windows Service と UaExpert の手動試験を、S7 の機材の BantoHub サービスを別の profile に切り替えて行い、記録の表を埋めた。サービスの鍵と証明書の置き場の ACL と、再起動での再利用も記録した。専用 VM でない PC で行う手順を「既にサービスがある PC で行うとき」に足した）。2026-10-17（#634: 有効化の PUT は起動の完了を待たずに返るので、手順 4 に状態の API での確認を足した。#636: 手動確認の手順 7 の文言の重複を直し、Machine 環境変数を消す後始末を手順 8 として追加）。2026-10-16（#201、Hub #627 マージ後の外部クライアント試験を追加）。
+
+**banto v8 の注記（2026-11-25）**: 初回セットアップ（`POST /api/auth/setup`・`allow_setup`・`BANTO_ALLOW_SETUP`）は banto v8 で廃止した。下の手順の `BANTO_ALLOW_SETUP`・初回 setup は v8 では使えない。Hub は `banto-hub create-admin` で管理者を作る（サービスを止めて実行。apps/banto-hub/README.md「初回セットアップ」）。今の動きは、今の動きは [banto-v8-upgrade-plan.md](../banto-v8-upgrade-plan.md) §7 と apps/chronogazer/README.md を正とする（ログインなしの組み込み admin・管理者は `create-admin`）。
 
 ローカル確認: Hub `b130385`（`0.2.0-alpha.31`）、Rust 1.98.1、Python 3.12、asyncua 1.1.8。新しい CI ワークフローでの結果は PR のチェックを参照する。
 

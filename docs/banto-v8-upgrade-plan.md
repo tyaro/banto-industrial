@@ -1,7 +1,7 @@
 # banto v8.0.0 への追従の計画
 
 作成日: 2026-11-24
-状態: **実装中**（2026-11-24。PR0a は #1336 で済み、PR0c は本 PR（#1336 の次）。PR1 は未着手。オーナー決定 3 件と、PR1 の受け入れ条件 3 件（§5、オーナーのレビュー）を記録）
+状態: **PR1 は本ブランチ `deps/banto-v8` で実装済み・レビュー待ち**（2026-11-25。段階 1〜4 の docs まで。PR0a は #1336、PR0c は #1337 で済み。オーナー決定と、PR1 の受け入れ条件 3 件（§5）の結果は §7）
 
 関連: [banto v8.0.0 のリリースノート](https://github.com/tyaro/banto/releases/tag/v8.0.0)、banto の `docs/upgrading.md` 4.2 節、banto の ADR-0034（持ち主の id と組み込みの `admin`）・ADR-0035（書き込みを切断から切り離す）。
 
@@ -42,7 +42,7 @@
 
 1. **PR0a（v7.9 のまま、機械的。#1336 で済み。ユーザー名だけを `testadmin` に替え、`setup_first_user` は PR1 で替える）**: 試験・E2E で作るユーザーの名前を `admin` から替える。v7.9 でもできるなら、試験の `setup_first_user` を `create_user(.., Role::Admin)` に替える。
 2. **PR0c**: `libsqlite3-sys` 0.40 と `deny.toml` の除外の削除（済み。sqlx-sqlite 0.9.1 は `>=0.30.1, <0.41.0` を受けるので v7.9 のまま出せた。Cargo.lock は libsqlite3-sys の項だけを手で書き換えた）。
-3. **PR1（必須・大）**: Cargo と npm のタグを同時に v8.0.0 へ。§3 の必須の行を全部と、§5 の受け入れ条件。Hub と CG を別の worktree で作り、1 つの PR に集める。上位モデルが監査する。
+3. **PR1（必須・大）**: Cargo と npm のタグを同時に v8.0.0 へ。§3 の必須の行を全部と、§5 の受け入れ条件。Hub と CG は別の worktree ではなく 1 本の worktree（`deps/banto-v8`）で順に作った（cargo のビルドが重なって PC が重くなるため）。1 つの PR に集める。上位モデルが監査する。
 4. 以降は任意（回り道の置き換え）: `isOnScreen`（`dockPanelOnScreen.ts` を消す）、`onRowContextMenu`（`/tags` の `rowClass`）、系列色 16（`--bi-chart-9〜16`）、`narrowViewport`（`mobileNav*`・`viewportWatch` の写し）、CG の `run_detached` を外す、`createDockLayoutStore`・`onLayoutCommit`、`@banto/charts/testing` で描画の回帰試験、デモの `storage: 'memory'`、Node 26。
 
 ## 5. PR1 の受け入れ条件（2026-11-24 オーナーのレビュー、#1331）
@@ -63,3 +63,28 @@
 - Hub の試運転の grant・`DisabledNoRevocation`（`commissioning.rs`・`service_elevated.rs`）が本番の経路で ui-settings を読み書きできるか。
 - 2 MiB を超える本文を受ける口が無いか（Hub の ingest は 1 MiB の上限、CG のバックアップのリストア）。
 - #1260 は上流（C3）で片付いた。`acct:` の形に追従した時点で閉じるかはオーナー。
+
+## 7. PR1 で決めたこと・確かめたこと（2026-11-25）
+
+### オーナー決定（2026-11-25）
+
+- ChronoGazer は未リリースなので、旧い DB からの移行は作らない。CG の migration の記録の表を既定の `_sqlx_migrations` に戻し、banto v8 の復元の検査（表の名前が固定）を通す。旧い表名 `_sqlx_migrations_chronogazer` の DB は v8 より前として断る。
+- Hub の `create-admin` は、管理者の作成・ログイン必須（`auth.disabled=false`）・試運転の口のロックダウン（`commissioning.locked_down=true`）を 1 度に行う。
+
+### §5 の結果
+
+1. **旧い履歴の分離**: 保存先に世代 id（設定 `data.store_generation`）を持たせ、保存先に印 `.chronogazer-store-generation` を置く。既定の保存先は `./data/history`（旧い `data.dir` は消さず残し、新版は使わない）。印の無い中身のある保存先・別の世代の保存先は、何も書かずに止まる（起動時の窓 `StoreDirRefused`）。DB を作り直すと世代が替わるので保存先を選び直す。別のインストールの DB のバックアップを戻したときも、保存先で止まる。試験: `a_recreated_db_does_not_mix_the_previous_history_into_reused_ids`（id を使い回しても旧い値が混ざらない）、`a_pre_v8_store_is_refused_and_the_new_default_leaves_it_alone`、`choosing_another_generations_store_in_the_recovery_window_writes_nothing`、`a_new_folder_is_claimed_and_another_generation_is_refused`、`an_unmarked_folder_with_content_is_refused_untouched`。
+2. **旧い形式の拒否とリストアの順序**: 予約の適用より前に、今の DB と予約のファイルを読み取り専用（immutable）で確かめ、旧形式なら予約を当てず・消さずに止まる（`refuse_legacy_profile`）。試験: `a_banto_v7_database_is_refused_without_being_touched`、`a_backup_that_could_not_start_is_refused_at_staging`、新版のバックアップの往復 `a_backup_taken_by_this_version_is_restored_on_the_next_start`（ignore にしていた復元の試験 7 本も戻した）。既知の限界: `-wal` にだけある内容は見えない（前の版が落ちたままの DB だけ）。
+3. **新しい DB の認証の初期値**: 新しい DB の Hub は試運転モードで、LAN の bind を断り loopback だけで起動する。上流の 0015 の `auth.disabled=true` は Hub の認証には読まない（AuthState は既定のログイン必須のまま）。`create-admin` と起動は同じ root の解き方（`profile_paths::resolve_hub_root_from_env`）。試験は `apps/banto-hub/host/tests/first_admin_service.rs`（作る前は資格情報なしで 401、試運転の grant は loopback だけ、動いている間の `create-admin` は何も書かない、作った後はログイン必須で grant は閉じる）。ChronoGazer の localDesktop は、LAN にログインなしでも管理者の権限を広げない（`no_login_gives_a_lan_peer_no_admin_rights`）。
+
+### §6 の結果
+
+- `auth.disabled` の行は上流の認証モードの読み取りで必須。0015 を両アプリの migrations-sqlite に写した（上流と byte 等価）。
+- 試運転の grant は、本番の経路で ui-settings を読み書きできる（`first_admin_service.rs`）。
+- 2 MiB を超える本文を受ける口は無い。
+- ADR-0035 の書き込みの切り離しは、Hub の TLS の経路（loopback の 8723）には掛からない。上流が `detach_writes` を公開していないため。banto に提案する（提案前。Issue ができたら番号をここに足す）。
+
+### E2E
+
+- 起動の前に `e2e/serve-with-first-admin.mjs` で `create-admin` を行う（上流と同じ形）。
+- Hub の E2E では、試運転の grant の経路と `lockdown-by-account` の 1 本が通らなくなったので skip にした（単体試験には残っている）。
