@@ -77,7 +77,6 @@ fn config(db_path: &Path, data_dir: PathBuf) -> HubConfig {
     HubConfig {
         drivers: common::hub_drivers(),
         db_path: db_path.to_string_lossy().into_owned(),
-        allow_setup: false,
         port_override: Some(0),
         bind_override: Some("127.0.0.1".to_string()),
         data_dir_override: Some(data_dir),

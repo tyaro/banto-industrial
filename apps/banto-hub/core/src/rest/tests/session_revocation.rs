@@ -1,6 +1,5 @@
 use super::super::*;
 use super::common::{session_call, session_login, session_request, test_env};
-use crate::db::migrate_memory;
 
 // --- banto v1.7.0 #204: session revocation -------------------------------
 
@@ -268,49 +267,6 @@ async fn a_failed_recheck_fails_the_request_but_keeps_the_session() {
         session_statuses(router, &viewer).await,
         (StatusCode::OK, StatusCode::OK)
     );
-}
-
-/// #204: the first account's session from `POST /api/auth/setup` is
-/// bound to the new account (`issue_account_token`), so a lookup-enabled
-/// `AuthState` accepts it - an unstamped token would be refused on its
-/// first use.
-#[tokio::test]
-async fn the_setup_session_is_bound_to_the_new_account() {
-    let pool = migrate_memory().await.expect("migrate_memory");
-    let users = UsersService::new(Db::Sqlite(pool.clone()));
-    let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
-    let auth = user_auth_state(users.clone(), audit.clone());
-    let router = extra_auth_router(
-        users,
-        auth.clone(),
-        audit,
-        true,
-        Arc::new(GrantRegistry::new()),
-        None,
-    );
-    let (status, body) = session_call(
-        &router,
-        session_request(
-            "POST",
-            "/api/auth/setup",
-            None,
-            Some(json!({
-                "username": "owner",
-                "password": "password123",
-                "displayName": "Owner",
-            })),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let token = body["token"].as_str().expect("setup token");
-    let session = auth
-        .authenticate(token)
-        .await
-        .unwrap()
-        .expect("the setup session is accepted");
-    assert_eq!(session.identity.id, "owner");
-    assert_eq!(session.identity.role, "admin");
 }
 
 /// #431: ゲートの判断の総当たり表。例外（照合できないのに通す）は

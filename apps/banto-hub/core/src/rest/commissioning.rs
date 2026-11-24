@@ -6,8 +6,8 @@
 //! 使う。外から使われるパス（`crate::rest::X`）は親の re-export で保つ。
 
 use super::{
-    actor_identity, get, json, middleware, post, require_session, require_session_role, ApiError,
-    AuditEntry, AuditLogService, AuthGate, AuthState, CommissioningService, HeaderMap, Json,
+    get, json, middleware, post, record_write, require_session, require_session_role, ApiError,
+    AuditActor, AuditLogService, AuthGate, AuthState, CommissioningService, Extension, Json,
     OperationKind, Role, Router, SessionRoleGuard, State,
 };
 
@@ -38,7 +38,6 @@ use super::{
 #[derive(Clone)]
 struct CommissioningAdminState {
     commissioning: CommissioningService,
-    auth: AuthState,
     audit: AuditLogService,
 }
 
@@ -54,27 +53,23 @@ async fn commissioning_status(
 /// 「フラグの保存 → 同じ関数内で試運転 grant の失効」を行う（ADR-0017 §5）。
 /// 呼び出し元の actor は**ロックダウンの前に**確定する: 試運転の grant
 /// セッションからの操作なら、ロックダウンの中で自分のトークンも失効するので、
-/// 後から `actor_identity` で引くと `None` になる。監査の detail には失効させた
+/// 後から引くと `None` になる（banto v8 ではゲートが認可の時点で作った写し
+/// `Extension<AuditActor>` を使うので、失効の後でも残る）。監査の detail には失効させた
 /// 件数を `revokedGrants` として残す（発行は監査しないので、閉じた側に件数を残す）。
 async fn commissioning_lock_down(
     State(state): State<CommissioningAdminState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
 ) -> Result<Json<crate::commissioning::CommissioningStatus>, ApiError> {
-    let identity = actor_identity(&headers, &state.auth);
     let revoked = state.commissioning.lock_down().await?;
-    state
-        .audit
-        .record(AuditEntry {
-            actor_username: identity.as_ref().map(|i| i.id.as_str()),
-            actor_role: identity.as_ref().map(|i| i.role.as_str()),
-            action: "lock_down",
-            resource: "commissioning",
-            entity_id: Some("1"),
-            detail: Some(json!({ "revokedGrants": revoked })),
-            origin: "rest",
-            result: "ok",
-        })
-        .await;
+    record_write(
+        &state.audit,
+        &actor,
+        "lock_down",
+        "commissioning",
+        Some("1"),
+        Some(json!({ "revokedGrants": revoked })),
+    )
+    .await;
     Ok(Json(crate::commissioning::CommissioningStatus {
         locked_down: true,
     }))
@@ -87,7 +82,6 @@ pub(super) fn commissioning_router(
 ) -> Router {
     let state = CommissioningAdminState {
         commissioning: commissioning.clone(),
-        auth: auth.clone(),
         audit: audit.clone(),
     };
 

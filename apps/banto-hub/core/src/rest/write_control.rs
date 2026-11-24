@@ -6,9 +6,9 @@
 //! 保つ。
 
 use super::{
-    actor_identity, broadcast, json, middleware, post, record_write, require_session,
-    require_session_role, Arc, AuditEntry, AuditLogService, AuthGate, AuthState, CollectorManager,
-    HeaderMap, IntoResponse, Json, OperationKind, Response, Role, Router, Serialize, ServerEvent,
+    broadcast, json, middleware, post, record_as, record_write_as, require_session,
+    require_session_role, Arc, AuditActor, AuditLogService, AuthGate, AuthState, CollectorManager,
+    Extension, IntoResponse, Json, OperationKind, Response, Role, Router, Serialize, ServerEvent,
     SessionRoleGuard, State, StatusCode, ToSchema, UnverifiedStopException, WriteControl,
     WriteControlChange,
 };
@@ -26,7 +26,6 @@ use super::{
 struct WriteControlAdminState {
     write_control: Arc<WriteControl>,
     manager: Arc<CollectorManager>,
-    auth: AuthState,
     audit: AuditLogService,
     events: broadcast::Sender<ServerEvent>,
 }
@@ -66,25 +65,22 @@ struct WriteControlStatusResponse {
 /// 「呼び出し側が future を捨てても」）。応答はその完了の後に返す（従来どおり）。
 async fn write_control_set(
     state: &WriteControlAdminState,
-    headers: &HeaderMap,
+    actor: Option<AuditActor>,
     enabled: bool,
     action: &str,
     unverified_stop: bool,
 ) -> Response {
-    let identity = actor_identity(headers, &state.auth);
-    let actor_id = identity.as_ref().map(|i| i.id.as_str());
+    let actor_id = actor.as_ref().map(|actor| actor.username.as_str());
 
     let follow_up = {
         let audit = state.audit.clone();
-        let auth = state.auth.clone();
-        let headers = headers.clone();
+        let actor = actor.clone();
         let events = state.events.clone();
         let action = action.to_string();
         move |change: WriteControlChange| async move {
             record_write_control_outcome(
                 &audit,
-                &auth,
-                &headers,
+                actor.as_ref(),
                 &events,
                 &action,
                 unverified_stop,
@@ -135,8 +131,7 @@ async fn write_control_set(
 /// `AuditLogService::record`（3 秒で打ち切って保留、#437）を通る。
 async fn record_write_control_outcome(
     audit: &AuditLogService,
-    auth: &AuthState,
-    headers: &HeaderMap,
+    actor: Option<&AuditActor>,
     events: &broadcast::Sender<ServerEvent>,
     action: &str,
     unverified_stop: bool,
@@ -151,14 +146,14 @@ async fn record_write_control_outcome(
     }
 
     if !change.succeeded() {
-        record_write_control_failure(audit, auth, headers, action, detail).await;
+        record_write_control_failure(audit, actor, action, detail).await;
         return;
     }
 
-    record_write(
+    record_write_as(
         audit,
-        auth,
-        headers,
+        actor,
+        "rest",
         action,
         "write_control",
         Some("1"),
@@ -205,24 +200,21 @@ pub(crate) fn write_control_audit_detail(
 /// `result: "ok"` 固定）とは別に、`result: "failed"` を記録する。
 async fn record_write_control_failure(
     audit: &AuditLogService,
-    auth: &AuthState,
-    headers: &HeaderMap,
+    actor: Option<&AuditActor>,
     action: &str,
     detail: serde_json::Value,
 ) {
-    let identity = actor_identity(headers, auth);
-    audit
-        .record(AuditEntry {
-            actor_username: identity.as_ref().map(|i| i.id.as_str()),
-            actor_role: identity.as_ref().map(|i| i.role.as_str()),
-            action,
-            resource: "write_control",
-            entity_id: Some("1"),
-            detail: Some(detail),
-            origin: "rest",
-            result: "failed",
-        })
-        .await;
+    record_as(
+        audit,
+        actor,
+        "rest",
+        action,
+        "write_control",
+        Some("1"),
+        Some(detail),
+        "failed",
+    )
+    .await;
 }
 
 /// #431: 照合できなかったため停止のみ例外で通した要求の監査行に付ける印。
@@ -266,9 +258,9 @@ pub(super) const WRITE_CONTROL_ENABLE_OPERATION: OperationKind = OperationKind::
 
 async fn write_control_enable(
     State(state): State<WriteControlAdminState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
 ) -> Response {
-    write_control_set(&state, &headers, true, "enable", false).await
+    write_control_set(&state, Some(actor), true, "enable", false).await
 }
 
 /// #431: 緊急停止は「書き込みを止める」操作だと宣言する。DB が応答しない
@@ -278,10 +270,13 @@ pub(super) const WRITE_CONTROL_DISABLE_OPERATION: OperationKind = OperationKind:
 
 async fn write_control_disable(
     State(state): State<WriteControlAdminState>,
-    headers: HeaderMap,
+    // #431 の例外（照合できなかった停止）では、ゲートがメモリ上のトークンから
+    // 主体を作れなかったときに無い。そのときも止める（監査の主体は空）。
+    actor: Option<Extension<AuditActor>>,
     exception: Option<axum::Extension<UnverifiedStopException>>,
 ) -> Response {
-    write_control_set(&state, &headers, false, "disable", exception.is_some()).await
+    let actor = actor.map(|Extension(actor)| actor);
+    write_control_set(&state, actor, false, "disable", exception.is_some()).await
 }
 
 pub(super) fn write_control_router(
@@ -294,7 +289,6 @@ pub(super) fn write_control_router(
     let state = WriteControlAdminState {
         write_control,
         manager,
-        auth: auth.clone(),
         audit: audit.clone(),
         events,
     };

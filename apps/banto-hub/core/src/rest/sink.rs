@@ -7,7 +7,8 @@
 //! （`crate::rest::X`）は親の re-export で保つ。
 
 use super::{
-    actor_identity, api_key_rejection_response, api_key_verdict, bearer_token, broadcast,
+    AuditActor, Extension,
+    actor_for_token, api_key_rejection_response, api_key_verdict, bearer_token, broadcast,
     forbidden_response, get, json, middleware, put, record_write, require_editor, require_session,
     unauthorized_response, ApiError, ApiKeysService, Arc, AuditLogService, AuthGate, AuthState,
     BantoError, CollectorManager, Deserialize, FieldError, FromStr, HeaderMap, IntoResponse, Json,
@@ -52,6 +53,7 @@ async fn sink_groups_get(
 
 async fn sink_groups_create(
     State(state): State<SinkGroupsState>,
+    Extension(actor): Extension<AuditActor>,
     headers: HeaderMap,
     Json(input): Json<SinkGroupInput>,
 ) -> Result<Response, ApiError> {
@@ -67,8 +69,7 @@ async fn sink_groups_create(
     let created = state.sink_groups.create(input).await?;
     record_write(
         &state.audit,
-        &state.auth,
-        &headers,
+        &actor,
         "create",
         "sink_groups",
         Some(&created.id.to_string()),
@@ -83,6 +84,7 @@ async fn sink_groups_create(
 
 async fn sink_groups_update(
     State(state): State<SinkGroupsState>,
+    Extension(actor): Extension<AuditActor>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     Json(input): Json<SinkGroupInput>,
@@ -99,8 +101,7 @@ async fn sink_groups_update(
     let updated = state.sink_groups.update(id, input).await?;
     record_write(
         &state.audit,
-        &state.auth,
-        &headers,
+        &actor,
         "update",
         "sink_groups",
         Some(&id.to_string()),
@@ -115,6 +116,7 @@ async fn sink_groups_update(
 
 async fn sink_groups_delete(
     State(state): State<SinkGroupsState>,
+    Extension(actor): Extension<AuditActor>,
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
@@ -130,8 +132,7 @@ async fn sink_groups_delete(
     state.sink_groups.delete(id).await?;
     record_write(
         &state.audit,
-        &state.auth,
-        &headers,
+        &actor,
         "delete",
         "sink_groups",
         Some(&id.to_string()),
@@ -232,7 +233,7 @@ pub(super) async fn require_sink_admin(
             Err((rejection, _denied)) => Err(api_key_rejection_response(rejection)),
         }
     } else {
-        match actor_identity(headers, auth) {
+        match actor_for_token(headers, auth) {
             Some(identity)
                 if Role::from_str(&identity.role)
                     .map(|role| role.at_least(Role::Admin))

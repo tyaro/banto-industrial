@@ -118,16 +118,51 @@ pub const MIGRATIONS_TABLE: &str = "_sqlx_migrations_banto_hub";
 pub struct LegacyDatabase {
     /// 拒否した DB ファイルのパス。
     pub path: PathBuf,
+    /// どの旧い形式か（利用者向けの説明を分ける）。
+    pub kind: LegacyKind,
 }
+
+/// [`LegacyDatabase`] の種類。どちらも自動の移行は無く、DB を作り直す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyKind {
+    /// 2026-10-02 のスキーマ整理より前（この app の記録テーブルが無いのに
+    /// `users` か `settings` がある）。
+    BeforeSchemaReset,
+    /// banto v8.0.0 より前の版で作った DB（ADR-0034 §9・
+    /// docs/banto-v8-upgrade-plan.md §2 の 1）。この app の記録テーブルに、banto v7 の
+    /// `0003_users.sql` の checksum（[`PRE_V8_USERS_CHECKSUM`]）が残っている。
+    BeforeBantoV8,
+}
+
+/// banto v8.0.0 が書き換えた migration のうち、版の順で最初のもの（`0003_users.sql`）。
+const PRE_V8_USERS_MIGRATION_VERSION: i64 = 3;
+
+/// banto v7.x（v7.9.0〜v7.11.0 で同じ本文）の `0003_users.sql` の checksum（sqlx: ファイルの
+/// SHA-384、小文字の 16 進）。上流 `apps/admin-template/core/src/db.rs` の
+/// `V7_USERS_CHECKSUM_SQLITE` と同じ値。この app の記録テーブルの版 3 にこれが残っている DB は、
+/// v8 より前の版で作った DB と確定できる（それ以外の食い違いは「判別できない」で、
+/// sqlx の `VersionMismatch` のまま止まる。DB は変わらない）。
+pub const PRE_V8_USERS_CHECKSUM: &str =
+    "25f4a5973321cc81959ce2f2e211df45acdfa0d0e9db30db155dd3ac62a36b00b82edbf393ac250b4867e2a30e1b1240";
 
 impl fmt::Display for LegacyDatabase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "この DB は旧形式です。{} を削除または退避して起動し直してください\
-             （アルファ版のため自動移行はありません。手順は docs/hub/banto-hub-operations.md）",
-            self.path.display()
-        )
+        match self.kind {
+            LegacyKind::BeforeSchemaReset => {
+                write!(
+                    f,
+                    "この DB は旧形式です。{} を削除または退避して起動し直してください\
+                     （アルファ版のため自動移行はありません。手順は docs/hub/banto-hub-operations.md）",
+                    self.path.display()
+                )
+            }
+            LegacyKind::BeforeBantoV8 => write!(
+                f,
+                "この DB は v8.0.0 より前の版のものです。読めません。DB を作り直してください。\
+                 {} を削除または退避して起動し直してください（データの移行はありません）",
+                self.path.display()
+            ),
+        }
     }
 }
 
@@ -259,10 +294,11 @@ async fn init_db_on(
             return Err(err.into());
         }
     };
-    if legacy {
+    if let Some(kind) = legacy {
         pool.close().await;
         return Err(InitDbError::Legacy(LegacyDatabase {
             path: place.db_path(),
+            kind,
         }));
     }
     if let Err(err) = run_hub_migrations(&pool).await {
@@ -324,7 +360,7 @@ pub(crate) async fn migrate_memory() -> Result<SqlitePool, BantoError> {
 
 /// 「この app の記録テーブルが無いのに `users` か `settings` がある」か
 /// （モジュール doc「旧形式の DB の拒否」）。
-async fn is_legacy_schema(pool: &SqlitePool) -> Result<bool, BantoError> {
+async fn is_legacy_schema(pool: &SqlitePool) -> Result<Option<LegacyKind>, BantoError> {
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, 'users', 'settings')",
     )
@@ -333,7 +369,26 @@ async fn is_legacy_schema(pool: &SqlitePool) -> Result<bool, BantoError> {
     .await
     .map_err(banto_storage::storage_error)?;
     let has_record = tables.iter().any(|name| name == MIGRATIONS_TABLE);
-    Ok(!has_record && !tables.is_empty())
+    if !has_record {
+        return Ok((!tables.is_empty()).then_some(LegacyKind::BeforeSchemaReset));
+    }
+    // banto v8（ADR-0034 §9）: 新しい migration を当てる前に、v8 より前の版の DB を
+    // 名前の付いた理由で断る（sqlx の `VersionMismatch` の文言では分からないため）。
+    // 表の名前は定数なので、`format!` に外の値は入らない。
+    let checksum: Option<Vec<u8>> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT checksum FROM {MIGRATIONS_TABLE} WHERE version = ?"
+    )))
+    .bind(PRE_V8_USERS_MIGRATION_VERSION)
+    .fetch_optional(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+    let hex = checksum.map(|bytes| {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    });
+    Ok((hex.as_deref() == Some(PRE_V8_USERS_CHECKSUM)).then_some(LegacyKind::BeforeBantoV8))
 }
 
 async fn run_migrations(pool: &SqlitePool) -> Result<(), BantoError> {
@@ -445,7 +500,7 @@ mod tests {
         assert_eq!(
             versions,
             vec![
-                2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110,
+                2, 3, 4, 5, 7, 8, 10, 12, 13, 14, 15, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110,
                 111, 112
             ]
         );
@@ -576,7 +631,7 @@ mod tests {
         assert_eq!(
             versions,
             vec![
-                2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110,
+                2, 3, 4, 5, 7, 8, 10, 12, 13, 14, 15, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110,
                 111, 112
             ]
         );
@@ -625,7 +680,8 @@ mod tests {
         old.dangerous_set_table_name(MIGRATIONS_TABLE);
         old.run(&pool).await.unwrap();
         sqlx::query(
-            "INSERT INTO users (username, password_hash, display_name) VALUES ('probe', 'x', 'Probe')",
+            "INSERT INTO users (username, password_hash, display_name, account_uid) \
+             VALUES ('probe', 'x', 'Probe', 'probe-uid')",
         )
         .execute(&pool)
         .await

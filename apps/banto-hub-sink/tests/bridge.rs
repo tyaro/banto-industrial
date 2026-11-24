@@ -286,7 +286,7 @@ async fn test_app() -> TestApp {
     let users = UsersService::new(Db::Sqlite(pool.clone()));
     let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
     users
-        .setup_first_user("testadmin", "password123", "管理者")
+        .create_user("testadmin", "password123", "管理者", banto_hub_core::users::Role::Admin)
         .await
         .expect("setup_first_user");
     let verify_users = users.clone();
@@ -300,6 +300,7 @@ async fn test_app() -> TestApp {
                         id: identity.username,
                         name: identity.display_name,
                         role: identity.role.to_string(),
+                        account_id: None,
                     }),
                     _ => None,
                 }
@@ -365,7 +366,6 @@ async fn test_app() -> TestApp {
         auth,
         commissioning,
         events_tx,
-        false,
         write_control,
         write_audit,
         mqtt,

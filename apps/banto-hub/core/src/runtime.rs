@@ -247,8 +247,6 @@ pub struct HubConfig {
     pub drivers: crate::broker_glue::HubDrivers,
     /// DB ファイルパス。旧 `BANTO_DB` env（既定 [`DEFAULT_DB_PATH`]）。
     pub db_path: String,
-    /// `POST /api/auth/setup`を許可するか。旧 `BANTO_ALLOW_SETUP=="1"`。
-    pub allow_setup: bool,
     /// settings の `server.port`を上書きする値。旧 `PORT` env
     /// （パース成功時のみ `Some`、未設定/パース失敗は `None` - 現行の
     /// `.ok().and_then(|v| v.parse().ok())`と同じ意味）。
@@ -463,7 +461,6 @@ impl HubRuntime {
         let HubConfig {
             drivers,
             db_path,
-            allow_setup,
             port_override,
             bind_override,
             data_dir_override,
@@ -599,7 +596,6 @@ impl HubRuntime {
             registry,
             drivers,
             tls_config,
-            allow_setup,
             port_override,
             bind_override,
             data_dir_override,
@@ -650,7 +646,6 @@ impl HubRuntime {
             registry,
             drivers,
             tls_config,
-            allow_setup,
             port_override,
             bind_override,
             data_dir_override,
@@ -700,8 +695,16 @@ impl HubRuntime {
         ensure_virtual_connection(&pool, &registry, MEM_CONNECTION_NAME).await;
 
         let events = event_channel();
-        let users = UsersService::new(Db::Sqlite(pool.clone()));
+        let users = UsersService::new(Db::Sqlite(pool.clone()))
+            .with_reserved_usernames(crate::commissioning::reserved_usernames());
         let settings = SettingsService::new(Db::Sqlite(pool.clone()));
+        // banto v8（ADR-0034 §2・§4・§9）: 組み込みの `admin` の行がちょうど 1 つ、予約名と
+        // 同じ名前のアカウントが無いことを確かめ、組み込みの行の id を読む（名前では引かない）。
+        // 満たさない DB は名前と対処を書いたエラーで起動を止める（直さない）。
+        let startup_users = users
+            .check_startup()
+            .await
+            .map_err(HubStartError::InitDb)?;
 
         // PORT/BANTO_BIND/BANTO_HUB_DATA (via `*_override`) override the
         // persisted settings, which in turn fall back to their own defaults
@@ -808,7 +811,8 @@ impl HubRuntime {
         // あり、そこで失敗して戻ると `JoinHandle` が捨てられて「止まらないまま
         // 残る」ため（デスクトップのトレイ再試行で起動のたびに積み上がる。#557 の
         // レビュー指摘）。最後に失敗しうる手順（サーバー起動）の後で起こす。
-        let auth = user_auth_state(users.clone(), audit.clone());
+        let auth = user_auth_state(users.clone(), audit.clone())
+            .with_builtin_admin_id(startup_users.builtin_admin_id);
 
         // 試運転モードとロックダウン（docs/hub/tag-server-design.md §5.6・
         // 2026-08-30 オーナー決定）: DB の永続状態からロックダウン済みかを
@@ -1124,7 +1128,6 @@ impl HubRuntime {
                 auth,
                 commissioning,
                 events,
-                allow_setup,
                 write_control,
                 write_audit.clone(),
                 mqtt.clone(),
@@ -1326,13 +1329,9 @@ impl HubRuntime {
                 "banto-hub: gRPC is DISABLED - enable it from the admin UI settings page (PUT /api/grpc-settings)",
             );
         }
-        if allow_setup {
-            log_line("banto-hub: first-run setup is ENABLED (BANTO_ALLOW_SETUP=1) - POST /api/auth/setup will create the first account");
-        } else {
-            log_line(
-                "banto-hub: first-run setup is DISABLED - set BANTO_ALLOW_SETUP=1 to allow POST /api/auth/setup",
-            );
-        }
+        // banto v8（ADR-0034 §7）: 初回セットアップ（`POST /api/auth/setup`）は無い。
+        // 最初の管理者はサービスを止めて `banto-hub create-admin` で作る。
+        log_line("banto-hub: first admin account: stop the hub and run `banto-hub create-admin --username <name>` (password on stdin)");
         // このメッセージはコンソール専用の案内文だが、`HubRuntime::start`は
         // コンソール/サービス両モード共通のコードパスなので、サービスモード
         // のログファイルにもそのまま出力される（実際に押せる Ctrl-C は無いが、
@@ -1392,7 +1391,6 @@ struct StartOnDb<'a> {
     registry: Arc<banto_driver_api::DriverRegistry>,
     drivers: crate::broker_glue::HubDrivers,
     tls_config: Option<TlsPlan>,
-    allow_setup: bool,
     port_override: Option<u16>,
     bind_override: Option<String>,
     data_dir_override: Option<PathBuf>,
@@ -2042,7 +2040,6 @@ mod tests {
                 .join("hub.sqlite3")
                 .to_string_lossy()
                 .into_owned(),
-            allow_setup: false,
             port_override: Some(0),
             bind_override: Some("127.0.0.1".into()),
             data_dir_override: Some(dir.path().join("data")),
@@ -2100,7 +2097,6 @@ mod tests {
         let config = HubConfig {
             drivers: crate::test_support::test_drivers(),
             db_path,
-            allow_setup: false,
             port_override: Some(0),
             bind_override: Some("127.0.0.1".to_string()),
             data_dir_override: Some(data_dir),
@@ -2146,7 +2142,6 @@ mod tests {
         let config = HubConfig {
             drivers: crate::test_support::test_drivers(),
             db_path: db.to_string_lossy().into_owned(),
-            allow_setup: false,
             port_override: Some(0),
             bind_override: Some("127.0.0.1".to_string()),
             data_dir_override: Some(dirs.data.path().to_path_buf()),
@@ -2187,7 +2182,6 @@ mod tests {
                 .join(DB_FILE_NAME)
                 .to_string_lossy()
                 .into_owned(),
-            allow_setup: false,
             port_override: Some(0),
             bind_override: Some("127.0.0.1".to_string()),
             data_dir_override: Some(dirs.data.path().to_path_buf()),
@@ -2316,7 +2310,6 @@ mod tests {
         let config = HubConfig {
             drivers: crate::test_support::test_drivers(),
             db_path: db.to_string_lossy().into_owned(),
-            allow_setup: false,
             port_override: Some(0),
             bind_override: Some(if legacy { "127.0.0.1" } else { "0.0.0.0" }.to_string()),
             data_dir_override: Some(dirs.data.path().to_path_buf()),
@@ -2420,7 +2413,6 @@ mod tests {
                 .join(DB_FILE_NAME)
                 .to_string_lossy()
                 .into_owned(),
-            allow_setup: false,
             port_override: Some(0),
             bind_override: Some("127.0.0.1".to_string()),
             data_dir_override: Some(dirs.data.path().to_path_buf()),
@@ -2472,7 +2464,6 @@ mod tests {
         let config = HubConfig {
             drivers: crate::test_support::test_drivers(),
             db_path: db.to_string_lossy().into_owned(),
-            allow_setup: false,
             port_override: Some(0),
             bind_override: Some("127.0.0.1".to_string()),
             data_dir_override: Some(dirs.data.path().to_path_buf()),
@@ -2554,7 +2545,6 @@ mod tests {
                 .join(DB_FILE_NAME)
                 .to_string_lossy()
                 .into_owned(),
-            allow_setup: false,
             port_override: Some(0),
             bind_override: Some("127.0.0.1".to_string()),
             data_dir_override: Some(dirs.data.path().to_path_buf()),
@@ -2627,7 +2617,6 @@ mod tests {
         let hub = HubRuntime::start(HubConfig {
             drivers: crate::test_support::test_drivers(),
             db_path,
-            allow_setup: false,
             port_override: Some(0),
             bind_override: Some("127.0.0.1".to_owned()),
             data_dir_override: Some(dir.path().join("data")),
@@ -2720,14 +2709,13 @@ mod tests {
             .into_owned();
         let pool = init_db(&db_path).await.expect("init DB");
         UsersService::new(Db::Sqlite(pool.clone()))
-            .setup_first_user("testadmin", "password123", "管理者")
+            .create_user("testadmin", "password123", "管理者", crate::users::Role::Admin)
             .await
             .expect("setup admin");
         pool.close().await;
         let hub = HubRuntime::start(HubConfig {
             drivers: crate::test_support::test_drivers(),
             db_path,
-            allow_setup: false,
             port_override: Some(0),
             bind_override: Some("127.0.0.1".to_owned()),
             data_dir_override: Some(dir.path().join("data")),
@@ -2871,7 +2859,7 @@ mod tests {
             .into_owned();
         let pool = init_db(&db_path).await.expect("init DB");
         UsersService::new(Db::Sqlite(pool.clone()))
-            .setup_first_user("testadmin", "password123", "管理者")
+            .create_user("testadmin", "password123", "管理者", crate::users::Role::Admin)
             .await
             .expect("setup admin");
         pool.close().await;
@@ -2879,7 +2867,6 @@ mod tests {
         let hub = HubRuntime::start(HubConfig {
             drivers: crate::test_support::test_drivers(),
             db_path,
-            allow_setup: false,
             port_override: Some(0),
             bind_override: Some("127.0.0.1".to_owned()),
             data_dir_override: Some(dir.path().join("data")),
@@ -3180,7 +3167,6 @@ mod tests {
         let hub = HubRuntime::start(HubConfig {
             drivers: crate::test_support::test_drivers(),
             db_path,
-            allow_setup: false,
             port_override: Some(0),
             bind_override: Some("127.0.0.1".to_owned()),
             data_dir_override: Some(dir.path().join("data")),
@@ -3600,7 +3586,6 @@ mod tests {
                 .join("registry.sqlite3")
                 .to_string_lossy()
                 .into_owned(),
-            allow_setup: false,
             port_override: Some(port),
             bind_override: Some("127.0.0.1".to_string()),
             data_dir_override: Some(dir.path().join("data")),
@@ -3661,7 +3646,6 @@ mod tests {
                 .join("registry.sqlite3")
                 .to_string_lossy()
                 .into_owned(),
-            allow_setup: false,
             port_override: Some(0),
             bind_override: Some("127.0.0.1".to_string()),
             data_dir_override: Some(dir.path().join("data")),
@@ -3713,7 +3697,6 @@ mod tests {
         let config = HubConfig {
             drivers: crate::test_support::test_drivers(),
             db_path,
-            allow_setup: false,
             port_override: Some(0),
             bind_override: Some("127.0.0.1".to_string()),
             data_dir_override: Some(dir.path().join("data")),
@@ -3890,7 +3873,6 @@ Host: {addr}
         let config = HubConfig {
             drivers: crate::test_support::test_drivers(),
             db_path,
-            allow_setup: false,
             port_override: Some(0),
             bind_override: Some("0.0.0.0".to_string()),
             data_dir_override: Some(data_dir),
@@ -3935,7 +3917,6 @@ Host: {addr}
         let config = HubConfig {
             drivers: crate::test_support::test_drivers(),
             db_path,
-            allow_setup: false,
             port_override: Some(0),
             bind_override: Some("127.0.0.1".to_string()),
             data_dir_override: Some(data_dir),
@@ -3978,7 +3959,6 @@ Host: {addr}
         let config = HubConfig {
             drivers: crate::test_support::test_drivers(),
             db_path,
-            allow_setup: false,
             port_override: Some(0),
             bind_override: Some("127.0.0.1".to_string()),
             data_dir_override: Some(dir.path().join("data")),
@@ -4279,7 +4259,7 @@ Host: {addr}
             .into_owned();
         let pool = init_db(&db_path).await.expect("init DB");
         UsersService::new(Db::Sqlite(pool.clone()))
-            .setup_first_user("testadmin", "password123", "管理者")
+            .create_user("testadmin", "password123", "管理者", crate::users::Role::Admin)
             .await
             .expect("setup admin");
         pool.close().await;
@@ -4287,7 +4267,6 @@ Host: {addr}
         let hub = HubRuntime::start(HubConfig {
             drivers: crate::test_support::test_drivers(),
             db_path: db_path.clone(),
-            allow_setup: false,
             port_override: Some(0),
             bind_override: Some("127.0.0.1".to_owned()),
             data_dir_override: Some(dir.path().join("data")),

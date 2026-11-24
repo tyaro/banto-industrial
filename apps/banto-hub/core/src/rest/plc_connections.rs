@@ -7,6 +7,7 @@
 //! （`crate::rest::X`）は親の re-export で保つ。
 
 use super::{
+    AuditActor, Extension,
     commit_catalog_and_notify, default_payload_enabled, json, preflight_transaction,
     queue_pending_registry_change, record_write, registry_before, registry_change_should_queue,
     reject_delete_if_referenced_by_sink_group, require_editor, storage_api_error, ApiError,
@@ -388,6 +389,7 @@ pub(super) async fn plc_connections_get(
 
 pub(super) async fn plc_connections_create(
     State(state): State<TagRegistryState>,
+    Extension(actor): Extension<AuditActor>,
     headers: HeaderMap,
     Json(input): Json<PlcConnectionPayload>,
 ) -> RegistryMutationResult<Response> {
@@ -462,8 +464,7 @@ pub(super) async fn plc_connections_create(
     tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
-        &state.auth,
-        &headers,
+        &actor,
         "create",
         "plc_connections",
         Some(&created.id.to_string()),
@@ -481,6 +482,7 @@ pub(super) async fn plc_connections_create(
 
 pub(super) async fn plc_connections_update(
     State(state): State<TagRegistryState>,
+    Extension(actor): Extension<AuditActor>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     Json(input): Json<PlcConnectionPayload>,
@@ -557,8 +559,7 @@ pub(super) async fn plc_connections_update(
     tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
-        &state.auth,
-        &headers,
+        &actor,
         "update",
         "plc_connections",
         Some(&id.to_string()),
@@ -576,6 +577,7 @@ pub(super) async fn plc_connections_update(
 
 pub(super) async fn plc_connections_delete(
     State(state): State<TagRegistryState>,
+    Extension(actor): Extension<AuditActor>,
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> RegistryMutationResult<Response> {
@@ -652,8 +654,7 @@ pub(super) async fn plc_connections_delete(
     tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
-        &state.auth,
-        &headers,
+        &actor,
         "delete",
         "plc_connections",
         Some(&id.to_string()),

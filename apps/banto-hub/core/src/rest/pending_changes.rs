@@ -7,14 +7,14 @@
 //! で使う。外から使われるパス（`crate::rest::X`）は親の re-export で保つ。
 
 use super::{
-    actor_identity, broadcast, commit_catalog_and_notify, default_payload_enabled, get, json,
+    broadcast, record_as, AuditActor, Extension, commit_catalog_and_notify, default_payload_enabled, get, json,
     middleware, post, preflight_api_error, preflight_transaction, record_write,
     redact_pending_change_for_response, registry_before, reject_delete_if_referenced_by_sink_group,
     reject_hub_connection_protocol, remove_tag_from_all_sink_groups, require_session,
-    require_session_role, storage_api_error, ApiError, Arc, AsyncMutex, AuditEntry,
+    require_session_role, storage_api_error, ApiError, Arc, AsyncMutex,
     AuditLogService, AuthGate, AuthState, BantoError, BatchTagDeleteOutcome, BatchTagOutcome,
     BatchTagUpdateOutcome, CollectionController, CollectionGroupPayload, CollectionGroupService,
-    CollectorManager, Deserialize, FieldError, HeaderMap, IntoResponse, Json, OperationKind, Path,
+    CollectorManager, Deserialize, FieldError, IntoResponse, Json, OperationKind, Path,
     PendingChange, PendingChangesService, PlcConnectionPayload, PlcConnectionResponse,
     PlcConnectionService, Query, Response, Role, Router, Serialize, ServerEvent, SessionRoleGuard,
     State, StatusCode, TagBatchUpdatePayload, TagInput, TagPayload, TagService, TagUpdateError,
@@ -31,7 +31,6 @@ struct PendingChangesAdminState {
     controller: Arc<CollectionController>,
     events: broadcast::Sender<ServerEvent>,
     apply_lock: Arc<AsyncMutex<()>>,
-    auth: AuthState,
     audit: AuditLogService,
 }
 
@@ -698,14 +697,13 @@ async fn pending_changes_get(
 
 async fn pending_changes_cancel(
     State(state): State<PendingChangesAdminState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
     Path(id): Path<i64>,
 ) -> Result<Json<PendingChange>, ApiError> {
     let pending = state.pending_changes.cancel_pending(id).await?;
     record_write(
         &state.audit,
-        &state.auth,
-        &headers,
+        &actor,
         "cancel",
         "pending_changes",
         Some(&id.to_string()),
@@ -717,14 +715,13 @@ async fn pending_changes_cancel(
 
 async fn pending_changes_requeue(
     State(state): State<PendingChangesAdminState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
     Path(id): Path<i64>,
 ) -> Result<Json<PendingChange>, ApiError> {
     let pending = state.pending_changes.requeue_pending(id).await?;
     record_write(
         &state.audit,
-        &state.auth,
-        &headers,
+        &actor,
         "requeue",
         "pending_changes",
         Some(&id.to_string()),
@@ -736,7 +733,7 @@ async fn pending_changes_requeue(
 
 async fn pending_changes_apply(
     State(state): State<PendingChangesAdminState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
     Path(id): Path<i64>,
 ) -> Response {
     let _guard = state.apply_lock.lock().await;
@@ -767,24 +764,21 @@ async fn pending_changes_apply(
             // （行は `applied`）で実行構成への反映だけが失敗した、という
             // 事実がここだけからしか追えないため、必ず残す
             // （#340 の `record_write_control_failure` と同じ型）。
-            let identity = actor_identity(&headers, &state.auth);
-            state
-                .audit
-                .record(AuditEntry {
-                    actor_username: identity.as_ref().map(|i| i.id.as_str()),
-                    actor_role: identity.as_ref().map(|i| i.role.as_str()),
-                    action: "apply",
-                    resource: "pending_changes",
-                    entity_id: Some(&id.to_string()),
-                    detail: Some(json!({
-                        "source": applying.source,
-                        "failureReason": failure_reason,
-                        "note": "DB への適用は成功したが、実行構成への反映に失敗した",
-                    })),
-                    origin: "rest",
-                    result: "failed",
-                })
-                .await;
+            record_as(
+                &state.audit,
+                Some(&actor),
+                "rest",
+                "apply",
+                "pending_changes",
+                Some(&id.to_string()),
+                Some(json!({
+                    "source": applying.source,
+                    "failureReason": failure_reason,
+                    "note": "DB への適用は成功したが、実行構成への反映に失敗した",
+                })),
+                "failed",
+            )
+            .await;
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({
@@ -820,8 +814,7 @@ async fn pending_changes_apply(
     };
     record_write(
         &state.audit,
-        &state.auth,
-        &headers,
+        &actor,
         "apply",
         "pending_changes",
         Some(&id.to_string()),
@@ -852,7 +845,6 @@ pub(super) fn pending_changes_router(
         controller,
         events,
         apply_lock: Arc::new(AsyncMutex::new(())),
-        auth: auth.clone(),
         audit: audit.clone(),
     };
     Router::new()

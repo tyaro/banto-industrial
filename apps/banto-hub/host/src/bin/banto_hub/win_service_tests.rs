@@ -360,7 +360,6 @@ impl Fixture {
                 let config = HubConfig {
                     drivers: crate::hub_drivers(),
                     db_path: paths.db_path.to_string_lossy().into_owned(),
-                    allow_setup: false,
                     port_override: Some(0),
                     bind_override: Some(bind.clone()),
                     data_dir_override: Some(paths.data_dir.clone()),
@@ -961,7 +960,6 @@ async fn hub_runtime_start_fails_fast_when_profile_lock_already_held() {
             .join("registry.sqlite3")
             .to_string_lossy()
             .into_owned(),
-        allow_setup: false,
         port_override: Some(0),
         bind_override: Some("127.0.0.1".to_string()),
         data_dir_override: Some(root.0.join("data")),

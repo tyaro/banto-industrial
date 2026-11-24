@@ -140,7 +140,7 @@ async fn test_env_on_pool(
     let plc_connections = manager.plc_connections();
 
     users
-        .setup_first_user("testadmin", "password123", "管理者")
+        .create_user("testadmin", "password123", "管理者", crate::users::Role::Admin)
         .await
         .expect("setup_first_user");
     users
@@ -159,6 +159,7 @@ async fn test_env_on_pool(
                         id: identity.username,
                         name: identity.display_name,
                         role: identity.role.to_string(),
+                        account_id: None,
                     }),
                     _ => None,
                 }
@@ -227,7 +228,6 @@ async fn test_env_on_pool(
         auth,
         commissioning,
         tx,
-        false,
         write_control,
         write_audit,
         mqtt,

@@ -234,6 +234,7 @@ pub mod broker_glue;
 pub mod clock_read;
 pub mod clock_sync;
 pub mod commissioning;
+pub mod first_admin;
 pub mod computed;
 pub mod controller;
 pub mod db;

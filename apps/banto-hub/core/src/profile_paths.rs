@@ -312,9 +312,6 @@ pub fn build_hub_config_from_env(host_kind: HubHostKind, drivers: HubDrivers) ->
         drivers,
         db_path: std::env::var("BANTO_DB")
             .unwrap_or_else(|_| paths.db_path.to_string_lossy().into_owned()),
-        allow_setup: std::env::var("BANTO_ALLOW_SETUP")
-            .map(|value| value == "1")
-            .unwrap_or(false),
         port_override: std::env::var("PORT")
             .ok()
             .and_then(|value| value.parse().ok()),

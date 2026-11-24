@@ -66,12 +66,12 @@ use banto_server::{AuthState, GrantCondition, GrantKind, GrantSpec, Identity};
 
 use crate::db::Db;
 use crate::settings::SettingsService;
-use crate::users::{Role, UsersService};
+use crate::users::{ReservedUsernames, Role, UsersService};
 
 /// `settings` テーブルのキー。値は `"true"`/`"false"`、未設定は常に
 /// 試運転モード扱い（[`resolve_locked_down`]参照 - 2026-08-30 オーナー決定
 /// でユーザー数によるフォールバック判定は撤回した）。
-const KEY_LOCKED_DOWN: &str = "commissioning.locked_down";
+pub(crate) const KEY_LOCKED_DOWN: &str = "commissioning.locked_down";
 
 /// 試運転モードの grant セッション（[`commissioning_grant_spec`]）の固定
 /// identity の `id`。実在ユーザーの `username`（`users.username`は
@@ -92,7 +92,17 @@ pub fn synthetic_identity() -> Identity {
         id: SYNTHETIC_ACTOR_ID.to_string(),
         name: "試運転モード".to_string(),
         role: Role::Admin.as_str().to_string(),
+        // grant の固定 identity はアカウントではない（banto v8 C3）。
+        account_id: None,
     }
+}
+
+/// banto v8（ADR-0034 §4）: 組み込みの `admin` に加えて、この Hub が登録する grant の
+/// 固定 id（[`SYNTHETIC_ACTOR_ID`]）をアカウント名として予約する。REST の
+/// `UsersService`・起動時の検査（`UsersService::check_startup`）・CLI の `create-admin`
+/// が同じ一覧を使う。
+pub fn reserved_usernames() -> ReservedUsernames {
+    ReservedUsernames::new([SYNTHETIC_ACTOR_ID])
 }
 
 /// 試運転モードの grant の kind（ADR-0017 §2「kind の識別子」: URL
@@ -422,7 +432,7 @@ mod tests {
     async fn unset_state_resolves_to_commissioning_mode_regardless_of_users() {
         let (settings, users) = services().await;
         users
-            .setup_first_user("owner", "password123", "オーナー")
+            .create_user("owner", "password123", "オーナー", crate::users::Role::Admin)
             .await
             .expect("setup_first_user");
 
@@ -486,7 +496,7 @@ mod tests {
         // 付き）を迂回して直接 SQL でロールを書き換え、「admin が1人も
         // いない」状況を再現する。
         users
-            .setup_first_user("owner", "password123", "オーナー")
+            .create_user("owner", "password123", "オーナー", crate::users::Role::Admin)
             .await
             .expect("setup_first_user");
         sqlx::query("UPDATE users SET role = 'editor' WHERE username = 'owner'")
@@ -514,7 +524,7 @@ mod tests {
     async fn lock_down_succeeds_with_an_admin_account_and_persists() {
         let (settings, users) = services().await;
         users
-            .setup_first_user("owner", "password123", "オーナー")
+            .create_user("owner", "password123", "オーナー", crate::users::Role::Admin)
             .await
             .expect("setup_first_user");
 
@@ -538,7 +548,7 @@ mod tests {
     async fn lock_down_is_idempotent_when_already_locked_down() {
         let (settings, users) = services().await;
         users
-            .setup_first_user("owner", "password123", "オーナー")
+            .create_user("owner", "password123", "オーナー", crate::users::Role::Admin)
             .await
             .expect("setup_first_user");
         let service = CommissioningService::load(settings, users, auth())
@@ -556,7 +566,7 @@ mod tests {
     async fn revert_to_commissioning_flips_state_back() {
         let (settings, users) = services().await;
         users
-            .setup_first_user("owner", "password123", "オーナー")
+            .create_user("owner", "password123", "オーナー", crate::users::Role::Admin)
             .await
             .expect("setup_first_user");
         let service = CommissioningService::load(settings, users, auth())
@@ -579,7 +589,7 @@ mod tests {
     async fn lock_down_revokes_the_commissioning_grant_tokens_after_persisting_the_flag() {
         let (settings, users) = services().await;
         users
-            .setup_first_user("owner", "password123", "オーナー")
+            .create_user("owner", "password123", "オーナー", crate::users::Role::Admin)
             .await
             .expect("setup_first_user");
         let auth = auth();

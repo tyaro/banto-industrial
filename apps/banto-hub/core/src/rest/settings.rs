@@ -7,10 +7,11 @@
 //! 保つ。
 
 use super::{
+    AuditActor, Extension,
     broadcast, get, json, middleware, post, record_write, require_banto_client_header,
     require_session, require_session_role, shutting_down_response, ApiError, Arc, AsyncMutex,
     AuditLogService, AuthGate, AuthState, BantoError, CollectorManager, Db, Deserialize,
-    FieldError, HeaderMap, HubSettingsExt, IntoResponse, IpAddr, Json, LocalDate, MqttPublisher,
+    FieldError, HubSettingsExt, IntoResponse, IpAddr, Json, LocalDate, MqttPublisher,
     MqttSettings, OperationKind, Response, Role, Router, Serialize, ServerEvent, SessionRoleGuard,
     SettingsService, State, StoreSettings, ToSchema,
 };
@@ -27,7 +28,6 @@ use super::{
 struct MqttSettingsAdminState {
     manager: Arc<CollectorManager>,
     mqtt: Arc<MqttPublisher>,
-    auth: AuthState,
     audit: AuditLogService,
     events: broadcast::Sender<ServerEvent>,
 }
@@ -140,7 +140,7 @@ pub(crate) fn validate_mqtt_settings_request(body: &MqttSettingsRequest) -> Vec<
 
 async fn mqtt_settings_put(
     State(state): State<MqttSettingsAdminState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
     Json(body): Json<MqttSettingsRequest>,
 ) -> Result<Json<MqttSettingsResponse>, ApiError> {
     let field_errors = validate_mqtt_settings_request(&body);
@@ -177,8 +177,7 @@ async fn mqtt_settings_put(
 
     record_write(
         &state.audit,
-        &state.auth,
-        &headers,
+        &actor,
         "update",
         "mqtt_settings",
         Some("1"),
@@ -202,7 +201,6 @@ pub(super) fn mqtt_settings_router(
     let state = MqttSettingsAdminState {
         manager,
         mqtt,
-        auth: auth.clone(),
         audit: audit.clone(),
         events,
     };
@@ -254,7 +252,6 @@ pub(super) fn mqtt_settings_router(
 #[derive(Clone)]
 struct StoreSettingsAdminState {
     manager: Arc<CollectorManager>,
-    auth: AuthState,
     audit: AuditLogService,
 }
 
@@ -324,7 +321,7 @@ async fn store_settings_get(
 /// リクエストで変更しない（既存値を読んで維持する）。
 async fn store_settings_put(
     State(state): State<StoreSettingsAdminState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
     Json(body): Json<StoreSettingsRequest>,
 ) -> Result<Json<StoreSettingsResponse>, ApiError> {
     let field_errors = validate_store_settings_request(&body);
@@ -342,8 +339,7 @@ async fn store_settings_put(
 
     record_write(
         &state.audit,
-        &state.auth,
-        &headers,
+        &actor,
         "update",
         "store_settings",
         Some("1"),
@@ -420,7 +416,7 @@ struct PruneNowResponse {
 /// なので必ず監査エントリを記録する。
 async fn store_settings_prune_now(
     State(state): State<StoreSettingsAdminState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
 ) -> Result<Json<PruneNowResponse>, ApiError> {
     let config = SettingsService::new(Db::Sqlite(state.manager.pool()))
         .store_config()
@@ -453,8 +449,7 @@ async fn store_settings_prune_now(
 
     record_write(
         &state.audit,
-        &state.auth,
-        &headers,
+        &actor,
         "delete",
         "store_settings_prune",
         Some("1"),
@@ -472,7 +467,6 @@ pub(super) fn store_settings_router(
 ) -> Router {
     let state = StoreSettingsAdminState {
         manager,
-        auth: auth.clone(),
         audit: audit.clone(),
     };
     Router::new()
@@ -529,7 +523,6 @@ pub(super) fn store_settings_router(
 struct GrpcSettingsAdminState {
     manager: Arc<CollectorManager>,
     grpc_server: Arc<crate::grpc::GrpcServer>,
-    auth: AuthState,
     audit: AuditLogService,
     events: broadcast::Sender<ServerEvent>,
 }
@@ -604,7 +597,7 @@ pub(crate) fn validate_grpc_settings_body(body: &GrpcSettingsBody) -> Vec<FieldE
 
 async fn grpc_settings_put(
     State(state): State<GrpcSettingsAdminState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
     Json(body): Json<GrpcSettingsBody>,
 ) -> Result<Json<GrpcSettingsBody>, ApiError> {
     let field_errors = validate_grpc_settings_body(&body);
@@ -633,8 +626,7 @@ async fn grpc_settings_put(
 
     record_write(
         &state.audit,
-        &state.auth,
-        &headers,
+        &actor,
         "update",
         "grpc_settings",
         Some("1"),
@@ -658,7 +650,6 @@ pub(super) fn grpc_settings_router(
     let state = GrpcSettingsAdminState {
         manager,
         grpc_server,
-        auth: auth.clone(),
         audit: audit.clone(),
         events,
     };
@@ -690,7 +681,6 @@ pub(super) fn grpc_settings_router(
 struct OpcUaSettingsAdminState {
     manager: Arc<CollectorManager>,
     publisher: Arc<crate::opcua::OpcUaPublisher>,
-    auth: AuthState,
     audit: AuditLogService,
     events: broadcast::Sender<ServerEvent>,
     write_lock: Arc<AsyncMutex<()>>,
@@ -805,7 +795,7 @@ pub(crate) fn validate_opcua_settings(config: &crate::settings::OpcUaSettings) -
 
 async fn opcua_settings_put(
     State(state): State<OpcUaSettingsAdminState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
     Json(mut config): Json<crate::settings::OpcUaSettings>,
 ) -> Result<Response, ApiError> {
     if config.advertised_host.as_deref() == Some("") {
@@ -835,8 +825,7 @@ async fn opcua_settings_put(
         state.publisher.apply(&config).await;
         record_write(
             &state.audit,
-            &state.auth,
-            &headers,
+            &actor,
             "update",
             "opcua_settings",
             Some("1"),
@@ -871,7 +860,6 @@ pub(crate) fn opcua_settings_router(
     let state = OpcUaSettingsAdminState {
         manager,
         publisher,
-        auth: auth.clone(),
         audit: audit.clone(),
         events,
         write_lock: Arc::new(AsyncMutex::new(())),

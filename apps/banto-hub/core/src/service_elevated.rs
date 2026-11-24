@@ -743,6 +743,8 @@ pub async fn revert_to_commissioning_with_audit(
             // 状態へ戻す操作そのものなので、ロールを引けるログイン
             // セッションが存在しない） - `None`のままにする
             // （`crate::audit`は`actor_role: None`を「未認証イベント」で
+            actor_id: None,
+            actor_kind: Some(crate::audit::ACTOR_KIND_CLI),
             // 許容済み、`login_failed`の既存例と同じ扱い）。
             actor_role: None,
             action: "commissioning_revert",
@@ -1750,7 +1752,7 @@ mod tests {
         let pool = crate::db::migrate_memory().await.expect("migrate_memory");
         let users = crate::users::UsersService::new(crate::db::Db::Sqlite(pool.clone()));
         users
-            .setup_first_user("owner", "old-password-1", "オーナー")
+            .create_user("owner", "old-password-1", "オーナー", crate::users::Role::Admin)
             .await
             .expect("setup_first_user");
 
@@ -1792,7 +1794,7 @@ mod tests {
         let settings = crate::settings::SettingsService::new(crate::db::Db::Sqlite(pool.clone()));
         let users = crate::users::UsersService::new(crate::db::Db::Sqlite(pool.clone()));
         users
-            .setup_first_user("owner", "password123", "オーナー")
+            .create_user("owner", "password123", "オーナー", crate::users::Role::Admin)
             .await
             .expect("setup_first_user");
         let auth = banto_server::AuthState::new(

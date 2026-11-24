@@ -1053,7 +1053,7 @@ mod tests {
         let db = || crate::db::Db::Sqlite(pool.clone());
         let users = crate::users::UsersService::new(db());
         users
-            .setup_first_user("testadmin", "password123", "管理者")
+            .create_user("testadmin", "password123", "管理者", crate::users::Role::Admin)
             .await
             .expect("setup admin");
         let audit = crate::audit::AuditLogService::new(db());

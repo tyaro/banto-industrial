@@ -286,7 +286,9 @@ async fn audit_log_list_as_of_id_pins_the_snapshot() {
     let audit = AuditLogService::new(Db::Sqlite(env.pool.clone()));
     let entry = |action: &'static str| AuditEntry {
         actor_username: Some("admin"),
+        actor_id: None,
         actor_role: Some("admin"),
+        actor_kind: Some("account"),
         action,
         resource: "items",
         entity_id: None,
