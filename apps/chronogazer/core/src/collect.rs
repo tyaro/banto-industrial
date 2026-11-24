@@ -684,6 +684,11 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+// banto v8（`crate::store_generation`）: DB を作り直して id を使い回す筋書きで、前の保存先の値が
+// 読み出しに混ざらないことの試験。
+#[cfg(test)]
+mod store_generation_tests;
+
 // R1-D の D-3a: 直近の履歴の読み出し（`GET /api/collect/history` /
 // `collect_history`）。操作キューを通らない読み出しで、本体は子モジュール。
 mod history;
@@ -3358,18 +3363,18 @@ fn collect_error_with_reason(err: CollectError, reason: String) -> BantoError {
 
 /// 設定 `data.dir` を実際のディレクトリへ解決する。
 ///
-/// 既定値は banto-hub に倣った相対パス `"./data"` なので、そのまま使うと
+/// 既定値は相対パス `"./data/history"`（[`crate::settings::default_data_dir`]）なので、そのまま使うと
 /// **プロセスの作業ディレクトリ**（デスクトップアプリでは何であるか分からない
 /// 場所）に時系列ファイルを作ってしまう。そこで**相対パスは `base`
 /// （アプリのデータディレクトリ）からの相対**として解決する。絶対パスが
 /// 設定されていればそれをそのまま使う（運用で外付けドライブを指したい、が
 /// この設定の主目的）。
 ///
-/// 空文字・空白だけは「未設定」とみなし、既定の `"./data"` と同じ扱いにする。
+/// 空文字・空白だけは「未設定」とみなし、既定の `"./data/history"` と同じ場所にする。
 pub fn resolve_data_dir(base: &Path, configured: &str) -> PathBuf {
     let trimmed = configured.trim();
     if trimmed.is_empty() {
-        return base.join("data");
+        return base.join("data").join("history");
     }
     let path = PathBuf::from(trimmed);
     if path.is_absolute() {
@@ -6209,7 +6214,10 @@ mod tests {
     #[test]
     fn blank_data_dir_falls_back_to_the_default_location() {
         let base = Path::new("C:/appdata");
-        assert_eq!(resolve_data_dir(base, "   "), base.join("data"));
+        assert_eq!(
+            resolve_data_dir(base, "   "),
+            base.join("data").join("history")
+        );
     }
 
     // --- 終了の受付（#392 A2 レビュー）------------------------------------

@@ -44,7 +44,8 @@ pub mod instance_lock;
 // （B2-4b）と共有するため移した（`server_host` は再公開）。
 pub mod key_store;
 // #392 B2-1: この PC からの接続を通す grant `localDesktop`（peer と Host の両方が
-// loopback、未初期化なら admin、初期化後は設定 `auth.local_grant`）。
+// loopback、起動時にログインなしならそのモードのロール、ログイン必須なら設定
+// `auth.local_grant`）。
 pub mod local_grant;
 // #623 PR-4: 設定モード ⇔ 運用モードの切り替えの SCM の扱いと待ち方・デスクトップのログ・引き継ぎ。
 pub mod mode_switch;
@@ -84,6 +85,8 @@ pub mod shell_launch;
 // 向け直し（Windows だけ）。`chronogazer-server` の bin から移し、デスクトップも使う。
 #[cfg(windows)]
 pub mod stdio_log;
+// banto v8 への追従（docs/banto-v8-upgrade-plan.md §5 の 1）: 時系列データの保存先の世代。
+pub mod store_generation;
 // #392（2026-10-12 オーナー決定）: 起動に失敗したときの「エラーの窓と対処の
 // 選択」の判断（純関数）と対処（作り直す・バックアップから戻す・保存先を
 // 選び直す）。窓は各シェル（今はデスクトップの `src-tauri`）が出す。

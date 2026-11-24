@@ -163,9 +163,15 @@ impl DataLayout {
         self.root.join(format!("{DB_FILE_NAME}.instance.lock"))
     }
 
-    /// 時系列データ（`data.dir` の既定の基準。`<root>\data`）。
+    /// 時系列データの管理するフォルダ（`<root>\data`。サービスが握る）。
     pub fn data_dir(&self) -> PathBuf {
         self.root.join("data")
+    }
+
+    /// 既定の時系列データの保存先（`data.dir` が未設定のとき。`<root>\data\history`。
+    /// banto v8 への追従から。[`crate::settings::default_data_dir`]・[`crate::store_generation`]）。
+    pub fn store_dir(&self) -> PathBuf {
+        self.data_dir().join("history")
     }
 
     /// バックアップ（`<DB の親>\backups\<DB のファイル名>`。banto の規約）。
@@ -401,6 +407,7 @@ mod tests {
             root.join("chronogazer.sqlite3.instance.lock")
         );
         assert_eq!(layout.data_dir(), root.join("data"));
+        assert_eq!(layout.store_dir(), root.join("data").join("history"));
         assert_eq!(
             layout.backups_dir(),
             root.join("backups").join("chronogazer.sqlite3")

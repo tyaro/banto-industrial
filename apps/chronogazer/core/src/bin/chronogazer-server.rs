@@ -965,9 +965,9 @@ async fn announce(server: &StartedServer, stop_hint: &str) {
             "{SERVER_LABEL}: LAN の待ち受けを開けませんでした（この PC からは使えます）: {err}"
         );
     }
-    // 最初の管理者の作成（`/api/auth/setup`）とこの PC からの接続（`localDesktop`、
-    // #392 B2-1）は、常時の listener への、この PC からの要求（peer と Host の両方が
-    // loopback）だけで開く（2026-10-14 オーナー決定。`0.0.0.0` にまとめても同じ）。
+    // この PC からの接続（`localDesktop`、#392 B2-1）は、常時の listener への、この PC からの
+    // 要求（peer と Host の両方が loopback）だけで開く（2026-10-14 オーナー決定。`0.0.0.0` に
+    // まとめても同じ）。banto v8 で初回セットアップ（`/api/auth/setup`）は無くなった。
     if let Some(addr) = engine.loopback_addr().await {
         let port = addr.port();
         if server.exposes_lan().await {

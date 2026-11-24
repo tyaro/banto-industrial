@@ -357,7 +357,7 @@ async fn latest_event(sandbox: &Sandbox) -> Option<String> {
     let pool = init_db(layout.db_path()).await.expect("開き直す");
     let reader = CollectorService::new(
         pool.clone(),
-        layout.data_dir(),
+        layout.store_dir(),
         chronogazer_core::engine::EngineConfig::builtin_drivers(),
     );
     let rows: Vec<CollectEventRow> = match reader.events(EventPage::default()).await {
@@ -371,7 +371,7 @@ async fn latest_event(sandbox: &Sandbox) -> Option<String> {
 /// データファイルの行数（全グループ）。
 async fn stored_row_count(sandbox: &Sandbox) -> usize {
     let mut count = 0;
-    for file in list_data_files(&sandbox.layout().data_dir()).expect("データファイルの列挙")
+    for file in list_data_files(&sandbox.layout().store_dir()).expect("データファイルの列挙")
     {
         let reader = TsReader::open(&file.path).await.expect("開ける");
         for group in reader.groups() {
@@ -660,7 +660,7 @@ async fn refuses_the_db_the_desktop_is_using_with_exit_code_2() {
         layout.secrets_dir(),
         layout.logs_dir(),
         layout.run_dir(),
-        layout.data_dir(),
+        layout.store_dir(),
     ] {
         assert!(!dir.exists(), "{} を作った", dir.display());
     }
@@ -737,7 +737,7 @@ async fn event_kinds(sandbox: &Sandbox) -> Vec<String> {
     let pool = init_db(layout.db_path()).await.expect("開き直す");
     let reader = CollectorService::new(
         pool.clone(),
-        layout.data_dir(),
+        layout.store_dir(),
         chronogazer_core::engine::EngineConfig::builtin_drivers(),
     );
     let rows: Vec<CollectEventRow> = match reader.events(EventPage::default()).await {

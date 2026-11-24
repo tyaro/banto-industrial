@@ -68,9 +68,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use banto_core::{BantoError, ErrorBody};
-use banto_server::routes::{
-    actor_for_token, bearer_token, require_role_at_least, AuditActor, RoleGuard,
-};
+use banto_server::routes::{bearer_token, require_role_at_least, AuditActor, RoleGuard};
 use banto_server::{
     bind as bind_listener, lan_urls_for_bind, request_is_loopback_local, require_auth, ApiError,
     AuthState, GrantKind, RunningServer, ServerConfig,
@@ -715,11 +713,12 @@ async fn server_settings_put(State(state): State<SettingsAdminState>, req: Reque
             "LAN の公開設定は、この PC からの接続（127.0.0.1）でだけ変更できます",
         );
     }
-    // 操作者は本文を待つ**前に**、要求のヘッダーから確定する（#600 の Copilot レビュー）:
+    // 操作者は、ゲート（`require_auth`・`require_role_at_least`）が認可の時点で要求に載せた
+    // 写し（banto v8、ADR-0034 §3）。トークンから引き直さない（#600 の Copilot レビュー:
     // 本文が届くのを待つ間に、別の `PUT /api/settings/auth` が `localDesktop` の grant を
     // 失効させると、後から引いた操作者は空になるのに、認可済みの変更は適用されて操作者
-    // なしで監査に残る。
-    let actor = actor_for_token(req.headers(), &state.auth);
+    // なしで監査に残る）。
+    let actor = req.extensions().get::<AuditActor>().cloned();
     // lock を取った後の再確認に使う（所有値にして切り離したタスクへ渡す）。
     let token = bearer_token(req.headers()).map(str::to_owned);
     let Json(payload) = match Json::<ServerSettingsPayload>::from_request(req, &()).await {
@@ -797,12 +796,12 @@ async fn auth_settings_put(State(state): State<SettingsAdminState>, req: Request
             "この PC からの接続の設定は、この PC からの接続（127.0.0.1）でだけ変更できます",
         );
     }
-    // 操作者は本文を待つ前と、保存・失効の前に確定する（#600 のレビューと Copilot
-    // レビュー）: `localDesktop` の admin のトークンで値を変えると、下の失効がこの要求
-    // 自身のトークンも消し、後から引くと操作者が空のまま特権の変更が監査に残る
+    // 操作者は、ゲートが認可の時点で要求に載せた写し（banto v8、ADR-0034 §3。#600 の
+    // レビューと Copilot レビュー）: `localDesktop` の admin のトークンで値を変えると、下の
+    // 失効がこの要求自身のトークンも消し、後から引くと操作者が空のまま特権の変更が監査に残る
     // （banto-hub の lock-down と同じ扱い）。本文を待つ間に別の要求が失効させた場合も
     // 同じ（`server_settings_put` と同じ扱い）。
-    let actor = actor_for_token(req.headers(), &state.auth);
+    let actor = req.extensions().get::<AuditActor>().cloned();
     let token = bearer_token(req.headers()).map(str::to_owned);
     let Json(body) =
         match Json::<serde_json::Map<String, serde_json::Value>>::from_request(req, &()).await {

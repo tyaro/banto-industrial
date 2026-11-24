@@ -92,7 +92,8 @@
 //!   書き換えられることが多いので、この確認は役に立たない。サービスの前に置かない
 //!   （banto ADR-0017 §6・設計書 §6 と同じ運用条件）。
 //! - 同じ PC の他の利用者・他のアプリ: loopback から入れる者は誰でも発行を受けられる。
-//!   そのため初期化後の既定は `off`（初回セットアップの選択は、それを承知で選ぶ口）。
+//!   そのためログイン必須の既定は `off`（`PUT /api/settings/auth` で開くのは、それを承知で
+//!   選ぶ口）。
 
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -431,7 +432,7 @@ pub struct LocalAccessState {
     pub users: UsersService,
     pub auth: AuthState,
     pub audit: AuditLogService,
-    /// 初回セットアップでの選択（モジュール doc）を保存する先。
+    /// 認証モードと設定 `auth.local_grant` を読む先（発行の条件。モジュール doc の 4.）。
     pub settings: SettingsService,
     /// `PUT /api/settings/auth` と同じ lock（`crate::rest::HostAccess::settings_lock`）。
     pub settings_lock: Arc<AsyncMutex<()>>,
@@ -525,7 +526,7 @@ pub async fn local_access_middleware(
         None
     };
 
-    // 予約名のアカウントがあれば、初期化後の `localDesktop` の発行を説明つきの `409` で
+    // 予約名のアカウントがあれば、`localDesktop` の発行を説明つきの `409` で
     // 断る（#600 の Copilot レビュー、[`has_reserved_accounts`]）。断る本体は条件の側
     // （status と発行で共有）にあり、ここは理由を伝えるだけ。この PC からの要求だけに
     // 答える（LAN の peer には条件の `403` のまま、アカウントの名前の有無を漏らさない）。
@@ -533,8 +534,8 @@ pub async fn local_access_middleware(
     // 監査と同じ `issued_role`（[`local_desktop_issue_role`]: 発行の POST・この listener が
     // 発行しうる・decode した kind が `localDesktop`）を使い、1 か所にまとめる（PR #649 の
     // オーナー Nit 1。挙動は同じ - `may_issue` は起動時の role があることを含む）。
-    // 未初期化で起動した後の初期化済み（#392 B2-2 で、設定が `admin` なら開く）も同じ
-    // なので、起動時の形は問わない（未初期化の間はアカウントが無く、常に偽）。
+    // ログインなしで起動した後にログイン必須へ切り替えた場合も同じなので、起動時の形は
+    // 問わない。
     if local && issued_role.is_some() {
         if let Ok(true) = has_reserved_accounts(&state.users).await {
             return (
@@ -550,11 +551,11 @@ pub async fn local_access_middleware(
     if !is_grant_issue {
         return next.run(req).await;
     }
-    // 発行（とその監査）・setup（とその後の失効）は、応答の future から切り離して最後まで
+    // 発行（とその監査）は、応答の future から切り離して最後まで
     // 走らせる（#600 の監査 F1・F4。[`run_detached`]）: hyper 1.x は応答を待つ間に
     // 相手の FIN を読むと service の future を捨てるので、`.await` をまたぐ後処理は
-    // 接続を切られると飛ぶ（発行したのに監査が無い・初期化したのに admin のトークンが
-    // 残る）。上流の処理（発行・setup の commit）ごと切り離すので、どの await 点で
+    // 接続を切られると飛ぶ（発行したのに監査が無い）。上流の処理（発行）ごと切り離すので、
+    // どの await 点で
     // 切られても、上流の副作用と後処理は揃って完結する。
     let detached = async move {
         let response = next.run(req).await;

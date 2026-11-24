@@ -7,9 +7,8 @@
 //!
 //! | Method | Path               | Body           | Response              |
 //! |--------|--------------------|----------------|------------------------|
-//! | GET    | `/api/auth/status`   | -              | `{initialized,grants}` (NO auth required; `grants` is `{ localDesktop: bool, publicViewer: bool }` - `publicViewer` is the live `server.viewer_public`, `localDesktop` is `crate::local_grant`'s judgment for THIS peer and Host) |
-//! | POST   | `/api/auth/grant/{kind}` | -          | `{success,token}` for `publicViewer` while 閲覧公開 is ON (`403` while OFF; banto v3.0.0 ADR-0017, 2026-10-04 owner decision) and for `localDesktop` (#392 B2-1: only on `chronogazer-server`'s always-on listener (`127.0.0.1`, or the merged `0.0.0.0` one), per request peer AND Host loopback, admin while uninitialized, else `auth.local_grant`; `403` otherwise). `404` for any other kind |
-//! | POST   | `/api/auth/setup`     | `{username,password,displayName}` | `{success,error?,token?}` (needs `allow_setup`; on `chronogazer-server`'s always-on listener: per request peer AND Host loopback, #392 B2-1) |
+//! | GET    | `/api/auth/status`   | -              | `{grants}` (NO auth required; banto v8 dropped `initialized`; `grants` is `{ localDesktop: bool, publicViewer: bool }` - `publicViewer` is the live `server.viewer_public`, `localDesktop` is `crate::local_grant`'s judgment for THIS peer and Host) |
+//! | POST   | `/api/auth/grant/{kind}` | -          | `{success,token}` for `publicViewer` while 閲覧公開 is ON (`403` while OFF; banto v3.0.0 ADR-0017, 2026-10-04 owner decision) and for `localDesktop` (#392 B2-1: only on `chronogazer-server`'s always-on listener (`127.0.0.1`, or the merged `0.0.0.0` one), per request peer AND Host loopback; the no-login mode's role when started without login, else `auth.local_grant`; `403` otherwise). `404` for any other kind |
 //! | POST   | `/api/auth/login`    | `{username,password}` | `{success,error?,token?}` |
 //! | POST   | `/api/auth/logout`   | -              | 200                    |
 //! | GET    | `/api/auth/check`    | -              | `bool`                 |
@@ -79,13 +78,11 @@
 //! wire - `username` always comes from the caller's own bearer token, never
 //! a request parameter).
 //!
-//! `/api/auth/status` and `/api/auth/setup` are deliberately NOT behind
-//! `require_auth` - the login page needs `status` before any session exists,
-//! and `setup` is how the very first session gets created. `setup` is
-//! additionally gated by an `allow_setup` flag (spec §8.2): the Tauri app
-//! always passes `false` (desktop first-run goes through the `auth_setup`
-//! Tauri command instead, spec §10), while `banto-serve` enables it via
-//! `BANTO_ALLOW_SETUP=1` so this REST path is exercisable standalone.
+//! `/api/auth/status` is deliberately NOT behind `require_auth` - the login
+//! page needs it before any session exists. banto v8 (ADR-0034 §5) removed
+//! the first-run `POST /api/auth/setup`: a new database starts in no-login
+//! mode with the built-in `admin`, and accounts are created through user
+//! management.
 //!
 //! Every `/api/*` route requires the `X-Banto-Client: banto` header
 //! (`banto_server::csrf`) and, except for the auth routes themselves, a
@@ -129,7 +126,7 @@
 //! `action: "denied"` when an authenticated caller's role is too low;
 //! [`audited_credential_verifier`] records `login`/`login_failed`;
 //! [`audit_logout_middleware`] records `logout` (only when a valid session
-//! is ended - banto #278); and `POST /api/auth/setup` records `setup`. Read routes (`list`/`get`) are never audited. The trail
+//! is ended - banto #278). Read routes (`list`/`get`) are never audited. The trail
 //! itself is only readable via `POST /api/audit-log/list`, `admin`-only.
 //!
 //! `/api/plc-connections/*`/`/api/collection-groups/*`/`/api/tags/*` (#383
@@ -202,8 +199,6 @@
 //!
 //! banto のものに替えて変わった振る舞い（wire を含む）:
 //!
-//! - 初回セットアップが 1 文で原子的になった（banto #277）。同時に来ても
-//!   アカウントは 1 つだけ。
 //! - 失敗ログインの監査の `actorUsername` は 32 文字に切り詰められ、
 //!   トークン無し・無効なトークンのログアウトは記録されない（banto #278）。
 //! - バックアップとリストア予約は `<DB の親>/backups/<DB ファイル名>/` に
@@ -219,15 +214,16 @@
 //!   照合した**今の** role で判定する（banto #204 の `AuthenticatedSession`）。
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use banto_core::{BantoError, FieldError, ListParams};
 use banto_server::routes::{
-    actor_for_token, audit_log_router, audit_logout_middleware, backups_router, extra_auth_router,
-    require_role_at_least, ui_settings_router, users_router, LogoutAuditState, RoleGuard,
+    audit_log_router, audit_logout_middleware, backups_router, extra_auth_router,
+    require_role_at_least, ui_settings_router, users_router, AuditActor, LogoutAuditState,
+    RoleGuard,
 };
 use banto_server::{
     auth_routes, require_auth, sse_route, ApiError, AuthState, GrantRegistry, GrantSpec,
@@ -343,14 +339,13 @@ async fn require_editor(
 
 // --- #332: Hub 接続 ----------------------------------------------------------
 
-/// `/api/hub/*` のハンドラ用 state（`BackupsState` と同じ構成）: 操作本体の
-/// [`HubService`]、監査記録用の [`AuditLogService`]、actor 解決用の
-/// [`AuthState`]。
+/// `/api/hub/*` のハンドラ用 state: 操作本体の [`HubService`] と監査記録用の
+/// [`AuditLogService`]。監査の主体は、ゲート（`require_auth`・`require_role_at_least`）が
+/// 認可の時点で要求に載せた写し（`Extension<AuditActor>`）を使う（banto v8、ADR-0034 §3）。
 #[derive(Clone)]
 struct HubState {
     hub: HubService,
     audit: AuditLogService,
-    auth: AuthState,
 }
 
 /// `POST /api/hub/connect` の body。
@@ -374,12 +369,12 @@ struct HubAdoptBody {
 /// `settings_change`/`settings` の監査エントリを 1 本記録する（Hub 操作
 /// 共通）。`detail` には接続先とキー名までしか入れない - 平文キーは
 /// どの経路にも出さない。
-async fn record_hub_change(state: &HubState, headers: &HeaderMap, detail: serde_json::Value) {
-    // banto v8（ADR-0034 §3）: 主体はトークンからの写し（`actor_for_token`）。
-    let actor = actor_for_token(headers, &state.auth);
+async fn record_hub_change(state: &HubState, actor: &AuditActor, detail: serde_json::Value) {
+    // banto v8（ADR-0034 §3）: 主体は認可の時点の写し。トークンから引き直すと、操作の間に
+    // セッションが切れたときに主体が空になる。
     banto_server::routes::record_write_as(
         &state.audit,
-        actor.as_ref(),
+        Some(actor),
         "rest",
         "settings_change",
         "settings",
@@ -398,13 +393,13 @@ async fn hub_status_handler(State(state): State<HubState>) -> Result<Json<HubVie
 /// `POST /api/hub/connect`（`admin` 限定）。
 async fn hub_connect_handler(
     State(state): State<HubState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
     Json(body): Json<HubConnectBody>,
 ) -> Result<Json<HubView>, ApiError> {
     let view = state.hub.connect(&body.endpoint).await?;
     record_hub_change(
         &state,
-        &headers,
+        &actor,
         json!({ "hubEndpoint": body.endpoint, "hubStatus": view.status.as_str() }),
     )
     .await;
@@ -415,14 +410,14 @@ async fn hub_connect_handler(
 /// 手動連携。
 async fn hub_adopt_key_handler(
     State(state): State<HubState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
     Json(body): Json<HubAdoptBody>,
 ) -> Result<Json<HubView>, ApiError> {
     let endpoint = body.endpoint;
     let view = state.hub.adopt_manual_key(&endpoint, body.key).await?;
     record_hub_change(
         &state,
-        &headers,
+        &actor,
         json!({ "hubEndpoint": endpoint, "hubKeyAdopted": true, "hubStatus": view.status.as_str() }),
     )
     .await;
@@ -448,10 +443,10 @@ async fn hub_subscription_handler(State(state): State<HubState>) -> Json<HubSubs
 /// の doc comment参照）。
 async fn hub_disconnect_handler(
     State(state): State<HubState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
 ) -> Result<Json<HubView>, ApiError> {
     let view = state.hub.disconnect().await?;
-    record_hub_change(&state, &headers, json!({ "hubDisconnected": true })).await;
+    record_hub_change(&state, &actor, json!({ "hubDisconnected": true })).await;
     Ok(Json(view))
 }
 
@@ -461,7 +456,6 @@ fn hub_router(hub: HubService, audit: AuditLogService, auth: AuthState) -> Route
     let state = HubState {
         hub,
         audit: audit.clone(),
-        auth: auth.clone(),
     };
     Router::new()
         .route(
@@ -2471,8 +2465,8 @@ pub fn api_router(
 
     session_only
         .merge(key_routes)
-        // #392 B2-1: Host の確認（status・grant・setup）と、未初期化の間の grant の
-        // 扱い（`crate::local_grant::local_access_middleware`）。CSRF の確認の内側。
+        // #392 B2-1: Host の確認（status・grant）と、予約名のアカウントがあるときの発行の
+        // 断り（`crate::local_grant::local_access_middleware`）。CSRF の確認の内側。
         .layer(middleware::from_fn_with_state(
             local_access,
             local_access_middleware,
@@ -4459,7 +4453,6 @@ mod tests {
     /// asserting both the `pending-restore` status endpoint AND the
     /// `restore_staged`/`restore_cancelled` audit entries it records.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "banto v8 のリストアの検査が _sqlx_migrations 固定で、ChronoGazer の記録の表を読めない（banto に表の名前を渡す口を提案する）"]
     async fn stage_restore_from_existing_backup_then_cancel_is_recorded_in_the_audit_log() {
         let (_dir, router, admin, _editor, _viewer) = router_with_role_tokens_and_backup().await;
 

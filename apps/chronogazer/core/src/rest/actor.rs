@@ -110,6 +110,11 @@ pub(crate) enum Actor {
         role: String,
         grant: Option<String>,
         account_id: Option<i64>,
+        /// 監査の主体の写し（banto v8、ADR-0034 §3）: banto の `require_auth` が認可の時点で
+        /// 要求に載せた `AuditActor`。[`Actor::audit_actor`] はこれがあればそのまま使う
+        /// （banto の帰属の規則と同じ値。トークンから引き直さない）。無いのは、写しを載せない
+        /// 経路（試験で手で組んだ値）だけ。
+        audit: Option<AuditActor>,
     },
     /// API キー。`label` は監査に載せる `名前（prefix）`。
     ApiKey {
@@ -162,6 +167,7 @@ impl Actor {
                 role,
                 grant,
                 account_id,
+                ..
             } => crate::free_trends::FreeTrendActor::from_session(
                 username,
                 role,
@@ -180,10 +186,15 @@ impl Actor {
     pub(crate) fn audit_actor(&self) -> AuditActor {
         match self {
             Self::Session {
+                audit: Some(snapshot),
+                ..
+            } => snapshot.clone(),
+            Self::Session {
                 username,
                 role,
                 grant,
                 account_id,
+                audit: None,
             } => {
                 let kind = grant
                     .as_deref()
@@ -274,6 +285,7 @@ impl<S: Send + Sync> FromRequestParts<S> for Actor {
                 role: session.identity.role.clone(),
                 grant: session.grant.as_ref().map(|kind| kind.as_str().to_string()),
                 account_id: session.stamp.map(|stamp| stamp.account_id),
+                audit: parts.extensions.get::<AuditActor>().cloned(),
             });
         }
         Err(unauthorized_response())
@@ -582,6 +594,7 @@ mod tests {
             role: "viewer".into(),
             grant: None,
             account_id: Some(1),
+            audit: None,
         };
         assert!(viewer.can_read());
         assert!(!viewer.can_configure());
@@ -591,6 +604,7 @@ mod tests {
             role: "editor".into(),
             grant: None,
             account_id: Some(1),
+            audit: None,
         };
         assert!(editor.can_configure());
         assert!(editor.can_operate_collect());
@@ -599,6 +613,7 @@ mod tests {
             role: "superuser".into(),
             grant: None,
             account_id: Some(1),
+            audit: None,
         };
         assert!(!unknown.can_read());
     }

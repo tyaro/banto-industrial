@@ -455,7 +455,7 @@ async fn latest_event(layout: &DataLayout) -> Option<String> {
     let pool = init_db(layout.db_path()).await.expect("開き直す");
     let reader = CollectorService::new(
         pool.clone(),
-        layout.data_dir(),
+        layout.store_dir(),
         chronogazer_core::engine::EngineConfig::builtin_drivers(),
     );
     let rows: Vec<CollectEventRow> = match reader.events(EventPage::default()).await {
@@ -468,7 +468,7 @@ async fn latest_event(layout: &DataLayout) -> Option<String> {
 
 async fn stored_row_count(layout: &DataLayout) -> usize {
     let mut count = 0;
-    for file in list_data_files(&layout.data_dir()).expect("データファイルの列挙") {
+    for file in list_data_files(&layout.store_dir()).expect("データファイルの列挙") {
         let reader = TsReader::open(&file.path).await.expect("開ける");
         for group in reader.groups() {
             count += reader
@@ -1218,7 +1218,7 @@ fn a_held_instance_lock_stops_with_2_without_creating_anything() {
         layout.db_path(),
         layout.logs_dir(),
         layout.run_dir(),
-        layout.data_dir(),
+        layout.store_dir(),
         layout.secrets_dir(),
     ] {
         assert!(!path.exists(), "{} を作った", path.display());

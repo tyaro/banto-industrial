@@ -292,11 +292,35 @@ async fn corrupt_db_is_classified_then_recreated_keeping_the_old_file() {
         .with("brokenFileName", set_aside.broken_file_name().unwrap());
     // 排他は対処からエンジンへ途切れずに引き継ぐ（その間に別のプロセスは取れない）。
     assert!(acquire_for_db(&db_path, ChronoGazerHost::Serve).is_err());
-    let engine = EngineRuntime::open_with_recovery_lock(config(dir.path()), lock)
+    // banto v8（`crate::store_generation`）: 作り直した DB は新しい世代なので、前の DB の
+    // 保存先（既定の `data/history`）には書かずに止まる（旧い履歴が新しいタグに混ざらない）。
+    let store = dir.path().join("data").join("history");
+    let store_before = snapshot(&store);
+    let err = match EngineRuntime::open_with_recovery_lock(config(dir.path()), lock)
         .await
         .expect("新しい DB を開ける")
         .with_recovery_note(note)
         .start()
+        .await
+    {
+        Ok(_) => panic!("前の DB の保存先で起動した"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(
+            err,
+            EngineStartError::StoreGeneration(crate::store_generation::ClaimError::Refused {
+                refusal: crate::store_generation::StoreRefusal::OtherGeneration { .. },
+                ..
+            })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(classify(&err), FailureKind::StoreDirUnwritable);
+    assert_eq!(snapshot(&store), store_before, "前の保存先に触れた");
+    // 前の保存先を退けると、新しい DB で起動できる。
+    std::fs::rename(&store, dir.path().join("data").join("history-old")).unwrap();
+    let engine = EngineRuntime::start(config(dir.path()))
         .await
         .expect("新しい DB で起動できる");
     let rows = audit_rows(&engine, "startup_recovery").await;
@@ -416,7 +440,6 @@ async fn set_aside_rolls_back_when_the_db_is_locked() {
 /// `restore_applied`）で、バックアップの時点の中身に戻る。壊れた DB は
 /// `.broken-<日時>` に残る。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "banto v8 のリストアの検査が _sqlx_migrations 固定で、ChronoGazer の記録の表を読めない（banto に表の名前を渡す口を提案する）"]
 async fn restore_from_backup_uses_the_restore_path_and_keeps_the_broken_db() {
     let dir = TempDir::new();
     let engine = start(dir.path()).await;
@@ -601,7 +624,11 @@ async fn store_dir_choice_is_saved_and_startup_continues() {
     // 窓・監査に出す既定の場所は `./` を含まない（同じ場所）。
     assert_eq!(
         note.detail["resolvedDataDir"],
-        dir.path().join("data").display().to_string()
+        dir.path()
+            .join("data")
+            .join("history")
+            .display()
+            .to_string()
     );
     let engine = opened
         .with_recovery_note(note)
@@ -610,7 +637,7 @@ async fn store_dir_choice_is_saved_and_startup_continues() {
         .expect("起動を続ける");
     assert_eq!(
         read_data_dir(&engine.services().settings).await.unwrap(),
-        Some("./data".to_string())
+        Some("./data/history".to_string())
     );
     stop(engine).await;
 }
@@ -687,7 +714,8 @@ async fn closing_an_opened_engine_releases_the_lock() {
 /// `StoreDirUnwritable` で止まり（保存先の「書き込めない」の窓・「もう一度確かめる」
 /// つき）、排他と pool を返し DB の設定は変えない。書けるようにしてから同じ設定で
 /// やり直す（=「もう一度確かめる」）と起動を続ける。`banto-serve` の設定
-/// （`store_dir_check_required: false`）は今までどおり確かめずに起動する。
+/// （`store_dir_check_required: false`）は書き込みを確かめないが、保存先の世代を確かめられない
+/// ので止まる（banto v8、`crate::store_generation`）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unwritable_store_dir_stops_until_it_becomes_writable() {
     let dir = TempDir::new();
@@ -722,16 +750,27 @@ async fn unwritable_store_dir_stops_until_it_becomes_writable() {
         "保存先の場所の中身に触れた"
     );
 
-    // banto-serve の設定は確かめない（今までどおり起動する）。
-    let engine = EngineRuntime::start(EngineConfig {
+    // banto-serve の設定は書き込みを確かめないが、保存先の世代（banto v8、
+    // `crate::store_generation`）を確かめられない保存先では起動しない（安全側）。
+    let err = match EngineRuntime::start(EngineConfig {
         drivers: crate::test_support::drivers(),
         store_dir_check_required: false,
         store_config_required: false,
         ..config(dir.path())
     })
     .await
-    .expect("banto-serve は今までどおり起動する");
-    stop(engine).await;
+    {
+        Ok(_) => panic!("banto-serve が世代を確かめられない保存先で起動した"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(
+            err,
+            EngineStartError::StoreGeneration(crate::store_generation::ClaimError::Io { .. })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(std::fs::read(&blocked).unwrap(), b"not a folder");
 
     // 書けるようにして「もう一度確かめる」（同じ設定でやり直す）。
     std::fs::remove_file(&blocked).unwrap();
@@ -816,7 +855,6 @@ fn make_corrupt_db_keeping_backups(dir: &Path) -> PathBuf {
 /// 続けずに理由を返し、予約を取り消して退けた DB を元の名前に戻す（何も消さない）。
 /// 排他も返る。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "banto v8 のリストアの検査が _sqlx_migrations 固定で、ChronoGazer の記録の表を読めない（banto に表の名前を渡す口を提案する）"]
 async fn a_failed_restore_apply_puts_everything_back() {
     let dir = TempDir::new();
     let engine = start(dir.path()).await;
@@ -895,4 +933,111 @@ async fn a_failed_probe_write_closes_the_file_before_it_is_removed() {
         .unwrap();
     assert!(super::write_probe(file).await.is_err(), "書けない");
     std::fs::remove_file(&path).expect("閉じた後なので消せる");
+}
+
+/// banto v8 への追従（docs/banto-v8-upgrade-plan.md §5 の 2）: v7 の実プロファイル（v7 の DB =
+/// 旧い記録の表・旧い 0003/0005、印の無い保存先）に v7 の予約（旧い DB をバックアップの予約として
+/// 置いたもの）がある。起動は予約を当てず・消さず、旧い DB・履歴に書かずに旧形式で止まり、
+/// プロファイルのファイルは byte で変わらない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_banto_v7_profile_with_a_v7_reservation_stops_without_touching_anything() {
+    let dir = TempDir::new();
+    let db_path = dir.path().join("chronogazer.sqlite3");
+    crate::db::write_banto_v7_db(&db_path).await;
+    let old_store = dir.path().join("data");
+    std::fs::create_dir_all(&old_store).unwrap();
+    std::fs::write(old_store.join("20261101-001.sqlite3"), b"v7 rows").unwrap();
+    let pending = BackupService::pending_restore_file(&db_path).unwrap();
+    std::fs::create_dir_all(pending.parent().unwrap()).unwrap();
+    crate::db::write_banto_v7_db(&pending).await;
+    let before = snapshot(dir.path());
+
+    let err = match EngineRuntime::start(config(dir.path())).await {
+        Ok(_) => panic!("v7 のプロファイルで起動した"),
+        Err(err) => err,
+    };
+    match &err {
+        EngineStartError::Database(InitDbError::Legacy(legacy)) => {
+            assert_eq!(legacy.kind, crate::db::LegacyKind::BeforeBantoV8);
+            assert_eq!(legacy.path, db_path);
+        }
+        other => panic!("旧形式で止まるはず: {other:?}"),
+    }
+    assert_eq!(classify(&err), FailureKind::LegacyDatabase);
+    assert_eq!(
+        snapshot(dir.path()),
+        before,
+        "プロファイルのファイルが変わった"
+    );
+    assert!(pending.is_file(), "v7 の予約が消えた");
+    drop(acquire_for_db(&db_path, ChronoGazerHost::Serve).expect("失敗の後は排他が返っている"));
+}
+
+/// 同じく §5 の 2: v8 の DB に v7 の予約だけがある（v7 で予約してから版を上げた）。予約は
+/// 「不正」として消されず（banto は検査に通らない予約を起動時に消す）、適用もされず、予約の
+/// ファイルを名指しした旧形式で止まる。DB・保存先・予約は byte で変わらない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_banto_v7_reservation_over_a_v8_db_is_neither_applied_nor_deleted() {
+    let dir = TempDir::new();
+    stop(start(dir.path()).await).await;
+    let db_path = dir.path().join("chronogazer.sqlite3");
+    let pending = BackupService::pending_restore_file(&db_path).unwrap();
+    std::fs::create_dir_all(pending.parent().unwrap()).unwrap();
+    crate::db::write_banto_v7_db(&pending).await;
+    let before = snapshot(dir.path());
+
+    let err = match EngineRuntime::start(config(dir.path())).await {
+        Ok(_) => panic!("v7 の予約で起動した"),
+        Err(err) => err,
+    };
+    match &err {
+        EngineStartError::Database(InitDbError::Legacy(legacy)) => {
+            assert_eq!(legacy.kind, crate::db::LegacyKind::BeforeBantoV8);
+            assert_eq!(legacy.path, pending);
+            assert!(
+                err.to_string().contains(&pending.display().to_string()),
+                "{err}"
+            );
+        }
+        other => panic!("旧形式で止まるはず: {other:?}"),
+    }
+    assert_eq!(
+        snapshot(dir.path()),
+        before,
+        "プロファイルのファイルが変わった"
+    );
+}
+
+/// 同じく §5 の 2: 新しい版で取ったバックアップは、予約 → 再起動で正しく戻る（起動時の検査
+/// `CandidateCheck` を通り、`restore_applied` が監査に残る）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backup_taken_by_this_version_is_restored_on_the_next_start() {
+    let dir = TempDir::new();
+    let engine = start(dir.path()).await;
+    let settings = &engine.services().settings;
+    settings.set("probe", "at-backup").await.unwrap();
+    let backup = engine.services().backup.create().await.expect("backup");
+    settings.set("probe", "after-backup").await.unwrap();
+    engine
+        .services()
+        .backup
+        .stage_restore_from_file(&backup.file_name)
+        .await
+        .expect("予約できる");
+    stop(engine).await;
+
+    let engine = start(dir.path()).await;
+    assert_eq!(
+        engine
+            .services()
+            .settings
+            .get("probe")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("at-backup")
+    );
+    assert!(engine.services().backup.pending_restore().await.is_none());
+    assert_eq!(audit_rows(&engine, "restore_applied").await.len(), 1);
+    stop(engine).await;
 }

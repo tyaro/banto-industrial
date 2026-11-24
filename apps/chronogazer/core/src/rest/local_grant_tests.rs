@@ -506,6 +506,13 @@ async fn changing_the_setting_closes_now_and_reopens_after_a_restart() {
         .filter(|row| row.action == "settings_change" && row.origin == "rest")
         .collect::<Vec<_>>();
     assert_eq!(changes.len(), 2, "{changes:?}");
+    // banto v8（ADR-0034 §3）: 主体はゲートが認可の時点で載せた写し。
+    assert!(
+        changes
+            .iter()
+            .all(|row| row.actor_username.as_deref() == Some("testadmin")),
+        "{changes:?}"
+    );
     assert!(
         changes.iter().any(|row| row
             .detail

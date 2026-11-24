@@ -24,10 +24,7 @@
 //! the LAN-access URLs printed at startup are actually reachable - the
 //! Tauri app's default of `127.0.0.1`-only is a setting applied at the
 //! settings-screen layer, Phase B, not a property of this dev vehicle),
-//! `BANTO_DB` (default `./banto-dev.sqlite3`), `BANTO_ALLOW_SETUP` (`1` to
-//! enable `POST /api/auth/setup`; unset/anything else keeps it `403`'d, spec
-//! §8.2 - the Tauri app never sets this, since desktop first-run goes
-//! through the `auth_setup` command instead), `BANTO_VIEWER_PUBLIC` (`1` to
+//! `BANTO_DB` (default `./banto-dev.sqlite3`), `BANTO_VIEWER_PUBLIC` (`1` to
 //! seed `server.viewer_public = true` at startup so LAN clients may mint a
 //! viewer-public grant session through `POST /api/auth/grant/publicViewer`
 //! without logging in - ADR-0012 / ADR-0017; 2026-10-04 オーナー決定で

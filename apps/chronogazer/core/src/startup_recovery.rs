@@ -238,6 +238,9 @@ pub fn classify(err: &EngineStartError) -> FailureKind {
         },
         EngineStartError::StoreDirUnwritable { .. } => FailureKind::StoreDirUnwritable,
         EngineStartError::StoreDirNotAllowed { .. } => FailureKind::Other,
+        // banto v8（`crate::store_generation`）: 対処は「書けない」と同じ（旧い履歴を退けて
+        // もう一度・保存先を選び直す・既定に戻す）。窓の文言は理由（`Display`）が出す。
+        EngineStartError::StoreGeneration(_) => FailureKind::StoreDirUnwritable,
         EngineStartError::Listen { .. } => FailureKind::Other,
     }
 }
@@ -680,7 +683,7 @@ where
 pub enum StoreDirChoice {
     /// 選んだフォルダ（絶対パス）。
     Folder(PathBuf),
-    /// 既定の場所（`./data`、アプリのデータディレクトリ基準）。
+    /// 既定の場所（`./data/history`、アプリのデータディレクトリ基準）。
     Default,
 }
 
@@ -712,6 +715,17 @@ pub async fn apply_store_dir(
             RecoveryChoice::ResetStoreDir,
         ),
     };
+    // banto v8（`crate::store_generation`）: 別の世代・v8 より前の保存先は、書き込みの確かめ
+    // （一時ファイルを書く）より前に断る（そのフォルダに何も書かない）。
+    let generation = crate::store_generation::db_generation(settings)
+        .await
+        .map_err(|err| {
+            RecoveryError(format!(
+                "保存先の世代を読めませんでした（設定 DB を読めません）: {err}"
+            ))
+        })?;
+    crate::store_generation::inspect_dir(&resolved, &generation)
+        .map_err(|err| RecoveryError(err.to_string()))?;
     check_writable_dir(&resolved).await?;
     set_data_dir(settings, &value).await.map_err(|err| {
         RecoveryError(format!(

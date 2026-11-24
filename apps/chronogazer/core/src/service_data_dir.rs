@@ -79,7 +79,11 @@ pub(crate) fn validate_service_data_dir(
     configured: &str,
 ) -> Result<PathBuf, String> {
     let value = configured.trim();
-    let value = if value.is_empty() { "./data" } else { value };
+    let value = if value.is_empty() {
+        crate::settings::default_data_dir()
+    } else {
+        value
+    };
     let input = Path::new(value);
 
     let relative = if input.is_absolute() {
@@ -354,7 +358,7 @@ mod tests {
         );
         assert_eq!(
             validate_service_data_dir(&root, "").unwrap(),
-            root.final_path().join("data")
+            root.final_path().join("data").join("history")
         );
     }
 
@@ -443,8 +447,12 @@ mod tests {
         let engine = EngineRuntime::start(service_config(&path, root.clone()))
             .await
             .expect("allowed service data.dir starts");
-        let child = root.final_path().join("data");
+        let child = root.final_path().join("data").join("history");
         assert!(child.is_dir(), "the service created its internal child");
+        // banto v8（`crate::store_generation`）: 使い始めた保存先には世代の印がある。
+        assert!(child
+            .join(crate::store_generation::MARKER_FILE_NAME)
+            .is_file());
         assert_eq!(engine.services().collect.data_dir(), child);
         assert!(
             std::fs::read_dir(&child).unwrap().all(|entry| !entry
@@ -515,7 +523,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "banto v8 のリストアの検査が _sqlx_migrations 固定で、ChronoGazer の記録の表を読めない（banto に表の名前を渡す口を提案する）"]
     async fn restored_outside_value_is_refused_before_touching_the_old_data() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("root");

@@ -40,21 +40,17 @@
 //!   持っている等）ときは、`127.0.0.1:port` に落として起動を続け、LAN を開けなかった
 //!   理由を残す（[`ListenPlan::loopback_fallback`]、#598 のレビュー。「loopback は常に、
 //!   LAN は best-effort」の約束をまとめた場合にも守る）。
-//! - `POST /api/auth/setup`（最初の管理者の作成）は、常時の listener への**この PC からの
-//!   要求**（peer と Host の両方が loopback）だけで開ける（`OpenedEngine::
-//!   with_loopback_local_access`）。デスクトップの初回セットアップ（その PC の前の人が
-//!   最初の管理者になる）と同じ範囲。`0.0.0.0` にまとめた 1 本でも、LAN からの要求は
-//!   peer が LAN なので閉じる（2026-10-14 オーナー決定で、B1-5 の「loopback に bind
-//!   できた listener だけ」から要求ごとの確認に変えた。以前は `0.0.0.0` のときこの PC
-//!   からも作れなかった）。LAN 専用の listener と、後から LAN の listener を入れ替える
-//!   経路（決定 9）のルーターでは常に閉じる。
-//! - **この PC からの接続（`localDesktop` の grant、#392 B2-1、[`crate::local_grant`]）**も
-//!   同じく常時の listener への、この PC からの要求だけで開く（未初期化の間は admin、初期化後は設定 `auth.local_grant`、
-//!   既定 off）。setup は置き換えずに併存させ、どちらにも **Host の確認**（peer と Host の
-//!   両方が loopback。DNS rebinding 対策）をかける。B1-5 の既知の制限「LAN に出していない
-//!   間は同じ PC の任意のプロセスが最初の管理者を作れる」は、デスクトップの初回セット
-//!   アップと同じ範囲として受け入れ（grant の未初期化の admin も同じ性質）、ブラウザーで
-//!   開いた外のページから作られる経路だけを Host の確認で塞いだ。
+//! - **この PC からの接続（`localDesktop` の grant、#392 B2-1、[`crate::local_grant`]）**は、
+//!   常時の listener への**この PC からの要求**（peer と Host の両方が loopback。Host の確認は
+//!   DNS rebinding 対策）だけで開く（`OpenedEngine::with_loopback_local_access`）。権限は、
+//!   起動時にログインなし（新しい DB の既定）ならそのモードのロール（既定 admin）、ログイン
+//!   必須なら設定 `auth.local_grant`（既定 off）。`0.0.0.0` にまとめた 1 本でも、LAN からの
+//!   要求は peer が LAN なので閉じる（2026-10-14 オーナー決定で、B1-5 の「loopback に bind
+//!   できた listener だけ」から要求ごとの確認に変えた）。LAN 専用の listener と、後から LAN の
+//!   listener を入れ替える経路（決定 9）のルーターでは常に閉じる。ログインなしの間は同じ PC の
+//!   任意のプロセスが admin で入れる（デスクトップのログインなしと同じ範囲として受け入れ、
+//!   ブラウザーで開いた外のページから入る経路だけを Host の確認で塞いだ）。banto v8 で初回
+//!   セットアップ `POST /api/auth/setup` は無くなった（最初の管理者は作らずに始まる）。
 //! - LAN の公開設定は REST（`PUT /api/settings/server`、[`crate::server_admin`]）から
 //!   変えられ、LAN の listener はその場で入れ替わる（決定 9）。常時の listener の形が
 //!   変わる設定（ポート・`0.0.0.0`）は保存だけで、次の起動から。
@@ -351,9 +347,9 @@ pub fn console_guidance(kind: FailureKind, layout: &DataLayout) -> Vec<String> {
                     db.display()
                 )),
                 RecoveryChoice::RecreateDatabase => Some(format!(
-                    "作り直す: {} と隣の -wal・-shm を別の名前に変えてから起動すると、空の設定 DB で起動します（時系列データ {} は残ります）。",
+                    "作り直す: {} と隣の -wal・-shm を別の名前に変えてから起動すると、空の設定 DB で起動します（時系列データ {} は消えずに残りますが、新しい DB はそこへは書きません。起動が保存先で止まったら、そのフォルダを別の名前に変えて退けてください）。",
                     db.display(),
-                    layout.data_dir().display()
+                    layout.store_dir().display()
                 )),
                 RecoveryChoice::Quit => None,
             };

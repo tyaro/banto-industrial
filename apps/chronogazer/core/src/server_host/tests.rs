@@ -1085,19 +1085,21 @@ async fn a_pinned_service_db_is_released_when_the_start_fails_after_opening_it()
     assert_db_released(&files);
 }
 
-/// #623 PR2b: DB の初期化の中の失敗（旧形式の DB）でも、`Err` が返った時点で握りを離している。
+/// #623 PR2b: DB の初期化の中の失敗（この版が知らない migration が当たった DB）でも、`Err` が
+/// 返った時点で握りを離している。旧形式の DB は握る前（`crate::db::refuse_legacy_profile`）に
+/// 断るので、握った後に失敗する例として新しい版の DB を使う。
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pinned_service_db_is_released_when_the_db_init_fails() {
     let dir = TempDir::new();
     let layout = DataLayout::new(dir.path());
-    let pool = banto_storage::connect_sqlite(layout.db_path())
-        .await
-        .unwrap();
-    sqlx::query("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL)")
-        .execute(&pool)
-        .await
-        .unwrap();
+    let pool = crate::db::init_db(layout.db_path()).await.unwrap();
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)          VALUES (99999, 'from a newer version', 1, x'00', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     pool.close().await;
     let files = db_files(&layout);
     let failure = lock_pinned(&layout)
@@ -1114,7 +1116,6 @@ async fn a_pinned_service_db_is_released_when_the_db_init_fails() {
 /// （PERSIST_WAL）がある状態から始め、適用後の DB を握ったまま開き、`close` で離す。
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "banto v8 のリストアの検査が _sqlx_migrations 固定で、ChronoGazer の記録の表を読めない（banto に表の名前を渡す口を提案する）"]
 async fn a_pending_restore_is_applied_before_the_service_pins_the_db() {
     let dir = TempDir::new();
     prepare_root(dir.path(), &[("test.marker", "current")]).await;

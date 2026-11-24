@@ -160,8 +160,9 @@ use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
 /// App-wide state managed by Tauri (spec §10, §11).
 struct AppState {
-    /// The webview window's own session identity, set by `auth_login`/
-    /// `auth_setup` and cleared by `auth_logout` - all called directly via
+    /// The webview window's own session identity, set by `auth_login` (and
+    /// the no-login mode's synthetic session) and cleared by `auth_logout` -
+    /// all called directly via
     /// `invoke()`, never through `/api/auth/login`. `Some` means logged in;
     /// carrying the full `UserIdentity` (not just a bool) lets
     /// `auth_change_password` recover the current `username` without a
@@ -229,7 +230,7 @@ struct AppState {
     server: Arc<ServerSlot>,
 }
 
-/// Result of `auth_login`/`auth_setup`. `superseded`/`seq` (banto #260,
+/// Result of `auth_login`. `superseded`/`seq` (banto #260,
 /// design §5.3/I-19): `superseded` is `true` when the credentials were
 /// valid but another command re-bound the session slot while this one was
 /// verifying, so the session was NOT installed ([`cas_session`]); `seq` is
@@ -484,7 +485,7 @@ fn desktop_audit_actor_kind(identity: &UserIdentity) -> &'static str {
 /// `users` account - and therefore how [`current_session`] re-validates it.
 #[derive(Debug, Clone, PartialEq)]
 enum DesktopSession {
-    /// A `users` account (`auth_login`, `auth_setup`, autologin): bound to
+    /// A `users` account (`auth_login`, autologin): bound to
     /// the row's `id` + `auth_epoch` it was established with and
     /// re-validated against that row on every command.
     Account(UserIdentity),
@@ -1828,10 +1829,8 @@ async fn server_apply_body(
         router: None,
         published: state.services.lan_status.clone(),
     };
-    // The new listener's router: `allow_setup: false` - the Tauri app's
-    // first-run setup goes through the `auth_setup` command above (`invoke()`,
-    // no network involved), not the REST endpoint - and no `localDesktop`
-    // grant (the desktop's LAN server is a LAN listener). The shared
+    // The new listener's router: no `localDesktop` grant (the desktop's LAN
+    // server is a LAN listener; banto v8 has no first-run setup). The shared
     // `rest_auth` is in `services`, so tokens outlive a restart.
     let router = || state.services.router(false);
     let ctx = ApplyContext {
@@ -3006,10 +3005,10 @@ async fn record_free_trend_denied(state: &AppState, identity: &UserIdentity) {
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(desktop_audit_username(&identity)),
-            actor_id: desktop_audit_actor_id(&identity, state.services.builtin_admin_id),
+            actor_username: Some(desktop_audit_username(identity)),
+            actor_id: desktop_audit_actor_id(identity, state.services.builtin_admin_id),
             actor_role: Some(identity.role.as_str()),
-            actor_kind: Some(desktop_audit_actor_kind(&identity)),
+            actor_kind: Some(desktop_audit_actor_kind(identity)),
             action: "denied",
             resource: FREE_TRENDS_RESOURCE,
             entity_id: None,
@@ -3794,10 +3793,10 @@ async fn record_collect_operation(
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(desktop_audit_username(&actor)),
-            actor_id: desktop_audit_actor_id(&actor, state.services.builtin_admin_id),
+            actor_username: Some(desktop_audit_username(actor)),
+            actor_id: desktop_audit_actor_id(actor, state.services.builtin_admin_id),
             actor_role: Some(actor.role.as_str()),
-            actor_kind: Some(desktop_audit_actor_kind(&actor)),
+            actor_kind: Some(desktop_audit_actor_kind(actor)),
             action,
             resource: COLLECT_AUDIT_RESOURCE,
             entity_id: None,
@@ -4574,8 +4573,8 @@ impl StartupErrorNotice {
             steps: concat!(
                 "ChronoGazer を終了してから、上のファイルを（同じ場所に「-wal」「-shm」が",
                 "付いたファイルがあれば一緒に）削除するか別の名前へ退避し、起動し直して",
-                "ください。新しい DB はアカウントも接続・タグも空なので、初回セットアップ",
-                "からやり直します。"
+                "ください。新しい DB はログインなし（組み込みの admin）で始まり、",
+                "アカウントも接続・タグも空です。"
             )
             .to_string(),
             closing: "このウィンドウを閉じると ChronoGazer は終了します。".to_string(),
@@ -4801,8 +4800,6 @@ fn desktop_engine_config_for(paths: &startup::LaunchPaths) -> EngineConfig {
         host: ChronoGazerHost::Desktop,
         // LAN の自動起動は DB を開けた後に設定から決める（[`launch_desktop`]）。
         listen: EngineListen::Disabled,
-        // 初回セットアップは `auth_setup` コマンド（`invoke()`）で行い、
-        // LAN の `POST /api/auth/setup` は開けない（`banto-serve` だけ）。
         seed_viewer_public: false,
         log_label: "banto",
         audit_origin: "tauri",
@@ -6417,7 +6414,6 @@ mod tests {
     /// -> `backups_pending` (spec M17), plus the `restore_staged` audit
     /// entry.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "banto v8 のリストアの検査が _sqlx_migrations 固定で、ChronoGazer の記録の表を読めない（banto に表の名前を渡す口を提案する）"]
     async fn stage_restore_then_pending_reports_it() {
         let (_dir, state) = app_state_with_tempdir().await;
         let admin = state
