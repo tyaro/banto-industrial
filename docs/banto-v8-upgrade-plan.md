@@ -1,7 +1,7 @@
 # banto v8.0.0 への追従の計画
 
 作成日: 2026-11-24
-状態: **PR1 は本ブランチ `deps/banto-v8` で実装済み・レビュー待ち**（2026-11-25。段階 1〜4 の docs まで。PR0a は #1336、PR0c は #1337 で済み。オーナー決定と、PR1 の受け入れ条件 3 件（§5）の結果は §7）
+状態: **PR1 は #1338 でマージ済み**（2026-11-25。段階 1〜4 の docs まで。PR0a は #1336、PR0c は #1337 で済み。オーナー決定と、PR1 の受け入れ条件 3 件（§5）の結果は §7）
 
 関連: [banto v8.0.0 のリリースノート](https://github.com/tyaro/banto/releases/tag/v8.0.0)、banto の `docs/upgrading.md` 4.2 節、banto の ADR-0034（持ち主の id と組み込みの `admin`）・ADR-0035（書き込みを切断から切り離す）。
 
@@ -85,7 +85,7 @@
 - `auth.disabled` の行は上流の認証モードの読み取りで必須。0015 を両アプリの migrations-sqlite に写した（上流と byte 等価）。
 - 試運転の grant は、本番の経路で ui-settings を読み書きできる（`first_admin_service.rs`）。
 - 2 MiB を超える本文を受ける口は無い。
-- ADR-0035 の書き込みの切り離しは、Hub の TLS の経路（loopback の 8723）には掛からない。上流が `detach_writes` を公開していないため。banto に提案する（提案前。Issue ができたら番号をここに足す）。
+- ADR-0035 の書き込みの切り離しは、Hub の TLS の経路（loopback の 8723）には掛からない。上流が `detach_writes` を公開していないため。banto に [tyaro/banto#947](https://github.com/tyaro/banto/issues/947) で提案した（2026-11-25。任意の listener を受ける `serve` か、層と `DetachedWrites` の公開）。入るまでは TLS の口の書き込みは切り離されない。
 
 ### E2E
 
