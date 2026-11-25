@@ -58,16 +58,31 @@ const BASE_URL = `http://127.0.0.1:${PORT}`;
 // ダウン）は収集中の構成 CRUD が即時・無停止で反映されるようになったため、
 // 「収集中の CRUD は未適用キューへ積まれる」ことを見る
 // `banto-hub-status-pending-apply-cancel.spec.ts` だけは**ロックダウン済み**の
-// サーバーが要る。banto v8 追従で、2 台とも `create-admin` により最初からロック
-// ダウン済みになった（下の firstAdminEnv）ので、台を分ける理由は薄れたが、
+// サーバーが要る。banto v8 追従で、1 台目・2 台目とも `create-admin` により最初から
+// ロックダウン済みになった（下の firstAdminEnv）ので、台を分ける理由は薄れたが、
 // 専用サーバー・専用 spec の構成（`LOCKED_DOWN_SPECS`）はそのまま残している
 // （ロックダウン専用の spec が他の spec の状態に触れない分離として）。
+// 試運転モードのサーバーは 3 台目（`COMMISSIONING_PORT`）だけが受け持つ。
 //
 // ポートは 8802 - 8798 chronogazer / 8805 banto-hub 本体（2026-10-09 に 8799 から移した） /
 // 8800 relay-wright / 8801 banto-hub perf（`banto-hub-perf.playwright.config.ts`）
 // のいずれとも衝突しない（指示の 8801 は perf が既に使用済みのため1つずらした）。
 const LOCKED_DOWN_PORT = 8802;
 const LOCKED_DOWN_BASE_URL = `http://127.0.0.1:${LOCKED_DOWN_PORT}`;
+
+// banto v8 追従: **試運転モード専用の 3 台目**。`create-admin` を通さずに起動した
+// 新しい DB の Hub は試運転モード（loopback だけ・ログインなしの admin の grant）で
+// 始まる。`banto-hub-lockdown-by-account.spec.ts` が「UI でアカウントを作る → UI で
+// ロックダウン → ログイン画面へ」の流れを見るのに使う。8798〜8808 のどれとも
+// 衝突しない 8809。
+const COMMISSIONING_PORT = 8809;
+const COMMISSIONING_BASE_URL = `http://127.0.0.1:${COMMISSIONING_PORT}`;
+
+/**
+ * 試運転モードのサーバー（3 台目）で走らせる spec 一覧。この spec は 1 本で
+ * サーバーをロックダウンまで進めるので、1 台を 1 本の spec が使い切る。
+ */
+const COMMISSIONING_SPECS = ['**/banto-hub-lockdown-by-account.spec.ts'];
 
 /**
  * ロックダウン済みサーバーで走らせる spec 一覧（下記 `projects` 参照）。
@@ -78,10 +93,6 @@ const LOCKED_DOWN_BASE_URL = `http://127.0.0.1:${LOCKED_DOWN_PORT}`;
  * 行う（同 spec の doc comment参照）。
  */
 const LOCKED_DOWN_SPECS = [
-	// 2026-10-04: アカウントでログインしたままのロックダウン。このプロジェクトの
-	// spec の中で辞書順の先頭に来るので、専用サーバーがまだ試運転モードのうちに走る
-	// （ほかの spec は `beforeAll` で冪等にロックダウンする）。
-	'**/banto-hub-lockdown-by-account.spec.ts',
 	'**/banto-hub-status-pending-apply-cancel.spec.ts',
 	'**/banto-hub-settings-guard.spec.ts',
 	// #441: セッションで開いたストリーム（`/api/v1/stream`）の失効は
@@ -111,6 +122,8 @@ process.env.BANTO_HUB_E2E_DB_DIR = dbDir;
 // 2台目の DB も**同じ**一時ディレクトリ配下に置く - `global-teardown-banto-hub.ts`
 // は `BANTO_HUB_E2E_DB_DIR` を丸ごと消すので、これだけで両方が片付く。
 const lockedDownDbPath = path.join(dbDir, 'banto-hub-e2e-locked-down.sqlite3');
+// 3 台目（試運転モード専用）も同じ一時ディレクトリ配下。
+const commissioningDbPath = path.join(dbDir, 'banto-hub-e2e-commissioning.sqlite3');
 
 // 2台目は **profile を分ける**必要がある: `HubRuntime::start` は
 // `BANTO_HUB_PROFILE`（既定 `default`）ごとに profile 排他ロックを取るので
@@ -122,6 +135,9 @@ const lockedDownDbPath = path.join(dbDir, 'banto-hub-e2e-locked-down.sqlite3');
 // `mkdtempSync` と同じ理由で先に作っておく。
 const lockedDownRoot = path.join(dbDir, 'locked-down-root');
 fs.mkdirSync(lockedDownRoot, { recursive: true });
+// 3 台目も profile・root を分ける（理由は上記と同じ）。
+const commissioningRoot = path.join(dbDir, 'commissioning-root');
+fs.mkdirSync(commissioningRoot, { recursive: true });
 
 // 1台目も profile・root を一時の値にする（banto v8 追従）。`banto-hub create-admin` は
 // 起動と同じ profile の排他を取る（Hub が動いていれば取れず止まる）ので、この PC で
@@ -177,32 +193,37 @@ export default defineConfig({
 		trace: 'retain-on-failure',
 		screenshot: 'only-on-failure'
 	},
-	// #341: 試運転モードのサーバー（既定）と、ロックダウン済み専用サーバーの
-	// 2プロジェクト。`LOCKED_DOWN_SPECS` に載っている spec だけが後者で走り、
-	// 他の spec は前者で走る（`testIgnore`/`testMatch` で厳密に排他にして
-	// あるので、どちらのプロジェクトでも二重に走る spec は無い）。
-	// `workers: 1` / `fullyParallel: false` は維持しているため、2つの
-	// プロジェクトも順番に実行される（同時に2つのサーバーが**起動**しては
+	// #341: 既定のサーバー（`create-admin` 済み）・ロックダウン済み専用サーバー・
+	// 試運転モード専用サーバー（banto v8 追従で追加）の 3 プロジェクト。
+	// `LOCKED_DOWN_SPECS` の spec はロックダウン済み専用、`COMMISSIONING_SPECS` の
+	// spec は試運転モード専用で走り、他の spec は既定のサーバーで走る
+	// （`testIgnore`/`testMatch` で厳密に排他にしてあるので、二重に走る spec は無い）。
+	// `workers: 1` / `fullyParallel: false` は維持しているため、3つの
+	// プロジェクトも順番に実行される（同時に3つのサーバーが**起動**しては
 	// いるが、テストが同時に走ることはない）。
 	projects: [
 		{
 			name: 'chromium',
-			testIgnore: LOCKED_DOWN_SPECS,
+			testIgnore: [...LOCKED_DOWN_SPECS, ...COMMISSIONING_SPECS],
 			use: { ...devices['Desktop Chrome'] }
 		},
 		{
 			name: 'chromium-locked-down',
 			testMatch: LOCKED_DOWN_SPECS,
 			use: { ...devices['Desktop Chrome'], baseURL: LOCKED_DOWN_BASE_URL }
+		},
+		{
+			name: 'chromium-commissioning',
+			testMatch: COMMISSIONING_SPECS,
+			use: { ...devices['Desktop Chrome'], baseURL: COMMISSIONING_BASE_URL }
 		}
 	],
 	webServer: [
 		{
 			command: `node "${serveWithFirstAdmin}" "${bantoHubBin}"`,
 			url: BASE_URL,
-			// 前回実行の(既にセットアップ済みの)DB を引き継ぐと、setup 画面の
-			// 「ユーザー0件」前提が崩れる - chronogazer 側と同じ理由で常に
-			// 新規サーバー/新規DBを起動する。
+			// 前回実行の DB を引き継ぐと「create-admin 済みの新しい DB」前提が崩れる
+			// - chronogazer 側と同じ理由で常に新規サーバー/新規DBを起動する。
 			reuseExistingServer: false,
 			timeout: 30_000,
 			env: {
@@ -224,8 +245,8 @@ export default defineConfig({
 			timeout: 30_000,
 			env: {
 				PORT: String(LOCKED_DOWN_PORT),
-				// 試運転モードのまま起動するので loopback 必須
-				// （`enforce_loopback_when_commissioning`、設計 §5.6）。
+				// create-admin でロックダウン済みだが、loopback のままでよい
+				// （試運転モードの 3 台目は loopback 必須。`enforce_loopback_when_commissioning`、設計 §5.6）。
 				BANTO_BIND: '127.0.0.1',
 				BANTO_DB: lockedDownDbPath,
 				// 上記 `lockedDownRoot` のコメント参照（profile 排他ロックを
@@ -233,6 +254,23 @@ export default defineConfig({
 				BANTO_HUB_ROOT: lockedDownRoot,
 				BANTO_HUB_PROFILE: 'e2e-locked-down',
 				...firstAdminEnv
+			}
+		},
+		{
+			// banto v8 追従: 試運転モード専用（`chromium-commissioning` プロジェクト）。
+			// `create-admin` を通さず banto-hub を直接起動する（新しい DB の Hub は
+			// 試運転モードで始まり、loopback だけ・ログインなしの admin の grant）。
+			command: `"${bantoHubBin}"`,
+			url: COMMISSIONING_BASE_URL,
+			reuseExistingServer: false,
+			timeout: 30_000,
+			env: {
+				PORT: String(COMMISSIONING_PORT),
+				// 試運転モードなので loopback 必須。
+				BANTO_BIND: '127.0.0.1',
+				BANTO_DB: commissioningDbPath,
+				BANTO_HUB_ROOT: commissioningRoot,
+				BANTO_HUB_PROFILE: 'e2e-commissioning'
 			}
 		}
 	]
