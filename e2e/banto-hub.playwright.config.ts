@@ -72,17 +72,29 @@ const LOCKED_DOWN_BASE_URL = `http://127.0.0.1:${LOCKED_DOWN_PORT}`;
 
 // banto v8 追従: **試運転モード専用の 3 台目**。`create-admin` を通さずに起動した
 // 新しい DB の Hub は試運転モード（loopback だけ・ログインなしの admin の grant）で
-// 始まる。`banto-hub-lockdown-by-account.spec.ts` が「UI でアカウントを作る → UI で
-// ロックダウン → ログイン画面へ」の流れを見るのに使う。8798〜8808 のどれとも
+// 始まる。`banto-hub-lockdown-by-grant.spec.ts` が「grant で UI からアカウントを作る →
+// UI でロックダウン → ログイン画面へ」の流れを見るのに使う。8798〜8808 のどれとも
 // 衝突しない 8809。
 const COMMISSIONING_PORT = 8809;
 const COMMISSIONING_BASE_URL = `http://127.0.0.1:${COMMISSIONING_PORT}`;
+
+// **試運転モード専用の 4 台目**。ロックダウンは 1 つの Hub につき一方向なので、grant 側の
+// 流れ（3 台目）とアカウント側の流れ（`banto-hub-lockdown-by-account.spec.ts`）は別の Hub で
+// 走らせる。8798〜8809 のどれとも衝突しない 8810。
+const COMMISSIONING_ACCOUNT_PORT = 8810;
+const COMMISSIONING_ACCOUNT_BASE_URL = `http://127.0.0.1:${COMMISSIONING_ACCOUNT_PORT}`;
 
 /**
  * 試運転モードのサーバー（3 台目）で走らせる spec 一覧。この spec は 1 本で
  * サーバーをロックダウンまで進めるので、1 台を 1 本の spec が使い切る。
  */
-const COMMISSIONING_SPECS = ['**/banto-hub-lockdown-by-account.spec.ts'];
+const COMMISSIONING_SPECS = ['**/banto-hub-lockdown-by-grant.spec.ts'];
+
+/**
+ * 試運転モードのサーバー（4 台目）で走らせる spec 一覧。アカウントでログインしたままの
+ * ロックダウン。3 台目とは別の Hub（ロックダウンは一方向のため）。
+ */
+const COMMISSIONING_ACCOUNT_SPECS = ['**/banto-hub-lockdown-by-account.spec.ts'];
 
 /**
  * ロックダウン済みサーバーで走らせる spec 一覧（下記 `projects` 参照）。
@@ -138,6 +150,10 @@ fs.mkdirSync(lockedDownRoot, { recursive: true });
 // 3 台目も profile・root を分ける（理由は上記と同じ）。
 const commissioningRoot = path.join(dbDir, 'commissioning-root');
 fs.mkdirSync(commissioningRoot, { recursive: true });
+// 4 台目（試運転モード専用・アカウント側）も同じ。
+const commissioningAccountDbPath = path.join(dbDir, 'banto-hub-e2e-commissioning-account.sqlite3');
+const commissioningAccountRoot = path.join(dbDir, 'commissioning-account-root');
+fs.mkdirSync(commissioningAccountRoot, { recursive: true });
 
 // 1台目も profile・root を一時の値にする（banto v8 追従）。`banto-hub create-admin` は
 // 起動と同じ profile の排他を取る（Hub が動いていれば取れず止まる）ので、この PC で
@@ -194,7 +210,7 @@ export default defineConfig({
 		screenshot: 'only-on-failure'
 	},
 	// #341: 既定のサーバー（`create-admin` 済み）・ロックダウン済み専用サーバー・
-	// 試運転モード専用サーバー（banto v8 追従で追加）の 3 プロジェクト。
+	// 試運転モード専用サーバー 2 台（banto v8 追従で追加。grant 側・アカウント側）の 5 プロジェクト。
 	// `LOCKED_DOWN_SPECS` の spec はロックダウン済み専用、`COMMISSIONING_SPECS` の
 	// spec は試運転モード専用で走り、他の spec は既定のサーバーで走る
 	// （`testIgnore`/`testMatch` で厳密に排他にしてあるので、二重に走る spec は無い）。
@@ -204,7 +220,7 @@ export default defineConfig({
 	projects: [
 		{
 			name: 'chromium',
-			testIgnore: [...LOCKED_DOWN_SPECS, ...COMMISSIONING_SPECS],
+			testIgnore: [...LOCKED_DOWN_SPECS, ...COMMISSIONING_SPECS, ...COMMISSIONING_ACCOUNT_SPECS],
 			use: { ...devices['Desktop Chrome'] }
 		},
 		{
@@ -215,7 +231,17 @@ export default defineConfig({
 		{
 			name: 'chromium-commissioning',
 			testMatch: COMMISSIONING_SPECS,
+			// CI のリトライは Hub・DB を作り直さない。途中まで進んだ（アカウント作成・ロックダウン
+			// 済みの）状態から直列の流れをやり直すと別の理由で落ちるので、リトライしない。
+			retries: 0,
 			use: { ...devices['Desktop Chrome'], baseURL: COMMISSIONING_BASE_URL }
+		},
+		{
+			name: 'chromium-commissioning-account',
+			testMatch: COMMISSIONING_ACCOUNT_SPECS,
+			// 上の `chromium-commissioning` と同じ理由でリトライしない。
+			retries: 0,
+			use: { ...devices['Desktop Chrome'], baseURL: COMMISSIONING_ACCOUNT_BASE_URL }
 		}
 	],
 	webServer: [
@@ -271,6 +297,21 @@ export default defineConfig({
 				BANTO_DB: commissioningDbPath,
 				BANTO_HUB_ROOT: commissioningRoot,
 				BANTO_HUB_PROFILE: 'e2e-commissioning'
+			}
+		},
+		{
+			// 試運転モード専用・アカウント側（`chromium-commissioning-account` プロジェクト）。
+			// 3 台目と同じ作りで、DB・root・profile だけ別。
+			command: `"${bantoHubBin}"`,
+			url: COMMISSIONING_ACCOUNT_BASE_URL,
+			reuseExistingServer: false,
+			timeout: 30_000,
+			env: {
+				PORT: String(COMMISSIONING_ACCOUNT_PORT),
+				BANTO_BIND: '127.0.0.1',
+				BANTO_DB: commissioningAccountDbPath,
+				BANTO_HUB_ROOT: commissioningAccountRoot,
+				BANTO_HUB_PROFILE: 'e2e-commissioning-account'
 			}
 		}
 	]

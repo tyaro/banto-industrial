@@ -1,92 +1,120 @@
 /**
- * 試運転モードの Hub で、アカウントを作ってからロックダウンし、そのアカウントで
- * ログインし直す流れの固定（banto v8 追従で書き直し。元は banto v3.0.0 追従の監査で出た
- * 後退の固定、2026-10-04 オーナー指示）。`chromium-commissioning` プロジェクト専用。
+ * 試運転中に**アカウントでログインした admin** がロックダウンしても、そのアカウントの
+ * まま続く、の固定（banto v3.0.0 追従の監査で出た後退の固定、2026-10-04 オーナー指示。
+ * banto v8 追従で、create-admin を通さない試運転モード専用の Hub 上へ組み直した）。
+ * `chromium-commissioning-account` プロジェクト専用（1 台を 1 本の spec が使い切る）。
  *
- * banto v8 では初回セットアップ（`POST /api/auth/setup`）が無く、最初の管理者は
- * `banto-hub create-admin` が作る（作ると同時にロックダウンする）。ほかの E2E の Hub は
- * どれも create-admin 済みでロックダウン済みなので、この spec は **create-admin を通さず
- * に起動した 3 台目**（試運転モード・loopback だけ・ログインなしの admin の grant）で走る。
+ * ロックダウンは 1 つの Hub につき一方向なので、ログインなしの grant 側の流れ
+ * （`banto-hub-lockdown-by-grant.spec.ts`）とは別の Hub で走らせる。
  *
  * 守りたいこと:
- * - 試運転モードでは、ログインなし（試運転の grant）で管理画面に入れ、`/users` から
- *   管理者のアカウントを作れる。
- * - 設定の「セキュリティ」カテゴリのロックダウンを実行すると、サーバーは試運転の grant
- *   を失効させる。grant のセッションだったブラウザは `/login` へ行く
- *   （`commissioningLockDown.ts` の `lockDownAndLeave`）。
- * - いま作ったアカウントでログインでき、admin として `/users` を開ける。
- * - ロックダウンしたあとは試運転の口が閉じている（`/api/commissioning/status` が
- *   `lockedDown: true`、設定の「セキュリティ」カテゴリも出ない）。
+ * - 試運転中はアカウントの admin にも、設定の「セキュリティ」カテゴリ（ロックダウンの欄）
+ *   が見える（可視判定はセッションの種別ではなくサーバーの
+ *   `GET /api/commissioning/status`、`commissioningState.svelte.ts`）。
+ * - ロックダウンを実行すると、サーバーは試運転の grant を失効させるが本人のアカウントの
+ *   トークンは有効なまま → 画面は `lockDownAndLeave` の `'stayed'`（「ログイン中の
+ *   アカウントで続けます」）で、ログイン画面へは行かず、そのアカウントで `/users` も開ける。
+ * - grant 側のセッション（別のブラウザコンテキスト）は失効して、次の遷移で `/login` へ行く。
  */
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type BrowserContext, type Page } from '@playwright/test';
 import { CSRF_HEADERS } from './banto-hub-auth';
 
 // `admin` は組み込みの管理者が使う予約名（banto v8）なので別の名前にする。
-const USERNAME = 'lockadmin';
-const PASSWORD = 'LockAdminPass1';
-const DISPLAY_NAME = 'ロックダウン管理者';
+const USERNAME = 'acctadmin';
+const PASSWORD = 'AcctAdminPass1';
+const DISPLAY_NAME = 'アカウント管理者';
 
 test.describe
-	.serial('banto-hub 試運転モードでアカウントを作ってロックダウンする（試運転モード専用サーバー）', () => {
-	let page: Page;
+	.serial('banto-hub アカウントでログインしたままのロックダウン（試運転モード専用サーバー）', () => {
+	let grantContext: BrowserContext;
+	let grantPage: Page;
+	let accountContext: BrowserContext;
+	let accountPage: Page;
 
 	test.beforeAll(async ({ browser }) => {
-		page = await browser.newPage();
+		// 1 つ目: ログインなしの試運転の grant（アカウントを作る役）。
+		grantContext = await browser.newContext();
+		grantPage = await grantContext.newPage();
+		// 2 つ目: 作ったアカウントでログインする別のコンテキスト（セッションを混ぜない）。
+		accountContext = await browser.newContext();
+		accountPage = await accountContext.newPage();
 	});
 
 	test.afterAll(async () => {
-		await page.close();
+		await grantContext.close();
+		await accountContext.close();
 	});
 
-	test('1. ログインなしの試運転の grant で、/users から管理者のアカウントを作れる', async () => {
-		const status = await page.request.get('/api/commissioning/status', { headers: CSRF_HEADERS });
+	test('1. 試運転の grant で、管理者のアカウントを作る', async () => {
+		const status = await grantPage.request.get('/api/commissioning/status', {
+			headers: CSRF_HEADERS
+		});
 		expect(((await status.json()) as { lockedDown?: boolean }).lockedDown).toBe(false);
 
-		await page.goto('/users');
-		await expect(page).toHaveURL(/\/users$/);
-		await expect(page.getByRole('heading', { level: 2, name: 'ユーザー管理' })).toBeVisible();
+		await grantPage.goto('/users');
+		await expect(grantPage.getByRole('heading', { level: 2, name: 'ユーザー管理' })).toBeVisible();
 
-		const form = page.locator('section.create');
+		const form = grantPage.locator('section.create');
 		await form.getByLabel('ユーザー名').fill(USERNAME);
 		await form.getByLabel('パスワード（8文字以上）').fill(PASSWORD);
 		await form.getByLabel('表示名').fill(DISPLAY_NAME);
 		await form.getByLabel('ロール').selectOption('admin');
 		await form.getByRole('button', { name: '作成' }).click();
 
-		await expect(page.getByText('作成しました')).toBeVisible();
-		await expect(page.getByText(USERNAME, { exact: true })).toBeVisible();
+		await expect(grantPage.getByText('作成しました')).toBeVisible();
 	});
 
-	test('2. 設定のセキュリティからロックダウンすると、試運転の grant が失効してログイン画面へ行く', async () => {
-		await page.goto('/settings/security');
-		await expect(page).toHaveURL(/\/settings\/security$/);
-		await expect(
-			page.getByRole('heading', { level: 2, name: '試運転モードのロックダウン' })
-		).toBeVisible();
+	test('2. 試運転中はアカウントの admin にもロックダウンの欄が見え、実行するとそのアカウントのまま続く', async () => {
+		await accountPage.goto('/login');
+		await accountPage.getByLabel('ユーザー名').fill(USERNAME);
+		await accountPage.getByLabel('パスワード').fill(PASSWORD);
+		await accountPage.getByRole('button', { name: 'ログイン' }).click();
+		await expect(accountPage).not.toHaveURL(/\/login$/);
 
-		page.once('dialog', (dialog) => void dialog.accept());
-		const button = page.getByRole('button', { name: 'ロックダウンを実行' });
+		// アカウントのセッション（`kind: 'account'`）で設定へ。セキュリティカテゴリは
+		// サーバーが試運転中なので出る。
+		await accountPage.goto('/settings/security');
+		await expect(accountPage).toHaveURL(/\/settings\/security$/);
+		await expect(
+			accountPage.getByRole('heading', { level: 2, name: '試運転モードのロックダウン' })
+		).toBeVisible();
+		await expect(accountPage.getByRole('link', { name: 'セキュリティ' })).toBeVisible();
+		const identity = await accountPage.evaluate(async () => {
+			const token = window.sessionStorage.getItem('banto.auth.token');
+			const res = await fetch('/api/auth/identity', {
+				headers: { 'X-Banto-Client': 'banto', Authorization: `Bearer ${token}` }
+			});
+			return (await res.json()) as { kind?: string };
+		});
+		expect(identity.kind, 'アカウントのセッションであること').toBe('account');
+
+		accountPage.once('dialog', (dialog) => void dialog.accept());
+		const button = accountPage.getByRole('button', { name: 'ロックダウンを実行' });
 		await expect(button).toBeEnabled();
 		await button.click();
 
-		await expect(page).toHaveURL(/\/login$/);
+		// 'stayed': ログイン画面へは行かず、そのアカウントで続ける。
+		await expect(accountPage.getByText('ログイン中のアカウントで続けます')).toBeVisible();
+		await expect(accountPage).not.toHaveURL(/\/login$/);
+		// セキュリティカテゴリは消え、security のページは先頭の可視カテゴリへ弾かれる。
+		await expect(accountPage).toHaveURL(/\/settings\/appearance$/);
+		await expect(accountPage.getByRole('link', { name: 'セキュリティ' })).toHaveCount(0);
 
-		const after = await page.request.get('/api/commissioning/status', { headers: CSRF_HEADERS });
+		const after = await accountPage.request.get('/api/commissioning/status', {
+			headers: CSRF_HEADERS
+		});
 		expect(((await after.json()) as { lockedDown?: boolean }).lockedDown).toBe(true);
+
+		// アカウントのトークンは生きている（ロックダウンが失効させるのは試運転の grant だけ）。
+		await accountPage.goto('/users');
+		await expect(accountPage).toHaveURL(/\/users$/);
+		await expect(
+			accountPage.getByRole('heading', { level: 2, name: 'ユーザー管理' })
+		).toBeVisible();
 	});
 
-	test('3. 作ったアカウントでログインでき、admin として /users を開ける', async () => {
-		await page.getByLabel('ユーザー名').fill(USERNAME);
-		await page.getByLabel('パスワード').fill(PASSWORD);
-		await page.getByRole('button', { name: 'ログイン' }).click();
-		await expect(page).toHaveURL(/\/status$/);
-
-		await page.goto('/users');
-		await expect(page).toHaveURL(/\/users$/);
-		await expect(page.getByRole('heading', { level: 2, name: 'ユーザー管理' })).toBeVisible();
-
-		// ロックダウンしたので、設定の「セキュリティ」カテゴリ（試運転中だけ出る）は無い。
-		await page.goto('/settings');
-		await expect(page.getByRole('link', { name: 'セキュリティ' })).toHaveCount(0);
+	test('3. grant 側のブラウザは失効していて、次の遷移でログイン画面へ行く', async () => {
+		await grantPage.goto('/users');
+		await expect(grantPage).toHaveURL(/\/login$/);
 	});
 });
