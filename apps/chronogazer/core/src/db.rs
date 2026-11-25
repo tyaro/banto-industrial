@@ -84,7 +84,8 @@
 //! （banto は検査に通らない予約を起動時に消す）。そこで起動は予約の適用の**前に**
 //! [`refuse_legacy_profile`] で、今の DB と予約のファイルを読み取り専用で確かめ、どちらかが
 //! 旧形式なら何も変えずに止まる（docs/banto-v8-upgrade-plan.md §5 の 2）。予約があるのに
-//! 形式を確かめられない（開けない・読めない・空でない `-wal` が残っている）ときも、予約を
+//! 形式を確かめられない（開けない・読めない・空でない `-wal`・`-journal` が残っている。DB の
+//! 本体が無いのに空でない `-wal`・`-journal` だけが残っているときも含む）ときも、予約を
 //! 当てずに止まる（[`InitDbError::Undetermined`]。オーナーのレビュー P2）。
 
 use banto_core::BantoError;
@@ -188,6 +189,8 @@ pub struct UndeterminedDatabase {
     pub pending: PathBuf,
     /// 確かめられなかった理由。
     pub reason: String,
+    /// 今の DB の本体が無いのに、空でない `-wal`・`-journal` が隣に残っていた。
+    pub db_missing: bool,
 }
 
 impl fmt::Display for UndeterminedDatabase {
@@ -202,16 +205,30 @@ impl fmt::Display for UndeterminedDatabase {
                 self.path.display(),
                 self.reason
             )
+        } else if self.db_missing {
+            write!(
+                f,
+                "今の DB {} が無いのに、隣に閉じきっていない変更（-wal か -journal）が残っている\
+                 ため、バックアップからの戻しの予約 {} を当てずに起動を止めました（{}）。\
+                 残っている -wal・-journal と予約のファイルは変えていません。DB の本体を別の\
+                 場所へ移したのなら、ChronoGazer を終了してから本体を元の場所へ戻して起動し\
+                 直してください（今の DB として確かめてから予約を当てます）。本体が要らない・\
+                 壊れているなら、隣の -wal・-shm・-journal を別の名前へ退避してから起動し直す\
+                 と、予約が当たります。",
+                self.path.display(),
+                self.pending.display(),
+                self.reason
+            )
         } else {
             write!(
                 f,
                 "今の DB {} の形式（この版のものか、v8.0.0 より前の版のものか）を確かめられない\
                  ため、バックアップからの戻しの予約 {} を当てずに起動を止めました（{}）。\
-                 今の DB・その -wal・予約のファイルは変えていません。ChronoGazer を終了してから\
+                 今の DB・その -wal・-journal・予約のファイルは変えていません。ChronoGazer を終了してから\
                  予約のファイルを一時的に別の場所へ移して一度起動し、正常に終了してから\
                  （今の DB の形式が確かめられ、-wal が DB へ畳まれます）予約のファイルを元の\
                  場所へ戻して起動し直してください。今の DB が壊れているなら、その DB と隣の\
-                 -wal・-shm を別の名前へ退避してから起動し直すと、予約が当たります。",
+                 -wal・-shm・-journal を別の名前へ退避してから起動し直すと、予約が当たります。",
                 self.path.display(),
                 self.pending.display(),
                 self.reason
@@ -483,9 +500,13 @@ fn hex_of(bytes: &[u8]) -> String {
 /// WAL を読むには `-shm` を作る・書くことがあり、バイトを変えずには読めない）。
 ///
 /// - **予約があるとき**: 今の DB を「無い／v8／旧形式／確かめられない」に分け、確かめられない
-///   （開けない・読めない・空でない `-wal` が残っている）なら、予約を当てずに
+///   （開けない・読めない・空でない `-wal`・`-journal` が残っている）なら、予約を当てずに
 ///   [`InitDbError::Undetermined`] で止まる（オーナーのレビュー P2。確かめずに当てると、
-///   旧形式の DB を保ったまま止まる約束を守れない）。予約のファイルも同じ考えで確かめ、
+///   旧形式の DB を保ったまま止まる約束を守れない）。本体が無くても、空でない `-wal`・`-journal`
+///   が隣に残っていれば「無い」とせずに止まる（`db_missing`。banto の予約の適用は本体が無くても
+///   `-wal`・`-shm` を消し、`-journal` は見ないので、当てると残りの変更を黙って失う）。本体も
+///   空でない `-wal`・`-journal` も無いときだけ「無い」= 初めての戻しとして通す。予約のファイルは
+///   有るときだけ確かめるので、本体の無い予約の側は起こらない（予約が無ければ何も当たらない）。予約のファイルも同じ考えで確かめ、
 ///   空でない `-wal`・`-journal` が隣にあって確かめられなければ止まる（黙って当てない・消さない）。
 ///   予約のファイルそのものが開けない・読めない（SQLite のファイルでない など）ときは今までどおり
 ///   飛ばす: 旧形式の DB とは言えず、banto の起動時の検査が「不正」として当てずに消す
@@ -514,6 +535,17 @@ pub async fn refuse_legacy_profile(db_path: &Path) -> Result<(), InitDbError> {
                         path,
                         pending: pending.clone(),
                         reason,
+                        db_missing: false,
+                    }));
+                }
+            }
+            FileFormat::Orphaned(reason) => {
+                if let Some(pending) = &pending {
+                    return Err(InitDbError::Undetermined(UndeterminedDatabase {
+                        path,
+                        pending: pending.clone(),
+                        reason,
+                        db_missing: true,
                     }));
                 }
             }
@@ -533,6 +565,8 @@ enum FileFormat {
     Legacy(LegacyKind),
     /// 空でない `-wal`・`-journal` が隣にあり、`immutable` では確かめられない（理由）。
     Undetermined(String),
+    /// 本体が無いのに、空でない `-wal`・`-journal` が隣に残っている（理由）。
+    Orphaned(String),
     /// 開けない・読めない（理由）。
     Unreadable(String),
 }
@@ -541,17 +575,29 @@ enum FileFormat {
 async fn format_of_file(path: &Path) -> FileFormat {
     use sqlx::sqlite::SqliteConnectOptions;
     use sqlx::{ConnectOptions, Connection};
-    match tokio::fs::try_exists(path).await {
-        Ok(true) => {}
-        Ok(false) => return FileFormat::Absent,
+    // 本体の有無より先に隣の `-wal`・`-journal` を見る: 本体だけが移された（消えた）のに
+    // 閉じきっていない変更が残っているとき、banto の予約の適用は本体が無くても `-wal`・`-shm` を
+    // 消し、`-journal` は見ないので、「無い」として当てると残りの変更を黙って失う・取り違える
+    // （オーナーのレビュー P2）。空の `-wal`・`-journal` は今の DB があるときと同じく中身が
+    // 無いので数えない（本体も無ければ「無い」= 初めての戻しとして通す）。
+    let present = match tokio::fs::try_exists(path).await {
+        Ok(present) => present,
         Err(err) => return FileFormat::Undetermined(format!("有無を確かめられません: {err}")),
-    }
+    };
     for suffix in ["-wal", "-journal"] {
         let mut side = path.as_os_str().to_owned();
         side.push(suffix);
         let side = PathBuf::from(side);
         match tokio::fs::metadata(&side).await {
             Ok(meta) if meta.len() == 0 => {}
+            Ok(_) if !present => {
+                return FileFormat::Orphaned(format!(
+                    "DB の本体 {} が無いのに、閉じきっていない変更 {} が残っています。\
+                     DB の本体だけを別の場所へ移した・消したときに残ります",
+                    path.display(),
+                    side.display()
+                ));
+            }
             Ok(_) => {
                 return FileFormat::Undetermined(format!(
                     "閉じきっていない変更 {} が残っています。前に使った ChronoGazer が正常に\
@@ -567,6 +613,9 @@ async fn format_of_file(path: &Path) -> FileFormat {
                 ));
             }
         }
+    }
+    if !present {
+        return FileFormat::Absent;
     }
     let mut conn = match SqliteConnectOptions::new()
         .filename(path)

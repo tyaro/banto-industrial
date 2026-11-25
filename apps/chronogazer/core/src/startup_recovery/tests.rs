@@ -1027,7 +1027,7 @@ async fn a_v8_profile_with_a_v8_reservation(root: &Path) -> PathBuf {
 
 /// 予約があるのに今の DB の形式を確かめられないとき、予約を当てずに止まり、DB・`-wal`・
 /// 予約は byte で変わらない（オーナーのレビュー P2）。
-async fn assert_undetermined_stop_touches_nothing(root: &Path, pending: &Path) {
+async fn assert_undetermined_stop_touches_nothing(root: &Path, pending: &Path, db_missing: bool) {
     let db_path = root.join("chronogazer.sqlite3");
     let before = snapshot(root);
     let err = match EngineRuntime::start(config(root)).await {
@@ -1038,6 +1038,7 @@ async fn assert_undetermined_stop_touches_nothing(root: &Path, pending: &Path) {
         EngineStartError::Database(InitDbError::Undetermined(undetermined)) => {
             assert_eq!(undetermined.path, db_path);
             assert_eq!(undetermined.pending, pending);
+            assert_eq!(undetermined.db_missing, db_missing);
             let text = err.to_string();
             assert!(text.contains("予約"), "{text}");
             assert!(text.contains(&pending.display().to_string()), "{text}");
@@ -1062,7 +1063,7 @@ async fn a_reservation_over_a_db_with_a_leftover_wal_is_not_applied() {
         vec![0x37u8; 4096],
     )
     .unwrap();
-    assert_undetermined_stop_touches_nothing(dir.path(), &pending).await;
+    assert_undetermined_stop_touches_nothing(dir.path(), &pending, false).await;
 }
 
 /// (b) 開けない今の DB ＋ 新版の予約: 予約を当てずに止まる。
@@ -1071,7 +1072,84 @@ async fn a_reservation_over_an_unreadable_db_is_not_applied() {
     let dir = TempDir::new();
     let pending = a_v8_profile_with_a_v8_reservation(dir.path()).await;
     std::fs::write(dir.path().join("chronogazer.sqlite3"), vec![0x5au8; 8192]).unwrap();
-    assert_undetermined_stop_touches_nothing(dir.path(), &pending).await;
+    assert_undetermined_stop_touches_nothing(dir.path(), &pending, false).await;
+}
+
+/// 今の DB の本体と隣の `-wal`・`-shm`・`-journal` を消す（本体だけを移した・初めての戻しの再現）。
+fn remove_db_and_side_files(root: &Path) {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let path = root.join(format!("chronogazer.sqlite3{suffix}"));
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("{} を消せない: {err}", path.display()),
+        }
+    }
+}
+
+/// (c) 今の DB の本体が無いのに、空でない `-wal`（または `-journal`）が残っている ＋ 新版の予約:
+/// banto の予約の適用は本体が無くても `-wal`・`-shm` を消し、`-journal` は見ないので、「無い」
+/// として当てずに止まる。残りのファイルと予約は byte で変わらない（オーナーのレビュー P2）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reservation_over_a_missing_db_with_leftover_side_files_is_not_applied() {
+    for suffix in ["-wal", "-journal"] {
+        let dir = TempDir::new();
+        let pending = a_v8_profile_with_a_v8_reservation(dir.path()).await;
+        remove_db_and_side_files(dir.path());
+        std::fs::write(
+            dir.path().join(format!("chronogazer.sqlite3{suffix}")),
+            vec![0x37u8; 4096],
+        )
+        .unwrap();
+        assert_undetermined_stop_touches_nothing(dir.path(), &pending, true).await;
+        assert!(
+            !dir.path().join("chronogazer.sqlite3").exists(),
+            "{suffix}: DB の本体が作られた"
+        );
+    }
+}
+
+/// (d) 今の DB の本体も、空でない `-wal`・`-journal` も無い ＋ 新版の予約（初めての戻し）: 空の
+/// `-wal`・`-journal` は数えず、予約が当たって起動する。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reservation_without_a_db_is_applied() {
+    for empty_side in [None, Some("-wal"), Some("-journal")] {
+        let dir = TempDir::new();
+        let engine = start(dir.path()).await;
+        engine
+            .services()
+            .settings
+            .set("probe", "at-backup")
+            .await
+            .unwrap();
+        let backup = engine.services().backup.create().await.expect("backup");
+        engine
+            .services()
+            .backup
+            .stage_restore_from_file(&backup.file_name)
+            .await
+            .expect("予約できる");
+        stop(engine).await;
+        remove_db_and_side_files(dir.path());
+        if let Some(suffix) = empty_side {
+            std::fs::write(dir.path().join(format!("chronogazer.sqlite3{suffix}")), b"").unwrap();
+        }
+
+        let engine = start(dir.path()).await;
+        assert_eq!(
+            engine
+                .services()
+                .settings
+                .get("probe")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("at-backup"),
+            "{empty_side:?}"
+        );
+        assert!(engine.services().backup.pending_restore().await.is_none());
+        stop(engine).await;
+    }
 }
 
 /// 同じく §5 の 2: 新しい版で取ったバックアップは、予約 → 再起動で正しく戻る（起動時の検査
