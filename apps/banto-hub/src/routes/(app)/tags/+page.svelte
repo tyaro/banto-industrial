@@ -1622,7 +1622,6 @@
 		if (selectedIds.has(t.id)) classes.push('tag-row-selected');
 		// #1255 段階 ③: `?focus=` の確認対象（持続）と、値・品質が変わった直後の一瞬の強調。
 		const externalName = externalNameForTag(t);
-		classes.push(`tag-row-id-${t.id}`); // 行の右クリックで行を特定する（#1254）
 		if (focusSet.has(externalName)) classes.push('confirm-target');
 		if (valueStream.isFlashing(externalName)) classes.push('value-flash');
 		if (insertArmed && insertBlockedReasons.has(t.id)) classes.push('tag-row-insert-blocked');
@@ -3578,10 +3577,8 @@
 		}
 	}
 
-	// 行の右クリックのメニュー。`BantoGrid` には行の右クリックの口が無いので、グリッドを包む
-	// 要素で `contextmenu` を受け、行は `rowClass`（`tagRowClass`）に載せた `tag-row-id-<id>`
-	// で特定する（行の DOM に id の属性は無い）。BantoGrid の内部の DOM（`.row`）に頼る回り道で、
-	// 行の右クリックの口を banto に提案した（tyaro/banto#784）。入ったら置き換える。
+	// 行の右クリックのメニュー。`BantoGrid` の `onRowContextMenu`（tyaro/banto#784）で受ける。
+	// 行の右クリックのほか、ContextMenu キー・Shift+F10 でも呼ばれ、preventDefault はグリッドがする。
 	interface WatchRowMenuState {
 		x: number;
 		y: number;
@@ -3590,20 +3587,13 @@
 	}
 	let watchRowMenu: WatchRowMenuState | null = $state(null);
 
-	function handleGridContextMenu(event: MouseEvent): void {
-		const target = event.target;
-		if (!(target instanceof Element)) return;
-		const rowEl = target.closest('.row');
-		if (!rowEl) return;
-		const match = [...rowEl.classList].map((c) => /^tag-row-id-(\d+)$/.exec(c)).find(Boolean);
-		if (!match) return;
-		const id = Number(match[1]);
-		event.preventDefault();
+	function handleRowContextMenu(row: Tag, pos: { x: number; y: number }): void {
+		const id = row.id;
 		// 選択モードで選んだ行の上なら、選んだ行すべて。そうでなければ右クリックした行だけ。
 		const ids = selectionMode && selectedIds.has(id) ? [...selectedIds] : [id];
 		watchRowMenu = {
-			x: event.clientX,
-			y: event.clientY,
+			x: pos.x,
+			y: pos.y,
 			ids,
 			triggerEl: document.activeElement instanceof HTMLElement ? document.activeElement : null
 		};
@@ -8279,8 +8269,7 @@
 										{:else if filteredTags.length === 0}
 											<p class="note">条件に一致するタグがありません。</p>
 										{:else}
-											<!-- svelte-ignore a11y_no_static_element_interactions -->
-											<div class="grid-wrap" oncontextmenu={handleGridContextMenu}>
+											<div class="grid-wrap">
 												<!--
 													T18-3e: `@banto/grid-svelte` の `GridState`
 													（`node_modules/@banto/grid-svelte/src/state.svelte.ts`）は
@@ -8307,6 +8296,7 @@
 														rows={gridDisplayRows}
 														{columns}
 														getRowId={(t) => t.id}
+														onRowContextMenu={handleRowContextMenu}
 														onRowClick={canWrite
 															? insertArmed
 																? handleInsertRowClick
