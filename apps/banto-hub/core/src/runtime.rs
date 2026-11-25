@@ -1739,12 +1739,18 @@ impl RunningHub {
                 ));
             }
         };
-        let (_, _, _, earlier_finished) = tokio::join!(
+        // 待ちの締め切りは 1 つにする。`wait_left` は呼んだ時点の残りしか写さないので、
+        // Windows の失効・作り直しの最中に終了すると、監視の停止（失効した世代は書き込みを
+        // 待たない）が join の途中で `keep` した残りは最初の待ちに入らない。join の後に
+        // 同じ締め切りでもう一度待って、DB を閉じる前に取りこぼさない。
+        let deadline = tokio::time::Instant::now() + banto_server::DETACHED_WRITES_STOP_TIMEOUT;
+        let _ = tokio::join!(
             stop_monitor,
             stop_tls,
             stop_plain,
-            listener_writes.wait_left(banto_server::DETACHED_WRITES_STOP_TIMEOUT)
+            listener_writes.wait_left_until(deadline)
         );
+        let earlier_finished = listener_writes.wait_left_until(deadline).await;
         let running = listener_writes.running();
         if !earlier_finished || running > 0 {
             log_err_line(&format!(

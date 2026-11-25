@@ -438,7 +438,7 @@ impl Listener for TlsListener {
 /// - 各 listener の停止口（[`StopHandle`]）。Hub の終了は、待つ前に**全部の門を先に閉じる**
 ///   （[`Self::close_all`]。どの口も書き込みを始めない状態にしてから待つ）。
 /// - 止めた世代に残った書き込み（[`RemainingWrites`]）。`stop_all` が待つのは渡した listener
-///   だけなので、作り直しで止めた世代の残りはここで持ち続け、終了で待つ（[`Self::wait_left`]）。
+///   だけなので、作り直しで止めた世代の残りはここで持ち続け、終了で待つ（[`Self::wait_left_until`]）。
 #[derive(Clone, Default)]
 pub(crate) struct ListenerWrites {
     budget: WriteBudget,
@@ -495,10 +495,11 @@ impl ListenerWrites {
         }
     }
 
-    /// 止めた世代に残った書き込みが終わるのを、全体で `limit` まで待つ。全部終わったら `true`。
-    pub(crate) async fn wait_left(&self, limit: Duration) -> bool {
+    /// 止めた世代に残った書き込みが終わるのを、`deadline` まで待つ。全部終わったら `true`。
+    /// 呼んだ時点で持っている残りを待つ（終わったものはすぐ返る）。後から `keep` された
+    /// ものは、もう一度呼んで待つ。
+    pub(crate) async fn wait_left_until(&self, deadline: tokio::time::Instant) -> bool {
         let left: Vec<RemainingWrites> = self.shared().left.clone();
-        let deadline = tokio::time::Instant::now() + limit;
         let mut finished = true;
         for remaining in left {
             let rest = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1590,7 +1591,7 @@ Content-Length: 0
     }
 
     /// #947: 失効は接続をすぐ切り、ポートも閉じ、停止は書き込みを待たずに戻るが、受理済みの
-    /// 書き込みは止めない（ADR-0035 §4）。残りは勘定が持ち、終了の待ち（`wait_left`）で終わる。
+    /// 書き込みは止めない（ADR-0035 §4）。残りは勘定が持ち、終了の待ち（`wait_left_until`）で終わる。
     #[tokio::test]
     async fn revoke_cuts_the_connection_but_lets_an_accepted_write_finish() {
         let writes = ListenerWrites::default();
@@ -1618,12 +1619,44 @@ Content-Length: 0
         assert!(!probe.done.load(Ordering::SeqCst));
         assert_eq!(writes.left_count(), 1, "残った書き込みを勘定が持っていない");
         probe.release.notify_one();
-        assert!(writes.wait_left(Duration::from_secs(5)).await);
+        assert!(
+            writes
+                .wait_left_until(tokio::time::Instant::now() + Duration::from_secs(5))
+                .await
+        );
         assert!(
             probe.done.load(Ordering::SeqCst),
             "失効で書き込みが止まった"
         );
         assert_eq!(writes.running(), 0);
+    }
+
+    /// #947（Codex P2）: 先の待ちが残りを写した後に `keep` された書き込みも、あとの待ちが
+    /// 同じ締め切りの中で待つ（終了の途中で止めた世代の残りを取りこぼさない）。
+    #[tokio::test]
+    async fn a_later_wait_covers_writes_kept_after_the_first_snapshot() {
+        let writes = ListenerWrites::default();
+        let (server, client, probe, mut started) = write_server(&writes).await;
+        let addr = server.local_addr();
+        let (_tls, _) = send_write(addr, client, &mut started).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        // 最初の待ちの時点では残りが無く、すぐ返る。
+        assert!(writes.wait_left_until(deadline).await);
+        server.revoker().revoke();
+        tokio::time::timeout(Duration::from_secs(2), server.stop())
+            .await
+            .expect("失効で止めた世代の停止が書き込みを待った");
+        assert_eq!(writes.left_count(), 1);
+        let release = probe.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            release.release.notify_one();
+        });
+        assert!(writes.wait_left_until(deadline).await);
+        assert!(
+            probe.done.load(Ordering::SeqCst),
+            "あとの待ちが残りを待たなかった"
+        );
     }
 
     #[cfg(windows)]
