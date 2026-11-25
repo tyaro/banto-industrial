@@ -449,6 +449,8 @@ pub(crate) struct ListenerWrites {
 struct WritesShared {
     gates: Vec<StopHandle>,
     left: Vec<RemainingWrites>,
+    /// `close_all` を呼んだ後は true のまま（ラッチ）。以後に登録された口は即座に閉じる。
+    closed: bool,
 }
 
 impl ListenerWrites {
@@ -474,9 +476,16 @@ impl ListenerWrites {
     }
 
     /// listener の停止口を覚える（[`Self::close_all`] で門を閉じるため）。止めた口は外す。
+    ///
+    /// すでに `close_all` の後なら、終了と同時に進んでいた更新・再 bind の新しい世代なので、
+    /// 門をその場で閉じる（以後は閉じたまま）。呼び出し側（`start_inner`）は accept を始める
+    /// 合図（`begin.send`）より前に登録するので、遅れた口は何も受け付けずに閉じる。
     pub(crate) fn register(&self, gate: StopHandle) {
         let mut shared = self.shared();
         shared.gates.retain(|gate| !gate.is_stop_requested());
+        if shared.closed {
+            gate.request_stop();
+        }
         shared.gates.push(gate);
     }
 
@@ -489,8 +498,13 @@ impl ListenerWrites {
 
     /// 覚えたすべての listener の停止を要求する（門を閉じ、受付をやめる。待たない。ADR-0035 §9
     /// の「全部の門を先に閉じ」）。受理済みの書き込みは止めない。
+    ///
+    /// 同じロックの中で `closed` を立てる（ラッチ）。終了と同時に進む証明書の更新・再 bind の
+    /// 世代が後から [`Self::register`] されても、開いたまま新しい書き込みを受けないようにする。
     pub(crate) fn close_all(&self) {
-        for gate in &self.shared().gates {
+        let mut shared = self.shared();
+        shared.closed = true;
+        for gate in &shared.gates {
             gate.request_stop();
         }
     }
@@ -1629,6 +1643,17 @@ Content-Length: 0
             "失効で書き込みが止まった"
         );
         assert_eq!(writes.running(), 0);
+    }
+
+    /// #947（オーナー P2）: `close_all` の後に始まった世代（終了と同時に進んだ更新・再 bind）は、
+    /// 登録の時点で門が閉じ、稼働中にならない。
+    #[tokio::test]
+    async fn a_generation_started_after_close_all_is_closed() {
+        let writes = ListenerWrites::default();
+        writes.close_all();
+        let (server, _client, _probe, _started) = write_server(&writes).await;
+        assert!(!server.is_serving(), "close_all の後の世代が稼働中だった");
+        server.stop().await;
     }
 
     /// #947（Codex P2）: 先の待ちが残りを写した後に `keep` された書き込みも、あとの待ちが
