@@ -5,19 +5,19 @@
  *
  * `e2e/tests/smoke.spec.ts`（ChronoGazer）と同じ設計: 実際の
  * `banto-hub`（`banto-hub-host`、`embed-ui` feature）バイナリを LAN/REST
- * モードで起動し、新規 SQLite DB に対して初回セットアップ画面が実際に出る
- * ことを含めて確認する。scenario 群は1つの `page` を
+ * モードで起動し、新規 SQLite DB に `banto-hub create-admin` で作った管理者で
+ * ログインできることを含めて確認する（banto v8 で初回セットアップ画面は無い）。scenario 群は1つの `page` を
  * `test.describe.serial` + config 全体の `workers: 1` で共有し、直前の
- * scenario が作った状態（管理者アカウント等）に次の scenario が乗る -
+ * scenario が作った状態（ログイン等）に次の scenario が乗る -
  * 人が実際に一度だけ触る操作列を模している。
  *
- * ここで作る管理者アカウント（`banto-hub-auth.ts` の
+ * 管理者アカウント（`banto-hub-auth.ts` の
  * `HUB_ADMIN_USERNAME`/`HUB_ADMIN_PASSWORD`）は、同じ `webServer`
- * インスタンスを共有する `banto-hub-tags-continuous.spec.ts` も認証に使う
+ * インスタンスを共有する他の spec も認証に使う
  * - 詳細は `banto-hub-auth.ts` の doc comment 参照。
  */
 import { expect, test, type Page } from '@playwright/test';
-import { HUB_ADMIN_DISPLAY_NAME, HUB_ADMIN_PASSWORD, HUB_ADMIN_USERNAME } from './banto-hub-auth';
+import { HUB_ADMIN_PASSWORD, HUB_ADMIN_USERNAME } from './banto-hub-auth';
 
 /** ナビのリンク名（メニューバーは名前だけ、サイドバーは前にアイコンが付く）。 */
 const NAV_TAGS = /^(?:\S+\s+)?タグ$/;
@@ -33,24 +33,23 @@ test.describe.serial('banto-hub smoke', () => {
 		await page.close();
 	});
 
-	test('1. first-run setup creates the admin account and lands on /status', async () => {
+	test('1. the administrator made by create-admin logs in and lands on /status', async () => {
 		await page.goto('/login');
 
-		// 新規DB → AuthProvider.status() が initialized: false を返す →
-		// login/+page.svelte がセットアップフォームを描画する（ログイン
-		// フォームではない）。
+		// banto v8（ADR-0034 §5/§7）: 初回セットアップの画面は無い。管理者は起動の前に
+		// `banto-hub create-admin` が作ってあり（ロックダウン済み）、最初からログイン
+		// フォームが出る（表示名・パスワード確認の欄は無い）。
 		await expect(page.getByRole('heading', { name: 'banto-hub' })).toBeVisible();
-		await expect(page.getByRole('button', { name: 'アカウントを作成' })).toBeVisible();
+		await expect(page.getByRole('button', { name: 'アカウントを作成' })).toHaveCount(0);
+		await expect(page.getByLabel('表示名')).toHaveCount(0);
+		await expect(page.getByLabel('パスワード（確認）')).toHaveCount(0);
 
-		await page.getByLabel('表示名').fill(HUB_ADMIN_DISPLAY_NAME);
 		await page.getByLabel('ユーザー名').fill(HUB_ADMIN_USERNAME);
-		await page.getByLabel('パスワード（8文字以上）').fill(HUB_ADMIN_PASSWORD);
-		await page.getByLabel('パスワード（確認）').fill(HUB_ADMIN_PASSWORD);
-		await page.getByRole('button', { name: 'アカウントを作成' }).click();
+		await page.getByLabel('パスワード').fill(HUB_ADMIN_PASSWORD);
+		await page.getByRole('button', { name: 'ログイン' }).click();
 
-		// login/+page.svelte's submitSetup() は成功後 /status へ goto する
-		// （banto-hub は relay-wright と違い、常に /status がログイン後の
-		// 着地点 - navigation.ts の doc comment 参照）。
+		// login/+page.svelte は成功後 /status へ goto する（banto-hub は relay-wright と違い、
+		// 常に /status がログイン後の着地点 - navigation.ts の doc comment 参照）。
 		await expect(page).toHaveURL(/\/status$/);
 		// h2「サーバー状態」(status/+page.svelte 内の section 見出し) -
 		// Header.svelte がページタイトルとして描く <h1>状態</h1> とは別物

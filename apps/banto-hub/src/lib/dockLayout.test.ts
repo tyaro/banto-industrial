@@ -4,7 +4,7 @@ import { dockLayoutKeys, parseStoredDockLayout, serializeDockLayout } from './do
 const SAVED = {
 	schema: 1 as const,
 	panels: ['left', 'center'],
-	layout: { version: 3, floating: [], docked: null }
+	layout: { version: 4, floating: [], docked: null }
 };
 
 describe('dockLayoutKeys', () => {

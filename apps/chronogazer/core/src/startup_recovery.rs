@@ -125,6 +125,10 @@ pub enum FailureKind {
     StoreDirUnreadable,
     /// 保存先（解決済みの `data.dir`）に書き込めない（2026-10-12 オーナー決定で追加）。
     StoreDirUnwritable,
+    /// 保存先が、この DB の保存先として使えない（banto v8、[`crate::store_generation`]。別の設定
+    /// DB の履歴か、印の無い旧い版の履歴が入っている）。書き込めないのではなく**使わない**と
+    /// 決めた（中身は変えていない）。対処の選択肢は「書き込めない」と同じ。
+    StoreDirRefused,
     /// DB が壊れている（SQLite が「DB ではない」「壊れている」と言う）。
     DatabaseCorrupt,
     /// DB を開けない・設定を読めない（権限・他のソフトが使用中・ディスクなど）。
@@ -207,7 +211,7 @@ pub fn plan(kind: FailureKind) -> WindowPlan {
         FailureKind::StoreDirUnreadable => {
             WindowPlan::Choices(vec![ChooseStoreDir, ResetStoreDir, Quit])
         }
-        FailureKind::StoreDirUnwritable => {
+        FailureKind::StoreDirUnwritable | FailureKind::StoreDirRefused => {
             WindowPlan::Choices(vec![RetryStoreCheck, ChooseStoreDir, ResetStoreDir, Quit])
         }
         FailureKind::DatabaseCorrupt | FailureKind::DatabaseUnopenable => {
@@ -224,6 +228,9 @@ pub fn classify(err: &EngineStartError) -> FailureKind {
     match err {
         EngineStartError::InstanceLock(_) => FailureKind::AlreadyRunning,
         EngineStartError::Database(InitDbError::Legacy(_)) => FailureKind::LegacyDatabase,
+        // 予約があるのに形式を確かめられない（`crate::db::refuse_legacy_profile`）: 予約を当てる・
+        // DB を作り直す選択肢は出さず、文言の対処（予約を一時的に移す など）に任せて終了だけ。
+        EngineStartError::Database(InitDbError::Undetermined(_)) => FailureKind::Other,
         EngineStartError::Database(InitDbError::Storage(err)) => {
             classify_storage_message(&err.to_string())
         }
@@ -238,6 +245,16 @@ pub fn classify(err: &EngineStartError) -> FailureKind {
         },
         EngineStartError::StoreDirUnwritable { .. } => FailureKind::StoreDirUnwritable,
         EngineStartError::StoreDirNotAllowed { .. } => FailureKind::Other,
+        // banto v8（`crate::store_generation`）: 使わないと決めた保存先（別の設定 DB・印の無い
+        // 旧い履歴）は「使えない」の窓、確かめられなかった（一覧・印の読み書き・フォルダの
+        // 作成の失敗）は「書き込めない」の窓。対処の選択肢は同じ（旧い履歴を退けてもう一度・
+        // 保存先を選び直す・既定に戻す）。
+        EngineStartError::StoreGeneration(crate::store_generation::ClaimError::Refused {
+            ..
+        }) => FailureKind::StoreDirRefused,
+        EngineStartError::StoreGeneration(crate::store_generation::ClaimError::Io { .. }) => {
+            FailureKind::StoreDirUnwritable
+        }
         EngineStartError::Listen { .. } => FailureKind::Other,
     }
 }
@@ -308,6 +325,8 @@ impl RecoveryNote {
         AuditEntry {
             actor_username: None,
             actor_role: None,
+            actor_id: None,
+            actor_kind: None,
             action: "startup_recovery",
             resource: "startup",
             entity_id: None,
@@ -499,6 +518,7 @@ fn is_transient(err: &std::io::Error) -> bool {
 pub async fn list_backups(db_path: &Path) -> Result<Vec<BackupInfo>, BantoError> {
     let pool = banto_storage::connect_sqlite_memory().await?;
     let result = BackupService::new(db_path.to_path_buf(), Db::Sqlite(pool.clone()))
+        .with_migrations(crate::db::sqlite_restore_manifest())
         .list()
         .await;
     pool.close().await;
@@ -589,7 +609,11 @@ pub async fn restore_from_backup(
     stamp: &str,
 ) -> Result<Prepared, RecoveryError> {
     restore_with(db_path, backup_file_name, stamp, |path| async move {
-        BackupService::apply_pending_restore_at_startup(&path).await
+        BackupService::apply_pending_restore_at_startup(
+            &path,
+            &crate::db::sqlite_restore_manifest(),
+        )
+        .await
     })
     .await
 }
@@ -608,7 +632,8 @@ where
     let pool = banto_storage::connect_sqlite_memory()
         .await
         .map_err(|err| RecoveryError(format!("リストアの準備に失敗しました: {err}")))?;
-    let backup = BackupService::new(db_path.to_path_buf(), Db::Sqlite(pool.clone()));
+    let backup = BackupService::new(db_path.to_path_buf(), Db::Sqlite(pool.clone()))
+        .with_migrations(crate::db::sqlite_restore_manifest());
     let result = async {
         backup
             .stage_restore_from_file(backup_file_name)
@@ -672,7 +697,7 @@ where
 pub enum StoreDirChoice {
     /// 選んだフォルダ（絶対パス）。
     Folder(PathBuf),
-    /// 既定の場所（`./data`、アプリのデータディレクトリ基準）。
+    /// 既定の場所（`./data/history`、アプリのデータディレクトリ基準）。
     Default,
 }
 
@@ -704,6 +729,17 @@ pub async fn apply_store_dir(
             RecoveryChoice::ResetStoreDir,
         ),
     };
+    // banto v8（`crate::store_generation`）: 別の世代・v8 より前の保存先は、書き込みの確かめ
+    // （一時ファイルを書く）より前に断る（そのフォルダに何も書かない）。
+    let generation = crate::store_generation::db_generation(settings)
+        .await
+        .map_err(|err| {
+            RecoveryError(format!(
+                "保存先の世代を読めませんでした（設定 DB を読めません）: {err}"
+            ))
+        })?;
+    crate::store_generation::inspect_dir(&resolved, &generation)
+        .map_err(|err| RecoveryError(err.to_string()))?;
     check_writable_dir(&resolved).await?;
     set_data_dir(settings, &value).await.map_err(|err| {
         RecoveryError(format!(

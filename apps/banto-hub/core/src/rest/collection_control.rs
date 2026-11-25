@@ -6,10 +6,10 @@
 //! 保つ。
 
 use super::{
-    actor_identity, broadcast, json, middleware, post, record_write, require_session,
-    require_session_role, ApiError, Arc, AuditEntry, AuditLogService, AuthGate, AuthState,
-    BantoError, CollectionController, CollectionStatus, Deserialize, ErrorBody, FieldError,
-    HeaderMap, IntoResponse, Json, OperationKind, QuitInProgress, Response, Role, Router, RunMode,
+    broadcast, json, middleware, post, record_as, record_write, require_session,
+    require_session_role, ApiError, Arc, AuditActor, AuditLogService, AuthGate, AuthState,
+    BantoError, CollectionController, CollectionStatus, Deserialize, ErrorBody, Extension,
+    FieldError, IntoResponse, Json, OperationKind, QuitInProgress, Response, Role, Router, RunMode,
     Serialize, ServerEvent, SessionRoleGuard, State, StatusCode,
 };
 
@@ -47,21 +47,19 @@ struct CollectionModeRequest {
 #[derive(Clone)]
 struct CollectionAdminState {
     controller: Arc<CollectionController>,
-    auth: AuthState,
     audit: AuditLogService,
     events: broadcast::Sender<ServerEvent>,
 }
 
 async fn collection_control_result(
     state: &CollectionAdminState,
-    headers: &HeaderMap,
+    actor: &AuditActor,
     action: &str,
     status: CollectionStatus,
 ) -> Json<CollectionStatusResponse> {
     record_write(
         &state.audit,
-        &state.auth,
-        headers,
+        actor,
         action,
         "collection",
         Some("1"),
@@ -83,10 +81,10 @@ async fn collection_control_result(
 
 async fn collection_start(
     State(state): State<CollectionAdminState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
 ) -> Response {
     match state.controller.start(RunMode::Configured).await {
-        Ok(status) => collection_control_result(&state, &headers, "start", status)
+        Ok(status) => collection_control_result(&state, &actor, "start", status)
             .await
             .into_response(),
         Err(refused) => quit_in_progress_response(refused),
@@ -95,10 +93,10 @@ async fn collection_start(
 
 async fn collection_start_all_simulation(
     State(state): State<CollectionAdminState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
 ) -> Response {
     match state.controller.start(RunMode::AllSimulation).await {
-        Ok(status) => collection_control_result(&state, &headers, "start_all_simulation", status)
+        Ok(status) => collection_control_result(&state, &actor, "start_all_simulation", status)
             .await
             .into_response(),
         Err(refused) => quit_in_progress_response(refused),
@@ -126,10 +124,10 @@ pub(super) fn quit_in_progress_response(refused: QuitInProgress) -> Response {
 
 async fn collection_stop(
     State(state): State<CollectionAdminState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
 ) -> Json<CollectionStatusResponse> {
     let status = state.controller.stop().await;
-    collection_control_result(&state, &headers, "stop", status).await
+    collection_control_result(&state, &actor, "stop", status).await
 }
 
 /// #341 レビュー対応（2026-09-14）: `POST /api/collection/reapply`（admin）-
@@ -149,17 +147,17 @@ async fn collection_stop(
 /// 通るため（T21 の「REST と二重実装しない」規律）。
 async fn collection_reapply(
     State(state): State<CollectionAdminState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
 ) -> Response {
     match state.controller.commit_catalog_and_apply_live().await {
         Ok(()) => {
             let status = state.controller.status();
-            collection_control_result(&state, &headers, "reapply", status)
+            collection_control_result(&state, &actor, "reapply", status)
                 .await
                 .into_response()
         }
         Err(message) => {
-            record_collection_reapply_failure(&state, &headers, &message).await;
+            record_collection_reapply_failure(&state, &actor, &message).await;
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({
@@ -177,28 +175,25 @@ async fn collection_reapply(
 /// （#340 の [`record_write_control_failure`] と同じ型）。
 async fn record_collection_reapply_failure(
     state: &CollectionAdminState,
-    headers: &HeaderMap,
+    actor: &AuditActor,
     error: &str,
 ) {
-    let identity = actor_identity(headers, &state.auth);
-    state
-        .audit
-        .record(AuditEntry {
-            actor_username: identity.as_ref().map(|i| i.id.as_str()),
-            actor_role: identity.as_ref().map(|i| i.role.as_str()),
-            action: "reapply",
-            resource: "collection",
-            entity_id: Some("1"),
-            detail: Some(json!({ "error": error })),
-            origin: "rest",
-            result: "failed",
-        })
-        .await;
+    record_as(
+        &state.audit,
+        Some(actor),
+        "rest",
+        "reapply",
+        "collection",
+        Some("1"),
+        Some(json!({ "error": error })),
+        "failed",
+    )
+    .await;
 }
 
 async fn collection_set_mode(
     State(state): State<CollectionAdminState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
     Json(body): Json<CollectionModeRequest>,
 ) -> Result<Response, ApiError> {
     let mode = match body.mode.as_str() {
@@ -215,7 +210,7 @@ async fn collection_set_mode(
     };
     match state.controller.set_mode(mode).await {
         Ok(status) => Ok(
-            collection_control_result(&state, &headers, "set_mode", status)
+            collection_control_result(&state, &actor, "set_mode", status)
                 .await
                 .into_response(),
         ),
@@ -231,7 +226,6 @@ pub(super) fn collection_control_router(
 ) -> Router {
     let state = CollectionAdminState {
         controller,
-        auth: auth.clone(),
         audit: audit.clone(),
         events,
     };

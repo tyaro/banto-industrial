@@ -129,7 +129,7 @@ use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 use utoipa::ToSchema;
 
-use crate::audit::{AuditEntry, AuditLogService};
+use crate::audit::{AuditActor, AuditEntry, AuditLogService};
 use crate::broker_glue::HubSessions;
 use crate::clock_read::{reading_from, unavailable, ClockReadCache, ClockReadView, ClockReading};
 use crate::hub::CollectorManager;
@@ -414,12 +414,9 @@ pub type FiredMinutes = HashMap<i64, BTreeSet<NaiveDateTime>>;
 /// 大きくずれていて直されても、その時刻表が永久に止まることはない。
 pub const FIRED_KEEP: chrono::TimeDelta = chrono::TimeDelta::hours(26);
 
-/// 手動の実行の操作者（監査の `actor_username`・`actor_role`）。
-#[derive(Debug, Clone, Copy)]
-pub struct ClockActor<'a> {
-    pub username: &'a str,
-    pub role: &'a str,
-}
+/// 手動の実行の操作者（監査の主体。banto v8 では認可したセッションの写し
+/// `AuditActor`、ADR-0034 §3）。
+pub type ClockActor<'a> = &'a AuditActor;
 
 /// 実行中の印を外すガード（future が捨てられても外す）。
 struct RunningGuard<'a> {
@@ -566,19 +563,18 @@ impl ClockSync {
             .insert(connection_id, record.clone());
         let entity_id = connection_id.to_string();
         audit
-            .record(AuditEntry {
-                actor_username: actor.map(|a| a.username),
-                actor_role: actor.map(|a| a.role),
-                action: AUDIT_ACTION_RUN,
-                resource: AUDIT_RESOURCE,
-                entity_id: Some(&entity_id),
-                detail: Some(record.detail()),
-                origin: match trigger {
+            .record(AuditEntry::by(
+                actor,
+                match trigger {
                     ClockTrigger::Schedule => SCHEDULE_ORIGIN,
                     ClockTrigger::Manual => "rest",
                 },
-                result: record.result.audit_result(),
-            })
+                AUDIT_ACTION_RUN,
+                AUDIT_RESOURCE,
+                Some(&entity_id),
+                Some(record.detail()),
+                record.result.audit_result(),
+            ))
             .await;
         record
     }
@@ -1231,10 +1227,7 @@ mod tests {
                 &audit,
                 3,
                 ClockTrigger::Manual,
-                Some(ClockActor {
-                    username: "admin",
-                    role: "admin",
-                }),
+                Some(&AuditActor::account("testadmin", 1, "admin")),
             )
             .await;
         assert_eq!(record.result, ClockResult::Unavailable);
@@ -1267,7 +1260,7 @@ mod tests {
 
         let rows = audit_rows(&pool).await;
         assert_eq!(rows.len(), 2, "{rows:?}");
-        assert_eq!(rows[0].0.as_deref(), Some("admin"));
+        assert_eq!(rows[0].0.as_deref(), Some("testadmin"));
         assert_eq!(
             (rows[0].1.as_str(), rows[0].2.as_str(), rows[0].3.as_str()),
             ("clock_sync", "rest", "failed")

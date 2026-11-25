@@ -39,7 +39,7 @@ Git Bash: `CHRONOGAZER_ROOT=/d/scratch/cg-dev pnpm --filter chronogazer tauri de
 環境変数 `CHRONOGAZER_ROOT`（**絶対パスだけ**。`.`・`..` を含むパスも断る）で変えられる。サービスと
 デスクトップで DB が分かれると、同じ PLC を二重に読み、履歴も割れるため。
 
-- ルートの下: DB `chronogazer.sqlite3`、時系列データ `data\`（`data.dir` の既定）、バックアップ
+- ルートの下: DB `chronogazer.sqlite3`、時系列データ `data\history\`（`data.dir` の既定。v8 より前の版の既定は `data\`）、バックアップ
   `backups\chronogazer.sqlite3\`、監査の保留 `audit-spool\chronogazer.sqlite3\`、Hub の API キー
   `secrets\hub-keys\`（DPAPI で守ったファイル。以前の版は OS キーリング）。デスクトップ版は
   `run\endpoint.json` を書かない（`chronogazer-server` のもの）。
@@ -62,7 +62,7 @@ Git Bash: `CHRONOGAZER_ROOT=/d/scratch/cg-dev pnpm --filter chronogazer tauri de
 - **以前の版のデータ**（`%APPDATA%\dev.tyaro.chronogazer\` の DB・時系列データ・バックアップ）は
   **使われない**。読まない・移さない・消さない。旧 DB が残っていれば、起動に成功した後に 1 回だけ
   （利用者ごと）「使われません。要らなければ手で削除してください」と案内する。アカウント・接続・タグ・
-  設定は引き継がれないので初回セットアップからやり直し、Hub 経由のタグを使うときは「設定 > Hub接続」から
+  設定は引き継がれないので、新しい DB で作り直し（banto v8 から初回セットアップは無い。管理者は下の起動の方法に従う）、Hub 経由のタグを使うときは「設定 > Hub接続」から
   接続し直す（以前の版が OS キーリングに入れた Hub のキーも残るだけで使われない）。
 
 LANモード（Tauri無し、REST + 静的配信のみのバイナリ。webkit2gtk が無い
@@ -78,9 +78,10 @@ cargo run -p chronogazer-core --bin banto-serve
 `banto-serve` の既定は `PORT=8721` / `BANTO_BIND=0.0.0.0`（LAN 越しの
 動作確認をしやすくするための開発用デフォルト。デスクトップ版 Tauri アプリ
 の LAN モード既定は `127.0.0.1`）。`BANTO_DB`（既定
-`./banto-dev.sqlite3`）・`BANTO_ALLOW_SETUP=1`（初回セットアップの許可）・
-`BANTO_VIEWER_PUBLIC=1`（閲覧公開を ON で保存する。外しても OFF には戻らない）も
-環境変数で指定できる（`core/src/bin/banto-serve.rs`）。
+`./banto-dev.sqlite3`）・`BANTO_VIEWER_PUBLIC=1`（閲覧公開を ON で保存する。外しても OFF には戻らない）も
+環境変数で指定できる（`core/src/bin/banto-serve.rs`）。banto v8 から初回セットアップと `BANTO_ALLOW_SETUP` は無い。
+新しい DB はログインなしで始まり、`banto-serve create-admin --username <名前>`（パスワードは標準入力）で
+管理者を作ってログイン必須に切り替える。
 
 ### 画面の無い本番用のエンジン `chronogazer-server`（2026-10-13〜、#392 B1-5）
 
@@ -101,12 +102,13 @@ target\debug\chronogazer-server.exe        # Ctrl-C で停止
   起動した利用者だけ）、ログ `logs\`、所在 `run\endpoint.json`（動いている間だけ）。
 - **待ち受け**: `http://127.0.0.1:<port>/`（設定 `server.port`、既定 8721）は常に開く。LAN は設定
   `server.enabled` がデスクトップ版と同じ条件を満たすときだけ `server.bind` に足す（`0.0.0.0` なら 1 本）。
-  最初の管理者の作成（`/api/auth/setup`）は要求ごとに決まる: 要求の送り元と `Host` の両方がこの PC
+  ログインなしの入口（`POST /api/auth/grant/localDesktop`。banto v8 で `/api/auth/setup` は廃止）は要求ごとに決まる: 要求の送り元と `Host` の両方がこの PC
   （`127.0.0.1`・`localhost`・`[::1]`）のときだけ受け付け、LAN からの要求では閉じる（`0.0.0.0` で 1 本に
   まとめていても同じ。外のページからの DNS rebinding も防ぐ。#392 B2-1、2026-10-14）。この PC のブラウザで
-  `http://127.0.0.1:<port>/` を開けば作れる。
+  `http://127.0.0.1:<port>/` を開けばログインなしで入れる（LAN からは管理者の権限を得られない。試験 `no_login_gives_a_lan_peer_no_admin_rights`）。
 - **この PC からの接続（ログインなし、#392 B2-1）**: 要求の送り元と `Host` の両方がこの PC のときだけ、`POST /api/auth/grant/localDesktop` でログインせずにセッションを受け取れる。最初の
-  管理者を作るまでの間は管理者、作った後は設定 `auth.local_grant`（`off`・`viewer`・`editor`・`admin`、
+  管理者を `chronogazer-server create-admin`（下の「最初の管理者」）で作るまでの間（新しい DB はログインなし）は
+  管理者、作った後は設定 `auth.local_grant`（`off`・`viewer`・`editor`・`admin`、
   **既定 `off`**）の権限。受け取った記録は監査ログに `login`（`via: localGrant`、操作者 `localDesktop`）で残る。
   設定は管理者がこの PC から `PUT /api/settings/auth`（`{"localGrant":"viewer"}` など）で変える（LAN からは
   変えられない）。発行をやめる方向は
@@ -130,8 +132,8 @@ target\debug\chronogazer-server.exe        # Ctrl-C で停止
   ため最終の書き出しが切れうる。起動の直後（PLC に接続中）にウィンドウを閉じると、`collection_stopped` が
   残らないことがある（行は失わない）。コンソールの文字を選択して出力が止まっていると、コンソールへの写しだけ
   諦める（ログには残る）。`logs\` と DB は同じ PC の他の利用者から読める（サービス化の権限の整理まで）。
-  最初の管理者を作るまでの間は、同じ PC のプログラムが最初の管理者を作れ、ログインなしで管理者として入れる
-  （デスクトップ版の初回セットアップと同じ範囲。ブラウザーで開いた外のページからは `Host` の確認で作れない）。
+  管理者を `chronogazer-server create-admin` で作るまでの間は、同じ PC のプログラムがログインなしで管理者として入れる
+  （デスクトップ版のログインなしと同じ範囲。ブラウザーで開いた外のページからは `Host` の確認で作れない）。
 
 #### Windows サービスとして動かす（2026-10-15〜、#392 B3-2b）
 
@@ -165,7 +167,15 @@ B3-4）が行う。手で行うときは**管理者として実行した PowerSh
    `sc.exe query ChronoGazer`、ログは `<データ>\logs\chronogazer-server-YYYY-MM-DD.log`（コンソール版と同じ
    ファイル。サービスの行は「Windows サービス」「SCM の STOP」「PRESHUTDOWN」を含む）。動いている間は
    デスクトップ版の ChronoGazer を起動すると、プロセスの中でエンジンを動かさずにサービスの画面を開く。
-4. ★ 解除: `& 'C:\Program Files\ChronoGazer\chronogazer-server.exe' uninstall`（動いていれば止めてから解除。
+4. ★ **最初の管理者**（banto v8）: 新しい DB はログインなしで始まり、その間はこの PC から誰でも管理者として
+   入れる。サービスには画面・REST からログイン必須へ切り替える口が無いので、**サービスを止めて**
+   `& 'C:\Program Files\ChronoGazer\chronogazer-server.exe' create-admin --username <名前> [--display-name <表示名>]`
+   を実行する（`Stop-Service ChronoGazer` の後。動いている間は何も書かずに断る）。パスワードは端末なら非表示で
+   2 回尋ね、パイプ・ファイルなら 1 行目を読む（Git Bash などの疑似端末では `< password.txt` で渡す）。管理者の
+   作成と `auth.disabled=false` は 1 つのトランザクションで、監査ログに残る。予約されたリストアがあれば止まる。
+   次の起動からこの PC からの接続は設定 `auth.local_grant`（既定 `off`）どおりになる（v7 と同じく `admin` にすれば
+   開く）。ログインなしの間に画面で `localGrant` を保存しても、効くのはこの後から。
+5. ★ 解除: `& 'C:\Program Files\ChronoGazer\chronogazer-server.exe' uninstall`（動いていれば止めてから解除。
    インストール利用者の記録も消える。**データは残す**）。
 
 - **終了コード**（`sc.exe query ChronoGazer` の `SERVICE_EXIT_CODE`）: 0 正常、1 後始末が時間内に終わらなかった・
@@ -299,9 +309,10 @@ DB スキーマを banto の admin-template と同じ形に整理した（2026-1
 または退避して起動し直してください（アルファ版のため自動移行はありません）」を
 出す（デスクトップ版はメインの画面の代わりにこの文と対処を書いた小さな窓を開き、
 閉じると終了する。`banto-serve` は標準エラーに出して終了する。2026-10-02 オーナー決定: 既存の DB は壊してよい。
-自動移行は作らない）。アプリを終了してから、そのパスの DB を（`-wal`・`-shm`
+自動移行は作らない）。アプリを終了してから、そのパスの DB を（`-wal`・`-shm`・`-journal`
 があれば一緒に）削除または別名へ退避し、起動し直す。新しい DB はアカウントも
-接続・タグも空なので、初回セットアップからやり直す。DB の場所はデスクトップ版が
+接続・タグも空なので、作り直す（初回セットアップは無い。ログインなしで入るか `create-admin` で管理者を作る）。新しい DB は新しい世代になり、前の時系列データの保存先は残るが使わない
+（印の無い・別の世代の保存先は書かずに止まり、起動時の窓で保存先を選び直す）。DB の場所はデスクトップ版が
 データのルートの `chronogazer.sqlite3`（既定 `%ProgramData%\ChronoGazer\chronogazer.sqlite3`。
 2026-10-14 より前の版は `%APPDATA%\dev.tyaro.chronogazer\chronogazer.sqlite3`）、`banto-serve` が
 `BANTO_DB`（既定 `./banto-dev.sqlite3`）。
@@ -317,12 +328,16 @@ DB スキーマを banto の admin-template と同じ形に整理した（2026-1
   権限が無い。起動時に一時ファイルを書いて消して確かめる）: 「もう一度確かめる」（差し直す・権限を直すなどした後に
   同じ保存先でやり直す）・「保存先のフォルダを選び直す」・「既定の場所に戻して起動する」・「終了」。
 - DB が壊れている・開けない: 「バックアップから戻す」（`backups\chronogazer.sqlite3\` の一覧から選ぶ。設定画面の
-  リストアと同じ検査）・「新しく作り直す」（初回セットアップからやり直す。時系列データのファイルは残る）・「終了」。
-  どちらも今の DB を `chronogazer.sqlite3.broken-<日時>`（`-wal`・`-shm` も同じ名前＋接尾辞）へ名前を変えて残す（確認あり）。
+  リストアと同じ検査）・「新しく作り直す」（新しい世代の DB になる。前の時系列データのファイルは残るが使わず、保存先を選び直す）・「終了」。
+  どちらも今の DB を `chronogazer.sqlite3.broken-<日時>`（`-wal`・`-shm`・`-journal` も同じ名前＋接尾辞）へ名前を変えて残す（確認あり）。
   他のソフトが DB を開いているなどで名前を変えられないときは、同じ窓に理由が出るので、閉じてから選び直す
   （権限・ロックで開けないときも「作り直す」は出るが、ロック中なら名前の変更が失敗するだけで何も消さない）。
   同じ DB を `banto-serve` や別の ChronoGazer が使用中なら、作り直す・戻すは何も変えずに理由を出す（先に止めてから選び直す）。
   バックアップを適用できなかったときは、元の DB を元の名前に戻して理由を出す（空の DB では起動しない）。
+  同じ世代でも同じ時点ではない: 同じ DB の旧いバックアップを戻すと、同じ世代なので起動時のエラーは出ないが、
+  戻したタグに今の保存先に残っている別のタグの値が混ざりうる。旧い設定だけを戻すなら今の保存先を消さずに
+  退避して新しい空の保存先で収集を始め、履歴も使うなら DB と時系列データを同じ時点の組で戻す（詳しくは下の
+  「アカウント・監査ログ・バックアップ」のバックアップの項）。
 - 新しい版の ChronoGazer が使った DB、その他の失敗: 「終了」だけ（理由を出す。ファイルには触れない）。
 - 既に起動中・旧形式の DB: 上の各節の窓（今までどおり）。
 
@@ -431,7 +446,7 @@ ON の間だけ有効で、OFF にするとその場でセッションが終わ�
 読み書きと、Hub・収集・タグレジストリの口だけ（`core/src/settings.rs`・
 `core/src/rest.rs`）。これで banto v2.1.0 の次の修正が入った:
 
-- 初回セットアップは 1 つしか成功しない（同時に送っても管理者は 1 人。banto #277）。
+- 初回セットアップは 1 つしか成功しない（同時に送っても管理者は 1 人。banto #277。banto v8 で初回セットアップ自体が廃止、管理者は `create-admin`）。
 - 失敗したログインの監査ログのユーザー名は 32 文字までに切り詰める。トークン無し・
   無効なトークンのログアウトは監査ログに記録しない（banto #278）。
 - バックアップとリストアの予約は DB ファイルごとのフォルダ
@@ -443,6 +458,13 @@ ON の間だけ有効で、OFF にするとその場でセッションが終わ�
   適用されない。起動時に標準エラーへ警告が出るだけで、移しも消しもしない
   （2026-10-04 オーナー決定: banto の既定どおり）。使いたいときは手で上のフォルダへ
   移す。
+- **同じ世代でも同じ時点ではない**（banto v8 への追従、2026-11-25）: 時系列データの保存先の世代の印は
+  「どの DB が作った保存先か」だけを見分け、同じ DB の「いつの時点か」は見分けない。同じ DB の**旧い
+  設定のバックアップ**を戻すと、接続・グループ・タグの id の振り出しも戻るので、戻した後に作るタグに
+  別のタグが使っていた id が付き、今の保存先に残っているそのタグの値が混ざりうる。同じ世代なので
+  **起動時のエラーは出ない**（`core/src/store_generation.rs` の「限界」）。旧い設定だけを戻すときは、
+  今の保存先のフォルダを消さずに別の場所へ退避し、新しい空の保存先で収集を始める。履歴も使い続けたい
+  なら、DB と時系列データを同じ時点のものの組で戻す。
 
 ## DB に書けなかった監査の保留（#437、2026-10-10〜）
 

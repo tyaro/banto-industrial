@@ -1310,6 +1310,8 @@ async fn require_tag_space_auth(
                         .record(AuditEntry {
                             actor_username: None,
                             actor_role: None,
+                            actor_id: None,
+                            actor_kind: None,
                             action: "denied",
                             resource: "api_keys",
                             entity_id: Some(&denied.id.to_string()),

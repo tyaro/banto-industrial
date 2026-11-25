@@ -106,8 +106,9 @@ use banto_collect::{
 };
 use banto_core::{BantoError, ErrorBody, FieldError, ListParams, ListResult};
 use banto_server::routes::{
-    actor_identity, audit_log_router, audit_logout_middleware, extra_auth_router, record_write,
-    ui_settings_router, users_router, LogoutAuditState,
+    actor_for_token, audit_log_router, audit_logout_middleware, extra_auth_router, record_as,
+    record_denied_as, record_write, record_write_as, ui_settings_router, users_router, AuditActor,
+    LogoutAuditState,
 };
 use banto_server::{
     auth_routes, require_banto_client_header, sse_route, ApiError, AuthState, AuthenticatedSession,
@@ -473,6 +474,11 @@ async fn require_session(
     match session_gate_decision(check, gate.operation, previously_valid) {
         GateDecision::Allow => {
             if let Some(session) = session {
+                // banto v8（ADR-0034 §3）: 監査の主体は、ここで認可したセッションの
+                // 写し（`banto_server::require_auth` と同じ）。ハンドラは
+                // `Extension<AuditActor>` で受け取り、書き込みの後にトークンを
+                // 引き直さない（書き込みの間にセッションが切れても主体が残る）。
+                req.extensions_mut().insert(gate.auth.audit_actor(&session));
                 req.extensions_mut().insert(session);
                 // #430: `/api/tag-stream` をセッションで開いたときも、接続中に
                 // 同じトークンを照合し直せるよう材料を載せる
@@ -492,6 +498,11 @@ async fn require_session(
                 "banto-hub: セッションを照合できなかったため、書き込みの停止のみ例外で受け付けます"
             );
             req.extensions_mut().insert(UnverifiedStopException);
+            // 照合できなかったが、メモリ上ではまだ既知のトークン
+            // （`previously_valid`）。そのセッションの写しを主体にする。
+            if let Some(actor) = actor_for_token(req.headers(), &gate.auth) {
+                req.extensions_mut().insert(actor);
+            }
             next.run(req).await
         }
         GateDecision::Unauthorized => unauthorized_response(),
@@ -670,22 +681,25 @@ async fn require_session_role(
     match role {
         Some(role) if role.at_least(guard.min) => next.run(req).await,
         _ => {
-            if let Some(identity) = &identity {
+            // banto v8（ADR-0034 §3）: 拒否の行の主体も、手前の
+            // [`require_session`] が載せた写し（`Extension<AuditActor>`）。
+            // 無いのは #431 の例外だけで、そのときはメモリ上のトークンから作る。
+            let actor = req.extensions().get::<AuditActor>().cloned().or_else(|| {
+                identity
+                    .as_ref()
+                    .and_then(|_| actor_for_token(req.headers(), &guard.auth))
+            });
+            if let Some(actor) = &actor {
                 let method = req.method().as_str().to_string();
                 let path = req.uri().path().to_string();
-                guard
-                    .audit
-                    .record(AuditEntry {
-                        actor_username: Some(&identity.id),
-                        actor_role: Some(&identity.role),
-                        action: "denied",
-                        resource: guard.resource,
-                        entity_id: None,
-                        detail: Some(json!({ "method": method, "path": path })),
-                        origin: "rest",
-                        result: "denied",
-                    })
-                    .await;
+                record_denied_as(
+                    &guard.audit,
+                    actor,
+                    "rest",
+                    guard.resource,
+                    Some(json!({ "method": method, "path": path })),
+                )
+                .await;
             }
             forbidden_response()
         }
@@ -703,27 +717,23 @@ async fn require_editor(
     method: &str,
     path: &str,
 ) -> Result<(), BantoError> {
-    match actor_identity(headers, auth) {
-        Some(identity)
-            if Role::from_str(&identity.role)
+    match actor_for_token(headers, auth) {
+        Some(actor)
+            if Role::from_str(&actor.role)
                 .map(|role| role.at_least(Role::Editor))
                 .unwrap_or(false) =>
         {
             Ok(())
         }
-        Some(identity) => {
-            audit
-                .record(AuditEntry {
-                    actor_username: Some(&identity.id),
-                    actor_role: Some(&identity.role),
-                    action: "denied",
-                    resource,
-                    entity_id: None,
-                    detail: Some(json!({ "method": method, "path": path })),
-                    origin: "rest",
-                    result: "denied",
-                })
-                .await;
+        Some(actor) => {
+            record_denied_as(
+                audit,
+                &actor,
+                "rest",
+                resource,
+                Some(json!({ "method": method, "path": path })),
+            )
+            .await;
             Err(BantoError::Forbidden)
         }
         None => Err(BantoError::Unauthorized),
@@ -756,7 +766,6 @@ fn api_router_with_controller_mode(
     // `CommissioningState`ハンドル（`.state()`）だけを配る。
     commissioning: CommissioningService,
     events: broadcast::Sender<ServerEvent>,
-    allow_setup: bool,
     // T2-4（設計 §6）: 書き込み受付フラグ（既定 enabled、起動時に永続値を
     // 復元。2026-09-09 オーナー決定 #340）と書き込み監査サービス - どちらも
     // `bin/banto-hub.rs`（本番）または各テストのセットアップで一度だけ
@@ -839,7 +848,6 @@ fn api_router_with_controller_mode(
             users.clone(),
             auth.clone(),
             audit.clone(),
-            allow_setup,
             grants,
             None,
         ))
@@ -1230,7 +1238,6 @@ pub fn api_router_with_controller(
     // のフィールド doc comment参照。
     commissioning: CommissioningService,
     events: broadcast::Sender<ServerEvent>,
-    allow_setup: bool,
     write_control: Arc<WriteControl>,
     write_audit: WriteAuditService,
     mqtt: Arc<MqttPublisher>,
@@ -1254,7 +1261,6 @@ pub fn api_router_with_controller(
         auth,
         commissioning,
         events,
-        allow_setup,
         write_control,
         write_audit,
         mqtt,
@@ -1282,7 +1288,6 @@ pub fn api_router(
     // のフィールド doc comment参照。
     commissioning: CommissioningService,
     events: broadcast::Sender<ServerEvent>,
-    allow_setup: bool,
     write_control: Arc<WriteControl>,
     write_audit: WriteAuditService,
     mqtt: Arc<MqttPublisher>,
@@ -1309,7 +1314,6 @@ pub fn api_router(
         auth,
         commissioning,
         events,
-        allow_setup,
         write_control,
         write_audit,
         mqtt,

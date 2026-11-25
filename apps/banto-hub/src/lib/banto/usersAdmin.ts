@@ -10,12 +10,17 @@ import { CSRF_HEADER } from './setup';
 
 export type Role = 'admin' | 'editor' | 'viewer';
 
+/** `users.kind`。`builtin` は組み込みの `admin` の 1 行だけ（banto v8、ADR-0034 §2）。 */
+export type UserKind = 'account' | 'builtin';
+
 /** Mirrors `banto_hub_core::users::UserSummary`（wire は camelCase）。 */
 export interface UserSummary {
 	id: number;
 	username: string;
 	displayName: string;
 	role: Role;
+	/** `'builtin'` の行は読み取り専用（編集・削除・パスワードの操作を出さない）。名前では判断しない。 */
+	kind: UserKind;
 	createdAt: string;
 }
 

@@ -125,6 +125,12 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Pipes",
 ] }
 
+[target.'cfg(unix)'.dependencies]
+# banto v8: `chronogazer-server create-admin` のパスワードの非表示の入力（termios）。Hub の
+# `src/bin/banto_hub/password_input.rs` を共有する（banto-hub-host と同じ指定。Cargo.lock に既にある
+# 0.2 系で、新しいパッケージは増えない）。
+libc = "0.2"
+
 [dev-dependencies]
 # #644 PR3b: `crate::hub_tls` のテストの証明書を作る（banto-hub-tls-trust・banto-hub-core と
 # 同じ版・feature。新しい package は増えない）。

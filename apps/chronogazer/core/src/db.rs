@@ -45,25 +45,48 @@
 //! `sqlx` 0.9 には `Migrator::dangerous_set_table_name` があるので、記録
 //! テーブルを migrator ごとに分けて衝突を無くした:
 //!
-//! - この app: [`MIGRATIONS_TABLE`]（`_sqlx_migrations_chronogazer`）
+//! - この app: [`MIGRATIONS_TABLE`]（既定の名前 `_sqlx_migrations`）
 //! - `banto_tags::migrate`: `_sqlx_migrations_banto_tags`
 //! - `banto_collect::migrate`: 記録テーブルを使わない（冪等 DDL のまま）
 //!
+//! この app の分が既定の名前なのは、banto v8 のリストアの検査（`banto_admin_services::backup`
+//! の `check_migration_history`）が候補の履歴を固定の名前 `_sqlx_migrations` から読むため
+//! （banto v8 への追従、docs/banto-v8-upgrade-plan.md §2。v8 より前は
+//! [`PRE_V8_MIGRATIONS_TABLE`] に記録していた）。`banto_tags` は別の表なので、リストアの
+//! 検査には app の分だけが見える（[`sqlite_restore_manifest`] も app の分だけ）。
+//!
 //! `dangerous_` が警告しているのは「既存 DB の記録を見失い、適用済みの
 //! migration を流し直そうとする」こと。**既存の DB は壊してよい**（アルファ版。
-//! 2026-10-02 オーナー決定）ので受け入れた。その代わり、古い形式の DB は
+//! 2026-10-02 オーナー決定。ChronoGazer は未リリースなので v8 への追従でも移行しない、
+//! 2026-11-25 オーナー決定）ので受け入れた。その代わり、古い形式の DB は
 //! 黙って流さずに起動を拒否する（次節）。
 //!
 //! ## 旧形式の DB の拒否
 //!
-//! [`init_db`] は接続直後・migrate の前に、「この app の記録テーブル
-//! （[`MIGRATIONS_TABLE`]）が無いのに `users` または `settings` がある」DB を
-//! 旧形式とみなし、[`InitDbError::Legacy`] を返す（自動移行はしない）。
+//! [`init_db`] は接続直後・migrate の前に、次の DB を旧形式とみなし、
+//! [`InitDbError::Legacy`] を返す（自動移行はしない）:
+//!
+//! - banto v8 より前（[`LegacyKind::BeforeBantoV8`]）: v8 より前の記録の表
+//!   [`PRE_V8_MIGRATIONS_TABLE`] がある、または記録の表の版 3 に banto v7 の
+//!   `0003_users.sql` の checksum がある;
+//! - 2026-10-02 のスキーマ整理より前（[`LegacyKind::BeforeSchemaReset`]）: 記録の表が
+//!   無いのに `users` か `settings` がある、または記録の表に `banto_tags` の版 1 がある
+//!   （整理の前は `banto_tags` が共有の `_sqlx_migrations` に記録していた）。
+//!
 //! そのまま流すと `CREATE TABLE users` が「既にある」で落ち、何が起きたか
 //! 分からないため。新規の空ファイルと新しい形式の DB は通る。呼び出し側
 //! はメッセージを stderr に出して終了する（`bin/banto-serve.rs`）。`src-tauri`
 //! はリリースビルドで stderr が見えないので、加えてメインの窓の代わりにエラー
 //! 専用の窓を開き、閉じると終了する。作り直しの手順は `apps/chronogazer/README.md` 参照。
+//!
+//! リストアの予約は `init_db` より前に適用される（`crate::engine` の起動の順序の 2.）ので、
+//! `init_db` だけで断ると、旧形式の DB の上に予約が先に当たる・旧形式の予約が黙って消される
+//! （banto は検査に通らない予約を起動時に消す）。そこで起動は予約の適用の**前に**
+//! [`refuse_legacy_profile`] で、今の DB と予約のファイルを読み取り専用で確かめ、どちらかが
+//! 旧形式なら何も変えずに止まる（docs/banto-v8-upgrade-plan.md §5 の 2）。予約があるのに
+//! 形式を確かめられない（開けない・読めない・空でない `-wal`・`-journal` が残っている。DB の
+//! 本体が無いのに空でない `-wal`・`-journal` だけが残っているときも含む）ときも、予約を
+//! 当てずに止まる（[`InitDbError::Undetermined`]。オーナーのレビュー P2）。
 
 use banto_core::BantoError;
 use sqlx::SqlitePool;
@@ -87,8 +110,16 @@ pub type DbPool = SqlitePool;
 pub use banto_storage::Db;
 
 /// この app の migration 記録テーブルの名前（モジュール doc「なぜ
-/// `sqlx::migrate!` に戻せたか」）。旧形式の判定にも使う。
-pub const MIGRATIONS_TABLE: &str = "_sqlx_migrations_chronogazer";
+/// `sqlx::migrate!` に戻せたか」）。banto v8 のリストアの検査が読む既定の名前。
+pub const MIGRATIONS_TABLE: &str = "_sqlx_migrations";
+
+/// banto v8 への追従より前に、この app の記録に使っていた表の名前。これがある DB は
+/// v8 より前の版のもの（[`LegacyKind::BeforeBantoV8`]）。
+pub const PRE_V8_MIGRATIONS_TABLE: &str = "_sqlx_migrations_chronogazer";
+
+/// `banto_tags` の最初の migration の版。2026-10-02 のスキーマ整理より前の DB は、これを
+/// 共有の `_sqlx_migrations` に記録していた（この app の migration に版 1 は無い）。
+const PRE_RESET_BANTO_TAGS_FIRST_VERSION: i64 = 1;
 
 /// 旧形式（2026-10-02 のスキーマ整理より前）の DB を開こうとした（モジュール doc「旧形式の DB の
 /// 拒否」）。`Display` がそのまま利用者向けの説明になる。
@@ -96,20 +127,117 @@ pub const MIGRATIONS_TABLE: &str = "_sqlx_migrations_chronogazer";
 pub struct LegacyDatabase {
     /// 拒否した DB ファイルのパス。
     pub path: PathBuf,
+    /// どの旧い形式か（利用者向けの説明を分ける）。
+    pub kind: LegacyKind,
 }
+
+/// [`LegacyDatabase`] の種類。どちらも自動の移行は無く、DB を作り直す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyKind {
+    /// 2026-10-02 のスキーマ整理より前（この app の記録テーブルが無いのに
+    /// `users` か `settings` がある）。
+    BeforeSchemaReset,
+    /// banto v8.0.0 より前の版で作った DB（ADR-0034 §9・
+    /// docs/banto-v8-upgrade-plan.md §2 の 1）。v8 より前の記録の表
+    /// （[`PRE_V8_MIGRATIONS_TABLE`]）がある、または記録の表に banto v7 の
+    /// `0003_users.sql` の checksum（[`PRE_V8_USERS_CHECKSUM`]）が残っている。
+    BeforeBantoV8,
+}
+
+/// banto v8.0.0 が書き換えた migration のうち、版の順で最初のもの（`0003_users.sql`）。
+const PRE_V8_USERS_MIGRATION_VERSION: i64 = 3;
+
+/// banto v7.x（v7.9.0〜v7.11.0 で同じ本文）の `0003_users.sql` の checksum（sqlx: ファイルの
+/// SHA-384、小文字の 16 進）。上流 `apps/admin-template/core/src/db.rs` の
+/// `V7_USERS_CHECKSUM_SQLITE` と同じ値。この app の記録テーブルの版 3 にこれが残っている DB は、
+/// v8 より前の版で作った DB と確定できる（それ以外の食い違いは「判別できない」で、
+/// sqlx の `VersionMismatch` のまま止まる。DB は変わらない）。
+pub const PRE_V8_USERS_CHECKSUM: &str =
+    "25f4a5973321cc81959ce2f2e211df45acdfa0d0e9db30db155dd3ac62a36b00b82edbf393ac250b4867e2a30e1b1240";
 
 impl fmt::Display for LegacyDatabase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "この DB は旧形式です。{} を削除または退避して起動し直してください\
-             （アルファ版のため自動移行はありません）",
-            self.path.display()
-        )
+        match self.kind {
+            LegacyKind::BeforeSchemaReset => {
+                write!(
+                    f,
+                    "この DB は旧形式です。{} を削除または退避して起動し直してください\
+                     （アルファ版のため自動移行はありません）",
+                    self.path.display()
+                )
+            }
+            LegacyKind::BeforeBantoV8 => write!(
+                f,
+                "この DB は v8.0.0 より前の版のものです。読めません。DB を作り直してください。\
+                 {} を削除または退避して起動し直してください（データの移行はありません）",
+                self.path.display()
+            ),
+        }
     }
 }
 
 impl std::error::Error for LegacyDatabase {}
+
+/// リストアの予約があるのに、今の DB か予約のファイルの形式（v8 か、旧形式か）を確かめられ
+/// なかった（[`refuse_legacy_profile`]）。予約を当てずに止める。`Display` がそのまま利用者
+/// 向けの説明になる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndeterminedDatabase {
+    /// 確かめられなかったファイル（今の DB か予約のファイル）。
+    pub path: PathBuf,
+    /// リストアの予約のファイル。
+    pub pending: PathBuf,
+    /// 確かめられなかった理由。
+    pub reason: String,
+    /// 今の DB の本体が無いのに、空でない `-wal`・`-journal` が隣に残っていた。
+    pub db_missing: bool,
+}
+
+impl fmt::Display for UndeterminedDatabase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.path == self.pending {
+            write!(
+                f,
+                "バックアップからの戻しの予約 {} の形式（この版のものか、v8.0.0 より前の版の\
+                 ものか）を確かめられないため、予約を当てずに起動を止めました（{}）。\
+                 今の DB と予約のファイルは変えていません。戻しをやめるなら、ChronoGazer を\
+                 終了してから予約のファイルを別の場所へ移して起動し直してください。",
+                self.path.display(),
+                self.reason
+            )
+        } else if self.db_missing {
+            write!(
+                f,
+                "今の DB {} が無いのに、隣に閉じきっていない変更（-wal か -journal）が残っている\
+                 ため、バックアップからの戻しの予約 {} を当てずに起動を止めました（{}）。\
+                 残っている -wal・-journal と予約のファイルは変えていません。DB の本体を別の\
+                 場所へ移したのなら、ChronoGazer を終了してから本体を元の場所へ戻して起動し\
+                 直してください（今の DB として確かめてから予約を当てます）。本体が要らない・\
+                 壊れているなら、隣の -wal・-shm・-journal を別の名前へ退避してから起動し直す\
+                 と、予約が当たります。",
+                self.path.display(),
+                self.pending.display(),
+                self.reason
+            )
+        } else {
+            write!(
+                f,
+                "今の DB {} の形式（この版のものか、v8.0.0 より前の版のものか）を確かめられない\
+                 ため、バックアップからの戻しの予約 {} を当てずに起動を止めました（{}）。\
+                 今の DB・その -wal・-journal・予約のファイルは変えていません。ChronoGazer を終了してから\
+                 予約のファイルを一時的に別の場所へ移して一度起動し、正常に終了してから\
+                 （今の DB の形式が確かめられ、-wal が DB へ畳まれます）予約のファイルを元の\
+                 場所へ戻して起動し直してください。今の DB が壊れているなら、その DB と隣の\
+                 -wal・-shm・-journal を別の名前へ退避してから起動し直すと、予約が当たります。",
+                self.path.display(),
+                self.pending.display(),
+                self.reason
+            )
+        }
+    }
+}
+
+impl std::error::Error for UndeterminedDatabase {}
 
 /// [`init_db`] の失敗。旧形式の DB（[`InitDbError::Legacy`]）と、それ以外の
 /// 接続・migration の失敗（[`InitDbError::Storage`]）を呼び出し側で分けられる
@@ -118,6 +246,8 @@ impl std::error::Error for LegacyDatabase {}
 pub enum InitDbError {
     /// 旧形式の DB。起動を拒否する。
     Legacy(LegacyDatabase),
+    /// リストアの予約があるのに、形式を確かめられなかった（[`refuse_legacy_profile`]）。
+    Undetermined(UndeterminedDatabase),
     /// 接続または migration の失敗。
     Storage(BantoError),
 }
@@ -126,6 +256,7 @@ impl fmt::Display for InitDbError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Legacy(legacy) => legacy.fmt(f),
+            Self::Undetermined(undetermined) => undetermined.fmt(f),
             Self::Storage(err) => err.fmt(f),
         }
     }
@@ -135,6 +266,7 @@ impl std::error::Error for InitDbError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Legacy(legacy) => Some(legacy),
+            Self::Undetermined(undetermined) => Some(undetermined),
             Self::Storage(err) => Some(err),
         }
     }
@@ -152,6 +284,7 @@ impl From<InitDbError> for BantoError {
     fn from(err: InitDbError) -> Self {
         match err {
             InitDbError::Legacy(legacy) => BantoError::Other(legacy.to_string()),
+            InitDbError::Undetermined(undetermined) => BantoError::Other(undetermined.to_string()),
             InitDbError::Storage(err) => err,
         }
     }
@@ -221,10 +354,11 @@ async fn init_db_on(
             return Err(err.into());
         }
     };
-    if legacy {
+    if let Some(kind) = legacy {
         pool.close().await;
         return Err(InitDbError::Legacy(LegacyDatabase {
             path: place.db_path(),
+            kind,
         }));
     }
     // R2b-1d（docs/hub/banto-hub-connection-settings-design.md §6.7）: 戻せない migration 0025
@@ -304,18 +438,203 @@ pub(crate) async fn migrate_memory() -> Result<SqlitePool, BantoError> {
     Ok(pool)
 }
 
-/// 「この app の記録テーブルが無いのに `users` か `settings` がある」か
-/// （モジュール doc「旧形式の DB の拒否」）。
-async fn is_legacy_schema(pool: &SqlitePool) -> Result<bool, BantoError> {
+/// 旧形式の DB か（モジュール doc「旧形式の DB の拒否」）。読むだけ。
+async fn is_legacy_schema(pool: &SqlitePool) -> Result<Option<LegacyKind>, BantoError> {
+    let mut conn = pool.acquire().await.map_err(banto_storage::storage_error)?;
+    legacy_kind_of(&mut conn).await
+}
+
+/// [`is_legacy_schema`] の本体（読み取り専用の接続でも使う。[`refuse_legacy_profile`]）。
+async fn legacy_kind_of(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<Option<LegacyKind>, BantoError> {
     let tables: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, 'users', 'settings')",
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?, 'users', 'settings')",
     )
     .bind(MIGRATIONS_TABLE)
-    .fetch_all(pool)
+    .bind(PRE_V8_MIGRATIONS_TABLE)
+    .fetch_all(&mut *conn)
     .await
     .map_err(banto_storage::storage_error)?;
-    let has_record = tables.iter().any(|name| name == MIGRATIONS_TABLE);
-    Ok(!has_record && !tables.is_empty())
+    if tables.iter().any(|name| name == PRE_V8_MIGRATIONS_TABLE) {
+        return Ok(Some(LegacyKind::BeforeBantoV8));
+    }
+    if !tables.iter().any(|name| name == MIGRATIONS_TABLE) {
+        return Ok((!tables.is_empty()).then_some(LegacyKind::BeforeSchemaReset));
+    }
+    // 表の名前は定数なので、`format!` に外の値は入らない。
+    let rows: Vec<(i64, Vec<u8>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT version, checksum FROM {MIGRATIONS_TABLE} WHERE version IN (?, ?)"
+    )))
+    .bind(PRE_RESET_BANTO_TAGS_FIRST_VERSION)
+    .bind(PRE_V8_USERS_MIGRATION_VERSION)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(banto_storage::storage_error)?;
+    if rows
+        .iter()
+        .any(|(version, _)| *version == PRE_RESET_BANTO_TAGS_FIRST_VERSION)
+    {
+        return Ok(Some(LegacyKind::BeforeSchemaReset));
+    }
+    // banto v8（ADR-0034 §9）: 新しい migration を当てる前に、v8 より前の版の DB を
+    // 名前の付いた理由で断る（sqlx の `VersionMismatch` の文言では分からないため）。
+    let v7_users = rows.iter().any(|(version, checksum)| {
+        *version == PRE_V8_USERS_MIGRATION_VERSION && hex_of(checksum) == PRE_V8_USERS_CHECKSUM
+    });
+    Ok(v7_users.then_some(LegacyKind::BeforeBantoV8))
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// 起動の最初（リストアの予約の適用と `init_db` の前）に、今の DB と予約のファイルが旧形式で
+/// ないかを確かめる（モジュール doc「旧形式の DB の拒否」の最後の段落。
+/// docs/banto-v8-upgrade-plan.md §5 の 2）。どちらかが旧形式なら、何も変えずに
+/// [`InitDbError::Legacy`]（`path` は旧形式だったファイル）を返す。
+///
+/// ファイルは `immutable` の読み取り専用で開く（書き込み・ロック・`-wal`・`-shm` を作らない。
+/// バイトは変わらない）。`immutable` は `-wal`（とロールバックの `-journal`）を読まないので、
+/// 空でない `-wal`・`-journal` が隣にあるファイルは「確かめられない」とする（読み取り専用でも
+/// WAL を読むには `-shm` を作る・書くことがあり、バイトを変えずには読めない）。
+///
+/// - **予約があるとき**: 今の DB を「無い／v8／旧形式／確かめられない」に分け、確かめられない
+///   （開けない・読めない・空でない `-wal`・`-journal` が残っている）なら、予約を当てずに
+///   [`InitDbError::Undetermined`] で止まる（オーナーのレビュー P2。確かめずに当てると、
+///   旧形式の DB を保ったまま止まる約束を守れない）。本体が無くても、空でない `-wal`・`-journal`
+///   が隣に残っていれば「無い」とせずに止まる（`db_missing`。banto の予約の適用は本体が無くても
+///   `-wal`・`-shm` を消し、`-journal` は見ないので、当てると残りの変更を黙って失う）。本体も
+///   空でない `-wal`・`-journal` も無いときだけ「無い」= 初めての戻しとして通す。予約のファイルは
+///   有るときだけ確かめるので、本体の無い予約の側は起こらない（予約が無ければ何も当たらない）。予約のファイルも同じ考えで確かめ、
+///   空でない `-wal`・`-journal` が隣にあって確かめられなければ止まる（黙って当てない・消さない）。
+///   予約のファイルそのものが開けない・読めない（SQLite のファイルでない など）ときは今までどおり
+///   飛ばす: 旧形式の DB とは言えず、banto の起動時の検査が「不正」として当てずに消す
+///   （守るべき旧い DB ではない。`a_pending_restore_warning_is_written_to_the_daily_log`）。
+/// - **予約が無いとき**: 今の DB が旧形式なら止まり、確かめられないなら飛ばす（今までどおり。
+///   この後の [`init_db`] が判定し、開けない DB は起動時の対処の窓が扱う）。
+pub async fn refuse_legacy_profile(db_path: &Path) -> Result<(), InitDbError> {
+    let pending = crate::backup::BackupService::pending_restore_file(db_path).ok();
+    let pending = match pending {
+        Some(pending) if tokio::fs::try_exists(&pending).await.unwrap_or(true) => Some(pending),
+        _ => None,
+    };
+    for path in [Some(db_path.to_path_buf()), pending.clone()]
+        .into_iter()
+        .flatten()
+    {
+        match format_of_file(&path).await {
+            FileFormat::Absent | FileFormat::Current => {}
+            FileFormat::Legacy(kind) => {
+                return Err(InitDbError::Legacy(LegacyDatabase { path, kind }));
+            }
+            FileFormat::Unreadable(_) if Some(&path) == pending.as_ref() => {}
+            FileFormat::Undetermined(reason) | FileFormat::Unreadable(reason) => {
+                if let Some(pending) = &pending {
+                    return Err(InitDbError::Undetermined(UndeterminedDatabase {
+                        path,
+                        pending: pending.clone(),
+                        reason,
+                        db_missing: false,
+                    }));
+                }
+            }
+            FileFormat::Orphaned(reason) => {
+                if let Some(pending) = &pending {
+                    return Err(InitDbError::Undetermined(UndeterminedDatabase {
+                        path,
+                        pending: pending.clone(),
+                        reason,
+                        db_missing: true,
+                    }));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`format_of_file`] の結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileFormat {
+    /// ファイルが無い。
+    Absent,
+    /// 旧形式ではない（v8 の DB か、表の無い空の DB）。
+    Current,
+    /// 旧形式。
+    Legacy(LegacyKind),
+    /// 空でない `-wal`・`-journal` が隣にあり、`immutable` では確かめられない（理由）。
+    Undetermined(String),
+    /// 本体が無いのに、空でない `-wal`・`-journal` が隣に残っている（理由）。
+    Orphaned(String),
+    /// 開けない・読めない（理由）。
+    Unreadable(String),
+}
+
+/// `path` の DB を変えずに開いて [`legacy_kind_of`]（[`refuse_legacy_profile`] の doc）。
+async fn format_of_file(path: &Path) -> FileFormat {
+    use sqlx::sqlite::SqliteConnectOptions;
+    use sqlx::{ConnectOptions, Connection};
+    // 本体の有無より先に隣の `-wal`・`-journal` を見る: 本体だけが移された（消えた）のに
+    // 閉じきっていない変更が残っているとき、banto の予約の適用は本体が無くても `-wal`・`-shm` を
+    // 消し、`-journal` は見ないので、「無い」として当てると残りの変更を黙って失う・取り違える
+    // （オーナーのレビュー P2）。空の `-wal`・`-journal` は今の DB があるときと同じく中身が
+    // 無いので数えない（本体も無ければ「無い」= 初めての戻しとして通す）。
+    let present = match tokio::fs::try_exists(path).await {
+        Ok(present) => present,
+        Err(err) => return FileFormat::Undetermined(format!("有無を確かめられません: {err}")),
+    };
+    for suffix in ["-wal", "-journal"] {
+        let mut side = path.as_os_str().to_owned();
+        side.push(suffix);
+        let side = PathBuf::from(side);
+        match tokio::fs::metadata(&side).await {
+            Ok(meta) if meta.len() == 0 => {}
+            Ok(_) if !present => {
+                return FileFormat::Orphaned(format!(
+                    "DB の本体 {} が無いのに、閉じきっていない変更 {} が残っています。\
+                     DB の本体だけを別の場所へ移した・消したときに残ります",
+                    path.display(),
+                    side.display()
+                ));
+            }
+            Ok(_) => {
+                return FileFormat::Undetermined(format!(
+                    "閉じきっていない変更 {} が残っています。前に使った ChronoGazer が正常に\
+                     終了しなかったときに残ります",
+                    side.display()
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return FileFormat::Undetermined(format!(
+                    "{} を確かめられません: {err}",
+                    side.display()
+                ));
+            }
+        }
+    }
+    if !present {
+        return FileFormat::Absent;
+    }
+    let mut conn = match SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .read_only(true)
+        .immutable(true)
+        .connect()
+        .await
+    {
+        Ok(conn) => conn,
+        Err(err) => return FileFormat::Unreadable(format!("開けません: {err}")),
+    };
+    let kind = legacy_kind_of(&mut conn).await;
+    let _ = conn.close().await;
+    match kind {
+        Ok(Some(kind)) => FileFormat::Legacy(kind),
+        Ok(None) => FileFormat::Current,
+        Err(err) => FileFormat::Unreadable(format!("読めません: {err}")),
+    }
 }
 
 async fn run_migrations(pool: &SqlitePool) -> Result<(), BantoError> {
@@ -324,6 +643,127 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), BantoError> {
 }
 
 /// この app 自身の migrator（`banto_tags::migrate` の前。`init_db` が間に 0025 の前処理を挟む）。
+/// 起動時の検査（banto v8、ADR-0034 §2・§4・§5・§6・§9。上流の `startup::check` の
+/// デスクトップの形に当たる）。migration の後に呼ぶ。満たさない DB は名前と対処を書いた
+/// エラーで起動を止める（既定で埋めない・直さない）:
+///
+/// - 組み込みの `admin` の行がちょうど 1 つ、予約名（`admin` と
+///   [`crate::local_grant::reserved_usernames`]）と同じ名前のアカウントが無い;
+/// - 認証モード（`auth.disabled`・`auth.disabled_role`）を読める;
+/// - ログイン必須なら、ログインできる管理者のアカウントがある。
+///
+/// 返すのは組み込みの行の id（`AuthState::with_builtin_admin_id` と、デスクトップの
+/// コマンドの監査の主体に渡す）。
+pub async fn startup_check(db: &Db) -> Result<i64, BantoError> {
+    let settings = crate::settings::SettingsService::new(db.clone());
+    let users = crate::users::UsersService::new(db.clone())
+        .with_reserved_usernames(crate::local_grant::reserved_usernames());
+    let found = users.check_startup().await?;
+    let auth = settings.auth_config().await?;
+    if !auth.disabled && !users.has_admin().await? {
+        return Err(BantoError::Other(
+            "ログイン必須の設定なのに、ログインできる管理者のアカウントがありません。\
+             この DB は直接書き換えられた可能性があります。バックアップから戻すか、DB を作り直してください"
+                .to_string(),
+        ));
+    }
+    Ok(found.builtin_admin_id)
+}
+
+/// banto v8.0.0 の基準の最後の migration（`0014_ui_settings`、ADR-0034 §9）。リストアの
+/// 候補はここまでを全部当ててある必要がある（この app の 0101 以降は後の起動が当てる）。
+pub const BASELINE_MIGRATION_VERSION: i64 = 14;
+
+/// リストアの検査に渡す、この app の migration の一覧と起動時の検査（banto v8、ADR-0034 §9）。
+/// `BackupService::with_migrations` と `apply_pending_restore_at_startup` に渡す。
+///
+/// banto は候補の履歴を `_sqlx_migrations` から読む（この app の記録の表
+/// [`MIGRATIONS_TABLE`]。`banto_tags` の分は別の表なので一覧に入れない）。履歴が合った
+/// 候補には、起動と同じ検査（[`startup_check`]）を写しの上で掛ける
+/// （`CandidateCheck`。上流 admin-template の `startup::sqlite_restore_manifest` と同じ形）:
+/// 置き換えた後で起動できない候補を、置き換える前に断る。
+pub fn sqlite_restore_manifest() -> crate::backup::MigrationManifest {
+    sqlite_migration_manifest()
+        .with_candidate_check(crate::backup::CandidateCheck::new(check_restore_candidate))
+}
+
+/// [`sqlite_restore_manifest`] の、履歴の一覧だけ（起動時の検査なし）。
+fn sqlite_migration_manifest() -> crate::backup::MigrationManifest {
+    crate::backup::MigrationManifest::new(
+        sqlx::migrate!("./migrations-sqlite")
+            .iter()
+            .filter(|migration| !migration.migration_type.is_down_migration())
+            .map(|migration| (migration.version, migration.checksum.to_vec())),
+        BASELINE_MIGRATION_VERSION,
+    )
+}
+
+/// リストアの候補を、次の起動が見る形で確かめる（上流 admin-template の
+/// `startup::check_restore_candidate` と同じ方針）: 候補の**写し**に起動と同じ準備
+/// （migration。候補は基準より後の migration を欠いていてよい）を当ててから
+/// [`startup_check`]。候補そのものは書き込みで開かず、写しは結果に関わらず消す。
+///
+/// - `Rejected`: [`startup_check`] が断った（候補の中身の問題。組み込みの行・予約名・
+///   認証モード・管理者）。
+/// - `Err`: 確かめきれなかった（写しを作れない・開けない・migration が通らない・読めない）。
+///   候補の問題とは限らないので判定にしない（予約は残り、今回は適用しない）。
+///
+/// 0025 の前処理（[`prepare_0025`]）は当てない: 写しの隣にバックアップを作るだけで、
+/// 起動できるかの判定は変わらない。
+async fn check_restore_candidate(
+    candidate: PathBuf,
+) -> Result<crate::backup::CandidateVerdict, BantoError> {
+    let copy = restore_check_copy_path(&candidate);
+    let result = match tokio::fs::copy(&candidate, &copy).await {
+        Ok(_) => check_restore_copy(&copy).await,
+        Err(err) => Err(BantoError::Other(format!(
+            "リストア候補の検査用コピーを作れませんでした: {err}"
+        ))),
+    };
+    for path in [
+        copy.clone(),
+        sidecar_of(&copy, "-wal"),
+        sidecar_of(&copy, "-shm"),
+    ] {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    result
+}
+
+async fn check_restore_copy(copy: &Path) -> Result<crate::backup::CandidateVerdict, BantoError> {
+    let pool = banto_storage::connect_sqlite(copy).await?;
+    let result = match run_migrations(&pool).await {
+        Ok(()) => match startup_check(&Db::Sqlite(pool.clone())).await {
+            Ok(_) => Ok(crate::backup::CandidateVerdict::Accepted),
+            // 読めなかった（判定ではない）。
+            Err(err @ BantoError::Storage(_)) => Err(err),
+            Err(err) => Ok(crate::backup::CandidateVerdict::Rejected(err.to_string())),
+        },
+        Err(err) => Err(BantoError::Other(format!(
+            "リストア候補の検査用コピーで、起動の準備（migration）を終えられませんでした: {err}"
+        ))),
+    };
+    // 消す前に閉じる（Windows は開いた SQLite のファイルを消させない）。
+    pool.close().await;
+    result
+}
+
+fn restore_check_copy_path(candidate: &Path) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let name = format!(".restore-check-{}-{nonce}.tmp", std::process::id());
+    match candidate.parent() {
+        Some(dir) => dir.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+fn sidecar_of(path: &Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}{suffix}", path.display()))
+}
+
 async fn run_app_migrations(pool: &SqlitePool) -> Result<(), BantoError> {
     // この app 自身の分（admin-template のコピー）。記録テーブルを分ける理由は
     // モジュール doc 参照。
@@ -356,6 +796,43 @@ async fn run_shared_migrations(pool: &SqlitePool) -> Result<(), BantoError> {
         .await
         .map_err(|err| BantoError::Other(err.to_string()))?;
     Ok(())
+}
+
+/// 試験用: banto v7 の版の ChronoGazer が作った DB（v8 への追従の前の形）を `path` に作る
+/// （docs/banto-v8-upgrade-plan.md §5 の 2 の「v7 の実プロファイル」）。記録の表は
+/// [`PRE_V8_MIGRATIONS_TABLE`]、`0003_users.sql`・`0005_audit_log.sql` は v7 の本文
+/// （`tests/fixtures/banto-v7/`。main の写し）、v8 が足した 0014・0015 は無い。
+/// 作業用の migration の置き場は `path` の隣に作る。WAL を畳んで閉じる。
+#[cfg(test)]
+pub(crate) async fn write_banto_v7_db(path: &Path) {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let set = path.with_extension("v7-migrations");
+    std::fs::create_dir_all(&set).unwrap();
+    for entry in std::fs::read_dir(manifest.join("migrations-sqlite")).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("0014_") || name.starts_with("0015_") {
+            continue;
+        }
+        let source = if name.starts_with("0003_") || name.starts_with("0005_") {
+            manifest.join("tests/fixtures/banto-v7").join(&name)
+        } else {
+            entry.path()
+        };
+        std::fs::copy(source, set.join(&name)).unwrap();
+    }
+    let pool = banto_storage::connect_sqlite(path).await.unwrap();
+    let mut app = sqlx::migrate::Migrator::new(set.as_path()).await.unwrap();
+    app.dangerous_set_table_name(PRE_V8_MIGRATIONS_TABLE);
+    app.run(&pool).await.unwrap();
+    banto_tags::migrate(&pool).await.unwrap();
+    banto_collect::migrate(&pool).await.unwrap();
+    sqlx::query("INSERT INTO settings (key, value) VALUES ('probe', 'v7')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    std::fs::remove_dir_all(&set).unwrap();
 }
 
 #[cfg(test)]
@@ -420,8 +897,9 @@ mod tests {
         run_migrations(&pool).await.unwrap(); // second run: must not error
     }
 
-    /// スキーマ整理（2026-10-02）: 記録テーブルは migrator ごとに分かれ、共有の `_sqlx_migrations`
-    /// は作られない。この app の分は上流 admin-template の 9 本 + この app 固有。
+    /// スキーマ整理（2026-10-02）: 記録テーブルは migrator ごとに分かれる。banto v8 への追従から
+    /// この app の分は既定の `_sqlx_migrations`（リストアの検査が読む）、`banto_tags` は自分の表。
+    /// この app の分は上流 admin-template の写し + この app 固有。
     #[tokio::test]
     async fn migrations_are_recorded_in_per_migrator_tables() {
         let pool = init_db_memory().await.unwrap();
@@ -435,8 +913,8 @@ mod tests {
         assert_eq!(
             tables,
             vec![
-                "_sqlx_migrations_banto_tags".to_string(),
                 MIGRATIONS_TABLE.to_string(),
+                "_sqlx_migrations_banto_tags".to_string(),
             ]
         );
         let versions: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
@@ -445,11 +923,11 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        // 2〜13 は admin-template のコピー（9・11 は除く）、101 からはこの app 固有（#393 の表示グループ、
+        // 2〜15 は admin-template のコピー（9・11 は除く）、101 からはこの app 固有（#393 の表示グループ、
         // #532 の記録計の側のタグごとの設定、#1161 PR4 の API キー）。
         assert_eq!(
             versions,
-            vec![2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103, 104, 105, 106, 107, 108, 109]
+            vec![2, 3, 4, 5, 7, 8, 10, 12, 13, 14, 15, 101, 102, 103, 104, 105, 106, 107, 108, 109]
         );
         let has_auth_epoch: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'auth_epoch'",
@@ -531,7 +1009,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             versions,
-            vec![2, 3, 4, 5, 7, 8, 10, 12, 13, 101, 102, 103, 104, 105, 106, 107, 108, 109]
+            vec![2, 3, 4, 5, 7, 8, 10, 12, 13, 14, 15, 101, 102, 103, 104, 105, 106, 107, 108, 109]
         );
         let after: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pragma_table_info('audit_log') WHERE name = 'pending_id'",
@@ -571,7 +1049,7 @@ mod tests {
         old.dangerous_set_table_name(MIGRATIONS_TABLE);
         old.run(&pool).await.unwrap();
         sqlx::query(
-            "INSERT INTO users (username, password_hash, display_name) VALUES ('probe', 'x', 'Probe')",
+            "INSERT INTO users (username, password_hash, display_name, account_uid) VALUES ('probe', 'x', 'Probe', 'probe-uid')",
         )
         .execute(&pool)
         .await
@@ -634,6 +1112,109 @@ mod tests {
         }
     }
 
+    /// banto v8 への追従（docs/banto-v8-upgrade-plan.md §5 の 2）: v7 の版の DB（旧い記録の表・
+    /// 旧い 0003/0005）は [`LegacyKind::BeforeBantoV8`] で断られ、ファイルは byte で変わらない。
+    /// v7 の 0003 の checksum は [`PRE_V8_USERS_CHECKSUM`] と同じ。
+    #[tokio::test]
+    async fn a_banto_v7_database_is_refused_without_being_touched() {
+        let dir = crate::test_support::TempDir::new();
+        let db_path = dir.path().join("chronogazer.sqlite3");
+        write_banto_v7_db(&db_path).await;
+        let before = std::fs::read(&db_path).unwrap();
+
+        let pool = banto_storage::connect_sqlite(&db_path).await.unwrap();
+        let checksum: Vec<u8> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT checksum FROM {PRE_V8_MIGRATIONS_TABLE} WHERE version = 3"
+        )))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+        assert_eq!(hex_of(&checksum), PRE_V8_USERS_CHECKSUM);
+        // 上の読み取りで本体は変わっていない（以降の比べる基準）。
+        assert_eq!(std::fs::read(&db_path).unwrap(), before);
+
+        match refuse_legacy_profile(&db_path).await {
+            Err(InitDbError::Legacy(legacy)) => {
+                assert_eq!(legacy.path, db_path);
+                assert_eq!(legacy.kind, LegacyKind::BeforeBantoV8);
+            }
+            other => panic!("expected Legacy, got {other:?}"),
+        }
+        match init_db(&db_path).await {
+            Err(InitDbError::Legacy(legacy)) => {
+                assert_eq!(legacy.kind, LegacyKind::BeforeBantoV8);
+                assert!(legacy.to_string().contains("v8.0.0 より前"), "{legacy}");
+            }
+            other => panic!("expected Legacy, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            before,
+            "the v7 DB changed"
+        );
+    }
+
+    /// 2026-10-02 のスキーマ整理より前の、`banto_tags` が共有の `_sqlx_migrations` に版 1 を
+    /// 記録していた DB は [`LegacyKind::BeforeSchemaReset`]。新しい DB は旧形式ではない。
+    #[tokio::test]
+    async fn a_shared_history_with_banto_tags_version_1_is_before_the_schema_reset() {
+        let pool = banto_storage::connect_sqlite_memory().await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL); INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (1, 'plc connections', 1, x'00', 0); CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            is_legacy_schema(&pool).await.unwrap(),
+            Some(LegacyKind::BeforeSchemaReset)
+        );
+        pool.close().await;
+
+        let fresh = init_db_memory().await.unwrap();
+        assert_eq!(is_legacy_schema(&fresh).await.unwrap(), None);
+        fresh.close().await;
+    }
+
+    /// banto v8 の起動時の検査（`CandidateCheck`）: 履歴は合っていても起動できない候補
+    /// （組み込みの `admin` の行が無い）は予約の前に断られ、今の DB は変わらない。
+    #[tokio::test]
+    async fn a_backup_that_could_not_start_is_refused_at_staging() {
+        use crate::backup::BackupService;
+
+        let dir = crate::test_support::TempDir::new();
+        let db_path = dir.path().join("chronogazer.sqlite3");
+        let pool = init_db(&db_path).await.expect("init_db");
+        let backup = BackupService::new(db_path.clone(), Db::Sqlite(pool.clone()))
+            .with_migrations(sqlite_restore_manifest());
+        // 組み込みの行を消してからバックアップを取る（候補だけが壊れている）。
+        sqlx::query("DELETE FROM users WHERE username = 'admin'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let created = backup.create().await.expect("create backup");
+        let err = backup
+            .stage_restore_from_file(&created.file_name)
+            .await
+            .expect_err("a candidate the app cannot start on must be refused");
+        assert!(format!("{err:?}").contains("起動できなく"), "{err:?}");
+        assert!(backup.pending_restore().await.is_none());
+        // 検査用の写しは残らない。
+        let scope = BackupService::pending_restore_file(&db_path)
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let leftovers: Vec<String> = std::fs::read_dir(&scope)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".restore-check-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        pool.close().await;
+    }
+
     /// バックアップと復元の往復を ChronoGazer の実際の migration の上で
     /// （I2a #498 のレビューの任意提案、I2b で追加）: `init_db` で開いた DB で
     /// バックアップを作る → 値を変える → そのバックアップの復元を予約する →
@@ -652,7 +1233,8 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let backup = BackupService::new(db_path.clone(), Db::Sqlite(pool.clone()));
+        let backup = BackupService::new(db_path.clone(), Db::Sqlite(pool.clone()))
+            .with_migrations(sqlite_restore_manifest());
         let created = backup.create().await.expect("create backup");
         sqlx::query("UPDATE settings SET value = 'after-backup' WHERE key = 'probe'")
             .execute(&pool)
@@ -665,10 +1247,11 @@ mod tests {
         assert!(backup.pending_restore().await.is_some());
         pool.close().await;
 
-        let applied = BackupService::apply_pending_restore_at_startup(&db_path)
-            .await
-            .expect("apply at startup")
-            .expect("a staged restore is applied");
+        let applied =
+            BackupService::apply_pending_restore_at_startup(&db_path, &sqlite_restore_manifest())
+                .await
+                .expect("apply at startup")
+                .expect("a staged restore is applied");
 
         let pool = init_db(&db_path)
             .await
@@ -678,7 +1261,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value, "at-backup");
-        let backup = BackupService::new(db_path.clone(), Db::Sqlite(pool.clone()));
+        let backup = BackupService::new(db_path.clone(), Db::Sqlite(pool.clone()))
+            .with_migrations(sqlite_restore_manifest());
         assert!(backup.pending_restore().await.is_none());
         let names: Vec<String> = backup
             .list()

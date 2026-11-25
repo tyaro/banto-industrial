@@ -3,6 +3,7 @@ DELETE /api/collection-groups/{id}
 DELETE /api/plc-connections/{id}
 DELETE /api/sink/groups/{id}
 DELETE /api/tags/{id}
+DELETE /api/ui-settings/{key}
 DELETE /api/users/{id}
 GET /api/api-keys
 GET /api/audit-log/config
@@ -62,7 +63,6 @@ POST /api/auth/change-password
 POST /api/auth/grant/{kind}
 POST /api/auth/login
 POST /api/auth/logout
-POST /api/auth/setup
 POST /api/collection-groups
 POST /api/collection-groups/{id}/describe
 POST /api/collection/mode

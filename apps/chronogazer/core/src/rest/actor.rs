@@ -83,6 +83,9 @@ use crate::users::Role;
 
 /// キーの主体の監査の `actor_role`（§4.2）。
 pub(crate) const API_KEY_ACTOR_ROLE: &str = "api_key";
+/// banto v8（ADR-0034 §3）: API キーで動いた操作の監査の `actor_kind`（経路の自分の語）。
+/// 記録のためだけの値で、認可には使わない（Hub の `crate::mcp` と同じ綴り）。
+pub(crate) const API_KEY_ACTOR_KIND: &str = "apikey";
 
 /// 失効・期限切れのキーの拒否と、キーを通さないルートでの拒否を記録する
 /// `resource`（HUB の `/api/v1/*` と同じ）。
@@ -107,6 +110,11 @@ pub(crate) enum Actor {
         role: String,
         grant: Option<String>,
         account_id: Option<i64>,
+        /// 監査の主体の写し（banto v8、ADR-0034 §3）: banto の `require_auth` が認可の時点で
+        /// 要求に載せた `AuditActor`。[`Actor::audit_actor`] はこれがあればそのまま使う
+        /// （banto の帰属の規則と同じ値。トークンから引き直さない）。無いのは、写しを載せない
+        /// 経路（試験で手で組んだ値）だけ。
+        audit: Option<AuditActor>,
     },
     /// API キー。`label` は監査に載せる `名前（prefix）`。
     ApiKey {
@@ -159,6 +167,7 @@ impl Actor {
                 role,
                 grant,
                 account_id,
+                ..
             } => crate::free_trends::FreeTrendActor::from_session(
                 username,
                 role,
@@ -169,11 +178,45 @@ impl Actor {
         }
     }
 
-    /// 監査に載せる `(actor_username, actor_role)`。
-    fn audit_actor(&self) -> (&str, &str) {
+    /// 監査の主体（banto v8、ADR-0034 §3: `actor_username`・`actor_id`・`actor_role`・
+    /// `actor_kind`）。セッションは banto の `AuthState::audit_actor` と同じ規則
+    /// （`AuditActor::attribute`。この app の grant は `audit_as_builtin_admin` を付けない
+    /// ので、印の無い形）: アカウントは `users.id` と `account`、grant は `grant:<kind>`。
+    /// API キーはセッションではないので `id` は無く、kind は [`API_KEY_ACTOR_KIND`]。
+    pub(crate) fn audit_actor(&self) -> AuditActor {
         match self {
-            Self::Session { username, role, .. } => (username, role),
-            Self::ApiKey { label, .. } => (label, API_KEY_ACTOR_ROLE),
+            Self::Session {
+                audit: Some(snapshot),
+                ..
+            } => snapshot.clone(),
+            Self::Session {
+                username,
+                role,
+                grant,
+                account_id,
+                audit: None,
+            } => {
+                let kind = grant
+                    .as_deref()
+                    .map(banto_admin_services::audit::grant_actor_kind)
+                    .unwrap_or_else(|| banto_admin_services::audit::ACTOR_KIND_ACCOUNT.to_string());
+                AuditActor::attribute(
+                    banto_admin_services::audit::ActorSession {
+                        username,
+                        account_id: *account_id,
+                        role,
+                        kind: &kind,
+                        audit_as_builtin_admin: false,
+                    },
+                    None,
+                )
+            }
+            Self::ApiKey { label, .. } => AuditActor {
+                username: label.clone(),
+                id: None,
+                role: API_KEY_ACTOR_ROLE.to_string(),
+                kind: API_KEY_ACTOR_KIND.to_string(),
+            },
         }
     }
 
@@ -189,10 +232,10 @@ impl Actor {
         entity_id: Option<&str>,
         detail: Option<serde_json::Value>,
     ) {
-        let (username, role) = self.audit_actor();
+        let actor = self.audit_actor();
         record_write_as(
             audit,
-            Some(AuditActor { username, role }),
+            Some(&actor),
             origin,
             action,
             resource,
@@ -213,13 +256,13 @@ impl Actor {
         via: &Via<'_>,
         resource: &str,
     ) {
-        let (username, role) = self.audit_actor();
+        let actor = self.audit_actor();
         record_denied_as(
             audit,
-            AuditActor { username, role },
+            &actor,
             via.origin(),
             resource,
-            via.denied_detail(),
+            Some(via.denied_detail()),
         )
         .await;
     }
@@ -242,6 +285,7 @@ impl<S: Send + Sync> FromRequestParts<S> for Actor {
                 role: session.identity.role.clone(),
                 grant: session.grant.as_ref().map(|kind| kind.as_str().to_string()),
                 account_id: session.stamp.map(|stamp| stamp.account_id),
+                audit: parts.extensions.get::<AuditActor>().cloned(),
             });
         }
         Err(unauthorized_response())
@@ -398,6 +442,8 @@ async fn verify_own_key(
                     .record(AuditEntry {
                         actor_username: None,
                         actor_role: None,
+                        actor_id: None,
+                        actor_kind: None,
                         action: "denied",
                         resource: API_KEYS_RESOURCE,
                         entity_id: Some(&denied.id.to_string()),
@@ -548,6 +594,7 @@ mod tests {
             role: "viewer".into(),
             grant: None,
             account_id: Some(1),
+            audit: None,
         };
         assert!(viewer.can_read());
         assert!(!viewer.can_configure());
@@ -557,6 +604,7 @@ mod tests {
             role: "editor".into(),
             grant: None,
             account_id: Some(1),
+            audit: None,
         };
         assert!(editor.can_configure());
         assert!(editor.can_operate_collect());
@@ -565,6 +613,7 @@ mod tests {
             role: "superuser".into(),
             grant: None,
             account_id: Some(1),
+            audit: None,
         };
         assert!(!unknown.can_read());
     }
@@ -587,6 +636,9 @@ mod tests {
         assert!(config.can_read());
         assert!(config.can_configure());
         assert!(config.can_operate_collect());
-        assert_eq!(config.audit_actor().1, "api_key");
+        let actor = config.audit_actor();
+        assert_eq!(actor.role, "api_key");
+        assert_eq!(actor.kind, "apikey");
+        assert_eq!(actor.id, None);
     }
 }

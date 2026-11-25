@@ -36,7 +36,7 @@ export const grantAnswer =
 		identity: { id: 'commissioning', name: '試運転モード', role: 'admin', kind }
 	});
 
-export const ALICE: Identity = { id: 'alice', name: 'Alice', role: 'admin' };
+export const ALICE: Identity = { id: 'alice', name: 'Alice', role: 'admin', accountId: 'alice' };
 
 export function fakeAuthProvider(initial: Answer = noneAnswer) {
 	let revision = 1;

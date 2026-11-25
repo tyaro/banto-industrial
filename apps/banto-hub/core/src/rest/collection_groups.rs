@@ -9,8 +9,8 @@
 use super::{
     commit_catalog_and_notify, default_payload_enabled, json, preflight_transaction,
     queue_pending_registry_change, record_write, registry_before, registry_change_should_queue,
-    require_editor, storage_api_error, ApiError, CollectionGroup, CollectionGroupInput,
-    Deserialize, HeaderMap, IntoResponse, Json, ListParams, Path, RegistryMutationError,
+    require_editor, storage_api_error, ApiError, AuditActor, CollectionGroup, CollectionGroupInput,
+    Deserialize, Extension, HeaderMap, IntoResponse, Json, ListParams, Path, RegistryMutationError,
     RegistryMutationResult, Response, Serialize, State, StatusCode, TagRegistryState,
 };
 
@@ -156,6 +156,7 @@ pub(super) async fn collection_groups_describe(
 
 pub(super) async fn collection_groups_create(
     State(state): State<TagRegistryState>,
+    Extension(actor): Extension<AuditActor>,
     headers: HeaderMap,
     Json(input): Json<CollectionGroupPayload>,
 ) -> RegistryMutationResult<Response> {
@@ -218,8 +219,7 @@ pub(super) async fn collection_groups_create(
     tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
-        &state.auth,
-        &headers,
+        &actor,
         "create",
         "collection_groups",
         Some(&created.id.to_string()),
@@ -234,6 +234,7 @@ pub(super) async fn collection_groups_create(
 
 pub(super) async fn collection_groups_update(
     State(state): State<TagRegistryState>,
+    Extension(actor): Extension<AuditActor>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     Json(input): Json<CollectionGroupPayload>,
@@ -297,8 +298,7 @@ pub(super) async fn collection_groups_update(
     tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
-        &state.auth,
-        &headers,
+        &actor,
         "update",
         "collection_groups",
         Some(&id.to_string()),
@@ -313,6 +313,7 @@ pub(super) async fn collection_groups_update(
 
 pub(super) async fn collection_groups_delete(
     State(state): State<TagRegistryState>,
+    Extension(actor): Extension<AuditActor>,
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> RegistryMutationResult<Response> {
@@ -375,8 +376,7 @@ pub(super) async fn collection_groups_delete(
     tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
-        &state.auth,
-        &headers,
+        &actor,
         "delete",
         "collection_groups",
         Some(&id.to_string()),

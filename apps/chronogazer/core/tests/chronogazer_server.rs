@@ -242,17 +242,10 @@ async fn request(
     (status, serde_json::from_str(&text).unwrap_or_default())
 }
 
-/// LAN に出していないので、最初の管理者を作れる（token が返る）。
+/// 管理者 `testadmin` でログインした token（アカウントは [`prepare_root`] が作る。
+/// banto v8 で初回セットアップ `POST /api/auth/setup` は無くなった）。
 async fn setup_admin(port: u16) -> String {
-    let (status, body) = request(
-        reqwest::Method::POST,
-        format!("http://127.0.0.1:{port}/api/auth/setup"),
-        None,
-        Some(serde_json::json!({"username":"testadmin","password":ADMIN_PASSWORD,"displayName":"管理者"})),
-    )
-    .await;
-    assert_eq!(status, 200, "{body}");
-    body["token"].as_str().expect("token").to_string()
+    login(port).await
 }
 
 async fn login(port: u16) -> String {
@@ -269,13 +262,23 @@ async fn login(port: u16) -> String {
 
 // --- DB の準備と読み戻し -------------------------------------------------------
 
-/// 一時ルートの DB を作り、待ち受けを port 0（OS が選ぶ）にする。`plc_port` が
+/// 一時ルートの DB を作り、管理者 `testadmin` を作り、待ち受けを port 0（OS が選ぶ）にする。`plc_port` が
 /// あれば、シミュレータの Modbus TCP の接続 1・グループ 1（100ms）・タグ 1 を登録する。
 async fn prepare_root(sandbox: &Sandbox, plc_port: Option<u16>, hub: bool) {
     std::fs::create_dir_all(&sandbox.root).unwrap();
     let pool = init_db(sandbox.layout().db_path()).await.expect("init_db");
     let settings = SettingsService::new(Db::Sqlite(pool.clone()));
     settings.set("server.port", "0").await.unwrap();
+    // 管理者のアカウント（[`setup_admin`]。認証モードは新しい DB の既定のログインなしのまま）。
+    chronogazer_core::users::UsersService::new(Db::Sqlite(pool.clone()))
+        .create_user(
+            "testadmin",
+            ADMIN_PASSWORD,
+            "管理者",
+            chronogazer_core::users::Role::Admin,
+        )
+        .await
+        .expect("create_user");
     if let Some(port) = plc_port {
         register(&pool, "modbus-tcp", "127.0.0.1", port, "40001", "u16").await;
     }
@@ -354,7 +357,7 @@ async fn latest_event(sandbox: &Sandbox) -> Option<String> {
     let pool = init_db(layout.db_path()).await.expect("開き直す");
     let reader = CollectorService::new(
         pool.clone(),
-        layout.data_dir(),
+        layout.store_dir(),
         chronogazer_core::engine::EngineConfig::builtin_drivers(),
     );
     let rows: Vec<CollectEventRow> = match reader.events(EventPage::default()).await {
@@ -368,7 +371,7 @@ async fn latest_event(sandbox: &Sandbox) -> Option<String> {
 /// データファイルの行数（全グループ）。
 async fn stored_row_count(sandbox: &Sandbox) -> usize {
     let mut count = 0;
-    for file in list_data_files(&sandbox.layout().data_dir()).expect("データファイルの列挙")
+    for file in list_data_files(&sandbox.layout().store_dir()).expect("データファイルの列挙")
     {
         let reader = TsReader::open(&file.path).await.expect("開ける");
         for group in reader.groups() {
@@ -657,7 +660,7 @@ async fn refuses_the_db_the_desktop_is_using_with_exit_code_2() {
         layout.secrets_dir(),
         layout.logs_dir(),
         layout.run_dir(),
-        layout.data_dir(),
+        layout.store_dir(),
     ] {
         assert!(!dir.exists(), "{} を作った", dir.display());
     }
@@ -734,7 +737,7 @@ async fn event_kinds(sandbox: &Sandbox) -> Vec<String> {
     let pool = init_db(layout.db_path()).await.expect("開き直す");
     let reader = CollectorService::new(
         pool.clone(),
-        layout.data_dir(),
+        layout.store_dir(),
         chronogazer_core::engine::EngineConfig::builtin_drivers(),
     );
     let rows: Vec<CollectEventRow> = match reader.events(EventPage::default()).await {
@@ -1197,4 +1200,91 @@ async fn a_server_without_the_dev_switch_refuses_loopback_http_hub() {
     assert!(text.contains("endpoint"), "{body}");
     server.send("ctrl-c");
     assert_eq!(server.wait_exit().await.code(), Some(0));
+}
+
+// --- create-admin（banto v8） ----------------------------------------------------
+
+/// `chronogazer-server create-admin --username owner`（パスワードはパイプの 1 行目）。
+fn create_admin(sandbox: &Sandbox, password_line: &str) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_chronogazer-server"))
+        .args(["create-admin", "--username", "owner"])
+        .env("CHRONOGAZER_ROOT", &sandbox.root)
+        .env("APPDATA", &sandbox.appdata)
+        .env("LOCALAPPDATA", &sandbox.local_appdata)
+        .env_remove("BANTO_DB")
+        .current_dir(&sandbox.cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("chronogazer-server create-admin を起動できる");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(password_line.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// この PC（loopback）からの `GET /api/auth/status` の `grants.localDesktop`。
+async fn local_desktop_open(port: u16) -> serde_json::Value {
+    let (status, body) = request(
+        reqwest::Method::GET,
+        format!("http://127.0.0.1:{port}/api/auth/status"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    body["grants"]["localDesktop"].clone()
+}
+
+/// 独立レビュー P1: 新しい DB（ログインなし）のサービスは loopback に admin の grant を
+/// 出す。サービスを止めて `create-admin` を実行すると、次の起動では設定
+/// `auth.local_grant`（既定 off）どおりに閉じ、作った管理者でログインできる。動いている
+/// 間の `create-admin` は何も書かずに断る。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_admin_closes_the_no_login_grant_of_the_service() {
+    let sandbox = Sandbox::new();
+    prepare_root(&sandbox, None, false).await;
+
+    let mut server = Server::spawn(&sandbox, sandbox.root.to_str().unwrap());
+    let port = wait_ready(&sandbox, &server).await;
+    assert_eq!(local_desktop_open(port).await, true);
+    assert!(
+        sandbox.output_text().contains("create-admin"),
+        "{}",
+        sandbox.output_text()
+    );
+    // 動いている間は断る（何も書かない）。
+    let refused = create_admin(&sandbox, "password123\n");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("何も変更していません"), "{stderr}");
+    server.send("ctrl-c");
+    assert_eq!(server.wait_exit().await.code(), Some(0));
+
+    let created = create_admin(&sandbox, "password123\n");
+    assert_eq!(
+        created.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    let mut server = Server::spawn(&sandbox, sandbox.root.to_str().unwrap());
+    let port = wait_ready(&sandbox, &server).await;
+    assert_eq!(local_desktop_open(port).await, false);
+    let (status, body) = request(
+        reqwest::Method::POST,
+        format!("http://127.0.0.1:{port}/api/auth/login"),
+        None,
+        Some(serde_json::json!({"username":"owner","password":"password123"})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    server.send("ctrl-c");
+    assert_eq!(server.wait_exit().await.code(), Some(0));
+    sandbox.assert_profile_untouched();
 }

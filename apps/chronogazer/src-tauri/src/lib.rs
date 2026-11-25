@@ -90,12 +90,14 @@ mod switch;
 mod tray;
 
 use banto_core::{BantoError, FieldError, ListParams};
+use banto_server::routes::AuditActor;
 use banto_server::ServerConfig;
 use chronogazer_core::audit::{AuditEntry, AuditLogList, AuditLogService};
 use chronogazer_core::backup::{BackupInfo, PendingRestoreInfo};
 use chronogazer_core::server_admin::{
-    apply_server_settings, ApplyActor, ApplyContext, LanControl, ServerStatusView,
+    apply_server_settings, ApplyContext, LanControl, ServerStatusView,
 };
+use chronogazer_core::ui_settings::{UiSetting, UiSettingRevision, UiSettingsOwner};
 // #383 段階2b / R1-C: 収集サービス。C-2 で `collect_*` コマンドと起動時の
 // 自動開始を足し、C-3a で読み出し 3 本（現在値・接続状態・イベント一覧）を
 // 足した（監査の `resource` も床も REST と共有の定数）。
@@ -158,8 +160,9 @@ use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
 /// App-wide state managed by Tauri (spec §10, §11).
 struct AppState {
-    /// The webview window's own session identity, set by `auth_login`/
-    /// `auth_setup` and cleared by `auth_logout` - all called directly via
+    /// The webview window's own session identity, set by `auth_login` (and
+    /// the no-login mode's synthetic session) and cleared by `auth_logout` -
+    /// all called directly via
     /// `invoke()`, never through `/api/auth/login`. `Some` means logged in;
     /// carrying the full `UserIdentity` (not just a bool) lets
     /// `auth_change_password` recover the current `username` without a
@@ -227,7 +230,7 @@ struct AppState {
     server: Arc<ServerSlot>,
 }
 
-/// Result of `auth_login`/`auth_setup`. `superseded`/`seq` (banto #260,
+/// Result of `auth_login`. `superseded`/`seq` (banto #260,
 /// design §5.3/I-19): `superseded` is `true` when the credentials were
 /// valid but another command re-bound the session slot while this one was
 /// verifying, so the session was NOT installed ([`cas_session`]); `seq` is
@@ -307,10 +310,6 @@ type AuthFuture<T> = futures_util::future::BoxFuture<'static, Result<T, BantoErr
 /// `auth_login`'s credential check (design §8.3 `CredentialVerifier`).
 type CredentialVerifier =
     Arc<dyn Fn(String, String) -> AuthFuture<Option<UserIdentity>> + Send + Sync>;
-/// `auth_setup`'s first-account creation. Not in design §8.3's sketch (which
-/// names only the verifier and the auth-mode read): `auth_setup` awaits
-/// `setup_first_user`, not `verify`, so S-18/S-19 need their own hold point.
-type FirstUserSetup = Arc<dyn Fn(String, String, String) -> AuthFuture<UserIdentity> + Send + Sync>;
 /// `auth_logout`'s auth-mode read (design §8.3 `AuthModeSource`).
 type AuthModeSource = Arc<dyn Fn() -> AuthFuture<AuthSettings> + Send + Sync>;
 /// `auth_config_apply`'s settings save. Not in design §8.3's sketch: injected
@@ -320,7 +319,6 @@ type AuthConfigSave = Arc<dyn Fn(AuthSettings) -> AuthFuture<()> + Send + Sync>;
 /// See [`AppState::auth_io`].
 struct AuthIo {
     verify: CredentialVerifier,
-    setup_first_user: FirstUserSetup,
     auth_mode: AuthModeSource,
     save_auth_config: AuthConfigSave,
 }
@@ -328,21 +326,12 @@ struct AuthIo {
 impl AuthIo {
     fn production(users: &UsersService, settings: &SettingsService) -> Self {
         let verify_users = users.clone();
-        let setup_users = users.clone();
         let save_settings = settings.clone();
         let settings = settings.clone();
         Self {
             verify: Arc::new(move |username, password| {
                 let users = verify_users.clone();
                 Box::pin(async move { users.verify(&username, &password).await })
-            }),
-            setup_first_user: Arc::new(move |username, password, display_name| {
-                let users = setup_users.clone();
-                Box::pin(async move {
-                    users
-                        .setup_first_user(&username, &password, &display_name)
-                        .await
-                })
             }),
             auth_mode: Arc::new(move || {
                 let settings = settings.clone();
@@ -387,13 +376,16 @@ struct Identity {
     /// `Role: Deserialize` for a command return value that is only ever
     /// serialized outbound.
     role: String,
+    /// banto v8 C3 (#790, ADR-0034 §1): the account's `users.account_uid` -
+    /// the screen's owner key `acct:<accountId>`. Not set for the no-login
+    /// session (it is not an account).
+    #[serde(rename = "accountId", skip_serializing_if = "Option::is_none")]
+    account_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct AuthStatusResult {
-    initialized: bool,
-}
+struct AuthStatusResult {}
 
 fn identity_from(user: &UserIdentity) -> Identity {
     // Convention shared with `chronogazer_core::rest` and `banto-serve`:
@@ -404,6 +396,7 @@ fn identity_from(user: &UserIdentity) -> Identity {
         id: user.username.clone(),
         name: user.display_name.clone(),
         role: user.role.to_string(),
+        account_id: user.account_uid.clone(),
     }
 }
 
@@ -413,13 +406,86 @@ fn identity_from(user: &UserIdentity) -> Identity {
 /// principle be inserted with id 0).
 const LOCAL_SESSION_ID: i64 = 0;
 
+/// Message for a `LoginResult { superseded: true }` (the credentials were
+/// valid, but another session was established first).
+const SUPERSEDED_LOGIN_MESSAGE: &str =
+    "別のセッションが先に確定したため、このログインは適用されませんでした";
+
+/// banto v8 (ADR-0034 section 8, Issue #786): whose ui-settings a desktop
+/// session reads and writes - an account by its `users.id`, the no-login
+/// session as `local` (never by name).
+fn desktop_ui_owner(identity: &UserIdentity) -> UiSettingsOwner {
+    if is_local_identity(identity) {
+        UiSettingsOwner::Local
+    } else {
+        UiSettingsOwner::Account(identity.id)
+    }
+}
+
+/// The synthetic auth-disabled-mode session's username ([`local_identity`]).
+/// A reserved name (`chronogazer_core::local_grant::RESERVED_USERNAMES`), so no
+/// account can carry it.
+const LOCAL_SESSION_USERNAME: &str = "local";
+
+/// Whether `identity` is the synthetic auth-disabled-mode session
+/// ([`local_identity`]) - for the audit attribution only (the session itself is
+/// told apart by its [`DesktopSession`] variant).
+fn is_local_identity(identity: &UserIdentity) -> bool {
+    identity.id == LOCAL_SESSION_ID && identity.username == LOCAL_SESSION_USERNAME
+}
+
+/// banto v8 (ADR-0034 section 3): who the audit log attributes a desktop
+/// command to. An account is itself (`actor_id` = its `users.id`, kind
+/// `account`); the no-login session is the built-in `admin` (`actor_id` = the
+/// built-in row's id read at startup, kind `local`) with the session's own
+/// role - upstream's desktop template does the same.
+fn desktop_audit_actor(identity: &UserIdentity, builtin_admin_id: i64) -> AuditActor {
+    if is_local_identity(identity) {
+        AuditActor {
+            username: chronogazer_core::users::BUILTIN_ADMIN_USERNAME.to_string(),
+            id: Some(builtin_admin_id),
+            role: identity.role.as_str().to_string(),
+            kind: chronogazer_core::audit::ACTOR_KIND_LOCAL.to_string(),
+        }
+    } else {
+        AuditActor::account(&identity.username, identity.id, identity.role.as_str())
+    }
+}
+
+/// `actor_username` of [`desktop_audit_actor`] (for the entries built field by field).
+fn desktop_audit_username(identity: &UserIdentity) -> &str {
+    if is_local_identity(identity) {
+        chronogazer_core::users::BUILTIN_ADMIN_USERNAME
+    } else {
+        &identity.username
+    }
+}
+
+/// `actor_id` of [`desktop_audit_actor`].
+fn desktop_audit_actor_id(identity: &UserIdentity, builtin_admin_id: i64) -> Option<i64> {
+    Some(if is_local_identity(identity) {
+        builtin_admin_id
+    } else {
+        identity.id
+    })
+}
+
+/// `actor_kind` of [`desktop_audit_actor`].
+fn desktop_audit_actor_kind(identity: &UserIdentity) -> &'static str {
+    if is_local_identity(identity) {
+        chronogazer_core::audit::ACTOR_KIND_LOCAL
+    } else {
+        chronogazer_core::audit::ACTOR_KIND_ACCOUNT
+    }
+}
+
 /// The webview session (banto v1.7.0 #204, admin-template の同名の型を写した
 /// もの). An enum rather than a bare `UserIdentity` so there is no way to
 /// establish or read a session without saying whether it belongs to a
 /// `users` account - and therefore how [`current_session`] re-validates it.
 #[derive(Debug, Clone, PartialEq)]
 enum DesktopSession {
-    /// A `users` account (`auth_login`, `auth_setup`, autologin): bound to
+    /// A `users` account (`auth_login`, autologin): bound to
     /// the row's `id` + `auth_epoch` it was established with and
     /// re-validated against that row on every command.
     Account(UserIdentity),
@@ -645,8 +711,10 @@ async fn require_role(
                 .services
                 .audit
                 .record(AuditEntry {
-                    actor_username: Some(&identity.username),
+                    actor_username: Some(desktop_audit_username(&identity)),
+                    actor_id: desktop_audit_actor_id(&identity, state.services.builtin_admin_id),
                     actor_role: Some(identity.role.as_str()),
+                    actor_kind: Some(desktop_audit_actor_kind(&identity)),
                     action: "denied",
                     resource,
                     entity_id: None,
@@ -669,23 +737,22 @@ async fn require_role(
 /// `AuditEntry` を手で組み立てている（この PR では書き換えない）。
 async fn record_ok(
     audit: &AuditLogService,
-    actor: &UserIdentity,
+    actor: &AuditActor,
     action: &str,
     resource: &str,
     entity_id: Option<&str>,
     detail: Option<serde_json::Value>,
 ) {
     audit
-        .record(AuditEntry {
-            actor_username: Some(&actor.username),
-            actor_role: Some(actor.role.as_str()),
+        .record(AuditEntry::by(
+            Some(actor),
+            "tauri",
             action,
             resource,
             entity_id,
             detail,
-            origin: "tauri",
-            result: "ok",
-        })
+            "ok",
+        ))
         .await;
 }
 
@@ -710,83 +777,13 @@ fn ping() -> &'static str {
     concat!("banto ", env!("CARGO_PKG_VERSION"))
 }
 
-/// `GET`-ish command: has an account been created yet (spec §3.3/§8.2)? The
-/// login page calls this first to decide between the first-run setup form
-/// and the normal login form.
+/// `GET`-ish command for the login page. banto v8 (ADR-0034 §5) removed the
+/// first-run setup and with it `initialized`: a new database starts in
+/// no-login mode, and accounts are created from user management. Nothing is
+/// left to report here yet (kept so the command name stays registered).
 #[tauri::command]
-async fn auth_status(state: State<'_, AppState>) -> Result<AuthStatusResult, BantoError> {
-    Ok(AuthStatusResult {
-        initialized: state.services.users.is_initialized().await?,
-    })
-}
-
-/// Create the very first account and log the webview session in as it
-/// (spec §8.2). `BantoError::Validation` (bad username/short password)
-/// propagates as `Err` so the frontend form store can field-map it;
-/// "already initialized" (or any other non-validation failure) surfaces as
-/// `Ok(LoginResult { success: false, .. })` instead, since that is an
-/// expected/retryable outcome, not a form error.
-///
-/// banto #260 (design §5.3, S-18/S-19): the session is installed only if no
-/// other command re-bound the slot while the account was being created
-/// ([`cas_session`] against the `seq` read before the first `.await`);
-/// otherwise the account still exists but the result is `superseded`.
-#[tauri::command]
-async fn auth_setup(
-    state: State<'_, AppState>,
-    username: String,
-    password: String,
-    display_name: String,
-) -> Result<LoginResult, BantoError> {
-    setup_body(&state, username, password, display_name).await
-}
-
-/// Message for a `LoginResult { superseded: true }` (the credentials were
-/// valid, but another session was established first).
-const SUPERSEDED_LOGIN_MESSAGE: &str =
-    "別のセッションが先に確定したため、このログインは適用されませんでした";
-
-/// Body of [`auth_setup`] (testable with a plain `&AppState`, design §8.3).
-/// Slot-clearing errors: none - every `Err` is returned before the slot is
-/// written (the TS provider's revision relies on this, design I-19).
-async fn setup_body(
-    state: &AppState,
-    username: String,
-    password: String,
-    display_name: String,
-) -> Result<LoginResult, BantoError> {
-    // #600 のレビュー: 合成の identity と同じアカウント名は作らせない
-    // （`chronogazer_core::local_grant::RESERVED_USERNAMES`、REST と同じ判定・同じ誤り）。
-    chronogazer_core::local_grant::check_username_not_reserved(&username)?;
-    let (_, seq_at_entry) = read_slot(state);
-    // Owner decision on banto #266 (S-95): in auth-disabled mode no account session
-    // is ever installed. Checked on entry so no account is created for a
-    // setup that could not sign in; checked again at the install below
-    // (the mode can be switched on while the account is being created).
-    if state.services.settings.auth_config().await?.disabled {
-        return Ok(auth_disabled_login_result(state));
-    }
-    match (state.auth_io.setup_first_user)(username, password, display_name).await {
-        Ok(identity) => {
-            record_ok(
-                &state.services.audit,
-                &identity,
-                "setup",
-                "auth",
-                None,
-                None,
-            )
-            .await;
-            install_account_unless_auth_disabled(state, seq_at_entry, identity).await
-        }
-        Err(err @ BantoError::Validation { .. }) => Err(err),
-        Err(other) => Ok(LoginResult {
-            success: false,
-            error: Some(other.to_string()),
-            superseded: false,
-            seq: read_slot(state).1,
-        }),
-    }
+async fn auth_status(_state: State<'_, AppState>) -> Result<AuthStatusResult, BantoError> {
+    Ok(AuthStatusResult {})
 }
 
 /// `LoginResult.error` of a login/setup refused because auth-disabled mode is
@@ -892,7 +889,7 @@ async fn login_body(
             // (design §1.7, decision 7) - as for a superseded login.
             record_ok(
                 &state.services.audit,
-                &identity,
+                &desktop_audit_actor(&identity, state.services.builtin_admin_id),
                 "login",
                 "auth",
                 None,
@@ -914,7 +911,9 @@ async fn login_body(
                     actor_username: Some(&chronogazer_core::users::bound_username_for_audit(
                         &username,
                     )),
+                    actor_id: None,
                     actor_role: None,
+                    actor_kind: None,
                     action: "login_failed",
                     resource: "auth",
                     entity_id: None,
@@ -1018,7 +1017,7 @@ async fn logout_body(state: &AppState) -> Result<LogoutResult, BantoError> {
     if let Some(session) = previous {
         record_ok(
             &state.services.audit,
-            session.identity(),
+            &desktop_audit_actor(session.identity(), state.services.builtin_admin_id),
             "logout",
             "auth",
             None,
@@ -1028,7 +1027,12 @@ async fn logout_body(state: &AppState) -> Result<LogoutResult, BantoError> {
     }
     // Only `Installed` can happen here: with `seq` unchanged since the clear,
     // the slot is empty.
-    record_local_rebind(&state.services.audit, &rebind).await;
+    record_local_rebind(
+        &state.services.audit,
+        state.services.builtin_admin_id,
+        &rebind,
+    )
+    .await;
     Ok(LogoutResult { seq })
 }
 
@@ -1171,7 +1175,7 @@ async fn change_own_password(
     // recorded.
     record_ok(
         &state.services.audit,
-        &identity,
+        &desktop_audit_actor(&identity, state.services.builtin_admin_id),
         "password_change",
         "users",
         Some(&identity.id.to_string()),
@@ -1206,20 +1210,26 @@ async fn auth_change_password(
 fn local_identity(role: Role) -> UserIdentity {
     UserIdentity {
         id: LOCAL_SESSION_ID,
-        username: "local".to_string(),
+        username: LOCAL_SESSION_USERNAME.to_string(),
         display_name: "ローカルユーザー".to_string(),
         role,
         auth_epoch: 0,
+        // banto v8 C3: not an account.
+        account_uid: None,
     }
 }
 
 /// Spec M14: auth-disabled mode still records a `login` for its synthetic
 /// session, same as a normal login would - it is still "someone" starting to
 /// use the app, just without a credential check.
-async fn record_local_login(audit: &AuditLogService, identity: &UserIdentity) {
+async fn record_local_login(
+    audit: &AuditLogService,
+    builtin_admin_id: i64,
+    identity: &UserIdentity,
+) {
     record_ok(
         audit,
-        identity,
+        &desktop_audit_actor(identity, builtin_admin_id),
         "login",
         "auth",
         None,
@@ -1357,14 +1367,15 @@ fn apply_mode_to_session(
 /// user's logout, whose `detail` is empty).
 async fn record_mode_session_change(
     audit: &AuditLogService,
+    builtin_admin_id: i64,
     rebind: &LocalRebind,
     ended_local: Option<UserIdentity>,
 ) {
-    record_local_rebind(audit, rebind).await;
+    record_local_rebind(audit, builtin_admin_id, rebind).await;
     if let Some(local) = ended_local {
         record_ok(
             audit,
-            &local,
+            &desktop_audit_actor(&local, builtin_admin_id),
             "logout",
             "auth",
             None,
@@ -1398,20 +1409,24 @@ fn end_local_session(state: &AppState) -> Option<UserIdentity> {
 /// logout the user asked for - the detail tells the two apart) and then the
 /// synthetic `login`. A role change records nothing here (the synthetic
 /// session goes on; the apply's `settings_change` records the change).
-async fn record_local_rebind(audit: &AuditLogService, outcome: &LocalRebind) {
+async fn record_local_rebind(
+    audit: &AuditLogService,
+    builtin_admin_id: i64,
+    outcome: &LocalRebind,
+) {
     match outcome {
-        LocalRebind::Installed(local) => record_local_login(audit, local).await,
+        LocalRebind::Installed(local) => record_local_login(audit, builtin_admin_id, local).await,
         LocalRebind::Replaced { previous, local } => {
             record_ok(
                 audit,
-                previous,
+                &desktop_audit_actor(previous, builtin_admin_id),
                 "logout",
                 "auth",
                 None,
                 Some(serde_json::json!({ "reason": "auth_disabled" })),
             )
             .await;
-            record_local_login(audit, local).await;
+            record_local_login(audit, builtin_admin_id, local).await;
         }
         LocalRebind::Skipped | LocalRebind::RoleChanged | LocalRebind::Unchanged => {}
     }
@@ -1519,7 +1534,13 @@ async fn auth_config_apply_body(
         // it and re-bind/end from that, then report the error.
         if let Ok(stored) = state.services.settings.auth_config().await {
             let (rebind, ended_local) = apply_mode_to_session(state, &previous, &stored);
-            record_mode_session_change(&state.services.audit, &rebind, ended_local).await;
+            record_mode_session_change(
+                &state.services.audit,
+                state.services.builtin_admin_id,
+                &rebind,
+                ended_local,
+            )
+            .await;
         }
         return Err(err);
     }
@@ -1552,8 +1573,12 @@ async fn auth_config_apply_body(
         .services
         .audit
         .record(AuditEntry {
-            actor_username: actor.as_ref().map(|i| i.username.as_str()),
+            actor_username: actor.as_ref().map(desktop_audit_username),
+            actor_id: actor
+                .as_ref()
+                .and_then(|i| desktop_audit_actor_id(i, state.services.builtin_admin_id)),
             actor_role: actor.as_ref().map(|i| i.role.as_str()),
+            actor_kind: actor.as_ref().map(desktop_audit_actor_kind),
             action: "settings_change",
             resource: "settings",
             entity_id: None,
@@ -1566,7 +1591,13 @@ async fn auth_config_apply_body(
     // The session change is recorded after the settings change it follows
     // from: from the settings screen, the admin's session end (`logout`,
     // reason `auth_disabled`) and the synthetic `login`.
-    record_mode_session_change(&state.services.audit, &rebind, ended_local).await;
+    record_mode_session_change(
+        &state.services.audit,
+        state.services.builtin_admin_id,
+        &rebind,
+        ended_local,
+    )
+    .await;
     Ok(config)
 }
 
@@ -1626,7 +1657,7 @@ async fn autologin_enable_body(
     // different from `users_update`'s `role` detail.
     record_ok(
         &state.services.audit,
-        &actor,
+        &desktop_audit_actor(&actor, state.services.builtin_admin_id),
         "settings_change",
         "settings",
         None,
@@ -1669,7 +1700,7 @@ async fn autologin_disable_body(state: &AppState) -> Result<(), BantoError> {
     drop(auth_config_guard);
     record_ok(
         &state.services.audit,
-        &actor,
+        &desktop_audit_actor(&actor, state.services.builtin_admin_id),
         "settings_change",
         "settings",
         None,
@@ -1798,12 +1829,10 @@ async fn server_apply_body(
         router: None,
         published: state.services.lan_status.clone(),
     };
-    // The new listener's router: `allow_setup: false` - the Tauri app's
-    // first-run setup goes through the `auth_setup` command above (`invoke()`,
-    // no network involved), not the REST endpoint - and no `localDesktop`
-    // grant (the desktop's LAN server is a LAN listener). The shared
+    // The new listener's router: no `localDesktop` grant (the desktop's LAN
+    // server is a LAN listener; banto v8 has no first-run setup). The shared
     // `rest_auth` is in `services`, so tokens outlive a restart.
-    let router = || state.services.router(false, false);
+    let router = || state.services.router(false);
     let ctx = ApplyContext {
         settings: &state.services.settings,
         audit: &state.services.audit,
@@ -1819,10 +1848,10 @@ async fn server_apply_body(
     apply_server_settings(
         &ctx,
         config,
-        ApplyActor {
-            username: Some(&actor.username),
-            role: Some(actor.role.as_str()),
-        },
+        Some(&desktop_audit_actor(
+            &actor,
+            state.services.builtin_admin_id,
+        )),
     )
     .await
 }
@@ -1907,7 +1936,7 @@ async fn settings_set_body(
     // something sensitive a future setting might store here.
     record_ok(
         &state.services.audit,
-        actor,
+        &desktop_audit_actor(actor, state.services.builtin_admin_id),
         "settings_change",
         "settings",
         None,
@@ -1929,15 +1958,12 @@ async fn settings_set_body(
 /// namespace - consistent with that mode's "the whole device is one trusted
 /// user" framing.
 #[tauri::command]
-async fn ui_settings_get(
-    state: State<'_, AppState>,
-    key: String,
-) -> Result<Option<String>, BantoError> {
+async fn ui_settings_get(state: State<'_, AppState>, key: String) -> Result<UiSetting, BantoError> {
     let identity = require_role(&state, Role::Viewer, "settings").await?;
     state
         .services
         .settings
-        .ui_get(&identity.username, &key)
+        .ui_get(&desktop_ui_owner(&identity), &key)
         .await
 }
 
@@ -1952,12 +1978,35 @@ async fn ui_settings_set(
     state: State<'_, AppState>,
     key: String,
     value: String,
-) -> Result<(), BantoError> {
+    if_revision: Option<String>,
+) -> Result<UiSettingRevision, BantoError> {
     let identity = require_role(&state, Role::Viewer, "settings").await?;
     state
         .services
         .settings
-        .ui_set(&identity.username, &key, &value)
+        .ui_put(
+            &desktop_ui_owner(&identity),
+            &key,
+            &value,
+            if_revision.as_deref(),
+        )
+        .await
+}
+
+/// Delete one of the calling session's OWN UI settings (banto v8, Issue
+/// #786) - the Tauri twin of REST's `DELETE /api/ui-settings/{key}`: same
+/// `ifRevision`, same answer (`{ revision: "0" }`), not audited.
+#[tauri::command]
+async fn ui_settings_delete(
+    state: State<'_, AppState>,
+    key: String,
+    if_revision: Option<String>,
+) -> Result<UiSettingRevision, BantoError> {
+    let identity = require_role(&state, Role::Viewer, "settings").await?;
+    state
+        .services
+        .settings
+        .ui_delete(&desktop_ui_owner(&identity), &key, if_revision.as_deref())
         .await
 }
 
@@ -2028,8 +2077,10 @@ async fn vibrancy_apply(
             .services
             .audit
             .record(AuditEntry {
-                actor_username: Some(&actor.username),
+                actor_username: Some(desktop_audit_username(&actor)),
+                actor_id: desktop_audit_actor_id(&actor, state.services.builtin_admin_id),
                 actor_role: Some(actor.role.as_str()),
+                actor_kind: Some(desktop_audit_actor_kind(&actor)),
                 action: "settings_change",
                 resource: "settings",
                 entity_id: None,
@@ -2134,8 +2185,10 @@ async fn users_create_body(
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(&actor.username),
+            actor_username: Some(desktop_audit_username(&actor)),
+            actor_id: desktop_audit_actor_id(&actor, state.services.builtin_admin_id),
             actor_role: Some(actor.role.as_str()),
+            actor_kind: Some(desktop_audit_actor_kind(&actor)),
             action: "create",
             resource: "users",
             entity_id: Some(&identity.id.to_string()),
@@ -2181,8 +2234,10 @@ async fn users_update_body(
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(&actor.username),
+            actor_username: Some(desktop_audit_username(&actor)),
+            actor_id: desktop_audit_actor_id(&actor, state.services.builtin_admin_id),
             actor_role: Some(actor.role.as_str()),
+            actor_kind: Some(desktop_audit_actor_kind(&actor)),
             action: "update",
             resource: "users",
             entity_id: Some(&id.to_string()),
@@ -2221,8 +2276,10 @@ async fn users_reset_password_body(
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(&actor.username),
+            actor_username: Some(desktop_audit_username(&actor)),
+            actor_id: desktop_audit_actor_id(&actor, state.services.builtin_admin_id),
             actor_role: Some(actor.role.as_str()),
+            actor_kind: Some(desktop_audit_actor_kind(&actor)),
             action: "password_reset",
             resource: "users",
             entity_id: Some(&id.to_string()),
@@ -2256,8 +2313,10 @@ async fn users_delete_body(state: &AppState, id: i64) -> Result<(), BantoError> 
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(&acting.username),
+            actor_username: Some(desktop_audit_username(&acting)),
+            actor_id: desktop_audit_actor_id(&acting, state.services.builtin_admin_id),
             actor_role: Some(acting.role.as_str()),
+            actor_kind: Some(desktop_audit_actor_kind(&acting)),
             action: "delete",
             resource: "users",
             entity_id: Some(&id.to_string()),
@@ -2341,8 +2400,10 @@ async fn plc_connections_create_body(
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(&actor.username),
+            actor_username: Some(desktop_audit_username(&actor)),
+            actor_id: desktop_audit_actor_id(&actor, state.services.builtin_admin_id),
             actor_role: Some(actor.role.as_str()),
+            actor_kind: Some(desktop_audit_actor_kind(&actor)),
             action: "create",
             resource: "plc_connections",
             entity_id: Some(&created.id.to_string()),
@@ -2386,8 +2447,10 @@ async fn plc_connections_update_body(
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(&actor.username),
+            actor_username: Some(desktop_audit_username(&actor)),
+            actor_id: desktop_audit_actor_id(&actor, state.services.builtin_admin_id),
             actor_role: Some(actor.role.as_str()),
+            actor_kind: Some(desktop_audit_actor_kind(&actor)),
             action: "update",
             resource: "plc_connections",
             entity_id: Some(&id.to_string()),
@@ -2447,8 +2510,10 @@ async fn plc_connections_delete(state: State<'_, AppState>, id: i64) -> Result<(
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(&actor.username),
+            actor_username: Some(desktop_audit_username(&actor)),
+            actor_id: desktop_audit_actor_id(&actor, state.services.builtin_admin_id),
             actor_role: Some(actor.role.as_str()),
+            actor_kind: Some(desktop_audit_actor_kind(&actor)),
             action: "delete",
             resource: "plc_connections",
             entity_id: Some(&id.to_string()),
@@ -2502,8 +2567,10 @@ async fn collection_groups_create(
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(&actor.username),
+            actor_username: Some(desktop_audit_username(&actor)),
+            actor_id: desktop_audit_actor_id(&actor, state.services.builtin_admin_id),
             actor_role: Some(actor.role.as_str()),
+            actor_kind: Some(desktop_audit_actor_kind(&actor)),
             action: "create",
             resource: "collection_groups",
             entity_id: Some(&created.id.to_string()),
@@ -2544,8 +2611,10 @@ async fn collection_groups_update_body(
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(&actor.username),
+            actor_username: Some(desktop_audit_username(&actor)),
+            actor_id: desktop_audit_actor_id(&actor, state.services.builtin_admin_id),
             actor_role: Some(actor.role.as_str()),
+            actor_kind: Some(desktop_audit_actor_kind(&actor)),
             action: "update",
             resource: "collection_groups",
             entity_id: Some(&id.to_string()),
@@ -2570,8 +2639,10 @@ async fn collection_groups_delete(state: State<'_, AppState>, id: i64) -> Result
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(&actor.username),
+            actor_username: Some(desktop_audit_username(&actor)),
+            actor_id: desktop_audit_actor_id(&actor, state.services.builtin_admin_id),
             actor_role: Some(actor.role.as_str()),
+            actor_kind: Some(desktop_audit_actor_kind(&actor)),
             action: "delete",
             resource: "collection_groups",
             entity_id: Some(&id.to_string()),
@@ -2616,8 +2687,10 @@ async fn tags_create_body(state: &AppState, input: TagPayload) -> Result<Tag, Ba
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(&actor.username),
+            actor_username: Some(desktop_audit_username(&actor)),
+            actor_id: desktop_audit_actor_id(&actor, state.services.builtin_admin_id),
             actor_role: Some(actor.role.as_str()),
+            actor_kind: Some(desktop_audit_actor_kind(&actor)),
             action: "create",
             resource: "tags",
             entity_id: Some(&created.id.to_string()),
@@ -2652,8 +2725,10 @@ async fn tags_update_body(state: &AppState, id: i64, input: TagPayload) -> Resul
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(&actor.username),
+            actor_username: Some(desktop_audit_username(&actor)),
+            actor_id: desktop_audit_actor_id(&actor, state.services.builtin_admin_id),
             actor_role: Some(actor.role.as_str()),
+            actor_kind: Some(desktop_audit_actor_kind(&actor)),
             action: "update",
             resource: "tags",
             entity_id: Some(&id.to_string()),
@@ -2685,8 +2760,10 @@ async fn tags_delete_body(state: &AppState, id: i64) -> Result<(), BantoError> {
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(&actor.username),
+            actor_username: Some(desktop_audit_username(&actor)),
+            actor_id: desktop_audit_actor_id(&actor, state.services.builtin_admin_id),
             actor_role: Some(actor.role.as_str()),
+            actor_kind: Some(desktop_audit_actor_kind(&actor)),
             action: "delete",
             resource: "tags",
             entity_id: Some(&id.to_string()),
@@ -2717,7 +2794,7 @@ async fn record_display_group_write(
 ) {
     record_ok(
         &state.services.audit,
-        actor,
+        &desktop_audit_actor(actor, state.services.builtin_admin_id),
         action,
         DISPLAY_GROUPS_RESOURCE,
         entity_id,
@@ -2770,7 +2847,7 @@ async fn display_groups_save_after(
     if let Some(registration) = &saved.registration {
         record_ok(
             &state.services.audit,
-            actor,
+            &desktop_audit_actor(actor, state.services.builtin_admin_id),
             "create",
             "tags",
             None,
@@ -2928,8 +3005,10 @@ async fn record_free_trend_denied(state: &AppState, identity: &UserIdentity) {
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(&identity.username),
+            actor_username: Some(desktop_audit_username(identity)),
+            actor_id: desktop_audit_actor_id(identity, state.services.builtin_admin_id),
             actor_role: Some(identity.role.as_str()),
+            actor_kind: Some(desktop_audit_actor_kind(identity)),
             action: "denied",
             resource: FREE_TRENDS_RESOURCE,
             entity_id: None,
@@ -2993,7 +3072,7 @@ async fn free_trends_create_body(
     let created = free_trend_denied_on_forbidden(state, &identity, result).await?;
     record_ok(
         &state.services.audit,
-        &identity,
+        &desktop_audit_actor(&identity, state.services.builtin_admin_id),
         "create",
         FREE_TRENDS_RESOURCE,
         Some(&created.id.to_string()),
@@ -3023,7 +3102,7 @@ async fn free_trends_update_body(
     let updated = free_trend_denied_on_forbidden(state, &identity, result).await?;
     record_ok(
         &state.services.audit,
-        &identity,
+        &desktop_audit_actor(&identity, state.services.builtin_admin_id),
         "update",
         FREE_TRENDS_RESOURCE,
         Some(&id.to_string()),
@@ -3045,7 +3124,7 @@ async fn free_trends_delete_body(state: &AppState, id: i64) -> Result<(), BantoE
     let deleted = free_trend_denied_on_forbidden(state, &identity, result).await?;
     record_ok(
         &state.services.audit,
-        &identity,
+        &desktop_audit_actor(&identity, state.services.builtin_admin_id),
         "delete",
         FREE_TRENDS_RESOURCE,
         Some(&id.to_string()),
@@ -3104,7 +3183,7 @@ async fn tag_thresholds_update_body(
     let updated = tag_thresholds_service(state).update(tag_id, &input).await?;
     record_ok(
         &state.services.audit,
-        &actor,
+        &desktop_audit_actor(&actor, state.services.builtin_admin_id),
         "update",
         TAG_THRESHOLDS_RESOURCE,
         Some(&tag_id.to_string()),
@@ -3206,8 +3285,10 @@ async fn audit_config_apply(
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(&actor.username),
+            actor_username: Some(desktop_audit_username(&actor)),
+            actor_id: desktop_audit_actor_id(&actor, state.services.builtin_admin_id),
             actor_role: Some(actor.role.as_str()),
+            actor_kind: Some(desktop_audit_actor_kind(&actor)),
             action: "settings_change",
             resource: "settings",
             entity_id: None,
@@ -3242,8 +3323,10 @@ async fn backups_create_body(state: &AppState) -> Result<BackupInfo, BantoError>
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(&actor.username),
+            actor_username: Some(desktop_audit_username(&actor)),
+            actor_id: desktop_audit_actor_id(&actor, state.services.builtin_admin_id),
             actor_role: Some(actor.role.as_str()),
+            actor_kind: Some(desktop_audit_actor_kind(&actor)),
             action: "backup",
             resource: "backups",
             entity_id: Some(&info.file_name),
@@ -3329,8 +3412,10 @@ async fn backups_stage_restore_body(state: &AppState, file_name: &str) -> Result
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(&actor.username),
+            actor_username: Some(desktop_audit_username(&actor)),
+            actor_id: desktop_audit_actor_id(&actor, state.services.builtin_admin_id),
             actor_role: Some(actor.role.as_str()),
+            actor_kind: Some(desktop_audit_actor_kind(&actor)),
             action: "restore_staged",
             resource: "backups",
             entity_id: None,
@@ -3370,8 +3455,10 @@ async fn backups_cancel_restore_body(state: &AppState) -> Result<(), BantoError>
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(&actor.username),
+            actor_username: Some(desktop_audit_username(&actor)),
+            actor_id: desktop_audit_actor_id(&actor, state.services.builtin_admin_id),
             actor_role: Some(actor.role.as_str()),
+            actor_kind: Some(desktop_audit_actor_kind(&actor)),
             action: "restore_cancelled",
             resource: "backups",
             entity_id: None,
@@ -3436,8 +3523,10 @@ async fn hub_connect(state: State<'_, AppState>, endpoint: String) -> Result<Hub
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(&actor.username),
+            actor_username: Some(desktop_audit_username(&actor)),
+            actor_id: desktop_audit_actor_id(&actor, state.services.builtin_admin_id),
             actor_role: Some(actor.role.as_str()),
+            actor_kind: Some(desktop_audit_actor_kind(&actor)),
             action: "settings_change",
             resource: "settings",
             entity_id: None,
@@ -3498,8 +3587,10 @@ async fn hub_dismiss_legacy_selection_body(state: &AppState) -> Result<(), Banto
             .services
             .audit
             .record(AuditEntry {
-                actor_username: Some(&actor.username),
+                actor_username: Some(desktop_audit_username(&actor)),
+                actor_id: desktop_audit_actor_id(&actor, state.services.builtin_admin_id),
                 actor_role: Some(actor.role.as_str()),
+                actor_kind: Some(desktop_audit_actor_kind(&actor)),
                 action: "settings_change",
                 resource: "settings",
                 entity_id: None,
@@ -3545,8 +3636,10 @@ async fn tags_register_from_hub_body(
             .services
             .audit
             .record(AuditEntry {
-                actor_username: Some(&actor.username),
+                actor_username: Some(desktop_audit_username(&actor)),
+                actor_id: desktop_audit_actor_id(&actor, state.services.builtin_admin_id),
                 actor_role: Some(actor.role.as_str()),
+                actor_kind: Some(desktop_audit_actor_kind(&actor)),
                 action: "create",
                 resource: "tags",
                 entity_id: None,
@@ -3582,8 +3675,10 @@ async fn hub_adopt_manual_key(
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(&actor.username),
+            actor_username: Some(desktop_audit_username(&actor)),
+            actor_id: desktop_audit_actor_id(&actor, state.services.builtin_admin_id),
             actor_role: Some(actor.role.as_str()),
+            actor_kind: Some(desktop_audit_actor_kind(&actor)),
             action: "settings_change",
             resource: "settings",
             entity_id: None,
@@ -3610,8 +3705,10 @@ async fn hub_disconnect(state: State<'_, AppState>) -> Result<HubView, BantoErro
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(&actor.username),
+            actor_username: Some(desktop_audit_username(&actor)),
+            actor_id: desktop_audit_actor_id(&actor, state.services.builtin_admin_id),
             actor_role: Some(actor.role.as_str()),
+            actor_kind: Some(desktop_audit_actor_kind(&actor)),
             action: "settings_change",
             resource: "settings",
             entity_id: None,
@@ -3696,8 +3793,10 @@ async fn record_collect_operation(
         .services
         .audit
         .record(AuditEntry {
-            actor_username: Some(&actor.username),
+            actor_username: Some(desktop_audit_username(actor)),
+            actor_id: desktop_audit_actor_id(actor, state.services.builtin_admin_id),
             actor_role: Some(actor.role.as_str()),
+            actor_kind: Some(desktop_audit_actor_kind(actor)),
             action,
             resource: COLLECT_AUDIT_RESOURCE,
             entity_id: None,
@@ -4474,8 +4573,8 @@ impl StartupErrorNotice {
             steps: concat!(
                 "ChronoGazer を終了してから、上のファイルを（同じ場所に「-wal」「-shm」が",
                 "付いたファイルがあれば一緒に）削除するか別の名前へ退避し、起動し直して",
-                "ください。新しい DB はアカウントも接続・タグも空なので、初回セットアップ",
-                "からやり直します。"
+                "ください。新しい DB はログインなし（組み込みの admin）で始まり、",
+                "アカウントも接続・タグも空です。"
             )
             .to_string(),
             closing: "このウィンドウを閉じると ChronoGazer は終了します。".to_string(),
@@ -4606,7 +4705,7 @@ async fn initial_desktop_session(
         // shared with `auth_config_apply_body` / `logout_body` (banto v2.0.0
         // 移行): `local_identity` / `record_local_login`.
         let local_identity = local_identity(auth_config.disabled_role);
-        record_local_login(audit, &local_identity).await;
+        record_local_login(audit, services.builtin_admin_id, &local_identity).await;
         return Some(DesktopSession::AuthDisabledLocal(local_identity));
     }
     if !auth_config.autologin_enabled {
@@ -4626,8 +4725,10 @@ async fn initial_desktop_session(
         Ok(Some(identity)) => {
             audit
                 .record(AuditEntry {
-                    actor_username: Some(&identity.username),
+                    actor_username: Some(desktop_audit_username(&identity)),
+                    actor_id: desktop_audit_actor_id(&identity, services.builtin_admin_id),
                     actor_role: Some(identity.role.as_str()),
+                    actor_kind: Some(desktop_audit_actor_kind(&identity)),
                     action: "login",
                     resource: "auth",
                     entity_id: None,
@@ -4661,7 +4762,9 @@ async fn record_autologin_failed(audit: &AuditLogService, username: &str) {
     audit
         .record(AuditEntry {
             actor_username: Some(username),
+            actor_id: None,
             actor_role: None,
+            actor_kind: None,
             action: "login_failed",
             resource: "auth",
             entity_id: None,
@@ -4697,9 +4800,6 @@ fn desktop_engine_config_for(paths: &startup::LaunchPaths) -> EngineConfig {
         host: ChronoGazerHost::Desktop,
         // LAN の自動起動は DB を開けた後に設定から決める（[`launch_desktop`]）。
         listen: EngineListen::Disabled,
-        // 初回セットアップは `auth_setup` コマンド（`invoke()`）で行い、
-        // LAN の `POST /api/auth/setup` は開けない（`banto-serve` だけ）。
-        allow_setup: false,
         seed_viewer_public: false,
         log_label: "banto",
         audit_origin: "tauri",
@@ -5215,7 +5315,6 @@ pub fn run() {
             ping,
             switch_to_operation_mode,
             auth_status,
-            auth_setup,
             auth_login,
             auth_logout,
             auth_check,
@@ -5232,6 +5331,7 @@ pub fn run() {
             settings_set,
             ui_settings_get,
             ui_settings_set,
+            ui_settings_delete,
             vibrancy_apply,
             vibrancy_status,
             users_list,
@@ -5381,6 +5481,7 @@ mod tests {
     fn legacy_db_notice_carries_the_path_and_what_to_do() {
         let legacy = chronogazer_core::db::LegacyDatabase {
             path: std::path::PathBuf::from(r#"C:\Users\a "b"\</script>\chronogazer.sqlite3"#),
+            kind: chronogazer_core::db::LegacyKind::BeforeSchemaReset,
         };
         let notice = StartupErrorNotice::new(&legacy);
         assert_eq!(notice.path, legacy.path.display().to_string());
@@ -5698,11 +5799,27 @@ mod tests {
             hub.attach_registry(pool.clone());
         }
         let drivers = EngineConfig::builtin_drivers();
+        // banto v8: 組み込みの `admin` の行（新しい DB に 1 行ある）。本物は
+        // `chronogazer_core::db::startup_check` が返す。
+        let builtin_admin_id: i64 =
+            sqlx::query_scalar("SELECT id FROM users WHERE kind = 'builtin'")
+                .fetch_one(&pool)
+                .await
+                .expect("組み込みの admin の行");
+        // banto v8 の新しい DB はログインなしで始まる（migration 0015）。ここの試験は前の
+        // 既定（ログイン必須）を前提に書いてあるので、ログイン必須に戻しておく（本物は
+        // `set_auth_config` で切り替え、管理者のアカウントが要る。ログインなしを確かめる
+        // 試験は各自で `disabled: true` にする）。
+        settings
+            .set("auth.disabled", "false")
+            .await
+            .expect("auth.disabled");
         EngineServices {
             users: UsersService::new(Db::Sqlite(pool.clone())),
             settings,
             audit: AuditLogService::new(Db::Sqlite(pool.clone())),
-            backup: BackupService::new(db_path, Db::Sqlite(pool.clone())),
+            backup: BackupService::new(db_path, Db::Sqlite(pool.clone()))
+                .with_migrations(chronogazer_core::db::sqlite_restore_manifest()),
             hub,
             plc_connections: PlcConnectionService::with_registry(pool.clone(), drivers.clone())
                 .accept_hub_connections(),
@@ -5717,7 +5834,9 @@ mod tests {
             rest_auth: chronogazer_core::rest::user_auth_state(
                 UsersService::new(Db::Sqlite(pool.clone())),
                 AuditLogService::new(Db::Sqlite(pool.clone())),
-            ),
+            )
+            .with_builtin_admin_id(builtin_admin_id),
+            builtin_admin_id,
             events: event_channel(),
             pool,
             host: chronogazer_core::host_info::HostInfo::new(
@@ -5784,7 +5903,6 @@ mod tests {
             attach_hub: true,
             host: ChronoGazerHost::Desktop,
             listen: EngineListen::Disabled,
-            allow_setup: false,
             seed_viewer_public: false,
             log_label: "banto",
             audit_origin: "tauri",
@@ -6080,7 +6198,12 @@ mod tests {
         let owner = state
             .services
             .users
-            .setup_first_user("owner", "password123", "オーナー")
+            .create_user(
+                "owner",
+                "password123",
+                "オーナー",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .expect("setup_first_user");
         state.set_session_for_test(Some(DesktopSession::Account(owner)));
@@ -6091,7 +6214,9 @@ mod tests {
                 .audit
                 .try_record(AuditEntry {
                     actor_username: Some("owner"),
+                    actor_id: None,
                     actor_role: Some("admin"),
+                    actor_kind: None,
                     action,
                     resource: "items",
                     entity_id: None,
@@ -6150,7 +6275,12 @@ mod tests {
         let owner = state
             .services
             .users
-            .setup_first_user("owner", "password123", "オーナー")
+            .create_user(
+                "owner",
+                "password123",
+                "オーナー",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .expect("setup_first_user");
         let owner_id = owner.id;
@@ -6191,7 +6321,12 @@ mod tests {
         let owner = state
             .services
             .users
-            .setup_first_user("owner", "password123", "オーナー")
+            .create_user(
+                "owner",
+                "password123",
+                "オーナー",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .expect("setup_first_user");
         state.set_session_for_test(Some(DesktopSession::Account(owner)));
@@ -7745,7 +7880,6 @@ mod tests {
             display_groups_service(state),
             state.services.rest_auth.clone(),
             state.services.events.clone(),
-            false,
             chronogazer_core::rest::HostAccess::closed(),
         )
     }
@@ -7789,7 +7923,12 @@ mod tests {
             .expect("init_db_memory");
         let users = UsersService::new(Db::Sqlite(pool.clone()));
         users
-            .setup_first_user("testadmin", "password123", "管理者")
+            .create_user(
+                "testadmin",
+                "password123",
+                "管理者",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         let alice = users
@@ -8112,6 +8251,7 @@ mod tests {
             display_name: "ローカルユーザー".to_string(),
             role: Role::Editor,
             auth_epoch: 0,
+            account_uid: None,
         })));
         assert_eq!(
             require_role(&state, Role::Editor, "test")
@@ -8125,6 +8265,13 @@ mod tests {
             Err(BantoError::Forbidden)
         ));
 
+        // banto v8（ADR-0034 §6）: ログイン必須へ戻すには管理者のアカウントが要る。
+        state
+            .services
+            .users
+            .create_user("keeper", "password123", "管理者", Role::Admin)
+            .await
+            .expect("create admin");
         config.disabled = false;
         state
             .services
@@ -8153,7 +8300,12 @@ mod tests {
         let admin = state
             .services
             .users
-            .setup_first_user("testadmin", "password123", "管理者")
+            .create_user(
+                "testadmin",
+                "password123",
+                "管理者",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .expect("setup_first_user");
         state.set_session_for_test(Some(DesktopSession::Account(admin)));
@@ -8196,7 +8348,12 @@ mod tests {
         let admin = state
             .services
             .users
-            .setup_first_user("testadmin", "password123", "管理者")
+            .create_user(
+                "testadmin",
+                "password123",
+                "管理者",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .expect("setup_first_user");
         state.set_session_for_test(Some(DesktopSession::Account(admin)));
@@ -8238,7 +8395,12 @@ mod tests {
         let admin = state
             .services
             .users
-            .setup_first_user("testadmin", "password123", "管理者")
+            .create_user(
+                "testadmin",
+                "password123",
+                "管理者",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .expect("setup_first_user");
         state.set_session_for_test(Some(DesktopSession::Account(admin)));
@@ -8320,23 +8482,6 @@ mod tests {
             Box::pin(async move {
                 pass_gate(&slot).await;
                 users.verify(&username, &password).await
-            })
-        });
-        hold
-    }
-
-    /// Hold the first `auth_setup` account creation of `state`.
-    fn hold_setup(state: &mut AppState) -> Hold {
-        let (slot, hold) = gate();
-        let users = state.services.users.clone();
-        state.auth_io.setup_first_user = Arc::new(move |username, password, display_name| {
-            let slot = slot.clone();
-            let users = users.clone();
-            Box::pin(async move {
-                pass_gate(&slot).await;
-                users
-                    .setup_first_user(&username, &password, &display_name)
-                    .await
             })
         });
         hold
@@ -8428,7 +8573,12 @@ mod tests {
         let admin = state
             .services
             .users
-            .setup_first_user("testadmin", SLOT_PASSWORD, "Admin")
+            .create_user(
+                "testadmin",
+                SLOT_PASSWORD,
+                "Admin",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .expect("setup_first_user");
         state.set_session_for_test(Some(DesktopSession::Account(admin)));
@@ -8446,7 +8596,12 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("b", SLOT_PASSWORD, "B")
+            .create_user(
+                "b",
+                SLOT_PASSWORD,
+                "B",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         let mut hold = hold_verify(&mut state);
@@ -8476,7 +8631,12 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("b", SLOT_PASSWORD, "B")
+            .create_user(
+                "b",
+                SLOT_PASSWORD,
+                "B",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         let mut hold = hold_verify(&mut state);
@@ -8502,7 +8662,12 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("b", SLOT_PASSWORD, "B")
+            .create_user(
+                "b",
+                SLOT_PASSWORD,
+                "B",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
 
@@ -8533,7 +8698,12 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("b", SLOT_PASSWORD, "B")
+            .create_user(
+                "b",
+                SLOT_PASSWORD,
+                "B",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         let mut hold = hold_auth_mode(&mut state);
@@ -8568,7 +8738,12 @@ mod tests {
         let a = state
             .services
             .users
-            .setup_first_user("a", SLOT_PASSWORD, "A")
+            .create_user(
+                "a",
+                SLOT_PASSWORD,
+                "A",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         state.set_session_for_test(Some(DesktopSession::Account(a.clone())));
@@ -8596,7 +8771,12 @@ mod tests {
         let a = state
             .services
             .users
-            .setup_first_user("a", SLOT_PASSWORD, "A")
+            .create_user(
+                "a",
+                SLOT_PASSWORD,
+                "A",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         state.set_session_for_test(Some(DesktopSession::Account(a)));
@@ -8608,66 +8788,6 @@ mod tests {
         assert_eq!(audit_action_count(&state, "logout").await, 1);
     }
 
-    /// S-18: `auth_setup` overtaken by a completed logout: the account is
-    /// created, the session is not installed.
-    #[tokio::test]
-    async fn s18_a_slow_setup_does_not_undo_a_completed_logout() {
-        let mut state = app_state().await;
-        let mut hold = hold_setup(&mut state);
-
-        let setup = setup_body(
-            &state,
-            "b".to_string(),
-            SLOT_PASSWORD.to_string(),
-            "B".to_string(),
-        );
-        tokio::pin!(setup);
-        run_until_held!(setup, hold);
-
-        logout_body(&state).await.expect("logout");
-        hold.release.send(()).unwrap();
-        let result = setup.await.expect("setup");
-
-        assert!(!result.success);
-        assert!(result.superseded);
-        assert_eq!(read_slot(&state), (None, 1));
-        assert!(state.services.users.is_initialized().await.unwrap());
-        assert!(state
-            .services
-            .users
-            .get_by_username("b")
-            .await
-            .unwrap()
-            .is_some());
-    }
-
-    /// S-19: a logout overtaken by a completed `auth_setup` keeps the setup's
-    /// session.
-    #[tokio::test]
-    async fn s19_a_slow_logout_does_not_clear_a_later_setup() {
-        let mut state = app_state().await;
-        let mut hold = hold_auth_mode(&mut state);
-
-        let logout = logout_body(&state);
-        tokio::pin!(logout);
-        run_until_held!(logout, hold);
-
-        let setup = setup_body(
-            &state,
-            "b".to_string(),
-            SLOT_PASSWORD.to_string(),
-            "B".to_string(),
-        )
-        .await
-        .expect("setup");
-        assert!(setup.success);
-        hold.release.send(()).unwrap();
-        let result = logout.await.expect("logout");
-
-        assert_eq!(result.seq, setup.seq);
-        assert!(is_account(&read_slot(&state).0, "b"));
-    }
-
     /// S-54: re-resolving the same session - including after a display-name
     /// edit (a refresh of the same binding) - never advances seq.
     #[tokio::test]
@@ -8676,7 +8796,12 @@ mod tests {
         let a = state
             .services
             .users
-            .setup_first_user("a", SLOT_PASSWORD, "A")
+            .create_user(
+                "a",
+                SLOT_PASSWORD,
+                "A",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         let login = login_body(&state, "a".to_string(), SLOT_PASSWORD.to_string())
@@ -8713,7 +8838,12 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("owner", SLOT_PASSWORD, "オーナー")
+            .create_user(
+                "owner",
+                SLOT_PASSWORD,
+                "オーナー",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         let a = state
@@ -8756,7 +8886,12 @@ mod tests {
         let a = state
             .services
             .users
-            .setup_first_user("a", SLOT_PASSWORD, "A")
+            .create_user(
+                "a",
+                SLOT_PASSWORD,
+                "A",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         state.set_session_for_test(Some(DesktopSession::Account(a)));
@@ -8800,6 +8935,7 @@ mod tests {
             display_name: "ローカルユーザー".to_string(),
             role: Role::Viewer,
             auth_epoch: 0,
+            account_uid: None,
         })));
         let (_, seq) = read_slot(&state);
 
@@ -8825,7 +8961,12 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("a", SLOT_PASSWORD, "A")
+            .create_user(
+                "a",
+                SLOT_PASSWORD,
+                "A",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         let login = login_body(&state, "a".to_string(), SLOT_PASSWORD.to_string())
@@ -8935,7 +9076,12 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("a", SLOT_PASSWORD, "A")
+            .create_user(
+                "a",
+                SLOT_PASSWORD,
+                "A",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         let login = login_body(&state, "a".to_string(), SLOT_PASSWORD.to_string())
@@ -9012,7 +9158,12 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("testadmin", SLOT_PASSWORD, "Admin")
+            .create_user(
+                "testadmin",
+                SLOT_PASSWORD,
+                "Admin",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         let login = login_body(&state, "testadmin".to_string(), SLOT_PASSWORD.to_string())
@@ -9044,7 +9195,8 @@ mod tests {
         assert!(
             logins
                 .iter()
-                .any(|(actor, detail)| actor.as_deref() == Some("local")
+                // banto v8: ログインなしのセッションは組み込みの `admin` として記録する。
+                .any(|(actor, detail)| actor.as_deref() == Some("admin")
                     && detail
                         .as_deref()
                         .is_some_and(|d| d.contains("auth_disabled"))),
@@ -9144,7 +9296,12 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("testadmin", SLOT_PASSWORD, "Admin")
+            .create_user(
+                "testadmin",
+                SLOT_PASSWORD,
+                "Admin",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         let admin = state
@@ -9197,7 +9354,12 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("testadmin", SLOT_PASSWORD, "Admin")
+            .create_user(
+                "testadmin",
+                SLOT_PASSWORD,
+                "Admin",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
 
@@ -9327,7 +9489,12 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("testadmin", SLOT_PASSWORD, "Admin")
+            .create_user(
+                "testadmin",
+                SLOT_PASSWORD,
+                "Admin",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         state.set_session_for_test(Some(DesktopSession::Account(
@@ -9517,11 +9684,12 @@ mod tests {
         assert_eq!(read_slot(&state), (None, seq_n + 1));
         // The admin's session end when the mode was turned on is the other
         // `logout` (reason `auth_disabled`, see
-        // `enable_local_from_an_admin_session`); only Local's is asserted.
+        // `enable_local_from_an_admin_session`); only Local's is asserted
+        // (banto v8: recorded as the built-in `admin`).
         let logouts: Vec<_> = audit_rows(&state, "logout")
             .await
             .into_iter()
-            .filter(|(actor, _)| actor.as_deref() == Some("local"))
+            .filter(|(actor, _)| actor.as_deref() == Some("admin"))
             .collect();
         assert_eq!(logouts.len(), 1);
         let detail: serde_json::Value =
@@ -9547,7 +9715,12 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("testadmin", SLOT_PASSWORD, "Admin")
+            .create_user(
+                "testadmin",
+                SLOT_PASSWORD,
+                "Admin",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         let login = login_body(&state, "testadmin".to_string(), SLOT_PASSWORD.to_string())
@@ -9576,7 +9749,12 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("testadmin", SLOT_PASSWORD, "Admin")
+            .create_user(
+                "testadmin",
+                SLOT_PASSWORD,
+                "Admin",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         state.set_session_for_test(Some(DesktopSession::Account(
@@ -9623,7 +9801,12 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("testadmin", SLOT_PASSWORD, "Admin")
+            .create_user(
+                "testadmin",
+                SLOT_PASSWORD,
+                "Admin",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         state.set_session_for_test(Some(DesktopSession::Account(
@@ -9655,58 +9838,10 @@ mod tests {
         assert_eq!(audit_action_count(&state, "login_failed").await, 0);
     }
 
-    /// S-95: `auth_setup` while auth-disabled mode is on (the first-run
-    /// 「ログインなしで使い始める」 already chosen) is refused on entry and
-    /// creates no account.
-    #[tokio::test]
-    async fn s95_setup_in_auth_disabled_mode_creates_no_account() {
-        let state = app_state().await;
-        // ChronoGazer has no bootstrap window: with no account yet, the mode
-        // and its synthetic session are set up directly (as `run()`'s
-        // bootstrap would on a launch with `auth.disabled = true`).
-        let config = state.services.settings.auth_config().await.unwrap();
-        state
-            .services
-            .settings
-            .set_auth_config(&AuthSettings {
-                disabled: true,
-                ..config
-            })
-            .await
-            .unwrap();
-        state.set_session_for_test(Some(DesktopSession::AuthDisabledLocal(local_identity(
-            Role::Admin,
-        ))));
-        let before = read_slot(&state);
-        assert!(is_local(&before.0));
-
-        let result = setup_body(
-            &state,
-            "b".to_string(),
-            SLOT_PASSWORD.to_string(),
-            "B".to_string(),
-        )
-        .await
-        .expect("setup");
-
-        assert!(!result.success);
-        assert!(!result.superseded);
-        assert_eq!(result.error.as_deref(), Some(AUTH_DISABLED_LOGIN_MESSAGE));
-        assert_eq!(read_slot(&state), before);
-        assert!(
-            !state.services.users.is_initialized().await.unwrap(),
-            "no account created"
-        );
-        assert_eq!(audit_action_count(&state, "setup").await, 0);
-    }
-
     // admin-template の `s95_a_setup_overtaken_by_apply_true_keeps_the_account_but_installs_nothing`
     // は移植しない: 割り込む `auth_config_apply(true)` が BOOTSTRAP WINDOW
-    // （アカウント 0 件・セッションなし）頼み。ChronoGazer ではアカウント 0 件の
-    // 間にモードを入れる apply は、セッションが無いので `Unauthorized`、既に
-    // モードがオンなら `setup` が入口で断る
-    // （`s95_setup_in_auth_disabled_mode_creates_no_account`）ので、この順序は
-    // 起きない。
+    // （アカウント 0 件・セッションなし）頼み。banto v8 では初回セットアップ
+    // （`auth_setup`）そのものが無いので、この順序は起きない。
 
     /// banto PR #264 review P1 / re-review P2: a logout whose first read saw
     /// `disabled = false` (and after which the mode was switched on) clears
@@ -9720,7 +9855,12 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("a", SLOT_PASSWORD, "A")
+            .create_user(
+                "a",
+                SLOT_PASSWORD,
+                "A",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         let login = login_body(&state, "a".to_string(), SLOT_PASSWORD.to_string())
@@ -9767,7 +9907,12 @@ mod tests {
         let admin = state
             .services
             .users
-            .setup_first_user("testadmin", SLOT_PASSWORD, "Admin")
+            .create_user(
+                "testadmin",
+                SLOT_PASSWORD,
+                "Admin",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         state.set_session_for_test(Some(DesktopSession::Account(admin)));
@@ -9833,7 +9978,12 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("a", SLOT_PASSWORD, "A")
+            .create_user(
+                "a",
+                SLOT_PASSWORD,
+                "A",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         let login = login_body(&state, "a".to_string(), SLOT_PASSWORD.to_string())
@@ -9894,7 +10044,12 @@ mod tests {
         let a = state
             .services
             .users
-            .setup_first_user("a", SLOT_PASSWORD, "A")
+            .create_user(
+                "a",
+                SLOT_PASSWORD,
+                "A",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         state.set_session_for_test(Some(DesktopSession::Account(a)));
@@ -9929,7 +10084,12 @@ mod tests {
             state
                 .services
                 .users
-                .setup_first_user("b", SLOT_PASSWORD, "B")
+                .create_user(
+                    "b",
+                    SLOT_PASSWORD,
+                    "B",
+                    chronogazer_core::users::Role::Admin,
+                )
                 .await
                 .unwrap();
             let barrier = Arc::new(tokio::sync::Barrier::new(2));
@@ -9982,7 +10142,12 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("owner", SLOT_PASSWORD, "オーナー")
+            .create_user(
+                "owner",
+                SLOT_PASSWORD,
+                "オーナー",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         let a = state
@@ -10018,7 +10183,12 @@ mod tests {
         state
             .services
             .users
-            .setup_first_user("a", SLOT_PASSWORD, "A")
+            .create_user(
+                "a",
+                SLOT_PASSWORD,
+                "A",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         let login = login_body(&state, "a".to_string(), SLOT_PASSWORD.to_string())
@@ -10051,7 +10221,12 @@ mod tests {
         let admin = state
             .services
             .users
-            .setup_first_user("testadmin", SLOT_PASSWORD, "Admin")
+            .create_user(
+                "testadmin",
+                SLOT_PASSWORD,
+                "Admin",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         state.set_session_for_test(Some(DesktopSession::Account(admin)));
@@ -10164,7 +10339,12 @@ mod tests {
         changer
             .services
             .users
-            .setup_first_user("target", SLOT_PASSWORD, "Target")
+            .create_user(
+                "target",
+                SLOT_PASSWORD,
+                "Target",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .unwrap();
         for state in [&changer, &other] {
@@ -10296,7 +10476,12 @@ mod tests {
         let admin = state
             .services
             .users
-            .setup_first_user("testadmin", "password123", "管理者")
+            .create_user(
+                "testadmin",
+                "password123",
+                "管理者",
+                chronogazer_core::users::Role::Admin,
+            )
             .await
             .expect("setup_first_user");
         state.set_session_for_test(Some(DesktopSession::Account(admin)));
@@ -11221,6 +11406,7 @@ mod tests {
             display_name: "ローカルユーザー".to_string(),
             role: Role::Admin,
             auth_epoch: 0,
+            account_uid: None,
         })));
         let list = free_trends_list_body(&state).await.expect("local list");
         assert_eq!(list.len(), 1);
@@ -11238,6 +11424,13 @@ mod tests {
         ] {
             assert!(matches!(err, BantoError::Forbidden), "{err:?}");
         }
+        // banto v8（ADR-0034 §6）: ログイン必須へ戻すには管理者のアカウントが要る。
+        state
+            .services
+            .users
+            .create_user("keeper", "password123", "管理者", Role::Admin)
+            .await
+            .expect("create admin");
         config.disabled = false;
         state
             .services
@@ -11267,9 +11460,10 @@ mod tests {
                 s("denied", "denied", "viewer2"),
                 s("denied", "denied", "viewer2"),
                 s("update", "ok", "editor"),
-                s("denied", "denied", "local"),
-                s("denied", "denied", "local"),
-                s("denied", "denied", "local"),
+                // banto v8: ログインなしのセッションは組み込みの `admin` として記録する。
+                s("denied", "denied", "admin"),
+                s("denied", "denied", "admin"),
+                s("denied", "denied", "admin"),
                 s("delete", "ok", "viewer"),
             ]
         );
@@ -11357,42 +11551,26 @@ mod tests {
     }
 
     /// #600 のレビュー: 合成の identity と同じアカウント名（`local`・`localDesktop`・
-    /// `public`、大文字小文字・前後の空白を問わず）は、デスクトップの初回セットアップでも
-    /// アカウントの作成でも欄の誤り（`username`）で断り、アカウントを作らない。普通の
-    /// 名前は通る。
+    /// `public`、大文字小文字・前後の空白を問わず）は、デスクトップのアカウントの作成で
+    /// 断り、アカウントを作らない。普通の名前は通る（banto v8 で初回セットアップは
+    /// 無くなった）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reserved_usernames_are_refused_on_the_desktop_paths() {
-        let state = app_state().await;
-        for name in ["local", " LocalDesktop ", "PUBLIC"] {
-            let result = setup_body(
+        let state = admin_app_state().await;
+        for name in ["local", " LocalDesktop ", "PUBLIC", "localdesktop"] {
+            let result = users_create_body(
                 &state,
                 name.to_string(),
                 "password123".to_string(),
                 "名前".to_string(),
+                Role::Viewer,
             )
             .await;
-            match result {
-                Err(BantoError::Validation { field_errors }) => {
-                    assert_eq!(field_errors[0].field, "username", "{name}")
-                }
-                other => panic!("{name}: {other:?}"),
-            }
+            assert!(
+                matches!(result, Err(BantoError::Validation { .. })),
+                "{name}: {result:?}"
+            );
         }
-        assert!(!state.services.users.is_initialized().await.unwrap());
-
-        let state = admin_app_state().await;
-        let result = users_create_body(
-            &state,
-            "localdesktop".to_string(),
-            "password123".to_string(),
-            "名前".to_string(),
-            Role::Viewer,
-        )
-        .await;
-        assert!(
-            matches!(result, Err(BantoError::Validation { .. })),
-            "{result:?}"
-        );
         let created = users_create_body(
             &state,
             "operator".to_string(),
@@ -11411,6 +11589,7 @@ mod tests {
             .into_iter()
             .map(|user| user.username)
             .collect();
-        assert_eq!(names.len(), 2, "{names:?}");
+        // banto v8: 組み込みの `admin` の行も一覧に出る（admin・testadmin・operator）。
+        assert_eq!(names.len(), 3, "{names:?}");
     }
 }

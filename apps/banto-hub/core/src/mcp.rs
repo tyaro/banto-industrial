@@ -124,6 +124,10 @@ use crate::write_rate::WriteRateLimiter;
 use banto_server::routes::{record_write_as, AuditActor};
 use banto_server::ServerEvent;
 
+/// banto v8（ADR-0034 §3）: API キーで動いた操作の監査の `actor_kind`（経路の自分の語）。
+/// セッションではないので `actor_id` は無い。記録のためだけの値で、認可には使わない。
+pub(crate) const API_KEY_ACTOR_KIND: &str = "apikey";
+
 // --- 状態 --------------------------------------------------------------
 
 /// `/mcp` の認証ミドルウェア専用 state - `crate::rest::TagSpaceAuthState`と
@@ -1850,9 +1854,11 @@ async fn audit_config_action(
     let label = ctx.actor_label();
     record_write_as(
         &state.audit,
-        Some(AuditActor {
-            username: label.as_str(),
-            role: "api_key",
+        Some(&AuditActor {
+            username: label,
+            id: None,
+            role: "api_key".to_string(),
+            kind: API_KEY_ACTOR_KIND.to_string(),
         }),
         "mcp",
         action,
@@ -3516,6 +3522,8 @@ async fn audit_write_control_outcome(
         .record(AuditEntry {
             actor_username: Some(key_name),
             actor_role: Some("api_key"),
+            actor_id: None,
+            actor_kind: Some(API_KEY_ACTOR_KIND),
             action,
             resource: "write_control",
             entity_id: Some("1"),

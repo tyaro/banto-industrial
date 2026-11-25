@@ -82,6 +82,8 @@
 // バイナリターゲットとして自動検出してしまう（`[[bin]]`で明示済みの
 // `banto-hub`とは別に、`win_service.rs`単体にも`fn main()`を要求される）
 // ため、直下ではなくサブディレクトリ + `#[path]`で読み込む。
+#[path = "banto_hub/password_input.rs"]
+mod password_input;
 #[path = "banto_hub/wasm_plugins.rs"]
 mod wasm_plugins;
 #[cfg(windows)]
@@ -117,6 +119,10 @@ fn hub_drivers() -> HubDrivers {
 fn main() {
     match std::env::args().nth(1).as_deref() {
         None => run_console(),
+        Some(arg) if arg == CREATE_ADMIN_ARG => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            std::process::exit(create_admin(&args));
+        }
         #[cfg(windows)]
         Some(arg) if arg == win_service::INSTALL_ARG => win_service::install(),
         #[cfg(windows)]
@@ -132,8 +138,14 @@ fn main() {
 }
 
 fn print_usage() {
-    eprintln!("使い方: banto-hub.exe [install|uninstall|run-service]");
+    eprintln!("使い方: banto-hub.exe [install|uninstall|run-service|create-admin]");
     eprintln!("  （引数なし）  コンソールモードで起動（Ctrl-C で停止）");
+    eprintln!("  create-admin --username <名前> [--display-name <表示名>]");
+    eprintln!("                Hub の設定 DB に管理者のアカウントを作り、同時にロックダウン（ログイン必須）");
+    eprintln!(
+        "                にする。パスワードは端末なら非表示で 2 回尋ね、パイプ・ファイルなら 1 行目を読む。"
+    );
+    eprintln!("                Hub・サービスを止めてから実行する");
     #[cfg(windows)]
     {
         eprintln!("  install       Windows サービスとして登録（管理者権限が必要）");
@@ -145,6 +157,113 @@ fn print_usage() {
     #[cfg(not(windows))]
     {
         eprintln!("  install / uninstall / run-service は Windows 専用です（このビルドでは無効）");
+    }
+}
+
+/// banto v8（ADR-0034 §7・docs/banto-v8-upgrade-plan.md §2 の 2）: 最初の管理者を作る
+/// サブコマンド。上流の `banto-serve create-admin` と同じ形（`--username`・`--display-name`、
+/// パスワードは標準入力）。
+const CREATE_ADMIN_ARG: &str = "create-admin";
+
+/// `create-admin` の引数。パスワードは引数に入れない（プロセスの一覧と履歴に残る）。
+struct CreateAdminArgs {
+    username: String,
+    display_name: Option<String>,
+}
+
+fn parse_create_admin_args(args: &[String]) -> Result<CreateAdminArgs, String> {
+    let mut username = None;
+    let mut display_name = None;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        let slot = match arg.as_str() {
+            "--username" => &mut username,
+            "--display-name" => &mut display_name,
+            other => return Err(format!("知らない引数です: {other}")),
+        };
+        match rest.next() {
+            Some(value) => *slot = Some(value.clone()),
+            None => return Err(format!("{arg} に値がありません")),
+        }
+    }
+    Ok(CreateAdminArgs {
+        username: username.ok_or_else(|| "--username が必要です".to_string())?,
+        display_name,
+    })
+}
+
+/// 新しい管理者のパスワードを読む（上流 banto の `banto-serve create-admin` と同じ、#866）。
+/// 端末からは入力を表示せず 2 回尋ねる（打ち間違えると唯一の管理者がログインできない）。
+/// パイプ・ファイルからは標準入力の 1 行目（末尾の改行だけを落とす。空白は残す）。
+fn read_new_password() -> Result<String, String> {
+    use crate::password_input as pw;
+    if !pw::stdin_is_terminal() {
+        return pw::read_password_line(&mut std::io::stdin().lock())
+            .map_err(|err| format!("パスワードを読めませんでした: {err}"));
+    }
+    let (first, second) = pw::read_password_twice_hidden(
+        "パスワード（入力は表示されません）: ",
+        "パスワード（確認のためもう一度）: ",
+    )
+    .map_err(|err| {
+        format!(
+            "パスワードを非表示で読めませんでした: {err}（Git Bash・MSYS などの疑似端末では使えません。PowerShell・cmd・通常の端末で実行するか、パスワードをファイルに書いて < password.txt で渡してください）"
+        )
+    })?;
+    if !pw::confirmation_matches(&first, &second) {
+        return Err("2 回の入力が一致しません".to_string());
+    }
+    Ok(first)
+}
+
+/// `banto-hub create-admin`。待ち受けずに終わる。プロセスの終了コードを返す。
+fn create_admin(args: &[String]) -> i32 {
+    let parsed = match parse_create_admin_args(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("banto-hub: {message}");
+            print_usage();
+            return 2;
+        }
+    };
+    let password = match read_new_password() {
+        Ok(password) => password,
+        Err(message) => {
+            eprintln!("banto-hub: {message}。DB には触れていません");
+            return 1;
+        }
+    };
+    let display_name = parsed
+        .display_name
+        .clone()
+        .unwrap_or_else(|| parsed.username.clone());
+    let runtime = tokio::runtime::Runtime::new().expect("failed to build tokio runtime");
+    let config = build_hub_config_from_env(HubHostKind::Console, hub_drivers());
+    let created = runtime.block_on(banto_hub_core::first_admin::run_create_admin(
+        &config,
+        banto_hub_core::first_admin::NewAdmin {
+            username: &parsed.username,
+            password: &password,
+            display_name: &display_name,
+        },
+    ));
+    match created {
+        Ok(created) => {
+            println!(
+                "banto-hub: 管理者のアカウント {} を作り、ロックダウン（ログイン必須）にしました（DB: {}）",
+                created.user.username, config.db_path
+            );
+            0
+        }
+        Err(err) => {
+            let reason = banto_hub_core::first_admin::failure_reason(&err);
+            eprintln!(
+                "banto-hub: 管理者のアカウントを作れませんでした: {reason}\n\
+                 banto-hub: create-admin としては、アカウント・ロックダウン・監査ログを変更していません\
+                 （新しい DB の場合、migration は適用済みです）"
+            );
+            1
+        }
     }
 }
 

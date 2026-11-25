@@ -88,8 +88,10 @@ STOP_TIMEOUT_ABORT_SECONDS = 90.0
 # Sleep 29 回 + 追加待ちの Sleep 59 回（どちらも 1 秒おき）で 88 秒以上。
 STOP_TIMEOUT_MIN_ELAPSED_SECONDS = 88.0
 EXES = ("banto-hub.exe", "banto-hub-shell.exe", "banto-hub-elev.exe", "banto-hub-sink.exe")
-STATUS_URL = "http://127.0.0.1:8722/api/auth/status"
-SETUP_URL = "http://127.0.0.1:8722/api/auth/setup"
+# banto v8: `/api/auth/status` に `initialized` は無い。最初の管理者を作った（= ロックダウン済み）かは
+# 認証なしで読める試運転の状態で見る。
+STATUS_URL = "http://127.0.0.1:8722/api/commissioning/status"
+LOGIN_URL = "http://127.0.0.1:8722/api/auth/login"
 USERS_SID = "*S-1-5-32-545"
 
 
@@ -323,7 +325,8 @@ def tree_hashes(root: Path) -> dict[str, str]:
 
 
 def status_initialized(body: dict) -> bool:
-    return body.get("initialized") is True
+    # banto v8: 最初の管理者は `banto-hub create-admin` で作り、同時にロックダウンする。
+    return body.get("lockedDown") is True
 
 
 def evidence_has_secret(evidence, secret: str) -> bool:
@@ -821,32 +824,37 @@ def phase_fresh(c: Ctx) -> None:
     expect(p, bool(reg), "Apps registration not found")
 
 
-def _set_allow_setup_env() -> None:
-    # サービスの Environment（REG_MULTI_SZ）で初回セットアップを許可する。
-    run(
-        [
-            "reg", "add", rf"HKLM\SYSTEM\CurrentControlSet\Services\{HUB_SVC}",
-            "/v", "Environment", "/t", "REG_MULTI_SZ", "/d", "BANTO_ALLOW_SETUP=1", "/f",
-        ],
-        check=True,
+def _create_admin(p: str, c: Ctx) -> None:
+    # banto v8: 最初の管理者は、サービスを止めてから CLI で作る（パスワードは標準入力の 1 行目）。
+    r = subprocess.run(
+        [str(INSTDIR / "banto-hub.exe"), "create-admin", "--username", "acceptance",
+         "--display-name", "Acceptance"],
+        input=c.password + "\n", capture_output=True, text=True, timeout=120,
+        encoding="utf-8", errors="replace",
     )
+    obs(p, "create_admin", {"exit": r.returncode, "stderr_tail": r.stderr[-300:]})
+    expect(p, r.returncode == 0, "create-admin failed", r.returncode)
 
 
 def phase_start_seed(c: Ctx) -> None:
     p = "3_start_seed"
-    _set_allow_setup_env()
+    # 新しい DB で一度起動して（試運転モード・loopback）、止めてから create-admin。
     run(["sc", "start", HUB_SVC])
     obs(p, "running", wait_state(HUB_SVC, "RUNNING"))
     st = wait_status()
     obs(p, "status_before", st)
-    code, body = http_json(
-        SETUP_URL, {"username": "acceptance", "password": c.password, "displayName": "Acceptance"}
-    )
-    obs(p, "setup_http", {"code": code, "keys": sorted(body) if isinstance(body, dict) else None})
-    expect(p, code == 200, "first-run setup failed", {"code": code})
-    code, st = http_json(STATUS_URL)
+    expect(p, not status_initialized(st), "a new DB is already locked down", st)
+    run(["sc", "stop", HUB_SVC])
+    obs(p, "stopped", wait_state(HUB_SVC, "STOPPED"))
+    _create_admin(p, c)
+    run(["sc", "start", HUB_SVC])
+    obs(p, "running_after", wait_state(HUB_SVC, "RUNNING"))
+    st = wait_status()
     obs(p, "status_after", st)
-    expect(p, status_initialized(st), "status not initialized after setup", st)
+    expect(p, status_initialized(st), "status not initialized after create-admin", st)
+    code, body = http_json(LOGIN_URL, {"username": "acceptance", "password": c.password})
+    obs(p, "login_http", {"code": code, "keys": sorted(body) if isinstance(body, dict) else None})
+    expect(p, code == 200 and bool(body.get("token")), "login after create-admin failed", {"code": code})
     SENTINEL.parent.mkdir(parents=True, exist_ok=True)
     SENTINEL.write_text("banto-973 sentinel\n", encoding="utf-8")
     c.hashes["sentinel"] = sha256(SENTINEL)

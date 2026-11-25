@@ -15,7 +15,7 @@ use tokio::sync::broadcast as tokio_broadcast;
 // （`crate::users`・`crate::rest` の自前のルーター）ではどれも落ちる。
 
 /// 本番と同じ `user_auth_state` で組んだ router。アカウントは作らない
-/// （初回セットアップの前の状態）。試運転のまま（ロックダウンしない）。
+/// （banto v8 では初回セットアップは無い）。試運転のまま（ロックダウンしない）。
 async fn banto_wiring_env() -> (Router, sqlx::SqlitePool, UsersService, tempfile::TempDir) {
     let pool = migrate_memory().await.expect("migrate_memory");
     let (tx, _rx) = tokio_broadcast::channel(16);
@@ -58,7 +58,6 @@ async fn banto_wiring_env() -> (Router, sqlx::SqlitePool, UsersService, tempfile
         auth,
         commissioning,
         tx,
-        true,
         write_control,
         write_audit,
         mqtt,
@@ -77,58 +76,6 @@ async fn audit_rows(pool: &sqlx::SqlitePool, action: &str) -> Vec<Option<String>
         .unwrap()
 }
 
-/// banto #277: 初回セットアップの「表が空か」と INSERT が 1 文。同時に
-/// 来たセットアップは 1 つだけ成功し、アカウントも `setup` の監査も 1 件。
-/// 以前の写しは「空か確かめる → ハッシュ → INSERT」の 3 段で、全員が空を
-/// 見て admin が複数できた。
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_first_setups_create_exactly_one_account() {
-    let (router, pool, _users, _dir) = banto_wiring_env().await;
-    const ATTEMPTS: usize = 8;
-    let barrier = Arc::new(tokio::sync::Barrier::new(ATTEMPTS));
-    let mut handles = Vec::new();
-    for i in 0..ATTEMPTS {
-        let router = router.clone();
-        let barrier = barrier.clone();
-        handles.push(tokio::spawn(async move {
-            barrier.wait().await;
-            session_call(
-                &router,
-                session_request(
-                    "POST",
-                    "/api/auth/setup",
-                    None,
-                    Some(json!({
-                        "username": format!("owner{i}"),
-                        "password": "password123",
-                        "displayName": format!("Owner {i}"),
-                    })),
-                ),
-            )
-            .await
-        }));
-    }
-    let mut succeeded = 0;
-    for handle in handles {
-        let (status, body) = handle.await.unwrap();
-        assert_eq!(status, StatusCode::OK, "{body}");
-        if body["success"] == true {
-            assert!(body["token"].is_string(), "{body}");
-            succeeded += 1;
-        } else {
-            assert_eq!(body["success"], false, "{body}");
-            assert!(body["token"].is_null(), "{body}");
-        }
-    }
-    assert_eq!(succeeded, 1, "exactly one setup wins");
-    let accounts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(accounts, 1);
-    assert_eq!(audit_rows(&pool, "setup").await.len(), 1);
-}
-
 /// banto #278: 失敗ログインの監査に残す名前は 32 文字（末尾 `…`）に
 /// 切り詰める。名前は攻撃者が決められ、実在のアカウントである必要も
 /// ないので、そのまま残すと監査ログを膨らませる口になる。以前の写しは
@@ -137,7 +84,12 @@ async fn concurrent_first_setups_create_exactly_one_account() {
 async fn a_failed_login_records_a_bounded_username() {
     let (router, pool, users, _dir) = banto_wiring_env().await;
     users
-        .setup_first_user("testadmin", "password123", "管理者")
+        .create_user(
+            "testadmin",
+            "password123",
+            "管理者",
+            crate::users::Role::Admin,
+        )
         .await
         .unwrap();
     let long_name = "x".repeat(4096);
@@ -190,7 +142,12 @@ async fn a_failed_login_records_a_bounded_username() {
 async fn only_a_logout_that_ends_a_session_is_audited() {
     let (router, pool, users, _dir) = banto_wiring_env().await;
     users
-        .setup_first_user("testadmin", "password123", "管理者")
+        .create_user(
+            "testadmin",
+            "password123",
+            "管理者",
+            crate::users::Role::Admin,
+        )
         .await
         .unwrap();
     let token = session_login(&router, "testadmin", false).await;

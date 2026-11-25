@@ -659,6 +659,8 @@ impl GrpcService {
             .record(AuditEntry {
                 actor_username: None,
                 actor_role: None,
+                actor_id: None,
+                actor_kind: None,
                 action: "denied",
                 resource: "api_keys",
                 entity_id: Some(&id.to_string()),

@@ -3356,7 +3356,6 @@ mod tests {
                 .join("hub.sqlite3")
                 .to_string_lossy()
                 .into_owned(),
-            allow_setup: false,
             port_override: Some(0),
             bind_override: Some("127.0.0.1".into()),
             data_dir_override: Some(dir.path().join("data")),
@@ -3790,11 +3789,6 @@ mod tests {
                 config.db_path,
                 expected_paths.db_path.to_string_lossy().into_owned()
             ),
-        }
-
-        match std::env::var("BANTO_ALLOW_SETUP") {
-            Ok(value) => assert_eq!(config.allow_setup, value == "1"),
-            Err(_) => assert!(!config.allow_setup),
         }
 
         match std::env::var("PORT")

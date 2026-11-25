@@ -414,6 +414,8 @@ async fn record_rows(audit: &AuditLogService, rows: Vec<IngestAuditRow>) {
             .record(AuditEntry {
                 actor_username: None,
                 actor_role: None,
+                actor_id: None,
+                actor_kind: None,
                 action: row.action,
                 resource: row.resource,
                 entity_id: Some(&row.entity_id),

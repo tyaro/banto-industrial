@@ -6,6 +6,7 @@ DELETE /api/free-trends/{id}
 DELETE /api/hub
 DELETE /api/plc-connections/{id}
 DELETE /api/tags/{id}
+DELETE /api/ui-settings/{key}
 DELETE /api/users/{id}
 GET /api/api-keys
 GET /api/audit-log/config
@@ -54,7 +55,6 @@ POST /api/auth/change-password
 POST /api/auth/grant/{kind}
 POST /api/auth/login
 POST /api/auth/logout
-POST /api/auth/setup
 POST /api/backups
 POST /api/backups/restore
 POST /api/backups/{fileName}/restore

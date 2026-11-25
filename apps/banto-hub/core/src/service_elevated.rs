@@ -739,6 +739,8 @@ pub async fn revert_to_commissioning_with_audit(
     audit
         .try_record(crate::audit::AuditEntry {
             actor_username: Some(actor),
+            actor_id: None,
+            actor_kind: Some(crate::audit::ACTOR_KIND_CLI),
             // アプリ側のロール概念に対応する値が無い（ログインを要求しない
             // 状態へ戻す操作そのものなので、ロールを引けるログイン
             // セッションが存在しない） - `None`のままにする
@@ -1750,7 +1752,12 @@ mod tests {
         let pool = crate::db::migrate_memory().await.expect("migrate_memory");
         let users = crate::users::UsersService::new(crate::db::Db::Sqlite(pool.clone()));
         users
-            .setup_first_user("owner", "old-password-1", "オーナー")
+            .create_user(
+                "owner",
+                "old-password-1",
+                "オーナー",
+                crate::users::Role::Admin,
+            )
             .await
             .expect("setup_first_user");
 
@@ -1792,7 +1799,12 @@ mod tests {
         let settings = crate::settings::SettingsService::new(crate::db::Db::Sqlite(pool.clone()));
         let users = crate::users::UsersService::new(crate::db::Db::Sqlite(pool.clone()));
         users
-            .setup_first_user("owner", "password123", "オーナー")
+            .create_user(
+                "owner",
+                "password123",
+                "オーナー",
+                crate::users::Role::Admin,
+            )
             .await
             .expect("setup_first_user");
         let auth = banto_server::AuthState::new(

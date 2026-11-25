@@ -1676,9 +1676,11 @@ pub(crate) mod tests {
                 id: "alice".to_string(),
                 name: "Alice".to_string(),
                 role: "editor".to_string(),
+                account_id: None,
             },
             grant: None,
             stamp: None,
+            audit_as_builtin_admin: false,
         };
         assert_eq!(
             session_recheck_verdict(Ok(Some(session))),
@@ -1759,6 +1761,7 @@ pub(crate) mod tests {
                 id: "alice".to_string(),
                 name: "Alice".to_string(),
                 role: "editor".to_string(),
+                account_id: None,
             },
             stamp: banto_server::SessionStamp {
                 account_id: 7,

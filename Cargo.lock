@@ -699,8 +699,8 @@ dependencies = [
 
 [[package]]
 name = "banto-admin-services"
-version = "7.9.0"
-source = "git+https://github.com/tyaro/banto.git?tag=v7.9.0#c017882a654754dfed87bf558a319c96ba136716"
+version = "8.0.0"
+source = "git+https://github.com/tyaro/banto.git?tag=v8.0.0#c0ab2f83819e0ff8b081a0ab87b8de4efae1c41d"
 dependencies = [
  "argon2",
  "banto-core",
@@ -767,8 +767,8 @@ dependencies = [
 
 [[package]]
 name = "banto-core"
-version = "7.9.0"
-source = "git+https://github.com/tyaro/banto.git?tag=v7.9.0#c017882a654754dfed87bf558a319c96ba136716"
+version = "8.0.0"
+source = "git+https://github.com/tyaro/banto.git?tag=v8.0.0#c0ab2f83819e0ff8b081a0ab87b8de4efae1c41d"
 dependencies = [
  "chrono",
  "serde",
@@ -1003,6 +1003,7 @@ dependencies = [
  "chrono",
  "embed-resource",
  "futures-util",
+ "libc",
  "ring",
  "rumqttc",
  "rumqttd",
@@ -1206,8 +1207,8 @@ dependencies = [
 
 [[package]]
 name = "banto-server"
-version = "7.9.0"
-source = "git+https://github.com/tyaro/banto.git?tag=v7.9.0#c017882a654754dfed87bf558a319c96ba136716"
+version = "8.0.0"
+source = "git+https://github.com/tyaro/banto.git?tag=v8.0.0#c0ab2f83819e0ff8b081a0ab87b8de4efae1c41d"
 dependencies = [
  "async-stream",
  "axum 0.8.9",
@@ -1245,8 +1246,8 @@ dependencies = [
 
 [[package]]
 name = "banto-storage"
-version = "7.9.0"
-source = "git+https://github.com/tyaro/banto.git?tag=v7.9.0#c017882a654754dfed87bf558a319c96ba136716"
+version = "8.0.0"
+source = "git+https://github.com/tyaro/banto.git?tag=v8.0.0#c0ab2f83819e0ff8b081a0ab87b8de4efae1c41d"
 dependencies = [
  "banto-core",
  "serde_json",
@@ -1708,6 +1709,7 @@ dependencies = [
  "banto-tstore",
  "futures-util",
  "getrandom 0.4.3",
+ "libc",
  "qrcode",
  "rcgen",
  "reqwest",

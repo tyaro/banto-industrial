@@ -140,6 +140,9 @@
 	let saving = $state(false);
 
 	function selectUser(user: UserSummary): void {
+		// 組み込みの `admin` の行は読み取り専用（banto v8、ADR-0034 §2）: 編集・パスワード・削除の
+		// フォームを出さない。
+		if (user.kind === 'builtin') return;
 		selected = user;
 		editDisplayName = user.displayName;
 		editRole = user.role;

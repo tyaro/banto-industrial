@@ -49,10 +49,11 @@ fn account_with_id(username: &str, user_id: i64, role: Role) -> FreeTrendActor {
 /// `users` にアカウントを足して ID を返す（役割は主体の側で持つので、ここでは既定のまま）。
 async fn seed_user(pool: &SqlitePool, username: &str) -> i64 {
     sqlx::query_scalar(
-        "INSERT INTO users (username, password_hash, display_name) VALUES (?, 'x', ?) RETURNING id",
+        "INSERT INTO users (username, password_hash, display_name, account_uid)          VALUES (?, 'x', ?, ?) RETURNING id",
     )
     .bind(username)
     .bind(username)
+    .bind(format!("uid-{username}"))
     .fetch_one(pool)
     .await
     .expect("seed user")
@@ -61,11 +62,12 @@ async fn seed_user(pool: &SqlitePool, username: &str) -> i64 {
 /// `users` に ID を決めてアカウントを足す。
 async fn seed_user_with_id(pool: &SqlitePool, username: &str, id: i64) {
     sqlx::query(
-        "INSERT INTO users (id, username, password_hash, display_name) VALUES (?, ?, 'x', ?)",
+        "INSERT INTO users (id, username, password_hash, display_name, account_uid)          VALUES (?, ?, 'x', ?, ?)",
     )
     .bind(id)
     .bind(username)
     .bind(username)
+    .bind(format!("uid-{username}-{id}"))
     .execute(pool)
     .await
     .expect("seed user");

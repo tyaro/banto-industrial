@@ -17,8 +17,15 @@
 //! 1. **A1 の排他**（[`crate::instance_lock::acquire_for_db`]）。**DB に触れる
 //!    前**。取れなければ DB・リストア予約・監査の保留のどれにも触れずに
 //!    [`EngineStartError::InstanceLock`] を返す。
-//! 2. **リストア予約の適用**（`BackupService::apply_pending_restore_at_startup`、
-//!    pool を作る前でなければならない）。失敗しても起動は止めない（今までどおり）。
+//! 2. **旧形式の拒否とリストア予約の適用**。先に [`crate::db::refuse_legacy_profile`]
+//!    （banto v8 への追従）で今の DB と予約のファイルを読み取り専用で確かめ、どちらかが
+//!    旧形式なら何も変えずに [`EngineStartError::Database`]（`InitDbError::Legacy`）を返す
+//!    （適用が旧形式の DB の上に予約を当てる・旧形式の予約を「不正」として消すのを防ぐ）。
+//!    予約があるのに形式を確かめられない（開けない・空でない `-wal` が残っている など）ときも、
+//!    予約を当てずに `InitDbError::Undetermined` で止まる。
+//!    次に予約の適用（`BackupService::apply_pending_restore_at_startup`、pool を作る前で
+//!    なければならない）。適用の失敗では起動は止めない（今までどおり）。予約は banto の検査
+//!    （履歴と [`crate::db::sqlite_restore_manifest`] の起動時の検査）を通ったものだけが当たる。
 //! 3. **`init_db`**。旧形式の DB・開けない DB は [`EngineStartError::Database`]。
 //!    サービス（[`DbPin::InRoot`]、#623 PR2b）は 2. の**後**・`init_db` の**前**に、握った
 //!    ルートで DB の本体・`-wal`・`-shm` を握り（`ManagedDir::pin_sqlite(_checked)`。先に
@@ -38,7 +45,9 @@
 //!    差し込むが 2 回目は無視される）。
 //! 6. 収集サービスを組み（保存設定 `data.dir` を読めないとき、
 //!    [`EngineConfig::store_config_required`] なら Hub を止めて pool を閉じてから
-//!    [`EngineStartError::StoreConfig`]、そうでなければ既定値で続行）、
+//!    [`EngineStartError::StoreConfig`]、そうでなければ既定値で続行。保存先がこの DB の
+//!    世代のものでなければ、どの host でも保存先に書かずに
+//!    [`EngineStartError::StoreGeneration`]。[`crate::store_generation`]）、
 //!    [`EngineConfig::attach_hub`] なら `attach_hub`
 //!    （**自動開始より前**。後から繋いでも走り出した収集には効かない）。
 //! 7. **listener の bind**（ポートの確保だけ。まだ要求を受けない）。先に
@@ -146,11 +155,11 @@
 //!   `UnavailableKeyStore` か `BANTO_HUB_MEMORY_KEYS=1` の `MemoryKeyStore`、
 //!   `chronogazer-server` = DPAPI のファイル（`crate::server_host::open_key_store`））と
 //!   `attach_hub` の有無。
-//! - 待ち受け（[`EngineListen`]、`chronogazer-server` は加えて常時の loopback）と
-//!   `allow_setup`（`POST /api/auth/setup` を開けるのは `banto-serve` と、
-//!   `chronogazer-server` の常時の listener への**この PC からの要求だけ**（peer と Host。
-//!   2026-10-14 オーナー決定で listener 単位から要求ごとに変えた）。
-//!   [`OpenedEngine::with_loopback_local_access`]）。
+//! - 待ち受け（[`EngineListen`]、`chronogazer-server` は加えて常時の loopback）と、
+//!   この PC からの接続の grant `localDesktop` を開けるか（`chronogazer-server` の常時の
+//!   listener への**この PC からの要求だけ**（peer と Host。2026-10-14 オーナー決定で
+//!   listener 単位から要求ごとに変えた）。[`OpenedEngine::with_loopback_local_access`]。
+//!   banto v8 で初回セットアップ `POST /api/auth/setup` は無くなった）。
 //! - ログの接頭辞（`banto` / `banto-serve`）と、起動時の `restore_applied` の
 //!   監査の `origin`（`tauri` / `rest`）。今までの各 host の文言・値を保つため。
 //! - 保存設定を読めないときに起動を止めるか（`store_config_required`。
@@ -293,8 +302,6 @@ pub struct EngineConfig {
     pub host: ChronoGazerHost,
     /// LAN の待ち受け。
     pub listen: EngineListen,
-    /// `POST /api/auth/setup` を開けるか（`banto-serve` の `BANTO_ALLOW_SETUP`）。
-    pub allow_setup: bool,
     /// 起動時に保存済みの設定 `server.viewer_public` を `true` にする
     /// （`banto-serve` の `BANTO_VIEWER_PUBLIC`。開発・E2E 用）。
     pub seed_viewer_public: bool,
@@ -475,6 +482,10 @@ pub enum EngineStartError {
     StoreDirUnwritable { dir: PathBuf, reason: String },
     /// Service `data.dir` does not resolve to a safe child of its held root.
     StoreDirNotAllowed { dir: PathBuf, reason: String },
+    /// 保存先がこの DB の世代のものでない（v8 より前の版・作り直す前の DB の保存先）か、
+    /// それを確かめられなかった（[`crate::store_generation`]）。断ったときは保存先に何も
+    /// 書いていない。
+    StoreGeneration(crate::store_generation::ClaimError),
     /// [`EngineListen::Required`] の待ち受けを開けなかった。
     Listen {
         config: ServerConfig,
@@ -489,6 +500,9 @@ impl std::fmt::Display for EngineStartError {
             // 旧形式の DB は、何をすればよいかを書いた文言をそのまま出す
             // （`crate::db` のモジュール doc「旧形式の DB の拒否」）。
             Self::Database(InitDbError::Legacy(legacy)) => legacy.fmt(f),
+            // 予約があるのに形式を確かめられない（`crate::db::refuse_legacy_profile`）も、対処を
+            // 書いた文言をそのまま出す。
+            Self::Database(InitDbError::Undetermined(undetermined)) => undetermined.fmt(f),
             Self::Database(err) => write!(f, "DB の初期化に失敗しました: {err}"),
             Self::Hub(err) => write!(f, "Hub 接続の初期化に失敗しました: {err}"),
             Self::StoreConfig { source, .. } => {
@@ -499,6 +513,7 @@ impl std::fmt::Display for EngineStartError {
             }
             Self::StoreDirUnwritable { reason, .. } => f.write_str(reason),
             Self::StoreDirNotAllowed { reason, .. } => f.write_str(reason),
+            Self::StoreGeneration(err) => err.fmt(f),
             Self::Listen { config, source } => write!(
                 f,
                 "待ち受け（{}:{}）を開始できませんでした: {source}",
@@ -516,6 +531,7 @@ impl std::error::Error for EngineStartError {
             Self::Hub(err)
             | Self::StoreConfig { source: err, .. }
             | Self::Listen { source: err, .. } => Some(err),
+            Self::StoreGeneration(err) => Some(err),
             Self::StoreDirUnwritable { .. } | Self::StoreDirNotAllowed { .. } => None,
         }
     }
@@ -590,6 +606,9 @@ pub struct EngineServices {
     /// LAN の REST の bearer トークンの状態（listener を入れ替えてもトークンが
     /// 続くよう、エンジンが 1 つ持つ）。
     pub rest_auth: AuthState,
+    /// 組み込みの `admin` の行の id（banto v8、ADR-0034 §3。起動時の検査で 1 回読む）。
+    /// デスクトップのコマンドの監査の主体（ログインなしの間）に使う。
+    pub builtin_admin_id: i64,
     pub events: broadcast::Sender<ServerEvent>,
     /// 全サービスが共有する SQLite の pool（終了の最後に閉じる）。
     pub pool: DbPool,
@@ -717,7 +736,7 @@ impl EngineServices {
     /// `true` のルーターでは、この PC からの要求（要求ごとに peer と Host の両方が
     /// loopback）にだけ `localDesktop` の grant を開け、最初の管理者の作成にも同じ確認を
     /// かける（#392 B2-1、[`crate::local_grant`]）。LAN 専用の listener は `false`。
-    pub fn router(&self, allow_setup: bool, always_on_listener: bool) -> Router {
+    pub fn router(&self, always_on_listener: bool) -> Router {
         // LAN の listener を入れ替えるときに載せるルーター（REST の `PUT
         // /api/settings/server`）。閉じた形（setup も grant も無し）。この関数は
         // `EngineServices` の写しを持つので、slot → listener → ルーター → この関数 →
@@ -725,7 +744,7 @@ impl EngineServices {
         // listener を取り出すので輪はそこで切れる。
         let factory: LanRouterFactory = {
             let services = self.clone();
-            Arc::new(move || services.router(false, false))
+            Arc::new(move || services.router(false))
         };
         let access = HostAccess {
             local: LocalAccess {
@@ -755,7 +774,6 @@ impl EngineServices {
                 self.display_groups.clone(),
                 self.rest_auth.clone(),
                 self.events.clone(),
-                allow_setup,
                 access,
             ),
             self.backup_gate.clone(),
@@ -831,6 +849,14 @@ impl EngineRuntime {
     ) -> Result<OpenedEngine, EngineStartError> {
         let label = cfg.log_label;
 
+        // banto v8（docs/banto-v8-upgrade-plan.md §5 の 2）: 予約の適用より前に、今の DB と
+        // 予約のファイルが旧形式でないかを読み取り専用で確かめる。旧形式なら何も変えずに
+        // 止まる（予約を適用しない・消さない。`crate::db::refuse_legacy_profile`）。
+        // 起動時の対処で適用済みのリストアがあるとき（予約はもう無い）も、今の DB を確かめる。
+        crate::db::refuse_legacy_profile(&cfg.db_path)
+            .await
+            .map_err(EngineStartError::Database)?;
+
         // Spec M17: リストア予約は pool を作る前に適用する
         // （`BackupService::apply_pending_restore_at_startup` の doc）。失敗しても
         // 起動は止めない（今の DB はそのまま残る）。I2a（banto #280）: 予約も
@@ -842,7 +868,12 @@ impl EngineRuntime {
         // ここへ来る（`startup_recovery::restore_from_backup`）。
         let applied_restore = match preapplied_restore {
             Some(applied) => Some(applied),
-            None => match BackupService::apply_pending_restore_at_startup(&cfg.db_path).await {
+            None => match BackupService::apply_pending_restore_at_startup(
+                &cfg.db_path,
+                &crate::db::sqlite_restore_manifest(),
+            )
+            .await
+            {
                 Ok(applied) => applied,
                 Err(err) => {
                     eprintln!("{label}: 起動時のリストア適用に失敗しました: {err}");
@@ -1017,8 +1048,8 @@ impl OpenedEngine {
     }
 
     /// 常時の listener（[`OpenedEngine::with_loopback`]）のルーターで、**この PC からの
-    /// 要求だけ**に最初の管理者の作成（`POST /api/auth/setup`）とこの PC からの接続の
-    /// grant（`localDesktop`、[`crate::local_grant`]）を開ける（`chronogazer-server`）。
+    /// 要求だけ**にこの PC からの接続の grant（`localDesktop`、[`crate::local_grant`]）を
+    /// 開ける（`chronogazer-server`）。
     /// 「この PC から」は要求ごとに peer と Host の両方が loopback かで決める
     /// （[`crate::local_grant::local_access_middleware`]）。これが本当の境界で、常時の
     /// listener が `0.0.0.0` にまとめた 1 本でも、LAN からの要求は peer が LAN なので
@@ -1026,8 +1057,7 @@ impl OpenedEngine {
     /// だけ」と listener 単位で決めていた）。LAN 専用の listener（LAN の slot）と、後から
     /// LAN を入れ替えるときの [`RunningEngine::router`]（決定 9）は常に閉じる
     /// （多層の防御。LAN の IP に bind した listener に loopback の peer は来ない）。
-    /// [`EngineConfig::allow_setup`]（`banto-serve`）が `true` なら setup はそちらが
-    /// 優先（全部で開く）。発行の形（未初期化なら admin、初期化済みなら設定
+    /// 発行の形（起動時にログインなしならそのモードのロール、ログイン必須なら設定
     /// `auth.local_grant`）は `start` で 1 回だけ決める。
     pub fn with_loopback_local_access(mut self) -> Self {
         self.loopback_local_access = true;
@@ -1053,9 +1083,21 @@ impl OpenedEngine {
         // I2a: users/settings/audit/backup は banto の `banto_admin_services`。
         // バックエンドを問わない `Db` ハンドルを受けるので同じ pool を包んで渡す。
         let db = Db::Sqlite(pool.clone());
-        let users = UsersService::new(db.clone());
+        let users = UsersService::new(db.clone())
+            .with_reserved_usernames(crate::local_grant::reserved_usernames());
         let settings = SettingsService::new(db.clone());
-        let backup = BackupService::new(cfg.db_path.clone(), db.clone());
+        // banto v8: 起動時の検査（`crate::db::startup_check`）。満たさない DB では起動しない。
+        let builtin_admin_id = match crate::db::startup_check(&db).await {
+            Ok(id) => id,
+            Err(err) => {
+                close_then_release(&pool, &mut db_pins).await;
+                return Err(EngineStartError::Database(crate::db::InitDbError::Storage(
+                    err,
+                )));
+            }
+        };
+        let backup = BackupService::new(cfg.db_path.clone(), db.clone())
+            .with_migrations(crate::db::sqlite_restore_manifest());
         // #383 段階2a / R1-B: レジストリ 3 サービス（テーブルは `init_db` が呼ぶ
         // `banto_tags::migrate` で作成済み）。#393: 表示グループ。
         let plc_connections =
@@ -1075,7 +1117,8 @@ impl OpenedEngine {
         flush_at_startup(&audit, label).await;
         // LAN のセッション（spec §8.2）。`login`/`login_failed` を監査に書き、
         // 要求のたびにアカウントを確かめ直す（banto v1.7.0 #204）。
-        let rest_auth = user_auth_state(users.clone(), audit.clone());
+        let rest_auth =
+            user_auth_state(users.clone(), audit.clone()).with_builtin_admin_id(builtin_admin_id);
 
         // Spec M17: `restore_applied` は監査サービスができた今記録する
         // （適用そのものは pool より前に済んでいる）。
@@ -1084,6 +1127,8 @@ impl OpenedEngine {
                 .record(AuditEntry {
                     actor_username: None,
                     actor_role: None,
+                    actor_id: None,
+                    actor_kind: None,
                     action: "restore_applied",
                     resource: "backups",
                     entity_id: None,
@@ -1175,7 +1220,7 @@ impl OpenedEngine {
         hub.attach_registry(pool.clone());
 
         // #383 段階2b / R1-C: 収集。`data.dir` の相対パスは `data_base` 基準
-        // （既定 `"./data"` をそのまま使うとプロセスの作業ディレクトリに書いて
+        // （既定 `"./data/history"` をそのまま使うとプロセスの作業ディレクトリに書いて
         // しまう）。設定を読めなければ、`store_config_required` なら起動を止め
         // （Hub を止めて pool を閉じて返す）、そうでなければ既定値で続行する。
         let store_settings = match store_config(&settings).await {
@@ -1221,6 +1266,31 @@ impl OpenedEngine {
                 None,
             )
         };
+        // banto v8 への追従（docs/banto-v8-upgrade-plan.md §5 の 1、`crate::store_generation`）:
+        // 保存先がこの DB の世代のものか。書き込みの確かめ（下）より前に、どの host でも確かめる
+        // （断るときは保存先に何も書かない。旧い履歴が新しいタグに混ざらないため）。
+        let generation = match crate::store_generation::db_generation(&settings).await {
+            Ok(generation) => generation,
+            Err(err) => {
+                hub.shutdown().await;
+                close_then_release(&pool, &mut db_pins).await;
+                return Err(EngineStartError::StoreConfig {
+                    source: err,
+                    data_dir_unreadable: false,
+                });
+            }
+        };
+        let claimed = match &service_data_dir {
+            Some(held) => {
+                crate::store_generation::claim_managed_dir(held, &collect_data_dir, &generation)
+            }
+            None => crate::store_generation::claim_dir(&collect_data_dir, &generation),
+        };
+        if let Err(err) = claimed {
+            hub.shutdown().await;
+            close_then_release(&pool, &mut db_pins).await;
+            return Err(EngineStartError::StoreGeneration(err));
+        }
         // #392: 保存先に書き込めるか（`store_dir_check_required` のときだけ）。
         if cfg.store_dir_check_required {
             let check = match &service_data_dir {
@@ -1343,7 +1413,7 @@ impl OpenedEngine {
         // （2026-10-14 オーナー決定）。
         let always_on_local_access = loopback_local_access && bound_loopback.is_some();
         let local_grant = if always_on_local_access {
-            LocalGrantStart::resolve(&users, &settings, label).await
+            LocalGrantStart::resolve(&settings, label).await
         } else {
             LocalGrantStart::Unsupported
         };
@@ -1355,6 +1425,7 @@ impl OpenedEngine {
         });
 
         let services = EngineServices {
+            builtin_admin_id,
             users,
             settings,
             audit,
@@ -1380,19 +1451,12 @@ impl OpenedEngine {
 
         let listen_error = listen_error.or(fallback_error);
 
-        // 9. serve を始める。最初の管理者の作成は `allow_setup`（全部）か、
+        // 9. serve を始める。この PC からの接続の grant（#392 B2-1）は、
         // `loopback_local_access` なら常時の listener の、この PC からの要求（peer と
         // Host の両方が loopback）だけ（LAN の listener と後の入れ替えは閉じる）。
-        // この PC からの接続の grant（#392 B2-1）も同じ。
-        let lan_allow_setup = cfg.allow_setup;
-        let server =
-            bound.map(|bound: BoundServer| bound.serve(services.router(lan_allow_setup, false)));
-        let loopback_server = bound_loopback.map(|bound: BoundServer| {
-            bound.serve(services.router(
-                cfg.allow_setup || always_on_local_access,
-                always_on_local_access,
-            ))
-        });
+        let server = bound.map(|bound: BoundServer| bound.serve(services.router(false)));
+        let loopback_server = bound_loopback
+            .map(|bound: BoundServer| bound.serve(services.router(always_on_local_access)));
         *lan_slot.lock().await = server;
         *loopback_slot.lock().await = loopback_server;
 
@@ -1411,7 +1475,6 @@ impl OpenedEngine {
             services,
             server: lan_slot,
             loopback: loopback_slot,
-            allow_setup: lan_allow_setup,
             log_label: label,
             listen_error,
             background: std::sync::Mutex::new(BackgroundTasks {
@@ -1499,7 +1562,6 @@ pub struct RunningEngine {
     server: Arc<ServerSlot>,
     /// 常時の loopback の listener（[`OpenedEngine::with_loopback`]）。入れ替えない。
     loopback: Arc<ServerSlot>,
-    allow_setup: bool,
     log_label: &'static str,
     listen_error: Option<String>,
     background: std::sync::Mutex<BackgroundTasks>,
@@ -1539,10 +1601,10 @@ impl RunningEngine {
         self.loopback.local_addr().await
     }
 
-    /// LAN に出すルーター（`allow_setup` は起動時の設定のまま）。listener を
+    /// LAN に出すルーター（この PC からの接続の grant は閉じたまま）。listener を
     /// 入れ替えるときに使う。
     pub fn router(&self) -> Router {
-        self.services.router(self.allow_setup, false)
+        self.services.router(false)
     }
 
     /// [`EngineListen::BestEffort`] の待ち受けを開けなかったとき、または常時の
@@ -1731,7 +1793,6 @@ mod tests {
             attach_hub: false,
             host: ChronoGazerHost::Serve,
             listen,
-            allow_setup: false,
             seed_viewer_public: false,
             log_label: "engine-test",
             audit_origin: "rest",
@@ -2040,23 +2101,58 @@ mod tests {
         );
     }
 
-    /// `POST /api/auth/setup` の HTTP の状態（最初の管理者の作成）。
-    async fn post_setup(addr: SocketAddr) -> u16 {
-        let body = serde_json::json!({
-            "username": "testadmin",
-            "password": "admin-pass-1",
-            "displayName": "管理者",
-        });
+    /// `POST /api/auth/grant/localDesktop` の HTTP の状態（この PC からの接続。banto v8 で
+    /// 初回セットアップ `POST /api/auth/setup` は無くなったので、listener が開いているかは
+    /// これで見る。新しい DB はログインなしで、常時の listener なら admin で発行する）。
+    async fn post_local_grant(addr: SocketAddr) -> u16 {
         reqwest::Client::new()
-            .post(format!("http://{addr}/api/auth/setup"))
+            .post(format!("http://{addr}/api/auth/grant/localDesktop"))
             .header("X-Banto-Client", "banto")
-            .header("Content-Type", "application/json")
-            .body(body.to_string())
             .send()
             .await
             .expect("send")
             .status()
             .as_u16()
+    }
+
+    /// 管理者のアカウント `testadmin`（パスワード `admin-pass-1`）を作る（banto v8 で初回
+    /// セットアップは無くなった。前は `POST /api/auth/setup` で作っていた）。
+    async fn create_test_admin(engine: &RunningEngine) {
+        engine
+            .services()
+            .users
+            .create_user(
+                "testadmin",
+                "admin-pass-1",
+                "管理者",
+                crate::users::Role::Admin,
+            )
+            .await
+            .expect("create_user");
+    }
+
+    /// 起動の前に、管理者 `testadmin`（パスワード `admin-pass-1`）を作ってログイン必須にする
+    /// （banto v8 の新しい DB はログインなしで始まり、ログインなしの間は閲覧公開なしの
+    /// LAN を開けない。前の DB は既定でログイン必須だった）。`local_grant` を渡せば
+    /// `auth.local_grant` も書く（起動時に決まる `localDesktop` の権限）。
+    async fn require_login_with_admin(opened: &OpenedEngine, local_grant: Option<&str>) {
+        crate::users::UsersService::new(crate::db::Db::Sqlite(opened.pool().clone()))
+            .create_user(
+                "testadmin",
+                "admin-pass-1",
+                "管理者",
+                crate::users::Role::Admin,
+            )
+            .await
+            .expect("create_user");
+        let settings = opened.settings();
+        settings.set("auth.disabled", "false").await.unwrap();
+        if let Some(role) = local_grant {
+            settings
+                .set(crate::local_grant::LOCAL_GRANT_SETTING_KEY, role)
+                .await
+                .unwrap();
+        }
     }
 
     /// bind できないアドレス（TEST-NET-3。この PC のアドレスではない）。
@@ -2069,7 +2165,7 @@ mod tests {
 
     /// #598 のレビュー: 常時の listener（`0.0.0.0` にまとめたもの）を開けなくても、
     /// 代わりの `127.0.0.1` に落として起動を続け、理由を残す。落とした先は loopback
-    /// なので最初の管理者の作成が開く。代わりが無ければ `Err(Listen)`（反証の対照）。
+    /// なのでこの PC からの接続（`localDesktop`）が開く。代わりが無ければ `Err(Listen)`（反証の対照）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unbindable_primary_falls_back_to_loopback_and_keeps_running() {
         let dir = TempDir::new();
@@ -2085,7 +2181,7 @@ mod tests {
         let addr = engine.loopback_addr().await.expect("loopback");
         assert!(addr.ip().is_loopback(), "{addr}");
         assert!(engine.listen_error().is_some(), "落とした理由が残らない");
-        assert_eq!(post_setup(addr).await, 200);
+        assert_eq!(post_local_grant(addr).await, 200);
         assert!(!engine.shutdown(Duration::from_secs(10)).await.timed_out);
         drop(engine);
 
@@ -2097,29 +2193,6 @@ mod tests {
             .start()
             .await;
         assert!(matches!(result, Err(EngineStartError::Listen { .. })));
-    }
-
-    /// #598 のレビュー: `with_loopback_local_access` は、常時の listener（の、この PC
-    /// からの要求）だけで最初の管理者の作成を開け、LAN の listener（と後の入れ替えの
-    /// ルーター）は閉じる - アドレスが loopback でも LAN の slot は閉じる。
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn setup_opens_only_on_the_always_on_listener() {
-        let dir = TempDir::new();
-        let engine = EngineRuntime::open(config(dir.path(), EngineListen::Disabled))
-            .await
-            .expect("open")
-            .with_loopback(loopback_any_port())
-            .with_listen(EngineListen::BestEffort(loopback_any_port()))
-            .with_loopback_local_access()
-            .start()
-            .await
-            .expect("start");
-        let lan = engine.server_slot().local_addr().await.expect("lan");
-        let loopback = engine.loopback_addr().await.expect("loopback");
-        assert_eq!(post_setup(lan).await, 403, "LAN の listener で開いている");
-        assert!(!engine.allow_setup, "入れ替えのルーターで開いている");
-        assert_eq!(post_setup(loopback).await, 200);
-        assert!(!engine.shutdown(Duration::from_secs(10)).await.timed_out);
     }
 
     /// #392 B1-5: 常時の loopback は必須。ポートが塞がっていれば LAN が無くても
@@ -2635,7 +2708,7 @@ mod tests {
             .expect("start");
         assert_eq!(
             engine.services().local_grant,
-            LocalGrantStart::Uninitialized
+            LocalGrantStart::NoLogin(crate::users::Role::Admin)
         );
         let lan = engine.server_slot().local_addr().await.expect("lan");
         let loopback = engine.loopback_addr().await.expect("loopback");
@@ -2689,6 +2762,7 @@ mod tests {
         let opened = EngineRuntime::open(config(dir.path(), EngineListen::Disabled))
             .await
             .expect("open");
+        require_login_with_admin(&opened, None).await;
         let settings = opened.settings();
         let saved = settings.server_config().await.unwrap();
         settings
@@ -2706,7 +2780,6 @@ mod tests {
             .expect("start");
         let loopback = engine.loopback_addr().await.expect("loopback");
         let host = loopback.to_string();
-        assert_eq!(post_setup(loopback).await, 200);
         let (status, body) = http(
             loopback,
             "POST",
@@ -2874,7 +2947,7 @@ mod tests {
             .expect("start");
         let loopback = engine.loopback_addr().await.expect("loopback");
         let lan = engine.server_slot().local_addr().await.expect("lan");
-        assert_eq!(post_setup(loopback).await, 200);
+        create_test_admin(&engine).await;
         let (_, body) = http(
             loopback,
             "POST",
@@ -2990,6 +3063,7 @@ mod tests {
         let opened = EngineRuntime::open(config(dir.path(), EngineListen::Disabled))
             .await
             .expect("open");
+        require_login_with_admin(&opened, None).await;
         let settings = opened.settings();
         let saved = settings.server_config().await.unwrap();
         settings
@@ -3014,7 +3088,6 @@ mod tests {
         let loopback = engine.loopback_addr().await.expect("loopback");
         let host = loopback.to_string();
         assert!(engine.server_slot().local_addr().await.is_some());
-        assert_eq!(post_setup(loopback).await, 200);
         let (_, body) = http(
             loopback,
             "POST",
@@ -3106,12 +3179,14 @@ mod tests {
 
     /// #941 の試験の組み立て: 常時の listener（`127.0.0.1:<port>`）と LAN の slot の
     /// listener（`127.0.0.1:<任意>`）があり、保存値は `enabled: true`・`127.0.0.1`・`<port>`。
-    /// 未初期化なので、この PC からの `localDesktop` の grant で admin のトークンを得る。
+    /// 新しい DB はログインなし（既定 admin）で始まるので、この PC からの `localDesktop` の
+    /// grant で admin のトークンを得る。
     async fn engine_for_recheck(dir: &Path) -> (RunningEngine, u16, SocketAddr, String) {
         let port = free_port();
         let opened = EngineRuntime::open(config(dir, EngineListen::Disabled))
             .await
             .expect("open");
+        require_login_with_admin(&opened, Some("admin")).await;
         let settings = opened.settings();
         let saved = settings.server_config().await.unwrap();
         settings
@@ -3329,119 +3404,6 @@ mod tests {
         assert_eq!(result, "failed", "{detail}");
         assert_eq!(detail["saved"], false, "{detail}");
         assert_eq!(detail["restartRequired"], true, "{detail}");
-        assert!(!engine.shutdown(Duration::from_secs(10)).await.timed_out);
-    }
-
-    /// #600 の監査 F1: 未初期化の間に受け取った `localDesktop`（admin）のトークンは、
-    /// setup を送った側が commit の直後に接続を切っても失効する（setup の commit と失効・
-    /// 監査を応答の future から切り離した）。setup が commit したのを DB で見てから FIN を
-    /// 送る（それより前に切ると、hyper は本文を読む前に要求ごと捨て、setup 自体が
-    /// 起きない - 何も変わらないので約束は破れない）。
-    ///
-    /// commit の**後**の await 点で捨てられる組み合わせは時間でしか作れないので、この
-    /// テストは修正を戻しても落ちるとは限らない（反証はコミット本文）。決定的な守りは、
-    /// 本文で判断する純関数の表（`local_grant` の
-    /// `setup_success_is_read_from_the_body_and_fails_closed`）と、DB が読めなくても失効する
-    /// こと（`rest::local_grant_tests` の `setup_revokes_even_if_the_db_cannot_be_read_again`）。
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn setup_revokes_the_bootstrap_grant_even_if_the_client_disconnects() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let dir = TempDir::new();
-        let engine = EngineRuntime::open(config(dir.path(), EngineListen::Disabled))
-            .await
-            .expect("open")
-            .with_loopback(loopback_any_port())
-            .with_loopback_local_access()
-            .start()
-            .await
-            .expect("start");
-        let loopback = engine.loopback_addr().await.expect("loopback");
-        let host = loopback.to_string();
-        let (status, body) = http(
-            loopback,
-            "POST",
-            "/api/auth/grant/localDesktop",
-            &host,
-            None,
-            None,
-        )
-        .await;
-        assert_eq!(status, 200, "{body}");
-        let token = body["token"].as_str().expect("token").to_string();
-        let (_, me) = http(
-            loopback,
-            "GET",
-            "/api/auth/identity",
-            &host,
-            Some(&token),
-            None,
-        )
-        .await;
-        assert_eq!(me["role"], "admin", "{me}");
-
-        // setup を送り、commit したら書き込み側を閉じる（FIN）。応答が返るかどうかは問わない。
-        let request = raw_request(
-            "POST",
-            "/api/auth/setup",
-            &host,
-            None,
-            &serde_json::json!({
-                "username": "testadmin", "password": "admin-pass-1", "displayName": "管理者"
-            }),
-        );
-        let mut stream = tokio::net::TcpStream::connect(loopback)
-            .await
-            .expect("connect");
-        stream.write_all(request.as_bytes()).await.expect("write");
-        let users = engine.services().users.clone();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while !users.is_initialized().await.unwrap() {
-            assert!(
-                Instant::now() < deadline,
-                "setup が 20 秒以内に commit しなかった"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        stream.shutdown().await.expect("shutdown");
-        let mut ignored = Vec::new();
-        let _ = tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut ignored))
-            .await
-            .expect("FIN の後も接続が閉じられない");
-
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let revoked = engine
-                .services()
-                .audit
-                .list(banto_core::ListParams::default())
-                .await
-                .unwrap()
-                .rows
-                .into_iter()
-                .any(|row| row.action == "revoke_grants");
-            if revoked {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "切断した setup の後の失効の監査の行（revoke_grants）が 20 秒以内に出なかった"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(engine.services().users.is_initialized().await.unwrap());
-        let (_, me) = http(
-            loopback,
-            "GET",
-            "/api/auth/identity",
-            &host,
-            Some(&token),
-            None,
-        )
-        .await;
-        assert!(
-            me.is_null(),
-            "未初期化の間の admin のトークンが残っている: {me}"
-        );
         assert!(!engine.shutdown(Duration::from_secs(10)).await.timed_out);
     }
 

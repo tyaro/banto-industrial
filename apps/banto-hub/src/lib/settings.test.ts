@@ -8,10 +8,11 @@ vi.mock('./banto/setup', () => ({
 	getUiSettings: () => ({
 		get: async (key: string) => {
 			if (gate) await gate;
-			return store.get(key) ?? null;
+			return { value: store.get(key) ?? null, revision: '0' };
 		},
 		set: async (key: string, value: string) => {
 			store.set(key, value);
+			return { revision: '1' };
 		}
 	})
 }));

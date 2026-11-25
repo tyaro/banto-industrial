@@ -7,7 +7,7 @@
 //! 外から使われるパス（`crate::rest::X`）は親の re-export で保つ。
 
 use super::{
-    actor_identity, broadcast, json, ApiError, Arc, AuditLogService, AuthState, BantoError,
+    actor_for_token, broadcast, json, ApiError, Arc, AuditLogService, AuthState, BantoError,
     CollectionController, CollectionGroupService, CollectionState, CollectionStatus,
     CollectionStatusResponse, CollectorManager, CommissioningState, HeaderMap, IntoResponse, Json,
     PendingChange, PendingChangesService, PlcConnectionResponse, PlcConnectionService, Response,
@@ -234,7 +234,7 @@ pub(super) async fn queue_pending_registry_change(
     payload: serde_json::Value,
     status: CollectionStatus,
 ) -> RegistryMutationResult<Response> {
-    let identity = actor_identity(headers, &state.auth);
+    let identity = actor_for_token(headers, &state.auth);
     let base_fingerprint = compute_pending_base_fingerprint(
         &state.plc_connections,
         &state.collection_groups,
@@ -249,7 +249,7 @@ pub(super) async fn queue_pending_registry_change(
             &payload,
             state.manager.configured_revision() as i64,
             base_fingerprint.as_deref(),
-            identity.as_ref().map(|v| v.id.as_str()),
+            identity.as_ref().map(|v| v.username.as_str()),
             identity.as_ref().map(|v| v.role.as_str()),
         )
         .await?;

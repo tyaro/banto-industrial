@@ -8,7 +8,6 @@
 	import { isDemoTargetPath, resolveAppPath } from '#lib/navigation.js';
 	import { page } from '$app/state';
 	import Header from '#lib/components/Header.svelte';
-	import SetupBanner from '#lib/components/SetupBanner.svelte';
 	import Sidebar from '#lib/components/Sidebar.svelte';
 	import ShellLauncher from '#lib/components/ShellLauncher.svelte';
 	import { settings } from '#lib/settings.svelte.js';
@@ -199,7 +198,6 @@
 	{/if}
 	<div class="main">
 		<Header />
-		<SetupBanner />
 		<main>
 			{#if data.sessionGeneration === sessionController.snapshot.generation}
 				{#key data.sessionGeneration}

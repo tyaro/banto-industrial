@@ -8,8 +8,7 @@
  * It has to be a separate server: `banto-serve` reads `BANTO_VIEWER_PUBLIC`
  * only at startup (it seeds the settings-DB flag, and there is no REST route
  * to toggle it), and switching it on for the smoke server (`playwright.config.ts`)
- * would change smoke scenario 1's "an unauthenticated visit shows the setup
- * screen" premise. A separate config file (not a second project of the smoke
+ * would change what the smoke scenarios see of an unauthenticated visit. A separate config file (not a second project of the smoke
  * config) keeps `pnpm e2e` from starting an idle second server and keeps the
  * two suites' temp dirs and test-results apart - the same shape as the
  * banto-hub configs.
@@ -53,6 +52,15 @@ const dbPath = path.join(
 	'chronogazer-e2e-public-viewer.sqlite3'
 );
 
+// banto v8: the admin scenario 4 signs in as is made by `banto-serve create-admin` before the
+// server starts (no first-run setup screen any more); public viewing is unaffected by it.
+const serveWithFirstAdmin = path.join(dirname, 'serve-with-first-admin.mjs');
+const ADMIN = {
+	username: 'pv-admin',
+	password: 'E2ePvAdminPass1',
+	displayName: 'E2E閲覧公開管理者'
+};
+
 const bantoServeBin = path.join(
 	repoRoot,
 	'target',
@@ -88,7 +96,7 @@ export default defineConfig({
 	},
 	projects: [{ name: 'public-viewer', use: { ...devices['Desktop Chrome'] } }],
 	webServer: {
-		command: bantoServeBin,
+		command: `node "${serveWithFirstAdmin}" "${bantoServeBin}"`,
 		url: BASE_URL,
 		// Never reuse a leftover server: it would carry over an already-set-up
 		// database, breaking the "zero users" premise (scenarios 1-3 run before
@@ -100,9 +108,11 @@ export default defineConfig({
 			PORT: String(PORT),
 			BANTO_BIND: '127.0.0.1',
 			BANTO_DB: dbPath,
-			// Scenario 4 creates the first admin from the login screen to prove
-			// that signing in leaves the public-viewer session.
-			BANTO_ALLOW_SETUP: '1',
+			// Scenario 4 signs in as this admin from the login screen to prove that
+			// signing in leaves the public-viewer session.
+			BANTO_E2E_ADMIN_USERNAME: ADMIN.username,
+			BANTO_E2E_ADMIN_PASSWORD: ADMIN.password,
+			BANTO_E2E_ADMIN_DISPLAY_NAME: ADMIN.displayName,
 			BANTO_VIEWER_PUBLIC: '1'
 		}
 	}

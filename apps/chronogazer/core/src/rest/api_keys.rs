@@ -22,13 +22,13 @@
 //! （HUB の `clear-trip`）は無い。
 
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use banto_core::{BantoError, ErrorBody, FieldError};
-use banto_server::routes::{record_write, require_role_at_least, RoleGuard};
+use banto_server::routes::{record_write, require_role_at_least, AuditActor, RoleGuard};
 use banto_server::{require_auth, ApiError, AuthState};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -44,7 +44,6 @@ const AUDIT_RESOURCE: &str = "api_keys";
 #[derive(Clone)]
 struct ApiKeysAdminState {
     api_keys: ApiKeysService,
-    auth: AuthState,
     audit: AuditLogService,
 }
 
@@ -137,7 +136,7 @@ async fn api_keys_list(
 
 async fn api_keys_create(
     State(state): State<ApiKeysAdminState>,
-    headers: HeaderMap,
+    axum::Extension(actor): axum::Extension<AuditActor>,
     Json(body): Json<CreateApiKeyRequest>,
 ) -> Result<Response, RouteError> {
     validate_expires_at(body.expires_at, now_ms())?;
@@ -148,8 +147,7 @@ async fn api_keys_create(
             .await?;
         record_write(
             &state.audit,
-            &state.auth,
-            &headers,
+            &actor,
             "create",
             AUDIT_RESOURCE,
             Some(&issued.id.to_string()),
@@ -173,15 +171,14 @@ async fn api_keys_create(
 
 async fn api_keys_revoke(
     State(state): State<ApiKeysAdminState>,
-    headers: HeaderMap,
+    axum::Extension(actor): axum::Extension<AuditActor>,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiKeySummary>, RouteError> {
     let summary = run_detached("chronogazer: API キーの失効", async move {
         let summary = state.api_keys.revoke(id).await?;
         record_write(
             &state.audit,
-            &state.auth,
-            &headers,
+            &actor,
             "revoke",
             AUDIT_RESOURCE,
             Some(&id.to_string()),
@@ -196,7 +193,7 @@ async fn api_keys_revoke(
 
 async fn api_keys_delete(
     State(state): State<ApiKeysAdminState>,
-    headers: HeaderMap,
+    axum::Extension(actor): axum::Extension<AuditActor>,
     Path(id): Path<i64>,
 ) -> Result<Response, RouteError> {
     let outcome = run_detached("chronogazer: API キーの削除", async move {
@@ -204,8 +201,7 @@ async fn api_keys_delete(
         if let ApiKeyDeleteOutcome::Deleted(summary) = &outcome {
             record_write(
                 &state.audit,
-                &state.auth,
-                &headers,
+                &actor,
                 "delete",
                 AUDIT_RESOURCE,
                 Some(&id.to_string()),
@@ -236,7 +232,6 @@ pub(super) fn api_keys_router(
 ) -> Router {
     let state = ApiKeysAdminState {
         api_keys,
-        auth: auth.clone(),
         audit: audit.clone(),
     };
     Router::new()

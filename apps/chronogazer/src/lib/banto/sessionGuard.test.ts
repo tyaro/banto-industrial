@@ -131,7 +131,6 @@ function httpProviderWith(identity: () => Promise<Response>, options = { viewerP
 				: jsonResponse(403, { kind: 'forbidden', message: 'forbidden' });
 		}
 		return jsonResponse(200, {
-			initialized: true,
 			grants: { publicViewer: options.viewerPublic }
 		});
 	}) as unknown as typeof fetch;
@@ -225,11 +224,13 @@ describe('(app) ガード: 確定したときだけ判断する', () => {
 
 	it('確定した identity はそのまま進み、確定した世代を返す（ストアは snapshot から読む）', async () => {
 		session.setItem(TOKEN_KEY, 'live-token');
-		httpProviderWith(async () => jsonResponse(200, { id: 'alice', name: 'Alice', role: 'admin' }));
+		httpProviderWith(async () =>
+			jsonResponse(200, { id: 'alice', name: 'Alice', role: 'admin', accountId: 'alice' })
+		);
 
 		const result = await runGuard();
 		const snapshot = getSessionController().snapshot;
-		expect(snapshot).toMatchObject({ status: 'active', owner: 'account:alice' });
+		expect(snapshot).toMatchObject({ status: 'active', owner: 'acct:alice' });
 		expect(result).toEqual({ kind: 'data', sessionGeneration: snapshot.generation });
 		expect(session.getItem(TOKEN_KEY)).toBe('live-token');
 	});
@@ -245,7 +246,7 @@ describe('(app) ガード: 確定したときだけ判断する', () => {
 				status: 'active',
 				checked: rev(),
 				current: rev(),
-				identity: { id: 'alice', name: 'Alice', role: 'admin' }
+				identity: { id: 'alice', name: 'Alice', role: 'admin', accountId: 'alice' }
 			}),
 			credentialRevision: rev,
 			onCredentialChanged(listener) {
@@ -296,7 +297,8 @@ describe('(app) ガード: 閲覧公開（publicViewer grant、I2b）', () => {
 	it('ログイン済みのアカウントは閲覧公開 ON でも grant を求めず、どの画面も開く', async () => {
 		session.setItem(TOKEN_KEY, 'live-token');
 		const { paths } = httpProviderWith(
-			async () => jsonResponse(200, { id: 'alice', name: 'Alice', role: 'viewer' }),
+			async () =>
+				jsonResponse(200, { id: 'alice', name: 'Alice', role: 'viewer', accountId: 'alice' }),
 			{ viewerPublic: true }
 		);
 
@@ -308,7 +310,7 @@ describe('(app) ガード: 閲覧公開（publicViewer grant、I2b）', () => {
 describe('(app) ガード: Tauri の auth_resolve が DB エラーで reject したとき', () => {
 	/** A standard provider (as the Tauri one) whose `resolve()` is `answer`. */
 	function tauriLike(answer: AuthProvider['resolve']) {
-		const status = vi.fn(async () => ({ initialized: true, grants: {} }));
+		const status = vi.fn(async () => ({ grants: {} }));
 		const enterGrant = vi.fn(async () => ({ success: true }));
 		const revision = '1.0' as CredentialRevision;
 		useProvider({

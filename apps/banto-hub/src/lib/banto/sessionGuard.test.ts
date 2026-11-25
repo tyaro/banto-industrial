@@ -202,8 +202,7 @@ describe('ガード: 試運転モード（grantFallback の commissioning）', (
 		await runGuard();
 
 		hub.routes.identity = async () => jsonResponse(401, { kind: 'unauthorized' });
-		hub.routes.authStatus = async () =>
-			jsonResponse(200, { initialized: true, grants: { commissioning: false } });
+		hub.routes.authStatus = async () => jsonResponse(200, { grants: { commissioning: false } });
 		hub.routes.grant = async () => jsonResponse(403, { kind: 'forbidden' });
 
 		expectLogin(await runGuard());
@@ -212,8 +211,7 @@ describe('ガード: 試運転モード（grantFallback の commissioning）', (
 	});
 
 	it('grants.commissioning が false（ロックダウン済み・loopback でない）なら grant を試みず /login', async () => {
-		hub.routes.authStatus = async () =>
-			jsonResponse(200, { initialized: true, grants: { commissioning: false } });
+		hub.routes.authStatus = async () => jsonResponse(200, { grants: { commissioning: false } });
 		expectLogin(await runGuard());
 		expect(hub.paths()).toEqual(['/api/auth/status']);
 		expect(hub.session.getItem(TOKEN_KEY)).toBeNull();
@@ -285,8 +283,8 @@ describe('Remember me: 別タブのユーザーの切り替え（完了条件 8�
 		expect(second.sessionGeneration).not.toBe(first.sessionGeneration);
 		// 配線②（ownerChange.ts、OWNER_CHANGE_POLICY = 'rebuild'）が通知する変更。
 		expect(controller.snapshot.pendingOwnerChange).toEqual({
-			from: 'account:alice',
-			to: 'account:bob'
+			from: 'acct:alice',
+			to: 'acct:bob'
 		});
 	});
 

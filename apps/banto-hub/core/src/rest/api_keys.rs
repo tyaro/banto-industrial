@@ -11,10 +11,10 @@
 
 use super::{
     get, json, middleware, post, record_write, require_session, require_session_role,
-    shutting_down_response, ApiError, ApiKeysService, Arc, AuditLogService, AuthGate, AuthState,
-    BantoError, CollectorManager, Deserialize, ErrorBody, FieldError, HeaderMap, IntoResponse,
-    IssuedApiKey, Json, OperationKind, Path, Response, Role, Router, Serialize, SessionRoleGuard,
-    State, StatusCode, ToSchema,
+    shutting_down_response, ApiError, ApiKeysService, Arc, AuditActor, AuditLogService, AuthGate,
+    AuthState, BantoError, CollectorManager, Deserialize, ErrorBody, Extension, FieldError,
+    IntoResponse, IssuedApiKey, Json, OperationKind, Path, Response, Role, Router, Serialize,
+    SessionRoleGuard, State, StatusCode, ToSchema,
 };
 use crate::api_keys::ApiKeyDeleteOutcome;
 use axum::routing::delete;
@@ -28,7 +28,6 @@ use axum::routing::delete;
 #[derive(Clone)]
 struct ApiKeysAdminState {
     api_keys: ApiKeysService,
-    auth: AuthState,
     audit: AuditLogService,
     /// H10 ①: `api_keys_create` の「有効期限は未来限定」検証で使う時計
     /// （`manager.clock()`）。他の `*AdminState`（`WriteControlAdminState`
@@ -115,7 +114,7 @@ impl From<IssuedApiKey> for IssuedApiKeyResponse {
 /// 4xx で弾く（新しい HTTP パスは作らない）。
 async fn api_keys_create(
     State(state): State<ApiKeysAdminState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
     Json(body): Json<CreateApiKeyRequest>,
 ) -> Result<Response, ApiError> {
     if let Some(expires_at) = body.expires_at {
@@ -140,8 +139,7 @@ async fn api_keys_create(
             .await?;
         record_write(
             &state.audit,
-            &state.auth,
-            &headers,
+            &actor,
             "create",
             "api_keys",
             Some(&issued.id.to_string()),
@@ -178,7 +176,7 @@ async fn api_keys_list(
 /// [`api_keys_delete`]（#713）。
 async fn api_keys_revoke(
     State(state): State<ApiKeysAdminState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
     // クライアントの切断で、変更だけが確定して監査が欠けることがないよう切り離す（#940 のレビュー）。
@@ -188,8 +186,7 @@ async fn api_keys_revoke(
         let summary = state.api_keys.revoke(id).await?;
         record_write(
             &state.audit,
-            &state.auth,
-            &headers,
+            &actor,
             "revoke",
             "api_keys",
             Some(&id.to_string()),
@@ -214,7 +211,7 @@ async fn api_keys_revoke(
 /// には名前とプレフィックスを `delete` として残す。成功は `204`。
 async fn api_keys_delete(
     State(state): State<ApiKeysAdminState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
     // クライアントの切断で、変更だけが確定して監査が欠けることがないよう切り離す（#940 のレビュー）。
@@ -225,8 +222,7 @@ async fn api_keys_delete(
         if let ApiKeyDeleteOutcome::Deleted(summary) = &outcome {
             record_write(
                 &state.audit,
-                &state.auth,
-                &headers,
+                &actor,
                 "delete",
                 "api_keys",
                 Some(&id.to_string()),
@@ -259,7 +255,7 @@ async fn api_keys_delete(
 /// 参照。
 async fn api_keys_clear_trip(
     State(state): State<ApiKeysAdminState>,
-    headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
     // クライアントの切断で、変更だけが確定して監査が欠けることがないよう切り離す（#940 のレビュー）。
@@ -269,8 +265,7 @@ async fn api_keys_clear_trip(
         let summary = state.api_keys.clear_trip(id).await?;
         record_write(
             &state.audit,
-            &state.auth,
-            &headers,
+            &actor,
             "clear_trip",
             "api_keys",
             Some(&id.to_string()),
@@ -304,7 +299,6 @@ pub(super) fn api_keys_router(
 ) -> Router {
     let state = ApiKeysAdminState {
         api_keys,
-        auth: auth.clone(),
         audit: audit.clone(),
         manager,
     };

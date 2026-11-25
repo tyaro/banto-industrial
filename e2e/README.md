@@ -31,11 +31,14 @@ banto-hub は 2026-10-09 のオーナー決定で 8799 から 8805 に移した�
 別の作業で使うため。banto 本体の E2E は今も 8799 を使う）。
 
 `pnpm e2e:banto-hub` は **2台**の banto-hub を起動する（#341、2026-09-14）。
-8805 は従来どおり試運転モード（未ロックダウン）のままで、スイートの大半が
-これを使う。8802 は `banto-hub-status-pending-apply-cancel.spec.ts` 専用で、
-その spec の `beforeAll` が初回セットアップ直後にロックダウンする —
-「収集中の構成 CRUD は未適用キューへ積まれる」契約が #341 以降
-**ロックダウン済みのときだけ**成り立つため（試運転中は即時・無停止反映）。
+8805 はスイートの大半が使う。8802 はロックダウン済みでしか成り立たない spec 専用
+（`banto-hub-status-pending-apply-cancel.spec.ts` など。「収集中の構成 CRUD は未適用キューへ
+積まれる」契約は #341 以降ロックダウン済みのときだけ成り立つ）。
+**banto v8 追従**: 初回セットアップは無くなり、どちらの Hub も起動の前に
+`banto-hub create-admin`（`e2e/serve-with-first-admin.mjs`）で管理者を作る。create-admin は
+ロックダウンも同時に行うので、**どちらも最初からロックダウン済み**（試運転モードの Hub は
+E2E に無い。試運転の即時反映・試運転の grant の経路は E2E では通らない）。ChronoGazer の
+`pnpm e2e`・`pnpm e2e:public-viewer` も同じ形で、`banto-serve create-admin` が管理者を作る。
 プロジェクト名は `chromium`（8805）と `chromium-locked-down`（8802）で、
 片方だけ走らせたいときは `pnpm e2e:banto-hub --project=chromium-locked-down`
 のように指定する。2台目は `BANTO_HUB_PROFILE`/`BANTO_HUB_ROOT` も分けてある

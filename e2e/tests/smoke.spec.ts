@@ -4,8 +4,8 @@
  *
  * Runs against a real `banto-serve --features embed-ui` (chronogazer-core's
  * dev binary, LAN/REST mode - see playwright.config.ts's doc comment) with a
- * brand-new SQLite database, so scenario 1 legitimately hits the first-run
- * setup screen. Scenarios share ONE browser page/session and run in file
+ * brand-new SQLite database whose administrator `banto-serve create-admin` made
+ * before the server started (scenario 1 logs in as it). Scenarios share ONE browser page/session and run in file
  * order (`describe.serial` + `workers: 1`, config-wide), the same pattern as
  * banto's own e2e/tests/smoke.spec.ts.
  *
@@ -20,10 +20,10 @@
  * of those phases replaces a placeholder with real UI.
  */
 import { expect, test, type Page } from '@playwright/test';
+import { E2E_ADMIN } from '../first-admin';
 
-const ADMIN_USERNAME = 'e2e-admin';
-const ADMIN_PASSWORD = 'E2eAdminPass1';
-const ADMIN_DISPLAY_NAME = 'E2E管理者';
+const ADMIN_USERNAME = E2E_ADMIN.username;
+const ADMIN_PASSWORD = E2E_ADMIN.password;
 
 test.describe.serial('ChronoGazer R1-A smoke', () => {
 	let page: Page;
@@ -36,21 +36,22 @@ test.describe.serial('ChronoGazer R1-A smoke', () => {
 		await page.close();
 	});
 
-	test('1. first-run setup creates the admin account and lands on the monitor screen', async () => {
+	test('1. the administrator made by create-admin logs in and lands on the monitor screen', async () => {
 		await page.goto('/login');
 
-		// Fresh DB -> AuthProvider.status() reports uninitialized -> the login
-		// page renders the setup form, not the login form (login/+page.svelte).
+		// banto v8 (ADR-0034 §5/§7): no first-run setup screen. The admin was made by
+		// `banto-serve create-admin` before the server started (playwright.config.ts), so
+		// the page is the login form from the first visit: no display name, no
+		// password confirmation.
 		await expect(page.getByRole('heading', { name: '🏮 ChronoGazer' })).toBeVisible();
-		await expect(page.getByLabel('表示名')).toBeVisible();
+		await expect(page.getByLabel('表示名')).toHaveCount(0);
+		await expect(page.getByLabel('パスワード（確認）')).toHaveCount(0);
 
-		await page.getByLabel('表示名').fill(ADMIN_DISPLAY_NAME);
 		await page.getByLabel('ユーザー名').fill(ADMIN_USERNAME);
-		await page.getByLabel('パスワード（8文字以上）').fill(ADMIN_PASSWORD);
-		await page.getByLabel('パスワード（確認）').fill(ADMIN_PASSWORD);
-		await page.getByRole('button', { name: 'アカウントを作成' }).click();
+		await page.getByLabel('パスワード').fill(ADMIN_PASSWORD);
+		await page.getByRole('button', { name: 'ログイン', exact: true }).click();
 
-		// login/+page.svelte's submitSetup() redirects to /monitor (not
+		// login/+page.svelte redirects to /monitor (not
 		// /dashboard - this app has no dashboard route).
 		await expect(page).toHaveURL(/\/monitor$/);
 		// `level: 2` (the page body's own <h2>): Header.svelte also renders the

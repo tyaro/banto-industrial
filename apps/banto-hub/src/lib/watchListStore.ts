@@ -409,7 +409,7 @@ export function createWatchListStore(deps: WatchListStoreDeps = {}): WatchListSt
 		const pending = ops.slice(0, n);
 		let raw: string | null;
 		try {
-			raw = await provider.get(keys.setting);
+			raw = (await provider.get(keys.setting)).value;
 		} catch (error) {
 			return fail(error, 'read');
 		}

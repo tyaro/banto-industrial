@@ -24,13 +24,13 @@ use super::{
     broadcast, commit_catalog_and_notify, get, json, middleware, post, preflight_transaction,
     queue_pending_registry_change, record_write, registry_before, registry_change_should_queue,
     remove_tag_from_all_sink_groups, require_editor, require_session, storage_api_error,
-    tags_expression_check, tags_expression_functions, ApiError, Arc, AuditLogService, AuthGate,
-    AuthState, BantoError, BatchTagDeleteOutcome, BatchTagOutcome, BatchTagUpdateOutcome,
+    tags_expression_check, tags_expression_functions, ApiError, Arc, AuditActor, AuditLogService,
+    AuthGate, AuthState, BantoError, BatchTagDeleteOutcome, BatchTagOutcome, BatchTagUpdateOutcome,
     CollectionController, CollectionGroupService, CollectorManager, CommissioningState,
-    Deserialize, FieldError, GroupTagCount, HeaderMap, IntoResponse, Json, ListParams, ListResult,
-    OperationKind, Path, PendingChangesService, PlcConnectionService, RegistryMutationError,
-    RegistryMutationResult, Response, Router, Serialize, ServerEvent, State, StatusCode, Tag,
-    TagInput, TagRegistryState, TagService,
+    Deserialize, Extension, FieldError, GroupTagCount, HeaderMap, IntoResponse, Json, ListParams,
+    ListResult, OperationKind, Path, PendingChangesService, PlcConnectionService,
+    RegistryMutationError, RegistryMutationResult, Response, Router, Serialize, ServerEvent, State,
+    StatusCode, Tag, TagInput, TagRegistryState, TagService,
 };
 
 fn default_tag_decimals() -> i64 {
@@ -472,6 +472,7 @@ async fn tags_get(
 
 async fn tags_create(
     State(state): State<TagRegistryState>,
+    Extension(actor): Extension<AuditActor>,
     headers: HeaderMap,
     Json(input): Json<TagPayload>,
 ) -> RegistryMutationResult<Response> {
@@ -531,8 +532,7 @@ async fn tags_create(
     tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
-        &state.auth,
-        &headers,
+        &actor,
         "create",
         "tags",
         Some(&created.id.to_string()),
@@ -575,6 +575,7 @@ async fn tx_test_hook(tx: &mut sqlx::SqliteConnection) {
 
 async fn tags_update(
     State(state): State<TagRegistryState>,
+    Extension(actor): Extension<AuditActor>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     Json(input): Json<TagPayload>,
@@ -642,8 +643,7 @@ async fn tags_update(
     tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
-        &state.auth,
-        &headers,
+        &actor,
         "update",
         "tags",
         Some(&id.to_string()),
@@ -658,6 +658,7 @@ async fn tags_update(
 
 async fn tags_delete(
     State(state): State<TagRegistryState>,
+    Extension(actor): Extension<AuditActor>,
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> RegistryMutationResult<Response> {
@@ -720,8 +721,7 @@ async fn tags_delete(
     tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
-        &state.auth,
-        &headers,
+        &actor,
         "delete",
         "tags",
         Some(&id.to_string()),
@@ -818,6 +818,7 @@ struct BatchTagsResponse {
 /// 同じ管理系ルーターの層で一括適用される(`tag_registry_router` 参照)。
 async fn tags_batch(
     State(state): State<TagRegistryState>,
+    Extension(actor): Extension<AuditActor>,
     headers: HeaderMap,
     Json(body): Json<BatchTagsRequest>,
 ) -> RegistryMutationResult<Response> {
@@ -934,8 +935,7 @@ async fn tags_batch(
                 tx.commit().await.map_err(storage_api_error)?;
                 record_write(
                     &state.audit,
-                    &state.auth,
-                    &headers,
+                    &actor,
                     "batch_create",
                     "tags",
                     Some("-"),
@@ -1041,6 +1041,7 @@ struct BatchTagsUpdateResponse {
 /// 「対象1行だけ 409 で弾く」より優先するため（design: T18-3b 一括操作）。
 async fn tags_batch_update(
     State(state): State<TagRegistryState>,
+    Extension(actor): Extension<AuditActor>,
     headers: HeaderMap,
     Json(body): Json<BatchTagsUpdateRequest>,
 ) -> RegistryMutationResult<Response> {
@@ -1157,8 +1158,7 @@ async fn tags_batch_update(
                 tx.commit().await.map_err(storage_api_error)?;
                 record_write(
                     &state.audit,
-                    &state.auth,
-                    &headers,
+                    &actor,
                     "batch_update",
                     "tags",
                     Some("-"),
@@ -1243,6 +1243,7 @@ struct BatchTagsDeleteResponse {
 /// （収集稼働中は他の書き込みと同じく pending キュー）の一段構成にした。
 async fn tags_batch_delete(
     State(state): State<TagRegistryState>,
+    Extension(actor): Extension<AuditActor>,
     headers: HeaderMap,
     Json(body): Json<BatchTagsDeleteRequest>,
 ) -> RegistryMutationResult<Response> {
@@ -1332,8 +1333,7 @@ async fn tags_batch_delete(
             // 考え方 - 監査ログから「何件消えたか」が読めるようにする）。
             record_write(
                 &state.audit,
-                &state.auth,
-                &headers,
+                &actor,
                 "batch_delete",
                 "tags",
                 Some("-"),

@@ -28,15 +28,16 @@
 //!    peer 不明として扱うので、**status と発行が食い違わない**まま両方が閉じる
 //!    （`publicViewer` は peer を見ないので影響しない）。banto 本体の変更（上流の PR）は
 //!    要らない。
-//! 4. **権限**: 起動時に未初期化（アカウント 0 件）なら **admin**。条件は「いま未初期化、
-//!    または（いま初期化済み かつ いまの設定が `admin`）」をリクエストのたびに読むので、
-//!    初期化された時点で、設定が `admin` でなければ閉じる（#392 B2-2、2026-10-14 オーナー
-//!    決定: 初回セットアップで「この PC からはログインなしで使う」を選ぶと、setup の後処理が
-//!    設定を `admin` にし、再起動なしで続けて入れる。下の「初回セットアップでの選択」）。
-//!    初期化済みで起動したら設定 `auth.local_grant`（`off`/`viewer`/`editor`/`admin`、
-//!    **既定 off**、決定 8）の値。条件は「いま初期化済み かつ いまの設定が起動時の
-//!    値と同じ」をリクエストのたびに読む。
-//! 5. **予約名のアカウントが無い**（初期化後だけ。#600 の Copilot レビュー）: 合成の
+//! 4. **権限**（banto v8、2026-11-24 オーナー決定 = docs/banto-v8-upgrade-plan.md §2 の 3）:
+//!    「未初期化（アカウント 0 件）」は無くなった（新しい DB はログインなしで始まる）。
+//!    起動時に**ログインなし**（`auth.disabled = true`）なら、そのモードのロール
+//!    （`auth.disabled_role`、既定 admin。デスクトップのログインなし = 組み込みの `admin` と
+//!    同じ扱い）。条件は「いまもログインなしで同じロール」、またはログイン必須へ切り替えた
+//!    後は「いまの設定 `auth.local_grant` が起動時のロールと同じ」をリクエストのたびに読む。
+//!    起動時に**ログイン必須**なら設定 `auth.local_grant`（`off`/`viewer`/`editor`/`admin`、
+//!    **既定 off**、決定 8）の値。条件は「いまもログイン必須 かつ いまの設定が起動時の値と
+//!    同じ」。peer と Host の loopback の条件（1.〜3.）は変えない（LAN 側へ権限を広げない）。
+//! 5. **予約名のアカウントが無い**（#600 の Copilot レビュー。ログインなしの間も見る）: 合成の
 //!    identity と同じ名前（[`RESERVED_USERNAMES`]）のアカウントがあると、監査で発行した
 //!    セッションの操作と区別できないので、条件を偽にする（status も `false`）。発行の
 //!    要求には、別の名前のアカウントに移るよう伝える `409` を返す（[`has_reserved_accounts`]）。
@@ -53,78 +54,22 @@
 //!   順序: 閉じた条件を保存してから失効）。
 //! - **開く方向（新しい role で発行する）は次の起動から**。応答の
 //!   `localGrantRestartRequired` で知らせる。
-//! - 未初期化で起動した後に初期化された（最初の管理者を作った）ときは、設定が `admin`
-//!   ならそのまま入れる（起動時の role が admin なので、開く方向でも再起動は要らない。
-//!   #392 B2-2）。`viewer`・`editor` で入れるのは次の起動から（それまでは閉じる。
-//!   既定 off なら変わらない）。
+//! - ログインなしで起動した後にログイン必須へ切り替えたときは、設定が起動時のロールと
+//!   同じならそのまま入れる（開く方向でも再起動は要らない）。ほかのロールで入れるのは
+//!   次の起動から（それまでは閉じる。既定 off なら変わらない）。
 //!
-//! # 未初期化の間と最初の管理者の作成（`POST /api/auth/setup`）
+//! # 初回セットアップは無い（banto v8、ADR-0034 §5）
 //!
-//! - setup は置き換えずに**併存**させ、grant と同じく常時の listener の、この PC からの
-//!   要求（peer と Host の両方が loopback）だけで開く（`0.0.0.0` にまとめた 1 本でも、
-//!   LAN からの要求は閉じる。2026-10-14 オーナー決定）。grant の admin は「最初のアカウントを作るまでの間、この PC から
-//!   設定を始められる」ためのもので、最初のアカウントは setup（必ず admin）で作る。
-//! - setup にも同じ **Host の確認**をかける（[`local_access_middleware`]。B1-5 の既知の
-//!   制限「LAN に出していない間は同じ PC の任意のプロセスが最初の管理者を作れる」のうち、
-//!   ブラウザーで開いた外のページ（DNS rebinding）から作られる経路を塞ぐ。同じ PC の
-//!   プロセスが作れるのはデスクトップの初回セットアップと同じ範囲で、grant の未初期化の
-//!   admin と同じ性質 - 受け入れる）。
-//! - 未初期化の間に grant の admin で `POST /api/users` を呼ぶと断る（`400`）。最初の
-//!   アカウントを editor・viewer で作ると、初期化された時点で grant が閉じ、admin が
-//!   誰もいない状態に閉じ込められるため。
-//! - setup が成功して初期化されたら、未初期化の間に発行した admin のトークンを失効させる
-//!   （「未初期化の間だけ admin」。条件はアカウントの行で閉じているので、順序は ADR-0017
-//!   どおり）。成否は応答の本文の `success` で決め（上流は失敗でも `200` を返す）、DB は
-//!   読み直さない。読めない本文は失効へ倒す（#600 の監査 F1、[`setup_may_have_initialized`]）。
-//!
-//! # 初回セットアップでの選択（#392 B2-2、2026-10-14 オーナー決定）
-//!
-//! 設定 `auth.local_grant` の既定は `off` のまま（決定 8）だが、初回セットアップの画面は
-//! 「この PC からはログインなしで使う（管理者）」を**既定でチェックした**選択肢として出す
-//! （サービスの host で、未初期化の status が `grants.localDesktop: true` のときだけ）。
-//! 選んだら setup の本文に `"localGrant": "admin"` が載る（上流の `SetupRequest` は
-//! 知らない欄を読み飛ばす - `deny_unknown_fields` が無い）。
-//!
-//! - 本文の読み方（[`setup_local_grant_opt_in`]）: 欄が無い・`null` は選んでいない。
-//!   `"admin"` だけが選んだ印。それ以外の値（`viewer`・`off`・数値など）は setup を
-//!   走らせずに `400`（アカウントを作る前に断る。開けられるのは起動時の role の admin
-//!   だけで、別の role は条件に合わず黙って閉じたままになるため）。選んでいても、この
-//!   ルーターが未初期化の admin を発行しうる形（`chronogazer-server` の常時の listener を
-//!   未初期化で起動）でなければ `400`。
-//! - setup が**確かに成功した**（2xx で本文が `success: true`。失効の判断の「できたかも
-//!   しれない」とは別で、読めない本文では書かない - [`setup_succeeded`]）ときだけ、失効の
-//!   **後**に `auth.local_grant = admin` を `PUT /api/settings/auth` と同じ lock の下で
-//!   保存し、`settings_change`（`origin: rest`、`detail.via: "setup"`）を残す。操作者は
-//!   setup の応答のトークンで作られたアカウント（読めなければ空）。これも切り離した
-//!   タスクの中で応答の前に行うので、画面は応答を受けたらすぐ grant に入り直せる。失効を
-//!   先にするので、未初期化の間に発行したトークンは今までどおり必ず失効し、画面は
-//!   入り直す。
-//! - **選択は常に決定的**（#392 B2-2 の監査）: 選ばなかった作成（確かに成功して選んで
-//!   いない、または読めない本文で fail closed）の後は、設定が `off` 以外なら `off` を同じ
-//!   lock の下で保存し、`settings_change`（`localGrant: "off"`・`via: "setup"`、同じ操作者の
-//!   扱い）を残す（既に `off` なら書かず監査もしない）。未初期化の間に grant の admin から
-//!   `PUT /api/settings/auth` で先に保存した値で、チェックを外した作成の後も grant が
-//!   開いたままになるのを防ぐ。確かな失敗（`success: false`）では何もしない（[`setup_choice`]）。
-//! - 保存に失敗しても setup は成功のまま（アカウントはできている）。理由をログに出し、
-//!   `settings_change` を `result: "failed"` で残す。`admin` の保存の失敗では grant は
-//!   閉じたまま（fail closed）で、画面はログイン画面へ戻る。`off` の保存の失敗では
-//!   先に保存された値で開いたままになりうるので、エラーとしてログに明記する。
-//! - **保存と 2 回目の失効は同じ lock の下**（#392 B2-2 のレビュー）: 最初の失効から選択の
-//!   保存までの間に、先に保存されていた値で開いた条件のまま新しいトークンが発行されうる
-//!   （grant のセッションは条件を読み直さない）。[`save_setup_choice`] は lock を握ったまま
-//!   保存し（既に `off` なら書かない）、同期でもう一度失効させてから lock を外す（消えた数は
-//!   最初の失効と同じ形の `revoke_grants` に残す）。最初の失効はそのまま残す（保存が
-//!   失敗しても未初期化の間のトークンは必ず消える）。
-//! - **設定の REST は lock の下で認可を確かめ直す**: `PUT /api/settings/auth`・
-//!   `PUT /api/settings/server` は認可を lock の手前で済ませるので、lock を待つ間に失効した
-//!   トークン（setup の後の失効など）で、setup が保存した `off` を書き戻せた。lock を取った
-//!   後に要求のトークンをもう一度 `authenticate` し、無効なら何もせず `401`
-//!   （`crate::server_admin::recheck_token`。監査は認証の層の `401` と同じく残さない）。
+//! `POST /api/auth/setup` と、それに掛けていた Host の確認・未初期化の間の admin の
+//! トークンの失効・初回セットアップでの `localGrant` の選択・「未初期化の間に grant から
+//! 最初のアカウントを作らせない」断りは、上流が初回セットアップを無くしたので消した。
+//! アカウントはログインなしの間にユーザー管理で作り、ログイン必須への切り替えは
+//! banto の `SettingsService::set_auth_config`（管理者のアカウントが要る）が守る。
 //!
 //! # 後処理は応答から切り離す（#600 の監査 F1・F2・F4）
 //!
 //! hyper 1.x は応答を待つ間に相手の FIN を読むと service の future を捨てる。発行とその
-//! 監査、setup とその後の失効、設定の REST の適用（`crate::server_admin`）は
+//! 監査、設定の REST の適用（`crate::server_admin`）は
 //! [`run_detached`] で別のタスクにして、接続を切られても最後まで完結させる。
 //!
 //! # 監査
@@ -147,7 +92,8 @@
 //!   書き換えられることが多いので、この確認は役に立たない。サービスの前に置かない
 //!   （banto ADR-0017 §6・設計書 §6 と同じ運用条件）。
 //! - 同じ PC の他の利用者・他のアプリ: loopback から入れる者は誰でも発行を受けられる。
-//!   そのため初期化後の既定は `off`（初回セットアップの選択は、それを承知で選ぶ口）。
+//!   そのためログイン必須の既定は `off`（`PUT /api/settings/auth` で開くのは、それを承知で
+//!   選ぶ口）。
 
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -159,7 +105,6 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use banto_core::{BantoError, ErrorBody};
-use banto_server::routes::bearer_token;
 use banto_server::{
     request_is_loopback_local, AuthState, GrantCondition, GrantKind, GrantSpec, Identity,
 };
@@ -186,6 +131,13 @@ pub const LOCAL_GRANT_SETTING_KEY: &str = "auth.local_grant";
 /// banto-hub の試運転と同じ 16）。シェルの窓・タブの数として十分に大きく、超えたら
 /// 最古が失効する。
 pub const LOCAL_GRANT_MAX_SESSIONS: usize = 16;
+
+/// banto v8（ADR-0034 §4）: 組み込みの `admin` に加えて予約する名前（[`RESERVED_USERNAMES`]）。
+/// `UsersService::with_reserved_usernames` に渡すと、banto のサービスが作成を断り、
+/// 起動時の検査（`UsersService::check_startup`）が同じ名前のアカウントのある DB を止める。
+pub fn reserved_usernames() -> crate::users::ReservedUsernames {
+    crate::users::ReservedUsernames::new(RESERVED_USERNAMES)
+}
 
 /// アカウント名として使えない名前（#600 のレビュー、2026-10-14）: 資格情報なしの合成の
 /// セッションの identity と同じ名前。監査の行は `actor_username`/`actor_role` しか
@@ -322,27 +274,33 @@ pub enum LocalGrantStart {
     /// この host は発行しない（デスクトップ - 画面は Tauri の経路で入る - と
     /// `banto-serve`）。
     Unsupported,
-    /// 起動時に未初期化。admin で発行し、初期化されたら閉じる。
-    Uninitialized,
-    /// 起動時に初期化済み。この設定の値で発行する（`Off` なら発行しない）。
+    /// 起動時にログインなし（banto v8 の新しい DB の既定、`auth.disabled = true`）。
+    /// そのモードのロール（`auth.disabled_role`、既定 admin）で発行する。ログインなしの
+    /// 間はデスクトップと同じく組み込みの `admin` として扱う（docs/banto-v8-upgrade-plan.md
+    /// §2 の 3）。ログイン必須へ切り替えた後は、設定 `auth.local_grant` がこのロールの
+    /// ときだけ開いたまま（それ以外は閉じる）。
+    NoLogin(Role),
+    /// 起動時にログイン必須。この設定の値で発行する（`Off` なら発行しない）。
     Initialized(LocalGrantSetting),
 }
 
 impl LocalGrantStart {
     /// 起動時に決める（`chronogazer-server`）。読めなければ発行しない形
     /// （`Initialized(Off)`）に倒し、理由をログに出す（fail closed）。
-    pub async fn resolve(users: &UsersService, settings: &SettingsService, label: &str) -> Self {
-        let initialized = match users.is_initialized().await {
-            Ok(initialized) => initialized,
+    pub async fn resolve(settings: &SettingsService, label: &str) -> Self {
+        // banto v8（ADR-0034 §5）: 「未初期化（アカウント 0 件）」は無くなった。新しい DB は
+        // ログインなし（`auth.disabled = true`）で始まる。認証モードは既定で埋めずに読む。
+        let auth = match settings.auth_config().await {
+            Ok(auth) => auth,
             Err(err) => {
                 eprintln!(
-                    "{label}: アカウントの有無を読めなかったため、この PC からの接続（localDesktop）は発行しません: {err}"
+                    "{label}: 認証モードを読めなかったため、この PC からの接続（localDesktop）は発行しません: {err}"
                 );
                 return Self::Initialized(LocalGrantSetting::Off);
             }
         };
-        if !initialized {
-            return Self::Uninitialized;
+        if auth.disabled {
+            return Self::NoLogin(auth.disabled_role);
         }
         match read_setting(settings).await {
             Ok(setting) => Self::Initialized(setting),
@@ -359,22 +317,22 @@ impl LocalGrantStart {
     pub fn issued_role(&self) -> Option<Role> {
         match self {
             Self::Unsupported | Self::Initialized(LocalGrantSetting::Off) => None,
-            Self::Uninitialized => Some(Role::Admin),
+            Self::NoLogin(role) => Some(*role),
             Self::Initialized(LocalGrantSetting::Role(role)) => Some(*role),
         }
     }
 
     /// 保存済みの設定 `saved` で発行するには再起動が要るか（モジュール doc「ロールの
-    /// 変更は再起動で反映」）。`initialized_now` はいまアカウントがあるか。
-    pub fn restart_required(&self, saved: LocalGrantSetting, initialized_now: bool) -> bool {
+    /// 変更は再起動で反映」）。`login_required_now` はいまログイン必須か。
+    pub fn restart_required(&self, saved: LocalGrantSetting, login_required_now: bool) -> bool {
         match self {
             Self::Unsupported => false,
-            // 起動時の role は admin なので、初期化の後も `admin` ならそのまま入れる
-            // （#392 B2-2。条件は [`local_desktop_grant_spec`]）。
-            Self::Uninitialized => {
-                initialized_now
+            // 起動時のロールと同じ設定なら、ログイン必須に切り替えた後もそのまま入れる
+            // （条件は [`local_desktop_grant_spec`]）。
+            Self::NoLogin(started) => {
+                login_required_now
                     && saved != LocalGrantSetting::Off
-                    && saved != LocalGrantSetting::Role(Role::Admin)
+                    && saved != LocalGrantSetting::Role(*started)
             }
             // `off` にする（閉じる）のはすぐ効くので再起動は要らない（#600 のレビュー）。
             Self::Initialized(started) => *started != saved && saved != LocalGrantSetting::Off,
@@ -416,6 +374,8 @@ fn synthetic_identity(role: Role) -> Identity {
         id: LOCAL_GRANT_ACTOR_ID.to_string(),
         name: "この PC".to_string(),
         role: role.as_str().to_string(),
+        // grant の固定 identity はアカウントではない（banto v8 C3）。
+        account_id: None,
     }
 }
 
@@ -427,25 +387,26 @@ pub fn local_desktop_grant_spec(
 ) -> GrantSpec {
     let role = access.start.issued_role();
     let enabled: GrantCondition = match (access.may_issue(), access.start) {
-        // 未初期化の間、または初期化の後も設定が `admin`（初回セットアップで選んだ、または
-        // 保存した）なら開く（#392 B2-2。モジュール doc の 4.）。起動時の role が admin
-        // なので、設定が `admin` のときだけ再起動なしで続けられる。
-        (true, LocalGrantStart::Uninitialized) => Arc::new(move || {
+        // banto v8: ログインなしで起動したら、ログインなしのまま（同じロール）の間は開く。
+        // ログイン必須に切り替えた後は、設定 `auth.local_grant` が起動時のロールと同じ
+        // ときだけ開いたまま（モジュール doc の 4.）。どちらも予約名のアカウントがあれば
+        // 閉じる（ログインなしの間もユーザー管理でアカウントを作れるため）。
+        (true, LocalGrantStart::NoLogin(started)) => Arc::new(move || {
             let (users, settings) = (users.clone(), settings.clone());
             Box::pin(async move {
-                if !users.is_initialized().await? {
-                    return Ok(true);
-                }
-                Ok(
-                    read_setting(&settings).await? == LocalGrantSetting::Role(Role::Admin)
-                        && !has_reserved_accounts(&users).await?,
-                )
+                let auth = settings.auth_config().await?;
+                let open = if auth.disabled {
+                    auth.disabled_role == started
+                } else {
+                    read_setting(&settings).await? == LocalGrantSetting::Role(started)
+                };
+                Ok(open && !has_reserved_accounts(&users).await?)
             })
         }),
         (true, LocalGrantStart::Initialized(started)) => Arc::new(move || {
             let (users, settings) = (users.clone(), settings.clone());
             Box::pin(async move {
-                Ok(users.is_initialized().await?
+                Ok(!settings.auth_config().await?.disabled
                     && read_setting(&settings).await? == started
                     && !has_reserved_accounts(&users).await?)
             })
@@ -471,7 +432,7 @@ pub struct LocalAccessState {
     pub users: UsersService,
     pub auth: AuthState,
     pub audit: AuditLogService,
-    /// 初回セットアップでの選択（モジュール doc）を保存する先。
+    /// 認証モードと設定 `auth.local_grant` を読む先（発行の条件。モジュール doc の 4.）。
     pub settings: SettingsService,
     /// `PUT /api/settings/auth` と同じ lock（`crate::rest::HostAccess::settings_lock`）。
     pub settings_lock: Arc<AsyncMutex<()>>,
@@ -479,7 +440,6 @@ pub struct LocalAccessState {
 
 const STATUS_PATH: &str = "/api/auth/status";
 const GRANT_PREFIX: &str = "/api/auth/grant/";
-const SETUP_PATH: &str = "/api/auth/setup";
 const USERS_PATH: &str = "/api/users";
 /// アカウントを作る本文の上限（名前・パスワード・表示名だけなので十分に大きい）。
 const ACCOUNT_BODY_LIMIT: usize = 64 * 1024;
@@ -488,12 +448,8 @@ const ACCOUNT_BODY_LIMIT: usize = 64 * 1024;
 ///
 /// - `GET /api/auth/status`・`POST /api/auth/grant/*`: peer と Host の両方が loopback で
 ///   なければ `ConnectInfo` を外す（banto の判定が peer 不明として閉じる）。
-/// - `POST /api/auth/setup`: loopback の listener のルーターでは、peer と Host の両方が
-///   loopback でなければ `403`（`banto-serve` の `BANTO_ALLOW_SETUP` は開発用なので
-///   変えない）。成功して初期化されたら、未初期化の間の admin のトークンを失効させる
-///   （[`finish_setup`]）。本文の `localGrant` で初回セットアップでの選択を受ける
-///   （モジュール doc「初回セットアップでの選択」）。
-/// - `POST /api/users`: 未初期化の間に `localDesktop` のセッションから来たら `400`。
+/// - `POST /api/users`: 予約名（[`RESERVED_USERNAMES`]）のアカウントは作らせない。
+///   （banto v8 で初回セットアップ `POST /api/auth/setup` は無くなった。）
 /// - `POST /api/auth/grant/localDesktop` の成功: 監査に `login`（`via: localGrant`）。
 pub async fn local_access_middleware(
     State(state): State<LocalAccessState>,
@@ -508,18 +464,8 @@ pub async fn local_access_middleware(
         req.extensions_mut().remove::<ConnectInfo<SocketAddr>>();
     }
 
-    let is_setup = is_post && path == SETUP_PATH;
-    if is_setup && state.access.always_on_listener && !local {
-        return forbidden_with(
-            "最初の管理者の作成は、この PC の http://127.0.0.1:<port>/ からだけ行えます",
-        );
-    }
-
-    // 初回セットアップでの選択（`"localGrant": "admin"`、モジュール doc）。
-    let mut setup_opt_in = false;
-
     // アカウントを作る経路では予約名を断る（[`RESERVED_USERNAMES`]）。
-    if is_post && (path == SETUP_PATH || path == USERS_PATH) {
+    if is_post && path == USERS_PATH {
         let (parts, body) = req.into_parts();
         let bytes = match axum::body::to_bytes(body, ACCOUNT_BODY_LIMIT).await {
             Ok(bytes) => bytes,
@@ -545,12 +491,6 @@ pub async fn local_access_middleware(
                         return banto_server::ApiError(err).into_response();
                     }
                 }
-                if is_setup {
-                    setup_opt_in = match setup_local_grant_opt_in(&object, state.access) {
-                        Ok(opt_in) => opt_in,
-                        Err(err) => return banto_server::ApiError(err).into_response(),
-                    };
-                }
             }
             Ok(_) => {
                 return banto_server::ApiError(BantoError::BadRequest(
@@ -566,15 +506,6 @@ pub async fn local_access_middleware(
             }
         }
         req = Request::from_parts(parts, axum::body::Body::from(bytes));
-    }
-
-    if is_post && path == USERS_PATH {
-        // `&Request` を `.await` の向こうへ持たない（本文が `Sync` でないので future が
-        // `Send` でなくなる）。トークンだけを取り出して渡す。
-        let token = bearer_token(req.headers()).map(str::to_owned);
-        if let Some(refusal) = refuse_first_account_by_grant(&state, token).await {
-            return refusal;
-        }
     }
 
     // 発行の監査は、生のパスの文字列ではなく **percent decode した kind** で判断する
@@ -595,7 +526,7 @@ pub async fn local_access_middleware(
         None
     };
 
-    // 予約名のアカウントがあれば、初期化後の `localDesktop` の発行を説明つきの `409` で
+    // 予約名のアカウントがあれば、`localDesktop` の発行を説明つきの `409` で
     // 断る（#600 の Copilot レビュー、[`has_reserved_accounts`]）。断る本体は条件の側
     // （status と発行で共有）にあり、ここは理由を伝えるだけ。この PC からの要求だけに
     // 答える（LAN の peer には条件の `403` のまま、アカウントの名前の有無を漏らさない）。
@@ -603,8 +534,8 @@ pub async fn local_access_middleware(
     // 監査と同じ `issued_role`（[`local_desktop_issue_role`]: 発行の POST・この listener が
     // 発行しうる・decode した kind が `localDesktop`）を使い、1 か所にまとめる（PR #649 の
     // オーナー Nit 1。挙動は同じ - `may_issue` は起動時の role があることを含む）。
-    // 未初期化で起動した後の初期化済み（#392 B2-2 で、設定が `admin` なら開く）も同じ
-    // なので、起動時の形は問わない（未初期化の間はアカウントが無く、常に偽）。
+    // ログインなしで起動した後にログイン必須へ切り替えた場合も同じなので、起動時の形は
+    // 問わない。
     if local && issued_role.is_some() {
         if let Ok(true) = has_reserved_accounts(&state.users).await {
             return (
@@ -617,27 +548,23 @@ pub async fn local_access_middleware(
         }
     }
 
-    if !(is_grant_issue || is_setup) {
+    if !is_grant_issue {
         return next.run(req).await;
     }
-    // 発行（とその監査）・setup（とその後の失効）は、応答の future から切り離して最後まで
+    // 発行（とその監査）は、応答の future から切り離して最後まで
     // 走らせる（#600 の監査 F1・F4。[`run_detached`]）: hyper 1.x は応答を待つ間に
     // 相手の FIN を読むと service の future を捨てるので、`.await` をまたぐ後処理は
-    // 接続を切られると飛ぶ（発行したのに監査が無い・初期化したのに admin のトークンが
-    // 残る）。上流の処理（発行・setup の commit）ごと切り離すので、どの await 点で
+    // 接続を切られると飛ぶ（発行したのに監査が無い）。上流の処理（発行）ごと切り離すので、
+    // どの await 点で
     // 切られても、上流の副作用と後処理は揃って完結する。
     let detached = async move {
         let response = next.run(req).await;
         if let Some(role) = issued_role.filter(|_| response.status().is_success()) {
             record_grant_login(&state, role.as_str()).await;
         }
-        if is_setup {
-            finish_setup(&state, response, setup_opt_in).await
-        } else {
-            response
-        }
+        response
     };
-    match run_detached("localDesktop の発行・最初の管理者の作成", detached).await {
+    match run_detached("localDesktop の発行", detached).await {
         Ok(response) => response,
         Err(failed) => failed.into_response(),
     }
@@ -707,45 +634,6 @@ impl IntoResponse for DetachedTaskFailed {
     }
 }
 
-fn forbidden_with(message: &str) -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        Json(ErrorBody::Other {
-            message: message.to_string(),
-        }),
-    )
-        .into_response()
-}
-
-/// 未初期化の間に `localDesktop` のセッションが最初のアカウントを作ろうとしたら断る
-/// （モジュール doc「未初期化の間と最初の管理者の作成」）。
-async fn refuse_first_account_by_grant(
-    state: &LocalAccessState,
-    token: Option<String>,
-) -> Option<Response> {
-    if state.access.start != LocalGrantStart::Uninitialized {
-        return None;
-    }
-    let token = token?;
-    let session = state.auth.authenticate(&token).await.ok().flatten()?;
-    if session.grant.as_ref().map(GrantKind::as_str) != Some(LOCAL_DESKTOP_GRANT_KIND) {
-        return None;
-    }
-    match state.users.is_initialized().await {
-        Ok(true) => None,
-        Ok(false) => Some(
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorBody::BadRequest {
-                    message: "最初のアカウントは初回セットアップ（管理者）で作ってください。管理者が誰もいない状態を防ぐため、この PC からの接続ではまだアカウントを追加できません".to_string(),
-                }),
-            )
-                .into_response(),
-        ),
-        Err(err) => Some(banto_server::ApiError(err).into_response()),
-    }
-}
-
 /// `POST /api/auth/grant/<segment>` が `localDesktop` の発行なら、発行するセッションの
 /// role（それ以外は `None`）。kind は banto の発行口（`Path<String>`）と同じく percent
 /// decode して比べ、role はこの listener の起動時の形（[`LocalGrantStart::issued_role`]
@@ -766,267 +654,17 @@ async fn record_grant_login(state: &LocalAccessState, role: &str) {
         .audit
         .record(AuditEntry {
             actor_username: Some(LOCAL_GRANT_ACTOR_ID),
+            actor_id: None,
             actor_role: Some(role),
+            actor_kind: Some(&banto_admin_services::audit::grant_actor_kind(
+                LOCAL_DESKTOP_GRANT_KIND,
+            )),
             action: "login",
             resource: "auth",
             entity_id: None,
             detail: Some(serde_json::json!({ "via": "localGrant" })),
             origin: "rest",
             result: "ok",
-        })
-        .await;
-}
-
-/// setup の応答の本文の上限（`{success, token, ...}` だけなので十分に小さい）。
-const SETUP_RESPONSE_LIMIT: usize = 64 * 1024;
-
-/// setup の本文の欄（初回セットアップでの選択。モジュール doc）。
-const SETUP_LOCAL_GRANT_FIELD: &str = "localGrant";
-
-/// setup の本文の `localGrant` を読む（モジュール doc「初回セットアップでの選択」）:
-/// 欄が無い・`null` は `false`、`"admin"` は `true`。それ以外の値と、選んでいてもこの
-/// ルーターが未初期化の admin を発行しうる形でないときは `400`（setup を走らせない）。
-pub(crate) fn setup_local_grant_opt_in(
-    body: &serde_json::Map<String, serde_json::Value>,
-    access: LocalAccess,
-) -> Result<bool, BantoError> {
-    match body.get(SETUP_LOCAL_GRANT_FIELD) {
-        None | Some(serde_json::Value::Null) => Ok(false),
-        Some(serde_json::Value::String(value)) if value == Role::Admin.as_str() => {
-            if access.may_issue() && access.start == LocalGrantStart::Uninitialized {
-                Ok(true)
-            } else {
-                Err(BantoError::BadRequest(
-                    "この接続では、この PC からの接続（localGrant）を初回セットアップで指定できません"
-                        .to_string(),
-                ))
-            }
-        }
-        Some(other) => Err(BantoError::BadRequest(format!(
-            "初回セットアップの localGrant は \"admin\" だけを指定できます（{other}）"
-        ))),
-    }
-}
-
-/// setup が**確かに**成功したか（2xx かつ本文が `success: true`）。成功なら `Some` に
-/// 応答のトークン（読めれば）を入れて返す。初回セットアップでの選択の保存はこれが `Some`
-/// のときだけ行う（[`setup_may_have_initialized`] の「できたかもしれない」で書くと、
-/// 失敗した setup でも設定が `admin` になりうる）。
-pub(crate) fn setup_succeeded(status: StatusCode, body: Option<&[u8]>) -> Option<Option<String>> {
-    if !status.is_success() {
-        return None;
-    }
-    let value = serde_json::from_slice::<serde_json::Value>(body?).ok()?;
-    if value.get("success") != Some(&serde_json::Value::Bool(true)) {
-        return None;
-    }
-    Some(
-        value
-            .get("token")
-            .and_then(|token| token.as_str())
-            .map(str::to_owned),
-    )
-}
-
-/// setup の応答から、最初の管理者ができた**かもしれない**か（#600 の監査 F1）。`body` は
-/// 応答の本文（読めなかったら `None`）。
-///
-/// 上流（banto の `auth_setup_handler`）は、成功で `200 {success: true}`、既に初期化
-/// 済み・保存の失敗でも `200 {success: false}` を返す。HTTP の状態は setup の成否では
-/// ないので本文で決める: 2xx 以外と、本文が `success: false` を言うときだけ「できて
-/// いない」。2xx で本文が読めない・解釈できないときは「できたかもしれない」として失効へ
-/// 倒す（fail closed。失効しすぎても、未初期化のままなら grant をもう一度受け取れる）。
-pub(crate) fn setup_may_have_initialized(status: StatusCode, body: Option<&[u8]>) -> bool {
-    if !status.is_success() {
-        return false;
-    }
-    let said_failure = body
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
-        .is_some_and(|value| value.get("success") == Some(&serde_json::Value::Bool(false)));
-    !said_failure
-}
-
-/// setup の後処理（モジュール doc「未初期化の間と最初の管理者の作成」）: 最初の管理者が
-/// できた（かもしれない）なら、未初期化の間に発行した admin のトークンを失効させる。
-///
-/// #600 の監査 F1: DB を読み直さない（setup は commit 済みなのに、追加の
-/// `is_initialized()` だけが一時的に失敗すると失効が飛び、admin のトークンが寿命まで
-/// 残っていた）。判断は応答の本文だけ（[`setup_may_have_initialized`]）で、失効は同期で
-/// すぐ行い、監査の記録はその後（[`local_access_middleware`] の切り離したタスクの中）。
-///
-/// `opt_in` は初回セットアップでの選択（#392 B2-2、モジュール doc）: setup が確かに成功
-/// したら、失効の後に設定 `auth.local_grant` を `admin` にする。選ばなかった（または読め
-/// ない本文の）作成の後は `off` にする（[`setup_choice`]・[`save_setup_choice`]）。
-pub(crate) async fn finish_setup(
-    state: &LocalAccessState,
-    response: Response,
-    opt_in: bool,
-) -> Response {
-    if state.access.start != LocalGrantStart::Uninitialized || !response.status().is_success() {
-        return response;
-    }
-    let (parts, body) = response.into_parts();
-    let bytes = axum::body::to_bytes(body, SETUP_RESPONSE_LIMIT).await;
-    let may_have_initialized = setup_may_have_initialized(parts.status, bytes.as_deref().ok());
-    let revoked = if may_have_initialized {
-        state.auth.revoke_grant_tokens(&local_desktop_grant_kind())
-    } else {
-        0
-    };
-    // 保存は失効（同期）の後: 保存の前に初期化後の条件が開くことは無いので、未初期化の
-    // 間のトークンは必ず失効し、新しい発行は保存の後だけ。選択は常に決定的にする
-    // （[`setup_choice`]）。
-    let choice = setup_choice(
-        state.access,
-        opt_in,
-        setup_succeeded(parts.status, bytes.as_deref().ok()),
-        may_have_initialized,
-    );
-    if revoked > 0 {
-        record_setup_revocation(state, revoked).await;
-    }
-    if let Some((value, token)) = choice {
-        save_setup_choice(state, value, token.as_deref()).await;
-    }
-    match bytes {
-        Ok(bytes) => Response::from_parts(parts, axum::body::Body::from(bytes)),
-        Err(err) => {
-            eprintln!("最初の管理者の作成の応答を読めませんでした: {err}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorBody::Other {
-                    message: "最初の管理者の作成の応答を読めませんでした。ログイン画面から入り直してください".to_string(),
-                }),
-            )
-                .into_response()
-        }
-    }
-}
-
-/// setup の後の失効の監査（`revoke_grants`、`reason: initialized`）。最初の失効と、
-/// 選択の保存の後の 2 回目の失効（[`save_setup_choice`]）で同じ形。
-async fn record_setup_revocation(state: &LocalAccessState, revoked: usize) {
-    state
-        .audit
-        .record(AuditEntry {
-            actor_username: None,
-            actor_role: None,
-            action: "revoke_grants",
-            resource: "auth",
-            entity_id: None,
-            detail: Some(serde_json::json!({
-                "kind": LOCAL_DESKTOP_GRANT_KIND,
-                "reason": "initialized",
-                "revokedGrants": revoked,
-            })),
-            origin: "rest",
-            result: "ok",
-        })
-        .await;
-}
-
-/// setup の後に保存する設定 `auth.local_grant` と、操作者を引くトークン（モジュール doc
-/// 「初回セットアップでの選択」。**選択は常に決定的**）:
-///
-/// - 発行しうる形（未初期化で起動した常時の listener）でなければ何もしない。
-/// - 選んだ かつ 確かに成功（`succeeded` が `Some`）→ `admin`。
-/// - それ以外で、できたかもしれない（確かに成功して選んでいない、または読めない本文の
-///   fail closed）→ `off`（閉じる方向なので常に安全）。未初期化の間に grant の admin から
-///   `PUT /api/settings/auth` で先に保存した値が、選ばなかった作成の後に grant を開いた
-///   ままにしないため（#392 B2-2 の監査）。
-/// - 確かに失敗（`success: false`・2xx 以外）→ 何もしない。
-pub(crate) fn setup_choice(
-    access: LocalAccess,
-    opt_in: bool,
-    succeeded: Option<Option<String>>,
-    may_have_initialized: bool,
-) -> Option<(LocalGrantSetting, Option<String>)> {
-    if !(access.may_issue() && access.start == LocalGrantStart::Uninitialized) {
-        return None;
-    }
-    match succeeded {
-        Some(token) if opt_in => Some((LocalGrantSetting::Role(Role::Admin), token)),
-        Some(token) => Some((LocalGrantSetting::Off, token)),
-        None if may_have_initialized => Some((LocalGrantSetting::Off, None)),
-        None => None,
-    }
-}
-
-/// 初回セットアップの後の設定を保存する（[`setup_choice`]、モジュール doc「初回
-/// セットアップでの選択」）。`token` は setup の応答のトークン（操作者 = 作られた
-/// アカウントを引く）。`off` で既に `off` なら書かず、監査もしない。失敗しても setup の
-/// 応答は変えない（ログと `result: "failed"` の監査だけ）。
-async fn save_setup_choice(
-    state: &LocalAccessState,
-    value: LocalGrantSetting,
-    token: Option<&str>,
-) {
-    let actor = match token {
-        Some(token) => state
-            .auth
-            .authenticate(token)
-            .await
-            .ok()
-            .flatten()
-            .map(|session| session.identity),
-        None => None,
-    };
-    // lock を握ったまま「保存 → 2 回目の失効（同期）」（#392 B2-2 のレビュー、Codex P1・
-    // オーナー P2-2）: 最初の失効（`finish_setup`）からこの保存までの間に、先に保存されて
-    // いた値（未初期化の間に `PUT /api/settings/auth` で保存した admin など）で開いた条件の
-    // まま新しいトークンが発行されうる。grant のセッションは条件を毎回読み直さないので、
-    // 保存の後に `off` へ閉じてもそのトークンは残る。保存した値で条件が閉じた後に、
-    // もう一度失効させる。書かない（既に `off`）ときも失効は行う。
-    let (saved, revoked_again) = {
-        let _guard = state.settings_lock.lock().await;
-        let saved = if value == LocalGrantSetting::Off
-            && matches!(
-                read_setting(&state.settings).await,
-                Ok(LocalGrantSetting::Off)
-            ) {
-            None
-        } else {
-            Some(write_setting(&state.settings, value).await)
-        };
-        let revoked = state.auth.revoke_grant_tokens(&local_desktop_grant_kind());
-        (saved, revoked)
-    };
-    if revoked_again > 0 {
-        record_setup_revocation(state, revoked_again).await;
-    }
-    let Some(saved) = saved else {
-        return;
-    };
-    let result = match (&saved, value) {
-        (Ok(()), _) => "ok",
-        (Err(err), LocalGrantSetting::Off) => {
-            eprintln!(
-                "エラー: 初回セットアップの後に、この PC からの接続（auth.local_grant）を off にできませんでした。未初期化の間に保存された値のまま、この PC からログインなしで入れる状態が続いている可能性があります。設定の画面のセキュリティで「使わない」にしてください: {err}"
-            );
-            "failed"
-        }
-        (Err(err), _) => {
-            eprintln!(
-                "初回セットアップで選んだ「この PC からはログインなしで使う」を保存できませんでした（この PC からの接続は閉じたままです。設定の画面から変更してください）: {err}"
-            );
-            "failed"
-        }
-    };
-    state
-        .audit
-        .record(AuditEntry {
-            actor_username: actor.as_ref().map(|identity| identity.id.as_str()),
-            actor_role: actor.as_ref().map(|identity| identity.role.as_str()),
-            action: "settings_change",
-            resource: "settings",
-            entity_id: None,
-            detail: Some(serde_json::json!({
-                "localGrant": value.as_str(),
-                "via": "setup",
-                "saved": saved.is_ok(),
-            })),
-            origin: "rest",
-            result,
         })
         .await;
 }
@@ -1090,36 +728,6 @@ mod tests {
         );
     }
 
-    /// #600 の監査 F1: setup の成否は HTTP の状態ではなく本文の `success` で決め、
-    /// 読めない・解釈できない 2xx は失効へ倒す（fail closed）。
-    #[test]
-    fn setup_success_is_read_from_the_body_and_fails_closed() {
-        let ok = StatusCode::OK;
-        let cases: [(StatusCode, Option<&[u8]>, bool); 9] = [
-            (ok, Some(br#"{"success":true,"token":"t"}"#), true),
-            (ok, Some(br#"{"success":false,"error":"x"}"#), false),
-            (ok, Some(b"not json"), true),
-            (ok, None, true),
-            (ok, Some(b"{}"), true),
-            (ok, Some(br#"{"success":"false"}"#), true),
-            (ok, Some(b"[false]"), true),
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Some(br#"{"success":true}"#),
-                false,
-            ),
-            (StatusCode::FORBIDDEN, None, false),
-        ];
-        for (status, body, expected) in cases {
-            assert_eq!(
-                setup_may_have_initialized(status, body),
-                expected,
-                "{status} {:?}",
-                body.map(String::from_utf8_lossy)
-            );
-        }
-    }
-
     /// #600 の監査: 切り離したタスクが panic したら `500` を返す（呼び出し側は panic
     /// しない）。終わればその結果を返す。
     #[tokio::test]
@@ -1159,7 +767,7 @@ mod tests {
     fn issued_role_follows_the_start() {
         assert_eq!(LocalGrantStart::Unsupported.issued_role(), None);
         assert_eq!(
-            LocalGrantStart::Uninitialized.issued_role(),
+            LocalGrantStart::NoLogin(Role::Admin).issued_role(),
             Some(Role::Admin)
         );
         assert_eq!(
@@ -1177,147 +785,24 @@ mod tests {
         use LocalGrantSetting::{Off, Role as R};
         let viewer = R(Role::Viewer);
         assert!(!LocalGrantStart::Unsupported.restart_required(viewer, true));
-        assert!(!LocalGrantStart::Uninitialized.restart_required(viewer, false));
-        assert!(!LocalGrantStart::Uninitialized.restart_required(Off, true));
-        assert!(LocalGrantStart::Uninitialized.restart_required(viewer, true));
+        assert!(!LocalGrantStart::NoLogin(Role::Admin).restart_required(viewer, false));
+        assert!(!LocalGrantStart::NoLogin(Role::Admin).restart_required(Off, true));
+        assert!(LocalGrantStart::NoLogin(Role::Admin).restart_required(viewer, true));
         assert!(!LocalGrantStart::Initialized(viewer).restart_required(viewer, true));
         // 閉じる方向（`off`）はすぐ効く。
         assert!(!LocalGrantStart::Initialized(viewer).restart_required(Off, true));
         assert!(LocalGrantStart::Initialized(viewer).restart_required(R(Role::Admin), true));
         assert!(LocalGrantStart::Initialized(Off).restart_required(viewer, true));
-        // 未初期化で起動した後の `admin` は、起動時の role と同じなので再起動なしで入れる
-        // （#392 B2-2、初回セットアップでの選択）。
-        assert!(!LocalGrantStart::Uninitialized.restart_required(R(Role::Admin), true));
-        assert!(LocalGrantStart::Uninitialized.restart_required(R(Role::Editor), true));
-    }
-
-    /// #392 B2-2: setup の本文の `localGrant` の読み方（モジュール doc「初回セットアップでの
-    /// 選択」）。`"admin"` だけが選んだ印で、それ以外の値は `400`。発行しうる形でない
-    /// ルーターでは、選んでいたら `400`（選んでいなければ素通り）。
-    #[test]
-    fn setup_opt_in_accepts_only_admin_on_an_issuing_router() {
-        let open = LocalAccess {
-            start: LocalGrantStart::Uninitialized,
-            always_on_listener: true,
-        };
-        let body = |value: serde_json::Value| {
-            serde_json::json!({ "username": "testadmin", "localGrant": value })
-                .as_object()
-                .unwrap()
-                .clone()
-        };
-        let without = serde_json::json!({ "username": "testadmin" })
-            .as_object()
-            .unwrap()
-            .clone();
-        assert!(!setup_local_grant_opt_in(&without, open).unwrap());
-        assert!(!setup_local_grant_opt_in(&body(serde_json::Value::Null), open).unwrap());
-        assert!(setup_local_grant_opt_in(&body("admin".into()), open).unwrap());
-        for value in [
-            serde_json::json!("viewer"),
-            serde_json::json!("editor"),
-            serde_json::json!("off"),
-            serde_json::json!("Admin"),
-            serde_json::json!(true),
-            serde_json::json!(1),
-            serde_json::json!({ "role": "admin" }),
-        ] {
-            assert!(
-                setup_local_grant_opt_in(&body(value.clone()), open).is_err(),
-                "{value}"
-            );
-        }
-        for closed in [
-            LocalAccess {
-                always_on_listener: false,
-                ..open
-            },
-            LocalAccess {
-                start: LocalGrantStart::Initialized(LocalGrantSetting::Off),
-                ..open
-            },
-            LocalAccess::closed(),
-        ] {
-            assert!(setup_local_grant_opt_in(&body("admin".into()), closed).is_err());
-            assert!(!setup_local_grant_opt_in(&without, closed).unwrap());
-        }
-    }
-
-    /// #392 B2-2 の監査: 初回セットアップの後の設定は常に決定的（選べば admin、
-    /// できたかもしれないのに選んでいなければ off、確かな失敗と発行しない形では何もしない）。
-    #[test]
-    fn setup_choice_is_deterministic() {
-        use LocalGrantSetting::{Off, Role as R};
-        let open = LocalAccess {
-            start: LocalGrantStart::Uninitialized,
-            always_on_listener: true,
-        };
-        let token = || Some(Some("t".to_string()));
-        let admin = R(Role::Admin);
-        assert_eq!(
-            setup_choice(open, true, token(), true),
-            Some((admin, Some("t".to_string())))
-        );
-        assert_eq!(
-            setup_choice(open, false, token(), true),
-            Some((Off, Some("t".to_string())))
-        );
-        // 読めない本文（できたかもしれない）は、選んでいても off（fail closed）。
-        assert_eq!(setup_choice(open, true, None, true), Some((Off, None)));
-        assert_eq!(setup_choice(open, false, None, true), Some((Off, None)));
-        // 確かな失敗は何もしない。
-        assert_eq!(setup_choice(open, true, None, false), None);
-        assert_eq!(setup_choice(open, false, None, false), None);
-        for closed in [
-            LocalAccess {
-                always_on_listener: false,
-                ..open
-            },
-            LocalAccess {
-                start: LocalGrantStart::Initialized(admin),
-                ..open
-            },
-            LocalAccess::closed(),
-        ] {
-            assert_eq!(setup_choice(closed, true, token(), true), None);
-            assert_eq!(setup_choice(closed, false, token(), true), None);
-        }
-    }
-
-    /// #392 B2-2: 選択の保存は「確かに成功した」ときだけ（失効の判断の fail closed とは別）。
-    #[test]
-    fn setup_succeeded_needs_a_readable_success_true() {
-        let ok = StatusCode::OK;
-        assert_eq!(
-            setup_succeeded(ok, Some(br#"{"success":true,"token":"t"}"#)),
-            Some(Some("t".to_string()))
-        );
-        assert_eq!(
-            setup_succeeded(ok, Some(br#"{"success":true}"#)),
-            Some(None)
-        );
-        for body in [
-            Some(&br#"{"success":false,"error":"x"}"#[..]),
-            Some(&b"not json"[..]),
-            None,
-            Some(&b"{}"[..]),
-            Some(&br#"{"success":"true"}"#[..]),
-        ] {
-            assert_eq!(setup_succeeded(ok, body), None, "{body:?}");
-        }
-        assert_eq!(
-            setup_succeeded(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Some(br#"{"success":true}"#)
-            ),
-            None
-        );
+        // ログインなしで起動した後の `admin` は、起動時の role と同じなので再起動なしで入れる
+        // （banto v8、docs/banto-v8-upgrade-plan.md §2 の 3）。
+        assert!(!LocalGrantStart::NoLogin(Role::Admin).restart_required(R(Role::Admin), true));
+        assert!(LocalGrantStart::NoLogin(Role::Admin).restart_required(R(Role::Editor), true));
     }
 
     #[test]
     fn only_the_always_on_listener_with_a_role_may_issue() {
         let open = LocalAccess {
-            start: LocalGrantStart::Uninitialized,
+            start: LocalGrantStart::NoLogin(Role::Admin),
             always_on_listener: true,
         };
         assert!(open.may_issue());

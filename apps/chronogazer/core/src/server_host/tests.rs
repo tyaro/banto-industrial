@@ -185,6 +185,7 @@ fn exit_codes_follow_the_service_convention() {
         FailureKind::LegacyDatabase,
         FailureKind::StoreDirUnreadable,
         FailureKind::StoreDirUnwritable,
+        FailureKind::StoreDirRefused,
         FailureKind::DatabaseCorrupt,
         FailureKind::DatabaseUnopenable,
         FailureKind::DatabaseFromNewerVersion,
@@ -544,24 +545,34 @@ async fn get_json(url: &str) -> (u16, serde_json::Value) {
     (status, serde_json::from_str(&text).unwrap_or_default())
 }
 
-/// `POST /api/auth/setup`（最初の管理者の作成）。
-async fn post_setup(url: &str) -> (u16, serde_json::Value) {
-    let body = serde_json::json!({
-        "username": "testadmin",
-        "password": "admin-pass-1",
-        "displayName": "管理者",
-    });
+/// 管理者のアカウント `testadmin` を作り（banto v8 で初回セットアップ
+/// `POST /api/auth/setup` は無くなった）、`base` へログインしたトークンを返す。
+async fn create_admin_and_login(engine: &RunningEngine, base: &str) -> String {
+    engine
+        .services()
+        .users
+        .create_user(
+            "testadmin",
+            "admin-pass-1",
+            "管理者",
+            crate::users::Role::Admin,
+        )
+        .await
+        .expect("create_user");
     let response = reqwest::Client::new()
-        .post(url)
+        .post(format!("{base}/api/auth/login"))
         .header("X-Banto-Client", "banto")
         .header("Content-Type", "application/json")
-        .body(body.to_string())
+        .body(
+            serde_json::json!({ "username": "testadmin", "password": "admin-pass-1" }).to_string(),
+        )
         .send()
         .await
         .expect("send");
-    let status = response.status().as_u16();
+    assert_eq!(response.status().as_u16(), 200);
     let text = response.text().await.expect("text");
-    (status, serde_json::from_str(&text).unwrap_or_default())
+    let body: serde_json::Value = serde_json::from_str(&text).expect("json");
+    body["token"].as_str().expect("token").to_string()
 }
 
 /// `POST /api/auth/grant/localDesktop`（この PC からの接続、#392 B2-1）の HTTP の状態。
@@ -586,8 +597,8 @@ fn options(root: &Path) -> ServerOptions {
 
 /// 一時ルートで起動 → loopback の 1 本だけ（`127.0.0.1`）が `/api/host` に
 /// `hostKind = server` で答え、`run\endpoint.json` がその port と自分の pid を指す →
-/// 終了で `endpoint.json` が消え、終了コードは 0。LAN に出していないので最初の
-/// 管理者の作成（`POST /api/auth/setup`）が開いている。
+/// 終了で `endpoint.json` が消え、終了コードは 0。新しい DB はログインなしなので、
+/// この PC からの接続（`localDesktop`）が admin で開いている。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn start_serves_loopback_writes_the_endpoint_and_shutdown_clears_it() {
     let dir = TempDir::new();
@@ -609,18 +620,15 @@ async fn start_serves_loopback_writes_the_endpoint_and_shutdown_clears_it() {
     let (status, host) = get_json(&format!("http://{addr}/api/host")).await;
     assert_eq!(status, 200);
     assert_eq!(host["hostKind"], "server");
-    // #392 B2-1: 未初期化の間は、この PC から管理者として入れる。
+    // #392 B2-1・banto v8: ログインなしの間は、この PC から管理者として入れる。
     assert_eq!(
         started.engine().services().local_grant,
-        crate::local_grant::LocalGrantStart::Uninitialized
+        crate::local_grant::LocalGrantStart::NoLogin(crate::users::Role::Admin)
     );
     assert_eq!(
         post_local_grant(&format!("http://{addr}/api/auth/grant/localDesktop")).await,
         200
     );
-    let (status, body) = post_setup(&format!("http://{addr}/api/auth/setup")).await;
-    assert_eq!(status, 200);
-    assert_eq!(body["success"], true, "{body}");
 
     let summary = started.shutdown(Duration::from_secs(15)).await;
     assert_eq!(summary.endpoint, crate::endpoint::EndpointClear::Removed);
@@ -658,9 +666,7 @@ async fn drain_backups_waits_for_inflight_work_and_refuses_new_requests() {
     prepare_root(dir.path(), &[]).await;
     let started = start(options(dir.path())).await.expect("start");
     let addr = started.engine().loopback_addr().await.expect("loopback");
-    let (status, body) = post_setup(&format!("http://{addr}/api/auth/setup")).await;
-    assert_eq!(status, 200, "{body}");
-    let token = body["token"].as_str().expect("token").to_string();
+    let token = create_admin_and_login(started.engine(), &format!("http://{addr}")).await;
     let client = reqwest::Client::new();
     let get_backups = || {
         client
@@ -798,16 +804,21 @@ fn first_lan_ipv4() -> Option<std::net::Ipv4Addr> {
         .find(|ip| !ip.is_loopback())
 }
 
-/// LAN に出しているとき（bind `0.0.0.0` を 1 本にまとめる）も、最初の管理者の作成と
+/// LAN に出しているとき（bind `0.0.0.0` を 1 本にまとめる）も、
 /// この PC からの接続（`localDesktop`）は、要求ごとに peer と Host の両方が loopback なら
 /// 開く。LAN からの要求（peer が LAN）は同じ listener でも閉じる（2026-10-14 オーナー
 /// 決定。B1-5 では listener 単位で、この PC からも閉じていた）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn setup_and_local_grant_follow_the_request_on_the_merged_wildcard_listener() {
+async fn local_grant_follows_the_request_on_the_merged_wildcard_listener() {
     let dir = TempDir::new();
     prepare_root(
         dir.path(),
-        &[("server.enabled", "true"), ("server.bind", "0.0.0.0")],
+        // banto v8: 新しい DB はログインなしで、ログインなしの間に LAN へ出すには閲覧公開が要る。
+        &[
+            ("server.enabled", "true"),
+            ("server.bind", "0.0.0.0"),
+            ("server.viewer_public", "true"),
+        ],
     )
     .await;
     let started = start(options(dir.path())).await.expect("start");
@@ -816,7 +827,7 @@ async fn setup_and_local_grant_follow_the_request_on_the_merged_wildcard_listene
     assert!(started.exposes_lan().await);
     assert_eq!(
         started.engine().services().local_grant,
-        crate::local_grant::LocalGrantStart::Uninitialized
+        crate::local_grant::LocalGrantStart::NoLogin(crate::users::Role::Admin)
     );
     let port = started.engine().loopback_addr().await.unwrap().port();
 
@@ -830,8 +841,6 @@ async fn setup_and_local_grant_follow_the_request_on_the_merged_wildcard_listene
             post_local_grant(&format!("{base}/api/auth/grant/localDesktop")).await,
             403
         );
-        let (status, _) = post_setup(&format!("{base}/api/auth/setup")).await;
-        assert_eq!(status, 403, "LAN から最初の管理者を作れた");
     } else {
         eprintln!(
             "skip: この環境には非 loopback の IPv4 アドレスが無い（LAN からの要求は確かめない）"
@@ -844,9 +853,6 @@ async fn setup_and_local_grant_follow_the_request_on_the_merged_wildcard_listene
         post_local_grant(&format!("{base}/api/auth/grant/localDesktop")).await,
         200
     );
-    let (status, body) = post_setup(&format!("{base}/api/auth/setup")).await;
-    assert_eq!(status, 200);
-    assert_eq!(body["success"], true, "{body}");
     assert_eq!(
         started.shutdown(Duration::from_secs(15)).await.exit_code(),
         0
@@ -854,14 +860,19 @@ async fn setup_and_local_grant_follow_the_request_on_the_merged_wildcard_listene
 }
 
 /// #598 のレビュー: 計画では LAN に出す（特定の IP）が、その bind が失敗して
-/// loopback だけで動いているなら、最初の管理者の作成を開ける（新しい環境で作る
-/// 手段を失わない）。LAN を開けなかった理由は残る。
+/// loopback だけで動いているなら、この PC からの接続（`localDesktop`）を開ける（新しい
+/// 環境で入る手段を失わない）。LAN を開けなかった理由は残る。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn setup_opens_when_the_planned_lan_listener_could_not_bind() {
+async fn local_grant_opens_when_the_planned_lan_listener_could_not_bind() {
     let dir = TempDir::new();
     prepare_root(
         dir.path(),
-        &[("server.enabled", "true"), ("server.bind", "203.0.113.1")],
+        // banto v8: 新しい DB はログインなしで、ログインなしの間に LAN へ出すには閲覧公開が要る。
+        &[
+            ("server.enabled", "true"),
+            ("server.bind", "203.0.113.1"),
+            ("server.viewer_public", "true"),
+        ],
     )
     .await;
     let started = start(options(dir.path())).await.expect("start");
@@ -869,9 +880,13 @@ async fn setup_opens_when_the_planned_lan_listener_could_not_bind() {
     assert!(!started.exposes_lan().await, "実際には LAN に出ていない");
     assert!(started.engine().listen_error().is_some());
     let port = started.engine().loopback_addr().await.unwrap().port();
-    let (status, body) = post_setup(&format!("http://127.0.0.1:{port}/api/auth/setup")).await;
-    assert_eq!(status, 200);
-    assert_eq!(body["success"], true, "{body}");
+    assert_eq!(
+        post_local_grant(&format!(
+            "http://127.0.0.1:{port}/api/auth/grant/localDesktop"
+        ))
+        .await,
+        200
+    );
     assert_eq!(
         started.shutdown(Duration::from_secs(15)).await.exit_code(),
         0
@@ -1071,19 +1086,21 @@ async fn a_pinned_service_db_is_released_when_the_start_fails_after_opening_it()
     assert_db_released(&files);
 }
 
-/// #623 PR2b: DB の初期化の中の失敗（旧形式の DB）でも、`Err` が返った時点で握りを離している。
+/// #623 PR2b: DB の初期化の中の失敗（この版が知らない migration が当たった DB）でも、`Err` が
+/// 返った時点で握りを離している。旧形式の DB は握る前（`crate::db::refuse_legacy_profile`）に
+/// 断るので、握った後に失敗する例として新しい版の DB を使う。
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pinned_service_db_is_released_when_the_db_init_fails() {
     let dir = TempDir::new();
     let layout = DataLayout::new(dir.path());
-    let pool = banto_storage::connect_sqlite(layout.db_path())
-        .await
-        .unwrap();
-    sqlx::query("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL)")
-        .execute(&pool)
-        .await
-        .unwrap();
+    let pool = crate::db::init_db(layout.db_path()).await.unwrap();
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)          VALUES (99999, 'from a newer version', 1, x'00', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     pool.close().await;
     let files = db_files(&layout);
     let failure = lock_pinned(&layout)

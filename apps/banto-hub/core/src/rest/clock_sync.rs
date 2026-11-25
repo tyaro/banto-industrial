@@ -29,13 +29,12 @@
 //! 残すものは無い）。
 
 use super::{
-    actor_identity, record_write, require_editor, shutting_down_response, ApiError, BantoError,
-    HeaderMap, IntoResponse, Json, Path, Response, State, StatusCode, TagRegistryState,
+    record_write, require_editor, shutting_down_response, ApiError, AuditActor, BantoError,
+    Extension, HeaderMap, IntoResponse, Json, Path, Response, State, StatusCode, TagRegistryState,
 };
 use crate::clock_read::ClockReadView;
 use crate::clock_sync::{
-    parse_settings, ClockActor, ClockSyncRecord, ClockSyncSettings, ClockSyncView, ClockTrigger,
-    AUDIT_RESOURCE,
+    parse_settings, ClockSyncRecord, ClockSyncSettings, ClockSyncView, ClockTrigger, AUDIT_RESOURCE,
 };
 use axum::body::Bytes;
 use serde_json::json;
@@ -100,6 +99,7 @@ pub(super) async fn clock_sync_get(
 pub(super) async fn clock_sync_put(
     State(state): State<TagRegistryState>,
     headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
     Path(connection_id): Path<i64>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
@@ -118,14 +118,12 @@ pub(super) async fn clock_sync_put(
     // 時刻表が有効になることがないように。POST と同じ）。
     let manager = state.manager.clone();
     let audit = state.audit.clone();
-    let auth = state.auth.clone();
     let Some(task) = state.manager.detached().spawn(async move {
         let clock_sync = manager.clock_sync();
         clock_sync.save_settings(connection_id, &settings).await?;
         record_write(
             &audit,
-            &auth,
-            &headers,
+            &actor,
             "update",
             AUDIT_RESOURCE,
             Some(&connection_id.to_string()),
@@ -158,6 +156,7 @@ pub(super) async fn clock_sync_put(
 pub(super) async fn clock_sync_post(
     State(state): State<TagRegistryState>,
     headers: HeaderMap,
+    Extension(actor): Extension<AuditActor>,
     Path(connection_id): Path<i64>,
 ) -> Result<Response, ApiError> {
     require_editor(
@@ -180,15 +179,9 @@ pub(super) async fn clock_sync_post(
         )
             .into_response());
     }
-    // `require_editor` を通ったので identity はある（無ければ監査は actor なし）。
-    let actor = actor_identity(&headers, &state.auth).map(|identity| (identity.id, identity.role));
     let manager = state.manager.clone();
     let audit = state.audit.clone();
     let Some(task) = state.manager.detached().spawn(async move {
-        let actor = actor.as_ref().map(|(username, role)| ClockActor {
-            username: username.as_str(),
-            role: role.as_str(),
-        });
         manager
             .clock_sync()
             .run(
@@ -196,7 +189,7 @@ pub(super) async fn clock_sync_post(
                 &audit,
                 connection_id,
                 ClockTrigger::Manual,
-                actor,
+                Some(&actor),
             )
             .await
     }) else {

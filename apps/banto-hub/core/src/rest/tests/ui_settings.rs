@@ -39,9 +39,9 @@ async fn ui_settings_round_trip_with_the_viewer_role() {
     assert_eq!(status, StatusCode::OK);
     assert!(body["value"].is_null());
 
-    // viewer でも自分の設定は書ける（ロールの下限なし）。
+    // viewer でも自分の設定は書ける（ロールの下限なし）。banto v8 は `200 { revision }`。
     let (status, _) = put_setting(&env.router, "theme", &env.viewer_token, "glass").await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(status, StatusCode::OK);
     let (status, body) = get_setting(&env.router, "theme", &env.viewer_token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["value"], "glass");
@@ -51,7 +51,7 @@ async fn ui_settings_round_trip_with_the_viewer_role() {
 async fn ui_settings_are_isolated_per_user() {
     let env = test_env().await;
     let (status, _) = put_setting(&env.router, "theme", &env.admin_token, "glass").await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(status, StatusCode::OK);
 
     let (status, body) = get_setting(&env.router, "theme", &env.viewer_token).await;
     assert_eq!(status, StatusCode::OK);

@@ -242,6 +242,7 @@ pub mod desktop_log;
 pub mod detached;
 pub mod diag_log;
 pub mod events;
+pub mod first_admin;
 pub mod grpc;
 pub mod host_provided;
 pub mod host_switch;

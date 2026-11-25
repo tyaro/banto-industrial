@@ -53,7 +53,11 @@ const KEY_RETENTION_DAYS: &str = "retention.days";
 /// [`crate::collect::resolve_data_dir`] が決める（作業ディレクトリではなく
 /// アプリのデータディレクトリ基準 - デスクトップアプリの作業ディレクトリは
 /// 何であるか分からないため）。
-const DEFAULT_DATA_DIR: &str = "./data";
+///
+/// banto v8 への追従から `./data/history`（v8 より前は `./data`）。v8 より前の既定の保存先
+/// （`./data` の直下の日付ファイル）には触れず、既定のままの利用者は旧い履歴を残したまま
+/// 新しい場所で動き始める（[`crate::store_generation`]。docs/banto-v8-upgrade-plan.md §5 の 1）。
+const DEFAULT_DATA_DIR: &str = "./data/history";
 
 /// 時系列データの既定の保持期間（日）。**90 日**
 /// （docs/chronogazer/recorder-requirements.md §3.4「保持期間既定 90 日（設定可）」）。
@@ -81,8 +85,8 @@ fn parse_retention(raw: Option<String>, default: Option<i64>) -> Option<i64> {
 /// `data.dir` / `retention.days`）。`apps/banto-hub/core/src/settings.rs` の
 /// 同名の型が手本。
 ///
-/// * `data_dir`: 時系列ファイル（`banto-tstore`）の置き場。既定は banto-hub に
-///   倣って `"./data"`。**相対パスの解決先**は
+/// * `data_dir`: 時系列ファイル（`banto-tstore`）の置き場。既定は `"./data/history"`
+///   （[`DEFAULT_DATA_DIR`]）。**相対パスの解決先**は
 ///   [`crate::collect::resolve_data_dir`]（アプリのデータディレクトリ基準）。
 /// * `retention_days`: 保持期間。既定 **90 日**
 ///   （docs/chronogazer/recorder-requirements.md §3.4）。`None` は「無制限」
@@ -259,7 +263,7 @@ mod tests {
         let svc = service().await;
         let config = store_config(&svc).await.unwrap();
         assert_eq!(config, StoreSettings::default());
-        assert_eq!(config.data_dir, "./data");
+        assert_eq!(config.data_dir, "./data/history");
         assert_eq!(config.retention_days, Some(90));
     }
 

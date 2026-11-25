@@ -52,16 +52,24 @@ gRPC は API キー認証が必須だが TLS が無いため、既定では起�
 
 ## 初回セットアップ
 
-初回起動時のみ環境変数 `BANTO_ALLOW_SETUP=1` を指定して起動し、
-`POST /api/auth/setup`（管理 UI 上では初回セットアップ画面）で最初の
-管理者アカウントを作成する。作成が終わったら一度サーバーを停止し、
-`BANTO_ALLOW_SETUP` を外して再起動すること — 立てたままだと誰でも管理者
-アカウントを作成できてしまう。
+banto v8 から、初回セットアップの画面・`POST /api/auth/setup`・
+`BANTO_ALLOW_SETUP` は無い。新しい DB の Hub は試運転モードで、loopback の
+bind（既定の `127.0.0.1`）でしか起動しない（LAN の bind では起動を断る）。
+最初の管理者は、**Hub・サービスを止めてから** `banto-hub create-admin` で作る。
+管理者の作成とロックダウン（ログイン必須）を 1 つのトランザクションで行い、
+以後は LAN の bind でも起動できる。
 
 ```powershell
-$env:BANTO_ALLOW_SETUP = "1"
-.\banto-hub.exe
+Stop-Service BantoHub            # サービスで動かしているとき（管理者の PowerShell）
+.\banto-hub.exe create-admin --username owner --display-name "オーナー"
+Start-Service BantoHub
 ```
+
+パスワードは端末からは非表示で 2 回尋ねる。スクリプトからは標準入力の 1 行目を
+読む（`Get-Content password.txt | .\banto-hub.exe create-admin --username owner`）。
+DB の場所は起動と同じ env（`BANTO_HUB_ROOT`・`BANTO_HUB_PROFILE`・`BANTO_DB`）で決まる
+ので、サービスに env を設定しているときは同じ値で実行する。Hub が動いている間は
+何も書かずに断る。
 
 詳細は
 [../../docs/hub/banto-hub-operations.md](../../docs/hub/banto-hub-operations.md)

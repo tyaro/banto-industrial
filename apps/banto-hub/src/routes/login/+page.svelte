@@ -14,12 +14,10 @@
 
 	// status() が解決するまでは未確定: 一瞬でも片方のフォームを描画して
 	// 出し直す「フラッシュ」を避けるため何も出さない。
-	let mode: 'loading' | 'setup' | 'login' = $state('loading');
+	let mode: 'loading' | 'login' = $state('loading');
 
 	let username = $state('');
 	let password = $state('');
-	let displayName = $state('');
-	let passwordConfirm = $state('');
 	let error: string | null = $state(null);
 	let submitting = $state(false);
 	let remember = $state(false);
@@ -27,7 +25,7 @@
 	// localStorage を読めるため）。
 	const loopback = isLoopbackOrigin();
 
-	// banto v2.0.0（#260、design §6.1）: ログイン・初回セットアップが
+	// banto v2.0.0（#260、design §6.1）: ログインが
 	// `superseded`（別のログイン・ログアウトが先に確定し、このログインは何も
 	// 保存しなかった）を返したら、エラーではなく通知して /status へ移る。保護
 	// ガード（`(app)/+layout.ts`）が今保存されている資格情報で確定する。
@@ -37,10 +35,8 @@
 	$effect(() => {
 		void (async () => {
 			await bantoReady;
-			const status = await getAuthProvider().status?.();
-			// status() が無い AuthProvider（古い/独自実装）: 通常のログイン
-			// フォームとして振る舞う。
-			mode = status && !status.initialized ? 'setup' : 'login';
+			// banto v8: 初回セットアップの画面は無い（最初の管理者は `banto-hub create-admin`）。
+			mode = 'login';
 		})();
 	});
 
@@ -64,75 +60,10 @@
 			submitting = false;
 		}
 	}
-
-	async function submitSetup(event: SubmitEvent) {
-		event.preventDefault();
-		error = null;
-
-		if (password.length < 8) {
-			error = 'パスワードは8文字以上で入力してください';
-			return;
-		}
-		if (password !== passwordConfirm) {
-			error = 'パスワードが一致しません';
-			return;
-		}
-
-		submitting = true;
-		try {
-			const setup = getAuthProvider().setup;
-			if (!setup) {
-				error = 'この環境では初期セットアップに対応していません';
-				return;
-			}
-			const result = await setup({ username, password, displayName });
-			if (result.success) {
-				goto(resolveAppPath('/status'));
-			} else if (result.superseded) {
-				notify('info', LOGIN_SUPERSEDED_MESSAGE);
-				goto(resolveAppPath('/status'));
-			} else {
-				error = result.error ?? 'セットアップに失敗しました';
-			}
-		} finally {
-			submitting = false;
-		}
-	}
 </script>
 
 <div class="page">
-	{#if mode === 'setup'}
-		<form onsubmit={submitSetup}>
-			<h1>🏮 {APP_NAME}</h1>
-			<p class="note">初回起動です。管理者アカウントを作成してください。</p>
-
-			<label>
-				表示名
-				<input type="text" bind:value={displayName} autocomplete="name" />
-			</label>
-
-			<label>
-				ユーザー名
-				<input type="text" bind:value={username} autocomplete="username" />
-			</label>
-
-			<label>
-				パスワード（8文字以上）
-				<input type="password" bind:value={password} autocomplete="new-password" />
-			</label>
-
-			<label>
-				パスワード（確認）
-				<input type="password" bind:value={passwordConfirm} autocomplete="new-password" />
-			</label>
-
-			{#if error}
-				<p class="error">{error}</p>
-			{/if}
-
-			<button type="submit" disabled={submitting}>アカウントを作成</button>
-		</form>
-	{:else if mode === 'login'}
+	{#if mode === 'login'}
 		<form onsubmit={submitLogin}>
 			<h1>🏮 {APP_NAME}</h1>
 
@@ -191,13 +122,6 @@
 		margin: 0;
 		text-align: center;
 		font-size: 1.5rem;
-	}
-
-	.note {
-		margin: 0;
-		text-align: center;
-		color: var(--banto-text-muted);
-		font-size: 0.8rem;
 	}
 
 	label {

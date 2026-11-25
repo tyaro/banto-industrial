@@ -3,26 +3,29 @@
  * §3.2・§4 の B2-2 の実装メモ）: `chronogazer-server` が配る画面に、この PC から
  * ログインなしで入る（grant `localDesktop`）。
  *
- * 固定したい受入条件（2026-10-14 オーナー決定 1〜7）:
- * 1. 新しいルートの `/` → ログインなしで監視画面。上に「管理者のアカウントがまだ
- *    ありません」の帯、ヘッダーに「この PC」。Tauri の内部オブジェクトがある窓
- *    （シェルがサービスへ navigate した窓と同じ。`__TAURI_INTERNALS__` を注入する）
- *    でも invoke を呼ばない（`isTauri()` の origin の判定）。
- * 2. 帯から初回セットアップへ → 「この PC からはログインなしで使う（管理者）」が
- *    既定でチェック → 作成すると、ログインせずに監視画面へ戻る（「この PC」のまま）。
- *    設定はデスクトップ専用（ウィンドウ効果・自動ログイン・フォルダを開く）を出さず、
- *    接続（LAN）はこの PC から変えられる。
+ * **banto v8 追従（ADR-0034、docs/banto-v8-upgrade-plan.md）**: 初回セットアップ（画面・
+ * `POST /api/auth/setup`・「管理者のアカウントがまだありません」の帯・初回の
+ * 「この PC からはログインなしで使う」のチェック）は無くなった。新しい DB はログインなしで
+ * 始まり、この PC からの接続は組み込みの `admin` として入る。ログイン必須の DB は
+ * 起動の前に `banto-serve create-admin`（管理者の作成とログイン必須への切り替えを 1 度に
+ * 行う、上流と同じ形）で作り、この PC からの接続は設定 `auth.local_grant`（既定 off）で選ぶ。
+ *
+ * 固定したい受入条件（2026-10-14 オーナー決定 1〜7 を v8 の形に直した）:
+ * 1. 新しいルートの `/` → ログインなしで監視画面（ヘッダーに「この PC」）。Tauri の内部
+ *    オブジェクトがある窓（シェルがサービスへ navigate した窓と同じ。`__TAURI_INTERNALS__` を
+ *    注入する）でも invoke を呼ばない（`isTauri()` の origin の判定）。設定はデスクトップ専用
+ *    （ウィンドウ効果・自動ログイン・フォルダを開く）を出さず、接続（LAN）はこの PC から
+ *    変えられる。
  * 3. サーバーを再起動しても、新しいブラウザーの文脈で `/` → ログインなしで監視画面。
- * 4. ログアウト → ログイン画面（自動では入り直さない）に「この PC として続ける」→
- *    押すと監視画面。
+ * 4. ログイン必須で `auth.local_grant = admin`: ログアウト → ログイン画面（自動では入り直さない）に
+ *    「この PC として続ける」→ 押すと監視画面。
  * 4b. 閲覧公開も ON のとき、ログイン画面の「この PC として続ける」→ 監視画面 → 戻る →
  *    「閲覧のみで続ける」で閲覧者（`publicViewer`・viewer）に切り替わる（残っていた
  *    この PC の admin のセッションのまま進まない。#392 B2-2 のレビュー）。
  * 5. 設定 › セキュリティでこの PC からの接続を「使わない」にすると、自分のセッションも
  *    閉じてログイン画面へ。再起動の後も `/` はログイン画面。
- * 6. 別の新しいルートでチェックを外して作成すると、今までどおり作ったアカウントの
- *    セッションで監視画面へ（「この PC」ではない）。新しい文脈の `/` はログイン画面
- *    （grant は閉じている）。
+ * 6. ログイン必須で既定（`auth.local_grant` = off）: 新しい文脈の `/` はログイン画面
+ *    （grant は閉じている。「この PC として続ける」は出ない）。
  *
  * サーバーはこのスペックが子プロセスとして起動・再起動・停止する
  * （`chronogazer-server.playwright.config.ts` の doc）。データのルートはこの実行の
@@ -37,7 +40,7 @@ import {
 	type BrowserContext,
 	type Page
 } from '@playwright/test';
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
@@ -55,9 +58,14 @@ const serverBin = path.join(
 	process.platform === 'win32' ? 'chronogazer-server.exe' : 'chronogazer-server'
 );
 
+const ADMIN_USERNAME = 'e2e-owner';
 const ADMIN_PASSWORD = 'E2eServerAdmin1';
-const BANNER_TEXT = '管理者のアカウントがまだありません';
-const OPT_IN_LABEL = 'この PC からはログインなしで使う（管理者）';
+const bantoServeBin = path.join(
+	repoRoot,
+	'target',
+	'debug',
+	process.platform === 'win32' ? 'banto-serve.exe' : 'banto-serve'
+);
 
 /** `port` に TCP で接続できるか（1 回だけ試す）。 */
 function canConnect(port: number): Promise<boolean> {
@@ -199,16 +207,43 @@ async function expectThisPcSession(page: Page): Promise<void> {
 	await expect(page.locator('header').getByRole('button', { name: 'ログアウト' })).toBeVisible();
 }
 
-async function createFirstAdmin(page: Page, username: string, optIn: boolean): Promise<void> {
-	await expect(page.getByText('初回起動です。管理者アカウントを作成してください。')).toBeVisible();
-	const checkbox = page.getByLabel(OPT_IN_LABEL);
-	await expect(checkbox).toBeChecked();
-	if (!optIn) await checkbox.uncheck();
-	await page.getByLabel('表示名').fill(`E2E ${username}`);
-	await page.getByLabel('ユーザー名').fill(username);
-	await page.getByLabel('パスワード（8文字以上）').fill(ADMIN_PASSWORD);
-	await page.getByLabel('パスワード（確認）').fill(ADMIN_PASSWORD);
-	await page.getByRole('button', { name: 'アカウントを作成' }).click();
+/**
+ * 起動の前に、`root` の DB に管理者を作ってログイン必須にする（`banto-serve create-admin`、
+ * banto v8 の最初の管理者。パスワードは標準入力）。サーバーは止めておく。
+ */
+function createAdminOffline(root: string): void {
+	expect(fs.existsSync(bantoServeBin), `${bantoServeBin} がありません（README のビルド前提）`).toBe(
+		true
+	);
+	fs.mkdirSync(root, { recursive: true });
+	const created = spawnSync(
+		bantoServeBin,
+		['create-admin', '--username', ADMIN_USERNAME, '--display-name', 'E2E サーバー管理者'],
+		{
+			env: { ...process.env, BANTO_DB: path.join(root, 'chronogazer.sqlite3') },
+			input: `${ADMIN_PASSWORD}\n`,
+			encoding: 'utf8',
+			windowsHide: true
+		}
+	);
+	expect(created.status, `create-admin: ${created.stdout}${created.stderr}`).toBe(0);
+}
+
+/** 作った管理者でログインし、この PC からの接続（`auth.local_grant`）を `role` にする。 */
+async function setLocalGrant(request: APIRequestContext, role: string): Promise<void> {
+	const login = await request.post(`${BASE_URL}/api/auth/login`, {
+		headers: CSRF_HEADERS,
+		data: { username: ADMIN_USERNAME, password: ADMIN_PASSWORD }
+	});
+	expect(login.ok(), await login.text()).toBe(true);
+	const { token } = (await login.json()) as { token: string };
+	const headers = { ...CSRF_HEADERS, Authorization: `Bearer ${token}` };
+	const saved = await request.put(`${BASE_URL}/api/settings/auth`, {
+		headers,
+		data: { localGrant: role }
+	});
+	expect(saved.ok(), await saved.text()).toBe(true);
+	await request.post(`${BASE_URL}/api/auth/logout`, { headers });
 }
 
 /**
@@ -234,12 +269,12 @@ async function setViewerPublic(request: APIRequestContext, on: boolean): Promise
 	await request.post(`${BASE_URL}/api/auth/logout`, { headers });
 }
 
-test.describe.serial('この PC からの接続（初回セットアップで選ぶ）', () => {
+test.describe.serial('この PC からの接続（新しい DB はログインなし）', () => {
 	let root: string;
 	let server: RunningServer | null = null;
 
 	test.beforeAll(async () => {
-		root = freshRoot('opt-in');
+		root = freshRoot('no-login');
 		server = await startServer(root);
 	});
 
@@ -247,40 +282,21 @@ test.describe.serial('この PC からの接続（初回セットアップで選
 		await server?.stop();
 	});
 
-	test('1. 未初期化の / はログインなしで監視画面、上に作成の案内', async ({ browser }) => {
-		const { context, page, problems } = await shellLikeContext(browser);
-		await page.goto('/');
-		await expectThisPcSession(page);
-		await expect(page.getByRole('status').getByText(BANNER_TEXT)).toBeVisible();
-		expect(await invokedCommands(page)).toEqual([]);
-		expect(problems).toEqual([]);
-		await context.close();
-	});
-
-	test('2. 案内から作成（既定でチェック）→ ログインなしで監視画面に戻る、デスクトップ専用の設定は出ない', async ({
+	test('1. 新しい / はログインなしで監視画面、デスクトップ専用の設定は出ない', async ({
 		browser
 	}) => {
 		const { context, page, problems } = await shellLikeContext(browser);
 		await page.goto('/');
 		await expectThisPcSession(page);
-		await page.getByRole('link', { name: '管理者を作成する' }).click();
-		await expect(page).toHaveURL(/\/login$/);
-		await createFirstAdmin(page, 'e2e-owner', true);
-
-		await expectThisPcSession(page);
-		await expect(page.getByText(BANNER_TEXT)).toHaveCount(0);
 
 		// 外観: ウィンドウ効果（Acrylic）は出ない。
 		await page.goto('/settings/appearance');
 		await expect(page.getByRole('heading', { name: 'テーマ' })).toBeVisible();
 		await expect(page.getByRole('heading', { name: 'ウィンドウ効果' })).toHaveCount(0);
-		// アカウント: 自動ログインは出ず、パスワード変更の代わりに案内。
+		// アカウント: 自動ログインは出ない。
 		await page.goto('/settings/account');
 		await expect(page.getByRole('heading', { name: 'アカウント' })).toBeVisible();
 		await expect(page.getByRole('heading', { name: '自動ログイン' })).toHaveCount(0);
-		await expect(
-			page.getByText('この PC からの接続（ログインなし）ではアカウントがない')
-		).toBeVisible();
 		// データ: フォルダを開くは出ない。
 		await page.goto('/settings/data');
 		await expect(page.getByRole('heading', { name: 'バックアップ/リストア' })).toBeVisible();
@@ -289,9 +305,6 @@ test.describe.serial('この PC からの接続（初回セットアップで選
 		await page.goto('/settings/connectivity');
 		await expect(page.getByRole('button', { name: '保存して適用' })).toBeVisible();
 		await expect(page.getByText('状態:')).toBeVisible();
-		// セキュリティ: この PC からの接続は「管理者」。
-		await page.goto('/settings/security');
-		await expect(page.getByTestId('local-grant-select')).toHaveValue('admin');
 
 		expect(await invokedCommands(page)).toEqual([]);
 		expect(problems).toEqual([]);
@@ -304,9 +317,28 @@ test.describe.serial('この PC からの接続（初回セットアップで選
 		const { context, page, problems } = await shellLikeContext(browser);
 		await page.goto('/');
 		await expectThisPcSession(page);
-		await expect(page.getByText(BANNER_TEXT)).toHaveCount(0);
 		expect(problems).toEqual([]);
 		await context.close();
+	});
+});
+
+test.describe.serial('この PC からの接続（ログイン必須で「管理者」を選ぶ）', () => {
+	let root: string;
+	let server: RunningServer | null = null;
+
+	test.beforeAll(async ({ request }) => {
+		root = freshRoot('opt-in');
+		createAdminOffline(root);
+		// ログイン必須で起動した直後はこの PC からの接続は閉じている（既定 off）ので、作った管理者で
+		// ログインして `admin` にし、**再起動**で開く（開く方向は次の起動から。local_grant.rs）。
+		server = await startServer(root);
+		await setLocalGrant(request, 'admin');
+		await server.stop();
+		server = await startServer(root);
+	});
+
+	test.afterAll(async () => {
+		await server?.stop();
 	});
 
 	test('4. ログアウト → ログイン画面に「この PC として続ける」→ 監視画面', async ({ browser }) => {
@@ -387,35 +419,26 @@ test.describe.serial('この PC からの接続（初回セットアップで選
 	});
 });
 
-test.describe.serial('この PC からの接続（初回セットアップで選ばない）', () => {
+test.describe.serial('この PC からの接続（ログイン必須で既定のまま）', () => {
 	let server: RunningServer | null = null;
 
 	test.beforeAll(async () => {
-		server = await startServer(freshRoot('opt-out'));
+		const root = freshRoot('opt-out');
+		createAdminOffline(root);
+		server = await startServer(root);
 	});
 
 	test.afterAll(async () => {
 		await server?.stop();
 	});
 
-	test('6. チェックを外して作成 → 作ったアカウントで監視画面、新しい文脈の / はログイン画面', async ({
-		browser
-	}) => {
+	test('6. 新しい文脈の / はログイン画面（grant は閉じている）', async ({ browser }) => {
 		const { context, page, problems } = await shellLikeContext(browser);
 		await page.goto('/');
-		await expectThisPcSession(page);
-		await page.getByRole('link', { name: '管理者を作成する' }).click();
-		await createFirstAdmin(page, 'e2e-optout', false);
-		await expect(page).toHaveURL(/\/monitor$/);
-		await expect(page.locator('header').getByRole('button', { name: 'ログアウト' })).toBeVisible();
-		await expect(page.locator('header').getByText('この PC', { exact: true })).toHaveCount(0);
+		await expect(page).toHaveURL(/\/login$/);
+		await expect(page.getByRole('button', { name: 'ログイン', exact: true })).toBeVisible();
+		await expect(page.getByRole('button', { name: 'この PC として続ける' })).toHaveCount(0);
 		expect(problems).toEqual([]);
 		await context.close();
-
-		const fresh = await shellLikeContext(browser);
-		await fresh.page.goto('/');
-		await expect(fresh.page).toHaveURL(/\/login$/);
-		await expect(fresh.page.getByRole('button', { name: 'この PC として続ける' })).toHaveCount(0);
-		await fresh.context.close();
 	});
 });

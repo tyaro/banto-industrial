@@ -253,6 +253,10 @@ async fn commissioning_lock_down_flips_state_and_revokes_the_grant() {
     // 以後 grant は出ない。
     let (status, _) = grant_request(&env.router, Some(LOOPBACK_PEER)).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+    // banto v8: banto の設定もログイン必須に揃う（0015 の `auth.disabled = true` を残さない。
+    // `create-admin` と同じ）。
+    let settings = crate::settings::SettingsService::new(crate::db::Db::Sqlite(env.pool.clone()));
+    assert!(!settings.auth_config().await.unwrap().disabled);
 
     let (actor, detail): (Option<String>, Option<String>) = sqlx::query_as(
         "SELECT actor_username, detail FROM audit_log WHERE action = 'lock_down' ORDER BY id DESC LIMIT 1",
@@ -379,7 +383,12 @@ async fn an_issuance_parked_before_the_insert_loses_to_a_lock_down_that_complete
     let users = UsersService::new(Db::Sqlite(pool.clone()));
     let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
     users
-        .setup_first_user("testadmin", "password123", "管理者")
+        .create_user(
+            "testadmin",
+            "password123",
+            "管理者",
+            crate::users::Role::Admin,
+        )
         .await
         .expect("setup_first_user");
     let auth = user_auth_state(users.clone(), audit.clone());
@@ -420,7 +429,6 @@ async fn an_issuance_parked_before_the_insert_loses_to_a_lock_down_that_complete
         users.clone(),
         auth.clone(),
         audit.clone(),
-        false,
         Arc::new(registry),
         None,
     )
