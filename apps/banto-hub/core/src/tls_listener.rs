@@ -23,8 +23,34 @@
 //! 持っていても、次の読み書きは EOF かエラーになり（待っている読み書きも起こされる）、相手にも
 //! FIN が届く。印が立った後の [`SeverableTcp`] の読み書きはエラーを返し、印が立った後に
 //! 登録しようとした接続（失効と受け付けが競った）もすぐ閉じる。複製は包んだ側の drop で
-//! 登録から外して閉じる。最後に serve のタスクを abort するので、待ち受けのポートも閉じ、
-//! handshake の途中のものも捨てる。
+//! 登録から外して閉じる。最後に listener の停止を要求する（[`banto_server::StopHandle::request_stop`]）
+//! ので、待ち受けのポートも閉じ、handshake の途中のものも捨てる。
+//!
+//! ## 書き込みの切り離し（#947、banto ADR-0035 §9）
+//!
+//! この listener も router を `axum::serve` に直に渡さず、[`banto_server::BoundServer::from_listener`]
+//! で包んで `serve` に通す。平文の 8722（`banto_server::start`）と同じ 1 本のコードを通るので、
+//! 書き込み（POST・PUT・PATCH・DELETE）は接続から切り離されて、クライアントが落ちても最後まで
+//! 走り、停止の門（停止の後の書き込みは 503）と数え上げ（[`banto_server::StopOutcome`]）、
+//! `ConnectInfo<SocketAddr>`（`accept` が返した相手。ループバックの判定に使う）もそのまま掛かる。
+//!
+//! - **枠の共有**: 新規の受付の枠（[`banto_server::WriteBudget`]）は、Hub の平文の listener と
+//!   TLS の listener と、証明書の更新・失効の後に作り直した TLS の世代のすべてで 1 つを共有する
+//!   （[`ListenerWrites`]）。同じ router の書き込みなので、口が増えても同時に走る数の上限は増やさない。
+//!   作り直しの間も、もう一方の口の門は開いたままで、その書き込みは切り離されたまま。
+//! - **失効と切り離し**: 失効（[`TlsRevoker::revoke`]）は、張られた接続をすぐ切り、停止を要求する
+//!   （門を閉じ、ポートを閉じる）が、**受理済みの書き込みは止めない**。ADR-0035 §4 の約束（受理した
+//!   書き込みを途中で止めない。止めれば「途中で止まる」を自分で起こす）を失効でも守る。失効が防ぐ
+//!   のは、その証明書で**これから**届く要求で、失効の前に受け付けて認可を済ませた書き込みではない。
+//!   失効の後の書き込みは、開いたままの接続に来たものも、門で 503 になるか、切れた接続で届かない。
+//! - **停止の待ち方**: 通常の停止（[`RunningTlsListener::stop`]）は、受理済みの書き込みを上限
+//!   （`banto_server::DETACHED_WRITES_STOP_TIMEOUT`）まで待つ。失効で止めた世代は待たない（監視の
+//!   周期や同じポートでの作り直しを書き込みで止めない）。どちらでも残った書き込みは
+//!   [`ListenerWrites`] が持ち続け、Hub の終了（`RunningHub::shutdown_and_report`）が全部の門を
+//!   先に閉じてから、平文・TLS の停止と並べて同じ上限で待つ。
+//! - 通常の停止の接続の上限は banto の `STOP_TIMEOUT`（5 秒。過ぎたら serve のタスクを中断）に
+//!   なる（以前のこのモジュールの 3 秒より長い。平文の 8722 と同じ）。upgrade 済みの WebSocket
+//!   などがそれでも残りうるのは今までどおり（上の節）。
 
 use std::{
     collections::HashMap,
@@ -42,13 +68,14 @@ use std::{
     time::Duration,
 };
 
-use axum::serve::{Listener, ListenerExt};
+use axum::serve::Listener;
+use banto_server::{BoundServer, RemainingWrites, RunningServer, StopHandle, WriteBudget};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
     sync::oneshot,
-    task::{AbortHandle, JoinHandle, JoinSet},
+    task::JoinSet,
 };
 use tokio_rustls::{
     rustls::{
@@ -62,7 +89,6 @@ use zeroize::Zeroizing;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_PENDING_HANDSHAKES: usize = 32;
-const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone)]
 pub(crate) struct TlsConfig {
@@ -354,6 +380,9 @@ struct TlsListener {
     acceptor: Arc<RwLock<TlsAcceptor>>,
     severance: Arc<Severance>,
     handshakes: JoinSet<Option<(TlsStream<SeverableTcp>, SocketAddr)>>,
+    /// 開始の合図（[`start_inner`]）。届くまで最初の accept をしない（共有の停止口への登録の
+    /// 前に接続を受け付けない）。合図の送り手が捨てられたら受け付けない（停止を待つ）。
+    begin: Option<oneshot::Receiver<()>>,
 }
 
 impl Listener for TlsListener {
@@ -361,6 +390,14 @@ impl Listener for TlsListener {
     type Addr = SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        if let Some(begin) = &mut self.begin {
+            // `&mut` で待つので、この future が捨てられても合図を失わない。
+            let begun = begin.await.is_ok();
+            self.begin = None;
+            if !begun {
+                std::future::pending::<()>().await;
+            }
+        }
         loop {
             tokio::select! {
                 ready = self.handshakes.join_next(), if !self.handshakes.is_empty() => {
@@ -393,12 +430,96 @@ impl Listener for TlsListener {
     }
 }
 
+/// Hub の待ち受けのすべて（平文・TLS・作り直した TLS の世代）が共有する書き込みの勘定
+/// （#947、banto ADR-0035 §9。モジュール doc「書き込みの切り離し」）。複製は同じものを指す。
+///
+/// - 新規の受付の枠（[`WriteBudget`]）。平文の listener の [`RunningServer::write_budget`] から
+///   作り（[`Self::sharing`]）、TLS の各世代に `with_write_budget` で渡す。
+/// - 各 listener の停止口（[`StopHandle`]）。Hub の終了は、待つ前に**全部の門を先に閉じる**
+///   （[`Self::close_all`]。どの口も書き込みを始めない状態にしてから待つ）。
+/// - 止めた世代に残った書き込み（[`RemainingWrites`]）。`stop_all` が待つのは渡した listener
+///   だけなので、作り直しで止めた世代の残りはここで持ち続け、終了で待つ（[`Self::wait_left`]）。
+#[derive(Clone, Default)]
+pub(crate) struct ListenerWrites {
+    budget: WriteBudget,
+    shared: Arc<Mutex<WritesShared>>,
+}
+
+#[derive(Default)]
+struct WritesShared {
+    gates: Vec<StopHandle>,
+    left: Vec<RemainingWrites>,
+}
+
+impl ListenerWrites {
+    /// `budget`（平文の listener の枠）を共有する勘定。
+    pub(crate) fn sharing(budget: WriteBudget) -> Self {
+        Self {
+            budget,
+            shared: Arc::default(),
+        }
+    }
+
+    fn shared(&self) -> std::sync::MutexGuard<'_, WritesShared> {
+        self.shared.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub(crate) fn budget(&self) -> WriteBudget {
+        self.budget.clone()
+    }
+
+    /// 全世代を通して、いま走っている書き込みの数（0 なら、どの口の書き込みも残っていない）。
+    pub(crate) fn running(&self) -> usize {
+        self.budget.running()
+    }
+
+    /// listener の停止口を覚える（[`Self::close_all`] で門を閉じるため）。止めた口は外す。
+    pub(crate) fn register(&self, gate: StopHandle) {
+        let mut shared = self.shared();
+        shared.gates.retain(|gate| !gate.is_stop_requested());
+        shared.gates.push(gate);
+    }
+
+    /// 止めた世代に残った書き込みを、終わるまで持つ。終わったものは外す。
+    pub(crate) fn keep(&self, remaining: RemainingWrites) {
+        let mut shared = self.shared();
+        shared.left.retain(|left| !left.is_finished());
+        shared.left.push(remaining);
+    }
+
+    /// 覚えたすべての listener の停止を要求する（門を閉じ、受付をやめる。待たない。ADR-0035 §9
+    /// の「全部の門を先に閉じ」）。受理済みの書き込みは止めない。
+    pub(crate) fn close_all(&self) {
+        for gate in &self.shared().gates {
+            gate.request_stop();
+        }
+    }
+
+    /// 止めた世代に残った書き込みが終わるのを、全体で `limit` まで待つ。全部終わったら `true`。
+    pub(crate) async fn wait_left(&self, limit: Duration) -> bool {
+        let left: Vec<RemainingWrites> = self.shared().left.clone();
+        let deadline = tokio::time::Instant::now() + limit;
+        let mut finished = true;
+        for remaining in left {
+            let rest = deadline.saturating_duration_since(tokio::time::Instant::now());
+            finished &= remaining.wait(rest).await;
+        }
+        finished
+    }
+
+    #[cfg(test)]
+    fn left_count(&self) -> usize {
+        self.shared().left.iter().map(RemainingWrites::count).sum()
+    }
+}
+
 pub struct RunningTlsListener {
     #[cfg(windows)]
     acceptor: Option<Arc<RwLock<TlsAcceptor>>>,
     local_addr: SocketAddr,
-    shutdown: oneshot::Sender<()>,
-    task: JoinHandle<()>,
+    /// banto の `serve` で動く listener（#947。書き込みの切り離し・停止の門・数え上げ）。
+    server: RunningServer,
+    writes: ListenerWrites,
     severance: Arc<Severance>,
     // Shell transport keeps its origin reserved even if serve unexpectedly exits.
     _reservation: Option<std::net::TcpListener>,
@@ -415,7 +536,7 @@ pub struct TlsRevoker {
 enum RevocationTarget {
     Listener {
         severance: Arc<Severance>,
-        abort: Arc<AbortHandle>,
+        stop: StopHandle,
     },
     #[cfg(windows)]
     Following(Arc<Mutex<FollowingRevocation>>),
@@ -429,14 +550,17 @@ struct FollowingRevocation {
 }
 
 impl TlsRevoker {
-    /// 張られた接続をすべて OS の上で閉じ、serve のタスクを abort する（待ち受けのポートも閉じる）。
-    /// 待たない（同期）。何度呼んでもよい。止めた後は再開しない。
+    /// 張られた接続をすべて OS の上で閉じ、listener の停止を要求する（書き込みの門を閉じ、受付を
+    /// やめて待ち受けのポートも閉じる）。待たない（同期）。何度呼んでもよい。止めた後は再開しない。
     /// デスクトップ監視の共有ハンドルは、復帰した listener にも同じ停止の印を伝える。
+    ///
+    /// 受理済みの書き込み（切り離したタスク）は止めない（#947、ADR-0035 §4・§9。モジュール doc
+    /// 「書き込みの切り離し」）。失効の後に届く書き込みは、門で 503 になるか、切れた接続で届かない。
     pub fn revoke(&self) {
         match &self.target {
-            RevocationTarget::Listener { severance, abort } => {
+            RevocationTarget::Listener { severance, stop } => {
                 severance.sever();
-                abort.abort();
+                stop.request_stop();
             }
             #[cfg(windows)]
             RevocationTarget::Following(shared) => {
@@ -562,8 +686,16 @@ impl RunningTlsListener {
         }
         Ok(())
     }
+    /// 停止（失効を含む）が要求されておらず、受付のタスクが動いているか（banto の
+    /// `RunningServer::is_serving`。失効の直後から偽）。
     pub(crate) fn is_serving(&self) -> bool {
-        !self.task.is_finished()
+        self.server.is_serving()
+    }
+
+    /// この listener が書き込みを数える勘定（作り直しの次の世代に渡す）。
+    #[cfg(windows)]
+    pub(crate) fn writes(&self) -> &ListenerWrites {
+        &self.writes
     }
     /// Close current connections (including upgraded WS), retaining the bound socket.
     pub(crate) fn disconnect_clients(&self) {
@@ -580,48 +712,83 @@ impl RunningTlsListener {
         TlsRevoker {
             target: RevocationTarget::Listener {
                 severance: self.severance.clone(),
-                abort: Arc::new(self.task.abort_handle()),
+                stop: self.server.stop_handle(),
             },
         }
     }
 
-    pub async fn stop(mut self) {
-        let _ = self.shutdown.send(());
-        if tokio::time::timeout(STOP_TIMEOUT, &mut self.task)
-            .await
-            .is_err()
-        {
-            // Long-lived upgraded WebSockets can outlive graceful shutdown.
-            self.task.abort();
-            let _ = self.task.await;
+    /// 止める（banto の `RunningServer::stop`）。門を閉じて graceful shutdown を送り、接続は
+    /// banto の上限まで待って serve のタスクを中断する（upgrade 済みの WebSocket などは残りうる）。
+    /// 受理済みの書き込みは、通常の停止では上限まで待ち、失効で止めた世代では待たない。残った
+    /// 書き込みはログに出し、[`ListenerWrites`] が持ち続ける（Hub の終了で待つ。モジュール doc
+    /// 「書き込みの切り離し」）。
+    pub async fn stop(self) {
+        let RunningTlsListener {
+            server,
+            writes,
+            severance,
+            _reservation,
+            ..
+        } = self;
+        let revoked = severance.is_severed();
+        let outcome = if revoked {
+            server.stop_waiting_writes_for(Duration::ZERO).await
+        } else {
+            server.stop().await
+        };
+        if let Some(remaining) = outcome.remaining() {
+            crate::hub_log::log_err_line(&format!(
+                "[WARN] banto-hub: TLS の待ち受けを{}止めた後も書き込みが {} 件走っています（止めずに最後まで走らせ、Hub の終了で待ちます）: {}",
+                if revoked { "失効で" } else { "" },
+                remaining.count(),
+                remaining.operations().join(", ")
+            ));
+            writes.keep(remaining);
         }
+        // shell の予約は、待ち受けを止め終えてから離す。
+        drop(_reservation);
     }
 }
 
+/// 書き込みの枠を自分だけで持つ TLS の listener（ほかの口と枠を共有しない呼び手・試験向け）。
+/// Hub の待ち受けは [`start_sharing`] で平文の listener と枠を共有する。
 pub(crate) async fn start(
     config: &TlsConfig,
     app: axum::Router,
 ) -> Result<RunningTlsListener, TlsError> {
+    start_sharing(config, app, &ListenerWrites::default()).await
+}
+
+/// `writes`（平文の listener と共有する書き込みの勘定。モジュール doc「書き込みの切り離し」）で
+/// 書き込みを数える TLS の listener。
+pub(crate) async fn start_sharing(
+    config: &TlsConfig,
+    app: axum::Router,
+    writes: &ListenerWrites,
+) -> Result<RunningTlsListener, TlsError> {
     #[cfg(windows)]
     {
-        start_inner(config, app, None, None).await
+        start_inner(config, app, None, writes, None).await
     }
     #[cfg(not(windows))]
     {
-        start_inner(config, app, None).await
+        start_inner(config, app, None, writes).await
     }
 }
 
-/// 再 bind の serve は、永続の失効印を登録してからだけ動かす。
+/// 再 bind の serve は、永続の失効印を登録してからだけ動かす。`writes` は前の世代と同じ勘定。
 #[cfg(windows)]
 pub(crate) async fn start_following(
     config: &TlsConfig,
     app: axum::Router,
     follows: &TlsRevoker,
+    writes: &ListenerWrites,
 ) -> Result<RunningTlsListener, TlsError> {
-    start_inner(config, app, None, Some((follows, false))).await
+    start_inner(config, app, None, writes, Some((follows, false))).await
 }
 
+/// shell の HTTPS の口。プロセスの終わりまで持ち、Hub の作り直しをまたぐので、書き込みの枠は
+/// Hub の待ち受けと共有せず自分だけで持つ。
 #[cfg(windows)]
 pub(crate) async fn start_reserved(
     config: &TlsConfig,
@@ -632,7 +799,7 @@ pub(crate) async fn start_reserved(
         config,
         app,
         Some(excluded_ports),
-        #[cfg(windows)]
+        &ListenerWrites::default(),
         None,
     )
     .await
@@ -643,8 +810,9 @@ pub(crate) async fn start_renewed(
     config: &TlsConfig,
     app: axum::Router,
     follows: &TlsRevoker,
+    writes: &ListenerWrites,
 ) -> Result<RunningTlsListener, TlsError> {
-    start_inner(config, app, None, Some((follows, true))).await
+    start_inner(config, app, None, writes, Some((follows, true))).await
 }
 
 /// Bound OS-selected shell port; never consume the disk identity's 8723 port.
@@ -727,21 +895,17 @@ pub(crate) async fn start_plain_reserved(
         tcp,
         severance: severance.clone(),
     };
-    let (shutdown, receiver) = oneshot::channel();
-    let task = tokio::spawn(async move {
-        let _ = axum::serve(
-            listener.tap_io(|_| {}),
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async {
-            let _ = receiver.await;
-        })
-        .await;
-    });
+    // TLS の口と同じく banto の `serve` に通す（#947。モジュール doc「書き込みの切り離し」）。
+    // shell の口なので枠は自分だけで持つ（[`start_reserved`]）。
+    let server = BoundServer::from_listener(listener)
+        .map_err(|err| TlsError::Bind(io::Error::other(err.to_string())))?
+        .serve(app);
+    let writes = ListenerWrites::default();
+    writes.register(server.stop_handle());
     Ok(RunningTlsListener {
         local_addr,
-        shutdown,
-        task,
+        server,
+        writes,
         severance,
         _reservation: Some(reservation),
     })
@@ -751,6 +915,7 @@ async fn start_inner(
     config: &TlsConfig,
     app: axum::Router,
     reserve: Option<&[u16]>,
+    writes: &ListenerWrites,
     #[cfg(windows)] follows: Option<(&TlsRevoker, bool)>,
 ) -> Result<RunningTlsListener, TlsError> {
     let acceptor = Arc::new(RwLock::new(config.acceptor()?));
@@ -770,36 +935,29 @@ async fn start_inner(
     };
     let local_addr = tcp.local_addr().map_err(TlsError::Bind)?;
     let severance = Arc::new(Severance::default());
+    // serve と共有停止口への登録の間にも別 worker は動ける。accept は登録後まで待たせる。
+    let (begin, begun) = oneshot::channel();
     let listener = TlsListener {
         tcp,
         acceptor: acceptor.clone(),
         severance: severance.clone(),
         handshakes: JoinSet::new(),
+        begin: Some(begun),
     };
-    let (shutdown, receiver) = oneshot::channel();
-    // spawn と共有停止口への登録の間にも別 worker は動ける。accept は登録後まで待たせる。
-    let (begin, begun) = oneshot::channel();
-    let task = tokio::spawn(async move {
-        if begun.await.is_err() {
-            return;
-        }
-        let _ = axum::serve(
-            // TapIo supplies axum's generic Connected<Addr> implementation
-            // for custom listeners, preserving ConnectInfo<SocketAddr>.
-            listener.tap_io(|_| {}),
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async {
-            let _ = receiver.await;
-        })
-        .await;
-    });
+    // #947（banto ADR-0035 §9）: router を `axum::serve` に直に渡さず、banto の `serve` に通す。
+    // 平文の listener と同じ切り離しの層・停止の門・数え上げ・`ConnectInfo<SocketAddr>`（banto が
+    // `tap_io` で `accept` の相手を渡す）が掛かる。枠は `writes` で平文の listener と共有する。
+    let server = BoundServer::from_listener(listener)
+        .map_err(|err| TlsError::Bind(io::Error::other(err.to_string())))?
+        .with_write_budget(writes.budget())
+        .serve(app);
+    writes.register(server.stop_handle());
     let running = RunningTlsListener {
         #[cfg(windows)]
         acceptor: Some(acceptor),
         local_addr,
-        shutdown,
-        task,
+        server,
+        writes: writes.clone(),
         severance,
         _reservation: reservation,
     };
@@ -855,8 +1013,9 @@ mod tests {
         following.retire_identity();
         assert!(stale.is_revoked());
         assert!(!stale.externally_stopped());
+        let writes = listener.writes().clone();
         listener.stop().await;
-        let replacement = start_renewed(&next, Router::new(), &following)
+        let replacement = start_renewed(&next, Router::new(), &following, &writes)
             .await
             .unwrap();
         assert!(
@@ -867,7 +1026,7 @@ mod tests {
         assert!(following.externally_stopped());
         replacement.stop().await;
         assert!(
-            start_renewed(&next, Router::new(), &following)
+            start_renewed(&next, Router::new(), &following, &writes)
                 .await
                 .is_err(),
             "public external stop is permanent across all renewals"
@@ -966,27 +1125,6 @@ mod tests {
             start(&config, Router::new()).await,
             Err(TlsError::Certificate)
         ));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn stop_aborts_a_stalled_server_task() {
-        let (shutdown, _receiver) = oneshot::channel();
-        let (held_sender, held_receiver) = oneshot::channel::<()>();
-        let task = tokio::spawn(async move {
-            let _held_sender = held_sender;
-            std::future::pending::<()>().await;
-        });
-        let server = RunningTlsListener {
-            #[cfg(windows)]
-            acceptor: None,
-            local_addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
-            shutdown,
-            task,
-            severance: Arc::default(),
-            _reservation: None,
-        };
-        server.stop().await;
-        assert!(held_receiver.await.is_err());
     }
 
     #[tokio::test]
@@ -1315,6 +1453,179 @@ mod tests {
             "通常の停止で接続が切れた（比べの前提が変わった）"
         );
     }
+    /// 書き込みの試験の router の中身: 受理した書き込みが始まったら相手（`ConnectInfo`）を
+    /// 知らせ、`release` まで待ってから `done` を立てる。
+    struct WriteProbe {
+        started: tokio::sync::mpsc::UnboundedSender<SocketAddr>,
+        release: tokio::sync::Notify,
+        done: AtomicBool,
+    }
+
+    /// `POST /write` が [`WriteProbe`] で止まる TLS の listener（#947）。
+    async fn write_server(
+        writes: &ListenerWrites,
+    ) -> (
+        RunningTlsListener,
+        Arc<tokio_rustls::rustls::ClientConfig>,
+        Arc<WriteProbe>,
+        tokio::sync::mpsc::UnboundedReceiver<SocketAddr>,
+    ) {
+        let key_pair = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let config = TlsConfig::in_memory(
+            0,
+            key_pair.cert.pem().into_bytes(),
+            Zeroizing::new(key_pair.signing_key.serialize_pem().into_bytes()),
+        );
+        let (started, started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let probe = Arc::new(WriteProbe {
+            started,
+            release: tokio::sync::Notify::new(),
+            done: AtomicBool::new(false),
+        });
+        let handler_probe = probe.clone();
+        let app = Router::new().route(
+            "/write",
+            axum::routing::post(
+                move |axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>| {
+                    let probe = handler_probe.clone();
+                    async move {
+                        let _ = probe.started.send(peer);
+                        probe.release.notified().await;
+                        probe.done.store(true, Ordering::SeqCst);
+                        "written"
+                    }
+                },
+            ),
+        );
+        let server = start_sharing(&config, app, writes).await.unwrap();
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots.add(key_pair.cert.der().clone()).unwrap();
+        let client = Arc::new(
+            tokio_rustls::rustls::ClientConfig::builder_with_provider(Arc::new(
+                tokio_rustls::rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+        );
+        (server, client, probe, started_rx)
+    }
+
+    /// TLS で `POST /write` を送り切り、書き込みが始まるまで待つ。返すのは開いたままの接続と、
+    /// その接続の手元のアドレス。
+    async fn send_write(
+        addr: SocketAddr,
+        client: Arc<tokio_rustls::rustls::ClientConfig>,
+        started: &mut tokio::sync::mpsc::UnboundedReceiver<SocketAddr>,
+    ) -> (tokio_rustls::client::TlsStream<TcpStream>, SocketAddr) {
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let local = stream.local_addr().unwrap();
+        let mut tls = tokio_rustls::TlsConnector::from(client)
+            .connect("localhost".try_into().unwrap(), stream)
+            .await
+            .unwrap();
+        tls.write_all(
+            b"POST /write HTTP/1.1
+Host: localhost
+Content-Length: 0
+
+",
+        )
+        .await
+        .unwrap();
+        tls.flush().await.unwrap();
+        let peer = tokio::time::timeout(Duration::from_secs(5), started.recv())
+            .await
+            .expect("書き込みが始まらない")
+            .unwrap();
+        // banto の `serve` が `accept` の相手を `ConnectInfo<SocketAddr>` で渡す（ループバックの判定）。
+        assert_eq!(peer, local, "TLS の経路の ConnectInfo が接続の相手と違う");
+        (tls, local)
+    }
+
+    /// #947（banto ADR-0035 §9）: TLS の経路の書き込みも接続から切り離される。受理した後に
+    /// クライアントが落ちても最後まで走り、通常の停止はそれを待つ。枠は平文の listener と共有する。
+    #[tokio::test]
+    async fn tls_write_outlives_its_client_and_stop_waits_for_it() {
+        let plain = banto_server::start(
+            banto_server::ServerConfig {
+                bind: "127.0.0.1".into(),
+                port: 0,
+            },
+            Router::new(),
+        )
+        .await
+        .unwrap();
+        let writes = ListenerWrites::sharing(plain.write_budget());
+        let (server, client, probe, mut started) = write_server(&writes).await;
+        let (tls, _) = send_write(server.local_addr(), client, &mut started).await;
+        assert_eq!(
+            plain.write_budget().running(),
+            1,
+            "TLS の書き込みが平文の listener の枠で数えられていない"
+        );
+        // クライアントが落ちる。書き込みは止まらない。
+        drop(tls);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!probe.done.load(Ordering::SeqCst));
+        let stopping = tokio::spawn(server.stop());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !stopping.is_finished(),
+            "通常の停止が受理済みの書き込みを待たなかった"
+        );
+        probe.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), stopping)
+            .await
+            .expect("書き込みが終わっても停止が終わらない")
+            .unwrap();
+        assert!(
+            probe.done.load(Ordering::SeqCst),
+            "書き込みが完結しなかった"
+        );
+        assert_eq!(writes.running(), 0);
+        assert_eq!(writes.left_count(), 0);
+        plain.stop().await;
+    }
+
+    /// #947: 失効は接続をすぐ切り、ポートも閉じ、停止は書き込みを待たずに戻るが、受理済みの
+    /// 書き込みは止めない（ADR-0035 §4）。残りは勘定が持ち、終了の待ち（`wait_left`）で終わる。
+    #[tokio::test]
+    async fn revoke_cuts_the_connection_but_lets_an_accepted_write_finish() {
+        let writes = ListenerWrites::default();
+        let (server, client, probe, mut started) = write_server(&writes).await;
+        let addr = server.local_addr();
+        let (mut tls, _) = send_write(addr, client, &mut started).await;
+        server.revoker().revoke();
+        assert!(!server.is_serving(), "失効の直後も稼働中と答えた");
+        assert!(
+            closes_within(&mut tls, Duration::from_secs(2)).await,
+            "失効の後も書き込みの接続が残った"
+        );
+        let mut refused = false;
+        for _ in 0..50 {
+            if TcpStream::connect(addr).await.is_err() {
+                refused = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(refused, "失効の後も {addr} が受け付けた");
+        tokio::time::timeout(Duration::from_secs(2), server.stop())
+            .await
+            .expect("失効で止めた世代の停止が書き込みを待った");
+        assert!(!probe.done.load(Ordering::SeqCst));
+        assert_eq!(writes.left_count(), 1, "残った書き込みを勘定が持っていない");
+        probe.release.notify_one();
+        assert!(writes.wait_left(Duration::from_secs(5)).await);
+        assert!(
+            probe.done.load(Ordering::SeqCst),
+            "失効で書き込みが止まった"
+        );
+        assert_eq!(writes.running(), 0);
+    }
+
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn following_revoker_severs_new_listener_when_revoked_before_registration() {
@@ -1332,9 +1643,10 @@ mod tests {
             "temporary listener stop must not permanently revoke the monitor"
         );
         stable.revoke();
-        let replacement = start_following(&config, Router::new(), &stable)
-            .await
-            .unwrap();
+        let replacement =
+            start_following(&config, Router::new(), &stable, &ListenerWrites::default())
+                .await
+                .unwrap();
         // 登録時に既に失効なら、開始ゲートを開ける前に必ず serve と TCP を失効させる。
         assert!(replacement.revoker().is_revoked());
         let address = replacement.local_addr();
