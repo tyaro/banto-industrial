@@ -6,6 +6,8 @@
  * 2. 再読み込みの後も一覧が残る（利用者ごとにサーバーへ保存。`hub.watch.v1`）。
  * 3. 行の右クリックのメニュー「見張りに足す」で足せる。同じタグを重ねて足さない。
  * 4. 行ごとの「外す」・「すべて外す」で外せ、保存も空になる。
+ *    4b. キーボード（Shift+F10）でも同じメニューが出る。Esc で閉じるとフォーカスが行のセルへ戻り、
+ *        開き直して Enter で決めると、その行だけが見張りに入る（banto v8 の `onRowContextMenu`）。
  * 5. 保存値の初回の GET が失敗しても窓には何も出さず、足した見張りは「保存中」になり、
  *    読み直しで確定して保存される（再読み込みの後も残る）。PR #1282 の再レビュー。
  * 6. GET は通り、最初の PUT だけ失敗したら「保存できていません」と「今すぐ再試行」が出て、
@@ -197,6 +199,47 @@ test.describe.serial('banto-hub 値を見張る窓 (#1254)', () => {
 		await panel().getByTestId('watch-clear').click();
 		await expect(watchRows()).toHaveCount(0);
 		await expect(panel()).toContainText('見張っているタグはありません');
+		await expect.poll(savedWatchIds).toEqual([]);
+	});
+
+	test('4b. Shift+F10 でメニューが出て、Esc でセルへ戻り、開き直して Enter で意図した行だけが入る', async () => {
+		await expect(watchRows()).toHaveCount(0);
+		await page.getByPlaceholder('名前・アドレスで検索').fill(`e2e-watch-`);
+		const cellB = page.getByRole('gridcell', { name: TAG_B, exact: true });
+		// 左クリックで B のセルをアクティブにする（行の選択で右ペインが開いてもよい）。
+		await cellB.click();
+		const item = page.getByRole('menuitem', { name: '見張りに足す' });
+
+		await page.keyboard.press('Shift+F10');
+		await expect(item).toBeVisible();
+		await page.keyboard.press('Escape');
+		await expect(item).toHaveCount(0);
+		// フォーカスはグリッド（`role=grid`）へ戻り、アクティブなセルは B のまま。
+		await expect
+			.poll(() =>
+				page.evaluate(() => {
+					const grid = document.activeElement;
+					if (grid?.getAttribute('role') !== 'grid') return '';
+					return grid.querySelector('[role="gridcell"].active')?.textContent ?? '';
+				})
+			)
+			.toContain(TAG_B);
+		await expect(watchRows()).toHaveCount(0);
+		expect(await savedWatchIds()).toEqual([]);
+
+		// 戻ったフォーカスのまま、もう一度開いて Enter（最初の項目にフォーカスが入る）。
+		await page.keyboard.press('Shift+F10');
+		await expect(item).toBeVisible();
+		await page.keyboard.press('Enter');
+		await expect(item).toHaveCount(0);
+		await expect(watchRows()).toHaveCount(1);
+		await expect(panel()).toContainText(NAME_B);
+		await expect(panel()).not.toContainText(NAME_A);
+		await expect.poll(savedWatchIds).toEqual([tagIds[1]]);
+
+		// 次の試験のために外す。
+		await panel().getByTestId('watch-clear').click();
+		await expect(watchRows()).toHaveCount(0);
 		await expect.poll(savedWatchIds).toEqual([]);
 	});
 
