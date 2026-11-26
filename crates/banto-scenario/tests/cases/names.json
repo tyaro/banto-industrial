@@ -1,0 +1,51 @@
+{
+  "name": "原型の名前（__proto__・toString）もふつうの信号として扱う",
+  "frozenTimeSec": null,
+  "scenario": {
+    "format": "banto-scenario",
+    "version": 1,
+    "cycleSec": 60,
+    "signals": {
+      "__proto__": {
+        "kind": "number",
+        "base": 1
+      },
+      "toString": {
+        "kind": "bit",
+        "value": false
+      },
+      "constructor": {
+        "like": "__proto__",
+        "base": 2
+      }
+    },
+    "events": [
+      {
+        "atSec": 10,
+        "durationSec": 10,
+        "values": {
+          "__proto__": 5,
+          "toString": true
+        }
+      }
+    ]
+  },
+  "samples": [
+    {
+      "tSec": 0,
+      "values": {
+        "__proto__": 1,
+        "toString": false,
+        "constructor": 2
+      }
+    },
+    {
+      "tSec": 15,
+      "values": {
+        "__proto__": 5,
+        "toString": true,
+        "constructor": 2
+      }
+    }
+  ]
+}

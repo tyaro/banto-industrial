@@ -1,0 +1,16 @@
+{
+  "name": "丸めの中間が有限でないときは丸めずに返す",
+  "frozenTimeSec": null,
+  "scenario": {
+    "format": "banto-scenario",
+    "version": 1,
+    "cycleSec": 60,
+    "signals": {
+      "Huge": { "kind": "number", "base": 1e308, "digits": 9 },
+      "NegativeHuge": { "kind": "number", "base": -1.5e308, "digits": 1 }
+    }
+  },
+  "samples": [
+    { "tSec": 0, "values": { "Huge": 1e308, "NegativeHuge": -1.5e308 } }
+  ]
+}

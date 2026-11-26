@@ -1,0 +1,121 @@
+{
+  "name": "波・ランプ・段差・点滅・like・周期をまたぐ出来事・丸め（手で計算した値）",
+  "frozenTimeSec": 1015,
+  "scenario": {
+    "format": "banto-scenario",
+    "version": 1,
+    "cycleSec": 60,
+    "epochSec": 1000,
+    "freezeAtSec": 15,
+    "signals": {
+      "Wave": {
+        "kind": "number",
+        "base": 10,
+        "waves": [{ "amplitude": 2, "periodSec": 20, "shiftSec": 5 }]
+      },
+      "Ramp": { "kind": "number", "rampPerHour": 36 },
+      "Wrap": { "kind": "number", "rampPerHour": 3600, "rampWrap": 50 },
+      "Steps": {
+        "kind": "number",
+        "points": [
+          [0, 1],
+          [10, 1],
+          [10, 5],
+          [20, 5],
+          [30, 0]
+        ]
+      },
+      "Shifted": { "like": "Steps", "shiftSec": 10 },
+      "Blink": { "kind": "bit", "periodSec": 4, "onSec": 1 },
+      "Fixed": { "kind": "bit", "value": true },
+      "Rounded": { "kind": "number", "base": -1.25, "digits": 1 }
+    },
+    "events": [
+      {
+        "atSec": 50,
+        "durationSec": 20,
+        "values": { "Fixed": false, "Wave": 0 }
+      }
+    ]
+  },
+  "samples": [
+    {
+      "tSec": 1010,
+      "values": {
+        "Wave": 12,
+        "Ramp": 0.1,
+        "Wrap": 10,
+        "Steps": 5,
+        "Shifted": 1,
+        "Blink": false,
+        "Fixed": true,
+        "Rounded": -1.3
+      }
+    },
+    {
+      "tSec": 1015,
+      "values": {
+        "Wave": 10,
+        "Ramp": 0.15,
+        "Wrap": 15,
+        "Steps": 5,
+        "Shifted": 1,
+        "Blink": false,
+        "Fixed": true,
+        "Rounded": -1.3
+      }
+    },
+    {
+      "tSec": 1028,
+      "values": {
+        "Wave": 11.618033988749895,
+        "Ramp": 0.28,
+        "Wrap": 28,
+        "Steps": 1,
+        "Shifted": 5,
+        "Blink": true,
+        "Fixed": true,
+        "Rounded": -1.3
+      }
+    },
+    {
+      "tSec": 1055,
+      "values": {
+        "Wave": 0,
+        "Ramp": 0.55,
+        "Wrap": 5,
+        "Steps": 0,
+        "Shifted": 0,
+        "Blink": false,
+        "Fixed": false,
+        "Rounded": -1.3
+      }
+    },
+    {
+      "tSec": 1065,
+      "values": {
+        "Wave": 0,
+        "Ramp": 0.65,
+        "Wrap": 15,
+        "Steps": 1,
+        "Shifted": 0,
+        "Blink": false,
+        "Fixed": false,
+        "Rounded": -1.3
+      }
+    },
+    {
+      "tSec": 970,
+      "values": {
+        "Wave": 12,
+        "Ramp": -0.3,
+        "Wrap": 20,
+        "Steps": 0,
+        "Shifted": 5,
+        "Blink": false,
+        "Fixed": true,
+        "Rounded": -1.3
+      }
+    }
+  ]
+}
