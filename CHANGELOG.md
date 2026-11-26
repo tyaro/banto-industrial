@@ -5,6 +5,7 @@ banto-industrial のリリースノート。日付は JST。バージョンは [
 ## 未リリース
 
 - banto-tagclient の購読が、Live（と Unbound の待ち）の間に接続の生存を見張るようにしました（#1294）。最後の受信から 10 秒で `{"op":"ping"}` を送り、5 秒のうちに何も受信が無ければ接続を切って今までの再接続（backoff）に乗せます。`RestClient::with_liveness(ping_interval, pong_timeout)` で変えられます（100ms〜1 時間に収めます）。分かるのは接続の生存だけで、配信の抜けは見分けません。
+- **Hub の TLS の口（8723）の通常の停止で、接続の終わりを待つ上限を 5 秒から 3 秒に戻しました。** 証明書の更新・失効での作り直しのたびに 5 秒待っていたのを、banto v9.1.0 の `RunningServer::stop_within`（banto#980）で選べるようにしたものです。平文の 8722 は 5 秒のままです。あわせて、作り直しの世代をまたぐ書き込みの台帳を、自前の実装から banto の `WriteLedger`（banto#981）に置き換えました（終了で全部の口の書き込みを止めてから、残りを同じ上限で待つ動きは変わりません）。
 - **【互換を壊す変更】banto-tagclient の書込みの誤りを詳しく読めるようにしました（#1293）。** `Error::write_detail()` が `WriteErrorDetail`（Hub の理由の `code()`・監査の `audit_id()`・`correlation_id()`）を返します。機密は持たず、`code` は `[a-z0-9_]` の 1〜64 文字のときだけ、`correlation_id` は送った値と一致するときだけ採ります。502 `write_failed`（書込みは成立しなかったと確定。機器へ送ったかどうかはこのコードでは区別しません。PLC のセッションが無いときなど、何も送らずに返すこともあります）は `ErrorKind::WriteRejected` から新設の `ErrorKind::WriteFailed` に移りました（`WriteRejected` は「送る前に断った」だけ）。temp-scada など利用側の移行の条件: `WriteFailed` を「失敗（成立しない）」、`WriteUncertain` を引き続き「結果不明」として扱い、失敗の行にも返った `audit_id` を残してください。知らない kind を結果不明に落とす今の実装のまま依存だけ上げると、確定した失敗が「結果不明」に変わります。`Error` は `Copy` でなくなりました（`Clone` のまま。`kind()` は `&self`）。
 
 ## v0.3.0-alpha.4 — 2026-11-20（アルファ）

@@ -12,7 +12,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use super::*;
-use crate::tls_listener::{self, ListenerWrites, RunningTlsListener, TlsConfig, TlsRevoker};
+use crate::tls_listener::{self, RunningTlsListener, TlsConfig, TlsRevoker};
+use banto_server::WriteLedger;
 
 const INTERVAL: Duration = Duration::from_secs(30);
 
@@ -320,13 +321,13 @@ pub(crate) fn spawn(
     )
 }
 
-/// `writes` は Hub の平文の listener と共有する書き込みの勘定（復帰した listener が使う。#947）。
+/// `writes` は Hub の平文の listener も入っている書き込みの台帳（復帰した listener も入る。#947）。
 pub(crate) fn spawn_idle(
     router: axum::Router,
     config: Option<TlsConfig>,
     initial: DesktopTlsStatus,
     keep_alive: Arc<Option<crate::profile_lock::ProfileLockGuard>>,
-    writes: ListenerWrites,
+    writes: WriteLedger,
 ) -> Monitor {
     let (input, serving) = idle_input(config, initial, writes);
     spawn_production(input, router, serving, keep_alive)
@@ -335,7 +336,7 @@ pub(crate) fn spawn_idle(
 fn idle_input(
     config: Option<TlsConfig>,
     mut initial: DesktopTlsStatus,
-    writes: ListenerWrites,
+    writes: WriteLedger,
 ) -> (ActorInput, CertThumbprint) {
     let serving = config.as_ref().and_then(TlsConfig::thumbprint);
     initial.can_resume = serving.is_some();
@@ -392,9 +393,10 @@ struct ActorInput {
     listener: Option<RunningTlsListener>,
     config: Option<TlsConfig>,
     initial: DesktopTlsStatus,
-    /// 作り直す TLS の世代が使う書き込みの勘定（#947、banto ADR-0035 §9）。平文の listener と
-    /// 枠を共有し、止めた世代に残った書き込みは Hub の終了まで持つ。
-    writes: ListenerWrites,
+    /// 作り直す TLS の世代を入れる書き込みの台帳（#947、banto ADR-0035 §9、tyaro/banto#981）。
+    /// 平文の listener と同じ台帳で枠を共有し、止めた世代に残った書き込みは台帳が Hub の終了まで
+    /// 持つ。終了の後に作り直した世代は、停止が要求された状態で始まる。
+    writes: WriteLedger,
 }
 
 struct MonitorSettings {
@@ -749,7 +751,7 @@ fn renew_owned(
     router: axum::Router,
     external: TlsRevoker,
     pending: BTreeSet<CertThumbprint>,
-    writes: ListenerWrites,
+    writes: WriteLedger,
 ) -> RenewalResult {
     let place = DefaultUserTlsPlace::resolve(&WindowsTlsTrustOps).map_err(|e| e.reason);
     renew_owned_in(
@@ -769,7 +771,7 @@ fn renew_owned_in<P: UserTlsPlace + ?Sized>(
     router: axum::Router,
     external: TlsRevoker,
     mut pending: BTreeSet<CertThumbprint>,
-    writes: &ListenerWrites,
+    writes: &WriteLedger,
     place: Result<&P, &str>,
 ) -> RenewalResult {
     let runtime = tokio::runtime::Handle::current();
@@ -1034,7 +1036,7 @@ mod tests {
                 requires_recreation: false,
                 can_resume: false,
             },
-            ListenerWrites::default(),
+            WriteLedger::new(),
         );
         assert!(input.initial.can_resume);
         assert!(input.config.is_some());
@@ -1119,7 +1121,7 @@ mod tests {
                 next_router,
                 retained,
                 BTreeSet::new(),
-                &ListenerWrites::default(),
+                &WriteLedger::new(),
                 Ok(&place),
             )
         })
@@ -1144,7 +1146,7 @@ mod tests {
             ActorInput {
                 listener: renewed.listener,
                 config: renewed.config,
-                writes: ListenerWrites::default(),
+                writes: WriteLedger::new(),
                 initial: DesktopTlsStatus {
                     remedy: None,
                     address: None,

@@ -180,8 +180,8 @@ use std::time::Duration;
 use banto_collect::{CollectorOptions, Quality, RegistrySnapshot};
 use banto_core::BantoError;
 use banto_server::{
-    lan_urls_for_bind, request_is_loopback_local, start, static_router,
-    with_security_headers_using, RunningServer, SecurityHeaders, ServerConfig,
+    bind as bind_server, lan_urls_for_bind, request_is_loopback_local, static_router,
+    with_security_headers_using, RunningServer, SecurityHeaders, ServerConfig, WriteLedger,
     TAURI_IPC_CONNECT_SRC,
 };
 use banto_tags::{
@@ -220,7 +220,7 @@ use crate::settings::{HubSettingsExt, SettingsService};
 use crate::subscribe_core::EVAL_TICK_MS;
 pub use crate::tls_listener::RunningTlsListener as RunningTlsServer;
 pub use crate::tls_listener::TlsRevoker;
-use crate::tls_listener::{self, ListenerWrites, TlsConfig};
+use crate::tls_listener::{self, TlsConfig};
 use crate::users::UsersService;
 use crate::write_audit::{RejectionWriter, WriteAuditService};
 use crate::write_control::{load_startup_decision, WriteControl};
@@ -1132,17 +1132,18 @@ impl HubRuntime {
         );
         let shell_router = app.clone();
 
+        // #947（banto ADR-0035 §9、tyaro/banto#981）: 平文・TLS（とその作り直しの世代）の
+        // 待ち受けを 1 つの書き込みの台帳に入れる。枠を共有し、終了で全部の門を先に閉じ、止めた
+        // 世代に残った書き込みも待つ（`crate::tls_listener` のモジュール doc「書き込みの切り離し」）。
+        let listener_writes = WriteLedger::new();
         // Plain listener keeps the configured port; shell UI uses its own HTTPS origin.
-        let server = match start(
-            ServerConfig {
-                bind: bind.clone(),
-                port,
-            },
-            app.clone(),
-        )
+        let server = match bind_server(ServerConfig {
+            bind: bind.clone(),
+            port,
+        })
         .await
         {
-            Ok(started) => started,
+            Ok(bound) => bound.with_write_ledger(&listener_writes).serve(app.clone()),
             Err(err) => {
                 // ここまでに起こした背景タスクを残さない（`JoinHandle` を捨てても
                 // タスクは止まらない。#557 のレビュー指摘）。
@@ -1154,11 +1155,6 @@ impl HubRuntime {
                 return Err(HubStartError::ServerStart { port, source: err });
             }
         };
-        // #947（banto ADR-0035 §9）: TLS の待ち受け（とその作り直しの世代）は、平文の listener の
-        // 書き込みの枠を共有し、終了で全部の門を先に閉じるために停止口を覚える
-        // （`crate::tls_listener` のモジュール doc「書き込みの切り離し」）。
-        let listener_writes = ListenerWrites::sharing(server.write_budget());
-        listener_writes.register(server.stop_handle());
         // `Some(line)` は既定の TLS を待ち受けたときの行（ログは下でまとめて出す）。
         let mut default_tls_line: Option<String> = None;
         #[cfg(windows)]
@@ -1456,9 +1452,9 @@ pub struct RunningHub {
     sim_registry: Arc<BrokerSimRegistry>,
     server: RunningServer,
     tls_server: Option<RunningTlsServer>,
-    /// 平文・TLS（作り直しの世代も）の待ち受けが共有する書き込みの勘定（#947、banto
-    /// ADR-0035 §9）。終了で全部の門を先に閉じ、止めた世代に残った書き込みも待つ。
-    listener_writes: ListenerWrites,
+    /// 平文・TLS（作り直しの世代も）の待ち受けを入れた書き込みの台帳（#947、banto
+    /// ADR-0035 §9、tyaro/banto#981）。終了で全部の門を先に閉じ、止めた世代に残った書き込みも待つ。
+    listener_writes: WriteLedger,
     #[cfg(windows)]
     desktop_tls_monitor: Option<crate::hub_tls_prepare::desktop::watch::Monitor>,
     #[cfg(windows)]
@@ -1707,12 +1703,15 @@ impl RunningHub {
         // (`sessions`), so they are stopped last - see this module's doc
         // comment ("シャットダウン順序").
         self.sim_registry.shutdown().await;
-        // #947（banto ADR-0035 §9）: 平文・TLS の待ち受けを `RunningServer::stop_all` と同じ順で
-        // 止める。**全部の門を先に閉じ**（以後どの口も書き込みを始めない。監視が持つ TLS の
-        // listener も勘定に登録してあるので閉じる）、それから並行に待つ（待ちは足し算でなく最も
-        // 遅い 1 つ分）。証明書の作り直し・失効で前に止めた TLS の世代に残った書き込みも、同じ
-        // 上限で並べて待つ（`stop_all` が待つのは渡した listener だけ）。TLS の listener の
-        // 残りは `RunningTlsListener::stop` がログに出して勘定に足す。
+        // #947（banto ADR-0035 §9、tyaro/banto#981）: 平文・TLS の待ち受けを台帳
+        // （`WriteLedger::stop_all_until`）で止める。**全部の門を先に閉じ**（`close_all`。以後
+        // どの口も書き込みを始めない。監視が持つ TLS の listener も台帳に入っているので閉じる。
+        // 終了と同時に進んだ作り直しの世代は、停止が要求された状態で始まる）、それから並行に
+        // 待つ（待ちは足し算でなく最も遅い 1 つ分）。証明書の作り直し・失効で前に止めた TLS の
+        // 世代に残った書き込みも、台帳の枠で数えるので同じ締め切りで待つ。終了の途中で監視が
+        // 失効で止めた世代（その停止は書き込みを待たない）の書き込みも、枠に数えられたまま
+        // なので取りこぼさない。TLS の listener の停止はそれぞれのログを出す
+        // （`RunningTlsListener::stop`）。
         self.listener_writes.close_all();
         #[cfg(windows)]
         let monitor = self.desktop_tls_monitor.take();
@@ -1730,32 +1729,32 @@ impl RunningHub {
                 tls_server.stop().await;
             }
         };
-        let stop_plain = async {
-            if let Some(remaining) = server.stop().await.remaining() {
-                log_err_line(&format!(
-                    "banto-hub: [WARN] 平文の待ち受けを止めた後も書き込みが {} 件走っています: {}",
-                    remaining.count(),
-                    remaining.operations().join(", ")
-                ));
-            }
-        };
-        // 待ちの締め切りは 1 つにする。`wait_left` は呼んだ時点の残りしか写さないので、
-        // Windows の失効・作り直しの最中に終了すると、監視の停止（失効した世代は書き込みを
-        // 待たない）が join の途中で `keep` した残りは最初の待ちに入らない。join の後に
-        // 同じ締め切りでもう一度待って、DB を閉じる前に取りこぼさない。
         let deadline = tokio::time::Instant::now() + banto_server::DETACHED_WRITES_STOP_TIMEOUT;
-        let _ = tokio::join!(
+        let (_, _, outcome) = tokio::join!(
             stop_monitor,
             stop_tls,
-            stop_plain,
-            listener_writes.wait_left_until(deadline)
+            listener_writes.stop_all_until([server], deadline)
         );
-        let earlier_finished = listener_writes.wait_left_until(deadline).await;
-        let running = listener_writes.running();
-        if !earlier_finished || running > 0 {
+        if let Some(remaining) = outcome
+            .servers
+            .into_iter()
+            .next()
+            .and_then(|plain| plain.remaining())
+        {
             log_err_line(&format!(
-                "banto-hub: [WARN] 待ち受けを止めた後も、受理した書き込みが {} 件走ったまま終了へ進みます（止めずに走らせます。ADR-0035）",
-                running
+                "banto-hub: [WARN] 平文の待ち受けを止めた後も書き込みが {} 件走っています: {}",
+                remaining.count(),
+                remaining.operations().join(", ")
+            ));
+        }
+        // 監視・TLS の停止は台帳の待ちと並べたので、その後の値を読み直す（門は閉じてあるので、
+        // 走っている数は減るだけ）。
+        let running = listener_writes.budget().running();
+        if running > 0 {
+            log_err_line(&format!(
+                "banto-hub: [WARN] 待ち受けを止めた後も、受理した書き込みが {} 件走ったまま終了へ進みます（止めずに走らせます。ADR-0035）: {}",
+                running,
+                outcome.remaining.join(", ")
             ));
         }
         // サーバーを止めたので新しい handler は来ない。切断で捨てられた handler のものも
@@ -2500,6 +2499,88 @@ mod tests {
             matches!(err, HubStartError::UnsafeCommissioningBind(_)),
             "{err:?}"
         );
+    }
+
+    /// #947（banto ADR-0035 §9、tyaro/banto#981）: Hub の終了は、作り直しで前に止めた待ち受けの
+    /// 世代に残った書き込みを、台帳（`WriteLedger`）の同じ締め切りの中で待ってから、設定 DB を
+    /// 閉じる判断へ進む。終了の最中に台帳へ入った新しい世代は、書き込みを受けない（ラッチ）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_waits_for_a_stopped_generation_before_closing_the_db() {
+        let dir = crate::test_support::TempDir::new("hub-runtime-ledger");
+        let dirs = plain_profile_dirs(&dir);
+        let db = dirs.config.path().join(DB_FILE_NAME);
+        let config = HubConfig {
+            drivers: crate::test_support::test_drivers(),
+            db_path: db.to_string_lossy().into_owned(),
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".to_string()),
+            data_dir_override: Some(dirs.data.path().to_path_buf()),
+            profile_id: "dirs".to_string(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: true,
+            default_tls: None,
+        };
+        let hub = HubRuntime::start_with_profile_dirs(config, dirs.clone())
+            .await
+            .expect("start with profile dirs");
+        let pool = hub.pool.clone();
+        let ledger = hub.listener_writes.clone();
+        let local = || ServerConfig {
+            bind: "127.0.0.1".to_string(),
+            port: 0,
+        };
+        // 前の世代（証明書の作り直しで止めた TLS の世代に当たる）: 書き込みを 1 つ残したまま、
+        // 書き込みを待たずに止める（失効の停止と同じ）。
+        let old = bind_server(local())
+            .await
+            .unwrap()
+            .with_write_ledger(&ledger)
+            .serve(axum::Router::new());
+        let held = old
+            .hold_write_for_test("POST /old")
+            .expect("書き込みを受けない");
+        let stopped = old
+            .stop_within(std::time::Duration::ZERO, std::time::Duration::ZERO)
+            .await;
+        assert!(
+            stopped.remaining().is_some(),
+            "書き込みを残したまま止められなかった"
+        );
+
+        let shutdown = tokio::spawn(hub.shutdown_and_report());
+        // 終了が台帳を閉じるまで待つ（その前の手順は書き込みと関係ない）。
+        let closed_by = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !ledger.is_closed() {
+            assert!(
+                tokio::time::Instant::now() < closed_by,
+                "終了が台帳を閉じない"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // 終了の最中に台帳へ入った世代: 停止が要求された状態で始まり、書き込みを受けない。
+        let renewed = bind_server(local())
+            .await
+            .unwrap()
+            .with_write_ledger(&ledger)
+            .serve(axum::Router::new());
+        assert!(!renewed.is_serving(), "終了の最中の世代が稼働中だった");
+        assert!(
+            renewed.hold_write_for_test("POST /renewed").is_none(),
+            "終了の最中の世代が書き込みを受けた"
+        );
+        renewed.stop().await;
+        // 前の世代の書き込みが残る間は、終了は DB を閉じる手前で待つ。
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(!shutdown.is_finished(), "残りの書き込みを待たずに終了した");
+        assert!(!pool.is_closed(), "書き込みが残っているのに DB を閉じた");
+        drop(held);
+        let report = tokio::time::timeout(std::time::Duration::from_secs(20), shutdown)
+            .await
+            .expect("書き込みが終わっても終了が進まない")
+            .unwrap();
+        assert!(report.db_closed, "{report:?}");
+        assert!(pool.is_closed());
+        assert_eq!(ledger.budget().running(), 0);
     }
 
     /// #945 の総点検: 終了のとき、書き手を止めて拒否の表の残りを、pool を閉じる前に
