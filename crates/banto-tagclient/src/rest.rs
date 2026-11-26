@@ -594,6 +594,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_failed_502_carries_the_hub_detail() {
+        let (address, hub) = server(
+            502,
+            r#"{"error":"write_failed","detail":"secret text","audit_id":9,"correlation_id":"c-1"}"#,
+        );
+        let error = client(address)
+            .write_tag(
+                "plc.g.t",
+                RequestedValue::Bool(true),
+                WriteOptions::default().with_correlation_id("c-1"),
+            )
+            .await
+            .unwrap_err();
+        hub.join().unwrap();
+        assert_eq!(error.kind(), ErrorKind::WriteFailed);
+        let detail = error.write_detail().unwrap();
+        assert_eq!(detail.code(), Some("write_failed"));
+        assert_eq!(detail.audit_id(), Some(9));
+        assert_eq!(detail.correlation_id(), Some("c-1"));
+        assert!(!format!("{error:?}").contains("secret text"));
+
+        // A failure before any response carries no detail.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let error = client(address)
+            .write_tag(
+                "plc.g.t",
+                RequestedValue::Bool(true),
+                WriteOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.write_detail().is_none());
+    }
+
+    #[tokio::test]
     async fn connection_failure_is_transport() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());

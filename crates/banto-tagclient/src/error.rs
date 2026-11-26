@@ -1,4 +1,9 @@
 //! Stable, non-sensitive error classification for the public boundary.
+//!
+//! [`Error`] carries a stable [`ErrorKind`] and, only for a write the Hub
+//! answered with an error body, an optional [`WriteErrorDetail`] (the Hub's
+//! machine code, `audit_id`, and the caller's own `correlation_id` echoed
+//! back). It never carries a URL, header, secret, or free-form server text.
 
 use std::fmt;
 
@@ -45,13 +50,19 @@ pub enum ErrorKind {
     /// caller may choose to retry later, but this crate never does so
     /// automatically (2026-09-01 owner decision - see the `write` module doc).
     WriteUnavailable,
-    /// Any other write-time rejection banto-hub returned as a stable error
-    /// code (404 `not_found`, 409 `tag_disabled`, 422
+    /// Any other write-time rejection banto-hub returned *before sending*
+    /// anything to the device (404 `not_found`, 409 `tag_disabled`, 422
     /// `unsupported_value_type`/`value_out_of_range`, 429 `rate_limited`,
-    /// 501 `write_unsupported_protocol`, 502 `write_failed`). The request as
+    /// 501 `write_unsupported_protocol`). Nothing was sent. The request as
     /// constructed cannot succeed; the caller must change the tag, value, or
     /// timing before trying again.
     WriteRejected,
+    /// 502 `write_failed`: the Hub sent the write and the failure is
+    /// confirmed; it had no effect on the device. Unlike
+    /// [`Self::WriteRejected`] something was attempted (an `audit_id` is
+    /// usually available from [`Error::write_detail`]); unlike
+    /// [`Self::WriteUncertain`] the outcome is known.
+    WriteFailed,
     /// The write may or may not have reached the device (502
     /// `write_uncertain` or an unknown 502, 500 `internal`, 504 or any other
     /// 5xx that cannot guarantee nothing was sent, or a failure after
@@ -106,6 +117,7 @@ impl ErrorKind {
             Self::WriteForbidden => "write_forbidden",
             Self::WriteUnavailable => "write_unavailable",
             Self::WriteRejected => "write_rejected",
+            Self::WriteFailed => "write_failed",
             Self::WriteUncertain => "write_uncertain",
             Self::InvalidWriteOptions => "invalid_write_options",
             Self::KeyRevoked => "key_revoked",
@@ -136,20 +148,77 @@ impl ErrorKind {
     }
 }
 
-/// Error carrying only a stable category. It deliberately has no source
-/// message, URL, response body, header, or secret field.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Extra, non-sensitive facts from a Hub write error body. Only built inside
+/// this crate. `code` is restricted to `[a-z0-9_]{1,64}` (anything else is
+/// dropped so a reverse proxy's free text never gets in), `correlation_id` is
+/// kept only when it equals the value the caller sent, and `detail` is never
+/// read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct WriteErrorDetail {
+    code: Option<String>,
+    audit_id: Option<i64>,
+    correlation_id: Option<String>,
+}
+
+impl WriteErrorDetail {
+    pub(crate) fn new(
+        code: Option<String>,
+        audit_id: Option<i64>,
+        correlation_id: Option<String>,
+    ) -> Self {
+        Self {
+            code,
+            audit_id,
+            correlation_id,
+        }
+    }
+
+    /// The Hub's `error` code (for example `not_writable`, `rate_limited`,
+    /// `write_failed`), when it is a well-formed snake_case token.
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
+
+    /// The audit row id, present when the Hub failed after writing the audit row.
+    pub fn audit_id(&self) -> Option<i64> {
+        self.audit_id
+    }
+
+    /// The `correlation_id` the Hub echoed, only if it matches what was sent.
+    pub fn correlation_id(&self) -> Option<&str> {
+        self.correlation_id.as_deref()
+    }
+}
+
+/// Error carrying a stable category and, for write errors only, an optional
+/// [`WriteErrorDetail`]. It deliberately has no source message, URL, response
+/// body text, header, or secret field.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Error {
     kind: ErrorKind,
+    detail: Option<Box<WriteErrorDetail>>,
 }
 
 impl Error {
     pub(crate) const fn new(kind: ErrorKind) -> Self {
-        Self { kind }
+        Self { kind, detail: None }
     }
 
-    pub const fn kind(self) -> ErrorKind {
+    pub(crate) fn with_detail(mut self, detail: Option<WriteErrorDetail>) -> Self {
+        self.detail = detail.map(Box::new);
+        self
+    }
+
+    pub const fn kind(&self) -> ErrorKind {
         self.kind
+    }
+
+    /// The Hub's code / `audit_id` / `correlation_id` for a write the Hub
+    /// answered with an error body; `None` otherwise (including failures
+    /// before or while sending).
+    pub fn write_detail(&self) -> Option<&WriteErrorDetail> {
+        self.detail.as_deref()
     }
 }
 

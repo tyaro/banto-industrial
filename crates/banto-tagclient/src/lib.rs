@@ -103,7 +103,7 @@ pub use binding::{
     UnresolvedReason,
 };
 pub use endpoint::{Endpoint, RestUrls};
-pub use error::{Error, ErrorKind, Result};
+pub use error::{Error, ErrorKind, Result, WriteErrorDetail};
 pub use handle::TagClientHandle;
 pub use pinned_tls::PinnedHubTls;
 pub use rest::RestClient;

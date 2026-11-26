@@ -42,7 +42,7 @@ use reqwest::{Client, StatusCode};
 use serde_json::json;
 
 use crate::endpoint::Endpoint;
-use crate::error::{Error, ErrorKind, Result};
+use crate::error::{Error, ErrorKind, Result, WriteErrorDetail};
 use crate::secret::SecretApiKey;
 
 /// Upper bound of the response body this module reads. Only the `error` code
@@ -209,7 +209,11 @@ pub(crate) async fn send_write(
         return Ok(parse_receipt(endpoint, body.as_deref()));
     }
     let code = body.as_deref().and_then(error_code);
+    let detail = body
+        .as_deref()
+        .and_then(|body| error_detail(body, options.correlation_id.as_deref()));
     classify_write_failure(endpoint, status, code.as_deref())
+        .map_err(|error| error.with_detail(detail))
 }
 
 /// Read at most [`MAX_ERROR_BODY_BYTES`] of the body. `None` when it could not
@@ -234,6 +238,33 @@ async fn read_limited_body(response: &mut reqwest::Response) -> Option<Vec<u8>> 
 fn error_code(body: &[u8]) -> Option<String> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     value.get("error")?.as_str().map(str::to_owned)
+}
+
+/// Build the public [`WriteErrorDetail`] from a failure body. `code` only when
+/// it is `[a-z0-9_]{1,64}`; `correlation_id` only when it equals what was sent;
+/// `None` when nothing usable was found.
+fn error_detail(body: &[u8], sent_correlation_id: Option<&str>) -> Option<WriteErrorDetail> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let code = value
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .filter(|code| {
+            (1..=64).contains(&code.len())
+                && code
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        })
+        .map(str::to_owned);
+    let audit_id = value.get("audit_id").and_then(serde_json::Value::as_i64);
+    let correlation_id = value
+        .get("correlation_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|echoed| Some(*echoed) == sent_correlation_id)
+        .map(str::to_owned);
+    if code.is_none() && audit_id.is_none() && correlation_id.is_none() {
+        return None;
+    }
+    Some(WriteErrorDetail::new(code, audit_id, correlation_id))
 }
 
 fn parse_receipt(endpoint: &Endpoint, body: Option<&[u8]>) -> WriteReceipt {
@@ -302,7 +333,7 @@ fn log_write_send_failure(endpoint: &Endpoint, error: &reqwest::Error) -> Error 
 /// - 504 and any other 5xx not listed here -> [`ErrorKind::WriteUncertain`]
 ///   (a proxy may have forwarded the POST before timing out).
 /// - 502: `write_failed` (the send failed for certain) ->
-///   [`ErrorKind::WriteRejected`]; `write_uncertain` and anything else
+///   [`ErrorKind::WriteFailed`]; `write_uncertain` and anything else
 ///   (for example a reverse proxy's own 502) -> [`ErrorKind::WriteUncertain`],
 ///   because it is not known whether the write reached the device.
 /// - 500: `audit_write_failed` (nothing was sent) -> [`ErrorKind::Transport`];
@@ -325,7 +356,7 @@ fn classify_write_failure(
             _ => ErrorKind::WriteUncertain,
         },
         StatusCode::BAD_GATEWAY => match code {
-            Some("write_failed") => ErrorKind::WriteRejected,
+            Some("write_failed") => ErrorKind::WriteFailed,
             _ => ErrorKind::WriteUncertain,
         },
         StatusCode::INTERNAL_SERVER_ERROR => match code {
@@ -432,6 +463,36 @@ mod tests {
     }
 
     #[test]
+    fn error_detail_restricts_code_and_checks_correlation_id() {
+        let d = error_detail(
+            br#"{"error":"rate_limited","audit_id":42,"correlation_id":"c1","detail":"x"}"#,
+            Some("c1"),
+        )
+        .unwrap();
+        assert_eq!(d.code(), Some("rate_limited"));
+        assert_eq!(d.audit_id(), Some(42));
+        assert_eq!(d.correlation_id(), Some("c1"));
+        // a mismatching or unsent correlation id is dropped
+        let d = error_detail(br#"{"error":"a","correlation_id":"zz"}"#, Some("c1")).unwrap();
+        assert_eq!(d.correlation_id(), None);
+        let d = error_detail(br#"{"error":"a","correlation_id":"c1"}"#, None).unwrap();
+        assert_eq!(d.correlation_id(), None);
+        // bad code characters / length
+        assert!(error_detail(br#"{"error":"Bad Code"}"#, None).is_none());
+        assert!(error_detail(br#"{"error":"<html>"}"#, None).is_none());
+        let long = format!(r#"{{"error":"{}"}}"#, "a".repeat(65));
+        assert!(error_detail(long.as_bytes(), None).is_none());
+        let ok = format!(r#"{{"error":"{}"}}"#, "a".repeat(64));
+        assert!(error_detail(ok.as_bytes(), None).is_some());
+        // audit_id alone is kept even when the code is unusable
+        let d = error_detail(br#"{"error":"NO","audit_id":7}"#, None).unwrap();
+        assert_eq!((d.code(), d.audit_id()), (None, Some(7)));
+        // not JSON
+        assert!(error_detail(b"<html>bad gateway</html>", None).is_none());
+        assert!(error_detail(b"", None).is_none());
+    }
+
+    #[test]
     fn unauthorized_write_status_matches_read_path_classification() {
         let endpoint = Endpoint::new("http://example.test").unwrap();
         assert_eq!(
@@ -460,7 +521,7 @@ mod tests {
             (
                 StatusCode::BAD_GATEWAY,
                 Some("write_failed"),
-                ErrorKind::WriteRejected,
+                ErrorKind::WriteFailed,
             ),
             (
                 StatusCode::BAD_GATEWAY,
@@ -955,7 +1016,7 @@ mod tests {
             (
                 "502 Bad Gateway",
                 r#"{"error":"write_failed","audit_id":3}"#,
-                ErrorKind::WriteRejected,
+                ErrorKind::WriteFailed,
             ),
             (
                 "502 Bad Gateway",
