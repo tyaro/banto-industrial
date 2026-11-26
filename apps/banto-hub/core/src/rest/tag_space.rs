@@ -945,9 +945,10 @@ pub(crate) struct StatusResponse {
     pub(super) capabilities: Vec<String>,
     /// #1295: 設置ごとに変わらない Hub の id（UUID v4、小文字）。設定 DB に 1 度だけ作られ、
     /// DB を作り直すと変わり、DB のバックアップから戻すとその DB の id に戻る。消費側が
-    /// 「同じ URL のまま別の Hub に差し替えられた」ことを見分けるための印で、設定の
-    /// 時点は表さない（時点は `revision`・`run_id` で見る）。同じバックアップを別の機械に
-    /// 戻すと同じ id の Hub が 2 台できうる（`crate::hub_id`）。古い Hub はこの欄を返さない。
+    /// 「同じ URL のまま別の Hub に差し替えられた」ことを見分けるための設定 DB の系譜の
+    /// 印で、設定の時点は表さない（`revision`・`run_id` は稼働中の変更検知用で再起動で数え
+    /// 直すので、時点の代わりにもならない）。同じバックアップを別の機械に戻すと同じ id の
+    /// Hub が 2 台できうる（`crate::hub_id`）。古い Hub はこの欄を返さない。
     pub(super) hub_id: String,
     pub(super) revision: u64,
     pub(super) configured_revision: u64,

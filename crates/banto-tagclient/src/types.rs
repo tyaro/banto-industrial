@@ -250,13 +250,18 @@ pub struct HubStatus {
     pub capabilities: Vec<String>,
     /// Identity of the Hub installation (#1295): a lowercase UUID v4 the Hub keeps in
     /// its settings DB. It stays the same across restarts, changes when the DB is
-    /// recreated, and returns when the DB is restored from a backup. Compare it with
+    /// recreated, and returns when the DB is restored from a backup that already held
+    /// it (a backup from before #1295, or a new DB rebuilt from a config package, gets
+    /// a fresh id on its next start). Compare it with
     /// the value you stored earlier only to ask "is this the same Hub?" (e.g. the
     /// same URL now answered by a replaced Hub). `None` means "unknown" (a Hub that
     /// predates it), which must not be treated like "a different Hub". The same id
-    /// does not mean the same configuration point in time (an old backup may have
-    /// been restored): use `revision` and `run_id` of the catalog for that. One backup
-    /// restored onto two machines yields two Hubs with the same id.
+    /// does not mean the same configuration point in time (an old backup of the same
+    /// lineage may have been restored), and the catalog's `revision` and `run_id`
+    /// cannot tell either: they track changes while running and restart from zero, so
+    /// they repeat across restarts. Re-check the tag assignments against the current
+    /// catalog on every reconnect. One backup restored onto two machines yields two
+    /// Hubs with the same id.
     #[serde(default)]
     pub hub_id: Option<String>,
 }
