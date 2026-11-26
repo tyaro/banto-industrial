@@ -85,7 +85,7 @@
 - `auth.disabled` の行は上流の認証モードの読み取りで必須。0015 を両アプリの migrations-sqlite に写した（上流と byte 等価）。
 - 試運転の grant は、本番の経路で ui-settings を読み書きできる（`first_admin_service.rs`）。
 - 2 MiB を超える本文を受ける口は無い。
-- ADR-0035 の書き込みの切り離しは、v8 では Hub の TLS の経路（loopback の 8723）に掛からなかった（上流が `detach_writes` を公開していないため。[tyaro/banto#947](https://github.com/tyaro/banto/issues/947) で提案、2026-11-25）。**banto v9.0.0（#947、ADR-0035 §9）で掛けた**（2026-11-26）: TLS の listener を `BoundServer::from_listener(..).serve(router)` に通し、平文の 8722 と書き込みの枠（`WriteBudget`）を共有する。失効は接続をすぐ切ってポートを閉じるが、受理済みの書き込みは止めない。証明書の作り直し・失効で止めた世代に残った書き込みは Hub が持ち続け、終了で全部の門を先に閉じてから平文・TLS と並べて待つ。shell の HTTPS の口も同じ `serve` を通る（枠は自分だけ）。設計は `apps/banto-hub/core/src/tls_listener.rs` のモジュール doc「書き込みの切り離し」。
+- ADR-0035 の書き込みの切り離しは、v8 では Hub の TLS の経路（loopback の 8723）に掛からなかった（上流が `detach_writes` を公開していないため。[tyaro/banto#947](https://github.com/tyaro/banto/issues/947) で提案、2026-11-25）。**banto v9.0.0（#947、ADR-0035 §9）で掛けた**（2026-11-26）: TLS の listener を `BoundServer::from_listener(..).serve(router)` に通し、平文の 8722 と書き込みの枠（`WriteBudget`）を共有する。失効は接続をすぐ切ってポートを閉じるが、受理済みの書き込みは止めない。証明書の作り直し・失効で止めた世代に残った書き込みは Hub が持ち続け、終了で全部の門を先に閉じてから平文・TLS と並べて待つ。shell の HTTPS の口も同じ `serve` を通る（枠は自分だけ）。設計は `apps/banto-hub/core/src/tls_listener.rs` のモジュール doc「書き込みの切り離し」。残った回り道は banto へ提案した（2026-11-26）: 停止で接続を待つ上限（5 秒固定、以前の TLS の口は 3 秒）を選ぶ口 [tyaro/banto#980](https://github.com/tyaro/banto/issues/980)、作り直しの世代をまたぐ書き込みの台帳（今は自前の `ListenerWrites`）[tyaro/banto#981](https://github.com/tyaro/banto/issues/981)。
 
 ### E2E
 
