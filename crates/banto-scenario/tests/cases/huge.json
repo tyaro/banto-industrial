@@ -10,7 +10,5 @@
       "NegativeHuge": { "kind": "number", "base": -1.5e308, "digits": 1 }
     }
   },
-  "samples": [
-    { "tSec": 0, "values": { "Huge": 1e308, "NegativeHuge": -1.5e308 } }
-  ]
+  "samples": [{ "tSec": 0, "values": { "Huge": 1e308, "NegativeHuge": -1.5e308 } }]
 }
