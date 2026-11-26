@@ -812,7 +812,11 @@ fn data_type(entry: &TagEntry) -> Option<DataType> {
         "f64" => TagType::F64,
         _ => return None,
     };
-    let scaling = if entry.raw_device_value {
+    // i64・u64 は Double のまま出す。現在値の経路（`CurrentView.value`）が f64 なので、
+    // 2^53 を超える整数は公開の前に精度が落ちている。Int64・UInt64 で出すと丸めた値を
+    // 正確な整数に見せてしまう。出すには、整数を PLC から変化検出まで保ち、
+    // `TagReading::typed` で渡す必要がある（banto-opcua ADR-0007。将来の作業）。
+    let scaling = if entry.raw_device_value && !matches!(tag_type, TagType::I64 | TagType::U64) {
         ValueScaling::Raw
     } else {
         ValueScaling::Scaled
@@ -1474,8 +1478,9 @@ mod tests {
             ("u16", DataType::UInt16),
             ("i32", DataType::Int32),
             ("u32", DataType::UInt32),
-            ("i64", DataType::Int64),
-            ("u64", DataType::UInt64),
+            // 現在値の経路が f64 なので、i64・u64 は Double のまま（2^53 超の精度）。
+            ("i64", DataType::Double),
+            ("u64", DataType::Double),
             ("f32", DataType::Float),
             ("f64", DataType::Double),
         ];
