@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use banto_plc::modbus::frame::build_request_frame;
 use banto_plc::SlmpDevice;
-use banto_plc_sim::{load_plan, parse_plan, Plan, Runtime};
+use banto_plc_sim::{load_plan, parse_plan, Clock, Plan, Runtime};
 use banto_register_codec as codec;
 use banto_scenario::ScenarioValue;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -101,7 +101,9 @@ async fn slmp_bit(
 async fn slmp_values_match_the_scenario_at_a_frozen_time() {
     let plan = load_plan(&examples_dir().join("plant.sim.json")).unwrap();
     let t = plan.scenario.frozen_time_sec(None).unwrap();
-    let mut runtime = Runtime::start(plan.clone(), loopback()).await.unwrap();
+    let mut runtime = Runtime::start(plan.clone(), loopback(), Clock::Fixed(t))
+        .await
+        .unwrap();
     assert!(runtime.tick(t).is_empty());
     let mut stream = TcpStream::connect(runtime.addr()).await.unwrap();
 
@@ -146,7 +148,9 @@ async fn slmp_values_match_the_scenario_at_a_frozen_time() {
 async fn slmp_does_not_answer_inside_a_fault_and_recovers_after() {
     let plan = load_plan(&examples_dir().join("plant.sim.json")).unwrap();
     let epoch = plan.scenario.epoch_sec;
-    let mut runtime = Runtime::start(plan, loopback()).await.unwrap();
+    let mut runtime = Runtime::start(plan, loopback(), Clock::Fixed(epoch + 70.0))
+        .await
+        .unwrap();
 
     runtime.tick(epoch + 70.0);
     assert!(!runtime.is_hanging());
@@ -236,7 +240,9 @@ async fn modbus_values_match_the_scenario_at_frozen_times() {
     // 通常・Pump.Run が OFF の出来事の中（146〜168 秒）・Lamp の周期の違う秒。
     for offset_sec in [70.0, 147.0, 151.0] {
         let t = plan.scenario.epoch_sec + offset_sec;
-        let mut runtime = Runtime::start(plan.clone(), loopback()).await.unwrap();
+        let mut runtime = Runtime::start(plan.clone(), loopback(), Clock::Fixed(t))
+            .await
+            .unwrap();
         runtime.tick(t);
         let mut stream = TcpStream::connect(runtime.addr()).await.unwrap();
 
@@ -276,7 +282,9 @@ async fn modbus_values_match_the_scenario_at_frozen_times() {
 async fn modbus_does_not_answer_inside_a_fault_and_recovers_after() {
     let plan = parse_plan(MODBUS_CONFIG, &examples_dir()).unwrap();
     let epoch = plan.scenario.epoch_sec;
-    let mut runtime = Runtime::start(plan, loopback()).await.unwrap();
+    let mut runtime = Runtime::start(plan, loopback(), Clock::Fixed(epoch + 70.0))
+        .await
+        .unwrap();
 
     runtime.tick(epoch + 105.0);
     assert!(runtime.is_hanging());
@@ -308,8 +316,46 @@ async fn a_saturated_signal_warns_once_per_signal() {
     }"#;
     let plan = parse_plan(text, &examples_dir()).unwrap();
     let epoch = plan.scenario.epoch_sec;
-    let mut runtime = Runtime::start(plan, loopback()).await.unwrap();
-    assert_eq!(runtime.tick(epoch + 60.0).len(), 1);
+    // 最初の `tick` は `start` の中で行われ、警告はそこで標準エラーへ出る（1 回だけ）。
+    // 以後の `tick` は同じ信号で警告を返さない。
+    let mut runtime = Runtime::start(plan, loopback(), Clock::Fixed(epoch + 60.0))
+        .await
+        .unwrap();
+    assert!(runtime.tick(epoch + 60.0).is_empty());
     assert!(runtime.tick(epoch + 61.0).is_empty());
+    runtime.stop();
+}
+
+// `Runtime::start` は最初の値を置いてから返す。明示の `tick` なしで、立てた直後に読んだ値が
+// 止めた時刻の筋書きの値（未設定の 0 ではない）。`#[tokio::test]` は current_thread。
+#[tokio::test]
+async fn slmp_first_read_after_start_is_the_scenario_value() {
+    let plan = load_plan(&examples_dir().join("plant.sim.json")).unwrap();
+    let t = plan.scenario.frozen_time_sec(None).unwrap();
+    let runtime = Runtime::start(plan.clone(), loopback(), Clock::Fixed(t))
+        .await
+        .unwrap();
+    let mut stream = TcpStream::connect(runtime.addr()).await.unwrap();
+    let level = slmp_words(&mut stream, SlmpDevice::D, 100, 1)
+        .await
+        .unwrap();
+    let expected = (number(&plan, t, "Tank.Level") * 10.0).round() as i16;
+    assert_ne!(expected, 0, "試験の前提: 値が 0 でない時刻");
+    assert_eq!(codec::decode_i16(level[0]), expected);
+    runtime.stop();
+}
+
+#[tokio::test]
+async fn modbus_first_read_after_start_is_the_scenario_value() {
+    let plan = parse_plan(MODBUS_CONFIG, &examples_dir()).unwrap();
+    let t = plan.scenario.epoch_sec + 70.0;
+    let runtime = Runtime::start(plan.clone(), loopback(), Clock::Fixed(t))
+        .await
+        .unwrap();
+    let mut stream = TcpStream::connect(runtime.addr()).await.unwrap();
+    let level = modbus_registers(&mut stream, 3, 0, 1).await.unwrap();
+    let expected = (number(&plan, t, "Tank.Level") * 10.0).round() as i16;
+    assert_ne!(expected, 0, "試験の前提: 値が 0 でない時刻");
+    assert_eq!(codec::decode_i16(level[0]), expected);
     runtime.stop();
 }

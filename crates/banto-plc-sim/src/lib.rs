@@ -13,6 +13,10 @@
 //!   中なら `hang`（要求に答えない）、外へ出たら `stop_hanging` する。時刻は実行時は現在、
 //!   `--at`・`--freeze` なら止めた時刻（[`Clock`]）。同じ筋書きと時刻からは同じ値になる。
 //!
+//! 約束 2 つ。[`Runtime::start`] は最初の値を置き終えてから返す（それまで要求に答えない）。
+//! 途切れ（`faults`）の判定は周期の刻みでだけ行う近似で、始まり・終わりは最大 1 周期ずれ、
+//! 刻みより短い区間は抜けるので `durationSec` は `periodMs` 以上にする（読込の誤りにする）。
+//!
 //! 通信の途切れ（`faults`）を筋書きの形に入れず設定に書くのは、筋書きの形 版 1 をブラウザの
 //! 模擬と共有したままにするため（2026-11-26 オーナー決定）。判定は筋書きの出来事と同じ
 //! 「周期の中の秒」の規則（`banto-scenario` の `Scenario::phase` と同じ余りの取り方）。
@@ -295,7 +299,7 @@ pub fn parse_plan(text: &str, base_dir: &Path) -> Result<Plan, ConfigError> {
 
     let mut faults = Vec::new();
     for (index, fault) in raw.faults.iter().flatten().enumerate() {
-        faults.push(build_fault(index, fault, &scenario)?);
+        faults.push(build_fault(index, fault, &scenario, period_ms)?);
     }
 
     Ok(Plan {
@@ -312,6 +316,7 @@ fn build_fault(
     index: usize,
     fault: &RawFault,
     scenario: &Scenario,
+    period_ms: u64,
 ) -> Result<HangFault, ConfigError> {
     let at = format!("faults[{index}]");
     if fault.kind != "hang" {
@@ -328,6 +333,13 @@ fn build_fault(
     {
         return err(format!(
             "{at}.durationSec: 正で周期（{cycle} 秒）以下が要る（{}）",
+            fault.duration_sec
+        ));
+    }
+    // 判定は周期の刻みでしかしないので、刻みより短い区間は抜けうる（設計書「通信の途切れ」）。
+    if fault.duration_sec < period_ms as f64 / 1000.0 {
+        return err(format!(
+            "{at}.durationSec: periodMs（{period_ms} ms）以上が要る（{}）",
             fault.duration_sec
         ));
     }
@@ -623,8 +635,18 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    /// 待ち受けを始める。`listen` は設定の `listen` を上書きする。
-    pub async fn start(plan: Plan, listen: Option<SocketAddr>) -> std::io::Result<Self> {
+    /// 待ち受けを始め、**最初の値を置いてから**返す。`listen` は設定の `listen` を上書きする。
+    ///
+    /// `start_on` は bind の後に `.await` を持たず、受付は spawn したタスクで行う。current_thread
+    /// の実行時では、spawn されたタスクはこちらが `.await` で譲るまで走らないので、`start_on`
+    /// から下の同期の `tick` までの間に要求は答えられない（`--freeze` でも未設定の 0 を読めてしまう
+    /// のを防ぐ）。**multi-thread の実行時で呼ぶと、この保証は無い**（実行ファイルは
+    /// current_thread で動かす）。最初の `tick` の警告は標準エラーへ出す。
+    pub async fn start(
+        plan: Plan,
+        listen: Option<SocketAddr>,
+        clock: Clock,
+    ) -> std::io::Result<Self> {
         let want = listen.unwrap_or(plan.listen);
         let (sim, addr) = match plan.protocol {
             Protocol::Slmp => {
@@ -645,13 +667,18 @@ impl Runtime {
             }
         };
         let saturation_warned = vec![false; plan.mappings.len()];
-        Ok(Self {
+        let mut runtime = Self {
             plan,
             sim,
             addr,
             hanging: false,
             saturation_warned,
-        })
+        };
+        // ここから返すまで `.await` を挟まない（上の doc の保証）。
+        for warning in runtime.tick(clock.now()) {
+            eprintln!("{warning}");
+        }
+        Ok(runtime)
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -1084,6 +1111,40 @@ mod tests {
         assert!(!plan.in_fault(10.0));
         assert!(!plan.in_fault(169.9));
         assert!(plan.in_fault(360.0 + 175.0));
+    }
+
+    #[test]
+    fn fault_shorter_than_the_period_is_an_error() {
+        let m = message(
+            r#""protocol": "slmp", "periodMs": 500, "map": [], "faults": [{ "kind": "hang", "atSec": 10, "durationSec": 0.4 }]"#,
+        );
+        assert!(m.contains("faults[0].durationSec"), "{m}");
+        assert!(m.contains("periodMs"), "{m}");
+        // ちょうど周期の長さは通る。
+        plan_of(r#""protocol": "slmp", "periodMs": 500, "map": [], "faults": [{ "kind": "hang", "atSec": 10, "durationSec": 0.5 }]"#)
+            .unwrap();
+    }
+
+    #[test]
+    fn fault_boundaries_are_start_inclusive_and_end_exclusive() {
+        // epoch 0, 周期 180。
+        let plan = plan_of(
+            r#""protocol": "slmp", "map": [], "faults": [{ "kind": "hang", "atSec": 100, "durationSec": 15 }]"#,
+        )
+        .unwrap();
+        assert!(!plan.in_fault(99.999));
+        assert!(plan.in_fault(100.0));
+        assert!(plan.in_fault(114.999));
+        assert!(!plan.in_fault(115.0));
+        // 周期の終わりをまたぐ区間（170 秒から 20 秒＝次の周期の 10 秒まで）でも 1 つ。
+        let plan = plan_of(
+            r#""protocol": "slmp", "map": [], "faults": [{ "kind": "hang", "atSec": 170, "durationSec": 20 }]"#,
+        )
+        .unwrap();
+        assert!(!plan.in_fault(169.999));
+        assert!(plan.in_fault(170.0));
+        assert!(plan.in_fault(189.999));
+        assert!(!plan.in_fault(190.0));
     }
 
     const ORDERS: [Order; 2] = [Order::HighLow, Order::LowHigh];

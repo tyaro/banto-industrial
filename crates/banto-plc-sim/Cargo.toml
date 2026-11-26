@@ -19,7 +19,7 @@ banto-scenario = { path = "../banto-scenario" }
 banto-driver-api = { path = "../banto-driver-api", version = "0.3.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal", "net"] }
+tokio = { workspace = true, features = ["rt", "macros", "time", "signal", "net"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

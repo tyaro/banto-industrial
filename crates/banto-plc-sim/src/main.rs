@@ -65,7 +65,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     })
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let args = match parse_args(std::env::args().skip(1)) {
         Ok(args) => args,
@@ -88,7 +88,7 @@ async fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let runtime = match Runtime::start(plan, args.listen).await {
+    let runtime = match Runtime::start(plan, args.listen, clock).await {
         Ok(runtime) => runtime,
         Err(e) => {
             eprintln!("待ち受けに失敗: {e}");
