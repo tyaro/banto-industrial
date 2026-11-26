@@ -50,7 +50,8 @@
 //!   先に閉じてから、平文・TLS の停止と並べて同じ上限で待つ。
 //! - 通常の停止の接続の上限は banto の `STOP_TIMEOUT`（5 秒。過ぎたら serve のタスクを中断）に
 //!   なる（以前のこのモジュールの 3 秒より長い。平文の 8722 と同じ）。upgrade 済みの WebSocket
-//!   などがそれでも残りうるのは今までどおり（上の節）。
+//!   などがそれでも残りうるのは今までどおり（上の節）。上限を呼び手が選べる口は banto へ提案した
+//!   （[tyaro/banto#980](https://github.com/tyaro/banto/issues/980)）。
 
 use std::{
     collections::HashMap,
@@ -439,6 +440,8 @@ impl Listener for TlsListener {
 ///   （[`Self::close_all`]。どの口も書き込みを始めない状態にしてから待つ）。
 /// - 止めた世代に残った書き込み（[`RemainingWrites`]）。`stop_all` が待つのは渡した listener
 ///   だけなので、作り直しで止めた世代の残りはここで持ち続け、終了で待つ（[`Self::wait_left_until`]）。
+///
+/// 上流に同じ役目の台帳を提案した（[tyaro/banto#981](https://github.com/tyaro/banto/issues/981)）。入ったら置き換える。
 #[derive(Clone, Default)]
 pub(crate) struct ListenerWrites {
     budget: WriteBudget,
