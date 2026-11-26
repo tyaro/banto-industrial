@@ -1252,11 +1252,11 @@ async fn create_admin_closes_the_no_login_grant_of_the_service() {
     let mut server = Server::spawn(&sandbox, sandbox.root.to_str().unwrap());
     let port = wait_ready(&sandbox, &server).await;
     assert_eq!(local_desktop_open(port).await, true);
-    assert!(
-        sandbox.output_text().contains("create-admin"),
-        "{}",
-        sandbox.output_text()
-    );
+    // 案内の行は endpoint.json の書き込みより後に出ることがあるので、現れるまで待つ。
+    wait_for("create-admin の案内", async || {
+        sandbox.output_text().contains("create-admin").then_some(())
+    })
+    .await;
     // 動いている間は断る（何も書かない）。
     let refused = create_admin(&sandbox, "password123\n");
     let stderr = String::from_utf8_lossy(&refused.stderr);
