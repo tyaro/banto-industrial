@@ -40,30 +40,85 @@ struct Liveness {
     port: Option<u16>,
 }
 
+/// Upper bound for closing a connection the watch gave up on, so a stuck
+/// close cannot keep the worker from reconnecting.
+const LIVENESS_CLOSE_LIMIT: Duration = Duration::from_secs(1);
+
+/// The receive / send / close surface `Liveness` needs, split out so the
+/// timing can be tested with a fake.
+#[allow(async_fn_in_trait)]
+trait LivenessIo {
+    async fn receive_text(&mut self) -> Result<String>;
+    async fn send_ping(&mut self) -> Result<()>;
+    async fn close_best_effort(&mut self);
+}
+
+impl LivenessIo for crate::ws_transport::WebSocketConnection {
+    async fn receive_text(&mut self) -> Result<String> {
+        crate::ws_transport::WebSocketConnection::receive_text(self).await
+    }
+    async fn send_ping(&mut self) -> Result<()> {
+        crate::ws_transport::WebSocketConnection::send_ping(self).await
+    }
+    async fn close_best_effort(&mut self) {
+        crate::ws_transport::WebSocketConnection::close_best_effort(self).await
+    }
+}
+
 impl Liveness {
     fn new(rest: &RestClient) -> Self {
         let (ping_interval, pong_timeout) = rest.liveness();
+        Self::with_durations(
+            ping_interval,
+            pong_timeout,
+            rest.endpoint_host(),
+            rest.endpoint_port(),
+        )
+    }
+
+    fn with_durations(
+        ping_interval: Duration,
+        pong_timeout: Duration,
+        host: Option<String>,
+        port: Option<u16>,
+    ) -> Self {
         Self {
             ping_interval,
             pong_timeout,
             last_rx: tokio::time::Instant::now(),
             ping_deadline: None,
-            host: rest.endpoint_host(),
-            port: rest.endpoint_port(),
+            host,
+            port,
         }
     }
 
+    /// `instant + duration`, falling back to far ahead instead of panicking.
+    fn after(instant: tokio::time::Instant, duration: Duration) -> tokio::time::Instant {
+        instant
+            .checked_add(duration)
+            .or_else(|| instant.checked_add(crate::rest::MAX_LIVENESS_DURATION))
+            .unwrap_or(instant)
+    }
+
+    async fn cut<C: LivenessIo>(&self, connection: &mut C, what: &str) -> Error {
+        tracing::warn!(
+            host = ?self.host,
+            port = ?self.port,
+            "banto-hub WebSocket liveness {what}; reconnecting"
+        );
+        let _ = tokio::time::timeout(LIVENESS_CLOSE_LIMIT, connection.close_best_effort()).await;
+        Error::new(ErrorKind::Transport)
+    }
+
     /// Like `connection.receive_text()`, with the ping / deadline handling.
+    /// The pong deadline covers the ping send and the wait for a reply.
     /// Cancel-safe: the state lives in `self`, and a dropped call at most
     /// repeats the (idempotent) ping bookkeeping.
-    async fn receive(
-        &mut self,
-        connection: &mut crate::ws_transport::WebSocketConnection,
-    ) -> Result<String> {
+    async fn receive<C: LivenessIo>(&mut self, connection: &mut C) -> Result<String> {
         loop {
             let wake = match self.ping_deadline {
                 Some(deadline) => deadline,
-                None => self.last_rx + self.ping_interval,
+                None => Self::after(self.last_rx, self.ping_interval),
             };
             tokio::select! {
                 result = connection.receive_text() => {
@@ -74,16 +129,14 @@ impl Liveness {
                 }
                 _ = tokio::time::sleep_until(wake) => {
                     if self.ping_deadline.is_some() {
-                        tracing::warn!(
-                            host = ?self.host,
-                            port = ?self.port,
-                            "banto-hub WebSocket liveness timeout; reconnecting"
-                        );
-                        connection.close_best_effort().await;
-                        return Err(Error::new(ErrorKind::Transport));
+                        return Err(self.cut(connection, "timeout").await);
                     }
-                    connection.send_ping().await?;
-                    self.ping_deadline = Some(tokio::time::Instant::now() + self.pong_timeout);
+                    let deadline = Self::after(tokio::time::Instant::now(), self.pong_timeout);
+                    self.ping_deadline = Some(deadline);
+                    match tokio::time::timeout_at(deadline, connection.send_ping()).await {
+                        Ok(sent) => sent?,
+                        Err(_) => return Err(self.cut(connection, "ping send timeout").await),
+                    }
                 }
             }
         }
@@ -3851,6 +3904,69 @@ mod tests {
             None,
         )
         .await
+    }
+
+    #[test]
+    fn with_liveness_clamps_to_one_hour() {
+        let rest = client("http://127.0.0.1:1".into()).with_liveness(Duration::MAX, Duration::MAX);
+        let hour = Duration::from_secs(3600);
+        assert_eq!(rest.liveness(), (hour, hour));
+    }
+
+    struct FakeIo {
+        ping_hangs: bool,
+        close_hangs: bool,
+        closes: usize,
+    }
+
+    impl LivenessIo for FakeIo {
+        async fn receive_text(&mut self) -> Result<String> {
+            std::future::pending().await
+        }
+        async fn send_ping(&mut self) -> Result<()> {
+            if self.ping_hangs {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+        async fn close_best_effort(&mut self) {
+            self.closes += 1;
+            if self.close_hangs {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    async fn run_fake(close_hangs: bool) -> (Result<String>, usize) {
+        let mut io = FakeIo {
+            ping_hangs: true,
+            close_hangs,
+            closes: 0,
+        };
+        let mut liveness = Liveness::with_durations(
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            None,
+            None,
+        );
+        let result = tokio::time::timeout(Duration::from_secs(5), liveness.receive(&mut io))
+            .await
+            .expect("receive must not hang");
+        (result, io.closes)
+    }
+
+    #[tokio::test]
+    async fn a_hung_ping_send_is_cut_at_the_pong_deadline() {
+        let (result, closes) = run_fake(false).await;
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::Transport);
+        assert_eq!(closes, 1);
+    }
+
+    #[tokio::test]
+    async fn a_hung_close_does_not_block_the_cut() {
+        let (result, closes) = run_fake(true).await;
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::Transport);
+        assert_eq!(closes, 1);
     }
 
     #[test]

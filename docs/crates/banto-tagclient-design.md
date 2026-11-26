@@ -517,7 +517,7 @@ sequenceDiagram
 
 ### 5.1 生存の見張り（#1294）
 
-変化があったときだけ届く購読は、途中の経路が close を届けずに切れても静かなままで、無言の停止を見分けられない。そこで `Live`（と `Unbound` の待ち）の間、最後の受信から `ping_interval`（既定 10 秒）たつと `{"op":"ping"}` を送り、そこから `pong_timeout`（既定 5 秒）の間に何も受信が無ければ接続を切り、`Transport` の誤りとして今までの再接続（backoff）に乗せる。`pong` に限らずどのテキストの受信も生存とみなす。`RestClient::with_liveness(ping_interval, pong_timeout)` で変えられ、どちらも 100ms 未満は 100ms に引き上げる。分かるのは接続の生存だけで、配信の抜けは見分けない。`Unbound` の最初の `ping`→`pong` の待ち（§5.1）は別の期限のまま。
+変化があったときだけ届く購読は、途中の経路が close を届けずに切れても静かなままで、無言の停止を見分けられない。そこで `Live`（と `Unbound` の待ち）の間、最後の受信から `ping_interval`（既定 10 秒）たつと `{"op":"ping"}` を送り、そこから `pong_timeout`（既定 5 秒）の間に何も受信が無ければ接続を切り、`Transport` の誤りとして今までの再接続（backoff）に乗せる。`pong` に限らずどのテキストの受信も生存とみなす。`RestClient::with_liveness(ping_interval, pong_timeout)` で変えられ、どちらも 100ms〜1 時間に収める。`pong_timeout` の期限は `ping` の送信にも掛かり（送信が詰まっても見張りは止まらない）、切るときの close も 1 秒を上限にする。分かるのは接続の生存だけで、配信の抜けは見分けない。`Unbound` の最初の `ping`→`pong` の待ち（§5.1）は別の期限のまま。
 
 ## 6. バックプレッシャと所有権
 
