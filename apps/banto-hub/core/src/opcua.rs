@@ -40,7 +40,9 @@
 //!
 //! banto-opcua の `ServerConfig::with_pki_dir`（banto-opcua#23）に、profile の保護された
 //! データの下の置き場（[`crate::opcua_pki::pki_dir`]）を渡す。鍵と証明書は初回だけ作り、
-//! 次の起動からは再利用する（以前は起動のたびに一時 PKI で作っていた）。
+//! 次の起動からは再利用する（以前は起動のたびに一時 PKI で作っていた）。banto-opcua v0.3.4 では、
+//! ApplicationUri・公開ホスト・bind（未指定でないとき）・有効期間が今の設定と合わないと、
+//! 起動時に作り直す（拇印が変わるので、相手は信頼し直す）。
 //! - 本番の starter は、blocking 用のスレッドで**鍵を作る・読む前に**
 //!   [`crate::opcua_pki::prepare`] で置き場を用意して ACL を許可リストで確かめ、断られたら
 //!   起動しない（`failed` と理由）。
@@ -64,7 +66,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use banto_collect::Quality;
-use banto_opcua_server::model::{DataType, Quality as UaQuality, SampleTimestamps};
+use banto_opcua_server::model::{DataType, Quality as UaQuality, SampleTimestamps, SecurityPolicy};
 use banto_opcua_server::{OpcUaServer, RunningServer, ServerConfig, TagReading};
 use futures_util::future::{BoxFuture, FutureExt};
 use serde::Serialize;
@@ -703,7 +705,15 @@ fn server_config(
         .with_port(settings.port)
         .with_endpoint_path(&settings.endpoint_path)
         .with_namespace_uri(&settings.namespace_uri)
-        .with_sample_tags(false);
+        .with_sample_tags(false)
+        // banto-opcua v0.3 以降の既定は署名・暗号化のエンドポイントだけ。今の公開（None /
+        // Anonymous、tag-server-design §5.5）を保つため None を開き（#1332）、署名・暗号化の
+        // ポリシーは空にして None だけにする。信頼の一覧の画面が無い今は、暗号化の
+        // エンドポイントでつなげるクライアントがおらず、未認証の相手の証明書が `rejected/` に
+        // 上限なく溜まるだけになる。画面の文言（SecurityPolicy None / Anonymous のみ）とも
+        // 合わせる。開くのは Phase 3（#1324 の段 7）。
+        .with_none_endpoint(true)
+        .with_security_policies(Vec::<SecurityPolicy>::new());
     if let Some(host) = &settings.advertised_host {
         config = config.with_advertised_host(host);
     }
@@ -743,6 +753,7 @@ fn tag_reading(data_type: DataType, view: CurrentView) -> TagReading {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use banto_opcua_server::model::MappedValue;
 
     use tokio::sync::{mpsc, oneshot};
 
@@ -1148,6 +1159,57 @@ mod tests {
         publisher.shutdown().await;
     }
 
+    /// tyaro/banto-opcua#64: `close_tree` が `pki/trusted/`・`pki/rejected/` にも置く、利用者に
+    /// 読めない印（`.banto-safe-root`。SYSTEM・Administrators だけ）があっても、起動のたびの
+    /// 信頼の一覧の移行（v0.3.3 の `TrustList::migrate`）が印を開いて `PermissionDenied` で
+    /// 失敗せず、起動できる。昇格した管理者は印を読めてしまい確かめにならないので走らせない。
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unreadable_markers_in_the_trust_list_folders_do_not_stop_the_start() {
+        if banto_service_elev::is_current_process_admin().unwrap_or(false) {
+            eprintln!("skip: 昇格した管理者は印を読めるので、確かめにならない");
+            return;
+        }
+        let root = crate::test_support::TempDir::new("opcua-pki-trust-markers");
+        let pki = crate::opcua_pki::pki_dir(&root.path().join("data"));
+        crate::opcua_pki::prepare(&pki, None).expect("pki dir");
+        let mut markers = Vec::new();
+        for folder in ["own", "private", "trusted", "rejected"] {
+            std::fs::create_dir_all(pki.join(folder)).unwrap();
+            markers.push(pki.join(folder).join(".banto-safe-root"));
+        }
+        for marker in &markers {
+            std::fs::write(marker, b"").unwrap();
+            let output = std::process::Command::new("icacls")
+                .arg(marker)
+                .args([
+                    "/inheritance:r",
+                    "/grant:r",
+                    "*S-1-5-18:(F)",
+                    "*S-1-5-32-544:(F)",
+                    "*S-1-3-4:(DE,RA,S)",
+                ])
+                .output()
+                .expect("icacls");
+            assert!(output.status.success(), "icacls: {output:?}");
+            let err = std::fs::read(marker).expect_err("印は利用者に読めない（確かめにならない）");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{}",
+                marker.display()
+            );
+        }
+        let publisher = publisher_with_pki(real_starter(None), Some(pki.clone())).await;
+        publisher.apply(&enabled(free_port())).await;
+        wait_state(&publisher, OpcUaState::Running).await;
+        publisher.shutdown().await;
+        assert!(pki.join("private").join("private.pem").is_file());
+        for marker in &markers {
+            std::fs::remove_file(marker).unwrap();
+        }
+    }
+
     /// #634: banto-opcua の `Error::Pki`（ここでは証明書の場所がフォルダで、片方だけの
     /// ファイルとして消せない）は `failed` と理由（置き場と再試行のしかた）になる。原因を
     /// 取り除くと、同じ設定の保存で起動できる。
@@ -1246,7 +1308,7 @@ mod tests {
         );
         assert_eq!(reading.timestamps.source, system_time(175));
         assert_eq!(reading.quality, UaQuality::Stale);
-        assert_eq!(reading.value, Some(1.0));
+        assert_eq!(reading.value, Some(MappedValue::Boolean(true)));
     }
 
     // ---- #623 PR6: サービスでは起動の前に置き場の木を握る ----
