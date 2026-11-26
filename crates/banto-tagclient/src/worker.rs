@@ -35,9 +35,22 @@ struct Liveness {
     ping_interval: Duration,
     pong_timeout: Duration,
     last_rx: tokio::time::Instant,
-    ping_deadline: Option<tokio::time::Instant>,
+    ping: PingState,
     host: Option<String>,
     port: Option<u16>,
+}
+
+/// Where the ping cycle is. `Sending` is kept apart from `AwaitingPong` so a
+/// send dropped while pending (the caller's `select!` took another branch) is
+/// redone on the next `receive` instead of waiting for a pong never asked for.
+/// A dropped send may still have queued its frame, so the retry can put two
+/// pings on the wire; that only yields two `{"op":"pong"}` replies, which the
+/// Live gate ignores.
+#[derive(Clone, Copy, Debug)]
+enum PingState {
+    Idle,
+    Sending { deadline: tokio::time::Instant },
+    AwaitingPong { deadline: tokio::time::Instant },
 }
 
 /// Upper bound for closing a connection the watch gave up on, so a stuck
@@ -86,7 +99,7 @@ impl Liveness {
             ping_interval,
             pong_timeout,
             last_rx: tokio::time::Instant::now(),
-            ping_deadline: None,
+            ping: PingState::Idle,
             host,
             port,
         }
@@ -112,31 +125,36 @@ impl Liveness {
 
     /// Like `connection.receive_text()`, with the ping / deadline handling.
     /// The pong deadline covers the ping send and the wait for a reply.
-    /// Cancel-safe: the state lives in `self`, and a dropped call at most
-    /// repeats the (idempotent) ping bookkeeping.
+    /// Cancel-safe: the state lives in `self`. A call dropped while the ping
+    /// send is pending leaves `Sending`, and the next call redoes the send at
+    /// once with the same deadline (never extended).
     async fn receive<C: LivenessIo>(&mut self, connection: &mut C) -> Result<String> {
         loop {
-            let wake = match self.ping_deadline {
-                Some(deadline) => deadline,
-                None => Self::after(self.last_rx, self.ping_interval),
+            if let PingState::Sending { deadline } = self.ping {
+                match tokio::time::timeout_at(deadline, connection.send_ping()).await {
+                    Ok(Ok(())) => self.ping = PingState::AwaitingPong { deadline },
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => return Err(self.cut(connection, "ping send timeout").await),
+                }
+                continue;
+            }
+            let wake = match self.ping {
+                PingState::AwaitingPong { deadline } => deadline,
+                _ => Self::after(self.last_rx, self.ping_interval),
             };
             tokio::select! {
                 result = connection.receive_text() => {
                     let text = result?;
                     self.last_rx = tokio::time::Instant::now();
-                    self.ping_deadline = None;
+                    self.ping = PingState::Idle;
                     return Ok(text);
                 }
                 _ = tokio::time::sleep_until(wake) => {
-                    if self.ping_deadline.is_some() {
+                    if matches!(self.ping, PingState::AwaitingPong { .. }) {
                         return Err(self.cut(connection, "timeout").await);
                     }
                     let deadline = Self::after(tokio::time::Instant::now(), self.pong_timeout);
-                    self.ping_deadline = Some(deadline);
-                    match tokio::time::timeout_at(deadline, connection.send_ping()).await {
-                        Ok(sent) => sent?,
-                        Err(_) => return Err(self.cut(connection, "ping send timeout").await),
-                    }
+                    self.ping = PingState::Sending { deadline };
                 }
             }
         }
@@ -3917,16 +3935,41 @@ mod tests {
         ping_hangs: bool,
         close_hangs: bool,
         closes: usize,
+        /// Pends the first send and, when set, only answers after a send succeeded.
+        first_send_pends: bool,
+        sends: usize,
+        sent_ok: std::sync::Arc<tokio::sync::Notify>,
+        pong_after_send: bool,
+    }
+
+    impl FakeIo {
+        fn new(ping_hangs: bool, close_hangs: bool) -> Self {
+            Self {
+                ping_hangs,
+                close_hangs,
+                closes: 0,
+                first_send_pends: false,
+                sends: 0,
+                sent_ok: Default::default(),
+                pong_after_send: false,
+            }
+        }
     }
 
     impl LivenessIo for FakeIo {
         async fn receive_text(&mut self) -> Result<String> {
+            if self.pong_after_send {
+                self.sent_ok.notified().await;
+                return Ok(r#"{"op":"pong"}"#.to_string());
+            }
             std::future::pending().await
         }
         async fn send_ping(&mut self) -> Result<()> {
-            if self.ping_hangs {
+            self.sends += 1;
+            if self.ping_hangs || (self.first_send_pends && self.sends == 1) {
                 std::future::pending::<()>().await;
             }
+            self.sent_ok.notify_one();
             Ok(())
         }
         async fn close_best_effort(&mut self) {
@@ -3938,11 +3981,7 @@ mod tests {
     }
 
     async fn run_fake(close_hangs: bool) -> (Result<String>, usize) {
-        let mut io = FakeIo {
-            ping_hangs: true,
-            close_hangs,
-            closes: 0,
-        };
+        let mut io = FakeIo::new(true, close_hangs);
         let mut liveness = Liveness::with_durations(
             Duration::from_millis(100),
             Duration::from_millis(100),
@@ -3967,6 +4006,31 @@ mod tests {
         let (result, closes) = run_fake(true).await;
         assert_eq!(result.unwrap_err().kind(), ErrorKind::Transport);
         assert_eq!(closes, 1);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_ping_send_is_redone_instead_of_awaiting_a_pong() {
+        let mut io = FakeIo::new(false, false);
+        io.first_send_pends = true;
+        io.pong_after_send = true;
+        let mut liveness = Liveness::with_durations(
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+            None,
+            None,
+        );
+        // The first receive is cancelled while the ping send is pending.
+        let first =
+            tokio::time::timeout(Duration::from_millis(250), liveness.receive(&mut io)).await;
+        assert!(first.is_err(), "the first receive must be cancelled");
+        assert_eq!(io.sends, 1);
+        // The next one redoes the send at once, then gets the pong.
+        let second = tokio::time::timeout(Duration::from_millis(500), liveness.receive(&mut io))
+            .await
+            .expect("must not wait for a pong to a ping that was never sent");
+        assert_eq!(second.unwrap(), r#"{"op":"pong"}"#);
+        assert_eq!(io.sends, 2);
+        assert_eq!(io.closes, 0);
     }
 
     #[test]
