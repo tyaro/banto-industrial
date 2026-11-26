@@ -1,11 +1,8 @@
-//! 時刻だけで値が決まる筋書き（版つきの JSON）の読込と評価（Issue #389）。
+//! 時刻だけで値が決まる筋書き（版つきの JSON）の読込と評価（tyaro/temp-scada#389）。
 //!
 //! temp-scada の `crates/scada-scenario`（`43e641cc`）から移した（banto-industrial#1335）。
-//! 形の正本は `docs/crates/banto-scenario-format.md`。TypeScript の評価部は当面 temp-scada に残る
-//! （tyaro/temp-scada#389）。
-//!
-//! 形は `docs/crates/banto-scenario-format.md`。TypeScript の
-//! `apps/banto-scada/src/scenario/scenario.ts` と同じ筋書き・同じ時刻から同じ値を出す
+//! 形の正本は `docs/crates/banto-scenario-format.md`。TypeScript の評価部（当面は temp-scada の
+//! `apps/banto-scada/src/scenario/scenario.ts`）と同じ筋書き・同じ時刻から同じ値を出す
 //! （共通の試験ケースは `tests/cases/`）。計算の手順（余り・丸め・足す順）は両方で揃える。
 
 use std::collections::BTreeMap;

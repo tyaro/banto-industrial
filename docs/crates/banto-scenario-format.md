@@ -1,6 +1,6 @@
 # 時刻だけで値が決まる筋書きの形（版 1）
 
-状態: **実装済み**（2026-11-26、banto-industrial#1335 で temp-scada#389 の形 版 1 を移した）。Rust の評価部は `crates/banto-scenario`、共通の試験ケースは `crates/banto-scenario/tests/`。TypeScript の評価部は当面 temp-scada の `apps/banto-scada/src/scenario/scenario.ts`。製品のコード（`src/lib`）はこれを使わない。使うのは GitHub Pages のデモ（[デモの案内](https://github.com/tyaro/temp-scada/blob/work/docs/guides/demo-pages.md)。temp-scada）だけ。
+状態: **実装済み**（2026-11-26、banto-industrial#1335 で temp-scada#389 の形 版 1 を移した）。Rust の評価部は `crates/banto-scenario`、共通の試験ケースは `crates/banto-scenario/tests/`。TypeScript の評価部は当面 temp-scada の `apps/banto-scada/src/scenario/scenario.ts`。temp-scada では、製品のコード（`src/lib`）は使わず、GitHub Pages のデモ（[デモの案内](https://github.com/tyaro/temp-scada/blob/work/docs/guides/demo-pages.md)）だけが使う。banto-industrial では筋書きで動く模擬 PLC（#1335）が使う。
 
 ## 目的
 
@@ -74,7 +74,7 @@
 
 - 余りは `r = x % d; if r < 0 { r += d }` で、両方で同じ手順を取る。丸めは `round(|x| · 10^digits) / 10^digits` に符号を戻す（10 の累乗は表で引く）。
 - sin は言語の数学ライブラリの差で最後の桁がずれうる。共通の試験ケースは 1e-9 までの差を許す。丸めの境目のちょうど上で sin がずれると、丸めた値が 1 桁ずれる可能性は残る（試験ケースの時刻では起きていない）。
-- 試験ケース（`crates/banto-scenario/tests/cases/*.json`）は、筋書き（`scenario`、または `scenarioFile` で別のファイル）・`frozenTimeSec`・時刻ごとの期待値を持つ。`basics.json` は手で計算した値。`water.json` は Pages のデモの筋書きを TypeScript の評価部で書いた値で、筋書きを変えたら （temp-scada で）`SCENARIO_BLESS=1 pnpm --filter banto-scada exec vitest run src/scenario` で書き直し、Rust の試験（`cargo test -p banto-scenario`）が同じ値を出すことを確かめる。誤りの例は `tests/invalid.json`。water.json を書き直したら、ここの `tests/cases/water.json` と `tests/scenarios/water.scenario.json` も temp-scada から写す。
+- 試験ケース（`crates/banto-scenario/tests/cases/*.json`）は、筋書き（`scenario`、または `scenarioFile` で別のファイル）・`frozenTimeSec`・時刻ごとの期待値を持つ。`basics.json` は手で計算した値。`water.json` は Pages のデモの筋書きを TypeScript の評価部で書いた値で、筋書きを変えたら（temp-scada で）`SCENARIO_BLESS=1 pnpm --filter banto-scada exec vitest run src/scenario` で書き直し、Rust の試験（`cargo test -p banto-scenario`）が同じ値を出すことを確かめる。誤りの例は `tests/invalid.json`。water.json を書き直したら、ここの `tests/cases/water.json` と `tests/scenarios/water.scenario.json` も temp-scada から写す。
 
 ## 決めていないこと
 
