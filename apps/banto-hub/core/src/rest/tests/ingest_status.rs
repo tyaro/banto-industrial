@@ -154,6 +154,10 @@ async fn the_status_ingest_section_reports_the_sender_without_secrets_or_values(
     // 機械向け（snake_case）。
     let (status, v1) = v1_get(&env.router, &read_key, "/api/v1/status").await;
     assert_eq!(status, StatusCode::OK, "{v1:?}");
+    // #1295: 設置ごとに変わらない Hub の id。
+    assert!(v1["hub_id"]
+        .as_str()
+        .is_some_and(crate::hub_id::is_valid_hub_id));
     // #1223: 書き込みの契約の対応を機能名で知らせる。
     assert!(v1["capabilities"]
         .as_array()

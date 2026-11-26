@@ -249,6 +249,7 @@ pub mod host_switch;
 pub mod http_hub_health;
 pub mod hub;
 pub mod hub_health;
+pub mod hub_id;
 pub mod hub_log;
 pub mod hub_tls_prepare;
 pub mod ingest;

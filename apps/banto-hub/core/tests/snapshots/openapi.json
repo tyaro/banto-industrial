@@ -1425,6 +1425,10 @@
             "$ref": "#/components/schemas/GrpcStatusEntry",
             "description": "T4（設計 §5.4）: gRPC サーバーの設定。"
           },
+          "hub_id": {
+            "description": "#1295: 設置ごとに変わらない Hub の id（UUID v4、小文字）。設定 DB に 1 度だけ作られ、\nDB を作り直すと変わり、DB のバックアップから戻すとその DB の id に戻る。消費側が\n「同じ URL のまま別の Hub に差し替えられた」ことを見分けるための印で、設定の\n時点は表さない（時点は `revision`・`run_id` で見る）。同じバックアップを別の機械に\n戻すと同じ id の Hub が 2 台できうる（`crate::hub_id`）。古い Hub はこの欄を返さない。",
+            "type": "string"
+          },
           "ingest": {
             "description": "取り込み口 `push`（R2a-2e、docs/hub/banto-hub-ingest-design.md §9）: `push`\n接続ごとの受信の状態。`push` 接続が無ければ空配列。",
             "items": {
@@ -1507,6 +1511,7 @@
         "required": [
           "version",
           "capabilities",
+          "hub_id",
           "revision",
           "configured_revision",
           "running_revision",

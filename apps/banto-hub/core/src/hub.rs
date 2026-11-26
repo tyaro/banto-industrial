@@ -978,6 +978,9 @@ pub struct CollectorManager {
     /// physical broker session, catalog, driver version and latest attempt
     /// still match. Nothing is persisted or promoted to an allowlist.
     range_diagnostics: Mutex<HashMap<i64, StoredRangeDiagnostic>>,
+    /// #1295: 設置ごとに変わらない Hub の id（[`crate::hub_id`]）。起動時に [`Self::hub_id`] で
+    /// 1 回だけ DB から読み（無ければ作る）、以後は status のたびに DB を読まない。
+    hub_id: tokio::sync::OnceCell<String>,
     /// #341 レビュー対応（2026-09-14）: **テスト専用の失敗注入**。
     /// `true` のとき、次の [`Self::apply_run`] は collector 側のコミットを
     /// 実際には行わずに `Err` を返す（フラグはその場で降りる）。
@@ -1189,6 +1192,7 @@ impl CollectorManager {
         Self {
             clock_sync: Arc::new(crate::clock_sync::ClockSync::new(pool.clone())),
             range_diagnostics: Mutex::new(HashMap::new()),
+            hub_id: tokio::sync::OnceCell::new(),
             #[cfg(test)]
             fail_next_apply: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -1248,6 +1252,15 @@ impl CollectorManager {
         self.db_source.set_diag_log(diag_log.clone());
         self.diag_log = diag_log;
         self
+    }
+
+    /// #1295: この Hub の id（[`crate::hub_id`]）。最初の呼び出しで DB から読み（無ければ作り）、
+    /// 以後は覚えた値を返す。壊れた値ならエラー（起動時に呼んで止める）。
+    pub async fn hub_id(&self) -> Result<&str, banto_core::BantoError> {
+        self.hub_id
+            .get_or_try_init(|| crate::hub_id::load_or_create(&self.pool))
+            .await
+            .map(String::as_str)
     }
 
     /// H2: PLC の時計合わせの状態（`crate::clock_sync` のモジュール doc）。
