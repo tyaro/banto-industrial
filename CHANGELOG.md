@@ -2,6 +2,10 @@
 
 banto-industrial のリリースノート。日付は JST。バージョンは [SemVer](https://semver.org/lang/ja/) 準拠（`publish = false` のワークスペースで、タグはリポジトリ状態の目印）。
 
+## 未リリース
+
+- **【互換を壊す変更】banto-tagclient の書込みの誤りを詳しく読めるようにしました（#1293）。** `Error::write_detail()` が `WriteErrorDetail`（Hub の理由の `code()`・監査の `audit_id()`・`correlation_id()`）を返します。機密は持たず、`code` は `[a-z0-9_]` の 1〜64 文字のときだけ、`correlation_id` は送った値と一致するときだけ採ります。502 `write_failed`（書込みは成立しなかったと確定。機器へ送ったかどうかはこのコードでは区別しません。PLC のセッションが無いときなど、何も送らずに返すこともあります）は `ErrorKind::WriteRejected` から新設の `ErrorKind::WriteFailed` に移りました（`WriteRejected` は「送る前に断った」だけ）。temp-scada など利用側の移行の条件: `WriteFailed` を「失敗（成立しない）」、`WriteUncertain` を引き続き「結果不明」として扱い、失敗の行にも返った `audit_id` を残してください。知らない kind を結果不明に落とす今の実装のまま依存だけ上げると、確定した失敗が「結果不明」に変わります。`Error` は `Copy` でなくなりました（`Clone` のまま。`kind()` は `&self`）。
+
 ## v0.3.0-alpha.4 — 2026-11-20（アルファ）
 
 alpha.2 の次の配布物です。タグ `v0.3.0-alpha.3`（2026-11-19、`6a08efbb`）は temp-scada の `banto-tagclient` の参照先としてタグだけを付けたもので、版の表記は alpha.2 のままでした。この版はその内容（`capabilities` を含む）と、その後の ChronoGazer の変更を含みます。DB マイグレーションは Hub の 0111（書込み監査の 2 列）と、両アプリの 0013（banto の権限の表）が自動で当たります（前進のみ）。この版全体の実機確認は済んでいません。

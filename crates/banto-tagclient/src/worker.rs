@@ -159,7 +159,7 @@ impl RetryTracker {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct AttemptFailure {
     error: Error,
     /// The attempt published `Live` (received data). Resets both the rebind
@@ -256,7 +256,7 @@ pub(crate) async fn run_supervisor_with_config(
             }
             Err(failure) => failure,
         };
-        let error = failure.error;
+        let error = failure.error.clone();
         if error.kind() == ErrorKind::Stopped {
             tracing::debug!("banto-tagclient worker stopped by caller request");
             state_tx.send_replace(TagClientState::new(TagClientConnectionState::Stopped));
@@ -277,7 +277,12 @@ pub(crate) async fn run_supervisor_with_config(
         if is_rebindable(error.kind()) {
             state_tx.send_replace(TagClientState::rebinding(error.kind()));
         }
-        match plan_failure(&mut retry_tracker, &mut rebind_tracker, mode, failure) {
+        match plan_failure(
+            &mut retry_tracker,
+            &mut rebind_tracker,
+            mode,
+            failure.clone(),
+        ) {
             FailurePlan::Rebind(next_mode) => {
                 tracing::debug!(
                     error_kind = error.kind().as_str(),
@@ -1124,7 +1129,7 @@ mod tests {
                 &mut retry_tracker,
                 &mut rebind_tracker,
                 mode,
-                transport_failure
+                transport_failure.clone()
             ),
             FailurePlan::Backoff
         );
@@ -1137,7 +1142,7 @@ mod tests {
                 &mut retry_tracker,
                 &mut rebind_tracker,
                 mode,
-                transport_failure
+                transport_failure.clone()
             ),
             FailurePlan::Backoff
         );
@@ -1216,7 +1221,7 @@ mod tests {
                 &mut retry_tracker,
                 &mut rebind_tracker,
                 mode,
-                unbound_rebind,
+                unbound_rebind.clone(),
             ) {
                 FailurePlan::Rebind(next_mode) => next_mode,
                 other => panic!("an Unbound rebind must not fall back: {other:?}"),
@@ -1233,7 +1238,7 @@ mod tests {
                     &mut retry_tracker,
                     &mut rebind_tracker,
                     mode,
-                    unbound_disconnect
+                    unbound_disconnect.clone()
                 ),
                 FailurePlan::Backoff
             );

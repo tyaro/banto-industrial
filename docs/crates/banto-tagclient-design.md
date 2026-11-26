@@ -1,7 +1,7 @@
 # banto-tagclient 設計
 
 作成日: 2026-08-29
-状態: **2026-11-19: §4.4 の書込みを SCADA 向けの契約に合わせて実装した（#1202）。2026-11-18: §4.4 の書込みに SCADA 向けの変更（#1177、2026-11-18 オーナー決定、tag-server-design.md §6.6）を足した。#682（2026-10-31〜11-01、PR-1〜PR-3 で実装。§3.1・§4・§5 は反映済み）: 部分 Binding 解決（未解決名があっても解決できた名前だけで購読し、未解決は個別診断）と、同一世代の catalog / 解決結果 / current を 1 つの snapshot で公開する契約拡張は [banto-tagclient-partial-binding-design.md](banto-tagclient-partial-binding-design.md) が正。本書と食い違う所があれば同書を正とする。**
+状態: **2026-11-26: 書込みの `Err` から Hub の理由の code・`audit_id`・`correlation_id` を読めるようにし（`WriteErrorDetail`、`Error` は `Copy` でなくなった）、502 `write_failed` を新設の `ErrorKind::WriteFailed` に分けた（#1293）。2026-11-19: §4.4 の書込みを SCADA 向けの契約に合わせて実装した（#1202）。2026-11-18: §4.4 の書込みに SCADA 向けの変更（#1177、2026-11-18 オーナー決定、tag-server-design.md §6.6）を足した。#682（2026-10-31〜11-01、PR-1〜PR-3 で実装。§3.1・§4・§5 は反映済み）: 部分 Binding 解決（未解決名があっても解決できた名前だけで購読し、未解決は個別診断）と、同一世代の catalog / 解決結果 / current を 1 つの snapshot で公開する契約拡張は [banto-tagclient-partial-binding-design.md](banto-tagclient-partial-binding-design.md) が正。本書と食い違う所があれば同書を正とする。**
 **2026-09-30 オーナー決定（docs/scada/scada-design.md §9.6）で、bindingと書き込みの同一性を
 Hub内部の数値ID（`StableTagId`）から外部名（`external_name`）に変更した（§3.1・§4.4。
 SDKと呼び出し側は追従済み）。改名でbindingがunresolvedになるのは仕様。**
@@ -338,12 +338,25 @@ log-before-write）と衝突する。監査行をバッチ単位でまとめる�
 拒否されずシミュレータへ反映されるようになった）。この2つ
 は意味も呼出側の対処も異なるため、`ErrorKind::WriteForbidden`（403）と
 `ErrorKind::WriteUnavailable`（503）として区別する。それ以外の書き込み時拒否
-（404/409/422/429/501と、502の`write_failed`）は`ErrorKind::WriteRejected`へ集約する - リクエストの
+（404/409/422/429/501。送る前に断られた物）は`ErrorKind::WriteRejected`へ集約する - リクエストの
 組み立て自体を直さない限り再試行しても成功しない、という共通の性質でまとめている。
 分類はHTTPステータスと、応答bodyの`error`コード（Hubが決めた固定の語彙）のみで行い、
 `detail`文字列は使わない・ログにも出さない（`detail`はリクエスト由来の文字列を含みうる
 ため、この crate の公開エラー面へ任意のサーバー文字列を持ち込まない）。bodyは16 KiBまでしか
 読まず、読めない・大きすぎる・知らないコードは下の表の「既定」に落とす。
+
+**誤りの詳細（#1293）**: HTTP の誤りの応答を受けたときだけ、`Error::write_detail()` が
+`WriteErrorDetail`（`code()`・`audit_id()`・`correlation_id()`）を返す。機密を持たない約束は保つ:
+`code` は `[a-z0-9_]` の 1〜64 文字のときだけ採り（逆プロキシの自由文は捨てる）、
+`correlation_id` は応答の値がこちらが送った値と一致するときだけ採り、`detail` 欄は読まない。
+送る前の失敗・送信の失敗（transport・タイムアウト）には付かない。`Error` は `Box` を持つため
+`Copy` ではなく `Clone`（`kind()` は `&self`）。
+
+**`WriteFailed` の意味（#1293 のレビュー、2026-11-26）**: 502 `write_failed` は「書込みは成立しなかった
+（確定）」だけを表し、**機器へ送ったかどうかはこのコードでは区別しない**。Hub は PLC のセッションが無いとき
+（収集の停止との競合）やドライバが送る前に断ったときも、何も送らずに 502 `write_failed` を返す
+（`apps/banto-hub/core/src/write_path.rs` の `no_session_rejection`）。監査の行は送る前に作るので、
+`audit_id` の有無でも区別できない。送る前と後を分ける要件は、Hub に明示の応答を設けてから契約にする。
 
 **`ErrorKind`への3variant追加が既存の再試行判断に与える影響（確認済み、2026-09-01）**:
 #212で`ErrorKind`の細分化を見送った理由は、`worker.rs`の`is_rebindable`/`is_retryable`
@@ -378,7 +391,7 @@ log-before-write）と衝突する。監査行をバッチ単位でまとめる�
 | 403                      | `key_tripped`                                                                           | `KeyTripped`       |
 | 403                      | 上記以外・読めない（`not_writable`/`missing_write_scope`/`session_token_cannot_write`） | `WriteForbidden`   |
 | 404/409/422/429/501      | -                                                                                       | `WriteRejected`    |
-| 502                      | `write_failed`（送って失敗が確定）                                                      | `WriteRejected`    |
+| 502                      | `write_failed`（成立しなかったと確定。送ったかは区別しない）                            | `WriteFailed`      |
 | 502                      | `write_uncertain`・既定（リバースプロキシの502など。届いたか不明なので安全側）          | `WriteUncertain`   |
 | 500                      | `audit_write_failed`（送っていない）                                                    | `Transport`        |
 | 500                      | `internal`・既定（送ったか保証できない）                                                | `WriteUncertain`   |
