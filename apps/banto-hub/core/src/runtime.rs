@@ -220,7 +220,7 @@ use crate::settings::{HubSettingsExt, SettingsService};
 use crate::subscribe_core::EVAL_TICK_MS;
 pub use crate::tls_listener::RunningTlsListener as RunningTlsServer;
 pub use crate::tls_listener::TlsRevoker;
-use crate::tls_listener::{self, TlsConfig};
+use crate::tls_listener::{self, ListenerWrites, TlsConfig};
 use crate::users::UsersService;
 use crate::write_audit::{RejectionWriter, WriteAuditService};
 use crate::write_control::{load_startup_decision, WriteControl};
@@ -1154,6 +1154,11 @@ impl HubRuntime {
                 return Err(HubStartError::ServerStart { port, source: err });
             }
         };
+        // #947（banto ADR-0035 §9）: TLS の待ち受け（とその作り直しの世代）は、平文の listener の
+        // 書き込みの枠を共有し、終了で全部の門を先に閉じるために停止口を覚える
+        // （`crate::tls_listener` のモジュール doc「書き込みの切り離し」）。
+        let listener_writes = ListenerWrites::sharing(server.write_budget());
+        listener_writes.register(server.stop_handle());
         // `Some(line)` は既定の TLS を待ち受けたときの行（ログは下でまとめて出す）。
         let mut default_tls_line: Option<String> = None;
         #[cfg(windows)]
@@ -1162,18 +1167,20 @@ impl HubRuntime {
         let desktop_selected = matches!(&tls_config, Some(TlsPlan::Desktop(_)))
             || desktop_tls_initial_status.is_some();
         let tls_server = match tls_config {
-            Some(TlsPlan::Explicit(config)) => match tls_listener::start(&config, app).await {
-                Ok(listener) => Some(listener),
-                Err(err) => {
-                    server.stop().await;
-                    eval_handle.abort();
-                    prune_handle.abort();
-                    mqtt.shutdown().await;
-                    grpc_server.shutdown().await;
-                    opcua.shutdown().await;
-                    return Err(HubStartError::Tls(err.to_string()));
+            Some(TlsPlan::Explicit(config)) => {
+                match tls_listener::start_sharing(&config, app, &listener_writes).await {
+                    Ok(listener) => Some(listener),
+                    Err(err) => {
+                        server.stop().await;
+                        eval_handle.abort();
+                        prune_handle.abort();
+                        mqtt.shutdown().await;
+                        grpc_server.shutdown().await;
+                        opcua.shutdown().await;
+                        return Err(HubStartError::Tls(err.to_string()));
+                    }
                 }
-            },
+            }
             Some(plan) => {
                 let mut identity = match plan {
                     TlsPlan::Default(identity) => identity,
@@ -1187,7 +1194,7 @@ impl HubRuntime {
                 let serving = banto_hub_tls_trust::CertThumbprint::of_pem(identity.cert_pem()).ok();
                 let (cert, key) = identity.take_pem();
                 let config = TlsConfig::in_memory(identity.port(), cert, key);
-                match tls_listener::start(&config, app.clone()).await {
+                match tls_listener::start_sharing(&config, app.clone(), &listener_writes).await {
                     Ok(listener) => {
                         let listening_line = identity.listening_line(listener.local_addr());
                         #[cfg(windows)]
@@ -1249,6 +1256,7 @@ impl HubRuntime {
                                     Some(config),
                                     initial,
                                     tls_keep_alive.clone(),
+                                    listener_writes.clone(),
                                 ));
                         }
                         None
@@ -1273,6 +1281,7 @@ impl HubRuntime {
                 None,
                 initial,
                 tls_keep_alive,
+                listener_writes.clone(),
             ));
         }
         // REST が先にポートを確保する。同じポートを OPC UA に指定しても
@@ -1345,6 +1354,7 @@ impl HubRuntime {
             sim_registry,
             server,
             tls_server,
+            listener_writes,
             #[cfg(windows)]
             desktop_tls_monitor,
             #[cfg(windows)]
@@ -1446,6 +1456,9 @@ pub struct RunningHub {
     sim_registry: Arc<BrokerSimRegistry>,
     server: RunningServer,
     tls_server: Option<RunningTlsServer>,
+    /// 平文・TLS（作り直しの世代も）の待ち受けが共有する書き込みの勘定（#947、banto
+    /// ADR-0035 §9）。終了で全部の門を先に閉じ、止めた世代に残った書き込みも待つ。
+    listener_writes: ListenerWrites,
     #[cfg(windows)]
     desktop_tls_monitor: Option<crate::hub_tls_prepare::desktop::watch::Monitor>,
     #[cfg(windows)]
@@ -1694,14 +1707,57 @@ impl RunningHub {
         // (`sessions`), so they are stopped last - see this module's doc
         // comment ("シャットダウン順序").
         self.sim_registry.shutdown().await;
+        // #947（banto ADR-0035 §9）: 平文・TLS の待ち受けを `RunningServer::stop_all` と同じ順で
+        // 止める。**全部の門を先に閉じ**（以後どの口も書き込みを始めない。監視が持つ TLS の
+        // listener も勘定に登録してあるので閉じる）、それから並行に待つ（待ちは足し算でなく最も
+        // 遅い 1 つ分）。証明書の作り直し・失効で前に止めた TLS の世代に残った書き込みも、同じ
+        // 上限で並べて待つ（`stop_all` が待つのは渡した listener だけ）。TLS の listener の
+        // 残りは `RunningTlsListener::stop` がログに出して勘定に足す。
+        self.listener_writes.close_all();
         #[cfg(windows)]
-        if let Some(monitor) = self.desktop_tls_monitor.take() {
-            monitor.stop().await;
+        let monitor = self.desktop_tls_monitor.take();
+        let tls_server = self.tls_server.take();
+        let server = self.server;
+        let listener_writes = self.listener_writes.clone();
+        let stop_monitor = async {
+            #[cfg(windows)]
+            if let Some(monitor) = monitor {
+                monitor.stop().await;
+            }
+        };
+        let stop_tls = async {
+            if let Some(tls_server) = tls_server {
+                tls_server.stop().await;
+            }
+        };
+        let stop_plain = async {
+            if let Some(remaining) = server.stop().await.remaining() {
+                log_err_line(&format!(
+                    "banto-hub: [WARN] 平文の待ち受けを止めた後も書き込みが {} 件走っています: {}",
+                    remaining.count(),
+                    remaining.operations().join(", ")
+                ));
+            }
+        };
+        // 待ちの締め切りは 1 つにする。`wait_left` は呼んだ時点の残りしか写さないので、
+        // Windows の失効・作り直しの最中に終了すると、監視の停止（失効した世代は書き込みを
+        // 待たない）が join の途中で `keep` した残りは最初の待ちに入らない。join の後に
+        // 同じ締め切りでもう一度待って、DB を閉じる前に取りこぼさない。
+        let deadline = tokio::time::Instant::now() + banto_server::DETACHED_WRITES_STOP_TIMEOUT;
+        let _ = tokio::join!(
+            stop_monitor,
+            stop_tls,
+            stop_plain,
+            listener_writes.wait_left_until(deadline)
+        );
+        let earlier_finished = listener_writes.wait_left_until(deadline).await;
+        let running = listener_writes.running();
+        if !earlier_finished || running > 0 {
+            log_err_line(&format!(
+                "banto-hub: [WARN] 待ち受けを止めた後も、受理した書き込みが {} 件走ったまま終了へ進みます（止めずに走らせます。ADR-0035）",
+                running
+            ));
         }
-        if let Some(tls_server) = self.tls_server {
-            tls_server.stop().await;
-        }
-        self.server.stop().await;
         // サーバーを止めたので新しい handler は来ない。切断で捨てられた handler のものも
         // 含め、切り離したタスク（監査を書く）の終わりを pool を閉じる前に待つ。上限を
         // 過ぎても abort しない（DB を触るタスクを `abort()` で止めない）。
