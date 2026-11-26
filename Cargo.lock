@@ -1157,6 +1157,20 @@ name = "banto-plc-address"
 version = "0.3.0-alpha.4"
 
 [[package]]
+name = "banto-plc-sim"
+version = "0.3.0-alpha.4"
+dependencies = [
+ "banto-driver-api",
+ "banto-plc",
+ "banto-register-codec",
+ "banto-scenario",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "banto-plc-write"
 version = "0.3.0-alpha.4"
 dependencies = [

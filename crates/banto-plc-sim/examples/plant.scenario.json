@@ -1,0 +1,32 @@
+{
+  "format": "banto-scenario",
+  "version": 1,
+  "cycleSec": 180,
+  "epochSec": 1767225600,
+  "freezeAtSec": 70,
+  "signals": {
+    "Tank.Level": {
+      "kind": "number",
+      "points": [
+        [0, 40],
+        [60, 82],
+        [180, 40]
+      ],
+      "digits": 1
+    },
+    "Inflow": {
+      "kind": "number",
+      "base": 62,
+      "waves": [{ "amplitude": 34, "periodSec": 180, "shiftSec": 5 }]
+    },
+    "Hours": {
+      "kind": "number",
+      "base": 4212,
+      "rampPerHour": 1,
+      "rampWrap": 1000
+    },
+    "Pump.Run": { "kind": "bit", "value": true },
+    "Lamp": { "kind": "bit", "periodSec": 2, "onSec": 1 }
+  },
+  "events": [{ "atSec": 146, "durationSec": 22, "values": { "Pump.Run": false } }]
+}

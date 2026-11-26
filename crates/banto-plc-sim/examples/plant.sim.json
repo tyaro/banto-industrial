@@ -1,0 +1,17 @@
+{
+  "format": "banto-plc-sim",
+  "version": 1,
+  "protocol": "slmp",
+  "listen": "127.0.0.1:15000",
+  "scenario": "plant.scenario.json",
+  "periodMs": 100,
+  "wordOrder": "low_high",
+  "map": [
+    { "signal": "Tank.Level", "address": "D100", "type": "i16", "scale": 10 },
+    { "signal": "Inflow", "address": "D102", "type": "f32" },
+    { "signal": "Hours", "address": "D110", "type": "u32", "wordOrder": "high_low" },
+    { "signal": "Pump.Run", "address": "M10" },
+    { "signal": "Lamp", "address": "D120.3" }
+  ],
+  "faults": [{ "kind": "hang", "atSec": 100, "durationSec": 15 }]
+}
