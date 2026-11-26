@@ -3723,6 +3723,611 @@ mod tests {
         hub.shutdown().await;
     }
 
+    /// #1324 段 2（banto-opcua ADR-0007・ADR-0008）: スケーリングなしの数値は元の型、
+    /// スケーリング付きは Double で公開し、説明・単位・EURange を属性で出す。string は出さない。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn opcua_publishes_native_types_and_metadata() {
+        use opcua::{
+            client::{ClientBuilder, IdentityToken},
+            crypto::SecurityPolicy,
+            types::{
+                AttributeId, BrowseDescription, BrowseDirection, DataTypeId, DataValue,
+                EUInformation, LocalizedText, MessageSecurityMode, NodeId, Range, ReadValueId,
+                ReferenceTypeId, StatusCode, TimestampsToReturn, UserTokenPolicy, Variant,
+            },
+        };
+
+        let dir = crate::test_support::TempDir::new("hub-runtime-opcua-types");
+        let db_path = dir
+            .path()
+            .join("registry.sqlite3")
+            .to_string_lossy()
+            .into_owned();
+        let pool = init_db(&db_path).await.expect("init DB");
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(banto_tags::PlcConnectionInput {
+                name: "sim".to_owned(),
+                protocol: "modbus-tcp".to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: 15032,
+                unit_id: 1,
+                enabled: true,
+                simulation: true,
+                word_order: "low_high".to_owned(),
+                cpu_type: None,
+                database: None,
+                username: None,
+                secrets: Default::default(),
+                settings: None,
+            })
+            .await
+            .expect("connection");
+        let group = CollectionGroupService::new(pool.clone())
+            .create(banto_tags::CollectionGroupInput {
+                name: "g".to_owned(),
+                plc_connection_id: conn.id,
+                period_ms: 100,
+                enabled: true,
+                default_writable: false,
+                query_sql: None,
+            })
+            .await
+            .expect("group");
+        let tag_input = |name: &str, address: &str, data_type: &str| banto_tags::TagInput {
+            comment: None,
+            name: name.to_owned(),
+            collection_group_id: group.id,
+            address: address.to_owned(),
+            data_type: data_type.to_owned(),
+            string_length: None,
+            string_encoding: "utf8".to_owned(),
+            raw_lo: None,
+            raw_hi: None,
+            eng_lo: None,
+            eng_hi: None,
+            unit: None,
+            decimals: 0,
+            enabled: true,
+            writable: false,
+            tag_kind: banto_tags::PLC_TAG_KIND.to_owned(),
+            expression: None,
+            retain: false,
+            expected_revision: None,
+        };
+        let tags = TagService::new(pool.clone());
+        // スケーリングなし: 元の型（Int16）、説明と単位は付くがレンジは付かない。
+        tags.create(banto_tags::TagInput {
+            comment: Some("炉内温度".to_owned()),
+            unit: Some("℃".to_owned()),
+            ..tag_input("raw", "40001", "i16")
+        })
+        .await
+        .expect("raw tag");
+        // スケーリング付き: Double、EURange は工学値の範囲。
+        tags.create(banto_tags::TagInput {
+            unit: Some("%".to_owned()),
+            raw_lo: Some(0.0),
+            raw_hi: Some(4000.0),
+            eng_lo: Some(0.0),
+            eng_hi: Some(100.0),
+            ..tag_input("scaled", "40002", "i16")
+        })
+        .await
+        .expect("scaled tag");
+        // 説明・単位なし。
+        tags.create(tag_input("plain", "40003", "u16"))
+            .await
+            .expect("plain tag");
+        tags.create(tag_input("flag", "00001", "bit"))
+            .await
+            .expect("bit tag");
+        let port_holder = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve OPC port");
+        let opcua_port = port_holder.local_addr().expect("port").port();
+        drop(port_holder);
+        SettingsService::new(Db::Sqlite(pool.clone()))
+            .set_opcua_config(&crate::settings::OpcUaSettings {
+                enabled: true,
+                port: opcua_port,
+                ..Default::default()
+            })
+            .await
+            .expect("save OPC UA settings");
+        pool.close().await;
+
+        let hub = HubRuntime::start(HubConfig {
+            drivers: crate::test_support::test_drivers(),
+            db_path,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".to_owned()),
+            data_dir_override: Some(dir.path().join("data")),
+            profile_id: "test-opcua-types".to_owned(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: true,
+            default_tls: None,
+        })
+        .await
+        .expect("start Hub");
+        let (endpoint, namespace) = hub
+            .opcua
+            .endpoint_and_namespace()
+            .await
+            .expect("OPC UA is listening");
+
+        let pki = tempfile::tempdir().expect("client PKI");
+        let mut client = ClientBuilder::new()
+            .application_name("banto-hub-opcua-types-test")
+            .application_uri("urn:banto:hub:opcua:types-test")
+            .create_sample_keypair(true)
+            .pki_dir(pki.path())
+            .trust_server_certs(true)
+            .verify_server_certs(false)
+            .client()
+            .expect("client");
+        let (session, event_loop) = client
+            .connect_to_matching_endpoint(
+                (
+                    endpoint.as_str(),
+                    SecurityPolicy::None.to_str(),
+                    MessageSecurityMode::None,
+                    UserTokenPolicy::anonymous(),
+                ),
+                IdentityToken::Anonymous,
+            )
+            .await
+            .expect("connect");
+        let task = event_loop.spawn();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), session.wait_for_connection())
+                .await
+                .expect("connection timeout")
+        );
+        let node = |name: &str| NodeId::new(namespace, format!("sim.g.{name}"));
+        let read = |node: NodeId, attribute: AttributeId| {
+            let session = session.clone();
+            async move {
+                session
+                    .read(
+                        &[ReadValueId {
+                            node_id: node,
+                            attribute_id: attribute as u32,
+                            ..Default::default()
+                        }],
+                        TimestampsToReturn::Both,
+                        0.0,
+                    )
+                    .await
+                    .expect("Read")
+                    .remove(0)
+            }
+        };
+        let property = |node: NodeId, name: &'static str| {
+            let session = session.clone();
+            async move {
+                let result = session
+                    .browse(
+                        &[BrowseDescription {
+                            node_id: node,
+                            browse_direction: BrowseDirection::Forward,
+                            reference_type_id: ReferenceTypeId::HasProperty.into(),
+                            include_subtypes: false,
+                            result_mask: 63,
+                            ..Default::default()
+                        }],
+                        0,
+                        None,
+                    )
+                    .await
+                    .expect("Browse");
+                result[0]
+                    .references
+                    .iter()
+                    .flatten()
+                    .find(|r| r.browse_name.name.as_ref() == name)
+                    .map(|r| r.node_id.node_id.clone())
+            }
+        };
+        fn extension<T: Send + Sync + Clone + 'static>(value: &DataValue) -> T {
+            match &value.value {
+                Some(Variant::ExtensionObject(object)) => {
+                    object.inner_as::<T>().expect("expected struct").clone()
+                }
+                other => panic!("not an ExtensionObject: {other:?}"),
+            }
+        }
+        let data_type = |value: DataValue| match value.value {
+            Some(Variant::NodeId(id)) => *id,
+            other => panic!("not a NodeId: {other:?}"),
+        };
+
+        // 型。
+        assert_eq!(
+            data_type(read(node("raw"), AttributeId::DataType).await),
+            NodeId::from(DataTypeId::Int16)
+        );
+        assert_eq!(
+            data_type(read(node("scaled"), AttributeId::DataType).await),
+            NodeId::from(DataTypeId::Double)
+        );
+        assert_eq!(
+            data_type(read(node("plain"), AttributeId::DataType).await),
+            NodeId::from(DataTypeId::UInt16)
+        );
+        assert_eq!(
+            data_type(read(node("flag"), AttributeId::DataType).await),
+            NodeId::from(DataTypeId::Boolean)
+        );
+
+        // 説明・単位。レンジはスケーリングなしのタグには無い。
+        assert_eq!(
+            read(node("raw"), AttributeId::Description).await.value,
+            Some(Variant::LocalizedText(Box::new(LocalizedText::from(
+                "炉内温度"
+            ))))
+        );
+        let units: EUInformation = extension(
+            &read(
+                property(node("raw"), "EngineeringUnits")
+                    .await
+                    .expect("EngineeringUnits"),
+                AttributeId::Value,
+            )
+            .await,
+        );
+        assert_eq!(units.display_name.text.as_ref(), "℃");
+        assert!(property(node("raw"), "EURange").await.is_none());
+
+        // スケーリング付きは EURange（工学値の範囲）。
+        let range: Range = extension(
+            &read(
+                property(node("scaled"), "EURange").await.expect("EURange"),
+                AttributeId::Value,
+            )
+            .await,
+        );
+        assert_eq!((range.low, range.high), (0.0, 100.0));
+        let scaled_units: EUInformation = extension(
+            &read(
+                property(node("scaled"), "EngineeringUnits")
+                    .await
+                    .expect("EngineeringUnits"),
+                AttributeId::Value,
+            )
+            .await,
+        );
+        assert_eq!(scaled_units.display_name.text.as_ref(), "%");
+
+        // 属性なしのタグには何も付かない。
+        assert!(property(node("plain"), "EngineeringUnits").await.is_none());
+        assert!(property(node("plain"), "EURange").await.is_none());
+        assert!(property(node("flag"), "EngineeringUnits").await.is_none());
+        let missing = read(node("nope"), AttributeId::Value).await;
+        assert_ne!(missing.status(), StatusCode::Good);
+
+        task.abort();
+        hub.shutdown().await;
+    }
+
+    /// #1324 段 2（ADR-0008）: 属性の更新。説明だけの変更は同じノードのまま書き換え（NodeId と
+    /// 購読が続く）、単位が増える（ノードの形が変わる）ときは削除して登録し直す。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn opcua_updates_metadata_in_place_and_re_adds_when_the_shape_changes() {
+        use opcua::{
+            client::{ClientBuilder, DataChangeCallback, IdentityToken},
+            crypto::SecurityPolicy,
+            types::{
+                AttributeId, BrowseDescription, BrowseDirection, EUInformation, LocalizedText,
+                MessageSecurityMode, NodeId, ReadValueId, ReferenceTypeId, StatusCode,
+                TimestampsToReturn, UserTokenPolicy, Variant,
+            },
+        };
+
+        let dir = crate::test_support::TempDir::new("hub-runtime-opcua-metadata");
+        let db_path = dir
+            .path()
+            .join("registry.sqlite3")
+            .to_string_lossy()
+            .into_owned();
+        let pool = init_db(&db_path).await.expect("init DB");
+        ensure_virtual_connection(
+            &pool,
+            &crate::test_support::test_drivers().registry,
+            MEM_CONNECTION_NAME,
+        )
+        .await;
+        let connection_id: i64 =
+            sqlx::query_scalar("SELECT id FROM plc_connections WHERE name = ?")
+                .bind(MEM_CONNECTION_NAME)
+                .fetch_one(&pool)
+                .await
+                .expect("mem connection");
+        let group = CollectionGroupService::new(pool.clone())
+            .create(banto_tags::CollectionGroupInput {
+                name: "opcua-group".to_owned(),
+                plc_connection_id: connection_id,
+                period_ms: 100,
+                enabled: true,
+                default_writable: false,
+                query_sql: None,
+            })
+            .await
+            .expect("group");
+        let tag_input =
+            |name: &str, address: &str, comment: &str, unit: Option<&str>| banto_tags::TagInput {
+                comment: Some(comment.to_owned()),
+                name: name.to_owned(),
+                collection_group_id: group.id,
+                address: address.to_owned(),
+                data_type: "f32".to_owned(),
+                string_length: None,
+                string_encoding: "utf8".to_owned(),
+                raw_lo: None,
+                raw_hi: None,
+                eng_lo: None,
+                eng_hi: None,
+                unit: unit.map(str::to_owned),
+                decimals: 0,
+                enabled: true,
+                writable: false,
+                tag_kind: banto_tags::INTERNAL_TAG_KIND.to_owned(),
+                expression: None,
+                retain: false,
+                expected_revision: None,
+            };
+        let tags = TagService::new(pool.clone());
+        let comment_tag = tags
+            .create(tag_input("commented", "", "旧い説明", None))
+            .await
+            .expect("commented tag");
+        let unit_tag = tags
+            .create(tag_input("unitless", "", "", None))
+            .await
+            .expect("unitless tag");
+        let port_holder = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve OPC port");
+        let opcua_port = port_holder.local_addr().expect("port").port();
+        drop(port_holder);
+        SettingsService::new(Db::Sqlite(pool.clone()))
+            .set_opcua_config(&crate::settings::OpcUaSettings {
+                enabled: true,
+                port: opcua_port,
+                ..Default::default()
+            })
+            .await
+            .expect("save OPC UA settings");
+
+        let hub = HubRuntime::start(HubConfig {
+            drivers: crate::test_support::test_drivers(),
+            db_path,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".to_owned()),
+            data_dir_override: Some(dir.path().join("data")),
+            profile_id: "test-opcua-metadata".to_owned(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: true,
+            default_tls: None,
+        })
+        .await
+        .expect("start Hub");
+        let (endpoint, namespace) = hub
+            .opcua
+            .endpoint_and_namespace()
+            .await
+            .expect("OPC UA is listening");
+
+        let pki = tempfile::tempdir().expect("client PKI");
+        let mut client = ClientBuilder::new()
+            .application_name("banto-hub-opcua-metadata-test")
+            .application_uri("urn:banto:hub:opcua:metadata-test")
+            .create_sample_keypair(true)
+            .pki_dir(pki.path())
+            .trust_server_certs(true)
+            .verify_server_certs(false)
+            .client()
+            .expect("client");
+        let (session, event_loop) = client
+            .connect_to_matching_endpoint(
+                (
+                    endpoint.as_str(),
+                    SecurityPolicy::None.to_str(),
+                    MessageSecurityMode::None,
+                    UserTokenPolicy::anonymous(),
+                ),
+                IdentityToken::Anonymous,
+            )
+            .await
+            .expect("connect");
+        let task = event_loop.spawn();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), session.wait_for_connection())
+                .await
+                .expect("connection timeout")
+        );
+        let node = |name: &str| NodeId::new(namespace, format!("mem.opcua-group.{name}"));
+        let read = |node: NodeId, attribute: AttributeId| {
+            let session = session.clone();
+            async move {
+                session
+                    .read(
+                        &[ReadValueId {
+                            node_id: node,
+                            attribute_id: attribute as u32,
+                            ..Default::default()
+                        }],
+                        TimestampsToReturn::Both,
+                        0.0,
+                    )
+                    .await
+                    .expect("Read")
+                    .remove(0)
+            }
+        };
+        let units_node = |node: NodeId| {
+            let session = session.clone();
+            async move {
+                let result = session
+                    .browse(
+                        &[BrowseDescription {
+                            node_id: node,
+                            browse_direction: BrowseDirection::Forward,
+                            reference_type_id: ReferenceTypeId::HasProperty.into(),
+                            include_subtypes: false,
+                            result_mask: 63,
+                            ..Default::default()
+                        }],
+                        0,
+                        None,
+                    )
+                    .await
+                    .expect("Browse");
+                result[0]
+                    .references
+                    .iter()
+                    .flatten()
+                    .find(|r| r.browse_name.name.as_ref() == "EngineeringUnits")
+                    .map(|r| r.node_id.node_id.clone())
+            }
+        };
+        let description =
+            |text: &str| Some(Variant::LocalizedText(Box::new(LocalizedText::from(text))));
+        // 条件が成り立つまで（reconcile の反映を）待つ。
+        async fn until<F, Fut>(what: &str, mut check: F)
+        where
+            F: FnMut() -> Fut,
+            Fut: std::future::Future<Output = bool>,
+        {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                if check().await {
+                    return;
+                }
+                assert!(tokio::time::Instant::now() < deadline, "timeout: {what}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+
+        // internal タグには値が無いので、サーバー側の値の置き場に入れる。値は動かし続ける。
+        let set_values = |n: f64| {
+            for name in ["commented", "unitless"] {
+                let key = hub
+                    .manager
+                    .tag_map()
+                    .get(&format!("mem.opcua-group.{name}"))
+                    .expect("catalog entry")
+                    .tag_key
+                    .clone();
+                hub.manager.server_store().set(
+                    &key,
+                    Some(n),
+                    Quality::Good,
+                    1_700_000_000_000 + n as i64,
+                );
+            }
+        };
+        set_values(1.0);
+        until("first Good value", || async {
+            read(node("commented"), AttributeId::Value).await.status() == StatusCode::Good
+        })
+        .await;
+        assert_eq!(
+            read(node("commented"), AttributeId::Description)
+                .await
+                .value,
+            description("旧い説明")
+        );
+        // 値を購読しておく（説明の更新でノードが作り直されても続くかを見る）。
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let subscription = session
+            .create_subscription(
+                Duration::from_millis(100),
+                30,
+                10,
+                0,
+                0,
+                true,
+                DataChangeCallback::new(move |value, _| {
+                    let _ = sender.send(value);
+                }),
+            )
+            .await
+            .expect("subscription");
+        session
+            .create_monitored_items(
+                subscription,
+                TimestampsToReturn::Both,
+                vec![node("commented").into()],
+            )
+            .await
+            .expect("monitored item");
+        let first = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
+            .await
+            .expect("initial DataChange timeout")
+            .expect("subscription closed");
+        assert_eq!(first.status(), StatusCode::Good);
+
+        // (a) 説明だけの変更 → 同じノードのまま Description が変わる。
+        tags.update(
+            comment_tag.id,
+            tag_input("commented", "", "新しい説明", None),
+        )
+        .await
+        .expect("update comment");
+        hub.controller()
+            .commit_catalog_and_apply_live()
+            .await
+            .expect("publish comment");
+        until("Description follows the comment", || async {
+            read(node("commented"), AttributeId::Description)
+                .await
+                .value
+                == description("新しい説明")
+        })
+        .await;
+        assert_eq!(
+            read(node("commented"), AttributeId::Value).await.status(),
+            StatusCode::Good
+        );
+        // 値の購読は届き続ける。ノードを作り直していれば BadNodeIdUnknown が来る。
+        // （模擬 PLC のランプで値は動き続ける。）
+        while receiver.try_recv().is_ok() {}
+        set_values(2.0);
+        let after = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
+            .await
+            .expect("DataChange after the comment update")
+            .expect("subscription closed");
+        assert_eq!(after.status(), StatusCode::Good);
+        assert_eq!(after.value, Some(Variant::Double(2.0)));
+
+        // (b) 単位が増える（ノードの形が変わる）→ 削除・登録し直しで単位が読める。
+        assert!(units_node(node("unitless")).await.is_none());
+        tags.update(unit_tag.id, tag_input("unitless", "", "", Some("℃")))
+            .await
+            .expect("add unit");
+        hub.controller()
+            .commit_catalog_and_apply_live()
+            .await
+            .expect("publish unit");
+        until("EngineeringUnits appears", || async {
+            units_node(node("unitless")).await.is_some()
+        })
+        .await;
+        let units_id = units_node(node("unitless")).await.expect("units node");
+        match read(units_id, AttributeId::Value).await.value {
+            Some(Variant::ExtensionObject(object)) => {
+                let info = object.inner_as::<EUInformation>().expect("EUInformation");
+                assert_eq!(info.display_name.text.as_ref(), "℃");
+            }
+            other => panic!("not an ExtensionObject: {other:?}"),
+        }
+        until("value is Good again", || async {
+            read(node("unitless"), AttributeId::Value).await.status() == StatusCode::Good
+        })
+        .await;
+
+        session.disconnect().await.expect("disconnect");
+        task.abort();
+        pool.close().await;
+        hub.shutdown().await;
+    }
+
     /// #479: シェルが組むのと同じ `HubConfig`（`HubHostKind::Shell`）でも、`PORT`
     /// 相当の明示（`port_override`）があれば埋まったポートで起動に失敗する
     /// （退避しない）。退避せず固定のポートで起動することで

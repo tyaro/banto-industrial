@@ -162,6 +162,9 @@ fn metadata_test_tag(tag_kind: &str, simulation: bool, enabled: bool) -> TagEntr
         retain: false,
         simulation,
         push: false,
+        comment: String::new(),
+        scaling: None,
+        raw_device_value: false,
     }
 }
 

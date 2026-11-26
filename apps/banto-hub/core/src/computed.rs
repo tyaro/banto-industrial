@@ -953,6 +953,9 @@ mod tests {
             retain: false,
             simulation: false,
             push: false,
+            comment: String::new(),
+            scaling: None,
+            raw_device_value: false,
         }
     }
 
@@ -976,6 +979,9 @@ mod tests {
             retain: false,
             simulation: false,
             push: false,
+            comment: String::new(),
+            scaling: None,
+            raw_device_value: false,
         }
     }
 

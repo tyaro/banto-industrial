@@ -691,6 +691,9 @@ mod tests {
             retain: false,
             simulation: false,
             push: false,
+            comment: String::new(),
+            scaling: None,
+            raw_device_value: false,
         };
         assert_eq!(topic_for("banto", &entry), "banto/line1/fast/temp01");
     }

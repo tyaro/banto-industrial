@@ -66,8 +66,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use banto_collect::Quality;
-use banto_opcua_server::model::{DataType, Quality as UaQuality, SampleTimestamps, SecurityPolicy};
-use banto_opcua_server::{OpcUaServer, RunningServer, ServerConfig, TagReading};
+use banto_opcua_server::model::{
+    publish_data_type, DataType, EngineeringUnits, EuRange, MetadataError, Quality as UaQuality,
+    SampleTimestamps, SecurityPolicy, TagMetadata, TagType, ValueScaling,
+};
+use banto_opcua_server::{Error as UaError, OpcUaServer, RunningServer, ServerConfig, TagReading};
 use futures_util::future::{BoxFuture, FutureExt};
 use serde::Serialize;
 use tokio::sync::{watch, Mutex};
@@ -287,6 +290,8 @@ impl From<CurrentView> for ReadingKey {
 struct PublishedTag {
     ids: (i64, i64, i64),
     data_type: DataType,
+    /// いま公開している属性（説明・単位・レンジ）。変わったら `update_tag_metadata`。
+    metadata: TagMetadata,
     reading: ReadingKey,
     connection: String,
     group: String,
@@ -302,6 +307,8 @@ struct Inner {
     settings: Option<OpcUaSettings>,
     worker: Option<JoinHandle<()>>,
     last_errors: HashMap<String, String>,
+    /// 属性（説明・単位・レンジ）が不正なタグの直近のエラー。同じエラーは 1 回だけ出す。
+    last_metadata_errors: HashMap<String, String>,
     stopping: bool,
     /// `apply`・`shutdown` のたびに進む世代。起動タスクの結果は、自分の世代が
     /// まだ最新のときだけ書く（モジュール doc「並行の約束」）。
@@ -350,6 +357,7 @@ impl OpcUaPublisher {
                 settings: None,
                 worker: None,
                 last_errors: HashMap::new(),
+                last_metadata_errors: HashMap::new(),
                 stopping: false,
                 generation: 0,
                 start_task: None,
@@ -553,6 +561,7 @@ impl OpcUaPublisher {
         inner.pki_pin = None;
         inner.tags.clear();
         inner.last_errors.clear();
+        inner.last_metadata_errors.clear();
     }
 
     /// 値取得は共通の `read_current_view` を使う。ServerTimestamp だけが
@@ -568,16 +577,27 @@ impl OpcUaPublisher {
         let mut desired = HashMap::new();
         for entry in map.iter() {
             if let Some(data_type) = data_type(entry) {
-                desired.insert(entry.external_name.clone(), (entry, data_type));
+                // 不正な属性は値を隠さない。属性なしで公開し、エラーは 1 行だけ出す。
+                let (metadata, metadata_error) = match tag_metadata(entry, data_type) {
+                    Ok(metadata) => (metadata, None),
+                    Err(err) => (TagMetadata::new(), Some(err.to_string())),
+                };
+                desired.insert(
+                    entry.external_name.clone(),
+                    (entry, data_type, metadata, metadata_error),
+                );
             }
         }
         inner
             .last_errors
             .retain(|name, _| desired.contains_key(name));
+        inner
+            .last_metadata_errors
+            .retain(|name, _| desired.contains_key(name));
 
         let mut blocked = HashSet::new();
         inner.tags.retain(|name, old| {
-            let keep = desired.get(name).is_some_and(|(entry, ty)| {
+            let keep = desired.get(name).is_some_and(|(entry, ty, _, _)| {
                 entry.ids == old.ids
                     && *ty == old.data_type
                     && entry.connection == old.connection
@@ -593,9 +613,20 @@ impl OpcUaPublisher {
             }
             keep
         });
-        for (name, (entry, data_type)) in desired {
+        for (name, (entry, data_type, metadata, metadata_error)) in desired {
             if blocked.contains(&name) {
                 continue;
+            }
+            match metadata_error {
+                Some(error) => {
+                    if inner.last_metadata_errors.get(&name) != Some(&error) {
+                        log_err_line(&format!("banto-hub: OPC UA タグ属性 {name}: {error}"));
+                        inner.last_metadata_errors.insert(name.clone(), error);
+                    }
+                }
+                None => {
+                    inner.last_metadata_errors.remove(&name);
+                }
             }
             let (connection, group, tag) = (
                 entry.connection.as_str(),
@@ -604,6 +635,39 @@ impl OpcUaPublisher {
             );
             let view = read_current_view(entry, collect.as_ref(), &store, now_ms);
             let reading_key = ReadingKey::from(view);
+            // 属性だけが変わったときは同じノードのまま書き換える（NodeId と購読を
+            // 保つ。ADR-0008）。ノードの形が変わる（単位やレンジの有無が変わる）ときは
+            // 削除して登録し直す。
+            if inner
+                .tags
+                .get(&name)
+                .is_some_and(|old| old.metadata != metadata)
+            {
+                match server.update_tag_metadata(connection, group, tag, &metadata) {
+                    Ok(()) => {
+                        if let Some(old) = inner.tags.get_mut(&name) {
+                            old.metadata = metadata.clone();
+                        }
+                    }
+                    Err(UaError::MetadataShapeChanged(_)) => {
+                        if let Err(err) = server.remove_tag(connection, group, tag) {
+                            log_err_line(&format!("banto-hub: OPC UA タグ削除 {name}: {err}"));
+                            continue;
+                        }
+                        inner.tags.remove(&name);
+                    }
+                    Err(err) => {
+                        let error = err.to_string();
+                        if inner.last_errors.get(&name) != Some(&error) {
+                            log_err_line(&format!(
+                                "banto-hub: OPC UA タグ属性更新 {name}: {error}"
+                            ));
+                            inner.last_errors.insert(name.clone(), error);
+                        }
+                        continue;
+                    }
+                }
+            }
             if inner
                 .tags
                 .get(&name)
@@ -615,7 +679,7 @@ impl OpcUaPublisher {
             let result = if inner.tags.contains_key(&name) {
                 server.update_tag_reading(connection, group, tag, reading)
             } else {
-                server.add_tag_reading(connection, group, tag, reading)
+                server.add_tag_reading_with_metadata(connection, group, tag, reading, &metadata)
             };
             match result {
                 Ok(()) => {
@@ -625,6 +689,7 @@ impl OpcUaPublisher {
                         PublishedTag {
                             ids: entry.ids,
                             data_type,
+                            metadata,
                             reading: reading_key,
                             connection: entry.connection.clone(),
                             group: entry.group.clone(),
@@ -723,12 +788,65 @@ fn server_config(
     Ok(config)
 }
 
+/// 公開する DataType（banto-opcua ADR-0007、#1324 段 2）。bit は Boolean。数値は、値が
+/// 機器の生の整数・浮動小数と保証できるタグ（PLC の接続の PLC タグでスケーリングなし。
+/// `TagEntry::raw_device_value`）だけ元の型のまま、ほかは Double。
+///
+/// 元の型は丸めない（`MappedValue::from_number`）ので、小数や型の範囲外の値は Bad で値なし
+/// になる。スケーリング付き・push・hub・計算・内部のタグは工学値や式の結果・利用者の書いた
+/// 値で小数も範囲外もありうるため、今まで通り Double で出す（出さないと読めていた値が
+/// Bad になる退行）。
+///
+/// string は公開しない（None）。ChronoGazer は数値とビットだけを記録するので、文字列を
+/// OPC UA に出すかは別の判断にする。
 fn data_type(entry: &TagEntry) -> Option<DataType> {
-    match entry.data_type.as_str() {
-        "string" => None,
-        "bit" => Some(DataType::Boolean),
-        _ => Some(DataType::Double),
+    let tag_type = match entry.data_type.as_str() {
+        "bit" => TagType::Bit,
+        "i16" => TagType::I16,
+        "u16" => TagType::U16,
+        "i32" => TagType::I32,
+        "u32" => TagType::U32,
+        "i64" => TagType::I64,
+        "u64" => TagType::U64,
+        "f32" => TagType::F32,
+        "f64" => TagType::F64,
+        _ => return None,
+    };
+    let scaling = if entry.raw_device_value {
+        ValueScaling::Raw
+    } else {
+        ValueScaling::Scaled
+    };
+    Some(publish_data_type(tag_type, scaling))
+}
+
+/// 変数ノードに付ける属性（banto-opcua ADR-0008、#1324 段 2）。説明はタグのコメント、
+/// 単位は表示名だけ（UNECE コードは付けない）、レンジはスケーリングの工学値の範囲。
+/// 空の説明・単位は付けない。ビットには単位・レンジを付けない。
+///
+/// レンジは下限 <= 上限が条件なので、逆向きのスケーリング（eng_lo > eng_hi）は並べ
+/// 替える。`validate` に通らなければ呼び出し側が属性なしで公開する。
+fn tag_metadata(entry: &TagEntry, data_type: DataType) -> Result<TagMetadata, MetadataError> {
+    let numeric = !matches!(data_type, DataType::Boolean | DataType::String);
+    let mut metadata = TagMetadata::new();
+    if !entry.comment.trim().is_empty() {
+        metadata = metadata.with_description(entry.comment.clone());
     }
+    if numeric {
+        if let Some(unit) = entry.unit.as_deref().filter(|u| !u.trim().is_empty()) {
+            metadata = metadata.with_engineering_units(EngineeringUnits::display(unit));
+        }
+        if let Some(scaling) = entry.scaling {
+            let (low, high) = if scaling.eng_lo <= scaling.eng_hi {
+                (scaling.eng_lo, scaling.eng_hi)
+            } else {
+                (scaling.eng_hi, scaling.eng_lo)
+            };
+            metadata = metadata.with_eu_range(EuRange::new(low, high));
+        }
+    }
+    metadata.validate(data_type)?;
+    Ok(metadata)
 }
 
 fn system_time(ms: i64) -> Option<SystemTime> {
@@ -1309,6 +1427,183 @@ mod tests {
         assert_eq!(reading.timestamps.source, system_time(175));
         assert_eq!(reading.quality, UaQuality::Stale);
         assert_eq!(reading.value, Some(MappedValue::Boolean(true)));
+    }
+
+    // ---- #1324 段 2: 公開する型と属性（banto-opcua ADR-0007・ADR-0008） ----
+
+    fn entry_of(data_type: &str, scaling: Option<banto_tags::Scaling>) -> TagEntry {
+        TagEntry {
+            external_name: "c.g.t".to_owned(),
+            tag_key: "tag:1".to_owned(),
+            ids: (1, 1, 1),
+            connection: "c".to_owned(),
+            group: "g".to_owned(),
+            name: "t".to_owned(),
+            address: "40001".to_owned(),
+            data_type: data_type.to_owned(),
+            unit: None,
+            decimals: 0,
+            period_ms: 1_000,
+            enabled: true,
+            writable: false,
+            tag_kind: banto_tags::PLC_TAG_KIND.to_owned(),
+            expression: None,
+            retain: false,
+            simulation: false,
+            push: false,
+            comment: String::new(),
+            scaling,
+            raw_device_value: scaling.is_none(),
+        }
+    }
+
+    fn scaling(eng_lo: f64, eng_hi: f64) -> banto_tags::Scaling {
+        banto_tags::Scaling {
+            raw_lo: 0.0,
+            raw_hi: 4000.0,
+            eng_lo,
+            eng_hi,
+        }
+    }
+
+    #[test]
+    fn data_type_follows_the_hub_type_and_scaling() {
+        let unscaled = [
+            ("bit", DataType::Boolean),
+            ("i16", DataType::Int16),
+            ("u16", DataType::UInt16),
+            ("i32", DataType::Int32),
+            ("u32", DataType::UInt32),
+            ("i64", DataType::Int64),
+            ("u64", DataType::UInt64),
+            ("f32", DataType::Float),
+            ("f64", DataType::Double),
+        ];
+        for (hub_type, expected) in unscaled {
+            assert_eq!(
+                data_type(&entry_of(hub_type, None)),
+                Some(expected),
+                "{hub_type}"
+            );
+        }
+        // スケーリング付きの数値は Double、bit は Boolean のまま。
+        let numeric_as_double = |entry: TagEntry, label: &str| {
+            for (hub_type, _) in unscaled {
+                let expected = if hub_type == "bit" {
+                    DataType::Boolean
+                } else {
+                    DataType::Double
+                };
+                let entry = TagEntry {
+                    data_type: hub_type.to_owned(),
+                    ..entry.clone()
+                };
+                assert_eq!(data_type(&entry), Some(expected), "{label} {hub_type}");
+            }
+        };
+        numeric_as_double(entry_of("i16", Some(scaling(0.0, 100.0))), "scaled");
+        // 値が機器の生の値と保証できないタグ（計算・内部・push・hub）は、スケーリングが
+        // 無くても Double（小数や範囲外の値が Bad にならないように）。
+        let not_raw = TagEntry {
+            raw_device_value: false,
+            ..entry_of("i16", None)
+        };
+        numeric_as_double(not_raw, "not a raw device value");
+        // string は公開しない（別の判断）。
+        assert_eq!(data_type(&entry_of("string", None)), None);
+    }
+
+    #[test]
+    fn a_value_the_type_cannot_hold_is_published_as_bad_without_a_value() {
+        // banto-opcua-server `TagReading::new` → `MappedValue::from_number`（丸めない）。
+        let view = |value| CurrentView {
+            value: Some(value),
+            quality: Quality::Good,
+            timestamp_ms: 100,
+            source_time_ms: Some(100),
+            quality_since_ms: Some(100),
+        };
+        for (data_type, value) in [
+            (DataType::Int16, 1.5),
+            (DataType::Int16, 40_000.0),
+            (DataType::UInt16, -1.0),
+            (DataType::Float, 0.1),
+        ] {
+            let reading = tag_reading(data_type, view(value));
+            assert_eq!(reading.value, None, "{data_type} {value}");
+        }
+        let held = tag_reading(DataType::Int16, view(-7.0));
+        assert_eq!(held.value, Some(MappedValue::Int16(-7)));
+        assert_eq!(held.quality, UaQuality::Good);
+    }
+
+    #[test]
+    fn metadata_has_description_units_and_range_only_where_they_apply() {
+        // 何も無ければ属性なし。
+        let plain = entry_of("i16", None);
+        assert_eq!(
+            tag_metadata(&plain, DataType::Int16),
+            Ok(TagMetadata::new())
+        );
+        // 空白だけの説明・単位は付けない。
+        let blank = TagEntry {
+            comment: "  ".to_owned(),
+            unit: Some(String::new()),
+            ..entry_of("i16", None)
+        };
+        assert_eq!(
+            tag_metadata(&blank, DataType::Int16),
+            Ok(TagMetadata::new())
+        );
+        // 説明・単位（UNECE コードなし）。レンジはスケーリングなしでは付けない。
+        let unit_only = TagEntry {
+            comment: "炉内温度".to_owned(),
+            unit: Some("℃".to_owned()),
+            ..entry_of("i16", None)
+        };
+        assert_eq!(
+            tag_metadata(&unit_only, DataType::Int16),
+            Ok(TagMetadata::new()
+                .with_description("炉内温度")
+                .with_engineering_units(EngineeringUnits::display("℃")))
+        );
+        // スケーリング付きは EURange。逆向き（eng_lo > eng_hi）は並べ替える。
+        let scaled = TagEntry {
+            unit: Some("%".to_owned()),
+            ..entry_of("i16", Some(scaling(0.0, 100.0)))
+        };
+        let metadata = tag_metadata(&scaled, DataType::Double).expect("valid");
+        assert_eq!(metadata.eu_range, Some(EuRange::new(0.0, 100.0)));
+        let reversed = entry_of("i16", Some(scaling(100.0, 0.0)));
+        let metadata = tag_metadata(&reversed, DataType::Double).expect("valid");
+        assert_eq!(metadata.eu_range, Some(EuRange::new(0.0, 100.0)));
+        // ビットには単位・レンジを付けない（説明は付く）。
+        let bit = TagEntry {
+            comment: "運転中".to_owned(),
+            unit: Some("℃".to_owned()),
+            ..entry_of("bit", None)
+        };
+        assert_eq!(
+            tag_metadata(&bit, DataType::Boolean),
+            Ok(TagMetadata::new().with_description("運転中"))
+        );
+    }
+
+    #[test]
+    fn invalid_metadata_is_an_error_so_the_tag_is_published_without_it() {
+        let too_long = TagEntry {
+            comment: "あ".repeat(banto_opcua_server::model::MAX_STRING_BYTES),
+            ..entry_of("i16", None)
+        };
+        assert_eq!(
+            tag_metadata(&too_long, DataType::Int16),
+            Err(MetadataError::TextTooLong)
+        );
+        let infinite = entry_of("i16", Some(scaling(0.0, f64::INFINITY)));
+        assert_eq!(
+            tag_metadata(&infinite, DataType::Double),
+            Err(MetadataError::InvalidRange)
+        );
     }
 
     // ---- #623 PR6: サービスでは起動の前に置き場の木を握る ----
