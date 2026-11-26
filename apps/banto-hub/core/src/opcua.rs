@@ -703,7 +703,10 @@ fn server_config(
         .with_port(settings.port)
         .with_endpoint_path(&settings.endpoint_path)
         .with_namespace_uri(&settings.namespace_uri)
-        .with_sample_tags(false);
+        .with_sample_tags(false)
+        // banto-opcua v0.3 以降の既定は署名・暗号化のエンドポイントだけ。今の公開（None /
+        // Anonymous、tag-server-design §5.5）を保つため開く（#1332）。
+        .with_none_endpoint(true);
     if let Some(host) = &settings.advertised_host {
         config = config.with_advertised_host(host);
     }
@@ -743,6 +746,7 @@ fn tag_reading(data_type: DataType, view: CurrentView) -> TagReading {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use banto_opcua_server::model::MappedValue;
 
     use tokio::sync::{mpsc, oneshot};
 
@@ -1246,7 +1250,7 @@ mod tests {
         );
         assert_eq!(reading.timestamps.source, system_time(175));
         assert_eq!(reading.quality, UaQuality::Stale);
-        assert_eq!(reading.value, Some(1.0));
+        assert_eq!(reading.value, Some(MappedValue::Boolean(true)));
     }
 
     // ---- #623 PR6: サービスでは起動の前に置き場の木を握る ----

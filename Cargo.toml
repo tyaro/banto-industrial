@@ -124,7 +124,7 @@ publish = false
 # distribution method decided in banto's docs/publishing.md; see
 # crates/banto-tags/Cargo.toml for the feature set actually used.
 [workspace.dependencies]
-banto-opcua-server = { git = "https://github.com/tyaro/banto-opcua", tag = "v0.2.0" }
+banto-opcua-server = { git = "https://github.com/tyaro/banto-opcua", tag = "v0.3.3" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -309,7 +309,7 @@ sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 # #ci-speed（2026-10-19）: 暗号まわりの第三者 crate だけ、開発・テストのビルド（dev / test
 # プロファイル）でも最適化する。最適化なし（opt-level 0）だと、パスワードのハッシュ
 # （argon2。banto-admin-services 経由でログイン・ユーザー作成のたびに走る）と OPC UA の
-# RSA 鍵生成（async-opcua-crypto → rsa → num-bigint-dig）が極端に遅く、CI の nextest で
+# RSA 鍵生成（async-opcua-crypto → rsa → crypto-bigint。banto-opcua v0.3 で rsa が 0.10 に上がり num-bigint-dig は消えた）が極端に遅く、CI の nextest で
 # ログインや Hub の起動を伴うテストが 1 本数十秒かかっていた（PR #703 の junit）。
 # 自前の crate は対象にしないので、デバッグのしやすさは変わらない。第三者 crate なので
 # ビルドが増えるのはキャッシュが外れたときの 1 回だけ。
@@ -319,7 +319,7 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.rsa]
 opt-level = 3
-[profile.dev.package.num-bigint-dig]
+[profile.dev.package.crypto-bigint]
 opt-level = 3
 
 # #ci-speed（2026-10-28）: wasmtime / cranelift（WASM ゲストを動かす実行系）も同じく dev・テストで

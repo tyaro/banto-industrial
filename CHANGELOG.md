@@ -4,6 +4,7 @@ banto-industrial のリリースノート。日付は JST。バージョンは [
 
 ## 未リリース
 
+- banto-opcua を v0.3.3 に上げました（#1332）。Hub の OPC UA は SecurityPolicy None / Anonymous のエンドポイントを引き続き開きます（`with_none_endpoint(true)`）。署名・暗号化のエンドポイントも並んで開きます。値の型（bit は Boolean、数値は Double、string は公開しない）は変わりません。RSA の依存が 0.10 に上がり、`deny.toml` の RUSTSEC-2023-0071 の除外を外しました。
 - **Hub の `GET /api/v1/status` に、設置ごとに変わらない Hub の id `hub_id` を足しました（#1295）。** 設定 DB（`settings` の `hub.id`）に UUID v4 を最初の起動で 1 度だけ作ります。DB を作り直すと変わり、`hub.id` の入ったバックアップから戻すとその DB の id に戻ります（この版より前のバックアップや、設定パッケージから作り直した DB は新しい id になります。同じバックアップを別の機械に戻すと同じ id の Hub が 2 台できます）。id は設定 DB の系譜の印で、設定の時点は表しません。`revision`・`run_id` も再起動で数え直すので時点の代わりにならず、消費側は再接続のたびに今のカタログでタグの割り付けを照合してください。壊れた値があると起動を止めます。MCP の `get_server_status` にも載ります。
 - banto-tagclient の `HubStatus` に `hub_id: Option<String>` を足しました（#1295）。古い Hub は返さないので `None`（「分からない」で、「別の Hub」ではありません）。保存した値と同じ Hub かを判定するためだけに使います。
 - banto を v9.1.1 に上げました（API の変更・migration なし）。Hub のドックのタブの帯が狭いときに、タブが縮んで題名が省略記号（…）になります（banto#986）。全文はタブにマウスを載せると出ます。
