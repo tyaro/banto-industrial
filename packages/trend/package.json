@@ -19,7 +19,7 @@
     "check": "svelte-check --tsconfig ./tsconfig.json"
   },
   "dependencies": {
-    "@banto/charts": "github:tyaro/banto#v9.0.0&path:packages/charts"
+    "@banto/charts": "github:tyaro/banto#v9.1.0&path:packages/charts"
   },
   "peerDependencies": {
     "svelte": "^5.57.2"
