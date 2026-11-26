@@ -62,10 +62,14 @@
 # #1335 PR1: crates/banto-scenario (temp-scada の scada-scenario を移した、時刻だけで値が
 # 決まる筋書き（版 1 の JSON）の評価部。依存は serde_json だけ.
 # docs/crates/banto-scenario-format.md).
+# #1335 PR2: crates/banto-plc-sim (筋書きで動く模擬 PLC の実行ファイル banto-plc-sim。
+# banto-plc のシミュレータを設定ファイル（割付と筋書き）だけで立てる.
+# docs/crates/banto-plc-sim-design.md).
 [workspace]
 resolver = "2"
 members = [
     "crates/banto-scenario",
+    "crates/banto-plc-sim",
     "crates/banto-tags",
     "crates/banto-db-source",
     "crates/banto-plc-address",
