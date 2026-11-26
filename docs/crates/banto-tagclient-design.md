@@ -1,7 +1,7 @@
 # banto-tagclient 設計
 
 作成日: 2026-08-29
-状態: **2026-11-26: 書込みの `Err` から Hub の理由の code・`audit_id`・`correlation_id` を読めるようにし（`WriteErrorDetail`、`Error` は `Copy` でなくなった）、502 `write_failed` を新設の `ErrorKind::WriteFailed` に分けた（#1293）。2026-11-19: §4.4 の書込みを SCADA 向けの契約に合わせて実装した（#1202）。2026-11-18: §4.4 の書込みに SCADA 向けの変更（#1177、2026-11-18 オーナー決定、tag-server-design.md §6.6）を足した。#682（2026-10-31〜11-01、PR-1〜PR-3 で実装。§3.1・§4・§5 は反映済み）: 部分 Binding 解決（未解決名があっても解決できた名前だけで購読し、未解決は個別診断）と、同一世代の catalog / 解決結果 / current を 1 つの snapshot で公開する契約拡張は [banto-tagclient-partial-binding-design.md](banto-tagclient-partial-binding-design.md) が正。本書と食い違う所があれば同書を正とする。**
+状態: **2026-11-26: Live・Unbound の間はアプリ層の `ping` で接続の生存を見張り、期限までに何も受信が無ければ切って再接続に乗せる（`RestClient::with_liveness`、既定 10 秒・5 秒、#1294）。2026-11-26: 書込みの `Err` から Hub の理由の code・`audit_id`・`correlation_id` を読めるようにし（`WriteErrorDetail`、`Error` は `Copy` でなくなった）、502 `write_failed` を新設の `ErrorKind::WriteFailed` に分けた（#1293）。2026-11-19: §4.4 の書込みを SCADA 向けの契約に合わせて実装した（#1202）。2026-11-18: §4.4 の書込みに SCADA 向けの変更（#1177、2026-11-18 オーナー決定、tag-server-design.md §6.6）を足した。#682（2026-10-31〜11-01、PR-1〜PR-3 で実装。§3.1・§4・§5 は反映済み）: 部分 Binding 解決（未解決名があっても解決できた名前だけで購読し、未解決は個別診断）と、同一世代の catalog / 解決結果 / current を 1 つの snapshot で公開する契約拡張は [banto-tagclient-partial-binding-design.md](banto-tagclient-partial-binding-design.md) が正。本書と食い違う所があれば同書を正とする。**
 **2026-09-30 オーナー決定（docs/scada/scada-design.md §9.6）で、bindingと書き込みの同一性を
 Hub内部の数値ID（`StableTagId`）から外部名（`external_name`）に変更した（§3.1・§4.4。
 SDKと呼び出し側は追従済み）。改名でbindingがunresolvedになるのは仕様。**
@@ -514,6 +514,10 @@ sequenceDiagram
 または`reconnecting`としてcurrentを公開しない。対象が消えた場合は
 `unresolved`に移り、値をcurrentにはしない。切断後もWebSocketだけを
 張り直さず、必ずcatalogとsnapshotからやり直す。
+
+### 5.1 生存の見張り（#1294）
+
+変化があったときだけ届く購読は、途中の経路が close を届けずに切れても静かなままで、無言の停止を見分けられない。そこで `Live`（と `Unbound` の待ち）の間、最後の受信から `ping_interval`（既定 10 秒）たつと `{"op":"ping"}` を送り、そこから `pong_timeout`（既定 5 秒）の間に何も受信が無ければ接続を切り、`Transport` の誤りとして今までの再接続（backoff）に乗せる。`pong` に限らずどのテキストの受信も生存とみなす。`RestClient::with_liveness(ping_interval, pong_timeout)` で変えられ、どちらも 100ms〜1 時間に収める。`pong_timeout` の期限は `ping` の送信にも掛かり（送信が詰まっても見張りは止まらない）、切るときの close も 1 秒を上限にする。分かるのは接続の生存だけで、配信の抜けは見分けない。`Unbound` の最初の `ping`→`pong` の待ち（§5.1）は別の期限のまま。
 
 ## 6. バックプレッシャと所有権
 

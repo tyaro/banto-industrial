@@ -23,6 +23,11 @@
 //! delete-and-recreate under the same name resolves again on the next rebind.
 //! [`StableTagId`] remains only as the Hub's wire shape in [`CatalogTag::ids`].
 //!
+//! While `Live` (and waiting as `Unbound`) the worker pings after an idle
+//! interval and cuts the connection when nothing is received in time, so a
+//! silently dead path reconnects (#1294; [`RestClient::with_liveness`], default
+//! 10 s / 5 s). This proves liveness only, not that no delivery was missed.
+//!
 //! [`RestClient::fetch_status`] (#1223) reads `GET /api/v1/status` as a
 //! [`HubStatus`]; check [`HubStatus::supports_write_contract`] before writing,
 //! because the Hub version string cannot tell whether the #1201 write contract

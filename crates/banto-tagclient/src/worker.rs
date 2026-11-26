@@ -24,6 +24,143 @@ use crate::{
     types::{GenerationSnapshot, TagClientConnectionState, TagClientState},
 };
 
+/// Application-layer liveness watch (#1294). A change-only subscription is
+/// silent while nothing changes, so a path that died without a close frame is
+/// invisible. After `ping_interval` without any received text the watch sends
+/// `{"op":"ping"}`; any received text (not only `pong`) counts as alive. If
+/// nothing arrives within `pong_timeout` after the ping, the connection is
+/// cut with a retryable `Transport` error. It proves the connection is alive
+/// only, not that no delivery was missed.
+struct Liveness {
+    ping_interval: Duration,
+    pong_timeout: Duration,
+    last_rx: tokio::time::Instant,
+    ping: PingState,
+    host: Option<String>,
+    port: Option<u16>,
+}
+
+/// Where the ping cycle is. `Sending` is kept apart from `AwaitingPong` so a
+/// send dropped while pending (the caller's `select!` took another branch) is
+/// redone on the next `receive` instead of waiting for a pong never asked for.
+/// A dropped send may still have queued its frame, so the retry can put two
+/// pings on the wire; that only yields two `{"op":"pong"}` replies, which the
+/// Live gate ignores.
+#[derive(Clone, Copy, Debug)]
+enum PingState {
+    Idle,
+    Sending { deadline: tokio::time::Instant },
+    AwaitingPong { deadline: tokio::time::Instant },
+}
+
+/// Upper bound for closing a connection the watch gave up on, so a stuck
+/// close cannot keep the worker from reconnecting.
+const LIVENESS_CLOSE_LIMIT: Duration = Duration::from_secs(1);
+
+/// The receive / send / close surface `Liveness` needs, split out so the
+/// timing can be tested with a fake.
+#[allow(async_fn_in_trait)]
+trait LivenessIo {
+    async fn receive_text(&mut self) -> Result<String>;
+    async fn send_ping(&mut self) -> Result<()>;
+    async fn close_best_effort(&mut self);
+}
+
+impl LivenessIo for crate::ws_transport::WebSocketConnection {
+    async fn receive_text(&mut self) -> Result<String> {
+        crate::ws_transport::WebSocketConnection::receive_text(self).await
+    }
+    async fn send_ping(&mut self) -> Result<()> {
+        crate::ws_transport::WebSocketConnection::send_ping(self).await
+    }
+    async fn close_best_effort(&mut self) {
+        crate::ws_transport::WebSocketConnection::close_best_effort(self).await
+    }
+}
+
+impl Liveness {
+    fn new(rest: &RestClient) -> Self {
+        let (ping_interval, pong_timeout) = rest.liveness();
+        Self::with_durations(
+            ping_interval,
+            pong_timeout,
+            rest.endpoint_host(),
+            rest.endpoint_port(),
+        )
+    }
+
+    fn with_durations(
+        ping_interval: Duration,
+        pong_timeout: Duration,
+        host: Option<String>,
+        port: Option<u16>,
+    ) -> Self {
+        Self {
+            ping_interval,
+            pong_timeout,
+            last_rx: tokio::time::Instant::now(),
+            ping: PingState::Idle,
+            host,
+            port,
+        }
+    }
+
+    /// `instant + duration`, falling back to far ahead instead of panicking.
+    fn after(instant: tokio::time::Instant, duration: Duration) -> tokio::time::Instant {
+        instant
+            .checked_add(duration)
+            .or_else(|| instant.checked_add(crate::rest::MAX_LIVENESS_DURATION))
+            .unwrap_or(instant)
+    }
+
+    async fn cut<C: LivenessIo>(&self, connection: &mut C, what: &str) -> Error {
+        tracing::warn!(
+            host = ?self.host,
+            port = ?self.port,
+            "banto-hub WebSocket liveness {what}; reconnecting"
+        );
+        let _ = tokio::time::timeout(LIVENESS_CLOSE_LIMIT, connection.close_best_effort()).await;
+        Error::new(ErrorKind::Transport)
+    }
+
+    /// Like `connection.receive_text()`, with the ping / deadline handling.
+    /// The pong deadline covers the ping send and the wait for a reply.
+    /// Cancel-safe: the state lives in `self`. A call dropped while the ping
+    /// send is pending leaves `Sending`, and the next call redoes the send at
+    /// once with the same deadline (never extended).
+    async fn receive<C: LivenessIo>(&mut self, connection: &mut C) -> Result<String> {
+        loop {
+            if let PingState::Sending { deadline } = self.ping {
+                match tokio::time::timeout_at(deadline, connection.send_ping()).await {
+                    Ok(Ok(())) => self.ping = PingState::AwaitingPong { deadline },
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => return Err(self.cut(connection, "ping send timeout").await),
+                }
+                continue;
+            }
+            let wake = match self.ping {
+                PingState::AwaitingPong { deadline } => deadline,
+                _ => Self::after(self.last_rx, self.ping_interval),
+            };
+            tokio::select! {
+                result = connection.receive_text() => {
+                    let text = result?;
+                    self.last_rx = tokio::time::Instant::now();
+                    self.ping = PingState::Idle;
+                    return Ok(text);
+                }
+                _ = tokio::time::sleep_until(wake) => {
+                    if matches!(self.ping, PingState::AwaitingPong { .. }) {
+                        return Err(self.cut(connection, "timeout").await);
+                    }
+                    let deadline = Self::after(tokio::time::Instant::now(), self.pong_timeout);
+                    self.ping = PingState::Sending { deadline };
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BackoffConfig {
     base: Duration,
@@ -493,6 +630,7 @@ async fn run_generation_inner(
         }
         result = connection.subscribe_on_change(subscription_id, &tags) => result?,
     }
+    let mut liveness = Liveness::new(rest);
 
     loop {
         let text = tokio::select! {
@@ -501,7 +639,7 @@ async fn run_generation_inner(
                 connection.close_best_effort().await;
                 return Err(stopped());
             }
-            result = connection.receive_text() => result?,
+            result = liveness.receive(&mut connection) => result?,
         };
         if gate.accept_wire(&text)? == AcceptedWire::Data {
             break;
@@ -517,7 +655,7 @@ async fn run_generation_inner(
                 connection.close_best_effort().await;
                 return Err(stopped());
             }
-            text = connection.receive_text() => {
+            text = liveness.receive(&mut connection) => {
                 gate.accept_wire(&text?)?;
             }
             snapshot = &mut values_future => break snapshot?,
@@ -533,7 +671,7 @@ async fn run_generation_inner(
                 connection.close_best_effort().await;
                 return Err(stopped());
             }
-            result = connection.receive_text() => result?,
+            result = liveness.receive(&mut connection) => result?,
         };
         if gate.accept_wire(&text)? == AcceptedWire::Data {
             publish_snapshot(&gate, generation, &catalog, &resolution, state_tx, was_live)?;
@@ -636,6 +774,7 @@ async fn run_unbound(
         values: None,
     }));
     *reached_unbound = true;
+    let mut liveness = Liveness::new(rest);
 
     loop {
         let text = tokio::select! {
@@ -644,7 +783,7 @@ async fn run_unbound(
                 connection.close_best_effort().await;
                 return Err(stopped());
             }
-            result = connection.receive_text() => result?,
+            result = liveness.receive(connection) => result?,
         };
         match parse_unbound_wire(&text)? {
             UnboundWire::ConfigChanged => return Err(Error::new(ErrorKind::RevisionMismatch)),
@@ -3740,5 +3879,280 @@ mod tests {
                 "{reason}: reconnected after a 1008 close"
             );
         }
+    }
+    // ---- #1294 liveness watch ----
+
+    fn liveness_worker(
+        address: String,
+        ping_interval: Duration,
+    ) -> (
+        watch::Receiver<TagClientState>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let (sender, receiver) =
+            watch::channel(TagClientState::new(TagClientConnectionState::Stopped));
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let rest_client = client(address).with_liveness(ping_interval, Duration::from_millis(100));
+        let requests = binding_requests(&[("a", "alpha")]);
+        let task = tokio::spawn(async move {
+            run_supervisor_with_config(
+                &rest_client,
+                &requests,
+                1,
+                &sender,
+                stop_rx,
+                BackoffConfig::new(Duration::from_millis(1), Duration::from_millis(5)),
+            )
+            .await
+        });
+        (receiver, stop_tx, task)
+    }
+
+    async fn live_socket(
+        listener: &TcpListener,
+        count: &AtomicUsize,
+    ) -> WebSocketStream<tokio::net::TcpStream> {
+        serve_named_generation(
+            listener,
+            "alpha",
+            named_catalog("alpha", 1, Some(7), CollectionMode::Configured),
+            named_values("alpha", 10.0, 1, Some(7), CollectionMode::Configured),
+            count,
+            None,
+        )
+        .await
+    }
+
+    #[test]
+    fn with_liveness_clamps_to_one_hour() {
+        let rest = client("http://127.0.0.1:1".into()).with_liveness(Duration::MAX, Duration::MAX);
+        let hour = Duration::from_secs(3600);
+        assert_eq!(rest.liveness(), (hour, hour));
+    }
+
+    struct FakeIo {
+        ping_hangs: bool,
+        close_hangs: bool,
+        closes: usize,
+        /// Pends the first send and, when set, only answers after a send succeeded.
+        first_send_pends: bool,
+        sends: usize,
+        sent_ok: std::sync::Arc<tokio::sync::Notify>,
+        pong_after_send: bool,
+    }
+
+    impl FakeIo {
+        fn new(ping_hangs: bool, close_hangs: bool) -> Self {
+            Self {
+                ping_hangs,
+                close_hangs,
+                closes: 0,
+                first_send_pends: false,
+                sends: 0,
+                sent_ok: Default::default(),
+                pong_after_send: false,
+            }
+        }
+    }
+
+    impl LivenessIo for FakeIo {
+        async fn receive_text(&mut self) -> Result<String> {
+            if self.pong_after_send {
+                self.sent_ok.notified().await;
+                return Ok(r#"{"op":"pong"}"#.to_string());
+            }
+            std::future::pending().await
+        }
+        async fn send_ping(&mut self) -> Result<()> {
+            self.sends += 1;
+            if self.ping_hangs || (self.first_send_pends && self.sends == 1) {
+                std::future::pending::<()>().await;
+            }
+            self.sent_ok.notify_one();
+            Ok(())
+        }
+        async fn close_best_effort(&mut self) {
+            self.closes += 1;
+            if self.close_hangs {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    async fn run_fake(close_hangs: bool) -> (Result<String>, usize) {
+        let mut io = FakeIo::new(true, close_hangs);
+        let mut liveness = Liveness::with_durations(
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            None,
+            None,
+        );
+        let result = tokio::time::timeout(Duration::from_secs(5), liveness.receive(&mut io))
+            .await
+            .expect("receive must not hang");
+        (result, io.closes)
+    }
+
+    #[tokio::test]
+    async fn a_hung_ping_send_is_cut_at_the_pong_deadline() {
+        let (result, closes) = run_fake(false).await;
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::Transport);
+        assert_eq!(closes, 1);
+    }
+
+    #[tokio::test]
+    async fn a_hung_close_does_not_block_the_cut() {
+        let (result, closes) = run_fake(true).await;
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::Transport);
+        assert_eq!(closes, 1);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_ping_send_is_redone_instead_of_awaiting_a_pong() {
+        let mut io = FakeIo::new(false, false);
+        io.first_send_pends = true;
+        io.pong_after_send = true;
+        let mut liveness = Liveness::with_durations(
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+            None,
+            None,
+        );
+        // The first receive is cancelled while the ping send is pending.
+        let first =
+            tokio::time::timeout(Duration::from_millis(250), liveness.receive(&mut io)).await;
+        assert!(first.is_err(), "the first receive must be cancelled");
+        assert_eq!(io.sends, 1);
+        // The next one redoes the send at once, then gets the pong.
+        let second = tokio::time::timeout(Duration::from_millis(500), liveness.receive(&mut io))
+            .await
+            .expect("must not wait for a pong to a ping that was never sent");
+        assert_eq!(second.unwrap(), r#"{"op":"pong"}"#);
+        assert_eq!(io.sends, 2);
+        assert_eq!(io.closes, 0);
+    }
+
+    #[test]
+    fn with_liveness_raises_both_durations_to_100ms() {
+        let rest = client("http://127.0.0.1:1".into())
+            .with_liveness(Duration::ZERO, Duration::from_millis(1));
+        assert_eq!(
+            rest.liveness(),
+            (Duration::from_millis(100), Duration::from_millis(100))
+        );
+        let rest = client("http://127.0.0.1:1".into());
+        assert_eq!(
+            rest.liveness(),
+            (Duration::from_secs(10), Duration::from_secs(5))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_silent_hub_after_ping_is_cut_and_reconnected() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let count = AtomicUsize::new(0);
+            let mut socket = live_socket(&listener, &count).await;
+            // The client pings after its idle interval; never answer.
+            let ping = tokio::time::timeout(Duration::from_secs(2), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(matches!(&ping, Message::Text(t) if t.contains("\"ping\"")));
+            // The client then cuts the connection and comes back.
+            let reconnect = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .is_ok();
+            drop(socket);
+            reconnect
+        });
+        let (mut receiver, stop_tx, task) = liveness_worker(address, Duration::from_millis(100));
+        wait_live_after(&mut receiver, 0).await;
+        assert!(server.await.unwrap(), "no reconnect after a silent ping");
+        let _ = stop_tx.send(());
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn pongs_keep_live_without_reconnecting() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let count = AtomicUsize::new(0);
+            let mut socket = live_socket(&listener, &count).await;
+            let mut pings = 0;
+            let end = tokio::time::Instant::now() + Duration::from_millis(700);
+            while let Ok(Some(Ok(Message::Text(text)))) =
+                tokio::time::timeout_at(end, socket.next()).await
+            {
+                if text.contains("\"ping\"") {
+                    pings += 1;
+                    socket
+                        .send(Message::Text(r#"{"op":"pong"}"#.into()))
+                        .await
+                        .unwrap();
+                }
+            }
+            let reconnected = tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_ok();
+            (pings, reconnected, socket)
+        });
+        let (mut receiver, stop_tx, task) = liveness_worker(address, Duration::from_millis(100));
+        wait_live_after(&mut receiver, 0).await;
+        let (pings, reconnected, _socket) = server.await.unwrap();
+        assert!(pings >= 2, "pings: {pings}");
+        assert!(!reconnected);
+        assert_eq!(
+            receiver.borrow().connection_state(),
+            TagClientConnectionState::Live
+        );
+        let _ = stop_tx.send(());
+        let _ = task.await;
+    }
+
+    // data arrives every 40ms; a 400ms ping interval leaves room so a loaded CI runner cannot let a ping through.
+    #[tokio::test]
+    async fn steady_data_keeps_live_without_pings() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let count = AtomicUsize::new(0);
+            let mut socket = live_socket(&listener, &count).await;
+            let mut pings = 0;
+            for n in 0..12 {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                let body = format!(
+                    r#"{{"op":"data","id":1,"t":{t},"values":[{{"tag":"alpha","v":{t},"q":"good","t":{t}}}]}}"#,
+                    t = 11 + n
+                );
+                socket.send(Message::Text(body.into())).await.unwrap();
+                while let Ok(Some(Ok(Message::Text(text)))) =
+                    tokio::time::timeout(Duration::from_millis(1), socket.next()).await
+                {
+                    if text.contains("\"ping\"") {
+                        pings += 1;
+                    }
+                }
+            }
+            let reconnected = tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_ok();
+            (pings, reconnected, socket)
+        });
+        let (mut receiver, stop_tx, task) = liveness_worker(address, Duration::from_millis(400));
+        wait_live_after(&mut receiver, 0).await;
+        let (pings, reconnected, _socket) = server.await.unwrap();
+        assert_eq!(pings, 0);
+        assert!(!reconnected);
+        assert_eq!(
+            receiver.borrow().connection_state(),
+            TagClientConnectionState::Live
+        );
+        let _ = stop_tx.send(());
+        let _ = task.await;
     }
 }

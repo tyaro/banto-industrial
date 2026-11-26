@@ -26,7 +26,21 @@ pub struct RestClient {
     secret: SecretApiKey,
     http: Client,
     pinned_tls: Option<PinnedHubTls>,
+    ping_interval: Duration,
+    pong_timeout: Duration,
 }
+
+/// Default idle time before the worker sends an application-layer `ping`
+/// while `Live` / `Unbound` (#1294).
+pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(10);
+/// Default time to wait for any frame after that `ping` before the connection
+/// is cut and the normal reconnect backoff takes over (#1294).
+pub const DEFAULT_LIVENESS_PONG_TIMEOUT: Duration = Duration::from_secs(5);
+/// Lower bound of both liveness durations, so a zero never spins.
+pub(crate) const MIN_LIVENESS_DURATION: Duration = Duration::from_millis(100);
+/// Upper bound of both liveness durations, so an absurd value cannot
+/// overflow an `Instant`.
+pub(crate) const MAX_LIVENESS_DURATION: Duration = Duration::from_secs(3600);
 
 impl RestClient {
     /// Construct a client with redirects disabled. No per-request time limit
@@ -112,7 +126,38 @@ impl RestClient {
             secret,
             http,
             pinned_tls,
+            ping_interval: DEFAULT_PING_INTERVAL,
+            pong_timeout: DEFAULT_LIVENESS_PONG_TIMEOUT,
         })
+    }
+
+    /// Tune the liveness watch of the subscription worker (#1294). While
+    /// `Live` (and while waiting as `Unbound`), a value-change stream is
+    /// silent when nothing changes, so a path that dropped without a close
+    /// frame is otherwise invisible. After `ping_interval` without any
+    /// received frame the worker sends `{"op":"ping"}`; if nothing at all is
+    /// received within `pong_timeout`, it cuts the connection and the usual
+    /// reconnect backoff applies. Defaults: 10 s and 5 s. Each value is
+    /// clamped to 100 ms..=1 hour. `pong_timeout` also covers sending the
+    /// ping itself. This detects a dead connection only, not
+    /// missed deliveries on a live one.
+    #[must_use]
+    pub fn with_liveness(mut self, ping_interval: Duration, pong_timeout: Duration) -> Self {
+        self.ping_interval = ping_interval.clamp(MIN_LIVENESS_DURATION, MAX_LIVENESS_DURATION);
+        self.pong_timeout = pong_timeout.clamp(MIN_LIVENESS_DURATION, MAX_LIVENESS_DURATION);
+        self
+    }
+
+    pub(crate) fn endpoint_host(&self) -> Option<String> {
+        self.endpoint.host().map(str::to_owned)
+    }
+
+    pub(crate) fn endpoint_port(&self) -> Option<u16> {
+        self.endpoint.port()
+    }
+
+    pub(crate) fn liveness(&self) -> (Duration, Duration) {
+        (self.ping_interval, self.pong_timeout)
     }
 
     /// Start one owned connection generation on the current Tokio runtime.
@@ -355,6 +400,8 @@ impl fmt::Debug for RestClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RestClient")
             .field("endpoint", &self.endpoint)
+            .field("ping_interval", &self.ping_interval)
+            .field("pong_timeout", &self.pong_timeout)
             .finish()
     }
 }
