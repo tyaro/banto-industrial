@@ -927,6 +927,9 @@ impl HubRuntime {
             .with_diag_log(DiagLog::new(log_line, log_err_line)),
         );
 
+        // #1295: Hub の id を起動時に 1 回だけ読む（無ければ作る）。壊れた値は起動を止める。
+        manager.hub_id().await.map_err(HubStartError::InitDb)?;
+
         // T14-3: startup commits the catalog/preflight only. The desktop host
         // remains stopped; the Windows service host explicitly starts
         // Configured mode through `RunningHub::controller()`.

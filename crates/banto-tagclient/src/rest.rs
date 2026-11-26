@@ -507,6 +507,19 @@ mod tests {
         let status = client(address).fetch_status().await.unwrap();
         assert!(status.capabilities.is_empty());
         assert!(!status.supports_write_contract());
+        assert_eq!(status.hub_id, None);
+        handle.join().unwrap();
+
+        // #1295: a Hub that reports its id.
+        let (address, handle) = server(
+            200,
+            r#"{"version":"0.3.0","hub_id":"0b1f9c1e-5d5a-4d57-8f0e-3b1a2c4d5e6f"}"#,
+        );
+        let status = client(address).fetch_status().await.unwrap();
+        assert_eq!(
+            status.hub_id.as_deref(),
+            Some("0b1f9c1e-5d5a-4d57-8f0e-3b1a2c4d5e6f")
+        );
         handle.join().unwrap();
 
         for (code, kind) in [

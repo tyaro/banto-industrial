@@ -943,6 +943,13 @@ pub(crate) struct StatusResponse {
     /// #1223: この Hub が提供する機能の名前（[`HUB_CAPABILITIES`]）。
     /// 古い Hub はこの欄を返さない（欄が無い＝未対応）。
     pub(super) capabilities: Vec<String>,
+    /// #1295: 設置ごとに変わらない Hub の id（UUID v4、小文字）。設定 DB に 1 度だけ作られ、
+    /// DB を作り直すと変わり、DB のバックアップから戻すとその DB の id に戻る。消費側が
+    /// 「同じ URL のまま別の Hub に差し替えられた」ことを見分けるための設定 DB の系譜の
+    /// 印で、設定の時点は表さない（`revision`・`run_id` は稼働中の変更検知用で再起動で数え
+    /// 直すので、時点の代わりにもならない）。同じバックアップを別の機械に戻すと同じ id の
+    /// Hub が 2 台できうる（`crate::hub_id`）。古い Hub はこの欄を返さない。
+    pub(super) hub_id: String,
     pub(super) revision: u64,
     pub(super) configured_revision: u64,
     pub(super) running_revision: u64,
@@ -1129,6 +1136,7 @@ pub(crate) async fn compute_status(state: &TagSpaceState) -> Result<StatusRespon
     Ok(StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         capabilities: HUB_CAPABILITIES.iter().map(|c| (*c).to_string()).collect(),
+        hub_id: state.manager.hub_id().await?.to_string(),
         revision,
         configured_revision: runtime.configured_revision,
         running_revision: runtime.running_revision,

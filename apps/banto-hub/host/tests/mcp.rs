@@ -1595,6 +1595,8 @@ async fn get_server_status_reports_locked_down() {
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     let status: Value = serde_json::from_str(text).unwrap();
     assert_eq!(status["lockedDown"], false);
+    // #1295: `compute_status` をそのまま使うので `hub_id` も載る。
+    assert!(status["hub_id"].as_str().is_some_and(|id| id.len() == 36));
 
     app.commissioning.lock_down().await.expect("lock_down");
 
