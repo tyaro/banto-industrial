@@ -1246,7 +1246,7 @@ LAN 公開は管理者が bind と必要な advertisedHost を明示したとき
 資格情報・暗号化・証明書管理を含む本番向け OPC UA は後続 Phase 3 の範囲であり、
 現段階で機密データを載せた LAN 公開はしない。
 
-**banto-opcua v0.3.3（2026-11-26、#1332）**: v0.3 で既定のエンドポイントが署名・暗号化のものだけになり、
+**banto-opcua v0.3.4（2026-11-26、#1332）**: v0.3 で既定のエンドポイントが署名・暗号化のものだけになり、
 SecurityPolicy None / Anonymous は `ServerConfig::with_none_endpoint(true)` を付けたときだけ開く。
 Hub は今の診断用の公開を保つため `server_config` で開き、署名・暗号化のポリシーは空にして
 None のエンドポイントだけを開く（信頼の一覧の画面が無い今は、暗号化でつなげるクライアントがおらず、

@@ -124,7 +124,7 @@ publish = false
 # distribution method decided in banto's docs/publishing.md; see
 # crates/banto-tags/Cargo.toml for the feature set actually used.
 [workspace.dependencies]
-banto-opcua-server = { git = "https://github.com/tyaro/banto-opcua", tag = "v0.3.3" }
+banto-opcua-server = { git = "https://github.com/tyaro/banto-opcua", tag = "v0.3.4" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

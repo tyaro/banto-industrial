@@ -40,7 +40,7 @@
 //!
 //! banto-opcua の `ServerConfig::with_pki_dir`（banto-opcua#23）に、profile の保護された
 //! データの下の置き場（[`crate::opcua_pki::pki_dir`]）を渡す。鍵と証明書は初回だけ作り、
-//! 次の起動からは再利用する（以前は起動のたびに一時 PKI で作っていた）。banto-opcua v0.3.3 では、
+//! 次の起動からは再利用する（以前は起動のたびに一時 PKI で作っていた）。banto-opcua v0.3.4 では、
 //! ApplicationUri・公開ホスト・bind（未指定でないとき）・有効期間が今の設定と合わないと、
 //! 起動時に作り直す（拇印が変わるので、相手は信頼し直す）。
 //! - 本番の starter は、blocking 用のスレッドで**鍵を作る・読む前に**
@@ -1157,6 +1157,57 @@ mod tests {
         assert_eq!(first, second, "鍵と証明書は作り直さずに再利用する");
         eprintln!("OPC UA の起動: 初回 {first_elapsed:?}、2 回目 {second_elapsed:?}");
         publisher.shutdown().await;
+    }
+
+    /// tyaro/banto-opcua#64: `close_tree` が `pki/trusted/`・`pki/rejected/` にも置く、利用者に
+    /// 読めない印（`.banto-safe-root`。SYSTEM・Administrators だけ）があっても、起動のたびの
+    /// 信頼の一覧の移行（v0.3.3 の `TrustList::migrate`）が印を開いて `PermissionDenied` で
+    /// 失敗せず、起動できる。昇格した管理者は印を読めてしまい確かめにならないので走らせない。
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unreadable_markers_in_the_trust_list_folders_do_not_stop_the_start() {
+        if banto_service_elev::is_current_process_admin().unwrap_or(false) {
+            eprintln!("skip: 昇格した管理者は印を読めるので、確かめにならない");
+            return;
+        }
+        let root = crate::test_support::TempDir::new("opcua-pki-trust-markers");
+        let pki = crate::opcua_pki::pki_dir(&root.path().join("data"));
+        crate::opcua_pki::prepare(&pki, None).expect("pki dir");
+        let mut markers = Vec::new();
+        for folder in ["own", "private", "trusted", "rejected"] {
+            std::fs::create_dir_all(pki.join(folder)).unwrap();
+            markers.push(pki.join(folder).join(".banto-safe-root"));
+        }
+        for marker in &markers {
+            std::fs::write(marker, b"").unwrap();
+            let output = std::process::Command::new("icacls")
+                .arg(marker)
+                .args([
+                    "/inheritance:r",
+                    "/grant:r",
+                    "*S-1-5-18:(F)",
+                    "*S-1-5-32-544:(F)",
+                    "*S-1-3-4:(DE,RA,S)",
+                ])
+                .output()
+                .expect("icacls");
+            assert!(output.status.success(), "icacls: {output:?}");
+            let err = std::fs::read(marker).expect_err("印は利用者に読めない（確かめにならない）");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{}",
+                marker.display()
+            );
+        }
+        let publisher = publisher_with_pki(real_starter(None), Some(pki.clone())).await;
+        publisher.apply(&enabled(free_port())).await;
+        wait_state(&publisher, OpcUaState::Running).await;
+        publisher.shutdown().await;
+        assert!(pki.join("private").join("private.pem").is_file());
+        for marker in &markers {
+            std::fs::remove_file(marker).unwrap();
+        }
     }
 
     /// #634: banto-opcua の `Error::Pki`（ここでは証明書の場所がフォルダで、片方だけの

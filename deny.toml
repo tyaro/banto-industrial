@@ -116,7 +116,7 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # 正規化により一致する。
 allow-git = ["https://github.com/tyaro/banto", "https://github.com/tyaro/slmp", "https://github.com/tyaro/banto-opcua", "https://github.com/tyaro/async-opcua"]
 # banto-opcua も banto/slmp と同じく Cargo.toml で tag 指定にした(#1046、
-# 当初 v0.2.0、今は v0.3.3)。async-opcua は banto-opcua 側の固定に従い、banto-hub-core の
+# 当初 v0.2.0、今は v0.3.4)。async-opcua は banto-opcua 側の固定に従い、banto-hub-core の
 # 試験用の直接依存も同じ rev に揃える。
 # cargo-deny の指定順は Any < Branch < Tag < Rev なので、
 # required-git-spec = "tag" は tag 固定を満たす。

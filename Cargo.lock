@@ -1124,13 +1124,13 @@ dependencies = [
 
 [[package]]
 name = "banto-opcua-core"
-version = "0.3.3"
-source = "git+https://github.com/tyaro/banto-opcua?tag=v0.3.3#56711e430c6871e497c9339d8a52721606dc5520"
+version = "0.3.4"
+source = "git+https://github.com/tyaro/banto-opcua?tag=v0.3.4#0904507dd04baf5a2791fb9b7f93f9b7b99ebc93"
 
 [[package]]
 name = "banto-opcua-pki"
-version = "0.3.3"
-source = "git+https://github.com/tyaro/banto-opcua?tag=v0.3.3#56711e430c6871e497c9339d8a52721606dc5520"
+version = "0.3.4"
+source = "git+https://github.com/tyaro/banto-opcua?tag=v0.3.4#0904507dd04baf5a2791fb9b7f93f9b7b99ebc93"
 dependencies = [
  "async-opcua",
  "banto-opcua-core",
@@ -1139,8 +1139,8 @@ dependencies = [
 
 [[package]]
 name = "banto-opcua-server"
-version = "0.3.3"
-source = "git+https://github.com/tyaro/banto-opcua?tag=v0.3.3#56711e430c6871e497c9339d8a52721606dc5520"
+version = "0.3.4"
+source = "git+https://github.com/tyaro/banto-opcua?tag=v0.3.4#0904507dd04baf5a2791fb9b7f93f9b7b99ebc93"
 dependencies = [
  "async-opcua",
  "async-trait",

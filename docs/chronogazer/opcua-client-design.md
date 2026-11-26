@@ -104,7 +104,7 @@ ChronoGazer（記録計）が、Hub にも他社の OPC UA サーバーにも、
 
 ### 2.4 Hub の OPC UA サーバーの今
 
-`banto-opcua-server`（tyaro/banto-opcua v0.3.3。2026-11-26 に v0.2.0 から上げた、#1332）を `apps/banto-hub/core/src/opcua.rs` で Hub に組み込んだ、**読み取り専用**のサーバー。設計書の位置づけは「診断用」（[tag-server-design.md](../hub/tag-server-design.md) §5.5）。2026-11-24 にコードを読んで確かめた（#1324 本文の表）。
+`banto-opcua-server`（tyaro/banto-opcua v0.3.4。2026-11-26 に v0.2.0 から上げた、#1332）を `apps/banto-hub/core/src/opcua.rs` で Hub に組み込んだ、**読み取り専用**のサーバー。設計書の位置づけは「診断用」（[tag-server-design.md](../hub/tag-server-design.md) §5.5）。2026-11-24 にコードを読んで確かめた（#1324 本文の表）。
 
 | 項目         | 今                                                                                                                                                                                             | ChronoGazer で使うのに                                                                              |
 | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
@@ -115,7 +115,7 @@ ChronoGazer（記録計）が、Hub にも他社の OPC UA サーバーにも、
 | 品質・時刻   | Good / Stale→UncertainLastUsableValue / Bad。SourceTimestamp は Good なら採取の時刻、Stale・Bad なら品質が変わった時刻                                                                         | 足りる。記録の時刻は §3.5                                                                           |
 | 購読         | Subscription・MonitoredItem あり。Hub の側は 250 ms ごとに照合して、変わったときだけ通知                                                                                                       | 使える（§3.7）                                                                                      |
 | HistoryRead  | 無い                                                                                                                                                                                           | 要らない（履歴は ChronoGazer が持つ）                                                               |
-| セキュリティ | **SecurityPolicy None・Anonymous のエンドポイントだけを開く**（banto-opcua v0.3.3）。クライアントの証明書は `pki_dir` の信頼の一覧で判断する                                                   | 別の機械から使うには banto-opcua#54 が要る（§5）                                                    |
+| セキュリティ | **SecurityPolicy None・Anonymous のエンドポイントだけを開く**（banto-opcua v0.3.4）。クライアントの証明書は `pki_dir` の信頼の一覧で判断する                                                   | 別の機械から使うには banto-opcua#54 が要る（§5）                                                    |
 
 ## 3. OPC UA のドライバの作り
 
