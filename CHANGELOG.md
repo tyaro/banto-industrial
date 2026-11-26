@@ -4,7 +4,7 @@ banto-industrial のリリースノート。日付は JST。バージョンは [
 
 ## 未リリース
 
-- **【互換を壊す変更】banto-tagclient の書込みの誤りを詳しく読めるようにしました（#1293）。** `Error::write_detail()` が `WriteErrorDetail`（Hub の理由の `code()`・監査の `audit_id()`・`correlation_id()`）を返します。機密は持たず、`code` は `[a-z0-9_]` の 1〜64 文字のときだけ、`correlation_id` は送った値と一致するときだけ採ります。502 `write_failed`（送って失敗が確定。機器には効いていない）は `ErrorKind::WriteRejected` から新設の `ErrorKind::WriteFailed` に移りました（`WriteRejected` は「送る前に断った」だけ）。temp-scada など利用側は、502 を `WriteRejected` で拾っていた所を `WriteFailed` にも対応させてください。`Error` は `Copy` でなくなりました（`Clone` のまま。`kind()` は `&self`）。
+- **【互換を壊す変更】banto-tagclient の書込みの誤りを詳しく読めるようにしました（#1293）。** `Error::write_detail()` が `WriteErrorDetail`（Hub の理由の `code()`・監査の `audit_id()`・`correlation_id()`）を返します。機密は持たず、`code` は `[a-z0-9_]` の 1〜64 文字のときだけ、`correlation_id` は送った値と一致するときだけ採ります。502 `write_failed`（書込みは成立しなかったと確定。機器へ送ったかどうかはこのコードでは区別しません。PLC のセッションが無いときなど、何も送らずに返すこともあります）は `ErrorKind::WriteRejected` から新設の `ErrorKind::WriteFailed` に移りました（`WriteRejected` は「送る前に断った」だけ）。temp-scada など利用側の移行の条件: `WriteFailed` を「失敗（成立しない）」、`WriteUncertain` を引き続き「結果不明」として扱い、失敗の行にも返った `audit_id` を残してください。知らない kind を結果不明に落とす今の実装のまま依存だけ上げると、確定した失敗が「結果不明」に変わります。`Error` は `Copy` でなくなりました（`Clone` のまま。`kind()` は `&self`）。
 
 ## v0.3.0-alpha.4 — 2026-11-20（アルファ）
 

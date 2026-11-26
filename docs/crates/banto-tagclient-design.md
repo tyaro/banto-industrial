@@ -352,6 +352,12 @@ log-before-write）と衝突する。監査行をバッチ単位でまとめる�
 送る前の失敗・送信の失敗（transport・タイムアウト）には付かない。`Error` は `Box` を持つため
 `Copy` ではなく `Clone`（`kind()` は `&self`）。
 
+**`WriteFailed` の意味（#1293 のレビュー、2026-11-26）**: 502 `write_failed` は「書込みは成立しなかった
+（確定）」だけを表し、**機器へ送ったかどうかはこのコードでは区別しない**。Hub は PLC のセッションが無いとき
+（収集の停止との競合）やドライバが送る前に断ったときも、何も送らずに 502 `write_failed` を返す
+（`apps/banto-hub/core/src/write_path.rs` の `no_session_rejection`）。監査の行は送る前に作るので、
+`audit_id` の有無でも区別できない。送る前と後を分ける要件は、Hub に明示の応答を設けてから契約にする。
+
 **`ErrorKind`への3variant追加が既存の再試行判断に与える影響（確認済み、2026-09-01）**:
 #212で`ErrorKind`の細分化を見送った理由は、`worker.rs`の`is_rebindable`/`is_retryable`
 がその時点の値一覧を前提に再試行を判断しており、分割すると挙動が変わりうることだった。
@@ -385,7 +391,7 @@ log-before-write）と衝突する。監査行をバッチ単位でまとめる�
 | 403                      | `key_tripped`                                                                           | `KeyTripped`       |
 | 403                      | 上記以外・読めない（`not_writable`/`missing_write_scope`/`session_token_cannot_write`） | `WriteForbidden`   |
 | 404/409/422/429/501      | -                                                                                       | `WriteRejected`    |
-| 502                      | `write_failed`（送って失敗が確定。機器には効いていない）                                | `WriteFailed`      |
+| 502                      | `write_failed`（成立しなかったと確定。送ったかは区別しない）                            | `WriteFailed`      |
 | 502                      | `write_uncertain`・既定（リバースプロキシの502など。届いたか不明なので安全側）          | `WriteUncertain`   |
 | 500                      | `audit_write_failed`（送っていない）                                                    | `Transport`        |
 | 500                      | `internal`・既定（送ったか保証できない）                                                | `WriteUncertain`   |

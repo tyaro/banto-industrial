@@ -332,7 +332,8 @@ fn log_write_send_failure(endpoint: &Endpoint, error: &reqwest::Error) -> Error 
 ///   [`ErrorKind::WriteUncertain`].
 /// - 504 and any other 5xx not listed here -> [`ErrorKind::WriteUncertain`]
 ///   (a proxy may have forwarded the POST before timing out).
-/// - 502: `write_failed` (the send failed for certain) ->
+/// - 502: `write_failed` (the write certainly did not take effect; whether it
+///   was sent is not distinguished, see [`ErrorKind::WriteFailed`]) ->
 ///   [`ErrorKind::WriteFailed`]; `write_uncertain` and anything else
 ///   (for example a reverse proxy's own 502) -> [`ErrorKind::WriteUncertain`],
 ///   because it is not known whether the write reached the device.

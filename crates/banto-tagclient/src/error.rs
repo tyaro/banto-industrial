@@ -57,11 +57,16 @@ pub enum ErrorKind {
     /// constructed cannot succeed; the caller must change the tag, value, or
     /// timing before trying again.
     WriteRejected,
-    /// 502 `write_failed`: the Hub sent the write and the failure is
-    /// confirmed; it had no effect on the device. Unlike
-    /// [`Self::WriteRejected`] something was attempted (an `audit_id` is
-    /// usually available from [`Error::write_detail`]); unlike
-    /// [`Self::WriteUncertain`] the outcome is known.
+    /// 502 `write_failed`: the write was **not** carried out, and the Hub
+    /// says so for certain (unlike [`Self::WriteUncertain`]). Whether it was
+    /// sent to the device is **not** distinguished by this code: the Hub also
+    /// answers 502 `write_failed` without sending anything, for example when
+    /// there is no PLC session (racing a collection stop) or the driver
+    /// rejected the request before sending. The audit row is written before
+    /// sending, so the presence of an `audit_id` in [`Error::write_detail`]
+    /// does not tell either. Do not show this to users as "sent to the
+    /// device and failed"; telling the two apart needs an explicit Hub
+    /// response first (#1293 review).
     WriteFailed,
     /// The write may or may not have reached the device (502
     /// `write_uncertain` or an unknown 502, 500 `internal`, 504 or any other
