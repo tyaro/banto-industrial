@@ -15,14 +15,14 @@
   "dependencies": {
     "@banto-industrial/demo-backend": "workspace:*",
     "@banto-industrial/trend": "workspace:*",
-    "@banto/admin-core": "github:tyaro/banto#v9.1.0&path:packages/admin-core",
-    "@banto/charts": "github:tyaro/banto#v9.1.0&path:packages/charts",
-    "@banto/forms": "github:tyaro/banto#v9.1.0&path:packages/forms",
-    "@banto/grid-svelte": "github:tyaro/banto#v9.1.0&path:packages/grid-svelte",
-    "@banto/report": "github:tyaro/banto#v9.1.0&path:packages/report",
-    "@banto/theme": "github:tyaro/banto#v9.1.0&path:packages/theme",
-    "@banto/tree-svelte": "github:tyaro/banto#v9.1.0&path:packages/tree-svelte",
-    "@banto/ui": "github:tyaro/banto#v9.1.0&path:packages/ui",
+    "@banto/admin-core": "github:tyaro/banto#v9.1.1&path:packages/admin-core",
+    "@banto/charts": "github:tyaro/banto#v9.1.1&path:packages/charts",
+    "@banto/forms": "github:tyaro/banto#v9.1.1&path:packages/forms",
+    "@banto/grid-svelte": "github:tyaro/banto#v9.1.1&path:packages/grid-svelte",
+    "@banto/report": "github:tyaro/banto#v9.1.1&path:packages/report",
+    "@banto/theme": "github:tyaro/banto#v9.1.1&path:packages/theme",
+    "@banto/tree-svelte": "github:tyaro/banto#v9.1.1&path:packages/tree-svelte",
+    "@banto/ui": "github:tyaro/banto#v9.1.1&path:packages/ui",
     "@tauri-apps/api": "^2.12.5"
   },
   "devDependencies": {
