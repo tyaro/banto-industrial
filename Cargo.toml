@@ -59,9 +59,13 @@
 # PostgreSQL の接続オプションとエラー文言」を、DB ブリッジ（R2a-3b、banto-hub-sink）と
 # 共有するために切り出した内部 crate。依存は sqlx（postgres）だけ.
 # docs/hub/banto-hub-ingest-design.md §10.1).
+# #1335 PR1: crates/banto-scenario (temp-scada の scada-scenario を移した、時刻だけで値が
+# 決まる筋書き（版 1 の JSON）の評価部。依存は serde_json だけ.
+# docs/crates/banto-scenario-format.md).
 [workspace]
 resolver = "2"
 members = [
+    "crates/banto-scenario",
     "crates/banto-tags",
     "crates/banto-db-source",
     "crates/banto-plc-address",

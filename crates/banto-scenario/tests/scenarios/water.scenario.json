@@ -1,0 +1,554 @@
+{
+  "format": "banto-scenario",
+  "version": 1,
+  "cycleSec": 180,
+  "epochSec": 1767225600,
+  "signals": {
+    "WWT.Inflow.Flow": {
+      "kind": "number",
+      "base": 62,
+      "waves": [
+        {
+          "amplitude": 34,
+          "periodSec": 180,
+          "shiftSec": 5
+        },
+        {
+          "amplitude": 0.6,
+          "periodSec": 7.570102779734442,
+          "shiftSec": -2.0481927710843375
+        },
+        {
+          "amplitude": 0.4,
+          "periodSec": 2.7199936394716824,
+          "shiftSec": -0.38961038961038963
+        }
+      ],
+      "digits": 1
+    },
+    "WWT.RawTank.Level": {
+      "kind": "number",
+      "base": 0,
+      "points": [
+        [0, 40],
+        [60, 82],
+        [75, 92],
+        [85, 90],
+        [104, 62],
+        [122, 56],
+        [146, 19],
+        [168, 21],
+        [180, 40]
+      ],
+      "digits": 1
+    },
+    "WWT.P101.State": {
+      "kind": "number",
+      "base": 1,
+      "digits": 0
+    },
+    "WWT.P101.Run": {
+      "kind": "bit",
+      "value": true
+    },
+    "WWT.P101.Current": {
+      "kind": "number",
+      "base": 18.4,
+      "waves": [
+        {
+          "amplitude": 0.24,
+          "periodSec": 7.570102779734442,
+          "shiftSec": -4.096385542168675
+        },
+        {
+          "amplitude": 0.16000000000000003,
+          "periodSec": 2.7199936394716824,
+          "shiftSec": -0.7792207792207793
+        }
+      ],
+      "digits": 1
+    },
+    "WWT.P101.Hours": {
+      "kind": "number",
+      "base": 4212,
+      "rampPerHour": 1,
+      "rampWrap": 1000,
+      "digits": 1
+    },
+    "WWT.P102.State": {
+      "kind": "number",
+      "base": 0,
+      "digits": 0
+    },
+    "WWT.P102.Run": {
+      "kind": "bit",
+      "value": false
+    },
+    "WWT.P102.Fault": {
+      "kind": "bit",
+      "value": false
+    },
+    "WWT.P102.Current": {
+      "kind": "number",
+      "base": 16.1,
+      "waves": [
+        {
+          "amplitude": 0.24,
+          "periodSec": 7.570102779734442,
+          "shiftSec": -6.144578313253012
+        },
+        {
+          "amplitude": 0.16000000000000003,
+          "periodSec": 2.7199936394716824,
+          "shiftSec": -1.1688311688311688
+        }
+      ],
+      "digits": 1
+    },
+    "WWT.P102.Hours": {
+      "kind": "number",
+      "base": 1876,
+      "rampPerHour": 0.5,
+      "rampWrap": 1000,
+      "digits": 1
+    },
+    "WWT.V101.Open": {
+      "kind": "bit",
+      "value": true
+    },
+    "WWT.V102.Open": {
+      "kind": "bit",
+      "value": false
+    },
+    "WWT.Feed.Flowing": {
+      "kind": "bit",
+      "value": true
+    },
+    "WWT.Feed.Flow": {
+      "kind": "number",
+      "base": 0,
+      "waves": [
+        {
+          "amplitude": 0.72,
+          "periodSec": 7.570102779734442,
+          "shiftSec": -8.19277108433735
+        },
+        {
+          "amplitude": 0.48,
+          "periodSec": 2.7199936394716824,
+          "shiftSec": -1.5584415584415585
+        }
+      ],
+      "points": [
+        [0, 42],
+        [60, 42],
+        [60, 78],
+        [104, 78],
+        [104, 42],
+        [122, 42],
+        [122, 78],
+        [140, 78],
+        [140, 42],
+        [180, 42]
+      ],
+      "digits": 1
+    },
+    "WWT.Feed.Pressure": {
+      "kind": "number",
+      "base": 0,
+      "waves": [
+        {
+          "amplitude": 0.0024,
+          "periodSec": 7.570102779734442,
+          "shiftSec": -10.240963855421688
+        },
+        {
+          "amplitude": 0.0016,
+          "periodSec": 2.7199936394716824,
+          "shiftSec": -1.948051948051948
+        }
+      ],
+      "points": [
+        [0, 0.31],
+        [60, 0.31],
+        [60, 0.36],
+        [104, 0.36],
+        [104, 0.31],
+        [122, 0.31],
+        [122, 0.36],
+        [140, 0.36],
+        [140, 0.31],
+        [180, 0.31]
+      ],
+      "digits": 3
+    },
+    "WWT.Feed.Total": {
+      "kind": "number",
+      "base": 0,
+      "rampPerHour": 75.6,
+      "rampWrap": 1000000,
+      "digits": 0
+    },
+    "WWT.Chem.Level": {
+      "kind": "number",
+      "base": 64,
+      "waves": [
+        {
+          "amplitude": 10,
+          "periodSec": 180,
+          "shiftSec": -45
+        }
+      ],
+      "digits": 1
+    },
+    "WWT.P201.State": {
+      "kind": "number",
+      "base": 0,
+      "digits": 0
+    },
+    "WWT.P201.Run": {
+      "kind": "bit",
+      "value": false
+    },
+    "WWT.React.Level": {
+      "kind": "number",
+      "base": 62,
+      "waves": [
+        {
+          "amplitude": 6,
+          "periodSec": 60
+        }
+      ],
+      "digits": 1
+    },
+    "WWT.React.pH": {
+      "kind": "number",
+      "base": 7.3,
+      "waves": [
+        {
+          "amplitude": 1.3,
+          "periodSec": 180,
+          "shiftSec": 20
+        },
+        {
+          "amplitude": 0.012,
+          "periodSec": 7.570102779734442,
+          "shiftSec": -12.289156626506024
+        },
+        {
+          "amplitude": 0.008,
+          "periodSec": 2.7199936394716824,
+          "shiftSec": -2.3376623376623376
+        }
+      ],
+      "digits": 2
+    },
+    "WWT.Aer.Level": {
+      "kind": "number",
+      "base": 71,
+      "waves": [
+        {
+          "amplitude": 3,
+          "periodSec": 90,
+          "shiftSec": 10
+        }
+      ],
+      "digits": 1
+    },
+    "WWT.Aer.DO": {
+      "kind": "number",
+      "base": 2.3,
+      "waves": [
+        {
+          "amplitude": 0.8,
+          "periodSec": 90
+        },
+        {
+          "amplitude": 0.024,
+          "periodSec": 7.570102779734442,
+          "shiftSec": -14.337349397590362
+        },
+        {
+          "amplitude": 0.016,
+          "periodSec": 2.7199936394716824,
+          "shiftSec": -2.727272727272727
+        }
+      ],
+      "digits": 2
+    },
+    "WWT.B301.State": {
+      "kind": "number",
+      "base": 1,
+      "digits": 0
+    },
+    "WWT.B301.Run": {
+      "kind": "bit",
+      "value": true
+    },
+    "WWT.B302.State": {
+      "kind": "number",
+      "base": 0,
+      "digits": 0
+    },
+    "WWT.B302.Run": {
+      "kind": "bit",
+      "value": false
+    },
+    "WWT.Air.Flow": {
+      "kind": "number",
+      "base": 0,
+      "waves": [
+        {
+          "amplitude": 0.18,
+          "periodSec": 7.570102779734442,
+          "shiftSec": -16.3855421686747
+        },
+        {
+          "amplitude": 0.12,
+          "periodSec": 2.7199936394716824,
+          "shiftSec": -3.116883116883117
+        }
+      ],
+      "points": [
+        [0, 12.4],
+        [50.50607820926054, 12.4],
+        [50.50607820926054, 24.6],
+        [84.49392179073946, 24.6],
+        [84.49392179073946, 12.4],
+        [140.50607820926052, 12.4],
+        [140.50607820926052, 24.6],
+        [174.49392179073948, 24.6],
+        [174.49392179073948, 12.4],
+        [180, 12.4]
+      ],
+      "digits": 1
+    },
+    "WWT.Clar.Level": {
+      "kind": "number",
+      "base": 66,
+      "waves": [
+        {
+          "amplitude": 4,
+          "periodSec": 180,
+          "shiftSec": 70
+        }
+      ],
+      "digits": 1
+    },
+    "WWT.Clar.Sludge": {
+      "kind": "number",
+      "base": 1.2,
+      "waves": [
+        {
+          "amplitude": 0.3,
+          "periodSec": 180,
+          "shiftSec": 100
+        }
+      ],
+      "digits": 2
+    },
+    "WWT.V401.Open": {
+      "kind": "bit",
+      "value": false
+    },
+    "WWT.Return.Flow": {
+      "kind": "number",
+      "base": 8.5,
+      "waves": [
+        {
+          "amplitude": 0.18,
+          "periodSec": 7.570102779734442,
+          "shiftSec": -18.433734939759034
+        },
+        {
+          "amplitude": 0.12,
+          "periodSec": 2.7199936394716824,
+          "shiftSec": -3.506493506493506
+        }
+      ],
+      "digits": 1
+    },
+    "WWT.Treated.Level": {
+      "kind": "number",
+      "base": 50,
+      "waves": [
+        {
+          "amplitude": 28,
+          "periodSec": 180,
+          "shiftSec": 40
+        }
+      ],
+      "digits": 1
+    },
+    "WWT.Treated.Turbidity": {
+      "kind": "number",
+      "base": 1.8,
+      "waves": [
+        {
+          "amplitude": 0.6,
+          "periodSec": 45
+        },
+        {
+          "amplitude": 0.048,
+          "periodSec": 7.570102779734442,
+          "shiftSec": -20.481927710843376
+        },
+        {
+          "amplitude": 0.032,
+          "periodSec": 2.7199936394716824,
+          "shiftSec": -3.896103896103896
+        }
+      ],
+      "digits": 2
+    },
+    "WWT.P501.State": {
+      "kind": "number",
+      "base": 0,
+      "digits": 0
+    },
+    "WWT.P501.Run": {
+      "kind": "bit",
+      "value": false
+    },
+    "WWT.Out.Flow": {
+      "kind": "number",
+      "base": 64,
+      "waves": [
+        {
+          "amplitude": 0.8999999999999999,
+          "periodSec": 7.570102779734442,
+          "shiftSec": -22.53012048192771
+        },
+        {
+          "amplitude": 0.6000000000000001,
+          "periodSec": 2.7199936394716824,
+          "shiftSec": -4.285714285714286
+        }
+      ],
+      "digits": 1
+    }
+  },
+  "events": [
+    {
+      "atSec": 0,
+      "durationSec": 60,
+      "values": {
+        "WWT.P102.Current": 0
+      }
+    },
+    {
+      "atSec": 60,
+      "durationSec": 44,
+      "values": {
+        "WWT.P102.State": 1,
+        "WWT.P102.Run": true,
+        "WWT.V102.Open": true
+      }
+    },
+    {
+      "atSec": 104,
+      "durationSec": 18,
+      "values": {
+        "WWT.P102.State": 2,
+        "WWT.P102.Fault": true,
+        "WWT.P102.Current": 0
+      }
+    },
+    {
+      "atSec": 122,
+      "durationSec": 18,
+      "values": {
+        "WWT.P102.State": 1,
+        "WWT.P102.Run": true,
+        "WWT.V102.Open": true
+      }
+    },
+    {
+      "atSec": 140,
+      "durationSec": 40,
+      "values": {
+        "WWT.P102.Current": 0
+      }
+    },
+    {
+      "atSec": 146,
+      "durationSec": 22,
+      "values": {
+        "WWT.P101.State": 0,
+        "WWT.P101.Run": false,
+        "WWT.P101.Current": 0,
+        "WWT.V101.Open": false,
+        "WWT.Feed.Flowing": false,
+        "WWT.Feed.Flow": 0,
+        "WWT.Feed.Pressure": 0.02
+      }
+    },
+    {
+      "atSec": 31.309932474020215,
+      "durationSec": 67.38013505195957,
+      "values": {
+        "WWT.P201.State": 1,
+        "WWT.P201.Run": true
+      }
+    },
+    {
+      "atSec": 50.50607820926054,
+      "durationSec": 33.98784358147893,
+      "values": {
+        "WWT.B302.State": 1,
+        "WWT.B302.Run": true
+      }
+    },
+    {
+      "atSec": 140.50607820926052,
+      "durationSec": 33.987843581478955,
+      "values": {
+        "WWT.B302.State": 1,
+        "WWT.B302.Run": true
+      }
+    },
+    {
+      "atSec": 30,
+      "durationSec": 25,
+      "values": {
+        "WWT.V401.Open": true
+      }
+    },
+    {
+      "atSec": 120,
+      "durationSec": 25,
+      "values": {
+        "WWT.V401.Open": true
+      }
+    },
+    {
+      "atSec": 55,
+      "durationSec": 65,
+      "values": {
+        "WWT.Return.Flow": 0
+      }
+    },
+    {
+      "atSec": 145,
+      "durationSec": 65,
+      "values": {
+        "WWT.Return.Flow": 0
+      }
+    },
+    {
+      "atSec": 42.04802187907617,
+      "durationSec": 85.90395624184765,
+      "values": {
+        "WWT.P501.State": 1,
+        "WWT.P501.Run": true
+      }
+    },
+    {
+      "atSec": 127.95197812092383,
+      "durationSec": 94.09604375815235,
+      "values": {
+        "WWT.Out.Flow": 0
+      }
+    }
+  ]
+}

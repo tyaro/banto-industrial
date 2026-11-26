@@ -1,0 +1,10 @@
+[package]
+name = "banto-scenario"
+description = "時刻だけで値が決まる筋書き（版つきの JSON）の読込と評価（temp-scada の scada-scenario から移した）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }

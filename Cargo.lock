@@ -1192,6 +1192,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "banto-scenario"
+version = "0.3.0-alpha.4"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "banto-secret-store"
 version = "0.1.0"
 dependencies = [

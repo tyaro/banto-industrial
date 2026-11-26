@@ -1,0 +1,387 @@
+[
+  {
+    "name": "知らない項目",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {},
+      "extra": 1
+    }
+  },
+  {
+    "name": "format が違う",
+    "scenario": {
+      "format": "other",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {}
+    }
+  },
+  {
+    "name": "読めない版",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 2,
+      "cycleSec": 60,
+      "signals": {}
+    }
+  },
+  {
+    "name": "周期が 0",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 0,
+      "signals": {}
+    }
+  },
+  {
+    "name": "止める秒が周期",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "freezeAtSec": 60,
+      "signals": {}
+    }
+  },
+  {
+    "name": "種類が無い",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {
+        "A": {
+          "base": 1
+        }
+      }
+    }
+  },
+  {
+    "name": "信号の知らない項目",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {
+        "A": {
+          "kind": "bit",
+          "base": 1
+        }
+      }
+    }
+  },
+  {
+    "name": "like の循環",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {
+        "A": {
+          "like": "B"
+        },
+        "B": {
+          "like": "A"
+        }
+      }
+    }
+  },
+  {
+    "name": "like が無い信号",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {
+        "A": {
+          "like": "Z"
+        }
+      }
+    }
+  },
+  {
+    "name": "like と種類が違う",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {
+        "A": {
+          "kind": "bit"
+        },
+        "B": {
+          "like": "A",
+          "kind": "number"
+        }
+      }
+    }
+  },
+  {
+    "name": "点の秒が戻る",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {
+        "A": {
+          "kind": "number",
+          "points": [
+            [10, 1],
+            [5, 2]
+          ]
+        }
+      }
+    }
+  },
+  {
+    "name": "点の秒が周期を超える",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {
+        "A": {
+          "kind": "number",
+          "points": [
+            [0, 1],
+            [61, 2]
+          ]
+        }
+      }
+    }
+  },
+  {
+    "name": "波の周期が 0",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {
+        "A": {
+          "kind": "number",
+          "waves": [
+            {
+              "amplitude": 1,
+              "periodSec": 0
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "name": "桁が 10",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {
+        "A": {
+          "kind": "number",
+          "digits": 10
+        }
+      }
+    }
+  },
+  {
+    "name": "桁が小数",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {
+        "A": {
+          "kind": "number",
+          "digits": 1.5
+        }
+      }
+    }
+  },
+  {
+    "name": "ON が周期より長い",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {
+        "A": {
+          "kind": "bit",
+          "periodSec": 4,
+          "onSec": 5
+        }
+      }
+    }
+  },
+  {
+    "name": "出来事の無い信号",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {},
+      "events": [
+        {
+          "atSec": 0,
+          "durationSec": 1,
+          "values": {
+            "Z": 1
+          }
+        }
+      ]
+    }
+  },
+  {
+    "name": "出来事の値の種類が違う",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {
+        "A": {
+          "kind": "bit"
+        }
+      },
+      "events": [
+        {
+          "atSec": 0,
+          "durationSec": 1,
+          "values": {
+            "A": 1
+          }
+        }
+      ]
+    }
+  },
+  {
+    "name": "出来事が周期より長い",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {},
+      "events": [
+        {
+          "atSec": 0,
+          "durationSec": 61,
+          "values": {}
+        }
+      ]
+    }
+  },
+  {
+    "name": "出来事の秒が周期",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {},
+      "events": [
+        {
+          "atSec": 60,
+          "durationSec": 1,
+          "values": {}
+        }
+      ]
+    }
+  },
+  {
+    "name": "波が null",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {
+        "A": {
+          "kind": "number",
+          "waves": null
+        }
+      }
+    }
+  },
+  {
+    "name": "点列が null",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {
+        "A": {
+          "kind": "number",
+          "points": null
+        }
+      }
+    }
+  },
+  {
+    "name": "ビットの値が null",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {
+        "A": {
+          "kind": "bit",
+          "value": null
+        }
+      }
+    }
+  },
+  {
+    "name": "基準値が null",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {
+        "A": {
+          "kind": "number",
+          "base": null
+        }
+      }
+    }
+  },
+  {
+    "name": "出来事が null",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {},
+      "events": null
+    }
+  },
+  {
+    "name": "出来事が宣言していない toString を指す",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {},
+      "events": [
+        {
+          "atSec": 0,
+          "durationSec": 1,
+          "values": {
+            "toString": 1
+          }
+        }
+      ]
+    }
+  },
+  {
+    "name": "like が宣言していない constructor を指す",
+    "scenario": {
+      "format": "banto-scenario",
+      "version": 1,
+      "cycleSec": 60,
+      "signals": {
+        "A": {
+          "like": "constructor"
+        }
+      }
+    }
+  }
+]
