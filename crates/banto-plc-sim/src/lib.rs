@@ -70,6 +70,15 @@ impl std::fmt::Display for Protocol {
 }
 
 impl Protocol {
+    /// `wordOrder` を省いたときの並び（Hub の `default_word_order_for` と同じ。
+    /// SLMP は下位ワードが先、Modbus は上位ワードが先）。
+    fn default_order(self) -> Order {
+        match self {
+            Protocol::Slmp => Order::LowHigh,
+            Protocol::Modbus => Order::HighLow,
+        }
+    }
+
     /// 省略時の待ち受け（`dev_plc` と同じ）。
     fn default_listen(self) -> SocketAddr {
         let port = match self {
@@ -259,7 +268,7 @@ pub fn parse_plan(text: &str, base_dir: &Path) -> Result<Plan, ConfigError> {
         Some(text) => Order::parse(text).ok_or_else(|| {
             ConfigError(format!("wordOrder: high_low か low_high が要る（{text}）"))
         })?,
-        None => Order::LowHigh,
+        None => protocol.default_order(),
     };
 
     let scenario_path = base_dir.join(&raw.scenario);
@@ -388,6 +397,9 @@ fn build_mapping(
             ))
         }
         _ => {}
+    }
+    if data_type == DataType::Bit && (entry.scale.is_some() || entry.word_order.is_some()) {
+        return err(format!("{at}: ビットの割付に scale・wordOrder は書けない"));
     }
     let scale = entry.scale.unwrap_or(1.0);
     if !scale.is_finite() || scale == 0.0 {
@@ -859,17 +871,14 @@ mod tests {
 
     /// 試験用に筋書きを一時の置き場へ書いて、設定の本文を検査する。
     fn plan_of(body: &str) -> Result<Plan, ConfigError> {
-        // 試験は並列に走るので、呼び出しごとに別の置き場へ書く。
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("banto-plc-sim-test-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // 試験は並列に走るので、呼び出しごとに別の置き場へ書く（終わりに消える）。
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         std::fs::write(dir.join("s.json"), SCENARIO).unwrap();
         let text = format!(
             r#"{{ "format": "banto-plc-sim", "version": 1, "scenario": "s.json", {body} }}"#
         );
-        parse_plan(&text, &dir)
+        parse_plan(&text, dir)
     }
 
     fn message(body: &str) -> String {
@@ -901,8 +910,28 @@ mod tests {
         assert_eq!(plan.mappings[0].data_type, DataType::I16);
         assert_eq!(plan.mappings[1].data_type, DataType::Bit);
         assert_eq!(plan.mappings[2].data_type, DataType::Bit);
-        assert_eq!(plan.mappings[0].order, Order::LowHigh);
+        // Modbus の既定の並びは high_low（Hub と同じ）。
+        assert_eq!(plan.mappings[0].order, Order::HighLow);
         assert!(plan.faults.is_empty());
+    }
+
+    #[test]
+    fn the_default_word_order_follows_the_protocol() {
+        let plan = plan_of(r#""protocol": "slmp", "map": [{ "signal": "N", "address": "D100" }]"#)
+            .unwrap();
+        assert_eq!(plan.mappings[0].order, Order::LowHigh);
+    }
+
+    #[test]
+    fn scale_and_word_order_on_a_bit_mapping_are_errors() {
+        let m = message(
+            r#""protocol": "slmp", "map": [{ "signal": "B", "address": "M100", "scale": 2 }]"#,
+        );
+        assert!(m.contains("map[0] (B)") && m.contains("scale"), "{m}");
+        let m = message(
+            r#""protocol": "slmp", "map": [{ "signal": "B", "address": "M100", "wordOrder": "high_low" }]"#,
+        );
+        assert!(m.contains("wordOrder"), "{m}");
     }
 
     #[test]

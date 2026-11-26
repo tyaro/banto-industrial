@@ -252,7 +252,7 @@ async fn modbus_values_match_the_scenario_at_frozen_times() {
         );
         let hours = modbus_registers(&mut stream, 3, 9, 2).await.unwrap();
         assert_eq!(
-            codec::decode_u32([hours[0], hours[1]], codec::WordOrder::LowHigh),
+            codec::decode_u32([hours[0], hours[1]], codec::WordOrder::HighLow),
             number(&plan, t, "Hours").round() as u32
         );
         assert_eq!(

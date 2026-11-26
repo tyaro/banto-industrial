@@ -1166,6 +1166,7 @@ dependencies = [
  "banto-scenario",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
