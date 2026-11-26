@@ -1248,11 +1248,13 @@ LAN 公開は管理者が bind と必要な advertisedHost を明示したとき
 
 **banto-opcua v0.3.3（2026-11-26、#1332）**: v0.3 で既定のエンドポイントが署名・暗号化のものだけになり、
 SecurityPolicy None / Anonymous は `ServerConfig::with_none_endpoint(true)` を付けたときだけ開く。
-Hub は今の診断用の公開を保つため `server_config` で開く（暗号化のエンドポイントも並んで開く。
-その扱いの設定・証明書の信頼の一覧の画面は Phase 3 で決める）。async-opcua は banto-opcua の固定
+Hub は今の診断用の公開を保つため `server_config` で開き、署名・暗号化のポリシーは空にして
+None のエンドポイントだけを開く（信頼の一覧の画面が無い今は、暗号化でつなげるクライアントがおらず、
+未認証の相手の証明書が `rejected/` に溜まるだけになるため。暗号化のエンドポイントと信頼の一覧の画面は
+Phase 3＝#1324 の段 7 で決める）。async-opcua は banto-opcua の固定
 （fork の `a08a53a`）にそろえ、`rsa` は 0.10 に上がった。RUSTSEC-2023-0071（rsa 0.9 の
 タイミングサイドチャネル）は木から消えたので、`deny.toml` の期限付きの除外は外した。
-根拠は [banto-opcua ADR-0001](https://github.com/tyaro/banto-opcua/blob/42328ea2698979472241645b4cab2f8e3ee1d5a5/docs/adr/0001-async-opcua-base.md) に記録する。
+async-opcua の固定の根拠は [banto-opcua ADR-0001](https://github.com/tyaro/banto-opcua/blob/42328ea2698979472241645b4cab2f8e3ee1d5a5/docs/adr/0001-async-opcua-base.md) に記録する。
 
 ### 5.6 認証（全プロトコル共通)
 

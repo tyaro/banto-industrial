@@ -3360,6 +3360,18 @@ mod tests {
                 .await
                 .expect("connection timeout")
         );
+        // 開くのは None / Anonymous のエンドポイントだけ（署名・暗号化は Phase 3）。
+        let endpoints = client
+            .get_server_endpoints_from_url(endpoint.as_str())
+            .await
+            .expect("GetEndpoints");
+        assert!(!endpoints.is_empty());
+        assert!(
+            endpoints
+                .iter()
+                .all(|e| e.security_mode == MessageSecurityMode::None),
+            "{endpoints:?}"
+        );
         let read = || async {
             session
                 .read(

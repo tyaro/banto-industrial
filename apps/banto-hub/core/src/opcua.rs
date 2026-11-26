@@ -40,7 +40,9 @@
 //!
 //! banto-opcua の `ServerConfig::with_pki_dir`（banto-opcua#23）に、profile の保護された
 //! データの下の置き場（[`crate::opcua_pki::pki_dir`]）を渡す。鍵と証明書は初回だけ作り、
-//! 次の起動からは再利用する（以前は起動のたびに一時 PKI で作っていた）。
+//! 次の起動からは再利用する（以前は起動のたびに一時 PKI で作っていた）。banto-opcua v0.3.3 では、
+//! ApplicationUri・公開ホスト・bind（未指定でないとき）・有効期間が今の設定と合わないと、
+//! 起動時に作り直す（拇印が変わるので、相手は信頼し直す）。
 //! - 本番の starter は、blocking 用のスレッドで**鍵を作る・読む前に**
 //!   [`crate::opcua_pki::prepare`] で置き場を用意して ACL を許可リストで確かめ、断られたら
 //!   起動しない（`failed` と理由）。
@@ -64,7 +66,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use banto_collect::Quality;
-use banto_opcua_server::model::{DataType, Quality as UaQuality, SampleTimestamps};
+use banto_opcua_server::model::{DataType, Quality as UaQuality, SampleTimestamps, SecurityPolicy};
 use banto_opcua_server::{OpcUaServer, RunningServer, ServerConfig, TagReading};
 use futures_util::future::{BoxFuture, FutureExt};
 use serde::Serialize;
@@ -705,8 +707,13 @@ fn server_config(
         .with_namespace_uri(&settings.namespace_uri)
         .with_sample_tags(false)
         // banto-opcua v0.3 以降の既定は署名・暗号化のエンドポイントだけ。今の公開（None /
-        // Anonymous、tag-server-design §5.5）を保つため開く（#1332）。
-        .with_none_endpoint(true);
+        // Anonymous、tag-server-design §5.5）を保つため None を開き（#1332）、署名・暗号化の
+        // ポリシーは空にして None だけにする。信頼の一覧の画面が無い今は、暗号化の
+        // エンドポイントでつなげるクライアントがおらず、未認証の相手の証明書が `rejected/` に
+        // 上限なく溜まるだけになる。画面の文言（SecurityPolicy None / Anonymous のみ）とも
+        // 合わせる。開くのは Phase 3（#1324 の段 7）。
+        .with_none_endpoint(true)
+        .with_security_policies(Vec::<SecurityPolicy>::new());
     if let Some(host) = &settings.advertised_host {
         config = config.with_advertised_host(host);
     }

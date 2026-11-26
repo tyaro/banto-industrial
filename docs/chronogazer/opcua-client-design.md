@@ -115,7 +115,7 @@ ChronoGazer（記録計）が、Hub にも他社の OPC UA サーバーにも、
 | 品質・時刻   | Good / Stale→UncertainLastUsableValue / Bad。SourceTimestamp は Good なら採取の時刻、Stale・Bad なら品質が変わった時刻                                                                         | 足りる。記録の時刻は §3.5                                                                           |
 | 購読         | Subscription・MonitoredItem あり。Hub の側は 250 ms ごとに照合して、変わったときだけ通知                                                                                                       | 使える（§3.7）                                                                                      |
 | HistoryRead  | 無い                                                                                                                                                                                           | 要らない（履歴は ChronoGazer が持つ）                                                               |
-| セキュリティ | **SecurityPolicy None・Anonymous だけ**。クライアントの証明書は全部信頼                                                                                                                        | 別の機械から使うには banto-opcua#54 が要る（§5）                                                    |
+| セキュリティ | **SecurityPolicy None・Anonymous のエンドポイントだけを開く**（banto-opcua v0.3.3）。クライアントの証明書は `pki_dir` の信頼の一覧で判断する                                                   | 別の機械から使うには banto-opcua#54 が要る（§5）                                                    |
 
 ## 3. OPC UA のドライバの作り
 
