@@ -22,6 +22,8 @@ use std::fmt;
 ///
 /// The WASM adapter maps each WIT case to the variant of the same name
 /// (`verification-failed` to [`ItemError::VerificationFailed`], #902).
+/// [`ItemError::Indeterminate`] has no WIT case: a WASM guest never splits a
+/// write over several requests, so it never has a per-item "maybe written".
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
@@ -46,6 +48,13 @@ pub enum ItemError {
     /// (a read-modify-write check read). The device may have applied it;
     /// read back before writing again. Still non-fatal.
     VerificationFailed(String),
+    /// The write was sent and its result never came back (the connection
+    /// broke or the request timed out while it was in flight, e.g. one
+    /// chunk of a write split over several requests). The device may or may
+    /// not have applied it. Never treat it as a success, and never resend it
+    /// automatically: read back first (#678). The session that returns it
+    /// also fails its next call, so the host reconnects.
+    Indeterminate(String),
 }
 
 impl fmt::Display for ItemError {
@@ -56,6 +65,9 @@ impl fmt::Display for ItemError {
             ItemError::Rejected(m) => write!(f, "ドライバが断りました: {m}"),
             ItemError::VerificationFailed(m) => {
                 write!(f, "書込み後の確認読みが合いません: {m}")
+            }
+            ItemError::Indeterminate(m) => {
+                write!(f, "書けたか分かりません（送ったが応答がありません）: {m}")
             }
         }
     }
@@ -191,6 +203,10 @@ mod tests {
         assert_eq!(
             ItemError::VerificationFailed("D100 のビット 5".into()).to_string(),
             "書込み後の確認読みが合いません: D100 のビット 5"
+        );
+        assert_eq!(
+            ItemError::Indeterminate("ns=2;s=Level".into()).to_string(),
+            "書けたか分かりません（送ったが応答がありません）: ns=2;s=Level"
         );
     }
 

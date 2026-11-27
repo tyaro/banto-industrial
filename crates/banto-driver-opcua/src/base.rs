@@ -254,7 +254,8 @@ impl DriverBase for OpcUaDriver {
     /// A NodeId string (`banto-opcua-core`'s `NodeAddress`); the canonical
     /// form is its `Display` (`ns=0;` is never left out, `nsu=` re-encodes
     /// `;` and `%`). Every numeric kind is accepted at every NodeId: whether
-    /// the node's type fits is only known when it is read. Strings are
+    /// the node's type fits is only known when it is read or written
+    /// (a write of another type is `BadTypeMismatch`). Strings are
     /// refused ([`STRING_REFUSED`]).
     fn parse_address(&self, text: &str, kind: &TagKind) -> Result<DriverAddress, AddressError> {
         match kind {

@@ -23,10 +23,12 @@
 //! ## Writing a value (`scalar_for_write`)
 //!
 //! The component never converts types (ADR-0005), so the value is sent as
-//! the node's built-in type. `bit` writes a Boolean node only; a number writes
-//! a numeric node, exactly (an integer node refuses a fraction or an
-//! out-of-range value as `ItemError::Rejected`: nothing was sent). A String
-//! node, or a bit to a numeric node, is `ItemError::Unsupported`.
+//! the built-in type of the tag's kind (`scalar_type_for`, #678: never the
+//! node's type read back). `bit` writes a Boolean; a number writes a numeric
+//! type, exactly (an integer type refuses a fraction, an out-of-range value
+//! or NaN as `ItemError::Rejected`: nothing was sent). A bit to a numeric
+//! type is `ItemError::Unsupported`. A node of another type answers
+//! `BadTypeMismatch` (the session's `ItemError::Device`).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -196,8 +198,8 @@ fn show(number: Number) -> String {
     }
 }
 
-/// The built-in type a tag of `data_type` is written as when the node's own
-/// type is not known (its value could not be read).
+/// The built-in type a tag of `data_type` is written as (#678: the tag's
+/// type, whatever the node's own type is).
 pub(crate) fn scalar_type_for(data_type: DataType) -> ScalarType {
     match data_type {
         DataType::Bit => ScalarType::Boolean,
@@ -212,7 +214,7 @@ pub(crate) fn scalar_type_for(data_type: DataType) -> ScalarType {
     }
 }
 
-/// `value` as the node's built-in type `target` (the module doc's rules).
+/// `value` as the built-in type `target` (the module doc's rules).
 pub(crate) fn scalar_for_write(
     value: &Value,
     target: ScalarType,
@@ -310,8 +312,7 @@ fn leading_status(message: &str) -> Option<u32> {
     .map(StatusCode::code)
 }
 
-/// A connection-wide failure from a Read (or from the Read that learns a
-/// node's type before a Write) as a [`FatalError`].
+/// A connection-wide failure from a Read (or a Write) as a [`FatalError`].
 ///
 /// The component folds the service error into its message, so the class is
 /// read back from the leading StatusCode: `BadTimeout` is
@@ -552,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_go_out_as_the_nodes_type() {
+    fn writes_go_out_as_the_target_type() {
         use ScalarType::*;
         let f = |x: f64| Value::F64(x);
         for (value, target, expected) in [

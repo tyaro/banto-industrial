@@ -154,7 +154,7 @@ ChronoGazer（記録計）が、Hub にも他社の OPC UA サーバーにも、
 - SecurityPolicy・利用者の認証は、banto-opcua#54 が入るまで設定に出さない（None / Anonymous に決め打ち）。**平文・匿名でつないでいることを接続の画面に出す**（#678 の受入れ条件。ChronoGazer も同じ）。
 - キーの名前・既定の値は段 3 の着手のときに部品の `ClientConfig` に合わせて決める（上の表は形の案）。
 - **決めた（2026-11-27、`crates/banto-driver-opcua`）**: `endpointUrl`（必須、`opc.tcp://`）、`readMode`（`read` だけ。`subscribe` は `validate_config` が「未対応」と断る）、`keepAliveIntervalMs`（既定 5000、100〜30000）、`maxFailedKeepAliveCount`（既定 3、1〜10）。既定は部品の `ClientConfig::new` と同じ（試験で突き合わせる）。部品の自動再接続は止め（`ReconnectPolicy::Disabled`）、接続の時間切れ・要求の時間切れは `ConnectContext` から渡す。
-- **作ったもの（2026-11-27）**: 品質は StatusCode の深刻度で写す（Good → Good、Uncertain で値あり → `Uncertain`、Bad・値なし → そのタグだけ `ItemError`）。SourceTimestamp は `source_time_ms` に入れ、無ければ `None`（現在時刻で補わない）。`read_batch` は `read_batch_detailed` から作る。書き込みは Read で覚えたノードの型で送り（部品は型を変換しない）、部品の結末が「送っていない」「要求ごとの拒否」ならそのタグだけの誤り、「届いたか分からない」が 1 つでもあれば接続ごとの失敗にする（Driver API の `ItemError` に「書かれたかもしれない」が無いため）。string は §3.4 のとおり未対応。適合試験は C4 の壊れた応答の分類・C5 の分割・C8 の接続の数（GetEndpoints が別の接続）の 3 つが OPC UA では文面どおりに満たせず、理由を試験に書いて外した（`tests/conformance.rs`）。
+- **作ったもの（2026-11-27）**: 品質は StatusCode の深刻度で写す（Good → Good、Uncertain で値あり → `Uncertain`、Bad・値なし → そのタグだけ `ItemError`）。SourceTimestamp は `source_time_ms` に入れ、無ければ `None`（現在時刻で補わない）。`read_batch` は `read_batch_detailed` から作る。書き込みは **タグの型** で送る（#678 の決定。ノードを先に読んで型を覚えることはしない。部品は型を変換しない）。タグの型で表せない値（整数の型に小数・範囲外・NaN）は送らずに `ItemError::Rejected`、ノードの型と合わなければサーバーの `BadTypeMismatch` をそのタグだけの `ItemError::Device` にする。分けて送った Write が途中で切れても `write_batch` は `Ok` でノードごとに返す（#678 の 2026-10-17 のコメント）: 応答を受けた分はその StatusCode、要求ごとの拒否は `Device`、「送っていない」は `Rejected`、「送ったが応答が無い」は新しい `ItemError::Indeterminate`（書かれたかもしれない。成功として扱わず、自動で送り直さない）。部品の Write が失敗したらセッションを壊れた印にし、次の Read・Write は何も送らずに `Err` を返して broker の再接続に回す（2026-11-27、PR #1356 のオーナーのレビュー）。string は §3.4 のとおり未対応。適合試験は C4 の壊れた応答の分類・C5 の分割・C8 の接続の数（GetEndpoints が別の接続）の 3 つが OPC UA では文面どおりに満たせず、理由を試験に書いて外した（`tests/conformance.rs`）。
 
 ### 3.4 型の写し
 
@@ -196,7 +196,7 @@ Uncertain（Stale）と SourceTimestamp をドライバから渡すために、`
   - 使う側（`banto-collect` の broker の読み取り）は新しいメソッドを呼び、Uncertain を Stale として扱う。
 - **段 3 の最初の PR で足した**（`Session::read_batch_detailed`・`Reading`・`ReadQuality`。`banto-driver-api` の未公開の 0.3.0 に入れた。使う側の broker・collect・Hub はまだ変えていない）。
 - 別案: `ItemError` に「Uncertain」を足す。足すのは易しいが、値を持てない（UncertainLastUsableValue の値を捨てる）うえ、エラーとして数えられるので採らない。
-- 書き込みの途中の切断（ADR-0005 の `WriteOutcome` の `Unknown`・`NotSent`）を返す形も Hub の #678 で要る。ChronoGazer は書かないので、この設計では扱わない。
+- 書き込みの途中の切断（ADR-0005 の `WriteOutcome` の `Unknown`・`NotSent`）を返す形も Hub の #678 で要る。→ `ItemError::Indeterminate` を足した（`banto-driver-api` 0.3.0、未公開。WIT には足さない: WASM のゲストは Write を分けて送らない）。ChronoGazer は書かないので、これ以上はこの設計では扱わない。
 
 ### 3.7 再接続と読み方
 

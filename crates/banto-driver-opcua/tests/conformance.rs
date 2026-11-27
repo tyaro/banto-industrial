@@ -26,8 +26,7 @@
 
 mod common;
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::net::{IpAddr, Ipv4Addr};
 
 use banto_driver_api::{
     AddressError, BoxFuture, ConnectContext, DataType, DriverAddress, DriverBase, DriverDescriptor,
@@ -38,8 +37,7 @@ use banto_driver_conformance::proxy::FaultProxy;
 use banto_driver_conformance::session::{self, ResponsePatch, SessionFixtures};
 use banto_driver_conformance::{static_checks, StaticFixtures};
 use banto_driver_opcua::{keys, OpcUaDriver};
-use common::{tag, TestServer};
-use tokio::net::{TcpListener, TcpStream};
+use common::{relay, tag, TestServer};
 
 /// The driver with `endpointUrl` taken from the harness's `host` / `port`.
 struct Proxied;
@@ -97,27 +95,6 @@ impl SessionDriver for Proxied {
         settings.insert(keys::ENDPOINT_URL, url);
         OpcUaDriver.connect(&settings, cx)
     }
-}
-
-/// A TCP relay whose upstream is set after it starts.
-async fn relay() -> (SocketAddr, Arc<Mutex<Option<SocketAddr>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let upstream = Arc::new(Mutex::new(None::<SocketAddr>));
-    let target = upstream.clone();
-    tokio::spawn(async move {
-        while let Ok((mut down, _)) = listener.accept().await {
-            let Some(to) = *target.lock().unwrap() else {
-                continue;
-            };
-            tokio::spawn(async move {
-                if let Ok(mut up) = TcpStream::connect(to).await {
-                    let _ = tokio::io::copy_bidirectional(&mut down, &mut up).await;
-                }
-            });
-        }
-    });
-    (addr, upstream)
 }
 
 fn n(data_type: DataType) -> TagKind {
@@ -202,8 +179,12 @@ fn fixtures() -> SessionFixtures {
         .write(&tag("Setpoint"), n(F64), Value::F64(2.25))
         .write(&tag("Enable"), n(Bit), Value::Bit(true))
         .write(&tag("Level"), n(I16), Value::F64(321.0))
-        .unsupported_write(&tag("Enable"), n(U16), Value::F64(1.0))
-        .unsupported_write(&tag("Setpoint"), n(Bit), Value::Bit(true))
+        // A bit value for a numeric tag is refused before sending. A tag whose
+        // type is not the node's (u16 to a Boolean node) is sent as the tag's
+        // type and is the server's `BadTypeMismatch` (`Device`, #678), so it
+        // is not an "unsupported" write here (tests/server.rs covers it).
+        .unsupported_write(&tag("Setpoint"), n(F64), Value::Bit(true))
+        .unsupported_write(&tag("Level"), n(I16), Value::Bit(true))
         // The OPC UA binary message type of the next response ("MSG").
         .broken(ResponsePatch::new(0, 0, b"XYZ".to_vec()))
 }

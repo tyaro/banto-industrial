@@ -14,38 +14,41 @@
 //! NamespaceArray read) is additionally bounded by `connect_timeout + 2 x
 //! response_timeout`, so a host never waits on it unboundedly.
 //!
-//! ## Writes
+//! ## Writes (#678)
 //!
-//! The component sends a value as the type it is given (it never converts),
-//! so the session learns each node's built-in type from a Read - every Read
-//! with a value records it, and a Write reads the nodes it has not seen yet
-//! first. A node whose value cannot be read is written as the tag kind's own
-//! type (`bit` = Boolean, `i16` = Int16, ..., `f64` = Double); a
-//! `BadTypeMismatch` forgets the learned type. The component's results map as:
+//! A value is sent as the type the **tag** is registered with (`bit` =
+//! Boolean, `i16` = Int16, `u16` = UInt16, `i32` = Int32, `u32` = UInt32,
+//! `f32` = Float, `i64` = Int64, `u64` = UInt64, `f64` = Double); the session
+//! never reads the node first and never learns or guesses its type. A value
+//! the tag's type cannot hold (a fraction, out of range or NaN for an integer
+//! type) is not sent (`ItemError::Rejected`). A node of another type answers
+//! `BadTypeMismatch`, which is that tag's `ItemError::Device` like any other
+//! Bad: register the tag with the node's type.
+//!
+//! The component's results map per node, and `write_batch` is `Ok` even when
+//! the component's call is `Err`:
 //!
 //! | Component result | Driver API |
 //! | --- | --- |
 //! | `Ok`, node Good / Uncertain | `Ok(())` |
 //! | `Ok`, node Bad (`BadNotWritable`, `BadTypeMismatch`, `BadNodeIdUnknown`, ...) | `ItemError::Device { code }` |
-//! | `Err`, every outcome known: `Completed(status)` | as the `Ok` rows |
-//! | `Err`, every outcome known: `Rejected(status)` (the server refused the whole request before processing it) | `ItemError::Device { code }` |
-//! | `Err`, every outcome known: `NotSent` | `ItemError::Rejected` ("not sent") |
-//! | `Err` with any `Unknown` outcome (sent, result lost: it may have been written) | `Err(FatalError)` for the whole batch |
-//! | the type-learning Read fails | `Err(FatalError)` (nothing was sent) |
+//! | `Err`: `Completed(status)` (a chunk answered before the failure) | as the `Ok` rows |
+//! | `Err`: `Rejected(status)` (the server refused the whole request before processing it) | `ItemError::Device { code }` |
+//! | `Err`: `NotSent` | `ItemError::Rejected` (not sent, so not written) |
+//! | `Err`: `Unknown(status)` (sent, result lost) | `ItemError::Indeterminate` |
+//! | `Err`: an outcome added later (`#[non_exhaustive]`) | `ItemError::Indeterminate` |
+//! | any `Err` | the session is marked broken: its next `read_batch` / `read_batch_detailed` / `write_batch` sends nothing and returns `Err(FatalError)` |
 //!
-//! Why: `NotSent` and `Rejected` are certain "not written", so they stay
-//! per-item and the caller may retry them; `Completed` carries the server's
-//! own answer. `Unknown` cannot be expressed per item - the Driver API's
-//! `ItemError` has no "maybe written" case, and claiming either success or
-//! failure would be a lie - so the batch is connection-fatal, which is also
-//! what it is (the request's response was lost). The component *does*
-//! distinguish a split Write that broke in the middle (earlier chunks
-//! `Completed`, the failing chunk `Unknown` / `NotSent` / `Rejected`, the rest
-//! `NotSent`), but once one chunk is `Unknown` that detail is lost here.
-//! When an `Err` without `Unknown` leaves the connection itself broken, the
-//! next read returns `Err` and the host reconnects then.
-
-use std::collections::HashMap;
+//! Why: a write the component splits over several requests can break in the
+//! middle - earlier chunks answered, the failing chunk maybe written, the
+//! rest not sent - and each of those is a fact about its own node, so it is
+//! returned per node rather than lost in one batch-wide error. "Maybe
+//! written" is its own reason (`Indeterminate`), never a success and never
+//! resent automatically; `NotSent` and `Rejected` are certain "not written".
+//! The component's `Err` always means the request or the connection failed,
+//! so the session refuses further calls and the broker reconnects (the
+//! `Err` is `Timeout` when a chunk timed out, else the failure's class,
+//! normally `Io`).
 
 use banto_driver_api::{
     BoxFuture, ConnectContext, DeviceError, FatalError, ItemError, Reading, Session, SessionDriver,
@@ -54,15 +57,12 @@ use banto_driver_api::{
 use banto_opcua_client::{
     ClientConfig, ConnectedClient, OpcUaClient, ReconnectPolicy, WriteFailure, WriteOutcome,
 };
-use banto_opcua_core::{NodeAddress, ScalarType, ScalarValue, StatusCode};
+use banto_opcua_core::{NodeAddress, ScalarValue};
 
 use crate::base::{parse_node, ClientSettings, OpcUaDriver};
 use crate::convert::{
     fatal_of, fatal_of_connect, reading_of, scalar_for_write, scalar_type_for, status_error,
 };
-
-/// `BadTypeMismatch` (the learned type was wrong: forget it).
-const BAD_TYPE_MISMATCH: StatusCode = StatusCode::BAD_TYPE_MISMATCH;
 
 impl SessionDriver for OpcUaDriver {
     fn connect(
@@ -101,7 +101,7 @@ impl SessionDriver for OpcUaDriver {
             };
             Ok(Box::new(OpcUaSession {
                 client: Some(client),
-                types: HashMap::new(),
+                broken: None,
             }) as Box<dyn Session>)
         })
     }
@@ -111,8 +111,9 @@ impl SessionDriver for OpcUaDriver {
 struct OpcUaSession {
     /// `None` after [`Session::disconnect`].
     client: Option<ConnectedClient>,
-    /// Each node's built-in type, by canonical NodeId, as last read.
-    types: HashMap<String, ScalarType>,
+    /// Set by a Write the component failed (the module doc's table): every
+    /// later call returns this without sending, so the host reconnects.
+    broken: Option<FatalError>,
 }
 
 /// A spec's NodeId, or the tag's own error (an address the driver never
@@ -126,6 +127,9 @@ fn node_of(spec: &TagSpec) -> Result<NodeAddress, ItemError> {
 
 impl OpcUaSession {
     fn client(&self) -> Result<&ConnectedClient, FatalError> {
+        if let Some(e) = &self.broken {
+            return Err(e.clone());
+        }
         self.client
             .as_ref()
             .ok_or_else(|| FatalError::Io("OPC UA の接続は閉じました".into()))
@@ -136,6 +140,7 @@ impl OpcUaSession {
         &mut self,
         specs: &[TagSpec],
     ) -> Result<Vec<Result<Reading, ItemError>>, FatalError> {
+        self.client()?;
         let mut results: Vec<Option<Result<Reading, ItemError>>> = vec![None; specs.len()];
         let mut positions = Vec::with_capacity(specs.len());
         let mut nodes = Vec::with_capacity(specs.len());
@@ -161,10 +166,7 @@ impl OpcUaSession {
                     readings.len()
                 )));
             }
-            for ((i, node), reading) in positions.into_iter().zip(&nodes).zip(&readings) {
-                if let Some(value) = &reading.value {
-                    self.types.insert(node.to_string(), value.scalar_type());
-                }
+            for (i, reading) in positions.into_iter().zip(&readings) {
                 results[i] = Some(reading_of(reading, &specs[i].kind));
             }
         }
@@ -178,45 +180,22 @@ impl OpcUaSession {
         &mut self,
         items: &[WriteItem],
     ) -> Result<Vec<Result<(), ItemError>>, FatalError> {
+        self.client()?;
         let mut results: Vec<Option<Result<(), ItemError>>> = vec![None; items.len()];
-        let mut parsed = Vec::with_capacity(items.len());
+        let mut sent_positions = Vec::with_capacity(items.len());
+        let mut writes: Vec<(NodeAddress, ScalarValue)> = Vec::with_capacity(items.len());
         for (i, item) in items.iter().enumerate() {
-            match node_of(&item.spec) {
-                Ok(node) => parsed.push((i, node)),
-                Err(e) => results[i] = Some(Err(e)),
-            }
-        }
-        // Learn the types not seen yet (nothing is written before this).
-        let mut unknown: Vec<NodeAddress> = Vec::new();
-        for (_, node) in &parsed {
-            if !self.types.contains_key(&node.to_string()) && !unknown.contains(node) {
-                unknown.push(node.clone());
-            }
-        }
-        if !unknown.is_empty() {
-            let readings = self
-                .client()?
-                .read_batch(&unknown)
-                .await
-                .map_err(|e| fatal_of(&e))?;
-            for (node, reading) in unknown.iter().zip(&readings) {
-                if let Some(value) = &reading.value {
-                    self.types.insert(node.to_string(), value.scalar_type());
+            let node = match node_of(&item.spec) {
+                Ok(node) => node,
+                Err(e) => {
+                    results[i] = Some(Err(e));
+                    continue;
                 }
-            }
-        }
-        let mut sent_positions = Vec::with_capacity(parsed.len());
-        let mut writes: Vec<(NodeAddress, ScalarValue)> = Vec::with_capacity(parsed.len());
-        for (i, node) in parsed {
-            let TagKind::Numeric(data_type) = items[i].spec.kind else {
+            };
+            let TagKind::Numeric(data_type) = item.spec.kind else {
                 unreachable!("node_of refuses non-numeric kinds");
             };
-            let target = self
-                .types
-                .get(&node.to_string())
-                .copied()
-                .unwrap_or_else(|| scalar_type_for(data_type));
-            match scalar_for_write(&items[i].value, target) {
+            match scalar_for_write(&item.value, scalar_type_for(data_type)) {
                 Ok(value) => {
                     sent_positions.push(i);
                     writes.push((node, value));
@@ -225,15 +204,25 @@ impl OpcUaSession {
             }
         }
         if !writes.is_empty() {
-            let outcomes = match self.client()?.write_batch(&writes).await {
+            let outcomes: Vec<WriteOutcome> = match self.client()?.write_batch(&writes).await {
                 Ok(statuses) => statuses.into_iter().map(WriteOutcome::Completed).collect(),
-                Err(failure) => self.known_outcomes(failure)?,
-            };
-            for ((i, (node, _)), outcome) in sent_positions.into_iter().zip(&writes).zip(outcomes) {
-                if outcome == WriteOutcome::Completed(BAD_TYPE_MISMATCH) {
-                    self.types.remove(&node.to_string());
+                Err(failure) => {
+                    self.broken = Some(broken_by(&failure));
+                    failure.outcomes
                 }
-                results[i] = Some(item_result(outcome));
+            };
+            if outcomes.len() != writes.len() && self.broken.is_none() {
+                self.broken = Some(FatalError::Protocol(format!(
+                    "Write の結果が {} 件の要求に {} 件でした",
+                    writes.len(),
+                    outcomes.len()
+                )));
+            }
+            for (i, result) in sent_positions
+                .into_iter()
+                .zip(per_node(&outcomes, writes.len()))
+            {
+                results[i] = Some(result);
             }
         }
         Ok(results
@@ -241,29 +230,42 @@ impl OpcUaSession {
             .map(|r| r.expect("every position is filled"))
             .collect())
     }
+}
 
-    /// A failed batch's outcomes when each is certain; any `Unknown` makes
-    /// the batch connection-fatal (the module doc's table).
-    fn known_outcomes(&self, failure: WriteFailure) -> Result<Vec<WriteOutcome>, FatalError> {
-        if failure
-            .outcomes
-            .iter()
-            .any(|o| matches!(o, WriteOutcome::Unknown(_)))
-        {
-            return Err(match fatal_of(&failure.error) {
-                // A lost write result is never a plain "framing" problem to
-                // the host; keep the class but say it may have been written.
-                FatalError::Timeout => FatalError::Timeout,
-                other => FatalError::Io(format!(
-                    "Write の結果を受け取れませんでした（書かれたかもしれません）: {other}"
-                )),
-            });
-        }
-        Ok(failure.outcomes)
+/// `BadTimeout`.
+const BAD_TIMEOUT: u32 = 0x800A_0000;
+
+/// The session's state after the component failed a Write: `Timeout` when a
+/// chunk timed out, else the failure's class (`Io` for a lost connection).
+fn broken_by(failure: &WriteFailure) -> FatalError {
+    if failure.outcomes.iter().any(
+        |o| matches!(o, WriteOutcome::Unknown(status) if status.code() & 0xFFFF_0000 == BAD_TIMEOUT),
+    ) {
+        return FatalError::Timeout;
+    }
+    match fatal_of(&failure.error) {
+        FatalError::Io(m) => FatalError::Io(format!(
+            "Write の途中で接続が使えなくなりました（つなぎ直します）: {m}"
+        )),
+        other => other,
     }
 }
 
-/// One node's certain outcome as the item's result.
+/// The sent nodes' results, in order, from the component's outcomes. Each
+/// node keeps its own outcome; one the component did not return (it promises
+/// one per node) is not known to be unwritten.
+fn per_node(outcomes: &[WriteOutcome], sent: usize) -> Vec<Result<(), ItemError>> {
+    (0..sent)
+        .map(|k| match outcomes.get(k) {
+            Some(outcome) => item_result(*outcome),
+            None => Err(ItemError::Indeterminate(
+                "Write の結果が要求より少なく返りました".into(),
+            )),
+        })
+        .collect()
+}
+
+/// One node's outcome as the item's result (the module doc's table).
 fn item_result(outcome: WriteOutcome) -> Result<(), ItemError> {
     match outcome {
         WriteOutcome::Completed(status) | WriteOutcome::Rejected(status)
@@ -284,10 +286,13 @@ fn item_result(outcome: WriteOutcome) -> Result<(), ItemError> {
         WriteOutcome::NotSent => Err(ItemError::Rejected(
             "接続が切れたので送っていません（書かれていません）".into(),
         )),
+        WriteOutcome::Unknown(status) => Err(ItemError::Indeterminate(format!(
+            "送りましたが結果を受け取れませんでした（{status}）。書かれたかもしれません"
+        ))),
         // `#[non_exhaustive]`: an outcome added later is not known to be
-        // unwritten, so it is not a success either.
-        _ => Err(ItemError::Rejected(format!(
-            "Write の結末が不明です: {outcome:?}"
+        // unwritten, so it is neither a success nor "not written".
+        _ => Err(ItemError::Indeterminate(format!(
+            "Write の結末が分かりません: {outcome:?}"
         ))),
     }
 }
@@ -335,6 +340,8 @@ impl Session for OpcUaSession {
 
 #[cfg(test)]
 mod tests {
+    use banto_opcua_core::StatusCode;
+
     use super::*;
 
     #[test]
@@ -363,8 +370,78 @@ mod tests {
             Err(ItemError::Device(e)) if e.code == 0x8010_0000
         ));
         assert!(matches!(
+            item_result(WriteOutcome::Completed(StatusCode::BAD_TYPE_MISMATCH)),
+            Err(ItemError::Device(e)) if e.code == 0x8074_0000
+        ));
+        assert!(matches!(
             item_result(WriteOutcome::NotSent),
             Err(ItemError::Rejected(_))
         ));
+        // Sent, result lost: maybe written - never a success, never "not written".
+        for status in [
+            StatusCode::BAD_CONNECTION_CLOSED,
+            StatusCode::from_code(BAD_TIMEOUT),
+        ] {
+            assert!(matches!(
+                item_result(WriteOutcome::Unknown(status)),
+                Err(ItemError::Indeterminate(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn a_split_write_broken_in_the_middle_keeps_each_nodes_outcome() {
+        // Chunk 1 answered (Good, BadNotWritable), chunk 2 lost, chunk 3 not sent.
+        let outcomes = [
+            WriteOutcome::Completed(StatusCode::GOOD),
+            WriteOutcome::Completed(StatusCode::BAD_NOT_WRITABLE),
+            WriteOutcome::Unknown(StatusCode::BAD_CONNECTION_CLOSED),
+            WriteOutcome::Unknown(StatusCode::BAD_CONNECTION_CLOSED),
+            WriteOutcome::NotSent,
+        ];
+        let got = per_node(&outcomes, outcomes.len());
+        assert_eq!(got[0], Ok(()));
+        assert!(matches!(&got[1], Err(ItemError::Device(e)) if e.code == 0x803B_0000));
+        assert!(matches!(got[2], Err(ItemError::Indeterminate(_))));
+        assert!(matches!(got[3], Err(ItemError::Indeterminate(_))));
+        assert!(matches!(got[4], Err(ItemError::Rejected(_))));
+        // A whole-request refusal is certain "not written", per node.
+        let got = per_node(
+            &[WriteOutcome::Rejected(StatusCode::BAD_TOO_MANY_OPERATIONS)],
+            1,
+        );
+        assert!(matches!(&got[0], Err(ItemError::Device(e)) if e.code == 0x8010_0000));
+        // An outcome the component failed to return is not known to be unwritten.
+        let got = per_node(&outcomes[..1], 2);
+        assert_eq!(got[0], Ok(()));
+        assert!(matches!(got[1], Err(ItemError::Indeterminate(_))));
+    }
+
+    fn spec(data_type: banto_driver_api::DataType) -> TagSpec {
+        use banto_driver_api::DriverBase;
+        let kind = TagKind::numeric(data_type);
+        TagSpec::new(
+            OpcUaDriver.parse_address("ns=2;s=Level", &kind).unwrap(),
+            kind,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_broken_session_refuses_every_call_without_sending() {
+        let mut s = OpcUaSession {
+            client: None,
+            broken: Some(FatalError::Timeout),
+        };
+        let specs = [spec(banto_driver_api::DataType::I16)];
+        assert_eq!(s.read_batch(&specs).await, Err(FatalError::Timeout));
+        assert_eq!(
+            s.read_batch_detailed(&specs).await.map(|_| ()),
+            Err(FatalError::Timeout)
+        );
+        let items = [WriteItem::new(specs[0].clone(), Value::F64(1.0))];
+        assert_eq!(s.write_batch(&items).await, Err(FatalError::Timeout));
+        // Even an empty batch (nothing to send) is refused.
+        assert_eq!(s.write_batch(&[]).await, Err(FatalError::Timeout));
+        assert_eq!(s.read_batch(&[]).await, Err(FatalError::Timeout));
     }
 }

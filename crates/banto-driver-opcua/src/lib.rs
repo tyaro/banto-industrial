@@ -48,10 +48,11 @@
 //!   the server sends one, becomes `source_time_ms`; it is never filled with
 //!   the current time. `read_batch` is `read_batch_detailed` without the
 //!   quality, so the two cannot disagree.
-//! - **Writes** (`session.rs`): the value is sent as the node's own built-in
-//!   type (learned from a Read, since the component never converts types),
-//!   and the component's per-node outcomes are mapped by the table in
-//!   `session.rs`'s module doc.
+//! - **Writes** (`session.rs`, #678): the value is sent as the tag's type (a
+//!   node of another type answers `BadTypeMismatch`, that tag's
+//!   `ItemError::Device`), and the component's per-node outcomes - also of a
+//!   split Write broken in the middle (`ItemError::Indeterminate` for "sent,
+//!   result lost") - are mapped by the table in `session.rs`'s module doc.
 //!
 //! ## Module map
 //!

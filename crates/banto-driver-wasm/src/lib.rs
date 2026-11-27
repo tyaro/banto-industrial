@@ -1362,6 +1362,8 @@ fn api_write_fatal(value: write_types::FatalError) -> FatalError {
     }
 }
 
+/// The API's `ItemError::Indeterminate` (sent, result lost) has no WIT case:
+/// a WASM guest never splits a write over several requests (#678).
 fn api_write_item_error(value: write_types::ItemError) -> ItemError {
     match value {
         write_types::ItemError::Device(e) => {
