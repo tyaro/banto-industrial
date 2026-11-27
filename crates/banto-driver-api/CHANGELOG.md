@@ -18,6 +18,8 @@ R2b-6a（docs/hub/driver/banto-hub-driver-ui-design.md §3。2026-10-24）。UI 
 - `Transport::Udp`（`"udp"`。#916）: UDP の接続済みソケット。1 データグラム = 1 応答、エンジンは再送しない、ハンドシェイクは 1 往復以上が必須（docs/hub/driver/banto-hub-driver-io-design.md §7.6）。`Transport` は `#[non_exhaustive]` なので、`_` を書いた `match` は直さなくてよい。`keys::TRANSPORT` の説明に `"udp"` を足した。
 - `FrameConnection::unplanned_reason`（既定: `None`）: `plan_read` が `covers` に入れなかった spec の理由。エンジンはこれが `Some(理由)` のとき `Unsupported(理由)`、`None` のとき従来の "計画に含まれない" を返す。WIT には写さない（WASM は既定のまま）。
 - `DriverAddress::index: Option<u64>` と `with_index`（アドレスの area の中の位置。`new` は `None`）。`DriverAddress` は `#[non_exhaustive]` なので、`new` / `with_*` で作っているコードは直さなくてよい。
+- `Session::read_batch_detailed`（#1324、docs/chronogazer/opcua-client-design.md §3.6。既定: `read_batch` を呼び、各 `Ok(value)` を Good・時刻なしの `Reading` に包む。`Err` はそのまま）。上書きするドライバは `read_batch` と同じ値を返すこと。
+- `Reading { value, quality, source_time_ms: Option<i64> }`（UNIX エポックのミリ秒。`Reading::good` / `Reading::new` で作る）と `ReadQuality`（`Good` / `Uncertain`。使う側は Uncertain を Stale として扱う）。どれも `#[non_exhaustive]`、`serde` feature あり。Bad は値がないので従来どおり `ItemError`。
 
 ### 壊れること
 
