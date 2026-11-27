@@ -10,8 +10,17 @@ export interface NodeIdTarget {
 	externalName: string;
 }
 
+/**
+ * Namespace URI の部分だけを符号化する。`;` は nsu の区切りなので `%3B` に、
+ * `%` は符号の印なので先に `%25` にする（先に `;` を置き換えると `%3B` の `%` まで二重に
+ * 符号化される）。banto-opcua の `NodeAddress::Display` と同じ。`s=` の外部名は触らない。
+ */
+function encodeNamespaceUri(uri: string): string {
+	return uri.replaceAll('%', '%25').replaceAll(';', '%3B');
+}
+
 export function opcUaNodeId(namespaceUri: string, externalName: string): string {
-	return `nsu=${namespaceUri};s=${externalName}`;
+	return `nsu=${encodeNamespaceUri(namespaceUri)};s=${externalName}`;
 }
 
 /** 公開される（`string` でない）行の NodeId を 1 行 1 件で返す。 */
