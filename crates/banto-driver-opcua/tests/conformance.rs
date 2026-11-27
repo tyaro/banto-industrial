@@ -22,7 +22,7 @@
 //!
 //! [`EXPECTED`] lists them with the reason; the test fails if any *other*
 //! check fails, and also if an expected one starts passing (so the list
-//! stays true).
+//! stays true; entries marked as timing-dependent are exempt from this).
 
 mod common;
 
@@ -209,7 +209,9 @@ fn fixtures() -> SessionFixtures {
 }
 
 /// Checks OPC UA does not meet as the harness words them, with why. Each is
-/// `(check, a phrase of its failure detail)`.
+/// `(check, a phrase of its failure detail, timing_dependent)`. A
+/// `timing_dependent` entry may pass on a fast machine, so its absence is not
+/// reported as stale.
 ///
 /// - **C4 (b), a broken response is `Framing` / `Protocol`**: async-opcua
 ///   closes the transport when a chunk does not decode, and the pending
@@ -223,16 +225,17 @@ fn fixtures() -> SessionFixtures {
 ///   certificate). Delivered a few bytes per millisecond-delay chunk it
 ///   outlasts the 1 s request timeout GetEndpoints runs under, so the
 ///   connect times out (`BadTimeout`). Reads on an established session are
-///   small and are not what fails.
+///   small and are not what fails. This depends on timing: a fast machine may
+///   finish the connect in time, so it may pass. Passing is not a failure.
 /// - **C8, one accepted connection per connect**: `banto-opcua-client`
 ///   reads the endpoints on a TCP connection of its own (GetEndpoints) and
 ///   then opens the session on a second one, so the peer accepts 2 per
 ///   connect. The 100 alternating reads and writes do share one session (the
 ///   harness counts 1 `connect`), which is the property #337 is about.
-const EXPECTED: &[(&str, &str)] = &[
-    ("C4", "壊れた応答が"),
-    ("C5", "バイトずつ届く"),
-    ("C8", "ピアが受けた接続が 2 本、connect が 1 回"),
+const EXPECTED: &[(&str, &str, bool)] = &[
+    ("C4", "壊れた応答が", false),
+    ("C5", "バイトずつ届く", true),
+    ("C8", "ピアが受けた接続が 2 本、connect が 1 回", false),
 ];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -252,15 +255,16 @@ async fn session_conforms() {
         .filter(|t| {
             !EXPECTED
                 .iter()
-                .any(|(id, phrase)| t.starts_with(&format!("{id}:")) && t.contains(phrase))
+                .any(|(id, phrase, _)| t.starts_with(&format!("{id}:")) && t.contains(phrase))
         })
         .collect();
-    let stale: Vec<&(&str, &str)> = EXPECTED
+    let stale: Vec<&(&str, &str, bool)> = EXPECTED
         .iter()
-        .filter(|(id, phrase)| {
-            !text
-                .iter()
-                .any(|t| t.starts_with(&format!("{id}:")) && t.contains(phrase))
+        .filter(|(id, phrase, timing_dependent)| {
+            !*timing_dependent
+                && !text
+                    .iter()
+                    .any(|t| t.starts_with(&format!("{id}:")) && t.contains(phrase))
         })
         .collect();
     assert!(
