@@ -115,7 +115,9 @@
 	import { isDockPanelOnScreen } from '#lib/dockPanelOnScreen.js';
 	import { persistThreePaneLayout } from '#lib/dockLayoutPersist.svelte.js';
 	import { lowScreenLogBand } from '#lib/dockLogBand.svelte.js';
-	import { canWriteResources } from '#lib/permissions.js';
+	import { canWriteResources, isAdmin } from '#lib/permissions.js';
+	import { getOpcUaSettings } from '#lib/banto/opcuaSettingsAdmin.js';
+	import { opcUaNodeIdLines } from '#lib/banto/opcuaNodeId.js';
 	import ConnectionTree from '#lib/components/ConnectionTree.svelte';
 	import TreeContextMenu from '#lib/components/TreeContextMenu.svelte';
 	import ConnectionDrawer from '#lib/components/ConnectionDrawer.svelte';
@@ -3597,6 +3599,41 @@
 			ids,
 			triggerEl: document.activeElement instanceof HTMLElement ? document.activeElement : null
 		};
+	}
+
+	// OPC UA の NodeId のコピー（#1324 段 2）。Namespace URI は admin 限定の設定 API にあるので、
+	// admin のセッションのときだけページを開いたときに 1 回読む。読めなければ項目を出さない（通知なし）。
+	let opcUaNamespaceUri: string | null = $state(null);
+	let opcUaNamespaceTried = false;
+	$effect(() => {
+		if (!isAdmin(sessionStore.role) || opcUaNamespaceTried) return;
+		opcUaNamespaceTried = true;
+		getOpcUaSettings().then(
+			(s) => (opcUaNamespaceUri = s.namespaceUri),
+			() => undefined
+		);
+	});
+
+	function opcUaNodeIdsFor(ids: number[]): string[] {
+		if (opcUaNamespaceUri === null) return [];
+		const wanted = new Set(ids);
+		const targets = tags
+			.filter((t) => wanted.has(t.id))
+			// グループが見つからない行は外部名が仮の表示なので写さない。
+			.filter((t) => externalNamePrefixByGroupId.has(t.collectionGroupId))
+			.map((t) => ({ dataType: t.dataType, externalName: externalNameForTag(t) }));
+		return opcUaNodeIdLines(opcUaNamespaceUri, targets);
+	}
+
+	async function copyOpcUaNodeIds(ids: number[]): Promise<void> {
+		const lines = opcUaNodeIdsFor(ids);
+		if (lines.length === 0) return;
+		try {
+			await navigator.clipboard.writeText(lines.join('\n'));
+			toastStore.push('success', `NodeId をコピーしました（${lines.length} 件）`);
+		} catch {
+			toastStore.push('error', 'コピーに失敗しました。');
+		}
 	}
 
 	function closeWatchRowMenu(): void {
@@ -8485,7 +8522,21 @@
 						? `見張りに足す（${watchRowMenu.ids.length} 件）`
 						: '見張りに足す',
 				onSelect: () => addWatchTags(watchRowMenu?.ids ?? [])
-			}
+			},
+			...(opcUaNamespaceUri === null
+				? []
+				: [
+						{
+							id: 'opcua-nodeid-copy',
+							label: 'OPC UA の NodeId をコピー',
+							disabled: opcUaNodeIdsFor(watchRowMenu.ids).length === 0,
+							title:
+								opcUaNodeIdsFor(watchRowMenu.ids).length === 0
+									? 'OPC UA に出るタグがありません（string 型のタグは出ません）'
+									: undefined,
+							onSelect: () => void copyOpcUaNodeIds(watchRowMenu?.ids ?? [])
+						}
+					])
 		]}
 		onClose={closeWatchRowMenu}
 	/>
