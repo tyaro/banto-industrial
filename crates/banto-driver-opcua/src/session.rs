@@ -30,7 +30,9 @@
 //!
 //! | Component result | Driver API |
 //! | --- | --- |
-//! | `Ok`, node Good / Uncertain | `Ok(())` |
+//! | `Ok`, node Good (including Good_Clamped and other Good sub-codes) | `Ok(())` |
+//! | `Ok`, node `Good_CompletesAsynchronously` (0x002E0000, sub-code compared, info bits ignored) | `ItemError::Indeterminate` (accepted, not confirmed applied) |
+//! | `Ok`, node Uncertain | `ItemError::Indeterminate` (reflection not confirmed) |
 //! | `Ok`, node Bad (`BadNotWritable`, `BadTypeMismatch`, `BadNodeIdUnknown`, ...) | `ItemError::Device { code }` |
 //! | `Err`: `Completed(status)` (a chunk answered before the failure) | as the `Ok` rows |
 //! | `Err`: `Rejected(status)` (the server refused the whole request before processing it) | `ItemError::Device { code }` |
@@ -45,6 +47,10 @@
 //! returned per node rather than lost in one batch-wide error. "Maybe
 //! written" is its own reason (`Indeterminate`), never a success and never
 //! resent automatically; `NotSent` and `Rejected` are certain "not written".
+//! Likewise a reply that says the server accepted the write without
+//! confirming it reached the target (`Good_CompletesAsynchronously`,
+//! OPC UA Part 4 section 5.11.4, or any Uncertain) is `Indeterminate` with
+//! the status code in the reason, not a plain success.
 //! The component's `Err` always means the request or the connection failed,
 //! so the session refuses further calls and the broker reconnects (the
 //! `Err` is `Timeout` when a chunk timed out, else the failure's class,
@@ -265,6 +271,28 @@ fn per_node(outcomes: &[WriteOutcome], sent: usize) -> Vec<Result<(), ItemError>
         .collect()
 }
 
+/// `Good_CompletesAsynchronously` (0x002E0000): the server accepted the write
+/// but has not confirmed it reached the target (Part 4 section 5.11.4).
+/// Compared on the upper 16 bits (sub-code); the low info bits are ignored.
+const GOOD_COMPLETES_ASYNCHRONOUSLY: u32 = 0x002E_0000;
+
+/// A Good / Uncertain write status that does not confirm the write was
+/// applied, as an `Indeterminate` reason; `None` when it is a plain success.
+fn unconfirmed(status: banto_opcua_core::StatusCode) -> Option<ItemError> {
+    if status.is_good() && status.code() & 0xFFFF_0000 == GOOD_COMPLETES_ASYNCHRONOUSLY {
+        Some(ItemError::Indeterminate(format!(
+            "サーバーは受け付けましたが、書き込み先への反映を確かめていません（Good_CompletesAsynchronously 0x{GOOD_COMPLETES_ASYNCHRONOUSLY:08X}）"
+        )))
+    } else if status.is_uncertain() {
+        Some(ItemError::Indeterminate(format!(
+            "書き込みの結果が不確かです（{status}、0x{:08X}）",
+            status.code()
+        )))
+    } else {
+        None
+    }
+}
+
 /// One node's outcome as the item's result (the module doc's table).
 fn item_result(outcome: WriteOutcome) -> Result<(), ItemError> {
     match outcome {
@@ -277,6 +305,11 @@ fn item_result(outcome: WriteOutcome) -> Result<(), ItemError> {
                 }
                 other => other,
             })
+        }
+        WriteOutcome::Completed(status) | WriteOutcome::Rejected(status)
+            if unconfirmed(status).is_some() =>
+        {
+            Err(unconfirmed(status).expect("checked by the guard"))
         }
         WriteOutcome::Rejected(status) => Err(ItemError::Device(DeviceError::new(
             status.code(),
@@ -350,10 +383,28 @@ mod tests {
             item_result(WriteOutcome::Completed(StatusCode::GOOD)),
             Ok(())
         );
-        assert_eq!(
-            item_result(WriteOutcome::Completed(StatusCode::from_code(0x4090_0000))),
-            Ok(())
-        );
+        // Good with other sub-codes / info bits is still a success.
+        for code in [0x0000_0000, 0x0000_0400, 0x0030_0000, 0x0030_0400] {
+            assert_eq!(
+                item_result(WriteOutcome::Completed(StatusCode::from_code(code))),
+                Ok(()),
+                "{code:#010x}"
+            );
+        }
+        // Accepted but not confirmed applied, or Uncertain: Indeterminate.
+        for code in [0x002E_0000, 0x002E_0400, 0x4090_0000, 0x4000_0000] {
+            assert!(
+                matches!(
+                    item_result(WriteOutcome::Completed(StatusCode::from_code(code))),
+                    Err(ItemError::Indeterminate(_))
+                ),
+                "{code:#010x}"
+            );
+        }
+        assert!(matches!(
+            item_result(WriteOutcome::Completed(StatusCode::from_code(0x002E_0400))),
+            Err(ItemError::Indeterminate(m)) if m.contains("Good_CompletesAsynchronously 0x002E0000")
+        ));
         assert_eq!(
             item_result(WriteOutcome::Completed(StatusCode::BAD_NOT_WRITABLE)),
             Err(ItemError::Device(DeviceError::new(
@@ -415,6 +466,19 @@ mod tests {
         let got = per_node(&outcomes[..1], 2);
         assert_eq!(got[0], Ok(()));
         assert!(matches!(got[1], Err(ItemError::Indeterminate(_))));
+    }
+
+    #[test]
+    fn a_split_write_keeps_async_unknown_and_not_sent_apart() {
+        let outcomes = [
+            WriteOutcome::Completed(StatusCode::from_code(0x002E_0000)),
+            WriteOutcome::Unknown(StatusCode::BAD_CONNECTION_CLOSED),
+            WriteOutcome::NotSent,
+        ];
+        let got = per_node(&outcomes, 3);
+        assert!(matches!(&got[0], Err(ItemError::Indeterminate(m)) if m.contains("0x002E0000")));
+        assert!(matches!(got[1], Err(ItemError::Indeterminate(_))));
+        assert!(matches!(got[2], Err(ItemError::Rejected(_))));
     }
 
     fn spec(data_type: banto_driver_api::DataType) -> TagSpec {
