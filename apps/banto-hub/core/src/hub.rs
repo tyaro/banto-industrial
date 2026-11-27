@@ -561,6 +561,22 @@ pub struct TagEntry {
     /// 持つ（`push` の値は実機でもシミュレーションでもない）。
     #[serde(skip)]
     pub push: bool,
+    /// タグの説明（`tags.comment`）。**wire には出さない**。OPC UA の Description 属性に
+    /// 写すためだけに持つ（#1324 段 2、banto-opcua ADR-0008）。
+    #[serde(skip)]
+    pub comment: String,
+    /// **収集が実際に掛ける**リニアスケーリング（PLC の接続の PLC タグだけ。push・hub の
+    /// 接続とサーバー側のタグには掛からないので `None`）。**wire には出さない**。OPC UA の
+    /// EURange を決めるためだけに持つ（#1324 段 2、banto-opcua ADR-0008）。
+    #[serde(skip)]
+    pub scaling: Option<banto_tags::Scaling>,
+    /// 値が**機器の生の整数・浮動小数そのもの**と保証できるか（PLC の接続の PLC タグで、
+    /// スケーリングなし）。**wire には出さない**。OPC UA に元の型（Int16 など）で出して
+    /// よいのはこのタグだけ（banto-opcua ADR-0007、#1324 段 2）。push・hub の接続、計算・
+    /// 内部のタグは工学値・式の結果・利用者の書いた値で、小数や型の範囲外もありうる。
+    /// 元の型は丸めない（`MappedValue::from_number`）ので、合わない値は Bad になる。
+    #[serde(skip)]
+    pub raw_device_value: bool,
 }
 
 /// Immutable snapshot of the external-name catalog, rebuilt from scratch on
@@ -729,6 +745,19 @@ fn catalog_entries(snapshot: &RegistrySnapshot) -> Vec<TagEntry> {
         let Some(conn) = conn_by_id.get(&group.plc_connection_id) else {
             continue;
         };
+        // 収集がスケーリングを掛ける・値が機器の生の値になるのは、PLC の接続（ブローカー
+        // 管理のドライバ）の PLC タグだけ。push・hub は送り手が工学値を送り、virtual・
+        // postgres は式・SQL の結果（`banto_collect::config` の `ResolvedConnection::Plc`）。
+        // シミュレーションの接続も値層の `SimDevice` がワードを返すので整数は整数のまま
+        // （`banto_plc::ramp`）で、実機と同じ扱い。
+        let on_plc_connection = tag.tag_kind == banto_tags::PLC_TAG_KIND
+            && ![
+                banto_tags::PUSH_PROTOCOL,
+                banto_tags::HUB_PROTOCOL,
+                banto_tags::VIRTUAL_PROTOCOL,
+                banto_tags::POSTGRES_PROTOCOL,
+            ]
+            .contains(&conn.protocol.as_str());
         entries.push(TagEntry {
             external_name: external_name(&conn.name, &group.name, &tag.name),
             tag_key: tag_key(tag.id),
@@ -748,6 +777,9 @@ fn catalog_entries(snapshot: &RegistrySnapshot) -> Vec<TagEntry> {
             retain: tag.retain,
             simulation: conn.simulation,
             push: conn.protocol == banto_tags::PUSH_PROTOCOL,
+            comment: tag.comment.clone(),
+            scaling: on_plc_connection.then(|| tag.scaling()).flatten(),
+            raw_device_value: on_plc_connection && tag.scaling().is_none(),
         });
     }
 

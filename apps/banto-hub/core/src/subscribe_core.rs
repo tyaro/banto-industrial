@@ -383,6 +383,9 @@ mod unverified_tests {
             retain: false,
             simulation: false,
             push: false,
+            comment: String::new(),
+            scaling: None,
+            raw_device_value: false,
         }
     }
 
@@ -502,6 +505,9 @@ mod id_pattern_tests {
             retain: false,
             simulation: false,
             push: false,
+            comment: String::new(),
+            scaling: None,
+            raw_device_value: false,
         }
     }
 
