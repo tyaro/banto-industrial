@@ -265,7 +265,7 @@ fn per_node(outcomes: &[WriteOutcome], sent: usize) -> Vec<Result<(), ItemError>
         .map(|k| match outcomes.get(k) {
             Some(outcome) => item_result(*outcome),
             None => Err(ItemError::Indeterminate(
-                "Write の結果が要求より少なく返りました".into(),
+                "送りましたが、この項目の結果が応答に含まれていませんでした".into(),
             )),
         })
         .collect()
@@ -285,7 +285,7 @@ fn unconfirmed(status: banto_opcua_core::StatusCode) -> Option<ItemError> {
         )))
     } else if status.is_uncertain() {
         Some(ItemError::Indeterminate(format!(
-            "書き込みの結果が不確かです（{status}、0x{:08X}）",
+            "サーバーの応答は不確かで、反映を確かめていません（{status}、0x{:08X}）",
             status.code()
         )))
     } else {
@@ -320,12 +320,12 @@ fn item_result(outcome: WriteOutcome) -> Result<(), ItemError> {
             "接続が切れたので送っていません（書かれていません）".into(),
         )),
         WriteOutcome::Unknown(status) => Err(ItemError::Indeterminate(format!(
-            "送りましたが結果を受け取れませんでした（{status}）。書かれたかもしれません"
+            "送りましたが応答を受け取れませんでした（{status}）"
         ))),
         // `#[non_exhaustive]`: an outcome added later is not known to be
         // unwritten, so it is neither a success nor "not written".
         _ => Err(ItemError::Indeterminate(format!(
-            "Write の結末が分かりません: {outcome:?}"
+            "送りましたが結果が分かりません（{outcome:?}）"
         ))),
     }
 }
@@ -401,6 +401,17 @@ mod tests {
                 "{code:#010x}"
             );
         }
+        // The final display: an accepted reply never reads as "no reply".
+        let accepted = item_result(WriteOutcome::Completed(StatusCode::from_code(0x002E_0000)))
+            .unwrap_err()
+            .to_string();
+        let lost = item_result(WriteOutcome::Unknown(StatusCode::BAD_CONNECTION_CLOSED))
+            .unwrap_err()
+            .to_string();
+        assert!(accepted.contains("受け付けました"), "{accepted}");
+        assert!(!accepted.contains("応答がありません"), "{accepted}");
+        assert!(lost.contains("応答を受け取れませんでした"), "{lost}");
+        assert!(!lost.contains("応答がありません"), "{lost}");
         assert!(matches!(
             item_result(WriteOutcome::Completed(StatusCode::from_code(0x002E_0400))),
             Err(ItemError::Indeterminate(m)) if m.contains("Good_CompletesAsynchronously 0x002E0000")

@@ -48,12 +48,17 @@ pub enum ItemError {
     /// (a read-modify-write check read). The device may have applied it;
     /// read back before writing again. Still non-fatal.
     VerificationFailed(String),
-    /// The write was sent and its result never came back (the connection
-    /// broke or the request timed out while it was in flight, e.g. one
-    /// chunk of a write split over several requests). The device may or may
-    /// not have applied it. Never treat it as a success, and never resend it
-    /// automatically: read back first (#678). The session that returns it
-    /// also fails its next call, so the host reconnects.
+    /// The write may or may not have reached the target. Never treat it as
+    /// a success, and never resend it automatically: read back first, then
+    /// decide (#678). Two cases, told apart by the reason text:
+    ///
+    /// - (a) it was sent but its result never came back (the connection
+    ///   broke or the request timed out, e.g. one chunk of a write split over
+    ///   several requests). Only here does the session that returns it fail
+    ///   its next call, so the host reconnects.
+    /// - (b) a reply came, but it does not confirm the target applied the
+    ///   write (OPC UA `Good_CompletesAsynchronously` or an Uncertain
+    ///   status). The connection stays as it is.
     Indeterminate(String),
 }
 
@@ -67,7 +72,7 @@ impl fmt::Display for ItemError {
                 write!(f, "書込み後の確認読みが合いません: {m}")
             }
             ItemError::Indeterminate(m) => {
-                write!(f, "書けたか分かりません（送ったが応答がありません）: {m}")
+                write!(f, "書き込み先への反映を確かめられません: {m}")
             }
         }
     }
@@ -206,7 +211,7 @@ mod tests {
         );
         assert_eq!(
             ItemError::Indeterminate("ns=2;s=Level".into()).to_string(),
-            "書けたか分かりません（送ったが応答がありません）: ns=2;s=Level"
+            "書き込み先への反映を確かめられません: ns=2;s=Level"
         );
     }
 
