@@ -1,7 +1,7 @@
 # ChronoGazer の OPC UA のクライアント（共有のドライバ）の設計
 
 作成日: 2026-11-24
-状態: **設計確定（2026-11-24 のオーナー決定を記録。§7 の 11 項目も同日に決めた。2026-11-26: §6 の段 1 の banto-opcua 側は v0.3.3 で済み、Hub の固定も v0.3.3 に上げた（#1332。None・Anonymous の公開は `with_none_endpoint(true)` で保つ）。段 2 のうち Hub のサーバーの側（型・説明・単位・レンジ）は 2026-11-27 に済んだ。残りは管理画面の LAN の表示と NodeId を写す口）**
+状態: **設計確定（2026-11-24 のオーナー決定を記録。§7 の 11 項目も同日に決めた。2026-11-26: §6 の段 1 の banto-opcua 側は v0.3.3 で済み、Hub の固定も v0.3.3 に上げた（#1332。None・Anonymous の公開は `with_none_endpoint(true)` で保つ）。段 2 のうち Hub のサーバーの側（型・説明・単位・レンジ）は 2026-11-27 に済んだ。管理画面の LAN への公開の注意は設定画面（ConnectivitySection.svelte「LAN への公開に注意」）に既にある。NodeId を写す口は `/tags` の行のメニュー「OPC UA の NodeId をコピー」で済んだ（admin のみ。Namespace URI が admin 限定の設定 API にあるため）。段 2 は完了）**
 関連: [#1324](https://github.com/tyaro/banto-industrial/issues/1324)（Hub 経由の専用のつなぎをやめ、OPC UA でつなぐ）、[#678](https://github.com/tyaro/banto-industrial/issues/678)（OPC UA のクライアントのドライバ）、[#383](https://github.com/tyaro/banto-industrial/issues/383)（3 ドライバの決定。この設計で改める）、[#700](https://github.com/tyaro/banto-industrial/pull/700)（OPC UA のクライアントは WASM の対象外）、[#1306](https://github.com/tyaro/banto-industrial/issues/1306)（記録の持ち主は ChronoGazer）、tyaro/banto-opcua の [ADR-0005](https://github.com/tyaro/banto-opcua/blob/v0.2.0/docs/adr/0005-client-as-hub-driver.md)・[ADR-0006](https://github.com/tyaro/banto-opcua/blob/v0.2.0/docs/adr/0006-client-subscription-latest-values.md)、提案 [banto-opcua#54](https://github.com/tyaro/banto-opcua/issues/54)（セキュリティ）・[#55](https://github.com/tyaro/banto-opcua/issues/55)（属性）・[#56](https://github.com/tyaro/banto-opcua/issues/56)（型）、[記録計要件](recorder-requirements.md) §7、[画面改善案](chronogazer-ui-improvement-proposal.md) §5、[タグサーバーの設計](../hub/tag-server-design.md) §3.4.1・§5.5、[Driver API の設計](../hub/driver/banto-driver-api-design.md)
 
 ## 1. 目的と範囲・決まったこと
@@ -218,7 +218,7 @@ Uncertain（Stale）と SourceTimestamp をドライバから渡すために、`
 ### 4.2 記録項目の登録
 
 - **段 4（最初の版）**: NodeId を手で入れる（#678）。今の「記録」ページの右ペイン・CSV の取り込み・MCP の `create_tag` がそのまま使える（アドレスの欄に NodeId）。型は数値と bit だけを選べる（§3.4）。単位・小数桁は利用者が入れる。
-- **Hub から集める人の手間**: Hub の外部名を写して `nsu=urn:banto:opcua:tags;s=` を前に付ける。Hub の管理画面（`/tags`）から NodeId を写しやすくする（例: 行のメニューに「OPC UA の NodeId をコピー」）のは、Hub の側の小さな作業として段 2 に入れてよい（§7 の 10）。
+- **Hub から集める人の手間**: Hub の外部名を写して `nsu=urn:banto:opcua:tags;s=` を前に付ける。Hub の管理画面（`/tags`）から NodeId を写しやすくする（例: 行のメニューに「OPC UA の NodeId をコピー」）のは、Hub の側の小さな作業として段 2 に入れてよい（§7 の 10）。（実装済み: 行のメニュー「OPC UA の NodeId をコピー」。複数行は 1 行 1 件、string 型は除く。Namespace URI は admin 限定の設定 API にあるので admin のときだけ出る）
 - **後の段（Browse）**: 相手のサーバーをブラウズして選ぶ。単位・説明（banto-opcua#55 の後）・型を写して登録する。今の「Hub から追加」（`HubImportDialog.svelte`）の置き換えになる。Driver API に Browse の口が無いので、足し方（ドライバの任意のメソッドにするか、`opcua` だけの口にするか）はその段で決める。画面は画面改善の段階 1（左ツリー＝接続先の 3 ペイン）に合わせる（#678 の 2026-11-17 のコメント）。
 
 ### 4.3 表示グループのタグの選択

@@ -4,6 +4,7 @@ banto-industrial のリリースノート。日付は JST。バージョンは [
 
 ## 未リリース
 
+- Hub の `/tags` の行のメニューに「OPC UA の NodeId をコピー」を足しました（admin のみ、#1324 段 2）。`nsu=<Namespace URI>;s=<接続.グループ.タグ>` を 1 行 1 件でコピーし、ChronoGazer の記録項目のアドレスに貼れます。string 型のタグは OPC UA に出ないので除きます。
 - **【互換を壊す変更】Hub の OPC UA で、数値のタグを元の型のまま公開するようにしました（#1324 段 2、banto-opcua ADR-0007・ADR-0008）。** PLC の接続の PLC タグでスケーリングを掛けないものだけ、元の型（i16 なら Int16、f32 なら Float など）で出します。スケーリング付き・計算・内部・push・hub のタグの数値は今までどおり Double（小数や型の範囲外の値が Bad にならないように）、bit は Boolean です。i64・u64 も Double のままです（現在値の経路が f64 なので、2^53 を超える整数は精度が落ちるため）。クライアントから見た DataType が変わります（今までは数値が全部 Double）。タグのコメント・単位・スケーリングの工学値の範囲を Description・EngineeringUnits・EURange に出します。string は今までどおり出しません。
 - banto-opcua を v0.3.4 に上げました（#1332）。Hub の OPC UA は今までどおり SecurityPolicy None / Anonymous のエンドポイントだけを開きます（v0.3 の既定の署名・暗号化のエンドポイントは開かず、Phase 3 で扱います）。値の型（bit は Boolean、数値は Double、string は公開しない）は変わりません。RSA の依存が 0.10 に上がり、`deny.toml` の RUSTSEC-2023-0071 の除外を外しました。v0.3.3 は信頼の一覧の移行（`TrustList::migrate`）が `pki/trusted/`・`pki/rejected/` の利用者に読めない印を開いて `PermissionDenied` で起動に失敗した（tyaro/banto-opcua#64）ので、直った v0.3.4 にしました。
 - **Hub の `GET /api/v1/status` に、設置ごとに変わらない Hub の id `hub_id` を足しました（#1295）。** 設定 DB（`settings` の `hub.id`）に UUID v4 を最初の起動で 1 度だけ作ります。DB を作り直すと変わり、`hub.id` の入ったバックアップから戻すとその DB の id に戻ります（この版より前のバックアップや、設定パッケージから作り直した DB は新しい id になります。同じバックアップを別の機械に戻すと同じ id の Hub が 2 台できます）。id は設定 DB の系譜の印で、設定の時点は表しません。`revision`・`run_id` も再起動で数え直すので時点の代わりにならず、消費側は再接続のたびに今のカタログでタグの割り付けを照合してください。壊れた値があると起動を止めます。MCP の `get_server_status` にも載ります。
