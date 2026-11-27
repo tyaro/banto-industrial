@@ -136,5 +136,6 @@ pub use schema::{
 pub use session::{BoxFuture, ConnectContext, Session, SessionDriver};
 pub use settings::{keys, DuplicateKey, FieldError, Setting, Settings};
 pub use types::{
-    DataType, RawValue, StringEncoding, TagKind, TagSpec, TagValue, Value, WordOrder, WriteItem,
+    DataType, RawValue, ReadQuality, Reading, StringEncoding, TagKind, TagSpec, TagValue, Value,
+    WordOrder, WriteItem,
 };

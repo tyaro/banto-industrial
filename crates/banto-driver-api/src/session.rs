@@ -21,7 +21,7 @@ use std::time::Duration;
 use crate::driver::DriverBase;
 use crate::error::{FatalError, ItemError};
 use crate::settings::Settings;
-use crate::types::{TagSpec, Value, WriteItem};
+use crate::types::{Reading, TagSpec, Value, WriteItem};
 
 /// A boxed, `Send` future - what keeps [`SessionDriver`] and [`Session`]
 /// object-safe. The same definition as `banto_plc::BoxFuture`.
@@ -125,6 +125,30 @@ pub trait Session: Send + 'static {
         specs: &'a [TagSpec],
     ) -> BoxFuture<'a, Result<Vec<Result<Value, ItemError>>, FatalError>>;
 
+    /// Read `specs` with a quality and a source time per value (design
+    /// `docs/chronogazer/opcua-client-design.md` §3.6).
+    ///
+    /// Same contract as [`read_batch`](Self::read_batch): `Ok` has
+    /// `specs.len()` results in `specs` order, and `Err` is a per-connection
+    /// failure. An item that has no value (a Bad status) is an `Err`
+    /// [`ItemError`]; an item with a usable but doubtful value is an `Ok`
+    /// [`Reading`] with [`ReadQuality::Uncertain`](crate::ReadQuality).
+    ///
+    /// The default calls [`read_batch`](Self::read_batch) and wraps each
+    /// `Ok(value)` as a Good reading with no source time (`Err` passes
+    /// through). A driver that overrides this must return the same values as
+    /// `read_batch`; the two must never disagree. Callers are expected to
+    /// call this method rather than `read_batch`.
+    fn read_batch_detailed<'a>(
+        &'a mut self,
+        specs: &'a [TagSpec],
+    ) -> BoxFuture<'a, Result<Vec<Result<Reading, ItemError>>, FatalError>> {
+        Box::pin(async move {
+            let items = self.read_batch(specs).await?;
+            Ok(items.into_iter().map(|r| r.map(Reading::good)).collect())
+        })
+    }
+
     /// Write `items`, with the same contract as
     /// [`read_batch`](Self::read_batch). The default refuses with
     /// [`FatalError::Protocol`] (a read-only driver).
@@ -203,5 +227,63 @@ mod tests {
     fn default_read_clock_has_no_contract() {
         let mut s: Box<dyn Session> = Box::new(ReadOnly);
         assert_eq!(block_on_ready(s.read_clock()), Ok(None));
+    }
+
+    #[test]
+    fn default_read_batch_detailed_wraps_good_without_time_and_passes_errors() {
+        struct Mixed(bool);
+        impl Session for Mixed {
+            fn read_batch<'a>(
+                &'a mut self,
+                specs: &'a [TagSpec],
+            ) -> BoxFuture<'a, Result<Vec<Result<Value, ItemError>>, FatalError>> {
+                let fail = self.0;
+                Box::pin(async move {
+                    if fail {
+                        return Err(FatalError::Protocol("down".into()));
+                    }
+                    Ok(specs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| {
+                            if i == 1 {
+                                Err(ItemError::Rejected("bad".into()))
+                            } else {
+                                Ok(Value::F64(i as f64))
+                            }
+                        })
+                        .collect())
+                })
+            }
+            fn disconnect(&mut self) -> BoxFuture<'_, ()> {
+                Box::pin(async {})
+            }
+        }
+        let spec = |n: u16| {
+            TagSpec::new(
+                crate::DriverAddress::new(
+                    crate::DriverId::new("t").unwrap(),
+                    format!("D{n}"),
+                    "D",
+                    true,
+                    1,
+                ),
+                crate::TagKind::numeric(crate::DataType::U16),
+            )
+        };
+        let specs = [spec(0), spec(1), spec(2)];
+        let mut s: Box<dyn Session> = Box::new(Mixed(false));
+        let got = block_on_ready(s.read_batch_detailed(&specs)).unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], Ok(Reading::good(Value::F64(0.0))));
+        assert_eq!(got[0].as_ref().unwrap().quality, crate::ReadQuality::Good);
+        assert_eq!(got[0].as_ref().unwrap().source_time_ms, None);
+        assert_eq!(got[1], Err(ItemError::Rejected("bad".into())));
+        assert_eq!(got[2], Ok(Reading::good(Value::F64(2.0))));
+        let mut s: Box<dyn Session> = Box::new(Mixed(true));
+        assert!(matches!(
+            block_on_ready(s.read_batch_detailed(&specs)),
+            Err(FatalError::Protocol(_))
+        ));
     }
 }

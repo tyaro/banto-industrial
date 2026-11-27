@@ -478,3 +478,61 @@ mod tests {
         assert_eq!(item.value, Value::F64(1.25));
     }
 }
+
+/// Quality of a successfully read value ([`Reading::quality`]).
+///
+/// A Bad status has no usable value, so it is not here: a driver returns it
+/// as an [`ItemError`](crate::ItemError), as `read_batch` always has.
+/// `Uncertain` is "there is a value but it is not certain" (an OPC UA
+/// Uncertain status); the consumer treats it as Stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "snake_case")
+)]
+#[non_exhaustive]
+pub enum ReadQuality {
+    /// The value is good.
+    Good,
+    /// The value is present but not certain.
+    Uncertain,
+}
+
+/// One value read by [`Session::read_batch_detailed`](crate::Session::read_batch_detailed):
+/// the value with its quality and the device's source time.
+///
+/// `#[non_exhaustive]`: build it with [`Reading::good`] / [`Reading::new`].
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "snake_case")
+)]
+#[non_exhaustive]
+pub struct Reading {
+    /// The value read.
+    pub value: Value,
+    /// Its quality.
+    pub quality: ReadQuality,
+    /// The device's source timestamp, in milliseconds since the UNIX epoch
+    /// (UTC), when the device supplies one.
+    pub source_time_ms: Option<i64>,
+}
+
+impl Reading {
+    /// A Good reading with no source time (what the default
+    /// `read_batch_detailed` produces).
+    pub fn good(value: Value) -> Self {
+        Self::new(value, ReadQuality::Good, None)
+    }
+
+    /// A reading with an explicit quality and source time.
+    pub fn new(value: Value, quality: ReadQuality, source_time_ms: Option<i64>) -> Self {
+        Self {
+            value,
+            quality,
+            source_time_ms,
+        }
+    }
+}
