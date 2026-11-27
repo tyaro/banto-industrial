@@ -65,6 +65,9 @@
 # #1335 PR2: crates/banto-plc-sim (筋書きで動く模擬 PLC の実行ファイル banto-plc-sim。
 # banto-plc のシミュレータを設定ファイル（割付と筋書き）だけで立てる.
 # docs/crates/banto-plc-sim-design.md).
+# #1324 段 3: crates/banto-driver-opcua (OPC UA のクライアントのセッション型の共有ドライバ。
+# 部品は banto-opcua の banto-opcua-client（git の tag 固定）。内部 crate.
+# docs/chronogazer/opcua-client-design.md §3).
 [workspace]
 resolver = "2"
 members = [
@@ -80,6 +83,7 @@ members = [
     "crates/banto-drivers",
     "crates/banto-driver-slmp",
     "crates/banto-driver-modbus",
+    "crates/banto-driver-opcua",
     "crates/banto-driver-wasm",
     "crates/banto-plc",
     "crates/banto-plc-write",
@@ -125,6 +129,10 @@ publish = false
 # crates/banto-tags/Cargo.toml for the feature set actually used.
 [workspace.dependencies]
 banto-opcua-server = { git = "https://github.com/tyaro/banto-opcua", tag = "v0.3.4" }
+# #1324 段 3: OPC UA のクライアントのドライバ（crates/banto-driver-opcua）の部品。サーバーと
+# 同じ tag に固定する（async-opcua の rev も banto-opcua の固定に従ってそろう）。
+banto-opcua-client = { git = "https://github.com/tyaro/banto-opcua", tag = "v0.3.4" }
+banto-opcua-core = { git = "https://github.com/tyaro/banto-opcua", tag = "v0.3.4" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
