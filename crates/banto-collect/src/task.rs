@@ -134,14 +134,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use banto_driver_api::{FatalError, ItemError, Value};
+use banto_driver_api::{FatalError, ItemError, ReadQuality, Reading, Value};
 use banto_tags::scale_raw;
 use banto_tstore::{Clock, TsWriter};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::client::{ClientFactory, CollectClient, ReadBatch};
+use crate::client::{ClientFactory, CollectClient, ReadBatchDetailed};
 use crate::config::{ConnectionPlan, GroupPlan};
 use crate::current::{CurrentValuesHandle, Quality};
 use crate::event::{CollectEvent, EventKind, EventSink, ThresholdLevel};
@@ -562,10 +562,10 @@ pub(crate) async fn run_connection(
                     // Read this group iff currently connected. The match's
                     // borrow of `state` is released at the end of the
                     // statement, before we may reassign `state` below.
-                    let read_outcome: Option<ReadBatch> =
+                    let read_outcome: Option<ReadBatchDetailed> =
                         match &mut state {
                             ConnState::Connected(client) => {
-                                Some(client.read_batch(&plan.groups[i].requests).await)
+                                Some(client.read_batch_detailed(&plan.groups[i].requests).await)
                             }
                             _ => None,
                         };
@@ -675,6 +675,56 @@ struct TagTick {
     recorded: Option<f64>,
 }
 
+/// The PLC mapping table as one pure function (mirrors `classify_external`):
+///
+/// - Good Bit/F64 -> shown and recorded, Good;
+/// - **Uncertain** Bit/F64 (OPC UA) -> a stored Stale: shown with its value,
+///   recorded as no value, so it never becomes Good, is not judged against
+///   thresholds and does not move `last_good_ms` (2026-11 オーナー決定);
+///   a non-finite Uncertain value is Bad;
+/// - a string, a per-item error, no reading at all, or a quality this crate
+///   does not know (the enum is `#[non_exhaustive]`) -> Bad.
+fn classify_plc(
+    reading: Option<&Result<Reading, ItemError>>,
+    scaling: Option<&banto_tags::Scaling>,
+) -> TagTick {
+    const BAD: TagTick = TagTick {
+        shown: None,
+        quality: Quality::Bad,
+        recorded: None,
+    };
+    let Some(Ok(reading)) = reading else {
+        return BAD;
+    };
+    let number = match &reading.value {
+        Value::Bit(b) => {
+            if *b {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        Value::F64(raw) => match scaling {
+            Some(s) => scale_raw(*raw, s),
+            None => *raw,
+        },
+        Value::Str(_) => return BAD,
+    };
+    match reading.quality {
+        ReadQuality::Good => TagTick {
+            shown: Some(number),
+            quality: Quality::Good,
+            recorded: Some(number),
+        },
+        ReadQuality::Uncertain if number.is_finite() => TagTick {
+            shown: Some(number),
+            quality: Quality::Stale,
+            recorded: None,
+        },
+        _ => BAD,
+    }
+}
+
 /// Turn one group's read outcome into a stored row, cache updates, and
 /// threshold edge events. `results = None` means "no reading this tick"
 /// (disconnected or fatal): every tag becomes `None`/Bad. Threshold state is
@@ -682,7 +732,7 @@ struct TagTick {
 /// active level untouched (a comms loss must not spuriously "clear" an alarm).
 async fn record_group(
     group: &GroupPlan,
-    results: Option<&[Result<Value, ItemError>]>,
+    results: Option<&[Result<Reading, ItemError>]>,
     ptime_ms: i64,
     ctx: &TaskContext,
     conn_key: &str,
@@ -693,27 +743,7 @@ async fn record_group(
         .tags
         .iter()
         .enumerate()
-        .map(|(idx, tag)| {
-            let (value, quality) = match results.map(|r| &r[idx]) {
-                Some(Ok(Value::Bit(b))) => (Some(if *b { 1.0 } else { 0.0 }), Quality::Good),
-                Some(Ok(Value::F64(raw))) => {
-                    let scaled = match &tag.scaling {
-                        Some(s) => scale_raw(*raw, s),
-                        None => *raw,
-                    };
-                    (Some(scaled), Quality::Good)
-                }
-                // Per-tag Bad within an otherwise-good batch (an item error,
-                // or a string where the plan never asks for one - the build
-                // skips string tags), or the whole tick absent (None).
-                Some(Ok(Value::Str(_))) | Some(Err(_)) | None => (None, Quality::Bad),
-            };
-            TagTick {
-                shown: value,
-                quality,
-                recorded: value,
-            }
-        })
+        .map(|(idx, tag)| classify_plc(results.map(|r| &r[idx]), tag.scaling.as_ref()))
         .collect();
     record_ticks(
         group,
@@ -1384,7 +1414,7 @@ mod tests {
         let mut append_health = AppendHealth::default();
 
         for (offset, value) in [(100, 50.0), (200, 85.0), (300, 105.0), (400, 50.0)] {
-            let reading = [Ok(Value::F64(value))];
+            let reading = [Ok(Reading::good(Value::F64(value)))];
             record_group(
                 &group,
                 Some(&reading),
@@ -1521,7 +1551,7 @@ mod tests {
         };
         let mut threshold_state = vec![None];
         let mut append_health = AppendHealth::default();
-        let good = [Ok(Value::F64(1.0))];
+        let good = [Ok(Reading::good(Value::F64(1.0)))];
 
         // A simulation tick updates the in-memory path above but must not call
         // append. The writer intentionally does not know target-group, so an
@@ -1709,7 +1739,7 @@ mod tests {
         };
         let mut threshold_state = vec![None];
         let mut append_health = AppendHealth::default();
-        let value = |v: f64| [Ok(Value::F64(v))];
+        let value = |v: f64| [Ok(Reading::good(Value::F64(v)))];
 
         // Tick 1: normal.
         record_group(
@@ -1807,6 +1837,199 @@ mod tests {
                 (T0_MS, Some(1.0)),
                 (fresh_ptime, Some(3.0)),
                 (fresh_ptime + 100, Some(4.0)),
+            ]
+        );
+    }
+
+    fn reading_of(value: Value, quality: ReadQuality) -> Result<Reading, ItemError> {
+        Ok(Reading::new(value, quality, None))
+    }
+
+    #[test]
+    fn classify_plc_maps_good_uncertain_and_the_rest() {
+        let scaling = banto_tags::Scaling {
+            raw_lo: 0.0,
+            raw_hi: 10.0,
+            eng_lo: 0.0,
+            eng_hi: 100.0,
+        };
+        let good = reading_of(Value::F64(5.0), ReadQuality::Good);
+        assert_eq!(
+            classify_plc(Some(&good), None),
+            TagTick {
+                shown: Some(5.0),
+                quality: Quality::Good,
+                recorded: Some(5.0)
+            }
+        );
+        let good_bit = reading_of(Value::Bit(true), ReadQuality::Good);
+        assert_eq!(classify_plc(Some(&good_bit), None).recorded, Some(1.0));
+
+        // Uncertain: shown (scaled), Stale, nothing recorded.
+        let unc = reading_of(Value::F64(5.0), ReadQuality::Uncertain);
+        assert_eq!(
+            classify_plc(Some(&unc), Some(&scaling)),
+            TagTick {
+                shown: Some(50.0),
+                quality: Quality::Stale,
+                recorded: None
+            }
+        );
+        let unc_bit = reading_of(Value::Bit(false), ReadQuality::Uncertain);
+        assert_eq!(
+            classify_plc(Some(&unc_bit), None),
+            TagTick {
+                shown: Some(0.0),
+                quality: Quality::Stale,
+                recorded: None
+            }
+        );
+        // A non-finite Uncertain value is Bad, never a shown Stale.
+        let nan = reading_of(Value::F64(f64::NAN), ReadQuality::Uncertain);
+        assert_eq!(classify_plc(Some(&nan), None).quality, Quality::Bad);
+
+        // Str / per-item error / no reading -> Bad.
+        let s = reading_of(Value::Str("x".into()), ReadQuality::Good);
+        assert_eq!(classify_plc(Some(&s), None).quality, Quality::Bad);
+        let err: Result<Reading, ItemError> = Err(ItemError::Device(
+            banto_driver_api::DeviceError::new(1, "boom"),
+        ));
+        let tick = classify_plc(Some(&err), None);
+        assert_eq!(
+            (tick.shown, tick.quality, tick.recorded),
+            (None, Quality::Bad, None)
+        );
+        assert_eq!(classify_plc(None, None).quality, Quality::Bad);
+    }
+
+    /// Uncertain is a stored Stale: shown with its value, recorded as no
+    /// value, no threshold judgement, `last_good_ms` kept; the next Good tick
+    /// is Good again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_uncertain_reading_is_a_stored_stale_not_judged_and_not_recorded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(T0_MS, 9 * 3_600_000));
+        let column = |key: &str| TagColumn {
+            key: key.to_string(),
+            name: key.to_string(),
+            data_type: "f32".to_string(),
+            unit: None,
+            decimals: 0,
+        };
+        let config = StoreConfig {
+            groups: vec![GroupConfig {
+                key: "g".to_string(),
+                name: "G".to_string(),
+                period_ms: 100,
+                tags: vec![column("u"), column("g")],
+            }],
+        };
+        let writer = Arc::new(
+            TsWriter::open(dir.path(), config, clock.clone())
+                .await
+                .expect("writer should open"),
+        );
+        let (writer_tx, writer_rx) = watch::channel(writer.clone());
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("sqlite memory pool");
+        crate::migrate(&pool).await.expect("collect_events");
+        let events = EventSink::new(pool);
+        let mut live = events.subscribe();
+        let ctx = TaskContext {
+            writer_rx,
+            clock: clock.clone(),
+            current: CurrentValuesHandle::new(clock.clone()),
+            events,
+            status: Arc::new(RwLock::new(HashMap::new())),
+            backoff: BackoffConfig::default(),
+            simulation: false,
+            factory: crate::client::broker_client_factory(Arc::new(HashMap::new())),
+        };
+        let plan = |key: &str| crate::config::TagPlan {
+            key: key.to_string(),
+            scaling: None,
+            thresholds: Thresholds {
+                hh: None,
+                h: Some(80.0),
+                l: None,
+                ll: None,
+            },
+        };
+        let group = GroupPlan {
+            key: "g".to_string(),
+            period: Duration::from_millis(100),
+            period_ms: 100,
+            requests: vec![],
+            external_names: vec![],
+            tags: vec![plan("u"), plan("g")],
+        };
+        let mut threshold_state = vec![None, None];
+        let mut append_health = AppendHealth::default();
+        let batch_of = |q: ReadQuality, v: f64| {
+            vec![
+                reading_of(Value::F64(v), q),
+                reading_of(Value::F64(1.0), ReadQuality::Good),
+            ]
+        };
+
+        // 100: Good below H. 200: Uncertain above H. 300: Good above H.
+        for (q, v, at) in [
+            (ReadQuality::Good, 50.0, 100),
+            (ReadQuality::Uncertain, 90.0, 200),
+        ] {
+            record_group(
+                &group,
+                Some(&batch_of(q, v)),
+                T0_MS + at,
+                &ctx,
+                "conn:1",
+                &mut threshold_state,
+                &mut append_health,
+            )
+            .await;
+        }
+        let r = ctx.current.snapshot_readings();
+        assert_eq!(r["u"].sample.quality, Quality::Stale);
+        assert_eq!(r["u"].sample.value, Some(90.0));
+        assert_eq!(r["u"].last_good_ms, Some(T0_MS + 100));
+        assert_eq!(r["g"].sample.quality, Quality::Good);
+        assert!(live.try_recv().is_err(), "Uncertain above H must not fire");
+
+        record_group(
+            &group,
+            Some(&batch_of(ReadQuality::Good, 90.0)),
+            T0_MS + 300,
+            &ctx,
+            "conn:1",
+            &mut threshold_state,
+            &mut append_health,
+        )
+        .await;
+        let r = ctx.current.snapshot_readings();
+        assert_eq!(r["u"].sample.quality, Quality::Good);
+        assert_eq!(r["u"].last_good_ms, Some(T0_MS + 300));
+        let evt = live.try_recv().expect("Good above H enters H");
+        assert_eq!(evt.kind, EventKind::ThresholdEntered);
+
+        drop(ctx);
+        drop(writer_tx);
+        let writer = Arc::try_unwrap(writer).unwrap_or_else(|_| panic!("sole owner"));
+        writer.close().await.unwrap();
+        let mut stored = Vec::new();
+        for file in banto_tstore::list_data_files(dir.path()).unwrap() {
+            let reader = banto_tstore::TsReader::open(&file.path).await.unwrap();
+            for sample in reader.read_range("g", i64::MIN, i64::MAX).await.unwrap() {
+                stored.push((sample.ptime_ms, sample.values.clone()));
+            }
+        }
+        stored.sort_by_key(|(p, _)| *p);
+        assert_eq!(
+            stored,
+            vec![
+                (T0_MS + 100, vec![Some(50.0), Some(1.0)]),
+                (T0_MS + 200, vec![None, Some(1.0)]),
+                (T0_MS + 300, vec![Some(90.0), Some(1.0)]),
             ]
         );
     }

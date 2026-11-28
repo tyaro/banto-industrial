@@ -3,7 +3,7 @@
 //! (recorder-requirements.md §3.2). One shared, cheaply-cloneable handle that
 //! the collection tasks write and the UI reads.
 //!
-//! ## Quality: Good/Bad stored, Stale derived
+//! ## Quality: Good/Bad stored, Stale derived (plus two stored Stale)
 //!
 //! Each write records [`Quality::Good`] (the last read of this tag
 //! succeeded) or [`Quality::Bad`] (it failed - a PLC exception, an
@@ -16,13 +16,19 @@
 //! "更新停止"); Stale only appears when updates genuinely stop arriving - e.g.
 //! a collection task that is no longer ticking at all.
 //!
-//! **The one stored Stale: an external source's own label** (#383 段階3 P3,
+//! **Stored Stale, case 1: an external source's own label** (#383 段階3 P3,
 //! 2026-10-10 オーナー決定 H4). A Hub-sourced tag whose value the Hub itself
 //! labels `stale` is written here as [`Quality::Stale`] (with the Hub's last
 //! value) on every tick - the Hub, not this cache, is the one that knows its
 //! value stopped updating. It reads back as Stale regardless of age (the
 //! time-based derivation above never turns it back into Good) and does not
 //! move `last_good_ms`. See `crate::external`.
+//!
+//! **Stored Stale, case 2: an OPC UA Uncertain reading** (a PLC tag whose
+//! driver read it with `ReadQuality::Uncertain`, 2026-11 オーナー決定). The
+//! value is shown, never becomes Good, is not judged against thresholds, is
+//! recorded as no value, and does not move `last_good_ms` - exactly the
+//! external case's handling (`task.rs::classify_plc`).
 //!
 //! ## Last successful receive time (`last_good_ms`)
 //!
@@ -129,8 +135,9 @@ pub struct CurrentReading {
 struct Entry {
     value: Option<f64>,
     ptime_ms: i64,
-    /// Good or Bad for a PLC tag (its Stale is a read-time derivation);
-    /// Stale only for an external-source tag the source labelled stale.
+    /// Good or Bad for a PLC tag (its Stale is a read-time derivation) except
+    /// an Uncertain reading; Stale for an external-source tag the source
+    /// labelled stale, or a PLC tag read as Uncertain (module doc).
     stored_quality: Quality,
     period_ms: u32,
     /// See [`CurrentReading::last_good_ms`].
@@ -233,10 +240,11 @@ impl CurrentValuesHandle {
     }
 
     /// Record a fresh sample for `tag_key`. Called once per tag per tick by
-    /// the collection tasks. A PLC task passes Good or Bad only (its Stale is
-    /// derived on read); an external-source task (`crate::external`) may
-    /// also pass [`Quality::Stale`] when the source itself labelled the value
-    /// stale (module doc, "The one stored Stale").
+    /// the collection tasks. A PLC task passes Good or Bad (its Stale is
+    /// derived on read), or [`Quality::Stale`] for an Uncertain reading; an
+    /// external-source task (`crate::external`) may also pass
+    /// [`Quality::Stale`] when the source itself labelled the value stale
+    /// (module doc, "Stored Stale").
     pub(crate) fn set(
         &self,
         tag_key: &str,

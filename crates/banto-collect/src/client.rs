@@ -47,11 +47,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use banto_broker::{BrokerConnectionStatus, ReadOnlyHandle};
-use banto_driver_api::{BoxFuture, FatalError, ItemError, TagSpec, Value};
+use banto_driver_api::{BoxFuture, FatalError, ItemError, Reading, TagSpec, Value};
 
 /// What one [`CollectClient::read_batch`] answers: one result per spec, in
 /// order, or a connection-fatal error for the whole call.
 pub type ReadBatch = Result<Vec<Result<Value, ItemError>>, FatalError>;
+
+/// What one [`CollectClient::read_batch_detailed`] answers: like
+/// [`ReadBatch`] but each value carries its [`Reading`] quality and source
+/// time.
+pub type ReadBatchDetailed = Result<Vec<Result<Reading, ItemError>>, FatalError>;
 
 /// The client a connection task reads through. One instance per connect
 /// attempt ([`ClientFactory`]); the task owns it while connected and drops it
@@ -66,6 +71,23 @@ pub type ReadBatch = Result<Vec<Result<Value, ItemError>>, FatalError>;
 pub trait CollectClient: Send {
     fn connect(&mut self) -> BoxFuture<'_, Result<(), FatalError>>;
     fn read_batch<'a>(&'a mut self, specs: &'a [TagSpec]) -> BoxFuture<'a, ReadBatch>;
+    /// Like `read_batch`, but each value carries its quality (the periodic
+    /// collection reads through this). The default wraps `read_batch` with
+    /// [`Reading::good`], so a client with no quality of its own behaves
+    /// exactly as before.
+    fn read_batch_detailed<'a>(
+        &'a mut self,
+        specs: &'a [TagSpec],
+    ) -> BoxFuture<'a, ReadBatchDetailed> {
+        Box::pin(async move {
+            self.read_batch(specs).await.map(|items| {
+                items
+                    .into_iter()
+                    .map(|item| item.map(Reading::good))
+                    .collect()
+            })
+        })
+    }
     fn disconnect(&mut self) -> BoxFuture<'_, ()>;
 }
 
@@ -183,6 +205,22 @@ impl CollectClient for BrokerReadClient {
         Box::pin(async move {
             handle
                 .read(batch)
+                .await
+                .map_err(|err| FatalError::Io(err.to_string()))
+        })
+    }
+
+    /// Same as `read_batch`, through the broker's `read_detailed` so the
+    /// driver's per-item quality (OPC UA Uncertain) reaches the collection.
+    fn read_batch_detailed<'a>(
+        &'a mut self,
+        specs: &'a [TagSpec],
+    ) -> BoxFuture<'a, ReadBatchDetailed> {
+        let handle = self.handle.clone();
+        let batch = specs.to_vec();
+        Box::pin(async move {
+            handle
+                .read_detailed(batch)
                 .await
                 .map_err(|err| FatalError::Io(err.to_string()))
         })
@@ -375,6 +413,14 @@ mod tests {
                 .expect("the fake broker answers"),
             Vec::new()
         );
+        assert_eq!(
+            routed
+                .read_batch_detailed(&[])
+                .await
+                .expect("the fake broker answers the detailed read too")
+                .len(),
+            0
+        );
 
         let mut missing = factory("conn:2");
         let err = missing
@@ -382,5 +428,31 @@ mod tests {
             .await
             .expect_err("a connection without a broker session must not connect");
         assert!(err.to_string().contains("conn:2"), "got {err}");
+    }
+
+    /// The default `read_batch_detailed` wraps `read_batch` as Good with no
+    /// source time, keeping per-item errors as they are.
+    #[tokio::test]
+    async fn the_default_detailed_read_wraps_plain_values_as_good() {
+        struct Plain;
+        impl CollectClient for Plain {
+            fn connect(&mut self) -> BoxFuture<'_, Result<(), FatalError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn read_batch<'a>(&'a mut self, _specs: &'a [TagSpec]) -> BoxFuture<'a, ReadBatch> {
+                Box::pin(async {
+                    Ok(vec![
+                        Ok(Value::F64(2.5)),
+                        Err(ItemError::Unsupported("x".to_string())),
+                    ])
+                })
+            }
+            fn disconnect(&mut self) -> BoxFuture<'_, ()> {
+                Box::pin(async {})
+            }
+        }
+        let out = Plain.read_batch_detailed(&[]).await.expect("ok");
+        assert_eq!(out[0].as_ref().unwrap(), &Reading::good(Value::F64(2.5)));
+        assert!(out[1].is_err());
     }
 }
