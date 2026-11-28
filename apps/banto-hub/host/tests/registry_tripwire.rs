@@ -56,17 +56,21 @@ async fn the_hub_registry_is_exactly_what_the_hub_collection_can_plan() {
         "ALLOWED_PROTOCOLS が変わった: Hub の収集が計画できる集合を見直す"
     );
 
+    // 旧い規則の一覧に無いのは session 型の `opcua`（#1324）だけ。登録したドライバは
+    // 一覧に載せなくてよい（`settings_input.rs` は registry に在る id を一覧で見ない）。
     let registered: BTreeSet<String> = registry.ids().map(|id| id.as_str().to_string()).collect();
-    assert_eq!(registered, plannable);
+    let mut expected = plannable.clone();
+    expected.insert("opcua".to_string());
+    assert_eq!(registered, expected);
     assert!(!registry.contains(HUB_PROTOCOL), "hub は Hub に載せない");
 
-    // 種類: broker 管理の 2 つがセッション型（R2b-3a-2。3b 以降は Frame も）、host が
+    // 種類: broker 管理の 3 つ（SLMP・Modbus TCP は Frame、OPC UA は Session）、host が
     // I/O を持つ 3 つが HostProvided。
     let dialed = ids_of_kind(registry, |k| {
         matches!(k, DriverKind::Session(_) | DriverKind::Frame(_))
     });
     let host_provided = ids_of_kind(registry, |k| matches!(k, DriverKind::HostProvided(_)));
-    assert_eq!(dialed, set(&["modbus-tcp", "slmp"]));
+    assert_eq!(dialed, set(&["modbus-tcp", "slmp", "opcua"]));
     assert_eq!(
         host_provided,
         set(&[PUSH_PROTOCOL, POSTGRES_PROTOCOL, VIRTUAL_PROTOCOL])

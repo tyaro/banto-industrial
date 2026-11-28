@@ -115,14 +115,13 @@ async fn uncertain_and_source_timestamp_reach_read_batch_detailed() {
     assert_eq!(stale.quality, ReadQuality::Uncertain);
     assert_eq!(stale.source_time_ms, Some(sampled_ms()));
     assert!(matches!(got[2], Err(ItemError::Device(_))));
-    // read_batch gives the same values (it is built from the detailed read).
+    // read_batch (temporary, until the broker reads with the detailed form)
+    // refuses the Uncertain node instead of returning its value as Good; the
+    // Good node is the same value.
     let plain = s.read_batch(&specs).await.expect("read");
-    for (detailed, plain) in got.iter().zip(&plain) {
-        assert_eq!(
-            detailed.as_ref().map(|r| r.value.clone()),
-            plain.as_ref().cloned()
-        );
-    }
+    assert_eq!(plain[0].as_ref().ok(), Some(&good.value));
+    assert!(matches!(&plain[1], Err(ItemError::Device(e)) if e.code & 0xC000_0000 == 0x4000_0000));
+    assert!(matches!(plain[2], Err(ItemError::Device(_))));
     s.disconnect().await;
     server.stop().await;
 }

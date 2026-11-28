@@ -98,14 +98,15 @@ pub fn register_wasm_operational_write(
 /// Everything a host injects to give the engine its drivers.
 pub struct Builtin {
     /// The driver registry (design §6.1): `modbus-tcp` as a frame-type entry
-    /// (R2b-3c) and `slmp` as a frame-type entry (R2b-3d; session-type from
-    /// R2b-3a-2, `HostBound` in R1-4b to R2b-3a-1).
+    /// (R2b-3c), `slmp` as a frame-type entry (R2b-3d; session-type from
+    /// R2b-3a-2, `HostBound` in R1-4b to R2b-3a-1) and `opcua` as a
+    /// session-type entry (#1324).
     /// The broker dials through it (collection, read-now, write and the
     /// connection test alike since R2b-3a-3).
     pub registry: DriverRegistry,
 }
 
-/// The built-in drivers (Modbus TCP and SLMP).
+/// The built-in drivers (SLMP, Modbus TCP and OPC UA).
 pub fn builtin() -> Builtin {
     Builtin {
         registry: registry(),
@@ -120,6 +121,11 @@ fn registry() -> DriverRegistry {
         .expect("builtin driver ids are distinct");
     registry
         .register(DriverEntry::frame(banto_driver_modbus::driver()))
+        .expect("builtin driver ids are distinct");
+    // OPC UA クライアント（session 型、#1324）。slmp・modbus-tcp の後ろ
+    // （2026-11-28 オーナー決定）。
+    registry
+        .register(DriverEntry::session(banto_driver_opcua::driver()))
         .expect("builtin driver ids are distinct");
     registry
 }
@@ -146,19 +152,22 @@ mod tests {
             .collect()
     }
 
-    /// The registry holds exactly the two built-ins - `modbus-tcp` (R2b-3c) and
-    /// `slmp` (R2b-3d), both frame-type - and each entry's descriptor id is the
-    /// key it is found under.
+    /// The registry holds exactly the three built-ins - `modbus-tcp` (R2b-3c)
+    /// and `slmp` (R2b-3d) as frame-type, `opcua` (#1324) as session-type -
+    /// and each entry's descriptor id is the key it is found under.
     #[test]
-    fn registry_holds_modbus_tcp_and_slmp_as_frame_drivers() {
+    fn registry_holds_modbus_tcp_and_slmp_as_frame_drivers_and_opcua_as_session() {
         let registry = builtin().registry;
-        assert_eq!(registry.len(), 2);
+        assert_eq!(registry.len(), 3);
         assert_eq!(
             ids_of_kind(&registry, true),
             BTreeSet::from(["modbus-tcp".to_string(), "slmp".to_string()])
         );
-        assert!(ids_of_kind(&registry, false).is_empty());
-        for id in ["slmp", "modbus-tcp"] {
+        assert_eq!(
+            ids_of_kind(&registry, false),
+            BTreeSet::from(["opcua".to_string()])
+        );
+        for id in ["slmp", "modbus-tcp", "opcua"] {
             let entry = registry.get(id).expect("registered");
             assert_eq!(entry.descriptor().id.as_str(), id);
         }
@@ -170,35 +179,42 @@ mod tests {
             registry.get("slmp").unwrap().descriptor().id.as_str(),
             banto_driver_slmp::PROTOCOL
         );
+        assert_eq!(
+            registry.get("opcua").unwrap().descriptor().id.as_str(),
+            banto_driver_opcua::PROTOCOL
+        );
     }
 
-    /// Tripwire 1 (design §6.3; re-read by R2b-1f, connection-settings
-    /// design §4.1): every id `builtin()` registers is in the *legacy* rule
-    /// list `ALLOWED_PROTOCOLS`. `builtin()` is the registry ChronoGazer
-    /// shares (`modbus-tcp`, `slmp`), and ChronoGazer still validates with
-    /// that legacy list until R2b-7, so an id outside it could never be
-    /// looked up from a ChronoGazer connection row. It is not the Hub's rule:
-    /// the Hub's source of truth is its registry (`push`/`postgres`/`virtual`
-    /// are registered by the host; see `host/tests/registry_tripwire.rs`).
-    /// 登録順（`/api/drivers` の並び）: SLMP が先頭、Modbus TCP が次
-    /// （2026-10-24 オーナー決定。docs/hub/driver/banto-hub-driver-ui-design.md §4.1）。
+    /// 登録順（`/api/drivers` の並び）: SLMP が先頭、Modbus TCP、OPC UA の順
+    /// （SLMP・Modbus は 2026-10-24、OPC UA は 2026-11-28 オーナー決定。
+    /// docs/hub/driver/banto-hub-driver-ui-design.md §4.1）。
     #[test]
     fn builtin_registry_lists_slmp_first() {
         let registry = builtin().registry;
         let ids: Vec<&str> = registry.ids().map(DriverId::as_str).collect();
-        assert_eq!(ids, ["slmp", "modbus-tcp"]);
+        assert_eq!(ids, ["slmp", "modbus-tcp", "opcua"]);
     }
 
+    /// Tripwire 1 (design §6.3; rewritten for #1324): `ALLOWED_PROTOCOLS` is
+    /// the *legacy* rule list of a service built without a registry. A
+    /// registered driver does **not** need to be in it: both Hub
+    /// (`hub.rs` `PlcConnectionService::with_registry`) and ChronoGazer
+    /// (`engine.rs` `PlcConnectionService::with_registry`) build registry-backed
+    /// services, whose `settings_input.rs` routes a registered id through the
+    /// driver's own schema and only consults the legacy list when the id is
+    /// not registered. So this pins the current truth: the registered ids
+    /// outside the legacy list are exactly the session driver `opcua`, and
+    /// the frame drivers are all inside it (their SQL history).
     #[test]
-    fn builtin_registry_ids_are_in_the_legacy_protocol_list() {
+    fn builtin_registry_ids_outside_the_legacy_protocol_list_are_only_opcua() {
         let registry = builtin().registry;
         assert!(!registry.is_empty());
-        for id in registry.ids() {
-            assert!(
-                ALLOWED_PROTOCOLS.contains(&id.as_str()),
-                "{id} is not in banto_tags::ALLOWED_PROTOCOLS"
-            );
-        }
+        let outside: BTreeSet<&str> = registry
+            .ids()
+            .map(DriverId::as_str)
+            .filter(|id| !ALLOWED_PROTOCOLS.contains(id))
+            .collect();
+        assert_eq!(outside, BTreeSet::from(["opcua"]));
     }
 
     /// Tripwire 2 (design §6.3; rewritten by R2b-3a-2,

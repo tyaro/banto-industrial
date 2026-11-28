@@ -1,7 +1,7 @@
 # ChronoGazer の OPC UA のクライアント（共有のドライバ）の設計
 
 作成日: 2026-11-24
-状態: **設計確定（2026-11-24 のオーナー決定を記録。§7 の 11 項目も同日に決めた。2026-11-26: §6 の段 1 の banto-opcua 側は v0.3.3 で済み、Hub の固定も v0.3.3 に上げた（#1332。None・Anonymous の公開は `with_none_endpoint(true)` で保つ）。段 2 のうち Hub のサーバーの側（型・説明・単位・レンジ）は 2026-11-27 に済んだ。管理画面の LAN への公開の注意は設定画面（ConnectivitySection.svelte「LAN への公開に注意」）に既にある。NodeId を写す口は `/tags` の行のメニュー「OPC UA の NodeId をコピー」で済んだ（admin のみ。Namespace URI が admin 限定の設定 API にあるため）。段 2 は完了。段 3 に着手: 最初の PR で `banto-driver-api` に品質と時刻の口を足した。2 本目で `crates/banto-driver-opcua`（周期 Read・Write、None・Anonymous、購読なし）を作った。`banto-drivers` への登録と Hub の画面は次の PR）**
+状態: **設計確定（2026-11-24 のオーナー決定を記録。§7 の 11 項目も同日に決めた。2026-11-26: §6 の段 1 の banto-opcua 側は v0.3.3 で済み、Hub の固定も v0.3.3 に上げた（#1332。None・Anonymous の公開は `with_none_endpoint(true)` で保つ）。段 2 のうち Hub のサーバーの側（型・説明・単位・レンジ）は 2026-11-27 に済んだ。管理画面の LAN への公開の注意は設定画面（ConnectivitySection.svelte「LAN への公開に注意」）に既にある。NodeId を写す口は `/tags` の行のメニュー「OPC UA の NodeId をコピー」で済んだ（admin のみ。Namespace URI が admin 限定の設定 API にあるため）。段 2 は完了。段 3 に着手: 最初の PR で `banto-driver-api` に品質と時刻の口を足した。2 本目で `crates/banto-driver-opcua`（周期 Read・Write、None・Anonymous、購読なし）を作った。`banto-drivers` への登録（2026-11-28、slmp・modbus-tcp の後ろ）と、接続の画面の「平文・匿名」の注意書き（Hub・ChronoGazer の両方）も済んだ。ブローカーが `read_batch_detailed` を使う配線までは、`read_batch` が Uncertain を Bad（`ItemError::Device`）にして、Good に見せない）**
 関連: [#1324](https://github.com/tyaro/banto-industrial/issues/1324)（Hub 経由の専用のつなぎをやめ、OPC UA でつなぐ）、[#678](https://github.com/tyaro/banto-industrial/issues/678)（OPC UA のクライアントのドライバ）、[#383](https://github.com/tyaro/banto-industrial/issues/383)（3 ドライバの決定。この設計で改める）、[#700](https://github.com/tyaro/banto-industrial/pull/700)（OPC UA のクライアントは WASM の対象外）、[#1306](https://github.com/tyaro/banto-industrial/issues/1306)（記録の持ち主は ChronoGazer）、tyaro/banto-opcua の [ADR-0005](https://github.com/tyaro/banto-opcua/blob/v0.2.0/docs/adr/0005-client-as-hub-driver.md)・[ADR-0006](https://github.com/tyaro/banto-opcua/blob/v0.2.0/docs/adr/0006-client-subscription-latest-values.md)、提案 [banto-opcua#54](https://github.com/tyaro/banto-opcua/issues/54)（セキュリティ）・[#55](https://github.com/tyaro/banto-opcua/issues/55)（属性）・[#56](https://github.com/tyaro/banto-opcua/issues/56)（型）、[記録計要件](recorder-requirements.md) §7、[画面改善案](chronogazer-ui-improvement-proposal.md) §5、[タグサーバーの設計](../hub/tag-server-design.md) §3.4.1・§5.5、[Driver API の設計](../hub/driver/banto-driver-api-design.md)
 
 ## 1. 目的と範囲・決まったこと
@@ -214,7 +214,7 @@ Uncertain（Stale）と SourceTimestamp をドライバから渡すために、`
 ### 4.1 接続
 
 - 接続の種類に OPC UA（`opcua`）が増える。登録簿に入れれば、`GET /api/drivers`・汎用のフォーム・MCP の `list_drivers`・`create_connection` にそのまま出る（§2.1）。画面に専用のコードはほぼ要らない。
-- 接続の画面に「平文・匿名でつないでいます」を出す（§5）。汎用のフォームに、ドライバが注意書きを出す口があるかは未確認。無ければ schema の説明か、`opcua` のときだけの表示を足す。
+- 接続の画面に「平文・匿名でつないでいます」を出す（§5）。汎用のフォームにドライバが注意書きを出す口は無いので、`opcua` のときだけの表示を足した（2026-11-28。Hub は `ConnectionDrawer.svelte`、ChronoGazer は `tags/+page.svelte` の作成・編集のフォーム。文言と判定は各アプリの `driverNotices.ts`）。
 - 接続試験は `probe`（§3.2）で読む。
 - シミュレーションの接続（`simulation = true`）は、セッション型も `SimDevice` に差し替わる（§2.1）。OPC UA の接続でも使えるかは段 4 で確かめる。
 
