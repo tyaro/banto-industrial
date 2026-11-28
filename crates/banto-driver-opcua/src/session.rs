@@ -347,10 +347,10 @@ impl Session for OpcUaSession {
     /// server itself does not vouch for) is **not** returned as a value: it
     /// is that tag's `ItemError::Device` carrying the node's StatusCode.
     ///
-    /// Temporary: until the broker reads through `read_batch_detailed`
-    /// (Uncertain -> Stale, docs/chronogazer/opcua-client-design.md §3.6),
-    /// where `read_batch_detailed` keeps the value with
-    /// `ReadQuality::Uncertain`.
+    /// That is the contract: plain reads (read-now, the connection test) have
+    /// no quality, while the collection reads `read_batch_detailed`, which
+    /// keeps the value with `ReadQuality::Uncertain` and is stored as Stale
+    /// (docs/chronogazer/opcua-client-design.md §3.6).
     fn read_batch<'a>(
         &'a mut self,
         specs: &'a [TagSpec],

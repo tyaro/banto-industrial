@@ -95,7 +95,7 @@ mod task;
 pub use broker_sim::{dial_fingerprint, BrokerSimRegistry, DialTarget};
 pub use client::{
     broker_client_factory, BrokerReadClient, ClientFactory, CollectClient, ReadBatch,
-    BROKER_RECONNECT_GRACE,
+    ReadBatchDetailed, BROKER_RECONNECT_GRACE,
 };
 pub use collector::{ApplyReport, Collector, CollectorOptions};
 pub use config::{

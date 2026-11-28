@@ -47,7 +47,9 @@
 //!   `Uncertain`, Bad or no value is an `ItemError`. The SourceTimestamp, when
 //!   the server sends one, becomes `source_time_ms`; it is never filled with
 //!   the current time. `read_batch` is `read_batch_detailed` without the
-//!   quality, so the two cannot disagree.
+//!   quality: Good items and their order are the same, and an Uncertain item
+//!   with a value is `Ok(Reading)` in the detailed read but that tag's
+//!   `ItemError::Device` (its StatusCode) in the plain one.
 //! - **Writes** (`session.rs`, #678): the value is sent as the tag's type (a
 //!   node of another type answers `BadTypeMismatch`, that tag's
 //!   `ItemError::Device`), and the component's per-node outcomes - also of a

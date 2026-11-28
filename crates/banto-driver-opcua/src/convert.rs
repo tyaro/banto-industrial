@@ -13,8 +13,10 @@
 //! | any other Bad (also the reserved severity `11`) | - | `ItemError::Device { code: status }` |
 //!
 //! `plain_value_of` (`Session::read_batch`, which has no quality) turns the
-//! Uncertain row into `ItemError::Device { code: status }` (temporary, until
-//! the broker reads with the detailed form).
+//! Uncertain row into `ItemError::Device { code: status }`. That is the
+//! contract: plain `read_batch` is for read-now and the connection test,
+//! while the collection reads `read_batch_detailed`, where Uncertain keeps
+//! its value and is stored as Stale.
 //!
 //! The value then has to fit the tag's kind (`value_of`): Boolean for `bit`;
 //! a number for the numeric kinds, widened to `f64`. An integer kind
@@ -59,8 +61,8 @@ const PROTOCOL_CODES: [u32; 6] = [
 
 /// A Read result as a plain value, for `Session::read_batch` (no quality):
 /// an Uncertain node is `ItemError::Device { code: status }` instead of a
-/// value that would read as Good. Temporary until the broker uses
-/// `read_batch_detailed` (design §3.6, Uncertain -> Stale).
+/// value that would read as Good. The collection does not come through here:
+/// it uses `read_batch_detailed` (design §3.6, Uncertain -> Stale).
 pub(crate) fn plain_value_of(node: &NodeReading, kind: &TagKind) -> Result<Value, ItemError> {
     let reading = reading_of(node, kind)?;
     if reading.quality == ReadQuality::Uncertain {
