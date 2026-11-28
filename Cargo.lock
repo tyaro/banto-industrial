@@ -841,6 +841,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "banto-driver-opcua"
+version = "0.1.0"
+dependencies = [
+ "banto-driver-api",
+ "banto-driver-conformance",
+ "banto-opcua-client",
+ "banto-opcua-core",
+ "banto-opcua-server",
+ "tokio",
+]
+
+[[package]]
 name = "banto-driver-slmp"
 version = "0.1.0"
 dependencies = [
@@ -1119,6 +1131,20 @@ dependencies = [
  "axum 0.8.9",
  "banto-core",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "banto-opcua-client"
+version = "0.3.4"
+source = "git+https://github.com/tyaro/banto-opcua?tag=v0.3.4#0904507dd04baf5a2791fb9b7f93f9b7b99ebc93"
+dependencies = [
+ "async-opcua",
+ "banto-opcua-core",
+ "banto-opcua-pki",
+ "futures-util",
+ "tempfile",
+ "thiserror 2.0.21",
  "tokio",
 ]
 

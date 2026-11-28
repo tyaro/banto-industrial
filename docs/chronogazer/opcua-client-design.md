@@ -1,7 +1,7 @@
 # ChronoGazer の OPC UA のクライアント（共有のドライバ）の設計
 
 作成日: 2026-11-24
-状態: **設計確定（2026-11-24 のオーナー決定を記録。§7 の 11 項目も同日に決めた。2026-11-26: §6 の段 1 の banto-opcua 側は v0.3.3 で済み、Hub の固定も v0.3.3 に上げた（#1332。None・Anonymous の公開は `with_none_endpoint(true)` で保つ）。段 2 のうち Hub のサーバーの側（型・説明・単位・レンジ）は 2026-11-27 に済んだ。管理画面の LAN への公開の注意は設定画面（ConnectivitySection.svelte「LAN への公開に注意」）に既にある。NodeId を写す口は `/tags` の行のメニュー「OPC UA の NodeId をコピー」で済んだ（admin のみ。Namespace URI が admin 限定の設定 API にあるため）。段 2 は完了。段 3 に着手: 最初の PR で `banto-driver-api` に品質と時刻の口を足した）**
+状態: **設計確定（2026-11-24 のオーナー決定を記録。§7 の 11 項目も同日に決めた。2026-11-26: §6 の段 1 の banto-opcua 側は v0.3.3 で済み、Hub の固定も v0.3.3 に上げた（#1332。None・Anonymous の公開は `with_none_endpoint(true)` で保つ）。段 2 のうち Hub のサーバーの側（型・説明・単位・レンジ）は 2026-11-27 に済んだ。管理画面の LAN への公開の注意は設定画面（ConnectivitySection.svelte「LAN への公開に注意」）に既にある。NodeId を写す口は `/tags` の行のメニュー「OPC UA の NodeId をコピー」で済んだ（admin のみ。Namespace URI が admin 限定の設定 API にあるため）。段 2 は完了。段 3 に着手: 最初の PR で `banto-driver-api` に品質と時刻の口を足した。2 本目で `crates/banto-driver-opcua`（周期 Read・Write、None・Anonymous、購読なし）を作った。`banto-drivers` への登録と Hub の画面は次の PR）**
 関連: [#1324](https://github.com/tyaro/banto-industrial/issues/1324)（Hub 経由の専用のつなぎをやめ、OPC UA でつなぐ）、[#678](https://github.com/tyaro/banto-industrial/issues/678)（OPC UA のクライアントのドライバ）、[#383](https://github.com/tyaro/banto-industrial/issues/383)（3 ドライバの決定。この設計で改める）、[#700](https://github.com/tyaro/banto-industrial/pull/700)（OPC UA のクライアントは WASM の対象外）、[#1306](https://github.com/tyaro/banto-industrial/issues/1306)（記録の持ち主は ChronoGazer）、tyaro/banto-opcua の [ADR-0005](https://github.com/tyaro/banto-opcua/blob/v0.2.0/docs/adr/0005-client-as-hub-driver.md)・[ADR-0006](https://github.com/tyaro/banto-opcua/blob/v0.2.0/docs/adr/0006-client-subscription-latest-values.md)、提案 [banto-opcua#54](https://github.com/tyaro/banto-opcua/issues/54)（セキュリティ）・[#55](https://github.com/tyaro/banto-opcua/issues/55)（属性）・[#56](https://github.com/tyaro/banto-opcua/issues/56)（型）、[記録計要件](recorder-requirements.md) §7、[画面改善案](chronogazer-ui-improvement-proposal.md) §5、[タグサーバーの設計](../hub/tag-server-design.md) §3.4.1・§5.5、[Driver API の設計](../hub/driver/banto-driver-api-design.md)
 
 ## 1. 目的と範囲・決まったこと
@@ -136,7 +136,7 @@ ChronoGazer（記録計）が、Hub にも他社の OPC UA サーバーにも、
 - `nsu=` の URI の `;` は `%3B`、`%` は `%25` に符号化して書く（Part 6）。画面の入力の説明（`address_help`）にも書く。GUID（`g=`）・ByteString（`b=`）は当面「未対応の識別子の型」として断る。
 - **`ns=` の番号はサーバーの再起動で変わることがある**ので、画面の説明では `nsu=` を勧める。Hub につなぐときは `nsu=urn:banto:opcua:tags;s=<外部名>`（Hub の名前空間の URI を変えていなければ）。
 - `offset_address`（連続登録）は、NodeId に「隣」が無いので断る（エラーを返す）。数値の識別子 `i=` だけ番号を足す案もあるが、意味のある並びとは限らないので入れない。
-- `probe`（接続試験で読む 1 点）は、どのサーバーにもある Server のノードを読む。候補は `ns=0;i=2259`（ServerStatus の State）。型が数値として受けられるかは着手のときに確かめる（未確認）。
+- `probe`（接続試験で読む 1 点）は、どのサーバーにもある Server のノードを読む。`ns=0;i=2259`（ServerStatus の State）を `i32` で読む。**確かめた（2026-11-27）**: State は Int32 の列挙で、banto-opcua-server からは `Running` = 0 が数値として読める（`crates/banto-driver-opcua/tests/server.rs`）。
 - 改名・削除: Hub のタグの改名で NodeId（外部名）が変わる。古い NodeId は `BadNodeIdUnknown` になり、そのタグだけ Bad になる（ほかのタグの収集は続く）。今の Hub 経由のつなぎと同じく、ChronoGazer の記録項目のアドレスを利用者が直す。Browse が入れば選び直せる（§4.2）。
 
 ### 3.3 接続の設定
@@ -153,6 +153,8 @@ ChronoGazer（記録計）が、Hub にも他社の OPC UA サーバーにも、
 - 接続の時間切れと要求の時間切れは、host が `ConnectContext`（`connect_timeout`・`response_timeout`）で渡す。要求の時間切れは収集の周期より短くする（ADR-0005）。
 - SecurityPolicy・利用者の認証は、banto-opcua#54 が入るまで設定に出さない（None / Anonymous に決め打ち）。**平文・匿名でつないでいることを接続の画面に出す**（#678 の受入れ条件。ChronoGazer も同じ）。
 - キーの名前・既定の値は段 3 の着手のときに部品の `ClientConfig` に合わせて決める（上の表は形の案）。
+- **決めた（2026-11-27、`crates/banto-driver-opcua`）**: `endpointUrl`（必須、`opc.tcp://`）、`readMode`（`read` だけ。`subscribe` は `validate_config` が「未対応」と断る）、`keepAliveIntervalMs`（既定 5000、100〜30000）、`maxFailedKeepAliveCount`（既定 3、1〜10）。既定は部品の `ClientConfig::new` と同じ（試験で突き合わせる）。部品の自動再接続は止め（`ReconnectPolicy::Disabled`）、接続の時間切れ・要求の時間切れは `ConnectContext` から渡す。
+- **作ったもの（2026-11-27）**: 品質は StatusCode の深刻度で写す（Good → Good、Uncertain で値あり → `Uncertain`、Bad・値なし → そのタグだけ `ItemError`）。SourceTimestamp は `source_time_ms` に入れ、無ければ `None`（現在時刻で補わない）。`read_batch` は `read_batch_detailed` から作る。書き込みは **タグの型** で送る（#678 の決定。ノードを先に読んで型を覚えることはしない。部品は型を変換しない）。タグの型で表せない値（整数の型に小数・範囲外・NaN）は送らずに `ItemError::Rejected`、ノードの型と合わなければサーバーの `BadTypeMismatch` をそのタグだけの `ItemError::Device` にする。分けて送った Write が途中で切れても `write_batch` は `Ok` でノードごとに返す（#678 の 2026-10-17 のコメント）: 応答を受けた分はその StatusCode、要求ごとの拒否は `Device`、「送っていない」は `Rejected`、「送ったが応答が無い」は新しい `ItemError::Indeterminate`（書かれたかもしれない。成功として扱わず、自動で送り直さない）。応答があっても反映を確かめていないもの（`Good_CompletesAsynchronously` 0x002E0000 と Uncertain。サブコードは上位 16 bit で比べ、情報のビットは無視する）も成功にせず、StatusCode 入りの `Indeterminate` にする（Part 4 §5.11.4、2026-11-27、PR #1356 のオーナーのレビュー）。部品の Write が失敗したらセッションを壊れた印にし、次の Read・Write は何も送らずに `Err` を返して broker の再接続に回す（2026-11-27、PR #1356 のオーナーのレビュー）。string は §3.4 のとおり未対応。適合試験は C4 の壊れた応答の分類・C5 の分割・C8 の接続の数（GetEndpoints が別の接続）の 3 つが OPC UA では文面どおりに満たせず、理由を試験に書いて外した（`tests/conformance.rs`）。
 
 ### 3.4 型の写し
 
@@ -194,7 +196,7 @@ Uncertain（Stale）と SourceTimestamp をドライバから渡すために、`
   - 使う側（`banto-collect` の broker の読み取り）は新しいメソッドを呼び、Uncertain を Stale として扱う。
 - **段 3 の最初の PR で足した**（`Session::read_batch_detailed`・`Reading`・`ReadQuality`。`banto-driver-api` の未公開の 0.3.0 に入れた。使う側の broker・collect・Hub はまだ変えていない）。
 - 別案: `ItemError` に「Uncertain」を足す。足すのは易しいが、値を持てない（UncertainLastUsableValue の値を捨てる）うえ、エラーとして数えられるので採らない。
-- 書き込みの途中の切断（ADR-0005 の `WriteOutcome` の `Unknown`・`NotSent`）を返す形も Hub の #678 で要る。ChronoGazer は書かないので、この設計では扱わない。
+- 書き込みの途中の切断（ADR-0005 の `WriteOutcome` の `Unknown`・`NotSent`）を返す形も Hub の #678 で要る。→ `ItemError::Indeterminate` を足した（`banto-driver-api` 0.3.0、未公開。WIT には足さない: WASM のゲストは Write を分けて送らない）。ChronoGazer は書かないので、これ以上はこの設計では扱わない。
 
 ### 3.7 再接続と読み方
 

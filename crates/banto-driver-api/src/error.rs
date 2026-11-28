@@ -22,6 +22,8 @@ use std::fmt;
 ///
 /// The WASM adapter maps each WIT case to the variant of the same name
 /// (`verification-failed` to [`ItemError::VerificationFailed`], #902).
+/// [`ItemError::Indeterminate`] has no WIT case: a WASM guest never splits a
+/// write over several requests, so it never has a per-item "maybe written".
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
@@ -46,6 +48,18 @@ pub enum ItemError {
     /// (a read-modify-write check read). The device may have applied it;
     /// read back before writing again. Still non-fatal.
     VerificationFailed(String),
+    /// The write may or may not have reached the target. Never treat it as
+    /// a success, and never resend it automatically: read back first, then
+    /// decide (#678). Two cases, told apart by the reason text:
+    ///
+    /// - (a) it was sent but its result never came back (the connection
+    ///   broke or the request timed out, e.g. one chunk of a write split over
+    ///   several requests). Only here does the session that returns it fail
+    ///   its next call, so the host reconnects.
+    /// - (b) a reply came, but it does not confirm the target applied the
+    ///   write (OPC UA `Good_CompletesAsynchronously` or an Uncertain
+    ///   status). The connection stays as it is.
+    Indeterminate(String),
 }
 
 impl fmt::Display for ItemError {
@@ -56,6 +70,9 @@ impl fmt::Display for ItemError {
             ItemError::Rejected(m) => write!(f, "ドライバが断りました: {m}"),
             ItemError::VerificationFailed(m) => {
                 write!(f, "書込み後の確認読みが合いません: {m}")
+            }
+            ItemError::Indeterminate(m) => {
+                write!(f, "書き込み先への反映を確かめられません: {m}")
             }
         }
     }
@@ -191,6 +208,10 @@ mod tests {
         assert_eq!(
             ItemError::VerificationFailed("D100 のビット 5".into()).to_string(),
             "書込み後の確認読みが合いません: D100 のビット 5"
+        );
+        assert_eq!(
+            ItemError::Indeterminate("ns=2;s=Level".into()).to_string(),
+            "書き込み先への反映を確かめられません: ns=2;s=Level"
         );
     }
 

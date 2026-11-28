@@ -1,0 +1,30 @@
+# #1324 段 3（docs/chronogazer/opcua-client-design.md §3）: OPC UA のクライアントの、
+# セッション型の共有ドライバ（#678 の本体）。Hub と ChronoGazer の両方が `banto-drivers` の
+# 登録簿から使う予定だが、この PR ではまだ `builtin()` に登録しない（次の PR）。
+# プロトコルの部品は banto-opcua の `banto-opcua-client`（ADR-0005）で、async-opcua の型は
+# この crate の外へ出さない（部品の公開 API も core の語彙だけ）。git の依存を持つので、
+# crates.io に公開する `banto-driver-api` と違い内部 crate（`publish = false`）。
+[package]
+name = "banto-driver-opcua"
+description = "OPC UA のクライアントのドライバ（banto-driver-api の SessionDriver。周期 Read・Write、None / Anonymous）(docs/chronogazer/opcua-client-design.md §3)"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# `DriverBase` / `SessionDriver` / `Session` と、品質と時刻つきの `Reading`（§3.6）。
+banto-driver-api = { path = "../banto-driver-api", version = "0.3.0" }
+# 接続・まとめて Read / Write（ADR-0005）。ルートの tag v0.3.4 の固定に従う。
+banto-opcua-client = { workspace = true }
+# NodeId の文字列の解析（`NodeAddress`）・StatusCode の深刻度・`ScalarValue`。
+banto-opcua-core = { workspace = true }
+# 接続の全体の時間切れ（`tokio::time::timeout`）。ランタイムは host のもの。
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+# tests/: in-process の OPC UA サーバー（None のエンドポイントを開く）。
+banto-opcua-server = { workspace = true }
+# tests/conformance.rs: 適合試験一式と FaultProxy。
+banto-driver-conformance = { path = "../banto-driver-conformance" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync"] }
