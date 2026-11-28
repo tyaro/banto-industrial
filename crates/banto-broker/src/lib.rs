@@ -206,7 +206,7 @@ use std::time::Duration;
 
 use banto_driver_api::{
     CivilTime, ConnectContext, DiagnosticReport, DriverKind, DriverRegistry, FatalError, ItemError,
-    Session, SessionDriver, Settings, TagSpec, Value, WordOrder, WriteItem,
+    Reading, Session, SessionDriver, Settings, TagSpec, Value, WordOrder, WriteItem,
 };
 pub use banto_driver_engine::sim::SimDevice;
 use banto_tags::PlcConnection;
@@ -665,6 +665,12 @@ enum Job {
         specs: Vec<TagSpec>,
         respond_to: oneshot::Sender<ReadOutcome>,
     },
+    /// Like [`Job::Read`] but through `Session::read_batch_detailed`, so the
+    /// answer carries each value's quality and source time.
+    ReadDetailed {
+        specs: Vec<TagSpec>,
+        respond_to: oneshot::Sender<ReadDetailedOutcome>,
+    },
     Write {
         items: Vec<WriteItem>,
         respond_to: oneshot::Sender<WriteOutcome>,
@@ -686,6 +692,11 @@ enum Job {
 
 /// What a read job answers: one result per spec, in order.
 pub type ReadOutcome = Result<Vec<Result<Value, ItemError>>, BrokerError>;
+
+/// What a detailed read job answers: one result per spec, in order, each
+/// with its quality and the device's source time (see
+/// `Session::read_batch_detailed`). Same errors as [`ReadOutcome`].
+pub type ReadDetailedOutcome = Result<Vec<Result<Reading, ItemError>>, BrokerError>;
 
 /// What a write job answers: one result per item, in order.
 pub type WriteOutcome = Result<Vec<Result<(), ItemError>>, BrokerError>;
@@ -891,6 +902,25 @@ impl BrokerHandle {
         self.fingerprint
     }
 
+    /// [`read`](Self::read) through `Session::read_batch_detailed`: the same
+    /// queueing and errors, but each value carries its quality and source
+    /// time. Plain `read` keeps a driver's own plain mapping (the OPC UA
+    /// driver reports Uncertain as an `ItemError` there); `read_detailed`
+    /// carries Uncertain and the source time. The collection path switches
+    /// to this in a later change.
+    pub async fn read_detailed(&self, specs: Vec<TagSpec>) -> ReadDetailedOutcome {
+        let (respond_to, rx) = oneshot::channel();
+        self.tx
+            .send(Job::ReadDetailed { specs, respond_to })
+            .await
+            .map_err(|_| BrokerError::TaskGone {
+                connection_id: self.connection_id,
+            })?;
+        rx.await.map_err(|_| BrokerError::TaskGone {
+            connection_id: self.connection_id,
+        })?
+    }
+
     /// Submit a read batch (numbers, bits and strings mixed) and await its
     /// result: one `Result<Value, ItemError>` per spec, in order. Fails fast
     /// with [`BrokerError::Disconnected`] if the session is down - see the
@@ -1041,6 +1071,11 @@ impl ReadOnlyHandle {
         self.inner.read(specs).await
     }
 
+    /// Identical to [`BrokerHandle::read_detailed`].
+    pub async fn read_detailed(&self, specs: Vec<TagSpec>) -> ReadDetailedOutcome {
+        self.inner.read_detailed(specs).await
+    }
+
     /// Identical to [`BrokerHandle::read_clock`] (the same job; it writes
     /// nothing to the PLC).
     pub async fn read_clock(&self) -> ClockReadOutcome {
@@ -1113,6 +1148,9 @@ pub fn spawn_test_handle_with_status(
                     let _ = respond_to.send(true);
                 }
                 Job::Read { respond_to, .. } => {
+                    let _ = respond_to.send(Ok(Vec::new()));
+                }
+                Job::ReadDetailed { respond_to, .. } => {
                     let _ = respond_to.send(Ok(Vec::new()));
                 }
                 Job::Write { items, respond_to } => {
@@ -1989,6 +2027,20 @@ async fn run_broker_task(
                         };
                         answer(connection_id, respond_to, outcome)
                     }
+                    Job::ReadDetailed { specs, respond_to } => {
+                        let outcome = match &mut state {
+                            ConnState::Connected(session) => Some(
+                                bounded_job(
+                                    read_job_limit(specs.len(), timeouts.response),
+                                    specs.len(),
+                                    session.read_batch_detailed(&specs),
+                                )
+                                .await,
+                            ),
+                            _ => None,
+                        };
+                        answer(connection_id, respond_to, outcome)
+                    }
                     Job::Write { items, respond_to } => {
                         let outcome = match &mut state {
                             ConnState::Connected(session) => Some(
@@ -2119,7 +2171,7 @@ mod tests {
 
     use std::time::Duration;
 
-    use banto_driver_api::{DataType, DriverEntry};
+    use banto_driver_api::{DataType, DriverEntry, ReadQuality};
     use futures_util::future::join_all;
     use serde_json::json;
     use zeroize::Zeroizing;
@@ -2758,6 +2810,125 @@ mod tests {
         }
 
         supervisor.shutdown().await;
+    }
+
+    // -----------------------------------------------------------------
+    // read_detailed (quality and source time through the broker)
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn read_detailed_carries_quality_and_time_while_read_is_unchanged() {
+        let plc = FakePlc::new();
+        plc.set_word("D1", 11);
+        plc.set_word("D2", 22);
+        plc.set_detailed("D1", ReadQuality::Uncertain, Some(1_700_000_000_123));
+        let (handle, task, _shutdown) = spawn_task(
+            plc.connector(),
+            BackoffConfig::default(),
+            SessionTimeouts::default(),
+        );
+        let specs = vec![rspec("D1", DataType::U16), rspec("D2", DataType::U16)];
+        let plain = read_once_connected(&handle, specs.clone()).await;
+        assert_eq!(plain, vec![Ok(Value::F64(11.0)), Ok(Value::F64(22.0))]);
+
+        let detailed = handle.read_detailed(specs.clone()).await.unwrap();
+        assert_eq!(
+            detailed,
+            vec![
+                Ok(Reading::new(
+                    Value::F64(11.0),
+                    ReadQuality::Uncertain,
+                    Some(1_700_000_000_123)
+                )),
+                Ok(Reading::good(Value::F64(22.0))),
+            ]
+        );
+        // The read-only handle is the same job.
+        assert_eq!(
+            handle
+                .read_only()
+                .read_detailed(specs.clone())
+                .await
+                .unwrap(),
+            detailed
+        );
+        // And plain read is still the same after a detailed one.
+        assert_eq!(handle.read(specs).await.unwrap(), plain);
+
+        drop(handle);
+        let _ = task.join_handle.await;
+    }
+
+    #[tokio::test]
+    async fn read_detailed_without_overrides_is_read_wrapped_as_good() {
+        let plc = FakePlc::new();
+        plc.set_word("D5", 7);
+        let (handle, task, _shutdown) = spawn_task(
+            plc.connector(),
+            BackoffConfig::default(),
+            SessionTimeouts::default(),
+        );
+        let specs = vec![rspec("D5", DataType::U16), rspec("D6", DataType::U16)];
+        let plain = read_once_connected(&handle, specs.clone()).await;
+        let detailed = handle.read_detailed(specs).await.unwrap();
+        let wrapped: Vec<_> = plain.into_iter().map(|r| r.map(Reading::good)).collect();
+        assert_eq!(detailed, wrapped);
+
+        drop(handle);
+        let _ = task.join_handle.await;
+    }
+
+    #[tokio::test]
+    async fn read_detailed_while_disconnected_fails_fast_like_read() {
+        let plc = FakePlc::new();
+        plc.refuse_connections(true);
+        let (handle, task, _shutdown) = spawn_task(
+            plc.connector(),
+            BackoffConfig::default(),
+            SessionTimeouts::default(),
+        );
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(200),
+            handle.read_detailed(vec![rspec("D0", DataType::U16)]),
+        )
+        .await
+        .expect("must fail fast, not hang");
+        assert_eq!(outcome, Err(BrokerError::Disconnected { connection_id: 1 }));
+
+        drop(handle);
+        let _ = task.join_handle.await;
+    }
+
+    #[tokio::test]
+    async fn a_fatal_in_read_detailed_triggers_reconnect_like_read() {
+        let plc = FakePlc::new();
+        let backoff = BackoffConfig {
+            base: Duration::from_millis(20),
+            cap: Duration::from_millis(100),
+            factor: 2,
+        };
+        let (handle, task, _shutdown) =
+            spawn_task(plc.connector(), backoff, SessionTimeouts::default());
+        let _ = read_once_connected(&handle, vec![rspec("D0", DataType::U16)]).await;
+        plc.fail_next_call();
+
+        let failed = handle.read_detailed(vec![rspec("D0", DataType::U16)]).await;
+        assert!(
+            matches!(
+                failed,
+                Err(BrokerError::ConnectionFailed {
+                    connection_id: 1,
+                    ..
+                })
+            ),
+            "{failed:?}"
+        );
+        plc.set_word("D400", 55);
+        let recovered = read_once_connected(&handle, vec![rspec("D400", DataType::U16)]).await;
+        assert_eq!(recovered, vec![Ok(Value::F64(55.0))]);
+
+        drop(handle);
+        let _ = task.join_handle.await;
     }
 
     // -----------------------------------------------------------------

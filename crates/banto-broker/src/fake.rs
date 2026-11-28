@@ -34,7 +34,7 @@ use std::time::Duration;
 use banto_driver_api::{
     AddressError, BoxFuture, Capabilities, ConnectContext, DataType, DriverAddress, DriverBase,
     DriverDescriptor, DriverEntry, DriverId, DriverRegistry, FatalError, FieldError, ItemError,
-    Session, SessionDriver, Settings, TagKind, TagSpec, Value, WriteItem,
+    ReadQuality, Reading, Session, SessionDriver, Settings, TagKind, TagSpec, Value, WriteItem,
 };
 use tokio::sync::mpsc;
 
@@ -65,6 +65,9 @@ pub(crate) enum Behaviour {
 #[derive(Default)]
 struct State {
     words: HashMap<String, u16>,
+    /// Per-address quality / source time that `read_batch_detailed` reports
+    /// (an address without an entry is Good with no time, like the default).
+    detailed: HashMap<String, (ReadQuality, Option<i64>)>,
     refuse_connect: bool,
     fail_next_call: bool,
     behaviour: Behaviour,
@@ -88,6 +91,19 @@ impl FakePlc {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().expect("fake plc poisoned")
+    }
+
+    /// Make `read_batch_detailed` report `quality` and `source_time_ms` for
+    /// one canonical address; plain `read_batch` is unaffected.
+    pub(crate) fn set_detailed(
+        &self,
+        canonical: &str,
+        quality: ReadQuality,
+        source_time_ms: Option<i64>,
+    ) {
+        self.lock()
+            .detailed
+            .insert(canonical.to_string(), (quality, source_time_ms));
     }
 
     /// Seed one word at a canonical address (e.g. `"D400"`).
@@ -221,6 +237,28 @@ impl Session for FakeSession {
                 results.pop();
             }
             Ok(results)
+        })
+    }
+
+    fn read_batch_detailed<'a>(
+        &'a mut self,
+        specs: &'a [TagSpec],
+    ) -> BoxFuture<'a, Result<Vec<Result<Reading, ItemError>>, FatalError>> {
+        Box::pin(async move {
+            // Same values (and same fatal / behaviour handling) as
+            // `read_batch`; only the quality and time come from the override.
+            let items = self.read_batch(specs).await?;
+            let state = self.plc.lock();
+            Ok(specs
+                .iter()
+                .zip(items)
+                .map(|(spec, item)| {
+                    item.map(|value| match state.detailed.get(&spec.address.canonical) {
+                        Some((quality, time)) => Reading::new(value, *quality, *time),
+                        None => Reading::good(value),
+                    })
+                })
+                .collect())
         })
     }
 
