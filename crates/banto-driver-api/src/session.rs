@@ -136,9 +136,14 @@ pub trait Session: Send + 'static {
     ///
     /// The default calls [`read_batch`](Self::read_batch) and wraps each
     /// `Ok(value)` as a Good reading with no source time (`Err` passes
-    /// through). A driver that overrides this must return the same values as
-    /// `read_batch`; the two must never disagree. Callers are expected to
-    /// call this method rather than `read_batch`.
+    /// through). A driver that overrides this must agree with `read_batch`
+    /// on every Good item (same value, same order) and on every `Err`; the
+    /// one allowed difference is an Uncertain item with a value, which is an
+    /// `Ok(Reading)` with `ReadQuality::Uncertain` here and an `ItemError`
+    /// from `read_batch` (which has no quality, so it must not hand the value
+    /// over as if it were Good). The periodic collection calls this method;
+    /// `read_batch` remains for callers without quality (read-now, the
+    /// connection test).
     fn read_batch_detailed<'a>(
         &'a mut self,
         specs: &'a [TagSpec],

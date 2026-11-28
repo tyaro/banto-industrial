@@ -143,11 +143,14 @@ const QUALITY_LABELS: Readonly<Record<string, string>> = {
 	stale: '陳腐化'
 };
 
-/** 未確認 = 起動後にまだ一度も実機から良好値を読めていない（収集開始後の不良と区別する）。 */
+/**
+ * 未確認 = 起動後にまだ一度も実機から良好な品質の値を受けていない（収集開始後の不良と区別する）。
+ * 応答はあっても Uncertain（OPC UA）しか来ていないタグもここに入る。
+ */
 export const UNVERIFIED_LABEL = '未確認';
 /** 「未確認」の説明（品質のセルの `title`）。 */
 export const UNVERIFIED_TITLE =
-	'未確認 = Hub の起動後に、まだ一度も実機から値を読めていない状態（収集開始後の不良とは別）';
+	'未確認 = Hub の起動後に、まだ一度も実機から良好な品質の値を受けていない状態（収集開始後の不良とは別）';
 
 export function qualityLabel(q: string): string {
 	return Object.hasOwn(QUALITY_LABELS, q) ? QUALITY_LABELS[q] : q;
