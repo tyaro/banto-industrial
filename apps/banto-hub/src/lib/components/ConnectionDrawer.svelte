@@ -121,6 +121,7 @@
 		type PlcConnectionTestResult
 	} from '#lib/banto/tagRegistryAdmin.js';
 	import DriverSettingsForm from '#lib/components/DriverSettingsForm.svelte';
+	import { driverNotice } from '#lib/banto/driverNotices.js';
 	import PlcClockSection from '#lib/components/PlcClockSection.svelte';
 	import {
 		REQUIRED_MESSAGE,
@@ -355,6 +356,8 @@
 
 	let form: PlcConnectionFormState = $state(blankConnectionForm([]));
 	const driver = $derived(driverFor(drivers, form.protocol));
+	/** プロトコル固有の注意書き（OPC UA の平文・匿名。無ければ null）。 */
+	const notice = $derived(driverNotice(form.protocol));
 	const protocolChoices = $derived(protocolOptions(drivers));
 	/**
 	 * 2026-09-15 追補: Drawer/Modal を開いた（または保存が成功した）時点の
@@ -1182,6 +1185,9 @@
 				{readOnly}
 				idPrefix="conn-driver"
 			/>
+			{#if notice}
+				<p class="hint sim-hint" role="note" data-testid="driver-notice">{notice}</p>
+			{/if}
 		{:else if driversStatus === 'ready' && form.protocol !== ''}
 			<p class="hint wide">このプロトコルの設定欄はありません（{form.protocol}）。</p>
 		{/if}

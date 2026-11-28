@@ -2128,8 +2128,8 @@ async fn drivers_list_has_the_device_drivers_in_registry_order_and_no_host_conne
         .collect();
     // The registry's order (`DriverRegistry::ids()`); `postgres`・`push`・`virtual`
     // (`HostProvided`) are registered by `hub_drivers()` but not listed.
-    // SLMP first (2026-10-24 owner decision): `banto_drivers::builtin()` registers it first.
-    assert_eq!(ids, ["slmp", "modbus-tcp"]);
+    // SLMP first (2026-10-24 owner decision), OPC UA last (2026-11-28): `banto_drivers::builtin()`'s order.
+    assert_eq!(ids, ["slmp", "modbus-tcp", "opcua"]);
     let registry_ids: Vec<String> = app
         .manager
         .registry()
@@ -2243,7 +2243,7 @@ async fn drivers_list_needs_a_session_and_a_viewer_may_read_it() {
         .expect("viewer login");
     let (status, body) = get_drivers(&app.router, Some(&viewer_token)).await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
-    assert_eq!(body.as_array().map(Vec::len), Some(2), "{body:?}");
+    assert_eq!(body.as_array().map(Vec::len), Some(3), "{body:?}");
 }
 
 #[path = "t12_device_address/mod.rs"]

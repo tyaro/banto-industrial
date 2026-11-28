@@ -12,6 +12,10 @@
 //! | `BadNotSupported` (the component's "array or unsupported type") | - | `ItemError::Unsupported` |
 //! | any other Bad (also the reserved severity `11`) | - | `ItemError::Device { code: status }` |
 //!
+//! `plain_value_of` (`Session::read_batch`, which has no quality) turns the
+//! Uncertain row into `ItemError::Device { code: status }` (temporary, until
+//! the broker reads with the detailed form).
+//!
 //! The value then has to fit the tag's kind (`value_of`): Boolean for `bit`;
 //! a number for the numeric kinds, widened to `f64`. An integer kind
 //! (`i16`..`u64`) refuses a fraction, NaN / infinity and anything outside its
@@ -52,6 +56,24 @@ const PROTOCOL_CODES: [u32; 6] = [
     0x8080_0000,
     0x8088_0000,
 ];
+
+/// A Read result as a plain value, for `Session::read_batch` (no quality):
+/// an Uncertain node is `ItemError::Device { code: status }` instead of a
+/// value that would read as Good. Temporary until the broker uses
+/// `read_batch_detailed` (design §3.6, Uncertain -> Stale).
+pub(crate) fn plain_value_of(node: &NodeReading, kind: &TagKind) -> Result<Value, ItemError> {
+    let reading = reading_of(node, kind)?;
+    if reading.quality == ReadQuality::Uncertain {
+        return Err(ItemError::Device(DeviceError::new(
+            node.status.code(),
+            format!(
+                "値の品質が Uncertain です。Good として表示しません（{}）",
+                node.status
+            ),
+        )));
+    }
+    Ok(reading.value)
+}
 
 /// A Read result as the tag's [`Reading`] (the table in the module doc).
 pub(crate) fn reading_of(node: &NodeReading, kind: &TagKind) -> Result<Reading, ItemError> {
@@ -369,6 +391,30 @@ mod tests {
 
     fn unsupported(r: Result<Value, ItemError>) -> bool {
         matches!(r, Err(ItemError::Unsupported(_)))
+    }
+
+    #[test]
+    fn plain_value_refuses_uncertain_but_the_detailed_reading_keeps_it() {
+        let k = n(DataType::F64);
+        let v = Some(ScalarValue::Double(1.5));
+        let uncertain = node(v.clone(), StatusCode::UNCERTAIN_LAST_USABLE_VALUE);
+        // Detailed: still a value, flagged Uncertain.
+        assert_eq!(
+            reading_of(&uncertain, &k).unwrap().quality,
+            ReadQuality::Uncertain
+        );
+        // Plain: an error carrying the node's own code, never a Good-looking value.
+        match plain_value_of(&uncertain, &k) {
+            Err(ItemError::Device(e)) => {
+                assert_eq!(e.code, StatusCode::UNCERTAIN_LAST_USABLE_VALUE.code());
+                assert!(e.to_string().contains("Uncertain"), "{e}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            plain_value_of(&node(v, StatusCode::GOOD), &k),
+            Ok(Value::F64(1.5))
+        );
     }
 
     #[test]

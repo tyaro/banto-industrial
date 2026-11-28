@@ -890,6 +890,7 @@ dependencies = [
  "banto-driver-api",
  "banto-driver-engine",
  "banto-driver-modbus",
+ "banto-driver-opcua",
  "banto-driver-slmp",
  "banto-driver-wasm",
  "banto-plc",

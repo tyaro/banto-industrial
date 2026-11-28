@@ -61,13 +61,15 @@ use banto_driver_api::{
     Settings, TagKind, TagSpec, Value, WriteItem,
 };
 use banto_opcua_client::{
-    ClientConfig, ConnectedClient, OpcUaClient, ReconnectPolicy, WriteFailure, WriteOutcome,
+    ClientConfig, ConnectedClient, NodeReading, OpcUaClient, ReconnectPolicy, WriteFailure,
+    WriteOutcome,
 };
 use banto_opcua_core::{NodeAddress, ScalarValue};
 
 use crate::base::{parse_node, ClientSettings, OpcUaDriver};
 use crate::convert::{
-    fatal_of, fatal_of_connect, reading_of, scalar_for_write, scalar_type_for, status_error,
+    fatal_of, fatal_of_connect, plain_value_of, reading_of, scalar_for_write, scalar_type_for,
+    status_error,
 };
 
 impl SessionDriver for OpcUaDriver {
@@ -146,8 +148,18 @@ impl OpcUaSession {
         &mut self,
         specs: &[TagSpec],
     ) -> Result<Vec<Result<Reading, ItemError>>, FatalError> {
+        self.read_with(specs, reading_of).await
+    }
+
+    /// One Read for `specs`, each node mapped by `map` (`reading_of` for the
+    /// detailed read, `plain_value_of` for the plain one).
+    async fn read_with<T: Clone>(
+        &mut self,
+        specs: &[TagSpec],
+        map: fn(&NodeReading, &TagKind) -> Result<T, ItemError>,
+    ) -> Result<Vec<Result<T, ItemError>>, FatalError> {
         self.client()?;
-        let mut results: Vec<Option<Result<Reading, ItemError>>> = vec![None; specs.len()];
+        let mut results: Vec<Option<Result<T, ItemError>>> = vec![None; specs.len()];
         let mut positions = Vec::with_capacity(specs.len());
         let mut nodes = Vec::with_capacity(specs.len());
         for (i, spec) in specs.iter().enumerate() {
@@ -173,7 +185,7 @@ impl OpcUaSession {
                 )));
             }
             for (i, reading) in positions.into_iter().zip(&readings) {
-                results[i] = Some(reading_of(reading, &specs[i].kind));
+                results[i] = Some(map(reading, &specs[i].kind));
             }
         }
         Ok(results
@@ -331,18 +343,19 @@ fn item_result(outcome: WriteOutcome) -> Result<(), ItemError> {
 }
 
 impl Session for OpcUaSession {
+    /// The plain read has no quality, so an Uncertain node (a value the
+    /// server itself does not vouch for) is **not** returned as a value: it
+    /// is that tag's `ItemError::Device` carrying the node's StatusCode.
+    ///
+    /// Temporary: until the broker reads through `read_batch_detailed`
+    /// (Uncertain -> Stale, docs/chronogazer/opcua-client-design.md §3.6),
+    /// where `read_batch_detailed` keeps the value with
+    /// `ReadQuality::Uncertain`.
     fn read_batch<'a>(
         &'a mut self,
         specs: &'a [TagSpec],
     ) -> BoxFuture<'a, Result<Vec<Result<Value, ItemError>>, FatalError>> {
-        Box::pin(async move {
-            Ok(self
-                .read_detailed(specs)
-                .await?
-                .into_iter()
-                .map(|r| r.map(|reading| reading.value))
-                .collect())
-        })
+        Box::pin(self.read_with(specs, plain_value_of))
     }
 
     fn read_batch_detailed<'a>(

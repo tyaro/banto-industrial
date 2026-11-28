@@ -90,6 +90,7 @@
 	import { guardUnsavedChanges, UNSAVED_NOTICE } from '#lib/unsavedChanges.js';
 	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
 	import RecordTree from '#lib/components/RecordTree.svelte';
+	import { driverNotice } from '#lib/driverNotices.js';
 	import {
 		formatPeriodMs,
 		recordTargetNodeId,
@@ -2038,6 +2039,11 @@
 									readOnly={creatingConnection}
 									idPrefix="plc-create-driver"
 								/>
+								{#if driverNotice(driver.id)}
+									<p class="note" role="note" data-testid="driver-notice">
+										{driverNotice(driver.id)}
+									</p>
+								{/if}
 							{/if}
 						</BantoForm>
 					{/if}
@@ -2334,6 +2340,11 @@
 														readOnly={savingConnection || deletingConnection}
 														idPrefix="plc-edit-driver"
 													/>
+													{#if driverNotice(driver.id)}
+														<p class="note" role="note" data-testid="driver-notice">
+															{driverNotice(driver.id)}
+														</p>
+													{/if}
 												{/if}
 												<button
 													type="button"
